@@ -675,26 +675,27 @@ async def api_cron_history_all(request: web.Request) -> web.Response:
 _LESSON_NEGATIVE_SEP = " — NOT: "
 
 
-def _drop_exact_lesson(vs: Any, rule: str, negative: str, source: str = "user_explicit") -> int:
-    """Delete lessons whose rule text is exactly ``rule``. Returns the count.
+def _enrich_exact_lesson(vs: Any, rule: str, negative: str, source: str = "user_explicit") -> bool:
+    """Attach ``negative`` to an existing lesson whose rule text is exactly ``rule``.
 
     ``write_lesson``'s substring dedup returns False when ``rule`` is contained in an
     existing lesson -- always true when re-submitting the same rule -- so adding a
     negative to an existing lesson was silently swallowed while this route still
-    returned HTTP 200. Dropping the exact-text row first lets the enriched lesson
-    land.
+    returned HTTP 200.
 
-    The composed replacement is PREFLIGHTED with ``validate_semantic`` before
-    anything is deleted: if the enriched text would be rejected (e.g. the injection
-    scan trips on the negative), the original stays put rather than being traded for
-    a write that never happens.
+    The update is NON-DESTRUCTIVE: the enriched value is written back under the SAME
+    key via ``set_semantic``, which validates before upserting, so a rejected
+    replacement leaves the stored lesson exactly as it was. Nothing is ever deleted,
+    so an existing superset lesson -- which would make ``write_lesson`` refuse the
+    follow-up write -- cannot cost us the original.
 
-    Only the text before the NOT-separator is compared, and the match must be exact,
-    so a longer superset lesson that merely *contains* ``rule`` is never removed.
+    The stored embedding is deliberately left alone: ``write_lesson`` embeds the RULE
+    only, and the rule text is unchanged here; only the NOT-clause is appended.
+
+    Returns True when the row already carries this clause or was enriched, so the
+    caller can skip ``write_lesson``.
     """
-    composed = f"{rule}{_LESSON_NEGATIVE_SEP}{negative}"
-    composed_json = json.dumps(composed)
-    dropped = 0
+    target = f"{rule}{_LESSON_NEGATIVE_SEP}{negative}"
     for row in vs.get_lessons():
         try:
             existing = json.loads(row["value_json"])
@@ -704,17 +705,12 @@ def _drop_exact_lesson(vs: Any, rule: str, negative: str, source: str = "user_ex
             continue
         if existing.split(_LESSON_NEGATIVE_SEP, 1)[0].strip() != rule.strip():
             continue
-        if (
-            vs.validate_semantic(
-                row["key"], composed, row["confidence"], source, value_json=composed_json
-            )
-            is not None
-        ):
-            # Replacement would be rejected -- keep the original.
-            continue
-        vs.delete_semantic(row["key"], source)
-        dropped += 1
-    return dropped
+        if existing == target:
+            return True  # already carries this clause
+        if vs.set_semantic(row["key"], target, row["confidence"], source) is None:
+            return True
+        return False  # rejected (e.g. injection scan) -- original left untouched
+    return False
 
 
 async def api_lessons_create(request: web.Request) -> web.Response:
@@ -843,11 +839,6 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # Write to vector store if available, else JSONL
     vs = _get_memory(state).vector_store
     if vs:
-        if negative:
-            # Without this, write_lesson's substring dedup swallows a re-submission
-            # that only ADDS a negative to an existing identical rule (see
-            # _drop_exact_lesson), and the caller still gets HTTP 200.
-            await asyncio.to_thread(_drop_exact_lesson, vs, rule, negative)
         # Embed the rule once off the event loop and reuse it for both the
         # contradiction scan and write_lesson's own dedup pass — the store
         # methods otherwise each perform a blocking in-process embed of the same
@@ -855,6 +846,14 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # (blocking embed + O(N) cosine scan), so run them via to_thread to
         # avoid stalling concurrent dashboard/Slack requests.
         rule_emb = await asyncio.to_thread(vs.embed_lesson, rule)
+        # A re-submission that only ADDS a negative to an existing identical rule is
+        # refused by write_lesson's substring dedup, so enrich that row in place
+        # instead — non-destructive, same key, validated before upsert (see
+        # _enrich_exact_lesson). Nothing is deleted, so a superset lesson that would
+        # make the follow-up write_lesson refuse cannot cost us the original.
+        enriched = False
+        if negative:
+            enriched = await asyncio.to_thread(_enrich_exact_lesson, vs, rule, negative)
         # Persist the lesson immediately so the request returns fast. The
         # contradiction sweep below makes a per-candidate LLM call (observed
         # ~27s each), which previously ran inline and blew the MCP client's
@@ -862,7 +861,8 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # caller saw a "timeout" for a lesson that was actually saved (and
         # re-saved on every retry). Writing first, then sweeping in the
         # background, removes the slow LLM call from the request path.
-        await asyncio.to_thread(vs.write_lesson, rule, category, negative, "user_explicit", rule_emb)
+        if not enriched:
+            await asyncio.to_thread(vs.write_lesson, rule, category, negative, "user_explicit", rule_emb)
         candidates = await asyncio.to_thread(
             vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb
         )
