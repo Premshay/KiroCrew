@@ -670,6 +670,37 @@ async def api_cron_history_all(request: web.Request) -> web.Response:
     return web.json_response({"runs": runs, "total": total})
 
 
+# write_lesson() joins a lesson and its NOT-clause as f"{rule} — NOT: {negative}",
+# so a stored lesson that already carries a negative reads "<rule> — NOT: <neg>".
+_LESSON_NEGATIVE_SEP = " — NOT: "
+
+
+def _drop_exact_lesson(vs: Any, rule: str, source: str = "user_explicit") -> int:
+    """Delete stored lessons whose rule text is exactly ``rule``. Returns the count.
+
+    ``write_lesson``'s substring dedup returns False when ``rule`` is contained in an
+    existing lesson -- always true when re-submitting the same rule -- so adding a
+    negative to an existing lesson was silently swallowed while this route still
+    returned HTTP 200. Dropping the exact-text row first lets the enriched lesson
+    land.
+
+    Only the text before the NOT-separator is compared, and the match must be exact,
+    so a longer superset lesson that merely *contains* ``rule`` is never removed.
+    """
+    dropped = 0
+    for row in vs.get_lessons():
+        try:
+            existing = json.loads(row["value_json"])
+        except Exception:
+            continue
+        if not isinstance(existing, str):
+            continue
+        if existing.split(_LESSON_NEGATIVE_SEP, 1)[0].strip() == rule.strip():
+            vs.delete_semantic(row["key"], source)
+            dropped += 1
+    return dropped
+
+
 async def api_lessons_create(request: web.Request) -> web.Response:
     """POST /api/lessons — add a lesson (vector store or JSONL fallback)."""
     from kiro_crew.learn import Lesson  # noqa: F811
@@ -796,6 +827,11 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # Write to vector store if available, else JSONL
     vs = _get_memory(state).vector_store
     if vs:
+        if negative:
+            # Without this, write_lesson's substring dedup swallows a re-submission
+            # that only ADDS a negative to an existing identical rule (see
+            # _drop_exact_lesson), and the caller still gets HTTP 200.
+            await asyncio.to_thread(_drop_exact_lesson, vs, rule)
         # Embed the rule once off the event loop and reuse it for both the
         # contradiction scan and write_lesson's own dedup pass — the store
         # methods otherwise each perform a blocking in-process embed of the same
@@ -832,11 +868,14 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             negative=negative,
             ts=datetime.now(timezone.utc).isoformat(),
         )
-        if scope == "workspace":
-            ws = cleaned.get("workspace")
-            _get_lessons(state, ws).save(lesson)
-        else:
-            state.lessons.save(lesson)
+        store = _get_lessons(state, cleaned.get("workspace")) if scope == "workspace" else state.lessons
+        # LessonStore.save() skips an exact rule duplicate, so the add-a-negative
+        # resubmission is swallowed on this path too. Gate the replace on an exact
+        # match: remove() is substring-based, so calling it unconditionally could
+        # take out a longer superset lesson.
+        if negative and any(le.rule.strip() == rule.strip() for le in store.load_all()):
+            store.remove(rule)
+        store.save(lesson)
     state.push_refresh("lessons")
     return web.json_response({"ok": True})
 

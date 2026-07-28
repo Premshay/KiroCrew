@@ -49,6 +49,7 @@ from kiro_crew.eval.runner import EvalRunner, format_results, score_by_dimension
 from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.learn import Lesson, LessonStore
+from kiro_crew.mcp_core import _resolve_session_key
 from kiro_crew.security import (
     BUILTIN_DENY_PATTERNS,
     is_sensitive_path,
@@ -1216,13 +1217,9 @@ def _gateway_add_lesson(rule: str, category: str, negative: str | None = None) -
     # the write in the security event log. A plain terminal has no session, so it
     # correctly falls through to the local path.
     try:
-        from kiro_crew.mcp_core import _resolve_session_key
-
         session_key = _resolve_session_key()
     except Exception:
-        import os as _os
-
-        session_key = _os.environ.get("KIROCREW_SESSION_KEY", "")
+        session_key = os.environ.get("KIROCREW_SESSION_KEY", "")
     if not session_key:
         return False
     base = f"http://localhost:{port}"
