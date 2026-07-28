@@ -695,7 +695,7 @@ def _enrich_exact_lesson(vs: Any, rule: str, negative: str, source: str = "user_
     Returns True when the row already carries this clause or was enriched, so the
     caller can skip ``write_lesson``.
     """
-    target = f"{rule}{_LESSON_NEGATIVE_SEP}{negative}"
+    wanted = rule.strip().casefold()
     for row in vs.get_lessons():
         try:
             existing = json.loads(row["value_json"])
@@ -703,8 +703,15 @@ def _enrich_exact_lesson(vs: Any, rule: str, negative: str, source: str = "user_
             continue
         if not isinstance(existing, str):
             continue
-        if existing.split(_LESSON_NEGATIVE_SEP, 1)[0].strip() != rule.strip():
+        base = existing.split(_LESSON_NEGATIVE_SEP, 1)[0]
+        # Case-INSENSITIVE, matching write_lesson's own dedup (``rule_lower in
+        # existing_lower``). A case-sensitive test would miss a case variant, fall
+        # through to write_lesson, and have the clause dropped by that same dedup.
+        if base.strip().casefold() != wanted:
             continue
+        # Keep the stored rule's own casing: write_lesson would have kept the existing
+        # entry, so re-casing someone's lesson here would be a gratuitous edit.
+        target = f"{base.strip()}{_LESSON_NEGATIVE_SEP}{negative}"
         if existing == target:
             return True  # already carries this clause
         if vs.set_semantic(row["key"], target, row["confidence"], source) is None:
@@ -891,11 +898,16 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # "use foo" would otherwise also delete "always use foo carefully". Skip the
         # replace when any non-exact substring match exists and keep the original.
         if negative:
-            stripped = rule.strip()
+            wanted = rule.strip().casefold()
             records = store.load_all()
-            has_exact = any(le.rule.strip() == stripped for le in records)
+            # casefold throughout: LessonStore.save() and remove() are both
+            # case-insensitive, so a case-sensitive test here would miss the exact
+            # duplicate AND fail to spot a case-variant superset that remove() would
+            # happily delete.
+            has_exact = any(le.rule.strip().casefold() == wanted for le in records)
             has_other_substring_match = any(
-                le.rule.strip() != stripped and stripped in le.rule for le in records
+                le.rule.strip().casefold() != wanted and wanted in le.rule.casefold()
+                for le in records
             )
             if has_exact and not has_other_substring_match:
                 store.remove(rule)
