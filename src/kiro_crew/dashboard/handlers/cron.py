@@ -675,8 +675,8 @@ async def api_cron_history_all(request: web.Request) -> web.Response:
 _LESSON_NEGATIVE_SEP = " — NOT: "
 
 
-def _drop_exact_lesson(vs: Any, rule: str, source: str = "user_explicit") -> int:
-    """Delete stored lessons whose rule text is exactly ``rule``. Returns the count.
+def _drop_exact_lesson(vs: Any, rule: str, negative: str, source: str = "user_explicit") -> int:
+    """Delete lessons whose rule text is exactly ``rule``. Returns the count.
 
     ``write_lesson``'s substring dedup returns False when ``rule`` is contained in an
     existing lesson -- always true when re-submitting the same rule -- so adding a
@@ -684,9 +684,16 @@ def _drop_exact_lesson(vs: Any, rule: str, source: str = "user_explicit") -> int
     returned HTTP 200. Dropping the exact-text row first lets the enriched lesson
     land.
 
+    The composed replacement is PREFLIGHTED with ``validate_semantic`` before
+    anything is deleted: if the enriched text would be rejected (e.g. the injection
+    scan trips on the negative), the original stays put rather than being traded for
+    a write that never happens.
+
     Only the text before the NOT-separator is compared, and the match must be exact,
     so a longer superset lesson that merely *contains* ``rule`` is never removed.
     """
+    composed = f"{rule}{_LESSON_NEGATIVE_SEP}{negative}"
+    composed_json = json.dumps(composed)
     dropped = 0
     for row in vs.get_lessons():
         try:
@@ -695,9 +702,18 @@ def _drop_exact_lesson(vs: Any, rule: str, source: str = "user_explicit") -> int
             continue
         if not isinstance(existing, str):
             continue
-        if existing.split(_LESSON_NEGATIVE_SEP, 1)[0].strip() == rule.strip():
-            vs.delete_semantic(row["key"], source)
-            dropped += 1
+        if existing.split(_LESSON_NEGATIVE_SEP, 1)[0].strip() != rule.strip():
+            continue
+        if (
+            vs.validate_semantic(
+                row["key"], composed, row["confidence"], source, value_json=composed_json
+            )
+            is not None
+        ):
+            # Replacement would be rejected -- keep the original.
+            continue
+        vs.delete_semantic(row["key"], source)
+        dropped += 1
     return dropped
 
 
@@ -831,7 +847,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             # Without this, write_lesson's substring dedup swallows a re-submission
             # that only ADDS a negative to an existing identical rule (see
             # _drop_exact_lesson), and the caller still gets HTTP 200.
-            await asyncio.to_thread(_drop_exact_lesson, vs, rule)
+            await asyncio.to_thread(_drop_exact_lesson, vs, rule, negative)
         # Embed the rule once off the event loop and reuse it for both the
         # contradiction scan and write_lesson's own dedup pass — the store
         # methods otherwise each perform a blocking in-process embed of the same
@@ -870,11 +886,19 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         )
         store = _get_lessons(state, cleaned.get("workspace")) if scope == "workspace" else state.lessons
         # LessonStore.save() skips an exact rule duplicate, so the add-a-negative
-        # resubmission is swallowed on this path too. Gate the replace on an exact
-        # match: remove() is substring-based, so calling it unconditionally could
-        # take out a longer superset lesson.
-        if negative and any(le.rule.strip() == rule.strip() for le in store.load_all()):
-            store.remove(rule)
+        # resubmission is swallowed on this path too. remove() is SUBSTRING-based,
+        # so it is only safe when the rule text appears in exactly one record:
+        # "use foo" would otherwise also delete "always use foo carefully". Skip the
+        # replace when any non-exact substring match exists and keep the original.
+        if negative:
+            stripped = rule.strip()
+            records = store.load_all()
+            has_exact = any(le.rule.strip() == stripped for le in records)
+            has_other_substring_match = any(
+                le.rule.strip() != stripped and stripped in le.rule for le in records
+            )
+            if has_exact and not has_other_substring_match:
+                store.remove(rule)
         store.save(lesson)
     state.push_refresh("lessons")
     return web.json_response({"ok": True})
