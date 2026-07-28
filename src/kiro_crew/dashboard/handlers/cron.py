@@ -788,6 +788,11 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         return web.json_response({"error": "rule is required"}, status=400)
     category = cleaned.get("category", "knowledge")
     scope = cleaned.get("scope", "global")
+    # LEARN_ADD_SCHEMA accepts and validates ``negative``, but both write paths
+    # below previously discarded it (write_lesson got a literal None; the JSONL
+    # Lesson omitted the kwarg), so every NOT-clause sent to this route -- from
+    # the learn_add MCP tool, the dashboard, or the CLI -- was silently lost.
+    negative = cleaned.get("negative") or None
     # Write to vector store if available, else JSONL
     vs = _get_memory(state).vector_store
     if vs:
@@ -805,7 +810,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # caller saw a "timeout" for a lesson that was actually saved (and
         # re-saved on every retry). Writing first, then sweeping in the
         # background, removes the slow LLM call from the request path.
-        await asyncio.to_thread(vs.write_lesson, rule, category, None, "user_explicit", rule_emb)
+        await asyncio.to_thread(vs.write_lesson, rule, category, negative, "user_explicit", rule_emb)
         candidates = await asyncio.to_thread(
             vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb
         )
@@ -821,7 +826,12 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             state._background_tasks.add(task)
             task.add_done_callback(state._background_tasks.discard)
     else:
-        lesson = Lesson(rule=rule, category=category, ts=datetime.now(timezone.utc).isoformat())
+        lesson = Lesson(
+            rule=rule,
+            category=category,
+            negative=negative,
+            ts=datetime.now(timezone.utc).isoformat(),
+        )
         if scope == "workspace":
             ws = cleaned.get("workspace")
             _get_lessons(state, ws).save(lesson)
