@@ -108,24 +108,6 @@
         "state_working": "Working"
       }
     },
-    "codeReviewSage": {
-      "codeReviewSagePage": {
-        "active_loaded_during_reviews_uncheck_to_disable": "Active — loaded during reviews (uncheck to disable)",
-        "delete_namespace_and_all_its_learnings": "Delete namespace {{name}} and all its learnings",
-        "delete_namespace_confirm": "Delete namespace \"{{name}}\" and all its learnings?",
-        "force_review_all_count": "Force review all ({{count}})",
-        "inactive_check_to_load_during_reviews": "Inactive — check to load during reviews",
-        "load_namespace_during_reviews": "Load namespace {{name}} during reviews",
-        "review": "Review",
-        "review_new": "Review {{count}} new",
-        "running": "Running…",
-        "phase_deep": "deep review…",
-        "phase_done": "reviewed",
-        "phase_failed": "failed",
-        "phase_gating": "design gate…",
-        "phase_queued": "queued"
-      }
-    },
     "fileExplorer": {
       "fileViewer": {
         "copy_path_2": "Copy path: {{path}}"
@@ -2806,7 +2788,6 @@
         "copied": "Copied",
         "update_check_managed_by_app": "This build updates through the app, not the gateway.",
         "update_check_managed_by_image": "This container updates by pulling a newer image.",
-        "update_to_version": "Update to v{{version}}",
         "not_checked_yet": "Not checked yet",
         "notify_when_an_update_is_available": "Notify when an update is available",
         "auto_update_notify_only_on_this_install": "This install cannot apply updates itself, so it only notifies."
