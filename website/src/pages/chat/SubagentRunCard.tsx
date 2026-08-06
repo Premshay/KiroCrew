@@ -13,7 +13,7 @@
  * exactly the window in which the UI would otherwise look empty. Clicking opens
  * the Subagents side panel.
  */
-import { memo } from 'react'
+import { memo, useMemo } from 'react'
 import { Bot, Loader2, CheckCircle2, AlertCircle, Clock, Square } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { useAppSelector, useAppDispatch } from '../../store'
@@ -160,6 +160,35 @@ const SubagentRunCard = memo(function SubagentRunCard({
 
   const mine = launch.ids.map(id => subagents[id])
   const counts = tally(mine)
+  // Max depth across this launch's whole SUBTREE, not just `launch.ids`.
+  // Grandchildren are spawned by a subagent rather than by this launch, so they
+  // never appear in `launch.ids` — walking `parentKey` back to one of our own
+  // ids is what lets the badge show for a genuinely nested run. Without it the
+  // badge stays at 1 and hides in exactly the case it exists to convey.
+  const myMaxDepth = useMemo(() => {
+    const mineIds = new Set(launch.ids)
+    const parentOf: Record<string, string | undefined> = {}
+    for (const a of Object.values(subagents)) if (a) parentOf[a.id] = a.parentKey
+    // Walk up the subagent chain; bounded so a malformed cycle cannot spin.
+    const rootsHere = (start?: string): boolean => {
+      let p = start
+      for (let guard = 0; p && guard < 32; guard++) {
+        if (!p.startsWith('subagent:')) return false
+        const pid = p.slice('subagent:'.length)
+        if (mineIds.has(pid)) return true
+        p = parentOf[pid]
+      }
+      return false
+    }
+    let md = 1
+    for (const a of Object.values(subagents)) {
+      if (!a?.depth) continue
+      if (mineIds.has(a.id) || rootsHere(a.parentKey)) {
+        if (a.depth > md) md = a.depth
+      }
+    }
+    return md
+  }, [subagents, launch.ids])
   // `unknown` = ids the live slice no longer holds (history reload, or dismissed
   // from the panel). Treat them as neither running nor terminal.
   //
@@ -236,6 +265,11 @@ const SubagentRunCard = memo(function SubagentRunCard({
           <div className="flex items-center gap-1.5 flex-wrap">
             <Bot size={12} className="text-accent/70 shrink-0" aria-hidden />
             <span className="truncate text-[13px] font-medium text-text-strong">{label}</span>
+            {myMaxDepth > 1 && (
+              <span className="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-accent/10 border border-accent/20 text-accent/70">
+                {myMaxDepth} {i18nT('pages.chat.subagentRunCard.depth_levels')}
+              </span>
+            )}
             {queued > 0 && settled === 0 && (
               <span
                 className="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-muted/15 border border-border text-muted"

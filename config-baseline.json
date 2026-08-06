@@ -59,6 +59,9 @@
         ],
         "max_channels": 1,
         "max_channel_agents": 3,
+        "subagent_tree_attribution": false,
+        "subagent_max_depth": 3,
+        "subagent_max_per_session": 0,
         "log_level": "WARNING",
         "soft_stop_budget_secs": 10.0
       }
@@ -671,6 +674,48 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null
+    },
+    {
+      "path": "agent.subagent_tree_attribution",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "SubAgent Tree Attribution",
+      "help": "Opt-in: build the nested-subagent orchestration tree by attributing each spawned child to the subagent whose own event stream produced the spawn_run result. Enforces subagent_max_depth at attribution time.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "agent.subagent_max_depth",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "SubAgent Max Depth",
+      "help": "Maximum nested spawn depth. Depth 1 = top-level subagent. Children at or beyond this depth lose spawn permission; children strictly over it are cancelled. Only enforced when subagent_tree_attribution is enabled.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 3
+    },
+    {
+      "path": "agent.subagent_max_per_session",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "SubAgent Max Per Session",
+      "help": "Hard cap on the number of live subagents under a single root session (the originating dashboard/slack/cron session), counting every nesting depth. 0 = no per-session limit (only the global max_subagents cap and subagent_max_depth apply). A positive N lets one session use at most N concurrent agents, so a single session cannot monopolize the global budget.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0
     },
     {
       "path": "agent.max_channels",

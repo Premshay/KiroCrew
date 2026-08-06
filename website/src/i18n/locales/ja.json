@@ -6325,6 +6325,7 @@
         "stopping_in_progress": "停止処理中"
       },
       "subagentProgressBar": {
+        "levels": "階層",
         "backend_hiccup_retrying": "バックエンドの一時的な問題 — 再試行中…",
         "collapse_agent_list": "サブエージェント一覧を折りたたむ",
         "expand_agent_list": "サブエージェント一覧を展開",
@@ -6343,6 +6344,7 @@
         "waiting_to_start_queued_behind_the_concurrency_l": "開始待ち — 同時実行数の上限により待機中"
       },
       "subagentRunCard": {
+        "depth_levels": "階層",
         "open_in_the_subagents_panel": "サブエージェントパネルで開く",
         "open_subagents_panel": "サブエージェントパネルを開く",
         "waiting": "待機中",
