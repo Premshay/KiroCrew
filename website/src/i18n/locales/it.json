@@ -6509,6 +6509,20 @@
         "stopping": "Arresto in corso…",
         "stopping_in_progress": "Arresto in corso"
       },
+      "subagentCompletionCard": {
+        "agent_id": "Agente {{id}}",
+        "completed": "Completato",
+        "digest_chunk_n_of_n": "Parte {{chunk}} di {{chunks}}",
+        "failed": "Non riuscito",
+        "hide_details": "Nascondi i dettagli",
+        "interrupted": "Interrotto",
+        "n_of_n_results_delivered": "{{done}} di {{total}} risultati consegnati",
+        "n_of_n_subagents_finished": "{{done}} di {{total}} subagenti completati",
+        "open_in_the_subagents_panel": "Apri nel pannello dei subagenti",
+        "panel": "Pannello",
+        "show_details": "Mostra i dettagli",
+        "stopped": "Interrotto"
+      },
       "subagentProgressBar": {
         "collapse_agent_list": "Comprimi l’elenco dei subagenti",
         "expand_agent_list": "Espandi l’elenco dei subagenti",
@@ -8442,7 +8456,6 @@
         "copied": "Copiato",
         "update_check_managed_by_app": "Questa build si aggiorna tramite l'app, non tramite il gateway.",
         "update_check_managed_by_image": "Questo container si aggiorna scaricando un'immagine più recente.",
-        "update_to_version": "Aggiorna alla v{{version}}",
         "not_checked_yet": "Non ancora controllato",
         "notify_when_an_update_is_available": "Avvisami quando è disponibile un aggiornamento",
         "auto_update_notify_only_on_this_install": "Questa installazione non può applicare gli aggiornamenti da sola, quindi si limita ad avvisare."

@@ -6509,6 +6509,20 @@
         "stopping": "Deteniendo…",
         "stopping_in_progress": "Detención en curso"
       },
+      "subagentCompletionCard": {
+        "agent_id": "Agente {{id}}",
+        "completed": "Completado",
+        "digest_chunk_n_of_n": "Parte {{chunk}} de {{chunks}}",
+        "failed": "Fallido",
+        "hide_details": "Ocultar los detalles",
+        "interrupted": "Interrumpido",
+        "n_of_n_results_delivered": "{{done}} de {{total}} resultados entregados",
+        "n_of_n_subagents_finished": "{{done}} de {{total}} subagentes finalizados",
+        "open_in_the_subagents_panel": "Abrir en el panel de Subagentes",
+        "panel": "Panel",
+        "show_details": "Mostrar los detalles",
+        "stopped": "Detenido"
+      },
       "subagentProgressBar": {
         "collapse_agent_list": "Contraer la lista de subagentes",
         "expand_agent_list": "Expandir la lista de subagentes",
@@ -8407,7 +8421,7 @@
         "update_error_server": "El servidor de actualizaciones devolvió un error.",
         "update_error_server_status": "El servidor de actualizaciones devolvió un error (HTTP {{status}}).",
         "update_error_unknown": "Algo ha ido mal. Vuelve a buscar actualizaciones.",
-        "update_to_version": "Actualizar a v{{version}}",
+        "update_to_version": "Actualizar a la v{{version}}",
         "updates": "Actualizaciones",
         "updating": "Actualizando…",
         "updating_gateway_restarting": "Actualizando — reiniciando el gateway…",
@@ -8442,7 +8456,6 @@
         "copied": "Copiado",
         "update_check_managed_by_app": "Esta versión se actualiza a través de la aplicación, no de la puerta de enlace.",
         "update_check_managed_by_image": "Este contenedor se actualiza descargando una imagen más reciente.",
-        "update_to_version": "Actualizar a la v{{version}}",
         "not_checked_yet": "Sin comprobar todavía",
         "notify_when_an_update_is_available": "Avisar cuando haya una actualización disponible",
         "auto_update_notify_only_on_this_install": "Esta instalación no puede aplicar actualizaciones por sí misma, solo avisa."

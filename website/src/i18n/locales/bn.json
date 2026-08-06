@@ -6435,6 +6435,20 @@
         "stopping": "থামানো হচ্ছে…",
         "stopping_in_progress": "থামানোর কাজ চলছে"
       },
+      "subagentCompletionCard": {
+        "agent_id": "এজেন্ট {{id}}",
+        "completed": "সম্পন্ন",
+        "digest_chunk_n_of_n": "{{chunks}}টির মধ্যে {{chunk}} নং অংশ",
+        "failed": "ব্যর্থ",
+        "hide_details": "বিবরণ লুকাও",
+        "interrupted": "বিঘ্নিত",
+        "n_of_n_results_delivered": "{{total}}টির মধ্যে {{done}}টি ফলাফল সরবরাহ করা হয়েছে",
+        "n_of_n_subagents_finished": "{{total}}টির মধ্যে {{done}}টি সাবএজেন্ট সম্পন্ন",
+        "open_in_the_subagents_panel": "সাবএজেন্ট প্যানেলে খুলুন",
+        "panel": "প্যানেল",
+        "show_details": "বিবরণ দেখাও",
+        "stopped": "থামানো হয়েছে"
+      },
       "subagentProgressBar": {
         "collapse_agent_list": "সাবএজেন্ট তালিকা সংকুচিত করো",
         "expand_agent_list": "সাবএজেন্ট তালিকা প্রসারিত করো",
@@ -8320,7 +8334,7 @@
         "update_error_server": "আপডেট সার্ভার একটি ত্রুটি ফেরত দিয়েছে।",
         "update_error_server_status": "আপডেট সার্ভার একটি ত্রুটি ফেরত দিয়েছে (HTTP {{status}})।",
         "update_error_unknown": "কিছু একটা ভুল হয়েছে। আবার আপডেট খুঁজে দেখুন।",
-        "update_to_version": "v{{version}}-এ আপডেট করো",
+        "update_to_version": "v{{version}}-এ আপডেট করুন",
         "updates": "আপডেট",
         "updating": "আপডেট হচ্ছে…",
         "updating_gateway_restarting": "আপডেট হচ্ছে — গেটওয়ে রিস্টার্ট হচ্ছে…",
@@ -8355,7 +8369,6 @@
         "copied": "কপি করা হয়েছে",
         "update_check_managed_by_app": "এই বিল্ডটি অ্যাপের মাধ্যমে আপডেট হয়, গেটওয়ের মাধ্যমে নয়।",
         "update_check_managed_by_image": "এই কনটেইনারটি নতুন ইমেজ টেনে আপডেট হয়।",
-        "update_to_version": "v{{version}}-এ আপডেট করুন",
         "not_checked_yet": "এখনও পরীক্ষা করা হয়নি",
         "notify_when_an_update_is_available": "আপডেট পাওয়া গেলে জানাও",
         "auto_update_notify_only_on_this_install": "এই ইনস্টলটি নিজে আপডেট প্রয়োগ করতে পারে না, তাই শুধু জানায়।"

@@ -6435,6 +6435,20 @@
         "stopping": "रोका जा रहा है…",
         "stopping_in_progress": "रोकने की प्रक्रिया चल रही है"
       },
+      "subagentCompletionCard": {
+        "agent_id": "एजेंट {{id}}",
+        "completed": "पूर्ण",
+        "digest_chunk_n_of_n": "{{chunks}} में से भाग {{chunk}}",
+        "failed": "विफल",
+        "hide_details": "विवरण छिपाएँ",
+        "interrupted": "बाधित",
+        "n_of_n_results_delivered": "{{total}} में से {{done}} परिणाम पहुँचाए गए",
+        "n_of_n_subagents_finished": "{{total}} में से {{done}} सबएजेंट पूर्ण",
+        "open_in_the_subagents_panel": "सबएजेंट पैनल में खोलें",
+        "panel": "पैनल",
+        "show_details": "विवरण दिखाएँ",
+        "stopped": "रोका गया"
+      },
       "subagentProgressBar": {
         "collapse_agent_list": "सब-एजेंट सूची समेटें",
         "expand_agent_list": "सब-एजेंट सूची विस्तृत करें",
@@ -8320,7 +8334,7 @@
         "update_error_server": "अपडेट सर्वर ने त्रुटि लौटाई।",
         "update_error_server_status": "अपडेट सर्वर ने त्रुटि लौटाई (HTTP {{status}})।",
         "update_error_unknown": "कुछ गड़बड़ हो गई। अपडेट दोबारा जाँचकर देखें।",
-        "update_to_version": "v{{version}} पर अपडेट करो",
+        "update_to_version": "v{{version}} पर अपडेट करें",
         "updates": "अपडेट",
         "updating": "अपडेट हो रहा है…",
         "updating_gateway_restarting": "अपडेट हो रहा है — गेटवे पुनः आरंभ हो रहा है…",
@@ -8355,7 +8369,6 @@
         "copied": "कॉपी किया गया",
         "update_check_managed_by_app": "यह बिल्ड ऐप के ज़रिए अपडेट होता है, गेटवे के ज़रिए नहीं।",
         "update_check_managed_by_image": "यह कंटेनर नई इमेज खींचकर अपडेट होता है।",
-        "update_to_version": "v{{version}} पर अपडेट करें",
         "not_checked_yet": "अभी जाँचा नहीं गया",
         "notify_when_an_update_is_available": "अपडेट उपलब्ध होने पर सूचित करें",
         "auto_update_notify_only_on_this_install": "यह इंस्टॉल स्वयं अपडेट लागू नहीं कर सकता, इसलिए यह केवल सूचित करता है।"

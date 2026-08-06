@@ -6509,6 +6509,20 @@
         "stopping": "Parando…",
         "stopping_in_progress": "Parada em andamento"
       },
+      "subagentCompletionCard": {
+        "agent_id": "Agente {{id}}",
+        "completed": "Concluído",
+        "digest_chunk_n_of_n": "Parte {{chunk}} de {{chunks}}",
+        "failed": "Falhou",
+        "hide_details": "Ocultar detalhes",
+        "interrupted": "Interrompido",
+        "n_of_n_results_delivered": "{{done}} de {{total}} resultados entregues",
+        "n_of_n_subagents_finished": "{{done}} de {{total}} subagentes concluídos",
+        "open_in_the_subagents_panel": "Abrir no painel de subagentes",
+        "panel": "Painel",
+        "show_details": "Mostrar detalhes",
+        "stopped": "Interrompido"
+      },
       "subagentProgressBar": {
         "collapse_agent_list": "Recolher a lista de subagentes",
         "expand_agent_list": "Expandir a lista de subagentes",
@@ -8442,7 +8456,6 @@
         "copied": "Copiado",
         "update_check_managed_by_app": "Esta versão é atualizada pelo próprio aplicativo, não pelo gateway.",
         "update_check_managed_by_image": "Este contêiner é atualizado baixando uma imagem mais recente.",
-        "update_to_version": "Atualizar para a v{{version}}",
         "not_checked_yet": "Ainda não verificado",
         "notify_when_an_update_is_available": "Avisar quando houver uma atualização disponível",
         "auto_update_notify_only_on_this_install": "Esta instalação não pode aplicar atualizações sozinha, apenas avisa."

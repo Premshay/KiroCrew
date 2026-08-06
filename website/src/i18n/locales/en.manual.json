@@ -2065,6 +2065,20 @@
         "switch_to_split_view": "Switch to split view",
         "switch_to_unified_view": "Switch to unified view"
       },
+      "subagentCompletionCard": {
+        "agent_id": "Agent {{id}}",
+        "completed": "Completed",
+        "digest_chunk_n_of_n": "Part {{chunk}} of {{chunks}}",
+        "failed": "Failed",
+        "hide_details": "Hide details",
+        "interrupted": "Interrupted",
+        "n_of_n_results_delivered": "{{done}} of {{total}} results delivered",
+        "n_of_n_subagents_finished": "{{done}} of {{total}} subagents finished",
+        "open_in_the_subagents_panel": "Open in the Subagents panel",
+        "panel": "Panel",
+        "show_details": "Show details",
+        "stopped": "Stopped"
+      },
       "subagentProgressBar": {
         "collapse_agent_list": "Collapse subagent list",
         "expand_agent_list": "Expand subagent list",
@@ -2810,7 +2824,6 @@
         "copied": "Copied",
         "update_check_managed_by_app": "This build updates through the app, not the gateway.",
         "update_check_managed_by_image": "This container updates by pulling a newer image.",
-        "update_to_version": "Update to v{{version}}",
         "not_checked_yet": "Not checked yet",
         "notify_when_an_update_is_available": "Notify when an update is available",
         "auto_update_notify_only_on_this_install": "This install cannot apply updates itself, so it only notifies."

@@ -6435,6 +6435,20 @@
         "stopping": "Wird gestoppt…",
         "stopping_in_progress": "Stoppen läuft"
       },
+      "subagentCompletionCard": {
+        "agent_id": "Agent {{id}}",
+        "completed": "Abgeschlossen",
+        "digest_chunk_n_of_n": "Teil {{chunk}} von {{chunks}}",
+        "failed": "Fehlgeschlagen",
+        "hide_details": "Details ausblenden",
+        "interrupted": "Unterbrochen",
+        "n_of_n_results_delivered": "{{done}} von {{total}} Ergebnissen geliefert",
+        "n_of_n_subagents_finished": "{{done}} von {{total}} Subagenten abgeschlossen",
+        "open_in_the_subagents_panel": "Im Subagenten-Panel öffnen",
+        "panel": "Panel",
+        "show_details": "Details anzeigen",
+        "stopped": "Gestoppt"
+      },
       "subagentProgressBar": {
         "collapse_agent_list": "Subagentenliste einklappen",
         "expand_agent_list": "Subagentenliste aufklappen",
@@ -8355,7 +8369,6 @@
         "copied": "Kopiert",
         "update_check_managed_by_app": "Dieser Build wird über die App aktualisiert, nicht über das Gateway.",
         "update_check_managed_by_image": "Dieser Container wird durch ein neueres Image aktualisiert.",
-        "update_to_version": "Auf v{{version}} aktualisieren",
         "not_checked_yet": "Noch nicht geprüft",
         "notify_when_an_update_is_available": "Benachrichtigen, wenn eine Aktualisierung verfügbar ist",
         "auto_update_notify_only_on_this_install": "Diese Installation kann Aktualisierungen nicht selbst anwenden und benachrichtigt nur."
