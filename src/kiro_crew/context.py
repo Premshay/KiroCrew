@@ -1488,6 +1488,8 @@ class ContextBuilder:
         runtime_source: str | None = None,
         exclude_last_n: int = 0,
         model_window: int | None = None,
+        subagent_context: bool = False,
+        task_text: str = "",
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -1669,7 +1671,8 @@ class ContextBuilder:
         # Inject for CC too: a fresh dashboard/Slack session maps to a new CC
         # subprocess with no in-process history, so the thread transcript must
         # be supplied for parity with kiro (which gets it natively).
-        if session_key and self.conversation_log and not resumed:
+        # Subagent lean context: skip thread history (task text IS the context).
+        if session_key and self.conversation_log and not resumed and not subagent_context:
             _history_header = (
                 "[THREAD CONVERSATION HISTORY — this is the PRIMARY context.\n"
                 "When the user says 'just now', 'earlier', 'the task', 'try again', "
@@ -1736,7 +1739,7 @@ class ContextBuilder:
 
         # Stop event context — inject notes for recent stop events so the
         # LLM knows prior turns were cancelled by the user.
-        if session_key and self.conversation_log:
+        if session_key and self.conversation_log and not subagent_context:
             _stop_notes = _build_stop_event_notes(self.conversation_log, session_key)
             if _stop_notes:
                 parts.append(_stop_notes)
@@ -1748,13 +1751,23 @@ class ContextBuilder:
         mem_key = memory_store or workspace
         memory = self.get_memory_for(mem_key)
         if not blocks_reads:
-            memory_ctx = memory.get_context(
-                prefs_cap=caps.prefs,
-                projects_cap=caps.projects,
-                history_cap=caps.memory_history,
-                semantic_cap=caps.semantic,
-                episodic_cap=caps.episodic,
-            )
+            if subagent_context:
+                # Lean context: only prefs + projects, drop history/semantic/episodic
+                memory_ctx = memory.get_context(
+                    prefs_cap=caps.prefs,
+                    projects_cap=caps.projects,
+                    history_cap=0,
+                    semantic_cap=0,
+                    episodic_cap=0,
+                )
+            else:
+                memory_ctx = memory.get_context(
+                    prefs_cap=caps.prefs,
+                    projects_cap=caps.projects,
+                    history_cap=caps.memory_history,
+                    semantic_cap=caps.semantic,
+                    episodic_cap=caps.episodic,
+                )
             if memory_ctx:
                 parts.append(memory_ctx)
 
@@ -1794,13 +1807,19 @@ class ContextBuilder:
         # (skipped for temporary sessions)
         lessons_ctx = ""
         if not blocks_reads:
-            # One query, not two: get_lessons_context() already returns "" when the
-            # store holds no lessons, so a separate get_lessons() existence probe
-            # would be a duplicate SELECT * over the same rows (embedding blobs
-            # included) whose only use is an emptiness check.
-            lessons_ctx = memory.vector_store.get_lessons_context() if memory.vector_store else ""
-            if not lessons_ctx:
-                lessons_ctx = self.lessons.get_context()
+            if subagent_context and task_text and memory.vector_store:
+                # Lean context: top-K lessons by cosine similarity to the task
+                lessons_ctx = memory.vector_store.get_relevant_lessons(task_text, k=10)
+            else:
+                # One query, not two: get_lessons_context() already returns "" when the
+                # store holds no lessons, so a separate get_lessons() existence probe
+                # would be a duplicate SELECT * over the same rows (embedding blobs
+                # included) whose only use is an emptiness check.
+                lessons_ctx = (
+                    memory.vector_store.get_lessons_context() if memory.vector_store else ""
+                )
+                if not lessons_ctx:
+                    lessons_ctx = self.lessons.get_context()
             # Merge workspace-scoped lessons if workspace differs from default
             if workspace and workspace != "default":
                 ws_lessons = self.get_lessons_for(workspace)
@@ -1842,7 +1861,7 @@ class ContextBuilder:
                 parts.append(lessons_ctx)
 
         # Provenance-tagged entries from recent sessions (skipped for temporary)
-        if session_key and self.conversation_log and not blocks_reads:
+        if session_key and self.conversation_log and not blocks_reads and not subagent_context:
             provenance = self.conversation_log.recent_with_provenance(
                 session_key, exclude_last_n=exclude_last_n
             )
@@ -1904,6 +1923,8 @@ class ContextBuilder:
         model_window: int | None = None,
         user_text_range: tuple[int, int] | None = None,
         user_span_out: list[int] | None = None,
+        subagent_context: bool = False,
+        task_text: str = "",
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -1987,6 +2008,8 @@ class ContextBuilder:
                 runtime_source=runtime_source,
                 exclude_last_n=exclude_last_n,
                 model_window=model_window,
+                subagent_context=subagent_context,
+                task_text=task_text,
             )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in

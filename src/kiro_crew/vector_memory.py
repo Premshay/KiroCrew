@@ -2020,6 +2020,56 @@ class VectorMemoryStore:
         lines.append("[End of learned corrections]\n")
         return "\n".join(lines)
 
+    def get_relevant_lessons(self, query: str, k: int = 10) -> str:
+        """Return top-K lessons by cosine similarity to *query*.
+
+        Falls back to recency-based (first *k*) if embeddings are unavailable
+        or the query cannot be embedded. Used for subagent lean context where
+        injecting all 50 lessons wastes budget.
+        """
+        lessons = self.get_lessons(limit=50)
+        if not lessons:
+            return ""
+
+        query_emb = self._try_embed(query) if self.embed_fn else None
+        if not query_emb:
+            # Fallback: recency-based top-k
+            selected = lessons[:k]
+        else:
+            scored: list[tuple[float, dict]] = []
+            for entry in lessons:
+                emb_blob = entry.get("embedding")
+                if (
+                    not emb_blob
+                    or not isinstance(emb_blob, bytes)
+                    or len(emb_blob) < 4
+                ):
+                    # No embedding stored — include with low priority
+                    scored.append((0.0, entry))
+                    continue
+                try:
+                    existing_emb = list(
+                        struct.unpack(f"{len(emb_blob) // 4}f", emb_blob)
+                    )
+                except struct.error:
+                    scored.append((0.0, entry))
+                    continue
+                sim = self._cosine_sim(query_emb, existing_emb)
+                scored.append((sim, entry))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            selected = [entry for _, entry in scored[:k]]
+
+        if not selected:
+            return ""
+        lines = [
+            "[Learned corrections — user-taught rules from past mistakes.\n"
+            "ALWAYS follow these. They override default behavior.]"
+        ]
+        for e in selected:
+            lines.append(f"- {json.loads(e['value_json'])}")
+        lines.append("[End of learned corrections]\n")
+        return "\n".join(lines)
+
     # ── Migration & Import ──
 
     @staticmethod
