@@ -2538,8 +2538,7 @@ class SkillsLoader:
             if len(desc) > _SHORT_DESC_CHARS:
                 desc = desc[:_SHORT_DESC_CHARS].rstrip() + "…"
             lines.append(
-                f"- **{meta.get('name', name)}**: {desc} → `{skill_file}` "
-                f"(dir: `{skill_file.parent}`)"
+                f"- **{meta.get('name', name)}**: {desc} → `{skill_file}`"
             )
         if not lines:
             return ""
@@ -2647,7 +2646,7 @@ class SkillsLoader:
             for s in ranked:
                 line = (
                     f"- **{s['name']}**: {self._short_desc(s['description'])} "
-                    f"-> `{s['path']}` (dir: `{s['dir']}`)"
+                    f"-> `{s['path']}`"
                 )
                 if (
                     budget is not None
@@ -2701,12 +2700,12 @@ class SkillsLoader:
                 "",
                 "If a user request relates to any skill below, read the full "
                 "skill file first with `cat <path>` before responding.",
-                "To run a skill's scripts, `cd` into its directory first.",
+                "To run a skill's scripts, `cd` into the directory containing its `SKILL.md`.",
                 "",
             ]
             for s in on_demand:
                 summary_lines.append(
-                    f"- **{s['name']}**: {s['description']} → `{s['path']}` (dir: `{s['dir']}`)"
+                    f"- **{s['name']}**: {self._short_desc(s['description'])} → `{s['path']}`"
                 )
             parts.append("\n".join(summary_lines))
         return "[Skills:]\n" + "\n\n---\n\n".join(parts) + "\n[End of skills]\n\n"

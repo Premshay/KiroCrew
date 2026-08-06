@@ -212,7 +212,8 @@ class TestRepoScope:
     ) -> None:
         skills = tmp_path / "skills"
         self._write_skill(skills, "repo-only", "src/kiro_crew")
-        loader = SkillsLoader(skills_path=skills, install_builtins=False)
+        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
+        loader = SkillsLoader(skills_path=skills, install_builtins=False, config=cfg)
         repo = tmp_path / "checkout"
         (repo / "src" / "kiro_crew").mkdir(parents=True)
         subdir = repo / "website"
@@ -225,7 +226,8 @@ class TestRepoScope:
     ) -> None:
         skills = tmp_path / "skills"
         self._write_skill(skills, "anywhere", None)
-        loader = SkillsLoader(skills_path=skills, install_builtins=False)
+        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
+        loader = SkillsLoader(skills_path=skills, install_builtins=False, config=cfg)
         outside = tmp_path / "elsewhere"
         outside.mkdir()
         monkeypatch.chdir(outside)
@@ -332,7 +334,8 @@ class TestTriggeredSkills:
             "tiny-url",
             f"---\nname: tiny-url\ndescription: Shorten URLs\ntriggers: {triggers}\n---\n# Tiny URL\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
+        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
         if monkeypatch is not None:
             from unittest.mock import MagicMock
 
@@ -518,11 +521,9 @@ class TestTriggerMatching:
             "weather",
             "---\nname: weather\ndescription: Get weather info\ntriggers: weather forecast\n---\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
+        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
 
-        mock_config = MagicMock()
-        mock_config.skills.max_triggered = 3
-        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", lambda: mock_config)
         monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
 
         result = loader.get_triggered_skills("what's the weather forecast today")
@@ -538,11 +539,9 @@ class TestTriggerMatching:
             "code-search",
             "---\nname: code-search\ndescription: Search code\ntriggers: search code, !search examples\n---\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
+        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
 
-        mock_config = MagicMock()
-        mock_config.skills.max_triggered = 3
-        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", lambda: mock_config)
         monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
 
         # Positive match without negative words
@@ -586,11 +585,9 @@ class TestTriggerMatching:
             "better",
             "---\nname: better\ndescription: Better\ntriggers: alpha beta gamma\n---\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=5))
+        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
 
-        mock_config = MagicMock()
-        mock_config.skills.max_triggered = 5
-        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", lambda: mock_config)
         monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
 
         result = loader.get_triggered_skills("alpha beta gamma")
@@ -606,11 +603,9 @@ class TestTriggerMatching:
             skills_dir, "always", "---\nname: always\nalways: true\ntriggers: test\n---\n"
         )
         _create_skill(skills_dir, "normal", "---\nname: normal\ntriggers: test\n---\n")
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=5))
+        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
 
-        mock_config = MagicMock()
-        mock_config.skills.max_triggered = 5
-        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", lambda: mock_config)
         monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
 
         result = loader.get_triggered_skills("test")
@@ -627,11 +622,9 @@ class TestTriggerMatching:
             "tiny-url",
             "---\nname: tiny-url\ndescription: Shorten URLs\ntriggers: shorten url, create tiny link, make short url\n---\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
+        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
 
-        mock_config = MagicMock()
-        mock_config.skills.max_triggered = 3
-        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", lambda: mock_config)
         monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
 
         assert "tiny-url" in loader.get_triggered_skills("please shorten this url")
@@ -1180,7 +1173,11 @@ class TestTriggerPerformance:
             "pipeline",
             "---\nname: pipeline\ndescription: d\ntriggers: pipeline health\n---\n# x\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = SkillsLoader(
+            skills_path=skills_dir,
+            install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
 
         fake_sel = MagicMock()
         monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
@@ -1567,7 +1564,7 @@ class TestLazyLoadContext:
 
     def test_budget_none_is_legacy_full_dump(self, tmp_path):
         # Opt-in OFF (budget=None): legacy block — old header, every skill shown,
-        # no top-K / tail-pointer, no skill_search. Byte-for-byte pre-feature.
+        # no top-K / tail-pointer, no skill_search.
         loader = self._make(tmp_path, n_on_demand=3)
         ctx = loader.get_context(budget=None)
         assert "If a user request relates to any skill below" in ctx
@@ -1576,6 +1573,25 @@ class TestLazyLoadContext:
         assert "skill_search" not in ctx
         for i in range(3):
             assert f"**od{i}**" in ctx
+
+    def test_skills_config_max_triggered_default_is_zero(self):
+        assert SkillsConfig().max_triggered == 0
+
+    def test_budget_none_truncates_long_description(self, tmp_path):
+        # On the budget=None (legacy) path, descriptions >160 chars are truncated.
+        skills_dir = tmp_path / "skills"
+        long_desc = "x" * 200
+        _create_skill(
+            skills_dir,
+            "longdesc",
+            f"---\nname: longdesc\ndescription: {long_desc}\n---\n# LD\nBody.",
+        )
+        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        ctx = loader.get_context(budget=None)
+        # Full 200-char description should NOT appear verbatim.
+        assert long_desc not in ctx
+        # Truncated with ellipsis.
+        assert "..." in ctx or "…" in ctx
 
 
 class TestSearchSkills:
