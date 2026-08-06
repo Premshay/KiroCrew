@@ -2372,6 +2372,7 @@ async def _worktree_remove(
     name: str,
     force: bool = False,
     progress: Callable[[str], None] | None = None,
+    _caller: str = "handler",
 ) -> dict:
     """Remove a feature worktree. All safety gates preserved.
 
@@ -2421,6 +2422,34 @@ async def _worktree_remove(
             return {
                 "ok": False,
                 "error": f"PR not merged (state: {(pr or {}).get('state', 'no PR')})",
+                "pr": _redact_pr(pr),
+            }
+
+    # Teardown guard: even with force=True, refuse to destroy a dirty worktree
+    # whose PR is not merged — that combination means unrecoverable data loss
+    # (uncommitted edits on an unmerged branch). Force retains its meaning for
+    # merged-dirty and diverged-OID overrides where the work IS already shipped.
+    if force and not _is_pr_merged(pr):
+        dirty = await _real_dirty(path)
+        if dirty is True:
+            logger.info(
+                "worktree_removal_audit: worktree=%s branch=%s caller=%s force=%s "
+                "dirty=True own=%s pr_state=%s verdict_oid=n/a "
+                "action=refused_dirty_unmerged",
+                name,
+                branch,
+                _caller,
+                force,
+                own,
+                (pr or {}).get("state", "none"),
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "refusing forced removal: worktree has uncommitted changes "
+                    "and PR is not merged — this would cause unrecoverable data "
+                    f"loss (PR state: {(pr or {}).get('state', 'no PR')})"
+                ),
                 "pr": _redact_pr(pr),
             }
 
@@ -2529,9 +2558,22 @@ async def _worktree_remove(
         if rc != 0:
             return {"ok": False, "error": _redact((stderr or stdout).strip()[:300])}
 
-        # delete branch if shipped/empty — atomically against the pinned OID
+        # delete branch if shipped/empty — atomically against the pinned OID.
+        # Fail-closed ancestry gate: even when the cached PR status says MERGED,
+        # verify the branch OID is actually contained in the base branch. A stale
+        # or wrong merged verdict cannot delete the only local pointer to unmerged
+        # commits — leaving a dangling ref is recoverable; deleting one is not.
         if branch and branch != BASE_BRANCH and verdict_oid:
+            should_delete = False
             if _is_pr_merged(pr) or own == 0:
+                remote = await _upstream_remote()
+                rc_anc, _, _ = await _run_cmd(
+                    ["git", "-C", MAIN_REPO, "merge-base", "--is-ancestor",
+                     verdict_oid.strip(), f"{remote}/{BASE_BRANCH}"],
+                    timeout=10,
+                )
+                should_delete = rc_anc == 0
+            if should_delete:
                 await _git(
                     MAIN_REPO, "update-ref", "-d",
                     f"refs/heads/{branch}", verdict_oid.strip(), timeout=10,
@@ -2540,6 +2582,18 @@ async def _worktree_remove(
     # Every removal path lands here — the single-worktree handler, each parallel
     # prune worker, and the auto-prune reaper — so this is the one place the
     # cached snapshot has to be told the row is gone.
+    logger.info(
+        "worktree_removal_audit: worktree=%s branch=%s caller=%s force=%s "
+        "dirty=%s own=%s pr_state=%s verdict_oid=%s action=removed",
+        name,
+        branch,
+        _caller,
+        force,
+        "unknown",
+        own,
+        (pr or {}).get("state", "none"),
+        (verdict_oid or "").strip()[:12] if verdict_oid else "none",
+    )
     _fleet_forget(name)
     return {"ok": True, "removed": True, "stopped_pod": stopped_pod, "pr": _redact_pr(pr)}
 
@@ -2899,7 +2953,9 @@ async def _prune_run(names: list[str]) -> dict:
                             # phase in {"stopping_pod", "removing"}
                             items[_nm]["status"] = phase
 
-                        res = await _worktree_remove(nm, force=False, progress=_progress)
+                        res = await _worktree_remove(
+                            nm, force=False, progress=_progress, _caller="prune"
+                        )
                         result = {"name": nm, **res}
                         if res.get("ok"):
                             status, error = "done", None
@@ -3030,7 +3086,7 @@ async def _auto_prune_once() -> dict:
         if not name or row.get("code") != "merged":
             continue
         try:
-            res = await _worktree_remove(name, force=False)
+            res = await _worktree_remove(name, force=False, _caller="reaper")
         except Exception as exc:  # noqa: BLE001
             res = {"ok": False, "error": _redact(str(exc))}
         if res.get("ok"):

@@ -4526,7 +4526,7 @@ async def test_auto_prune_once_removes_merged_only_and_records_failures():
     ]}
     seen = []
 
-    async def _fake_remove(name, force=False):
+    async def _fake_remove(name, force=False, **kwargs):
         assert force is False  # reaper never force-removes
         seen.append(name)
         return {"ok": True} if name == "wt-merged" else {"ok": False, "error": "nope"}
@@ -4658,7 +4658,7 @@ async def test_prune_run_per_item_states_and_failure_isolation(reset_prune_state
             return {"ok": False, "code": "active"}
         return {"ok": True, "code": "merged"}
 
-    async def fake_remove(nm, force=False, progress=None):
+    async def fake_remove(nm, force=False, progress=None, **kwargs):
         # exercise the phase callback the parallel driver passes in
         if progress is not None:
             progress("stopping_pod")
@@ -4707,7 +4707,7 @@ async def test_prune_run_exception_in_item_is_isolated(reset_prune_state):
     async def fake_prunable(path, branch):
         return {"ok": True, "code": "merged"}
 
-    async def fake_remove(nm, force=False, progress=None):
+    async def fake_remove(nm, force=False, progress=None, **kwargs):
         if nm == "wt-boom":
             raise RuntimeError("kaboom")
         return {"ok": True, "removed": True}
@@ -4746,7 +4746,7 @@ async def test_prune_run_caps_concurrency_at_semaphore_limit(reset_prune_state, 
         inflight -= 1
         return {"ok": True, "code": "merged"}
 
-    async def fake_remove(nm, force=False, progress=None):
+    async def fake_remove(nm, force=False, progress=None, **kwargs):
         return {"ok": True, "removed": True}
 
     with patch.object(mod, "_find_worktree", side_effect=fake_find), \
@@ -4816,7 +4816,7 @@ async def test_prune_run_deduplicates_names(reset_prune_state):
     async def fake_prunable(path, branch):
         return {"ok": True, "code": "merged"}
 
-    async def fake_remove(nm, force=False, progress=None):
+    async def fake_remove(nm, force=False, progress=None, **kwargs):
         removed.append(nm)
         return {"ok": True, "removed": True}
 
@@ -5789,3 +5789,279 @@ async def test_serving_install_reason_recomputes_when_the_checkout_set_changes(
     await mod._serving_install_reason([{"path": "/wt/a"}, {"path": "/wt/b"}])
 
     assert seen == [("/wt/a",), ("/wt/a", "/wt/b")]
+
+
+# --- Worktree teardown guard tests (issue #1554) ---
+
+
+@pytest.mark.asyncio
+async def test_force_remove_refuses_dirty_unmerged_worktree():
+    """Regression for #1554: force=True must NOT destroy a dirty tree whose PR
+    is unmerged — that combination is unrecoverable data loss."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod, "_find_worktree", new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod, "_pr_status_cached", new_callable=AsyncMock,
+            return_value={"state": "OPEN"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "uncommitted changes" in result["error"]
+    assert "not merged" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_force_remove_allows_dirty_merged_worktree():
+    """force=True still removes a dirty tree when the PR IS merged (the work
+    is shipped — force keeps its meaning for merged-dirty overrides)."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod, "_find_worktree", new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod, "_pr_status_cached", new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_ancestry_gate_skips_ref_delete_when_not_ancestor():
+    """When cached PR status wrongly says MERGED but the branch OID is NOT an
+    ancestor of the base branch, the ref must survive (fail-closed gate)."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    git_calls: list[tuple] = []
+
+    async def _fake_run_cmd(cmd, **kwargs):
+        git_calls.append(tuple(cmd))
+        if "worktree" in cmd and "remove" in cmd:
+            return (0, "", "")
+        if "merge-base" in cmd and "--is-ancestor" in cmd:
+            return (1, "", "")
+        return (0, "", "")
+
+    with (
+        patch.object(
+            mod, "_find_worktree", new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            mod, "_pr_status_cached", new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, side_effect=_fake_run_cmd),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    update_ref_calls = [c for c in git_calls if "update-ref" in c]
+    assert update_ref_calls == [], f"ref should NOT be deleted: {update_ref_calls}"
+
+
+@pytest.mark.asyncio
+async def test_ancestry_gate_allows_ref_delete_when_ancestor():
+    """When PR is merged and branch OID IS an ancestor of base, ref IS deleted."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    git_calls: list[tuple] = []
+    deleted_refs: list[str] = []
+
+    async def _fake_run_cmd(cmd, **kwargs):
+        git_calls.append(tuple(cmd))
+        if "worktree" in cmd and "remove" in cmd:
+            return (0, "", "")
+        if "merge-base" in cmd and "--is-ancestor" in cmd:
+            return (0, "", "")
+        return (0, "", "")
+
+    async def _fake_git(repo, *args, **kwargs):
+        if args and args[0] == "update-ref" and "-d" in args:
+            deleted_refs.append(args[2])
+            return ""
+        if args and args[0] == "rev-parse":
+            return "aaa1111"
+        return ""
+
+    with (
+        patch.object(
+            mod, "_find_worktree", new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            mod, "_pr_status_cached", new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(mod, "_git", new_callable=AsyncMock, side_effect=_fake_git),
+        patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, side_effect=_fake_run_cmd),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert "refs/heads/feat-x" in deleted_refs
+
+
+@pytest.mark.asyncio
+async def test_empty_branch_still_deletes_ref():
+    """own==0 (empty branch) still results in ref deletion because an empty
+    branch is trivially an ancestor of the base (merge-base succeeds)."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    deleted_refs: list[str] = []
+
+    async def _fake_run_cmd(cmd, **kwargs):
+        if "worktree" in cmd and "remove" in cmd:
+            return (0, "", "")
+        if "merge-base" in cmd and "--is-ancestor" in cmd:
+            return (0, "", "")
+        return (0, "", "")
+
+    async def _fake_git(repo, *args, **kwargs):
+        if args and args[0] == "update-ref" and "-d" in args:
+            deleted_refs.append(args[2])
+            return ""
+        if args and args[0] == "rev-parse":
+            return "bbb2222"
+        return ""
+
+    with (
+        patch.object(
+            mod, "_find_worktree", new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "empty-br", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(mod, "_pr_status_cached", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(mod, "_git", new_callable=AsyncMock, side_effect=_fake_git),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, side_effect=_fake_run_cmd),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("empty-br", force=False)
+
+    assert result["ok"] is True
+    assert "refs/heads/empty-br" in deleted_refs
+
+
+@pytest.mark.asyncio
+async def test_removal_audit_log_emitted(caplog):
+    """Successful removal emits a structured audit line with verdict fields."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod, "_find_worktree", new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            mod, "_pr_status_cached", new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "worktree=feat-x" in msg
+    assert "branch=feat-x" in msg
+    assert "caller=handler" in msg
+    assert "action=removed" in msg
+    assert "pr_state=MERGED" in msg
+
+
+@pytest.mark.asyncio
+async def test_force_refuse_audit_log_emitted(caplog):
+    """The dirty+unmerged force refusal also emits an audit line."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod, "_find_worktree", new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod, "_pr_status_cached", new_callable=AsyncMock,
+            return_value={"state": "OPEN"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "action=refused_dirty_unmerged" in msg
+    assert "dirty=True" in msg
