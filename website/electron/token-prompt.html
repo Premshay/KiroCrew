@@ -48,6 +48,7 @@
     <input id="url" type="text" placeholder="Paste token URL or raw token…" autofocus>
     <button onclick="go()">Connect</button>
     <div class="error" id="err">Invalid URL — must be http://localhost with a ?token= parameter</div>
+    <p class="hint" style="margin-top:16px;font-size:12px;">Press <code>Esc</code> to close this window.</p>
   </div>
   <script>
     // WHICH machine to act on depends on who holds the port. main.js probes the
@@ -91,6 +92,11 @@
       }
     }
     document.getElementById('url').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+    // Escape closes the window. The main process already drops fullscreen/kiosk
+    // before showing this page (so the native Close button + app menu are back),
+    // but a keyboard exit means the user is never stuck here regardless of window
+    // chrome. window.close() on the main window triggers the normal close/quit.
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') window.close(); });
   </script>
 </body>
 </html>
