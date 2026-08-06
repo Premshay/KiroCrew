@@ -1904,6 +1904,7 @@ class ContextBuilder:
         model_window: int | None = None,
         user_text_range: tuple[int, int] | None = None,
         user_span_out: list[int] | None = None,
+        needs_reinjection: bool = False,
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -2037,6 +2038,25 @@ class ContextBuilder:
                 "authoritative for this turn, even if the session originated on "
                 "another interface.\n\n"
             )
+
+        # Post-compaction re-injection: the skills index was lost when the
+        # session-start context was compacted. Re-inject it so the model can
+        # still discover skills by name/$token/skill_search.
+        if not is_new_session and needs_reinjection:
+            _cfg = KiroCrewConfig.load()
+            lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))
+            caps = _resolve_caps(model_window)
+            skills_ctx = self.skills.get_context(
+                budget=caps.skills if lazy_skills else None,
+            )
+            if skills_ctx:
+                if lazy_skills and len(skills_ctx) > caps.skills:
+                    skills_ctx = skills_ctx[: caps.skills] + "\n...[skills truncated]\n"
+                parts.append(
+                    "[REINJECTED AFTER COMPACTION — skills index for discovery]\n"
+                    + skills_ctx
+                    + "\n[END REINJECTED]\n\n"
+                )
 
         # Channel history — inject on every message for group channel context
         ch_ctx: str | None = None

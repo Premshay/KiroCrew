@@ -535,6 +535,10 @@ class _Session:
     provider_switch_replay: bool = False
     # Set of msg_ts values cancelled (message deleted while processing)
     cancelled: set[str] = field(default_factory=set)
+    # Set after context compaction drops the session-start skill index.
+    # Consumed one-shot by the next prompt builder to re-inject the skills
+    # index so the model can still discover skills post-compaction.
+    needs_context_reinjection: bool = False
 
 
 class _ProviderBgSession:
@@ -2798,6 +2802,17 @@ class SessionManager:
         if self._on_compacted is not None and cb is not None:
             logger.warning("Compact callback already registered; replacing existing handler")
         self._on_compacted = cb
+
+    def mark_needs_reinjection(self, key: str) -> None:
+        """Flag *key*'s session to re-inject skill context on the next turn.
+
+        Called after a successful compaction drops the session-start context
+        (which includes the skills index).  The flag is consumed one-shot by
+        the dashboard prompt builder.
+        """
+        sess = self._sessions.get(self._fold_key(key))
+        if sess is not None:
+            sess.needs_context_reinjection = True
 
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register a callback fired when the watchdog recycles a session.

@@ -2097,6 +2097,9 @@ class DashboardState:
                     logging.getLogger(__name__).exception(
                         "Failed to broadcast context_usage for slot %s", slot_key
                     )
+                # Compaction drops the session-start context (including the skills
+                # index). Flag the session so the next prompt re-injects it.
+                self.sessions.mark_needs_reinjection(key)
 
         self.sessions.set_compact_callback(_on_compacted)
 
