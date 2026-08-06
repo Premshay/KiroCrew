@@ -270,6 +270,27 @@ function TerminalView({ sessionId, cwd, visible, onSendToChat }: { sessionId: st
   // xterm instances persist in termCache across tab switches — only destroyed
   // on explicit tab close via disposeTerminalSession.
 
+  // Cmd+K (macOS) / Ctrl+K (Linux) — clear screen. macOS does not forward
+  // metaKey combos into the PTY (the OS intercepts them before xterm sees them),
+  // so Cmd+K never reaches term.onKey. We intercept it on the wrapper element
+  // and write ^L (form feed, \x0c) directly to the PTY via term.input(), which
+  // is the same byte readline/bash map to clear-screen. The handler runs on the
+  // wrapper rather than through attachCustomKeyEventHandler (that slot is owned
+  // by TerminalCompletion). e.preventDefault() stops any residual browser action.
+  useEffect(() => {
+    const wrap = wrapperRef.current
+    if (!wrap) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K') && !e.altKey && !e.shiftKey) {
+        e.preventDefault()
+        e.stopPropagation()
+        term.input('\x0c')
+      }
+    }
+    wrap.addEventListener('keydown', onKeyDown)
+    return () => wrap.removeEventListener('keydown', onKeyDown)
+  }, [term])
+
   // Selection toolbar lifecycle. We show the toolbar on mouseup (the drag is
   // finished and the selection is stable), anchored to the pointer, and hide it
   // whenever the selection is cleared or the viewport scrolls (which would leave

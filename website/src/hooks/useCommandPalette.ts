@@ -68,6 +68,18 @@ export const DOUBLE_SHIFT_WINDOW_MS = 250
 /** Live read of the global shortcuts toggle (default on; '0' means disabled). */
 const shortcutsEnabled = () => localStorage.getItem(SHORTCUTS_ENABLED_KEY) !== '0'
 
+/**
+ * True when focus is inside an xterm instance (the hidden textarea that xterm
+ * uses as its keyboard sink, or any element inside the `.xterm` root). All
+ * palette shortcuts must pass through when a terminal has focus so the shell
+ * can receive keys like ⌘K (clear screen in many shells via `bind -x`).
+ * Mirrors the identical guard in {@link useKeyboardShortcuts}.
+ */
+function isTerminalTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null
+  return !!el && typeof el.closest === 'function' && !!el.closest('.xterm')
+}
+
 export interface UseCommandPalette {
   /** Whether the palette is currently shown. */
   open: boolean
@@ -97,6 +109,19 @@ export function useCommandPalette(): UseCommandPalette {
       // unaffected. Reset any pending first Shift tap so re-enabling can't
       // resume a half-formed double-tap from across the disabled window.
       if (!shortcutsEnabled()) {
+        lastShiftRef.current = 0
+        return
+      }
+
+      // Let all bindings pass through when a terminal has keyboard focus.
+      // xterm owns the keystroke: ⌘K clears the screen in bash/zsh, and
+      // intercepting it here would swallow that without opening the palette
+      // (the terminal canvas/textarea captures the keydown first, then it
+      // bubbles — preventDefault here still reaches the shell's onData, but
+      // the cleared-screen feedback never fires because xterm's own handler
+      // already ran; the net effect is a half-dead key). The palette stays
+      // reachable via its nav button.
+      if (isTerminalTarget(e.target)) {
         lastShiftRef.current = 0
         return
       }

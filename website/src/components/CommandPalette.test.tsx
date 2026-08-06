@@ -288,6 +288,45 @@ describe('useCommandPalette — global trigger', () => {
     act(() => result.current.close())
     expect(result.current.open).toBe(false)
   })
+
+  it('⌘K does NOT open when focus is inside an xterm terminal', () => {
+    // Simulate an xterm hierarchy: .xterm root > hidden textarea (the keyboard
+    // sink that xterm uses for input, where the event's target would be).
+    const xtermRoot = document.createElement('div')
+    xtermRoot.className = 'xterm'
+    const xtermTextarea = document.createElement('textarea')
+    xtermRoot.appendChild(xtermTextarea)
+    document.body.appendChild(xtermRoot)
+
+    try {
+      const { result } = renderHook(() => useCommandPalette())
+      act(() => {
+        fireEvent.keyDown(xtermTextarea, { key: 'k', metaKey: true })
+      })
+      // The palette must stay closed — xterm should handle ⌘K (clear screen).
+      expect(result.current.open).toBe(false)
+    } finally {
+      xtermRoot.remove()
+    }
+  })
+
+  it('Ctrl+K does NOT open when focus is inside an xterm terminal', () => {
+    const xtermRoot = document.createElement('div')
+    xtermRoot.className = 'xterm'
+    const xtermTextarea = document.createElement('textarea')
+    xtermRoot.appendChild(xtermTextarea)
+    document.body.appendChild(xtermRoot)
+
+    try {
+      const { result } = renderHook(() => useCommandPalette())
+      act(() => {
+        fireEvent.keyDown(xtermTextarea, { key: 'k', ctrlKey: true })
+      })
+      expect(result.current.open).toBe(false)
+    } finally {
+      xtermRoot.remove()
+    }
+  })
 })
 
 describe('useCommandPalette — Enable shortcuts toggle', () => {
