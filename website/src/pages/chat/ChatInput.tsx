@@ -6,6 +6,14 @@ export type SlashInterceptResult = { intercepted: true } | { intercepted: false 
 
 const SIDE_RE = /^\/side(?:\s+([\s\S]+))?$/
 
+/** Sync predicate for the commands interceptSlashCommand handles. The steer
+ *  path needs a cheap synchronous check before deciding not to steer — see
+ *  ChatPage's steer() — so this stays in lockstep with the matches below. */
+export function isInterceptedSlashCommand(raw: string): boolean {
+  const trimmed = raw.trim()
+  return trimmed === '/onboarding' || SIDE_RE.test(trimmed)
+}
+
 export async function interceptSlashCommand(
   raw: string,
   slot: string | null,
