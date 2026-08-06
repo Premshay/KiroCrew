@@ -1193,8 +1193,20 @@ def set_orch_cfg(cfg: KiroCrewConfig) -> None:
     """Store a live reference to the orchestrator's config (called by events.py)."""
     global _orch_cfg
     _orch_cfg = cfg
+    load_voice_reply_config(cfg)
+
+
+def load_voice_reply_config(cfg: "KiroCrewConfig | None" = None) -> None:
+    """Populate the live voice state (``_vc``) from config's ``voice_reply``.
+
+    Callable without a Slack orchestrator: this historically ran only inside
+    ``set_orch_cfg`` on the Slack startup path, so a dashboard-only gateway
+    (no Slack tokens) never loaded persisted voice settings — every restart
+    silently reset TTS to disabled while the dashboard's PUT kept reporting
+    success. The dashboard server now calls this at app build.
+    """
     # Load voice_reply defaults from config
-    _vr: dict = cfg.raw.get("voice_reply", {}) if hasattr(cfg, "raw") else {}
+    _vr: dict = cfg.raw.get("voice_reply", {}) if (cfg is not None and hasattr(cfg, "raw")) else {}
     if not _vr:
         try:
             with open(config_path()) as f:
