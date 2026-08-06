@@ -1370,7 +1370,47 @@ class ContextBuilder:
         # Resolved before the dashboard-only widget branch below so it reaches
         # every session. When "default", nothing is injected (zero prompt bloat).
         verbosity = getattr(cfg.dashboard, "verbosity", "default")
-        if verbosity == "concise":
+        if verbosity == "ultra":
+            verbosity_block = (
+                "## Response Verbosity: Punchline First (ADHD reader)\n\n"
+                "Write for a reader with ADHD. They skim, they lose the thread "
+                "in long prose, and they stop reading at the first wall of "
+                "text. Detail is allowed — burying the point is not.\n"
+                "- **Open with the punchline: at most 3 sentences** giving the "
+                "problem, the answer or fix, and what to do next. A reader who "
+                "stops after those 3 sentences must still be fully served.\n"
+                "- **After the punchline, supporting detail is welcome — but "
+                "make it scannable, not prose.** Short bullets, one idea per "
+                "line, a bold lead-in label where it helps the eye land. No "
+                "paragraph longer than 2 sentences.\n"
+                "- Never bury the answer: no preamble, no restating the "
+                "question, no narration of what you are about to do "
+                '("let me…", "now I\'ll…", "looking at…"), no closing summary '
+                "of what you just said.\n"
+                "- Give the conclusion, not the reasoning chain. Include WHY "
+                "only when it changes what the user should do — then one line.\n"
+                "- Take a position. One recommendation, not a menu of options "
+                "with hedges. Mention a rejected alternative only if the user "
+                "might reasonably pick it.\n"
+                "- Use structure as signposts: bold labels, tables for "
+                "comparisons, code blocks for anything literal. Structure is "
+                "how an ADHD reader navigates — it is not padding.\n"
+                "- Progress notes during long work: one line, and only when "
+                "something actually changed or blocked.\n"
+                "- Code, commands, paths, identifiers, diffs, and error strings "
+                "stay verbatim and complete. Brevity applies to prose only, "
+                "never to correctness or to required output format.\n"
+                "- Preserve the user's language.\n\n"
+                "The 3-sentence punchline cap governs the OPENING, not the "
+                "whole response. Length after it is fine when the content earns "
+                "it — and is expected for security warnings, "
+                "irreversible-action confirmations, ordered multi-step "
+                "instructions where omissions cause mistakes, and anything the "
+                "user asked to be detailed (a design doc, a report, a deep "
+                "explanation). Keep those complete, still lead with the "
+                "punchline, and still cut filler."
+            )
+        elif verbosity == "concise":
             verbosity_block = (
                 "## Response Verbosity: Concise\n\n"
                 "Concise mode is on. Reduce length without losing substance:\n"
