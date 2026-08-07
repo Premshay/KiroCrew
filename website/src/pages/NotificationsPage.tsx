@@ -1,8 +1,9 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { ArrowLeft } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { useAppSelector, useAppDispatch } from '../store'
-import { ackNotification } from '../store/notificationsSlice'
+import { ackNotification, fetchNotifications } from '../store/notificationsSlice'
 import { PageHeader, StatCard, Card, CardTitle, EmptyState } from '../components/ui'
 import InfoTip from '../components/InfoTip'
 import NotificationFeed from '../components/notifications/NotificationFeed'
@@ -10,6 +11,14 @@ import NotificationDetailPanel from '../components/notifications/NotificationDet
 import type { Notification } from '../types'
 
 import { i18nT } from '../i18n/t'
+
+/** Delay before the one-shot reconciling fetch after a deep-link auto-ack.
+ *  Long enough for the boot-time list fetches (app shell, WS connect, this
+ *  page's cold-store fetch) to have resolved — any of them snapshots the
+ *  list before the ack lands and would otherwise overwrite the optimistic
+ *  acked flag with its stale copy. */
+const DEEP_LINK_ACK_SETTLE_MS = 3000
+
 /**
  * Full Notifications page (route /notifications). Page chrome + master/detail
  * layout only; the feed (filter/list) and detail view are the same shared
@@ -33,6 +42,65 @@ export default function NotificationsPage() {
     setSelectedTs(n.ts)
     if (!n.acked) dispatch(ackNotification(n.ts))
   }, [dispatch])
+
+  // Deep link: /notifications?id=<ts> opens that notification's detail (push
+  // taps land here — the note's ts is its store id, the same key ack/delete
+  // use). Selection goes through handleSelect so the note acks exactly as a
+  // tapped row does. The param is consumed once handled so back/refresh
+  // behave as the plain page.
+  const [params, setParams] = useSearchParams()
+  const deepLinkTs = params.get('id')
+  const clearDeepLink = useCallback(() => {
+    setParams(prev => {
+      const next = new URLSearchParams(prev)
+      next.delete('id')
+      return next
+    }, { replace: true })
+  }, [setParams])
+  // Shared with the fetch effect below: an id resolved (or already fetched
+  // for) needs no confirming GET.
+  const fetchedForTs = useRef<string | null>(null)
+  // Lives outside the select effect's cleanup: clearing the param re-runs
+  // that effect, and a per-run cleanup would cancel the timer immediately.
+  const settleTimer = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (settleTimer.current != null) window.clearTimeout(settleTimer.current)
+  }, [])
+  useEffect(() => {
+    if (!deepLinkTs) return
+    const match = items.find(n => n.ts === deepLinkTs)
+    if (!match) return
+    fetchedForTs.current = deepLinkTs
+    handleSelect(match)
+    clearDeepLink()
+    // Boot-time fetches whose snapshots predate the auto-ack can resolve
+    // after it and revert the acked flag; one re-fetch after they settle
+    // shows server truth (including a deliberate un-ack made meanwhile).
+    settleTimer.current = window.setTimeout(() => {
+      dispatch(fetchNotifications())
+    }, DEEP_LINK_ACK_SETTLE_MS)
+    // After the selected state paints, bring the feed row into view (desktop:
+    // the feed pane scrolls independently; mobile hides the feed, so there is
+    // no row to scroll and the query matches nothing).
+    requestAnimationFrame(() => {
+      const row = document.querySelector(`[data-notif-ts="${CSS.escape(deepLinkTs)}"]`)
+      if (row instanceof HTMLElement && typeof row.scrollIntoView === 'function') {
+        row.scrollIntoView({ block: 'center' })
+      }
+    })
+  }, [deepLinkTs, items, handleSelect, clearDeepLink, dispatch])
+  // A deep link that did not match above usually landed on a cold tab whose
+  // store is still empty, so fetch once per id. Only a CONFIRMED miss (fresh
+  // list without the id — expired or cleared away) drops the param; a failed
+  // fetch keeps it so a later WS-driven store update can still match.
+  useEffect(() => {
+    if (!deepLinkTs || fetchedForTs.current === deepLinkTs) return
+    fetchedForTs.current = deepLinkTs
+    dispatch(fetchNotifications()).then(res => {
+      if (fetchNotifications.fulfilled.match(res) &&
+          !res.payload.some(n => n.ts === deepLinkTs)) clearDeepLink()
+    })
+  }, [deepLinkTs, dispatch, clearDeepLink])
 
   return (
     <>
