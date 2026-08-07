@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, memo } from 'react'
-import { ArrowUpFromLine, ArrowUp, Headset, Loader2, Play, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Globe, FolderOpen, FileText, ChevronDown, Check } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Headset, Loader2, Play, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Globe, FolderOpen, FileText, ChevronDown, Check, Volume2 } from 'lucide-react'
 import { Toggle } from './ui'
 import CopyBranchButton from './CopyBranchButton'
 import { usePointerDrag } from '../hooks/usePointerDrag'
@@ -281,7 +281,7 @@ interface ChatInputProps {
   /** Flip the hands-free preference (and arm/exit the loop accordingly). */
   onHandsFreeToggle?: () => void
   /** Loop state for the status strip; null when the loop is not armed. */
-  handsFreePhase?: 'listening' | 'processing' | 'sent' | null
+  handsFreePhase?: 'listening' | 'processing' | 'sent' | 'speaking' | null
   /** True for streaming STT — the dictation panel's hint says "Enter to send"
    *  (live transcript in composer); batch says "click the mic to finish". */
   voiceStreaming?: boolean
@@ -2375,7 +2375,15 @@ function ChatInput({
                 <span className="font-medium">{i18nT('components.chatInput.handsfree_sent')}</span>
               </>
             )}
-            <span className="ml-auto text-muted font-normal">{i18nT('components.chatInput.handsfree_stop_hint')}</span>
+            {handsFreePhase === 'speaking' && (
+              <>
+                <Volume2 className="lucide-inline shrink-0" />
+                <span className="font-medium">{i18nT('components.chatInput.handsfree_speaking')}</span>
+              </>
+            )}
+            {/* While the reply is speaking the mic tap barges in rather than
+                stopping the loop, so the hint must promise interrupt, not stop. */}
+            <span className="ml-auto text-muted font-normal">{i18nT(handsFreePhase === 'speaking' ? 'components.chatInput.handsfree_interrupt_hint' : 'components.chatInput.handsfree_stop_hint')}</span>
           </div>
         )}
 
@@ -2581,8 +2589,8 @@ function ChatInput({
                 // control, so it stays enabled through the transcribing phase
                 // (a driver must be able to halt the loop at any moment).
                 disabled={disabled || (voiceTranscribing && !handsFreePhase) || optimizing}
-                aria-label={handsFreePhase ? i18nT('components.chatInput.handsfree_stop') : voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
-                title={handsFreePhase ? i18nT('components.chatInput.handsfree_stop') : voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
+                aria-label={handsFreePhase === 'speaking' ? i18nT('components.chatInput.handsfree_interrupt_hint') : handsFreePhase ? i18nT('components.chatInput.handsfree_stop') : voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
+                title={handsFreePhase === 'speaking' ? i18nT('components.chatInput.handsfree_interrupt_hint') : handsFreePhase ? i18nT('components.chatInput.handsfree_stop') : voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
               >
                 {voiceTranscribing && !handsFreePhase ? <Loader2 size={18} className="animate-spin" /> : <Mic size={18} />}
               </button>
