@@ -672,6 +672,8 @@ interface ChatState {
    *  rather than asserting a precise figure. */
   slotContextTokens: Record<string, { used?: number; window: number }>
   voicePlaying: boolean
+  /** Synthesis, queued audio, or playback is active. */
+  voiceBusy: boolean
   voiceAudio: string | null  // base64 stitched MP3 for replay
   subagents: Record<string, SubagentActivity>
   /** Aggregate "waiting to start" count per slot — agents accepted but queued
@@ -845,6 +847,7 @@ const initialState: ChatState = {
   slotContextPct: {},
   slotContextTokens: {},
   voicePlaying: false,
+  voiceBusy: false,
   voiceAudio: null,
   subagents: {},
   subagentQueued: {},
@@ -2121,7 +2124,7 @@ const chatSlice = createSlice({
   initialState,
   reducers: {
     setActiveSlot(state, action: PayloadAction<string | null>) { state.activeSlot = action.payload; state.slotState = 'idle'; state.pendingTurnSlot = null },
-    clearSlotState(state) { state.messages = []; state.toolLog = []; state.subagents = {}; state.activityTab = 'changes'; state.slotRunning = false; state.slotStopping = false; state.slotState = 'idle'; setPagingCursor(state, false, 0); state.loadingOlder = false; state.lastChunkSeq = undefined; state._wsChunkedDuringFetch = false; state.slotStatusDetail = {}; state.voicePlaying = false; state.voiceAudio = null; if (state.activeSlot) delete state.pendingQuestions?.[state.activeSlot]; state.pendingTurnSlot = null },
+    clearSlotState(state) { state.messages = []; state.toolLog = []; state.subagents = {}; state.activityTab = 'changes'; state.slotRunning = false; state.slotStopping = false; state.slotState = 'idle'; setPagingCursor(state, false, 0); state.loadingOlder = false; state.lastChunkSeq = undefined; state._wsChunkedDuringFetch = false; state.slotStatusDetail = {}; state.voicePlaying = false; state.voiceBusy = false; state.voiceAudio = null; if (state.activeSlot) delete state.pendingQuestions?.[state.activeSlot]; state.pendingTurnSlot = null },
     setPendingInput(state, action: PayloadAction<string | null>) { state.pendingInput = action.payload },
     setAgentSwitchNotice(state, action: PayloadAction<string | null>) {
       // Always create a fresh value so repeating the same refusal restarts the
@@ -2553,7 +2556,7 @@ const chatSlice = createSlice({
       if (isUnsafeKey(slot)) return
       state.slotStatusDetail[safeKey(slot)] = detail
     },
-    clearMessages(state) { state.messages = []; setPagingCursor(state, false, 0); state.voiceAudio = null; state.voicePlaying = false; if (state.activeSlot) evictMcpApps(state, state.activeSlot) },
+    clearMessages(state) { state.messages = []; setPagingCursor(state, false, 0); state.voiceAudio = null; state.voicePlaying = false; state.voiceBusy = false; if (state.activeSlot) evictMcpApps(state, state.activeSlot) },
     truncateAfterIndex(state, action: PayloadAction<number>) { state.messages = state.messages.slice(0, action.payload) },
     replaceMessages(state, action: PayloadAction<ChatMessage[]>) { state.messages = action.payload },
     /** Path B: seed a non-active slot's message history into the per-slot store
@@ -2604,6 +2607,7 @@ const chatSlice = createSlice({
       retainServerTotal(state, slot, total, running)
     },
     setVoicePlaying(state, action: PayloadAction<boolean>) { state.voicePlaying = action.payload },
+    setVoiceBusy(state, action: PayloadAction<boolean>) { state.voiceBusy = action.payload },
     setVoiceAudio(state, action: PayloadAction<string | null>) { state.voiceAudio = action.payload },
     toggleActivity(state) { state.activityOpen = !state.activityOpen; if (!state.activityOpen) state.focusToolCallId = null; persistActivityOpen(state.activeSlot, state.activityOpen) },
     openActivityPanel(state) { state.activityOpen = true; persistActivityOpen(state.activeSlot, true) },
@@ -4281,7 +4285,7 @@ const chatSlice = createSlice({
 export const {
   setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
   removeThinking, confirmOptimisticSend, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
-  sseContextUsage, setVoicePlaying, setVoiceAudio,
+  sseContextUsage, setVoicePlaying, setVoiceBusy, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,
   setGoalLoops, sseGoalLoop,
