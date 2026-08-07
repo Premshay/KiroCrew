@@ -130,6 +130,27 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "target process — so it is an egress boundary, redacted on the way out.",
     ),
     (
+        "md-notebook error middleware",
+        "apps/builtins/md_notebook/server.py",
+        "Every md-notebook API error body. Handlers drive git and filesystem work "
+        "over caller-supplied vault URLs, ids and note paths, so an unmodeled "
+        "exception carries absolute paths and git stderr; `_safe_error` scrubs "
+        "credentials, exfiltration URLs and host paths before the JSON reaches the "
+        "browser — the same output-boundary reason as the dashboard error sinks.",
+    ),
+    (
+        "Issue Radar provider CLI stderr",
+        "apps/builtins/issue_radar/backend/errors.py",
+        "`gh`/`glab` stderr quoted into provider exception messages, which the "
+        "issue-radar routes return in their error bodies and the frontend renders "
+        "verbatim. `sanitize_cli_stderr` runs only the host-path pass plus a "
+        "private-host filter, not the credential scanner: both CLIs take their "
+        "token from the environment rather than argv and neither echoes it, so host "
+        "topology is the disclosure risk here. The actionable phrasing (auth, "
+        "not-found, 403, timeout) is deliberately preserved so the user can "
+        "self-diagnose.",
+    ),
+    (
         "Side-chat parent snapshot",
         "dashboard/side_context.py",
         "Parent user/assistant turns embedded in the side-chat prompt. The prompt "
