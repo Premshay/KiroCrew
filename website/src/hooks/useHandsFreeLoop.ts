@@ -194,6 +194,38 @@ export function useHandsFreeLoop(opts: Opts): HandsFreeLoop {
     return () => clearInterval(iv)
   }, [armed, opts.recording, disarm])
 
+  // Screen wake lock for the whole armed span: hands-free exists for contexts
+  // where the user cannot tap (driving), and a screen that locks mid-loop can
+  // also throttle the tab enough to starve the VAD poll. Best-effort — without
+  // the API the screen just keeps its normal timeout. The UA auto-releases the
+  // lock whenever the page hides, so a return to visibility re-requests it
+  // while still armed.
+  useEffect(() => {
+    if (!armed || !('wakeLock' in navigator)) return
+    let lock: WakeLockSentinel | null = null
+    let disposed = false
+    const acquire = () => {
+      navigator.wakeLock.request('screen').then(l => {
+        if (disposed) void l.release().catch(() => {})
+        else lock = l
+      }).catch(() => {
+        // NotAllowedError (power-save mode, permissions policy): the loop
+        // still works, the screen just dims on its own schedule.
+      })
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') acquire()
+    }
+    acquire()
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      disposed = true
+      document.removeEventListener('visibilitychange', onVisibility)
+      if (lock) void lock.release().catch(() => {})
+      lock = null
+    }
+  }, [armed])
+
   const consumeAutoSend = useCallback(() => {
     const v = autoSendRef.current
     autoSendRef.current = false
