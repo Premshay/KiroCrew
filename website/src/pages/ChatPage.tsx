@@ -136,6 +136,9 @@ import { runBelongsToSlot } from '../apps/workflows/runModel'
 import { TipCard, useTipTrigger } from '../components/TipCard'
 import { useVoiceInput, voiceInputSupported, type TranscriptOrigin } from '../hooks/useVoiceInput'
 import { usePushToTalk } from '../hooks/usePushToTalk'
+import { useHandsFreeLoop, type HandsFreeLoop } from '../hooks/useHandsFreeLoop'
+import { isSendableTranscript, HANDS_FREE_LS_KEY } from '../hooks/handsFreeVad'
+import { usePersistedBool } from '../hooks/usePersistedBool'
 import VoiceDisabledModal from '../components/VoiceDisabledModal'
 import { ChatFooter, AssistantMessage, UserMessage, PinnedPrompt } from './chat'
 import type { TurnStats } from './chat/AssistantMessage'
@@ -1951,6 +1954,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // auto-submit callback — wired into the voice hook here, above send — can
   // fire it. Kept fresh by an effect after send is declared.
   const sendRef = useRef<((optionText?: string, targetSlot?: string) => void) | null>(null)
+  // Forward ref to the hands-free loop (instantiated below cancelVoice — it
+  // needs the capture controls) so applyVoiceText, declared first, can consume
+  // its auto-send flag. Assigned in render, like sendRef.
+  const handsFreeRef = useRef<HandsFreeLoop | null>(null)
   // Deliver a finished transcript to the slot that INITIATED the recording,
   // using the session id useVoiceInput snapshotted at record-start (falling back
   // to the active slot for the ordinary same-slot case). Same-slot splices into
@@ -2001,6 +2008,25 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // always the only copy: suppressing it would delete what the user said.
     if (origin === 'stream' && (sttDisarmedRef.current || sttAppendDisarmedRef.current)) return
     const target = sessionId ?? activeSlotRef.current
+    // Hands-free: this transcript came from a capture the VAD endpointer
+    // stopped, so it is sent rather than inserted. Direct send with the text
+    // (the same optionText path a follow-up double-click uses) bypasses the
+    // composer entirely — no setInput race, and a draft the user left in the
+    // composer stays untouched. A trivial transcript (noise) is dropped; the
+    // loop re-arms either way via useHandsFreeLoop's cycle effect.
+    if (handsFreeRef.current?.consumeAutoSend()) {
+      const trimmed = text.trim()
+      if (!isSendableTranscript(trimmed)) return
+      if (target === activeSlotRef.current) {
+        handsFreeRef.current.noteSent()
+        sendRef.current?.(trimmed)
+        return
+      }
+      // Slot changed while the transcript was in flight (the switch disarms
+      // the loop, but this delivery raced it): fall through to the normal
+      // routing below so the words land in the originating slot's draft
+      // instead of auto-sending into a session the user just left.
+    }
     const append = (base: string) => (base ? (base.endsWith(' ') ? base + text : base + ' ' + text) : text)
     // Splice into the LIVE composer only when the target slot is both the active
     // slot AND the slot the composer's `input` currently belongs to. On a slot
@@ -2320,6 +2346,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Uses voiceRef.current (not `voice`) so this prop stays referentially stable
   // and does not re-render the composer every render — matching toggleVoice.
   const cancelVoice = useCallback(() => {
+    // Esc is a manual act: the hands-free loop must not re-arm (or auto-send)
+    // after it. Idempotent when the loop itself routed here to discard.
+    handsFreeRef.current?.disarm()
     if (streamEnabledRef.current) {
       sttDisarmedRef.current = true
       // Remove the dictated region at the frozenInputRef boundary, preserving
@@ -2390,6 +2419,57 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     },
     { disabled: !voiceInputSupported },
   )
+  // Hands-free ("car mode") dictation: an opt-in loop over the BATCH pipeline
+  // where end-of-speech silence stops the capture, the transcript auto-sends,
+  // and listening re-arms (see useHandsFreeLoop). Batch-only by design:
+  // streaming providers ship their own semantic endpointer (onEndpoint above),
+  // so the toggle is withheld when streaming is active.
+  const handsFreeUsable = voiceInputSupported && sttConfigLoaded && sttEnabled && sttAvailable && !voice.streamEnabled
+  const [handsFreePref, setHandsFreePref] = usePersistedBool(HANDS_FREE_LS_KEY, false)
+  const handsFreePrefRef = useRef(handsFreePref)
+  handsFreePrefRef.current = handsFreePref
+  const handsFreeUsableRef = useRef(handsFreeUsable)
+  handsFreeUsableRef.current = handsFreeUsable
+  const handsFree = useHandsFreeLoop({
+    enabled: handsFreePref && handsFreeUsable,
+    recording: voice.recording,
+    transcribing: voice.transcribing,
+    error: voice.error,
+    clearError: voice.clearError,
+    sampleRef: voice.sampleRef,
+    // Capture controls. Read via the loop's own opts ref, so inline closures
+    // are fine — and toggleVoice keeps owning the config gates + disarm resets.
+    start: () => { if (!voiceRef.current.recording && !voiceRef.current.transcribing) toggleVoice() },
+    stopCommit: () => { if (voiceRef.current.recording) toggleVoice() },
+    cancelDiscard: cancelVoice,
+  })
+  handsFreeRef.current = handsFree
+  // The mic button: in hands-free mode it arms/exits the LOOP instead of a
+  // one-shot dictation. Exiting commits the in-flight utterance to the
+  // composer — after a manual act nothing may auto-send.
+  const handleVoiceToggle = useCallback(() => {
+    if (handsFreeRef.current?.armed) { handsFreeRef.current.exit('commit'); return }
+    if (handsFreePrefRef.current && handsFreeUsableRef.current) { handsFreeRef.current?.arm(); return }
+    toggleVoice()
+  }, [toggleVoice])
+  // The headset button: flips the persisted preference. Turning it ON also
+  // arms the loop right away (the "tap once to start" promise); turning it
+  // OFF exits, committing any capture in flight. The preference alone never
+  // starts listening on page load — arming always requires a tap.
+  const handleHandsFreeToggle = useCallback(() => {
+    const next = !handsFreePrefRef.current
+    setHandsFreePref(next)
+    if (next) { if (handsFreeUsableRef.current) handsFreeRef.current?.arm() }
+    else handsFreeRef.current?.exit('commit')
+  }, [setHandsFreePref])
+  // Typing is the user taking the composer back: exit the loop and discard
+  // any capture in flight so nothing they are editing gets auto-sent.
+  const handleComposerChange = useCallback((v: string) => {
+    if (handsFreeRef.current?.armed) handsFreeRef.current.exit('discard')
+    setInput(v)
+  }, [])
+  // The mic-disabled modal opening means the loop cannot run (STT off/absent).
+  useEffect(() => { if (voiceSetupOpen) handsFreeRef.current?.disarm() }, [voiceSetupOpen])
   // Stop any in-flight recording and clear the streaming prefix when the user
   // switches slots. The mic is a single shared device, so a recording can't
   // follow the user to another session; a BATCH transcript is still delivered
@@ -2416,6 +2496,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // applyVoiceText. (Cross-slot streaming delivery is a follow-up; streaming
     // is opt-in and off by default.)
     if (streamEnabledRef.current) sttDisarmedRef.current = true
+    // A slot switch is a manual act: stop the hands-free loop (clearing its
+    // auto-send flag) so the in-flight capture below commits to the
+    // originating slot's draft instead of auto-sending.
+    handsFreeRef.current?.disarm()
     if (voiceRef.current.recording) voiceRef.current.toggle()
   }, [activeSlot])
   // True when the current voice session (owned by the slot where recording
@@ -7210,7 +7294,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 </AnimatePresence>
               }
               value={input}
-              onChange={setInput}
+              onChange={handleComposerChange}
               onSend={() => send()}
               canSteer={composerBusy}
               onSteer={steer}
@@ -7288,12 +7372,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               voiceDeviceSwitchIsLive={voiceOwned && voice.deviceSwitchIsLive}
               onClearVoiceError={voice.clearError}
               voiceDictationPanel={sttDictationPanel}
+              handsFreeAvailable={handsFreeUsable}
+              handsFreeOn={handsFreePref}
+              onHandsFreeToggle={voiceInputSupported ? handleHandsFreeToggle : undefined}
+              handsFreePhase={handsFree.phase}
               voiceStreaming={voice.streamEnabled}
               voiceSampleRef={voice.sampleRef}
               voicePartial={voiceOwned ? voice.partial : ''}
               voiceCaretRef={voiceCaretRef}
               voicePendingCaretRef={voicePendingCaretRef}
-              onVoiceToggle={voiceInputSupported ? toggleVoice : undefined}
+              onVoiceToggle={voiceInputSupported ? handleVoiceToggle : undefined}
               onVoiceCancel={voiceInputSupported ? cancelVoice : undefined}
               onVoicePrewarm={voiceInputSupported ? voice.prewarm : undefined}
               agentName={currentSlot?.agent || 'default'}
@@ -7608,4 +7696,3 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     </RowDisclosureProvider>
   )
 }
-

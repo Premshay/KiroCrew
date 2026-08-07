@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo } from 'react'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Headset, Loader2, RotateCw, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, Check } from 'lucide-react'
 import CopyBranchButton from './CopyBranchButton'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import { useScrollEdges } from '../hooks/useScrollEdges'
@@ -305,6 +305,14 @@ interface ChatInputProps {
   onClearVoiceError?: () => void
   /** Show the animated dictation panel while recording (stt.dictation_panel). */
   voiceDictationPanel?: boolean
+  /** Hands-free (car-mode) dictation is usable here — renders the mode toggle. */
+  handsFreeAvailable?: boolean
+  /** Persisted hands-free preference (the toggle's pressed state). */
+  handsFreeOn?: boolean
+  /** Flip the hands-free preference (and arm/exit the loop accordingly). */
+  onHandsFreeToggle?: () => void
+  /** Loop state for the status strip; null when the loop is not armed. */
+  handsFreePhase?: 'listening' | 'processing' | 'sent' | null
   /** True for streaming STT — the dictation panel's hint says "Enter to send"
    *  (live transcript in composer); batch says "click the mic to finish". */
   voiceStreaming?: boolean
@@ -625,6 +633,10 @@ function ChatInput({
   voiceDeviceLabel = '',
   voiceDeviceId = '',
   voiceDictationPanel = false,
+  handsFreeAvailable = false,
+  handsFreeOn = false,
+  onHandsFreeToggle,
+  handsFreePhase = null,
   voiceStreaming = false,
   voiceSampleRef,
   voicePartial = '',
@@ -2492,6 +2504,42 @@ function ChatInput({
         <SessionRefStrip refs={pendingSessions} onRemove={onRemoveSessionRef} />
         <FilePreviewStrip files={pendingFiles} dirs={pendingDirs} resizedInfo={resizedInfo} onRemove={onRemoveFile} onRemoveDir={onRemoveDir} />
 
+        {/* Hands-free loop status. Always mounted while the loop is armed —
+            including the between-captures gaps the phase deliberately papers
+            over — so a driver gets one steady surface answering "is it safe to
+            talk". Taller touch row via hover-none, matching the 40px floor the
+            message-action footers use. */}
+        {handsFreePhase && (
+          <div
+            data-testid="handsfree-status"
+            aria-live="polite"
+            className="flex items-center gap-2 px-3 py-1.5 [@media(hover:none)]:min-h-[44px] text-[12px] border-b border-border bg-accent-subtle text-accent"
+          >
+            {handsFreePhase === 'listening' && (
+              <>
+                <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
+                  <span className="absolute inline-flex h-full w-full rounded-full bg-danger opacity-60 animate-ping" />
+                  <span className="relative inline-flex h-2 w-2 rounded-full bg-danger" />
+                </span>
+                <span className="font-medium">{i18nT('components.chatInput.handsfree_listening')}</span>
+              </>
+            )}
+            {handsFreePhase === 'processing' && (
+              <>
+                <Loader2 className="lucide-inline animate-spin shrink-0" />
+                <span className="font-medium">{i18nT('components.chatInput.transcribing')}</span>
+              </>
+            )}
+            {handsFreePhase === 'sent' && (
+              <>
+                <Check className="lucide-inline shrink-0" />
+                <span className="font-medium">{i18nT('components.chatInput.handsfree_sent')}</span>
+              </>
+            )}
+            <span className="ml-auto text-muted font-normal">{i18nT('components.chatInput.handsfree_stop_hint')}</span>
+          </div>
+        )}
+
         {showDictation ? (
           <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} />
         ) : (
@@ -2704,18 +2752,40 @@ function ChatInput({
             )}
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            {onHandsFreeToggle && handsFreeAvailable && (
+              /* Hands-free mode toggle. Three visual tiers: loop armed (solid
+                 accent), preference on but idle (subtle accent), off (muted).
+                 Grows to the 40px touch floor where the pointer cannot hover;
+                 the icon tracks the button's font size via lucide-inline. */
+              <button
+                className={`w-8 h-8 [@media(hover:none)]:w-10 [@media(hover:none)]:h-10 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none text-[18px] ${
+                  handsFreePhase ? 'bg-accent text-accent-fg' : handsFreeOn ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'
+                } disabled:opacity-30`}
+                onClick={onHandsFreeToggle}
+                disabled={disabled || optimizing}
+                aria-pressed={handsFreeOn}
+                aria-label={i18nT('components.chatInput.handsfree_voice')}
+                title={handsFreeOn ? i18nT('components.chatInput.handsfree_on') : i18nT('components.chatInput.handsfree_off')}
+                data-testid="handsfree-toggle"
+              >
+                <Headset className="lucide-inline" />
+              </button>
+            )}
             {onVoiceToggle && (
               <button
-                className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none ${
+                className={`w-8 h-8 ${handsFreeAvailable ? '[@media(hover:none)]:w-10 [@media(hover:none)]:h-10 ' : ''}rounded-lg flex items-center justify-center cursor-pointer transition-all border-none ${
                   voiceRecording ? 'bg-danger-subtle text-danger animate-pulse' : voiceTranscribing ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'
                 } disabled:opacity-30`}
                 onClick={onVoiceToggle}
                 onPointerDown={onVoicePrewarm}
-                disabled={disabled || voiceTranscribing || optimizing}
-                aria-label={voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
-                title={voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
+                // While the hands-free loop is armed the mic is its stop
+                // control, so it stays enabled through the transcribing phase
+                // (a driver must be able to halt the loop at any moment).
+                disabled={disabled || (voiceTranscribing && !handsFreePhase) || optimizing}
+                aria-label={handsFreePhase ? i18nT('components.chatInput.handsfree_stop') : voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
+                title={handsFreePhase ? i18nT('components.chatInput.handsfree_stop') : voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
               >
-                {voiceTranscribing ? <Loader2 size={18} className="animate-spin" /> : <Mic size={18} />}
+                {voiceTranscribing && !handsFreePhase ? <Loader2 size={18} className="animate-spin" /> : <Mic size={18} />}
               </button>
             )}
             {(isRunning || stopState === 'soft_pending' || stopState === 'killing') && onStop ? (
