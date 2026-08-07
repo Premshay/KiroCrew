@@ -110,7 +110,7 @@ export default function NotificationsPage() {
           the stat grid stacks several rows tall, so height-locking would pin
           the feed/detail to the sliver left under the grid; the page scrolls as
           a whole instead (the standard page skeleton). */}
-      <div className={`px-6 pb-8 flex-1 min-h-0 flex flex-col ${isMobile ? 'overflow-y-auto' : 'overflow-hidden'}`}>
+      <div className={`pb-8 flex-1 min-h-0 flex flex-col ${isMobile ? 'px-2 overflow-y-auto' : 'px-6 overflow-hidden'}`}>
         <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(120px,1fr))] mb-4 shrink-0">
           <StatCard label={i18nT('pages.notificationsPage.total')} value={items.length} accent />
           <StatCard label={i18nT('pages.notificationsPage.unread')} value={unread} />
@@ -133,8 +133,11 @@ export default function NotificationsPage() {
           {isMobile && selected ? (
             <div className="flex-1 min-w-0">
               {/* Natural height: the page scrolls on mobile, so the detail body
-                  grows instead of inner-scrolling a clipped pane. */}
-              <Card className="flex flex-col">
+                  grows instead of inner-scrolling a clipped pane. p-0: the
+                  panel brings its own px-5; stacked with Card's p-5 and the
+                  page gutter it squeezed body text to ~260px on a 390px
+                  screen. */}
+              <Card className="flex flex-col p-0 overflow-hidden">
                 <button className="flex items-center gap-1 px-2 py-1.5 text-[13px] text-muted hover:text-text cursor-pointer bg-transparent border-none mb-1" onClick={() => setSelectedTs(null)}>
                   <ArrowLeft size={14} /> {i18nT('pages.notificationsPage.back')}
                 </button>
