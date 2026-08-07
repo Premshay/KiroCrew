@@ -9,11 +9,13 @@ import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNoti
 import { MC_NOTIFICATION_EVENT, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone, type McNotificationDetail } from './notificationEvent'
 import { emitThemeSound } from './themeSound'
 import {
-  fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop, sseSideQueue, reconcileWorkflowRuns
+  fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceBusy, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop, sseSideQueue, reconcileWorkflowRuns
 } from '../store/chatSlice'
 import { TAB_ID } from '../api/tabId'
 import { api } from '../api/client'
 import { sanitizeLlmOutput } from '../utils/sanitize'
+import { nextSpeakableSpan, MIN_TTS_CHARS } from './sentenceCutter'
+import { markFirstAudio, markFirstToken } from '../utils/voiceTurnMetrics'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
 import type { StatusData, ChatMessage, ChatSlot, ChatFolder, Notification, PullRequestStatusBatch, TodoList } from '../types'
 import { i18nT } from '../i18n/t'
@@ -237,6 +239,9 @@ export function useWebSocket() {
   const voiceProgressRef = useRef<VoiceProgress | null>(null)
   const voiceMutedRef = useRef(false)  // suppress incoming chunks after interrupt
   const synthChainRef = useRef<Promise<unknown>>(Promise.resolve())  // serialize TTS calls
+  const synthInFlightRef = useRef(0)
+  const synthAbortRef = useRef<AbortController | null>(null)
+  const voiceBusyRef = useRef(false)
   // #1 streaming-chunk coalescing: accumulate per-slot chunk text and flush
   // once per animation frame, so the store updates (and the O(N) displayItems /
   // index-map recomputes each dispatch triggers) happen ~per frame instead of
@@ -257,8 +262,18 @@ export function useWebSocket() {
   const slotActivityRafRef = useRef<number | null>(null)
   const slotActivityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  const updateVoiceBusy = useCallback(() => {
+    const busy = synthInFlightRef.current > 0 || voiceQueueRef.current.length > 0 || voicePlayingRef.current
+    if (busy !== voiceBusyRef.current) {
+      voiceBusyRef.current = busy
+      dispatch(setVoiceBusy(busy))
+    }
+  }, [dispatch])
+
   const stopVoice = useCallback(() => {
     voiceMutedRef.current = true
+    synthAbortRef.current?.abort()
+    synthAbortRef.current = null
     if (activeAudioRef.current) {
       activeAudioRef.current.pause()
       activeAudioRef.current = null
@@ -267,7 +282,8 @@ export function useWebSocket() {
     voiceQueueRef.current = []
     voicePlayingRef.current = false
     dispatch(setVoicePlaying(false))
-  }, [dispatch])
+    updateVoiceBusy()
+  }, [dispatch, updateVoiceBusy])
 
   const voiceProgressFor = useCallback((slot: string, message: ChatMessage): VoiceProgress | null => {
     const messageId = voiceMessageId(message)
@@ -283,10 +299,18 @@ export function useWebSocket() {
   }, [])
 
   const enqueueVoiceSynthesis = useCallback((slot: string, text: string) => {
+    if (!synthAbortRef.current) synthAbortRef.current = new AbortController()
+    const signal = synthAbortRef.current.signal
+    synthInFlightRef.current += 1
+    updateVoiceBusy()
     synthChainRef.current = synthChainRef.current
-      .then(() => api.voiceSynthesize(slot, text))
+      .then(() => signal.aborted ? undefined : api.voiceSynthesize(slot, text, { signal }))
       .catch(() => {})
-  }, [])
+      .finally(() => {
+        synthInFlightRef.current = Math.max(0, synthInFlightRef.current - 1)
+        updateVoiceBusy()
+      })
+  }, [updateVoiceBusy])
 
   const flushVoiceTail = useCallback((slot: string, message: ChatMessage) => {
     const progress = voiceProgressFor(slot, message)
@@ -295,7 +319,7 @@ export function useWebSocket() {
     // Mark the whole message consumed even when its tail is below the speech
     // floor, so a later completion event cannot reconsider or repeat it.
     progress.spokenLen = message.content.length
-    if (remaining.length >= 10) enqueueVoiceSynthesis(slot, remaining)
+    if (remaining.length >= MIN_TTS_CHARS) enqueueVoiceSynthesis(slot, remaining)
   }, [enqueueVoiceSynthesis, voiceProgressFor])
 
   const playNextVoiceChunk = useCallback(() => {
@@ -312,21 +336,26 @@ export function useWebSocket() {
         playNextVoiceChunk()
       } else {
         dispatch(setVoicePlaying(false))
+        updateVoiceBusy()
       }
     }
     audio.onerror = () => {
       URL.revokeObjectURL(url)
       activeAudioRef.current = null
       voicePlayingRef.current = false
+      updateVoiceBusy()
       playNextVoiceChunk()
     }
-    audio.play().catch(() => {
+    audio.play().then(() => {
+      markFirstAudio()
+    }).catch(() => {
       URL.revokeObjectURL(url)
       activeAudioRef.current = null
       voicePlayingRef.current = false
+      updateVoiceBusy()
       playNextVoiceChunk()
     })
-  }, [dispatch])
+  }, [dispatch, updateVoiceBusy])
 
   /** Bumped by every `autonudge_state` frame. A seed captures this before its
    *  fetch and discards the response if a frame landed while it was in flight:
@@ -554,19 +583,10 @@ export function useWebSocket() {
       if (streaming) {
         const progress = voiceProgressFor(activeSlot, streaming)
         if (!progress) return
-        const full = streaming.content
-        let lastBound = -1
-        const re = /[.!?](?:\s|$)/g
-        let match
-        while ((match = re.exec(full)) !== null) {
-          if (match.index + 1 > progress.spokenLen) lastBound = match.index + 1
-        }
-        if (lastBound > progress.spokenLen) {
-          const newText = full.slice(progress.spokenLen, lastBound).trim()
-          if (newText.length >= 10) {
-            progress.spokenLen = lastBound
-            enqueueVoiceSynthesis(activeSlot, newText)
-          }
+        const span = nextSpeakableSpan(streaming.content, progress.spokenLen)
+        if (span) {
+          progress.spokenLen = span.nextSpokenLen
+          enqueueVoiceSynthesis(activeSlot, span.text)
         }
       }
     }
@@ -1163,6 +1183,7 @@ export function useWebSocket() {
             // index maps — on every token.
             const cs = data.slot
             if (cs) {
+              if (cs === store.getState().chat.activeSlot) markFirstToken()
               const buf = chunkBufRef.current
               let entry = buf.get(cs)
               if (!entry) { entry = { content: '', lastSeq: undefined }; buf.set(cs, entry) }
@@ -1535,6 +1556,7 @@ export function useWebSocket() {
                 const url = URL.createObjectURL(blob)
                 voiceQueueRef.current.push(url)
                 dispatch(setVoicePlaying(true))
+                updateVoiceBusy()
                 playNextVoiceChunk()
               } catch { /* malformed base64 */ }
             }
@@ -1651,7 +1673,7 @@ export function useWebSocket() {
     }
 
     ws.onerror = () => { /* onclose will fire */ }
-  }, [dispatch, flushChunks, scheduleChunkFlush, bufferSlotActivity, playNextVoiceChunk, queryClient, stopVoice, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordRetiredId])
+  }, [dispatch, flushChunks, scheduleChunkFlush, bufferSlotActivity, playNextVoiceChunk, queryClient, stopVoice, updateVoiceBusy, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordRetiredId])
 
   /**
    * Force an immediate reconnect: cancels any pending backoff timer, closes

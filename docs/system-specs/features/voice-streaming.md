@@ -21,8 +21,11 @@ Piper:  POST /api/voice/synthesize → synthesize_speech() one WAV
 
 | Component | File | Role |
 |-----------|------|------|
-| Sentence detector | `frontend/src/hooks/useWebSocket.ts` | Watches streaming chunks for sentence boundaries |
-| Playback queue | `frontend/src/hooks/useWebSocket.ts` | Queues and plays audio chunks sequentially |
+| Sentence cutter | `website/src/hooks/sentenceCutter.ts` | Pure boundary logic: where the next speakable span ends (see Streaming Auto-Speak Flow) |
+| Sentence detector | `website/src/hooks/useWebSocket.ts` | Feeds streamed text through the cutter on each chunk flush |
+| Playback queue | `website/src/hooks/useWebSocket.ts` | Queues and plays audio chunks sequentially |
+| Turn-taking hold | `website/src/hooks/useHandsFreeLoop.ts` + `website/src/pages/ChatPage.tsx` | Hands-free conversation mode: mic stays closed while the reply speaks; barge-in on mic tap (see Hands-Free Conversation Turn-Taking) |
+| Turn latency marks | `website/src/utils/voiceTurnMetrics.ts` | Debug-level per-turn spans: end-of-speech → first token / first audio |
 | Synthesize endpoint | `src/kiro_crew/dashboard/chat_voice.py` | `POST /api/voice/synthesize` — Polly: splits text into sentences + broadcasts chunks; Piper: `_synthesize_nonstreaming()` emits one clip (re-exported via `chat.py`) |
 | Voice config endpoint | `src/kiro_crew/dashboard/chat_voice.py` | `GET/PUT /api/voice/config` — read/update voice settings incl. `provider` + `piper_*` (re-exported via `chat.py`) |
 | TTS synthesis | `src/kiro_crew/voice_reply.py` | `synthesize_speech()` provider dispatcher (Polly `aws polly` / local `piper`), `streaming_voice_reply()` (Polly-only), `validate_length_scale()`, `stitch_mp3s()` |
@@ -33,8 +36,13 @@ Piper:  POST /api/voice/synthesize → synthesize_speech() one WAV
 1. User sends a message; `voiceProgressRef` clears its prior message identity
 2. Backend streams `chat_chunk` events via WebSocket
 3. Frontend accumulates text in a `streaming` message in Redux
-4. On each chunk, regex scans for sentence boundaries (`[.!?]` followed by whitespace)
-5. New complete sentences (≥10 chars) are sent to `POST /api/voice/synthesize`
+4. On each chunk flush, `sentenceCutter.ts` scans for sentence boundaries:
+   terminal punctuation (`[.!?]` followed by whitespace or end-of-text) only,
+   with guarded terminals that never cut — abbreviations (`e.g.`, `Dr.`),
+   bare list enumerators (`1.`, `a.` opening a line), and any terminal inside
+   an unbalanced ``` fence (code is held whole for the completion pass, whose
+   server-side strip sees the balanced fence and speaks its placeholder)
+5. New complete sentences (≥ `MIN_TTS_CHARS`, 10 chars) are sent to `POST /api/voice/synthesize`
 6. Backend calls Polly per sentence, broadcasts `voice_chunk` (base64 MP3) via WS
 7. Frontend decodes chunks into blob URLs, queues them, plays sequentially
 8. On `chat_segment` or `chat_done`, any remaining unspoken tail text is synthesized before finalization
@@ -42,16 +50,49 @@ Piper:  POST /api/voice/synthesize → synthesize_speech() one WAV
 
 ## Interrupt Mechanism
 
-Sending a new message while voice is playing triggers an interrupt:
+Sending a new message while voice is playing — or tapping the mic during a
+hands-free reply (barge-in) — triggers an interrupt:
 
-1. `ChatPage.tsx` dispatches a `voice-stop` DOM event on send
+1. `ChatPage.tsx` dispatches a `voice-stop` DOM event (on send, and on the
+   barge-in mic tap)
 2. `useWebSocket` listens for `voice-stop` and calls `stopVoice()`
-3. `stopVoice()` pauses the active `Audio` element, clears the queue, and sets `voiceMutedRef = true`
+3. `stopVoice()` aborts every in-flight `POST /api/voice/synthesize` via an
+   `AbortController` (one per speaking span), pauses the active `Audio`
+   element, clears the queue, and sets `voiceMutedRef = true`
 4. Incoming `voice_chunk` events from the old response are dropped while muted
 5. `chat_done` for the old response skips remaining-text synthesis when muted
 6. When a new response message identity is observed, `voiceMutedRef` resets to `false`
 
 The DOM event pattern avoids prop drilling between `ChatPage` (where send lives) and `useWebSocket` (where audio state lives, called from `App.tsx`).
+
+## Hands-Free Conversation Turn-Taking
+
+With hands-free dictation armed AND auto-speak on, the loop runs fast
+turn-taking (half-duplex — never listening while speaking):
+
+- **Hold.** `chat.voiceBusy` is true while the TTS pipeline is active
+  end-to-end: a synthesis POST in flight, chunks queued, or audio playing.
+  `ChatPage` passes `hold = autoSpeak && (slotRunning || voiceBusy)` into
+  `useHandsFreeLoop`, whose re-arm cycle will not open the mic while held. A
+  capture already in progress is never interrupted by a hold arriving
+  mid-utterance. `voiceBusy` (not `voicePlaying`) is the hold signal because
+  playing goes false in the gap between requesting a sentence's synthesis and
+  its audio arriving.
+- **Re-arm.** When the turn ends and the audio queue drains, the hold drops
+  and the ordinary re-arm cycle (400 ms delay) reopens the mic.
+- **Barge-in.** While the reply speaks, the mic button is the interrupt: the
+  tap fires `voice-stop` (stops audio, flushes the queue, aborts synthesis)
+  and sets a turn-scoped `bargedIn` flag so the hold does not re-assert while
+  the interrupted turn is still streaming; the loop re-arms the mic instead
+  of exiting. The flag clears when the turn and pipeline are fully idle.
+- **Phase.** The composer strip shows a `speaking` phase (with a
+  tap-to-interrupt hint) whenever the loop is armed and held.
+- **Latency marks.** The endpointer's auto-commit anchors a per-turn clock
+  (`voiceTurnMetrics.ts`); the first `chat_chunk` for the active slot and the
+  first audio `play()` log debug-level `end-of-speech → first token / first
+  audio` spans. Marks expire after 30 s; dead-end auto-sends clear them.
+
+With auto-speak off, hands-free keeps its dictate-anytime behavior — no hold.
 
 ## Voice Configuration
 
@@ -200,9 +241,12 @@ async pipeline: markdown strip → SSML → Polly → Slack file upload.
 | `voiceProgressRef` | `{ slot, messageId, spokenLen }` | Message-scoped character offset already sent to TTS |
 | `voiceMutedRef` | `boolean` | Suppresses incoming voice chunks after interrupt |
 | `synthChainRef` | `Promise` | Serializes synthesize calls to prevent out-of-order audio |
+| `synthInFlightRef` | `number` | In-flight synthesize POST count (feeds `voiceBusy`) |
+| `synthAbortRef` | `AbortController` | Aborts in-flight synthesis on interrupt/barge-in |
 
 Redux state in `chatSlice`:
 - `voicePlaying: boolean` — drives UI indicators
+- `voiceBusy: boolean` — pipeline active end-to-end (synthesis in flight, queued, or playing); the hands-free hold signal
 - `voiceAudio: string | null` — base64 stitched MP3 for replay via 🔊 button
 
 ## Manual Replay

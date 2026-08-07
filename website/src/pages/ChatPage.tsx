@@ -138,6 +138,7 @@ import { useVoiceInput, voiceInputSupported, type TranscriptOrigin } from '../ho
 import { usePushToTalk } from '../hooks/usePushToTalk'
 import { useHandsFreeLoop, type HandsFreeLoop } from '../hooks/useHandsFreeLoop'
 import { isSendableTranscript, HANDS_FREE_LS_KEY } from '../hooks/handsFreeVad'
+import { markEndOfSpeech, clearTurnMarks } from '../utils/voiceTurnMetrics'
 import { usePersistedBool } from '../hooks/usePersistedBool'
 import VoiceDisabledModal from '../components/VoiceDisabledModal'
 import { ChatFooter, AssistantMessage, UserMessage, PinnedPrompt } from './chat'
@@ -2016,12 +2017,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // loop re-arms either way via useHandsFreeLoop's cycle effect.
     if (handsFreeRef.current?.consumeAutoSend()) {
       const trimmed = text.trim()
-      if (!isSendableTranscript(trimmed)) return
+      // Dead-end auto-sends drop their end-of-speech mark: no turn will
+      // follow, and a stale mark would attribute a later, unrelated turn's
+      // first token to this abandoned utterance.
+      if (!isSendableTranscript(trimmed)) { clearTurnMarks(); return }
       if (target === activeSlotRef.current) {
         handsFreeRef.current.noteSent()
         sendRef.current?.(trimmed)
         return
       }
+      clearTurnMarks()
       // Slot changed while the transcript was in flight (the switch disarms
       // the loop, but this delivery raced it): fall through to the normal
       // routing below so the words land in the originating slot's draft
@@ -2430,6 +2435,34 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   handsFreePrefRef.current = handsFreePref
   const handsFreeUsableRef = useRef(handsFreeUsable)
   handsFreeUsableRef.current = handsFreeUsable
+  // ---- Conversation turn-taking (fast turn-taking, NOT duplex) ----
+  // While auto-speak is on and the assistant holds the floor — turn running,
+  // or its TTS pipeline busy (synthesis in flight / audio queued / playing) —
+  // the hands-free loop must not re-open the mic: it would record the reply.
+  // The mic re-arms when BOTH end (the audio queue drains after the turn).
+  // With auto-speak off there is no reply audio, so the loop keeps its
+  // dictate-while-streaming behavior unchanged.
+  const voiceBusy = useAppSelector(s => s.chat.voiceBusy)
+  const voiceCfgQ = useQuery<{ autoSpeak?: boolean }>({ queryKey: ['voiceConfig'], queryFn: () => api.voiceConfig() })
+  const [autoSpeakOn, setAutoSpeakOn] = useState(false)
+  useEffect(() => { if (voiceCfgQ.data) setAutoSpeakOn(!!voiceCfgQ.data.autoSpeak) }, [voiceCfgQ.data])
+  // ChatSettings flips the config without writing the query cache; the event
+  // is the live signal both it and VoicePanel emit (mirrors useWebSocket).
+  useEffect(() => {
+    const onCfg = (e: Event) => { const d = (e as CustomEvent).detail; if (d && 'autoSpeak' in d) setAutoSpeakOn(!!d.autoSpeak) }
+    window.addEventListener('voice-config-changed', onCfg)
+    return () => window.removeEventListener('voice-config-changed', onCfg)
+  }, [])
+  // Barge-in: a mic tap while the reply is speaking stops the audio and hands
+  // the floor back to the user for the REST OF THIS TURN — the hold must not
+  // re-assert while the interrupted turn is still streaming, so the flag
+  // holds until the turn and its audio pipeline are both fully idle.
+  const [bargedIn, setBargedIn] = useState(false)
+  useEffect(() => { if (!slotRunning && !voiceBusy) setBargedIn(false) }, [slotRunning, voiceBusy])
+  useEffect(() => { setBargedIn(false) }, [activeSlot])
+  const convoHold = autoSpeakOn && !bargedIn && (!!slotRunning || voiceBusy)
+  const convoHoldRef = useRef(convoHold)
+  convoHoldRef.current = convoHold
   const handsFree = useHandsFreeLoop({
     enabled: handsFreePref && handsFreeUsable,
     recording: voice.recording,
@@ -2437,17 +2470,27 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     error: voice.error,
     clearError: voice.clearError,
     sampleRef: voice.sampleRef,
+    hold: convoHold,
     // Capture controls. Read via the loop's own opts ref, so inline closures
     // are fine — and toggleVoice keeps owning the config gates + disarm resets.
     start: () => { if (!voiceRef.current.recording && !voiceRef.current.transcribing) toggleVoice() },
     stopCommit: () => { if (voiceRef.current.recording) toggleVoice() },
+    // The endpointer judged end-of-speech: anchor this turn's latency spans.
+    onAutoCommit: markEndOfSpeech,
     cancelDiscard: cancelVoice,
   })
   handsFreeRef.current = handsFree
   // The mic button: in hands-free mode it arms/exits the LOOP instead of a
   // one-shot dictation. Exiting commits the in-flight utterance to the
-  // composer — after a manual act nothing may auto-send.
+  // composer — after a manual act nothing may auto-send. While the reply is
+  // SPEAKING, the same tap is the barge-in: audio stops, queued synthesis is
+  // cancelled, and the loop re-arms the mic instead of exiting.
   const handleVoiceToggle = useCallback(() => {
+    if (handsFreeRef.current?.armed && convoHoldRef.current) {
+      window.dispatchEvent(new Event('voice-stop'))
+      setBargedIn(true)
+      return
+    }
     if (handsFreeRef.current?.armed) { handsFreeRef.current.exit('commit'); return }
     if (handsFreePrefRef.current && handsFreeUsableRef.current) { handsFreeRef.current?.arm(); return }
     toggleVoice()
