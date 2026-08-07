@@ -285,7 +285,10 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
                 const actionBtn = 'px-3 py-1 rounded-lg text-[12px] font-medium cursor-pointer font-body whitespace-nowrap transition-colors bg-[color-mix(in_srgb,var(--bg-hover)_80%,transparent)] backdrop-blur border border-[color-mix(in_srgb,var(--border)_45%,transparent)] hover:bg-bg-hover'
                 return (
                   <div key={n.ts} className={isStackChild && !mac ? 'ml-4' : ''}>
-                    <div data-notif-row
+                    {/* data-notif-ts lets the notifications page scroll a
+                        deep-linked (?id=<ts>) row into view without owning
+                        the feed's DOM. */}
+                    <div data-notif-row data-notif-ts={n.ts}
                       className={mac
                         ? `group flex flex-col px-3 py-2.5 rounded-2xl ${promptChannel || collapsedStack ? 'mb-0' : 'mb-2'} ${promptChannel ? 'rounded-b-none' : ''} ${collapsedStack ? 'relative z-[2] cursor-pointer' : ''} transition-all ${macCard}`
                         : `group flex flex-col px-2.5 py-2 rounded-md ${promptChannel ? 'rounded-b-none mb-0' : 'mb-1'} transition-all border-l-[3px] ${panelBorder} ${silenced ? 'border border-dashed border-border bg-transparent' : active ? 'bg-accent-subtle border border-accent' : 'border border-transparent hover:bg-bg-hover hover:border-border'} ${(n.acked || prio === 'passive') && !active && !silenced ? 'opacity-50' : ''} ${silenced ? 'opacity-60' : ''}`}
