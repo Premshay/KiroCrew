@@ -87,13 +87,13 @@ function isDeviceUnavailable(name: string): boolean {
 export async function acquireMicStream(exactId?: string): Promise<MediaStream> {
   const explicit = exactId !== undefined
   const id = explicit ? exactId : getPreferredMicId()
-  if (!id) return navigator.mediaDevices.getUserMedia({ audio: true })
+  if (!id) return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true } })
   try {
-    return await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: id } } })
+    return await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: id }, echoCancellation: true } })
   } catch (e) {
     if (explicit) throw e
     if (isDeviceUnavailable((e as { name?: string } | null)?.name || '')) {
-      return navigator.mediaDevices.getUserMedia({ audio: true })
+      return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true } })
     }
     throw e
   }

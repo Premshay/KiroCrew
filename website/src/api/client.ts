@@ -2606,8 +2606,15 @@ export const api = {
     }).then(j) as Promise<{ ok?: boolean; error?: string; code?: string; identityDetail?: string }>,
   revokeAwsConsent: (service: string) =>
     del('/api/aws/consent?service=' + encodeURIComponent(service)).then(j) as Promise<{ ok?: boolean; removed?: boolean }>,
-  voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string }) =>
-    post('/api/voice/synthesize', { slot, text, ...opts }).then(j),
+  voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; signal?: AbortSignal }) => {
+    const { signal, ...body } = opts ?? {}
+    return fetch('/api/voice/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ..._sk },
+      body: JSON.stringify({ slot, text, ...body }),
+      ...(signal ? { signal } : {}),
+    }).then(j)
+  },
 
   // Channels
   channelsList: () => fetch('/api/channels').then(j),

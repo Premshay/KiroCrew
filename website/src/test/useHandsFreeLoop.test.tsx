@@ -25,6 +25,8 @@ function makeHarness() {
     recording: false,
     transcribing: false,
     error: null as string | null,
+    hold: undefined as boolean | undefined,
+    onAutoCommit: undefined as (() => void) | undefined,
   }
   const hook = renderHook(
     (p: typeof props) =>
@@ -200,5 +202,69 @@ describe('useHandsFreeLoop', () => {
     }
     expect(hook.result.current.armed).toBe(true)
     expect(controls.start).toHaveBeenCalledTimes(5)
+  })
+
+  it('hold blocks the re-arm while the assistant speaks, then re-arms when it drops', () => {
+    const { hook, controls, props } = makeHarness()
+    act(() => hook.result.current.arm())
+    hook.rerender({ ...props, hold: true })
+    expect(hook.result.current.phase).toBe('speaking')
+    // The whole hold span passes without the mic opening.
+    act(() => { vi.advanceTimersByTime(5000) })
+    expect(controls.start).not.toHaveBeenCalled()
+    expect(hook.result.current.armed).toBe(true)
+    // Reply finished, audio queue drained: the ordinary re-arm cycle resumes.
+    hook.rerender({ ...props, hold: false })
+    expect(hook.result.current.phase).toBe('listening')
+    act(() => { vi.advanceTimersByTime(500) })
+    expect(controls.start).toHaveBeenCalledTimes(1)
+  })
+
+  it('a hold arriving mid-capture never interrupts the capture in progress', () => {
+    const { hook, sampleRef, controls, props } = makeHarness()
+    act(() => hook.result.current.arm())
+    act(() => { vi.advanceTimersByTime(500) })
+    expect(controls.start).toHaveBeenCalledTimes(1)
+    hook.rerender({ ...props, recording: true })
+    // The reply's first sentence starts speaking while the user is still
+    // being recorded (streaming overlap): the capture must run to its own
+    // endpoint, not be cut off.
+    hook.rerender({ ...props, recording: true, hold: true })
+    act(() => { vi.advanceTimersByTime(200) })
+    act(() => { sampleRef.current.level = SPEECH })
+    act(() => { vi.advanceTimersByTime(400) })
+    act(() => { sampleRef.current.level = QUIET })
+    act(() => { vi.advanceTimersByTime(600) })
+    expect(controls.stopCommit).toHaveBeenCalledTimes(1)
+    expect(controls.cancelDiscard).not.toHaveBeenCalled()
+    // With the hold still up after the cycle, the mic stays closed.
+    hook.rerender({ ...props, recording: false, hold: true })
+    act(() => { vi.advanceTimersByTime(2000) })
+    expect(controls.start).toHaveBeenCalledTimes(1)
+  })
+
+  it('fires onAutoCommit only for endpointer commits, never manual exits', () => {
+    const { hook, sampleRef, controls, props } = makeHarness()
+    const onAutoCommit = vi.fn()
+    // Endpointer path: arm, capture, endpoint on silence.
+    hook.rerender({ ...props, onAutoCommit })
+    act(() => hook.result.current.arm())
+    act(() => { vi.advanceTimersByTime(500) })
+    hook.rerender({ ...props, onAutoCommit, recording: true })
+    act(() => { vi.advanceTimersByTime(200) })
+    act(() => { sampleRef.current.level = SPEECH })
+    act(() => { vi.advanceTimersByTime(400) })
+    act(() => { sampleRef.current.level = QUIET })
+    act(() => { vi.advanceTimersByTime(600) })
+    expect(onAutoCommit).toHaveBeenCalledTimes(1)
+    expect(controls.stopCommit).toHaveBeenCalledTimes(1)
+    // Manual path: a user exit commits without the auto-commit seam firing.
+    act(() => { sampleRef.current.level = QUIET })
+    act(() => hook.result.current.arm())
+    act(() => { vi.advanceTimersByTime(500) })
+    hook.rerender({ ...props, onAutoCommit, recording: true })
+    act(() => hook.result.current.exit('commit'))
+    expect(controls.stopCommit).toHaveBeenCalledTimes(2)
+    expect(onAutoCommit).toHaveBeenCalledTimes(1)
   })
 })
