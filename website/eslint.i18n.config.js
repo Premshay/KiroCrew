@@ -192,6 +192,35 @@ export default [
       // module parser-facing only, and keep it DOM-free, which is the property
       // that makes that easy to check.
       'src/hooks/themeCss.ts',
+      // The streaming-TTS sentence cutter. `ABBREVIATIONS` is a closed set of
+      // abbreviation TOKENS ('e.g', 'Mr', 'Dr', …) matched against transcript text
+      // to decide where a `.` is a sentence terminal versus part of "Dr." or
+      // "e.g." — pattern data compared with `Set.has()`, never rendered to a user
+      // and never passed through `i18nT()`. `no-literal-string` flags seven of the
+      // thirteen tokens (the capitalized ones — the lowercase tokens already pass
+      // the Tailwind/CSS shape exclusion above by coincidence), and `i18n-strict`
+      // additionally tags them `[i18n-strict:all-caps-const]` because the name is
+      // ALL-CAPS, which routes them onto the zero-tolerance `[added-lines]` /
+      // `[vs-base]` diff gates rather than the report-only `[allcaps]` bucket —
+      // correctly, since that routing exists to catch exactly this shape
+      // (`ChatSidebar`'s filter/sort menus, `lib/effort.ts`) when the constant
+      // DOES hold real copy. Here it does not.
+      //
+      // Verified copy-free rather than assumed: the module imports no `react`,
+      // renders no JSX, and calls neither `i18nT` nor `useTranslation` (it is
+      // "the pure, unit-testable half" of the streaming-TTS pipeline, per its own
+      // header comment) — every other export is a regex, an index, or a
+      // `{ text, nextSpokenLen }` span. A closed-set content regex was considered
+      // and rejected: matching the literal text 'Mr' / 'Dr' / 'St' etc. wherever it
+      // appears would also exempt those strings if real UI copy (a title picker,
+      // an address field) ever used them, and no such occurrence exists today to
+      // even measure a blast radius against. A path this narrow cannot leak into
+      // a file that does hold copy.
+      //
+      // Stated as a false-negative class, per this file's convention: any
+      // user-visible copy ever added to THIS path will not be reported — keep the
+      // module parser-facing only.
+      'src/hooks/sentenceCutter.ts',
     ],
     linterOptions: {
       // Every `eslint-disable` comment in this codebase targets the MAIN config's
