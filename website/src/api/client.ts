@@ -1562,8 +1562,18 @@ export const api = {
   voiceConfig: () => fetch('/api/voice/config').then(j),
   updateVoiceConfig: (body: object) => put('/api/voice/config', body).then(j),
   voiceVoices: () => fetch('/api/voice/voices').then(j),
-  voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string }) =>
-    post('/api/voice/synthesize', { slot, text, ...opts }).then(j),
+  // `signal` aborts the request client-side (barge-in cancels queued
+  // sentences); it is split from the body so an AbortSignal never lands in the
+  // JSON payload.
+  voiceSynthesize: (slot: string, text: string, opts?: { voice?: string; engine?: string; rate?: string; pitch?: string; signal?: AbortSignal }) => {
+    const { signal, ...body } = opts ?? {}
+    return fetch('/api/voice/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ..._sk },
+      body: JSON.stringify({ slot, text, ...body }),
+      ...(signal ? { signal } : {}),
+    }).then(j)
+  },
 
   // Channels
   channelsList: () => fetch('/api/channels').then(j),

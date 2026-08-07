@@ -7,9 +7,11 @@ import { sseStatus, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, setC
 import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, fetchNotifications } from '../store/notificationsSlice'
 import { MC_NOTIFICATION_EVENT, TURN_DONE_KIND, shouldChimeOnTurnDone, type McNotificationDetail } from './notificationEvent'
 import { emitThemeSound } from './themeSound'
-import { fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop } from '../store/chatSlice'
+import { fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceBusy, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop } from '../store/chatSlice'
 import { api } from '../api/client'
 import { sanitizeLlmOutput } from '../utils/sanitize'
+import { nextSpeakableSpan, MIN_TTS_CHARS } from './sentenceCutter'
+import { markFirstToken, markFirstAudio } from '../utils/voiceTurnMetrics'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
 import type { StatusData, ChatSlot, Notification, PullRequestStatusBatch, TodoList } from '../types'
 import { i18nT } from '../i18n/t'
@@ -135,6 +137,16 @@ export function useWebSocket() {
   const spokeThisTurnRef = useRef(false)
   const voiceMutedRef = useRef(false)  // suppress incoming chunks after interrupt
   const synthChainRef = useRef<Promise<unknown>>(Promise.resolve())  // serialize TTS calls
+  // In-flight synthesis POSTs. Together with the queue and the playing flag
+  // this drives chat.voiceBusy — the queue alone goes empty in the window
+  // between requesting a sentence's synthesis and its voice_chunk arriving,
+  // and the hands-free hold must span that gap.
+  const synthInFlightRef = useRef(0)
+  // Aborts every chained synthesis fetch on barge-in. One controller per
+  // speaking span: stopVoice() aborts and drops it; the next enqueue creates
+  // a fresh one.
+  const synthAbortRef = useRef<AbortController | null>(null)
+  const voiceBusyRef = useRef(false)
   // #1 streaming-chunk coalescing: accumulate per-slot chunk text and flush
   // once per animation frame, so the store updates (and the O(N) displayItems /
   // index-map recomputes each dispatch triggers) happen ~per frame instead of
@@ -145,8 +157,47 @@ export function useWebSocket() {
   const chunkRafRef = useRef<number | null>(null)
   const chunkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  /** Recompute chat.voiceBusy from the three pipeline stages; dispatch only on
+   *  a transition so per-chunk traffic doesn't spam the store. */
+  const updateVoiceBusy = useCallback(() => {
+    const busy = synthInFlightRef.current > 0
+      || voiceQueueRef.current.length > 0
+      || voicePlayingRef.current
+    if (busy !== voiceBusyRef.current) {
+      voiceBusyRef.current = busy
+      dispatch(setVoiceBusy(busy))
+    }
+  }, [dispatch])
+
+  /** Serialize one sentence's TTS synthesis onto the chain. Serialization is
+   *  the ordering guarantee: the gateway broadcasts a sentence's voice_chunk
+   *  before its POST resolves, so chaining the next POST behind the previous
+   *  response means chunks can never arrive out of order — while the CURRENT
+   *  sentence is still playing from the queue, i.e. the next one is
+   *  pre-fetched during playback, not after it. */
+  const enqueueSynth = useCallback((slot: string, text: string) => {
+    if (!synthAbortRef.current) synthAbortRef.current = new AbortController()
+    const signal = synthAbortRef.current.signal
+    synthInFlightRef.current += 1
+    updateVoiceBusy()
+    synthChainRef.current = synthChainRef.current
+      .then(() => signal.aborted ? undefined : api.voiceSynthesize(slot, text, { signal }))
+      .catch(() => {})
+      .finally(() => {
+        synthInFlightRef.current = Math.max(0, synthInFlightRef.current - 1)
+        updateVoiceBusy()
+      })
+  }, [updateVoiceBusy])
+
   const stopVoice = useCallback(() => {
     voiceMutedRef.current = true
+    // Cancel synthesis still in flight — barge-in must stop future sentences,
+    // not only the audio already queued. The aborted fetches settle through
+    // their own finally, which walks the in-flight count back down.
+    if (synthAbortRef.current) {
+      synthAbortRef.current.abort()
+      synthAbortRef.current = null
+    }
     if (activeAudioRef.current) {
       activeAudioRef.current.pause()
       activeAudioRef.current = null
@@ -155,7 +206,8 @@ export function useWebSocket() {
     voiceQueueRef.current = []
     voicePlayingRef.current = false
     dispatch(setVoicePlaying(false))
-  }, [dispatch])
+    updateVoiceBusy()
+  }, [dispatch, updateVoiceBusy])
 
   const playNextVoiceChunk = useCallback(() => {
     if (voicePlayingRef.current || voiceQueueRef.current.length === 0) return
@@ -171,21 +223,28 @@ export function useWebSocket() {
         playNextVoiceChunk()
       } else {
         dispatch(setVoicePlaying(false))
+        updateVoiceBusy()
       }
     }
     audio.onerror = () => {
       URL.revokeObjectURL(url)
       activeAudioRef.current = null
       voicePlayingRef.current = false
+      updateVoiceBusy()
       playNextVoiceChunk()
     }
-    audio.play().catch(() => {
+    audio.play().then(() => {
+      // Resolution of play() is the closest observable to sound reaching the
+      // speaker; a no-op unless an end-of-speech mark is pending.
+      markFirstAudio()
+    }).catch(() => {
       URL.revokeObjectURL(url)
       activeAudioRef.current = null
       voicePlayingRef.current = false
+      updateVoiceBusy()
       playNextVoiceChunk()
     })
-  }, [dispatch])
+  }, [dispatch, updateVoiceBusy])
 
   /** Bumped by every `autonudge_state` frame. A seed captures this before its
    *  fetch and discards the response if a frame landed while it was in flight:
@@ -321,26 +380,15 @@ export function useWebSocket() {
       const msgs = store.getState().chat.messages
       const streaming = [...msgs].reverse().find(m => m.role === 'streaming')
       if (streaming) {
-        const full = streaming.content
-        let lastBound = -1
-        const re = /[.!?](?:\s|$)/g
-        let match
-        while ((match = re.exec(full)) !== null) {
-          if (match.index + 1 > spokenLenRef.current) lastBound = match.index + 1
-        }
-        if (lastBound > spokenLenRef.current) {
-          const newText = full.slice(spokenLenRef.current, lastBound).trim()
-          if (newText.length >= 10) {
-            spokenLenRef.current = lastBound
-            spokeThisTurnRef.current = true
-            synthChainRef.current = synthChainRef.current
-              .then(() => api.voiceSynthesize(activeSlot, newText))
-              .catch(() => {})
-          }
+        const span = nextSpeakableSpan(streaming.content, spokenLenRef.current)
+        if (span) {
+          spokenLenRef.current = span.nextSpokenLen
+          spokeThisTurnRef.current = true
+          enqueueSynth(activeSlot, span.text)
         }
       }
     }
-  }, [dispatch])
+  }, [dispatch, enqueueSynth])
 
   const scheduleChunkFlush = useCallback(() => {
     if (chunkFlushScheduledRef.current) return
@@ -709,6 +757,9 @@ export function useWebSocket() {
             // index maps — on every token.
             const cs = data.slot
             if (cs) {
+              // Latency mark: first streamed token after a voice end-of-speech
+              // (no-op without a pending mark — typed turns never mark).
+              if (cs === store.getState().chat.activeSlot) markFirstToken()
               const buf = chunkBufRef.current
               let entry = buf.get(cs)
               if (!entry) { entry = { content: '', lastSeq: undefined }; buf.set(cs, entry) }
@@ -956,10 +1007,8 @@ export function useWebSocket() {
                 // the counter — "remaining" would then be the whole reply,
                 // repeating everything already spoken.
                 const segmentReset = spokeThisTurnRef.current && spokenLenRef.current === 0
-                if (remaining.length >= 10 && !segmentReset) {
-                  synthChainRef.current = synthChainRef.current
-                    .then(() => api.voiceSynthesize(data.slot, remaining))
-                    .catch(() => {})
+                if (remaining.length >= MIN_TTS_CHARS && !segmentReset) {
+                  enqueueSynth(data.slot, remaining)
                 }
               }
               spokenLenRef.current = 0
@@ -1010,6 +1059,7 @@ export function useWebSocket() {
                 const url = URL.createObjectURL(blob)
                 voiceQueueRef.current.push(url)
                 dispatch(setVoicePlaying(true))
+                updateVoiceBusy()
                 playNextVoiceChunk()
               } catch { /* malformed base64 */ }
             }
@@ -1130,7 +1180,7 @@ export function useWebSocket() {
     }
 
     ws.onerror = () => { /* onclose will fire */ }
-  }, [dispatch, flushChunks, scheduleChunkFlush, playNextVoiceChunk, queryClient, stopVoice, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordResolvedAskId])
+  }, [dispatch, flushChunks, scheduleChunkFlush, playNextVoiceChunk, queryClient, stopVoice, enqueueSynth, updateVoiceBusy, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordResolvedAskId])
 
   /**
    * Force an immediate reconnect: cancels any pending backoff timer, closes

@@ -38,7 +38,13 @@ export function setPreferredMicId(id: string): void {
  */
 export function micAudioConstraints(): MediaStreamConstraints {
   const id = getPreferredMicId()
-  return { audio: id ? { deviceId: { ideal: id } } : true }
+  // echoCancellation is explicit, not left to the UA default: the hands-free
+  // conversation loop re-opens the mic right as reply audio finishes, and a
+  // speaker-playback tail bleeding into the capture reads as speech to the
+  // endpointer. Most browsers default it on; naming it makes that a contract.
+  const audio: MediaTrackConstraints = { echoCancellation: true }
+  if (id) audio.deviceId = { ideal: id }
+  return { audio }
 }
 
 /**

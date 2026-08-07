@@ -15,7 +15,7 @@ import { createUtteranceEndpointer, type EndpointerConfig } from './handsFreeVad
  * persisted preference must not surprise-open the mic on page load.
  */
 
-export type HandsFreePhase = 'listening' | 'processing' | 'sent'
+export type HandsFreePhase = 'listening' | 'processing' | 'sent' | 'speaking'
 
 /**
  * VAD poll cadence. The meter updates the sample every animation frame, so
@@ -54,8 +54,22 @@ interface Opts {
   start: () => void
   /** Stop the current capture and transcribe it (commit). */
   stopCommit: () => void
+  /**
+   * Fired when the ENDPOINTER (not the user) is about to commit a capture —
+   * the moment the user is judged to have stopped speaking. The seam for
+   * turn-latency instrumentation; manual commits (exit) never fire it.
+   */
+  onAutoCommit?: () => void
   /** Discard the current capture without transcribing. */
   cancelDiscard: () => void
+  /**
+   * Turn-taking hold: while true the loop stays armed but will not START a new
+   * capture — the assistant is replying (streaming a turn, or its TTS audio is
+   * synthesizing/queued/playing) and an open mic would record the reply
+   * instead of the user. Dropping back to false re-enters the ordinary re-arm
+   * cycle. A capture already in progress is never interrupted by the hold.
+   */
+  hold?: boolean
   vadConfig?: Partial<EndpointerConfig>
 }
 
@@ -157,9 +171,16 @@ export function useHandsFreeLoop(opts: Opts): HandsFreeLoop {
       return
     }
     if (opts.recording || opts.transcribing) return
+    // Turn-taking: the assistant holds the floor (reply streaming or its audio
+    // pipeline active). Do not open the mic — this effect re-runs when the
+    // hold drops and schedules the re-arm then. Checked after the
+    // recording/transcribing bail-outs so a hold arriving mid-capture (the
+    // reply's first sentence lands while the user is still being transcribed)
+    // never cancels work in progress.
+    if (opts.hold) return
     const t = setTimeout(() => {
       const o = optsRef.current
-      if (!o.recording && !o.transcribing && !o.error) {
+      if (!o.recording && !o.transcribing && !o.error && !o.hold) {
         cycleRecordedRef.current = false
         startAttemptedRef.current = true
         o.start()
@@ -167,7 +188,7 @@ export function useHandsFreeLoop(opts: Opts): HandsFreeLoop {
     }, REARM_DELAY_MS)
     return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- callbacks are read via optsRef (see its comment)
-  }, [armed, opts.enabled, opts.recording, opts.transcribing, opts.error, disarm])
+  }, [armed, opts.enabled, opts.recording, opts.transcribing, opts.error, opts.hold, disarm])
 
   // VAD polling while a hands-free capture is live. One endpointer per
   // capture: it calibrates its noise floor from that capture's opening window.
@@ -182,6 +203,7 @@ export function useHandsFreeLoop(opts: Opts): HandsFreeLoop {
       if (ev === 'endpoint') {
         fired = true
         autoSendRef.current = true
+        optsRef.current.onAutoCommit?.()
         optsRef.current.stopCommit()
       } else if (ev === 'abandon') {
         // Nobody spoke for the whole give-up window: stop holding the mic
@@ -243,13 +265,17 @@ export function useHandsFreeLoop(opts: Opts): HandsFreeLoop {
 
   // 'listening' covers the between-cycles gaps too (re-arm delay, capture
   // startup) so the strip doesn't flicker through idle several times a minute.
+  // 'sent' outranks 'speaking' so the confirmation flash still shows for its
+  // moment before the strip flips to the reply-playing state.
   const phase: HandsFreePhase | null = !armed
     ? null
     : opts.transcribing
       ? 'processing'
       : sentFlash
         ? 'sent'
-        : 'listening'
+        : opts.hold
+          ? 'speaking'
+          : 'listening'
 
   return { armed, phase, arm, disarm, exit, consumeAutoSend, noteSent }
 }
