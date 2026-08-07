@@ -119,7 +119,7 @@ export default function NotificationsPage() {
           the stat grid stacks several rows tall, so height-locking would pin
           the feed/detail to the sliver left under the grid; the page scrolls as
           a whole instead (the standard page skeleton). */}
-      <div ref={scrollRef} className={`px-4 md:px-6 pb-8 flex-1 min-h-0 flex flex-col ${isMobile ? 'overflow-y-auto' : 'overflow-hidden'}`}>
+      <div ref={scrollRef} className={`pb-8 flex-1 min-h-0 flex flex-col ${isMobile ? 'px-2 overflow-y-auto' : 'px-6 overflow-hidden'}`}>
         <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(120px,1fr))] mb-4 shrink-0">
           <StatCard label={i18nT('pages.notificationsPage.total')} value={items.length} accent />
           <StatCard label={i18nT('pages.notificationsPage.unread')} value={unread} />
@@ -153,8 +153,10 @@ export default function NotificationsPage() {
                 </button>
               </div>
               {/* Natural height: the page scrolls on mobile, so the detail body
-                  grows instead of inner-scrolling a clipped pane. */}
-              <Card className="flex flex-col">
+                  grows instead of inner-scrolling a clipped pane. The panel
+                  owns its horizontal padding, so avoid stacking the Card's
+                  inset on the narrower mobile page gutter. */}
+              <Card className="flex flex-col p-0 overflow-hidden">
                 <NotificationDetailPanel key={selected.ts} n={selected} onClose={() => setSelectedTs(null)} />
               </Card>
             </div>
