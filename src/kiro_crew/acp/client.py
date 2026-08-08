@@ -148,6 +148,11 @@ CLAUDE_ACP_BIN = "claude-agent-acp"
 # (mise/nvm/fnm/volta shims, npm global bin), so this resolves with no user
 # action when the binary is on PATH; otherwise the adapter surfaces its own
 # native-binary error.
+# Pause before respawning a failed session start. Sized to outlast an in-place
+# replacement of the agent CLI binary by its own self-updater, which is the one
+# recurring cause of an otherwise-healthy spawn failing.
+_ACP_RESPAWN_BACKOFF_S = 2.0
+
 CLAUDE_CODE_BIN = "claude"
 # npm package that provides the claude-agent-acp binary.  Install it publicly
 # with ``npm i -g @agentclientprotocol/claude-agent-acp`` (or add it as a
@@ -2812,11 +2817,18 @@ class AcpClient:
 
                     _startup_outcome = "ready"
                     return
-                except (AcpTimeoutError, AcpError) as exc:
+                except (AcpTimeoutError, AcpError, OSError) as exc:
                     if attempt == 0:
                         logger.warning("ACP init failed (%s), retrying with fresh process...", exc)
                         await self._kill_process(force=True)
                         self._reset_state()
+                        # The agent CLI is one binary shared by every process on
+                        # the host, and its self-updater replaces it in place, so
+                        # a spawn landing inside that window fails with the file
+                        # missing or busy. The rewrite takes well under a second;
+                        # retrying instantly just fails again inside the same
+                        # window, which is why OSError is caught here at all.
+                        await asyncio.sleep(_ACP_RESPAWN_BACKOFF_S)
                     else:
                         # AcpAuthRequired subclasses AcpError; label it distinctly
                         # so a not-logged-in exit is never counted as a generic
