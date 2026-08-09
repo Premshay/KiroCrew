@@ -108,6 +108,8 @@ async def apply_session_directive(
             result = await _suggest_followup(state, slot, args)
         elif kind == "ask_question":
             result = await _ask_question(state, slot, args)
+        elif kind == "session_checkpoint":
+            result = await _session_checkpoint(state, slot, args)
         else:
             _audit(session_key, kind, "error")
             return f"Error: unknown session directive {kind!r}."
@@ -409,6 +411,20 @@ async def _ask_question(state: Any, slot: Any, args: dict[str, Any]) -> str:
         "Question card shown in this session. End your turn now — the user's "
         "answer will arrive as your next message; do not re-ask or guess."
     )
+
+
+async def _session_checkpoint(state: Any, slot: Any, args: dict[str, Any]) -> str:
+    """Store a checkpoint on the consumer's own slot and publish its projection."""
+    setter = getattr(slot, "set_session_checkpoint", None)
+    if setter is None:
+        return "Error: this session cannot store a checkpoint."
+    setter(args)
+    if getattr(state, "conversation_log", None) is not None:
+        from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+        await save_slot_off_loop(state, slot, force=True)
+    _push(state)
+    return "Checkpoint recorded for this session's Multiplex view."
 
 
 def _push(state: Any) -> None:
