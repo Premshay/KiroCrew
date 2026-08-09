@@ -831,7 +831,8 @@ and let a sub-agent's card land in its parent's slot.
 
 **Return a session directive and let the session-aware consumer apply it.** This
 is what the `ask_question` MCP tool itself now does, along with `monitor_start`,
-`monitor_update`, `autonudge_stop`, `set_project` and `suggest_followup`
+`monitor_update`, `autonudge_stop`, `set_project`, `suggest_followup`, and
+`session_checkpoint`
 (`session_directive.DIRECTIVE_TOOLS`). The tool validates its arguments and
 returns a human-readable confirmation plus a marker line carrying the validated
 payload and **no session key**. `dashboard/chat_runner`'s tool-result handler

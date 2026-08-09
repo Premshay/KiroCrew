@@ -23,6 +23,12 @@ _CASES = {
     "set_project": {"project": "/workspace/foo", "clear": False},
     "suggest_followup": {"items": [{"title": "t", "prompt": "p"}]},
     "ask_question": {"questions": [{"question": "Which approach?", "options": [{"label": "A"}]}]},
+    "session_checkpoint": {
+        "summary": "Implementing the checkpoint writer.",
+        "main_items": ["Wire the MCP directive"],
+        "milestone": "Mapped the persistence seam.",
+        "progress": {"kind": "plan", "completed": 1, "total": 3, "label": "Checkpoint slice"},
+    },
 }
 
 
