@@ -437,9 +437,7 @@ def _record_terminal_timeline(slot: "_ChatSlot", stop_reason: str | None) -> Non
     if reason in ("", STOP_REASON_END_TURN, "stop", "completed"):
         return
     if reason == STOP_REASON_CANCELLED:
-        text = "Turn cancelled; no completion outcome was recorded."
-        consequence = "Inspect the conversation for any partial work before resuming."
-        priority = 75
+        return
     elif "timeout" in reason:
         text = "Turn timed out."
         consequence = "Verify partial work before resuming."
@@ -455,6 +453,16 @@ def _record_terminal_timeline(slot: "_ChatSlot", stop_reason: str | None) -> Non
         priority=priority,
         consequence=consequence,
     )
+
+
+def _approval_timeline_entry(operation: str) -> tuple[str, str]:
+    """Describe a human blocker even when the provider omits its operation label."""
+    if operation.strip().lower() in {"", "unknown", "tool", "command"}:
+        return (
+            "Approval required; operation not supplied by provider.",
+            "Open the conversation to inspect and approve or reject it.",
+        )
+    return f"Approval needed: {operation}.", "Awaiting your approval."
 
 
 def _emit_turn_metric(
@@ -7045,13 +7053,14 @@ async def _run_chat(
                 loop = asyncio.get_running_loop()
                 fut: asyncio.Future[str] = loop.create_future()
                 slot._approval_futures[str(event.request_id)] = fut
-                approval_operation = _extract_base_command(_safe_title) or _safe_title
+                approval_operation = _base or _extract_base_command(_safe_title) or _safe_title
+                approval_text, approval_consequence = _approval_timeline_entry(approval_operation)
                 slot.append_session_timeline(
-                    f"Approval needed: {approval_operation}.",
+                    approval_text,
                     "attention",
                     kind="attention",
                     priority=95,
-                    consequence="Awaiting your approval.",
+                    consequence=approval_consequence,
                 )
                 # Push via global SSE AFTER registering the future, so the
                 # slot dict reflects pending_approval=true and Board cards
@@ -9127,7 +9136,13 @@ async def _run_chat(
         slot.append("error", str(exc), "msg msg-err")
     except Exception as exc:
         logger.exception("Dashboard chat error in slot %s", slot.key)
-        slot.append_session_timeline("Turn ended with an error.", "terminal")
+        slot.append_session_timeline(
+            "Turn ended with an error.",
+            "terminal",
+            kind="terminal",
+            priority=90,
+            consequence="Inspect the conversation before retrying.",
+        )
         _err_text, _ = redact_exfiltration_urls(str(exc))
         _err_text, _ = redact_credentials(_err_text)
         slot.append("error", _err_text, "msg msg-err")
