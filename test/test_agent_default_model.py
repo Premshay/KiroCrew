@@ -29,7 +29,7 @@ from kiro_crew.config.loader import (
     resolve_agent_bindings,
     resolve_effective_model,
 )
-from kiro_crew.session import _session_model
+from kiro_crew.session import _session_crew_effort, _session_model
 
 
 def _load_from_dict(data: object) -> KiroCrewConfig:
@@ -208,6 +208,45 @@ class TestPerAgentModelStorage:
         )
         assert resolve_agent_bindings(cfg, "a").model == "claude-opus-5"
         assert resolve_agent_bindings(cfg, "b").model == "claude-sonnet-4.6"
+
+
+class TestPerAgentReasoningEffort:
+    """A crew's effort default is persisted independently of its model pin."""
+
+    def test_effort_round_trips_and_reaches_bindings(self) -> None:
+        cfg = _load_from_dict(
+            {
+                "agents": {
+                    "oncall": {
+                        "kiro_agent": "kirocrew",
+                        "reasoning_effort": "high",
+                    }
+                },
+                "default_agent": "oncall",
+            }
+        )
+        assert cfg.agents["oncall"].reasoning_effort == "high"
+        assert cfg.to_dict()["agents"]["oncall"]["reasoning_effort"] == "high"
+        assert resolve_agent_bindings(cfg, "oncall").reasoning_effort == "high"
+
+    @pytest.mark.parametrize("bad", ["ultra", 123, [], None])
+    def test_invalid_effort_loads_as_inherit(self, bad: object) -> None:
+        cfg = _load_from_dict(
+            {
+                "agents": {"oncall": {"kiro_agent": "kirocrew", "reasoning_effort": bad}},
+                "default_agent": "oncall",
+            }
+        )
+        assert cfg.agents["oncall"].reasoning_effort == ""
+        assert resolve_agent_bindings(cfg, "oncall").reasoning_effort == ""
+
+    def test_alias_only_session_surfaces_receive_the_crew_default(self) -> None:
+        cfg = _cfg(
+            {"oncall": {"kiro_agent": "kirocrew", "reasoning_effort": "xhigh"}},
+            "auto",
+        )
+        assert _session_crew_effort(cfg, "oncall") == "xhigh"
+        assert _session_crew_effort(cfg, "kirocrew") is None
 
 
 @pytest.fixture
