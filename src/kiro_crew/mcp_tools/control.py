@@ -498,12 +498,17 @@ def schemas() -> list[dict[str, Any]]:
                 "blocked, or finishing. Do NOT call every turn and do NOT summarize the "
                 "full transcript. The summary and current main_items replace the prior "
                 "view; milestone is appended to a seven-item server-capped trail. "
-                "Optional progress records a plan or goal count. This is session-bound: "
+                "Optional goal and progress describe the current objective. This is session-bound: "
                 "it updates only the session that called the tool."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "The session's current objective (max 240 chars).",
+                        "maxLength": 240,
+                    },
                     "summary": {
                         "type": "string",
                         "description": "What the session is working on now (max 360 chars).",

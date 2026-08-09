@@ -69,6 +69,7 @@ from kiro_crew.validation import (
     SESSION_CHECKPOINT_MAIN_ITEM_MAX,
     SESSION_CHECKPOINT_MAIN_ITEMS_MAX,
     SESSION_CHECKPOINT_MILESTONE_MAX,
+    SESSION_CHECKPOINT_GOAL_MAX,
     SESSION_CHECKPOINT_PROGRESS_LABEL_MAX,
     SESSION_CHECKPOINT_SUMMARY_MAX,
     SESSION_CHECKPOINT_TRAIL_MAX,
@@ -2424,6 +2425,9 @@ class _ChatSlot:
             for item in (raw_items if isinstance(raw_items, list) else [])
             if (text := self._checkpoint_text(item, SESSION_CHECKPOINT_MAIN_ITEM_MAX))
         ][:SESSION_CHECKPOINT_MAIN_ITEMS_MAX]
+        goal = self._checkpoint_text(checkpoint.get("goal"), SESSION_CHECKPOINT_GOAL_MAX)
+        if "goal" not in checkpoint and self._session_checkpoint is not None:
+            goal = self._session_checkpoint["goal"]
         old_trail = self._session_checkpoint.get("trail", []) if self._session_checkpoint else []
         trail = [
             text
@@ -2431,6 +2435,7 @@ class _ChatSlot:
             if (text := self._checkpoint_text(item, SESSION_CHECKPOINT_MILESTONE_MAX))
         ]
         self._session_checkpoint = {
+            "goal": goal,
             "summary": summary,
             "main_items": main_items,
             "trail": (trail + [milestone])[-SESSION_CHECKPOINT_TRAIL_MAX:],
@@ -2451,6 +2456,7 @@ class _ChatSlot:
         raw_trail = checkpoint.get("trail")
         updated_at = checkpoint.get("updated_at")
         self._session_checkpoint = {
+            "goal": self._checkpoint_text(checkpoint.get("goal"), SESSION_CHECKPOINT_GOAL_MAX),
             "summary": summary,
             "main_items": [
                 text
@@ -2478,6 +2484,7 @@ class _ChatSlot:
         if self._session_checkpoint is None:
             return None
         return {
+            "goal": self._session_checkpoint["goal"],
             "summary": self._session_checkpoint["summary"],
             "main_items": list(self._session_checkpoint["main_items"]),
             "trail": list(self._session_checkpoint["trail"]),
@@ -3622,6 +3629,7 @@ class _ChatSlot:
             # /api/chat/slots (cold load) and the WS `slots` snapshot — so the
             # pill survives reconnect without a separate rehydration path.
             "todo": self.todo_payload(),
+            "plan_goal": self._checkpoint_text(self._plan_goal, SESSION_CHECKPOINT_GOAL_MAX),
             "session_checkpoint": self.session_checkpoint_payload(),
             "session_timeline": self.session_timeline_payload(),
             "has_options": has_options,
