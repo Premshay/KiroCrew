@@ -360,7 +360,45 @@ def _record_plan_timeline(
     if current == previous:
         return
     label = f"Plan updated: {goal}" if goal else "Plan updated"
-    slot.append_session_timeline(f"{label} ({len(titles)} stages).", "plan")
+    slot.append_session_timeline(
+        f"{label} ({len(titles)} stages).",
+        "plan",
+        kind="plan",
+        priority=80,
+    )
+
+
+def _todo_timeline_entry(previous: object, current: object) -> tuple[str, str] | None:
+    """Return one operator-facing TODO outcome from two structured snapshots."""
+    if not isinstance(current, dict):
+        return None
+    current_tasks = current.get("tasks")
+    if not isinstance(current_tasks, list):
+        return None
+    previous_tasks = previous.get("tasks") if isinstance(previous, dict) else []
+    if not isinstance(previous_tasks, list):
+        previous_tasks = []
+    completed_before = {
+        str(task.get("id") or task.get("text") or "")
+        for task in previous_tasks
+        if isinstance(task, dict) and task.get("completed")
+    }
+    newly_completed = [
+        str(task.get("text") or "").strip()
+        for task in current_tasks
+        if isinstance(task, dict)
+        and task.get("completed")
+        and str(task.get("id") or task.get("text") or "") not in completed_before
+        and str(task.get("text") or "").strip()
+    ]
+    current_item = str(current.get("current") or "").strip()
+    previous_item = str(previous.get("current") or "").strip() if isinstance(previous, dict) else ""
+    if newly_completed:
+        consequence = f"Next: {current_item}." if current_item else "All current TODO items are complete."
+        return f"Completed: {newly_completed[-1]}.", consequence
+    if current_item and current_item != previous_item:
+        return f"Current item: {current_item}.", "Structured TODO state changed."
+    return None
 
 
 def _subagent_roster_snapshot(subagents: object) -> tuple[tuple[str, str], ...]:
@@ -385,7 +423,12 @@ def _record_subagent_roster_timeline(slot: "_ChatSlot", roster: tuple[tuple[str,
         status in ("", "working", "running", "pending", "queued", "in_progress")
         for _, status in roster
     )
-    slot.append_session_timeline(f"Subagents: {active} active of {len(roster)}.", "subagents")
+    slot.append_session_timeline(
+        f"Subagents: {active} active of {len(roster)}.",
+        "subagents",
+        kind="subagent_activity",
+        priority=20,
+    )
 
 
 def _record_terminal_timeline(slot: "_ChatSlot", stop_reason: str | None) -> None:
@@ -394,12 +437,24 @@ def _record_terminal_timeline(slot: "_ChatSlot", stop_reason: str | None) -> Non
     if reason in ("", STOP_REASON_END_TURN, "stop", "completed"):
         return
     if reason == STOP_REASON_CANCELLED:
-        text = "Turn cancelled."
+        text = "Turn cancelled; no completion outcome was recorded."
+        consequence = "Inspect the conversation for any partial work before resuming."
+        priority = 75
     elif "timeout" in reason:
-        text = "Turn ended after a timeout."
+        text = "Turn timed out."
+        consequence = "Verify partial work before resuming."
+        priority = 90
     else:
         text = "Turn ended with an error."
-    slot.append_session_timeline(text, "terminal")
+        consequence = "Inspect the conversation before retrying."
+        priority = 90
+    slot.append_session_timeline(
+        text,
+        "terminal",
+        kind="terminal",
+        priority=priority,
+        consequence=consequence,
+    )
 
 
 def _emit_turn_metric(
@@ -6990,7 +7045,14 @@ async def _run_chat(
                 loop = asyncio.get_running_loop()
                 fut: asyncio.Future[str] = loop.create_future()
                 slot._approval_futures[str(event.request_id)] = fut
-                slot.append_session_timeline("Waiting for tool approval.", "attention")
+                approval_operation = _extract_base_command(_safe_title) or _safe_title
+                slot.append_session_timeline(
+                    f"Approval needed: {approval_operation}.",
+                    "attention",
+                    kind="attention",
+                    priority=95,
+                    consequence="Awaiting your approval.",
+                )
                 # Push via global SSE AFTER registering the future, so the
                 # slot dict reflects pending_approval=true and Board cards
                 # move into the Blocked lane without a browser refresh.
@@ -7380,12 +7442,17 @@ async def _run_chat(
                 # and the WS `slots` snapshot rehydrate it after a reconnect),
                 # then push a lightweight delta so the pill updates mid-turn
                 # instead of waiting for the next full slots snapshot.
+                previous_todo = slot.todo_payload()
                 if slot.set_todo(event.todo):
                     todo = slot.todo_payload() or {}
-                    slot.append_session_timeline(
-                        f"TODO progress: {todo.get('completed', 0)} of {todo.get('total', 0)} complete.",
-                        "todo",
-                    )
+                    if milestone := _todo_timeline_entry(previous_todo, todo):
+                        slot.append_session_timeline(
+                            milestone[0],
+                            "todo",
+                            kind="work",
+                            priority=80,
+                            consequence=milestone[1],
+                        )
                     state.broadcast_ws(
                         "todo_update",
                         {"slot": slot.key, "todo": slot.todo_payload()},

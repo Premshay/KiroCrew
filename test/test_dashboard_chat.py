@@ -4877,10 +4877,14 @@ class TestRunChatSegmentFlush:
         assert state.resolve_approval("req-1", True) is True
         await turn
 
-        assert [entry["text"] for entry in slot.session_timeline_payload()] == [
+        timeline = slot.session_timeline_payload()
+        assert [entry["text"] for entry in timeline] == [
             "Session started.",
-            "Waiting for tool approval.",
+            "Approval needed: bash.",
         ]
+        assert timeline[-1]["kind"] == "attention"
+        assert timeline[-1]["priority"] == 95
+        assert timeline[-1]["consequence"] == "Awaiting your approval."
 
     @pytest.mark.asyncio
     async def test_text_only_complete_no_segments(self, tmp_path, monkeypatch):
@@ -12892,10 +12896,13 @@ class TestStopReasonCancelled:
 
         state.sessions.record_success.assert_not_called()
         state.sessions.record_failure.assert_not_called()
-        assert [entry["text"] for entry in slot.session_timeline_payload()] == [
+        timeline = slot.session_timeline_payload()
+        assert [entry["text"] for entry in timeline] == [
             "Session started.",
-            "Turn cancelled.",
+            "Turn cancelled; no completion outcome was recorded.",
         ]
+        assert timeline[-1]["kind"] == "terminal"
+        assert timeline[-1]["consequence"] == "Inspect the conversation for any partial work before resuming."
 
     @staticmethod
     def _wire_reinjection(state, tmp_path, monkeypatch):
