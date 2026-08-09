@@ -1532,10 +1532,13 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     dispatch resolves aliases first, so the alias is what would answer.
     """
     cfg = KiroCrewConfig.load()
-    agents = [
-        {"name": name, "scope": "global", **dataclasses.asdict(agent_cfg)}
-        for name, agent_cfg in cfg.agents.items()
-    ]
+    agents = []
+    for name, agent_cfg in cfg.agents.items():
+        item = {"name": name, "scope": "global", **dataclasses.asdict(agent_cfg)}
+        policy = _agent_runtime_policy(request, name)
+        if policy is not None:
+            item["runtime_policy"] = policy
+        agents.append(item)
 
     state: DashboardState | None = request.app.get("state")
 
@@ -1587,6 +1590,72 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     )
 
 
+def _agent_runtime_policy(request: web.Request, name: str) -> dict[str, Any] | None:
+    """Return companion-owned UI policy without making it an enforcement boundary."""
+    platform_context = request.app.get("platform_context")
+    getter = (
+        getattr(platform_context.providers, "agent_runtime_policy", None)
+        if platform_context
+        else None
+    )
+    if not callable(getter):
+        return None
+    try:
+        policy = getter(name)
+    except Exception:
+        logger.warning("Failed to read runtime policy for crew %s", name, exc_info=True)
+        return None
+    return policy if isinstance(policy, dict) else None
+
+
+async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
+    """GET /api/agents/{name}/models — discover a selectable crew's live options."""
+    name = request.match_info["name"]
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    if name not in cfg.agents:
+        return web.json_response({"error": "agent not found", "code": "agent_not_found"}, status=404)
+    policy = _agent_runtime_policy(request, name)
+    if policy is None or policy.get("model") != "selectable":
+        return web.json_response({"models": [], "effort_levels": []})
+    state: DashboardState | None = request.app.get("state")
+    if state is None:
+        return web.json_response(
+            {"error": "session manager unavailable", "code": "session_manager_unavailable"}, status=503
+        )
+    key = f"dashboard:model-discovery:{name}"
+    try:
+        provider, _is_new, _resumed = await asyncio.wait_for(
+            state.sessions.get_or_create(key, agent=name), timeout=30
+        )
+        available = getattr(provider, "available_models", lambda: [])()
+        efforts = getattr(provider, "get_valid_effort_levels", lambda: [])()
+        models = [
+            {
+                "modelId": str(model.get("modelId") or ""),
+                "name": str(model.get("name") or model.get("modelId") or ""),
+                "description": str(model.get("description") or ""),
+            }
+            for model in available
+            if isinstance(model, dict) and model.get("modelId")
+        ]
+        if not models:
+            return web.json_response(
+                {"error": "subscription returned no models", "code": "models_unavailable"}, status=503
+            )
+        return web.json_response(
+            {"models": models, "effort_levels": [level for level in efforts if isinstance(level, str)]}
+        )
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "model discovery timed out", "code": "models_timeout"}, status=503)
+    except Exception:
+        logger.warning("Model discovery failed for crew %s", name, exc_info=True)
+        return web.json_response(
+            {"error": "model discovery unavailable", "code": "models_unavailable"}, status=503
+        )
+    finally:
+        if state.sessions.has_session(key):
+            state.sessions.release(key)
+            await state.sessions.destroy(key)
 _config_lock = LoopBoundLock()
 
 
