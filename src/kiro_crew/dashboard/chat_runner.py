@@ -2104,31 +2104,30 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
     ``clear``, else arm with an optional ``--max N`` budget (default 50, clamped
     1..50).
     """
+
     _goal_svc = get_instance()
     _parts = message.split(None, 1)
     _rest = _parts[1].strip() if len(_parts) > 1 else ""
-    if _goal_svc is None:
-        body = (
-            "🎯 Goal loops are unavailable (AutoNudge is disabled). "
-            "Set `KIROCREW_AUTONUDGE=1` and restart the gateway."
-        )
-    elif _rest in ("", "status"):
-        _loop = _goal_svc.get_by_slot(slot.key)
-        if _loop is not None:
-            _cap = _loop.max_cycles or "∞"
-            body = f"🎯 Active goal (budget {_cap} turns). " "Use `/goal clear` to stop it."
+    changed = False
+    if _rest in ("", "status"):
+        if _goal_svc is None:
+            body = "No active goal loop (AutoNudge is disabled)."
         else:
-            body = (
-                "No active goal. Set one with `/goal <objective>` "
-                "(optionally `/goal --max N <objective>`)."
-            )
+            _loop = _goal_svc.get_by_slot(slot.key)
+            if _loop is not None:
+                _cap = _loop.max_cycles or "∞"
+                body = f"🎯 Active goal (budget {_cap} turns). " "Use `/goal clear` to stop it."
+            else:
+                body = (
+                    "No active goal. Set one with `/goal <objective>` "
+                    "(optionally `/goal --max N <objective>`)."
+                )
     elif _rest == "clear":
-        _loop = _goal_svc.get_by_slot(slot.key)
+        changed = slot.set_declared_goal("")
+        _loop = _goal_svc.get_by_slot(slot.key) if _goal_svc is not None else None
         if _loop is not None:
             await _goal_svc.remove(_loop.id)
-            body = "🎯 Goal cleared."
-        else:
-            body = "No active goal to clear."
+        body = "🎯 Goal cleared." if changed or _loop is not None else "No active goal to clear."
     else:
         _max_cycles = 50
         _objective = _rest
@@ -2141,34 +2140,41 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
         if not _objective:
             body = "Usage: `/goal <objective>` or `/goal --max N <objective>`."
         else:
-            _slug = re.sub(r"[^A-Za-z0-9._-]", "_", slot.key)
-            _sentinel = str(data_home() / "goal-stop" / f"{_slug}.stop")
-            Path(_sentinel).unlink(missing_ok=True)
-            _nudge = (
-                f"Goal: {_objective}\n"
-                "Each idle cycle, in order: "
-                f'(1) if the file {_sentinel} exists -> autonudge_stop(reason="sentinel") and stop; '
-                "(2) if the goal is fully met by concrete evidence (a passing test, a built file, "
-                'command output — not a guess) -> autonudge_stop(reason="goal met"), post a one-line '
-                "summary citing the evidence, and stop; "
-                "(3) else do ONE atomic step (<=5 tool calls) and make the deliverable durable "
-                "(write the file / run the check) before claiming progress.\n"
-                "Guardrails: never git push; never read credential files. Hard blocker -> state it once and "
-                f'autonudge_stop(reason="blocked"). Budget {_max_cycles} cycles (service stops at '
-                "the cap). One short progress line per cycle."
-            )
-            await _goal_svc.add(
-                slot.key,
-                message=_nudge,
-                idle_secs=15,
-                max_cycles=_max_cycles,
-                stop_sentinel_path=_sentinel,
-            )
-            body = (
-                f"⊙ Goal set ({_max_cycles}-turn budget): {_objective}\n\n"
-                "I'll work toward it across turns and stop when it's met "
-                "(verified by evidence) — or run `/goal clear` to stop."
-            )
+            changed = slot.set_declared_goal(_objective)
+            if _goal_svc is None:
+                body = (
+                    "🎯 Goal declared. Automatic goal loops are unavailable "
+                    "(set `KIROCREW_AUTONUDGE=1` and restart the gateway)."
+                )
+            else:
+                _slug = re.sub(r"[^A-Za-z0-9._-]", "_", slot.key)
+                _sentinel = str(data_home() / "goal-stop" / f"{_slug}.stop")
+                Path(_sentinel).unlink(missing_ok=True)
+                _nudge = (
+                    f"Goal: {_objective}\n"
+                    "Each idle cycle, in order: "
+                    f'(1) if the file {_sentinel} exists -> autonudge_stop(reason="sentinel") and stop; '
+                    "(2) if the goal is fully met by concrete evidence (a passing test, a built file, "
+                    'command output — not a guess) -> autonudge_stop(reason="goal met"), post a one-line '
+                    "summary citing the evidence, and stop; "
+                    "(3) else do ONE atomic step (<=5 tool calls) and make the deliverable durable "
+                    "(write the file / run the check) before claiming progress.\n"
+                    "Guardrails: never git push; never read credential files. Hard blocker -> state it once and "
+                    f'autonudge_stop(reason="blocked"). Budget {_max_cycles} cycles (service stops at '
+                    "the cap). One short progress line per cycle."
+                )
+                await _goal_svc.add(
+                    slot.key,
+                    message=_nudge,
+                    idle_secs=15,
+                    max_cycles=_max_cycles,
+                    stop_sentinel_path=_sentinel,
+                )
+                body = (
+                    f"⊙ Goal set ({_max_cycles}-turn budget): {_objective}\n\n"
+                    "I'll work toward it across turns and stop when it's met "
+                    "(verified by evidence) — or run `/goal clear` to stop."
+                )
     body = _redact_for_display(body)
     sel().log_tool_invocation(
         session_key=slot.key,
@@ -2180,6 +2186,8 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
         metadata={"slot": slot.key},
     )
     slot.append("assistant", body, "msg msg-a")
+    if changed:
+        await save_slot_off_loop(state, slot, force=True)
     state.push_slots_update()
     slot.append("done", "", "done")
 
