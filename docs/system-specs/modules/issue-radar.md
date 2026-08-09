@@ -5,7 +5,8 @@
 Issue Radar is an opt-in (`defaultEnabled: false`) built-in app for GitHub
 issue and pull-request triage. It connects one or more repos via the user's own
 `gh` CLI session (no GitHub App, no PAT management) and provides a 3-column
-workbench: browse/filter issues, view AI-summarized detail + timeline, apply
+workbench on desktop and a single-pane, list-to-detail workspace on phones.
+Both layouts let users browse/filter issues, view AI-summarized detail + timeline, apply
 triage actions (label, close/reopen), and record per-issue investigation findings
 in a local ledger. A parallel PULL REQUESTS section reuses the same shape —
 filter by lifecycle (open / merged / closed-unmerged), person, draft and label;

@@ -29,7 +29,7 @@ export default function CategoryRail({ categories, total, selected, onSelect, so
         key={key}
         type="button"
         aria-pressed={on}
-        className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[13px] text-left cursor-pointer border-0 bg-transparent transition-colors ${
+        className={`w-auto shrink-0 flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[13px] text-left cursor-pointer border-0 bg-transparent transition-colors sm:w-full ${
           on ? 'bg-[var(--accent-subtle)] text-text-strong font-semibold' : 'text-text hover:bg-bg-hover'
         }`}
         onClick={() => onSelect(key)}
@@ -40,16 +40,16 @@ export default function CategoryRail({ categories, total, selected, onSelect, so
   }
 
   return (
-    <div className="flex flex-col gap-[18px] w-full">
-      <div>
-        <div className="text-[11px] font-bold tracking-[.1em] text-muted mb-2">{i18nT('components.appstore.categoryRail.categories')}</div>
+    <div className="flex w-full flex-col gap-3 sm:gap-[18px]">
+      <div className="flex flex-wrap gap-1 overflow-x-auto pb-1 sm:flex-col sm:flex-nowrap sm:overflow-visible">
+        <div className="w-full text-[11px] font-bold tracking-[.1em] text-muted mb-1 sm:mb-2">{i18nT('components.appstore.categoryRail.categories')}</div>
         {item(i18nT('components.appstore.categoryRail.all_apps'), total, 'All')}
         {categories.map(({ category, count }) => item(category, count, category))}
       </div>
-      <div>
+      <div className="max-sm:flex max-sm:flex-wrap max-sm:items-center max-sm:gap-1.5">
         <div className="text-[11px] font-bold tracking-[.1em] text-muted mb-2">{i18nT('components.appstore.categoryRail.sources')}</div>
         {sources.map(s => (
-          <div key={s.name} className="flex items-center gap-2 px-2.5 py-[7px] border border-border rounded-[9px] bg-card text-[12.5px] mb-1.5">
+          <div key={s.name} className="flex items-center gap-2 px-2.5 py-[7px] border border-border rounded-[9px] bg-card text-[12.5px] mb-1.5 max-sm:mb-0">
             {s.builtin
               ? <BadgeCheck size={14} className="text-accent shrink-0" aria-label={i18nT('components.appstore.categoryRail.first_party')} />
               : <Database size={14} className="text-muted shrink-0" />}

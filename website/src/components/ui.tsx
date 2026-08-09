@@ -338,12 +338,12 @@ export function PanelSectionHeader({ label, count, trailing, className }: {
 
 export function PageHeader({ title, subtitle, actions }: { title: React.ReactNode; subtitle?: string; actions?: React.ReactNode }) {
   return (
-    <div className="flex items-end justify-between gap-4 px-6 pt-2 pb-3" data-testid="page-header">
+    <div className="flex flex-col items-stretch gap-3 px-3 pt-2 pb-3 sm:flex-row sm:items-end sm:justify-between sm:gap-4 sm:px-6" data-testid="page-header">
       <div>
         <div className="text-2xl font-bold tracking-tight text-text-strong" data-testid="page-title">{title}</div>
         {subtitle && <div className="text-muted text-sm mt-1" data-testid="page-subtitle">{subtitle}</div>}
       </div>
-      {actions && <div className="flex items-center gap-2.5 flex-wrap justify-end">{actions}</div>}
+      {actions && <div className="flex w-full items-center gap-2.5 flex-wrap justify-between sm:w-auto sm:justify-end">{actions}</div>}
     </div>
   )
 }

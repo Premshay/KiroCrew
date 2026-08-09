@@ -716,7 +716,7 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
   return (
     <article className="h-full flex flex-col">
       {/* ── Header (does not scroll) ── */}
-      <header className="px-6 pt-5 pb-4 border-b border-border">
+      <header className="px-4 pt-4 pb-3 border-b border-border sm:px-6 sm:pt-5 sm:pb-4">
         <div className="flex items-start gap-3">
           <div className="flex-1 min-w-0">
             {awaitingFirstPaint ? <HeaderSkeleton /> : (<>
@@ -789,11 +789,11 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
       </header>
 
       {/* ── Scroll area: timeline + sidebar ── */}
-      <div className="flex-1 min-h-0 overflow-hidden">
-        <div className="flex gap-6 px-6 py-5 h-full items-stretch">
+      <div className="flex-1 min-h-0 overflow-y-auto md:overflow-hidden">
+        <div className="flex h-auto flex-col gap-5 px-4 py-4 md:h-full md:flex-row md:items-stretch md:gap-6 md:px-6 md:py-5">
           {/* Main column — AI summary, the pinned description, linked refs,
               then the activity timeline (newest-first). */}
-          <main className="flex-1 min-w-0 overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
+          <main className="flex-1 min-w-0 overflow-visible md:overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
             <AiSummaryCard
               summary={aiQuery.data?.summary ?? ''}
               fromCache={aiQuery.data?.from_cache ?? false}
@@ -854,7 +854,7 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
           </main>
 
           {/* Sidebar — most triage-useful GitHub metadata. */}
-          <aside className="w-[236px] flex-shrink-0 overflow-y-auto scrollbar-none text-[12.5px]" style={{ scrollbarWidth: 'none' }}>
+          <aside className="w-full flex-shrink-0 overflow-visible text-[12.5px] md:w-[236px] md:overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
             <Section title={i18nT('apps.issueRadar.components.issueDetail.assignees')} icon={<Users size={12} />}>
               {assignees.length > 0 ? (
                 <div className="flex flex-col gap-1">

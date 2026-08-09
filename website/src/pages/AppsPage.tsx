@@ -371,7 +371,7 @@ export default function AppsPage() {
       <PageHeader
         title={i18nT('pages.appsPage.apps')}
         subtitle={i18nT('pages.appsPage.discover_install_and_manage_agentic_apps')}
-        actions={<>
+        actions={<div className="flex w-full items-center gap-2.5 max-sm:flex-wrap sm:w-auto">
           <SegmentedControl
             segments={[
               { key: 'discover' as const, label: i18nT('pages.appsPage.discover'), icon: <Boxes size={13} /> },
@@ -385,14 +385,14 @@ export default function AppsPage() {
             placeholder={tab === 'discover' ? i18nT('pages.appsPage.search_apps') : i18nT('pages.appsPage.search_library')}
             value={query}
             onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQuery(e.target.value)}
-            className="w-[220px]"
+            className="min-w-[150px] flex-1 sm:w-[220px] sm:flex-none"
             aria-label={i18nT('pages.appsPage.search_apps')}
           />
           <SourcesPopover open={sourcesOpen} onOpenChange={setSourcesOpen} onError={setError} />
-        </>}
+        </div>}
       />
 
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-3 pb-8 overflow-y-auto flex-1 min-h-0 sm:px-6">
         {/* Notifications */}
         {displayError && (
           <ErrorNotice

@@ -700,7 +700,7 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
   return (
     <article className="h-full flex flex-col">
       {/* ── Header (does not scroll) ── */}
-      <header className="px-6 pt-5 pb-4 border-b border-border">
+      <header className="px-4 pt-4 pb-3 border-b border-border sm:px-6 sm:pt-5 sm:pb-4">
         <div className="flex items-start gap-3">
           <div className="flex-1 min-w-0">
             {awaitingFirstPaint ? <HeaderSkeleton /> : (<>
@@ -762,9 +762,9 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
       </header>
 
       {/* ── Scroll area: main column + sidebar ── */}
-      <div className="flex-1 min-h-0 overflow-hidden">
-        <div className="flex gap-6 px-6 py-5 h-full items-stretch">
-          <main className="flex-1 min-w-0 overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
+      <div className="flex-1 min-h-0 overflow-y-auto md:overflow-hidden">
+        <div className="flex h-auto flex-col gap-5 px-4 py-4 md:h-full md:flex-row md:items-stretch md:gap-6 md:px-6 md:py-5">
+          <main className="flex-1 min-w-0 overflow-visible md:overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
             <AiSummaryCard
               summary={aiQuery.data?.summary ?? ''}
               fromCache={aiQuery.data?.from_cache ?? false}
@@ -867,7 +867,7 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
           </main>
 
           {/* Sidebar — the most useful PR metadata. */}
-          <aside className="w-[236px] flex-shrink-0 overflow-y-auto scrollbar-none text-[12.5px]" style={{ scrollbarWidth: 'none' }}>
+          <aside className="w-full flex-shrink-0 overflow-visible text-[12.5px] md:w-[236px] md:overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
             {/* Auto review first — failing/running checks are the most
                 actionable thing on a PR. */}
             <AutoReviewChecks

@@ -32,7 +32,7 @@ export default function AppListRow({ app, busy, onOpen, onGet, onUpdate, onEnabl
   return (
     <Clickable
       aria-label={i18nT('components.appstore.appListRow.view_details_for', { name: appDisplayName(app) })}
-      className="flex items-center gap-3.5 px-3.5 py-3 border border-border rounded-xl bg-card mb-2 cursor-pointer hover:border-border-strong transition-colors focus-ring"
+      className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-3.5 px-3.5 py-3 border border-border rounded-xl bg-card mb-2 cursor-pointer hover:border-border-strong transition-colors focus-ring sm:flex"
       onClick={onOpen}
     >
       {/* Hero capsule — 16:9 crop of the app's own art, gradient when absent */}
@@ -52,7 +52,7 @@ export default function AppListRow({ app, busy, onOpen, onGet, onUpdate, onEnabl
       {/* Actions: stop propagation so nested controls keep their own
           click/keyboard activation instead of triggering the row. */}
       <div
-        className="flex flex-col items-end gap-1.5 shrink-0"
+        className="col-span-2 flex items-center justify-end gap-2 border-t border-border pt-2 sm:col-auto sm:flex-col sm:items-end sm:border-t-0 sm:pt-0"
         onClick={e => e.stopPropagation()}
         onKeyDown={e => e.stopPropagation()}
         role="presentation"
