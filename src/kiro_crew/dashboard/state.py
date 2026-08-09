@@ -96,6 +96,7 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 _CHANNEL_ID_PREFIX_RE = re.compile(r"^([a-z][a-z0-9_-]*):(.*)$", re.IGNORECASE)
+_SESSION_TIMELINE_SOURCE_MAX = 32
 _CHANNEL_LABELS = {
     "slack": "Slack",
     "discord": "Discord DM",
@@ -1552,6 +1553,7 @@ class _ChatSlot:
         "_hook_continuation_depth",
         "_todo",
         "_session_checkpoint",
+        "_session_timeline",
         "_on_message",
         "_on_question_retired",
         "_has_reader_flag",
@@ -1777,6 +1779,7 @@ class _ChatSlot:
         # UI renders as "no pill" rather than "an empty list".
         self._todo: dict[str, Any] | None = None
         self._session_checkpoint: dict[str, Any] | None = None
+        self._session_timeline: list[dict[str, str]] = []
         # Callback for broadcasting messages via global SSE
         self._on_message: object | None = None  # Callable[[str, dict], None] | None
         # Announce stateless question cards this slot retires, so every client
@@ -2288,6 +2291,57 @@ class _ChatSlot:
             ),
         }
 
+    def _timeline_entry(self, value: object) -> dict[str, str] | None:
+        """Normalize one persisted timeline entry without trusting its metadata."""
+        if not isinstance(value, dict):
+            return None
+        text = self._checkpoint_text(value.get("text"), SESSION_CHECKPOINT_MILESTONE_MAX)
+        source = self._checkpoint_text(value.get("source"), _SESSION_TIMELINE_SOURCE_MAX)
+        timestamp = value.get("timestamp")
+        if not text or not source:
+            return None
+        return {
+            "text": text,
+            "source": source,
+            "timestamp": timestamp if isinstance(timestamp, str) else "",
+        }
+
+    def append_session_timeline(self, text: object, source: str) -> bool:
+        """Append one redacted structural milestone unless it repeats the current fact."""
+        entry = self._timeline_entry(
+            {
+                "text": text,
+                "source": source,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        if entry is None:
+            return False
+        if self._session_timeline and all(
+            self._session_timeline[-1].get(field) == entry[field] for field in ("text", "source")
+        ):
+            return False
+        self._session_timeline = (self._session_timeline + [entry])[-SESSION_CHECKPOINT_TRAIL_MAX:]
+        return True
+
+    def restore_session_timeline(self, timeline: object) -> None:
+        """Restore bounded structural history, keeping only adjacent distinct facts."""
+        if not isinstance(timeline, list):
+            return
+        restored: list[dict[str, str]] = []
+        for value in timeline:
+            entry = self._timeline_entry(value)
+            if entry is None:
+                continue
+            if restored and all(restored[-1].get(field) == entry[field] for field in ("text", "source")):
+                continue
+            restored.append(entry)
+        self._session_timeline = restored[-SESSION_CHECKPOINT_TRAIL_MAX:]
+
+    def session_timeline_payload(self) -> list[dict[str, str]]:
+        """Return an isolated bounded timeline for the slots snapshot."""
+        return [dict(entry) for entry in self._session_timeline]
+
     def set_session_checkpoint(self, checkpoint: dict[str, Any]) -> bool:
         """Replace the concise view and append one bounded milestone."""
         summary = self._checkpoint_text(checkpoint.get("summary"), SESSION_CHECKPOINT_SUMMARY_MAX)
@@ -2315,6 +2369,7 @@ class _ChatSlot:
             "progress": self._checkpoint_progress(checkpoint.get("progress")),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        self.append_session_timeline(milestone, "checkpoint")
         return True
 
     def restore_session_checkpoint(self, checkpoint: object) -> None:
@@ -2342,6 +2397,13 @@ class _ChatSlot:
             "progress": self._checkpoint_progress(checkpoint.get("progress")),
             "updated_at": updated_at if isinstance(updated_at, str) else "",
         }
+        if not self._session_timeline:
+            self.restore_session_timeline(
+                [
+                    {"text": text, "source": "checkpoint", "timestamp": self._session_checkpoint["updated_at"]}
+                    for text in self._session_checkpoint["trail"]
+                ]
+            )
 
     def session_checkpoint_payload(self) -> dict[str, Any] | None:
         """Return an isolated checkpoint copy for the slots snapshot."""
@@ -3483,6 +3545,7 @@ class _ChatSlot:
             # pill survives reconnect without a separate rehydration path.
             "todo": self.todo_payload(),
             "session_checkpoint": self.session_checkpoint_payload(),
+            "session_timeline": self.session_timeline_payload(),
             "has_options": has_options,
             "options": [_redact(o) for o in options],
             "prompt_preview": prompt_preview,
