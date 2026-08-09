@@ -580,6 +580,7 @@ def _rehydrate_slot_from_history(
             slot._channel_folder_filed = True
         if meta.get("app"):
             slot._app = meta["app"]
+        slot.restore_declared_goal(meta.get("declared_goal"))
         slot.restore_session_checkpoint(meta.get("session_checkpoint"))
         slot.restore_session_timeline(meta.get("session_timeline"))
         # Re-validate the companion binding against the slug grammar on restore
@@ -949,6 +950,7 @@ def _restore_recent_sessions_steps(
             slot._channel_folder_filed = True
         if meta.get("app"):
             slot._app = meta["app"]
+        slot.restore_declared_goal(meta.get("declared_goal"))
         slot.restore_session_checkpoint(meta.get("session_checkpoint"))
         slot.restore_session_timeline(meta.get("session_timeline"))
         # Same tamper gate as _rehydrate_slot_from_history: re-validate the
@@ -1993,6 +1995,8 @@ def _save_slot_to_history(
             # slot would lose the CRON tag that keeps it out of ``slots:user``.
             if slot._origin:
                 meta_line["origin"] = slot._origin
+            if declared_goal := slot.declared_goal_payload():
+                meta_line["declared_goal"] = declared_goal
             checkpoint = slot.session_checkpoint_payload()
             if checkpoint is not None:
                 meta_line["session_checkpoint"] = checkpoint
