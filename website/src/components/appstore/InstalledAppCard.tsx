@@ -12,7 +12,7 @@ import {
   ExternalLink, Clock, X, ArrowUp,
 } from 'lucide-react'
 import { api } from '../../api/client'
-import { Badge, Btn } from '../ui'
+import { Badge, Btn, IconButton } from '../ui'
 import HeroCapsule from './HeroCapsule'
 import type { InstalledApp } from './types'
 import { appDisplayName, appDescription } from './appManifest'
@@ -62,13 +62,13 @@ export default function InstalledAppCard({
                 <p className="text-muted mt-1">{i18nT('components.appstore.installedAppCard.run_this_on_your_local_machine')}</p>
                 <code className="block mt-1.5 bg-bg-elevated px-2 py-1 rounded text-[12px] font-mono select-all">{remoteCmd}</code>
               </div>
-              <button aria-label={i18nT('components.appstore.installedAppCard.dismiss')} className="text-muted hover:text-text text-sm shrink-0" onClick={() => setRemoteCmd('')}><X className="lucide-inline" /></button>
+              <IconButton aria-label={i18nT('components.appstore.installedAppCard.dismiss')} className="shrink-0" onClick={() => setRemoteCmd('')}><X className="lucide-inline" /></IconButton>
             </div>
           </div>
         </div>
       )}
-      <div className="p-4">
-        <div className="flex items-start justify-between gap-4">
+      <div className="p-3 sm:p-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
           <div className="flex items-start gap-3 flex-1 min-w-0">
             {/* Hero capsule — same art and fallback chain as Discover's rows,
                 so one app looks like itself on both tabs. */}
@@ -77,11 +77,11 @@ export default function InstalledAppCard({
               art={{ heroImage: m?.heroImage, heroImageDark: m?.heroImageDark, screenshots: m?.screenshots }}
               icon={pageIcon}
               iconUrl={iconUrl}
-              className="w-24 h-[54px] mt-0.5"
+              className="w-20 h-[45px] mt-0.5 sm:w-24 sm:h-[54px]"
             />
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 mb-1 flex-wrap">
-                <button type="button" className="font-medium text-text cursor-pointer hover:text-accent transition-colors bg-transparent border-0 p-0 text-left" onClick={onDetail}>{appDisplayName(app)}</button>
+                <Btn type="button" className="h-auto border-0 bg-transparent p-0 font-medium text-text hover:text-accent" onClick={onDetail}>{appDisplayName(app)}</Btn>
                 <span className="text-[11px] text-muted bg-bg-elevated px-1.5 py-0.5 rounded">{i18nT('components.appstore.installedAppCard.v')}{app.version}{app.updateAvailable && ` (v${app._newVersion} available)`}</span>
                 {isBuiltin ? (
                   <>
@@ -120,17 +120,17 @@ export default function InstalledAppCard({
               </div>
             </div>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3 sm:shrink-0 sm:flex-nowrap sm:border-t-0 sm:pt-0">
             {/* Open button — all app types */}
             {hasOpenCommand && (
-              <Btn primary onClick={() => api.openApp(app.name).then((res: { remote?: boolean; command?: string; message?: string } | null) => {
+              <Btn primary className="min-h-10" onClick={() => api.openApp(app.name).then((res: { remote?: boolean; command?: string; message?: string } | null) => {
                 if (res?.remote) setRemoteCmd(res.command || res.message || i18nT('components.appstore.installedAppCard.app_cannot_be_opened_kirocrew_is_running_in_a_he'))
               }).catch(() => {})}>
                 <ExternalLink size={14} /> {i18nT('components.appstore.installedAppCard.open')}
               </Btn>
             )}
             {app.enabled && hasUI && !hasOpenCommand && (
-              <Btn primary onClick={onOpen}>
+              <Btn primary className="min-h-10" onClick={onOpen}>
                 <ExternalLink size={14} /> {i18nT('components.appstore.installedAppCard.open')}
               </Btn>
             )}
@@ -138,6 +138,7 @@ export default function InstalledAppCard({
             {/* Enable/Disable */}
             {app.enabled ? (
               <Btn
+                className="min-h-10"
                 onClick={() => onAction(app.name, 'disable')}
                 disabled={actionLoading === `${app.name}:disable`}
               >
@@ -145,6 +146,7 @@ export default function InstalledAppCard({
               </Btn>
             ) : (
               <Btn
+                className="min-h-10"
                 onClick={() => onAction(app.name, 'enable')}
                 disabled={actionLoading === `${app.name}:enable`}
               >
@@ -158,7 +160,7 @@ export default function InstalledAppCard({
                 onClick={() => onAction(app.name, 'update')}
                 disabled={actionLoading === `${app.name}:update`}
                 title={i18nT('components.appstore.installedAppCard.update_to', { version: app._newVersion || app.version })}
-                className="!bg-[var(--info)] !text-white hover:!opacity-80"
+                className="min-h-10 !bg-[var(--info)] !text-white hover:!opacity-80"
               >
                 <ArrowUp size={14} /> {i18nT('components.appstore.installedAppCard.update')}
               </Btn>
@@ -166,6 +168,7 @@ export default function InstalledAppCard({
             {/* Sync — always available for gateway apps */}
             {canUpdate && !app.updateAvailable && (
               <Btn
+                className="min-h-10"
                 onClick={() => onAction(app.name, 'update')}
                 disabled={actionLoading === `${app.name}:update`}
                 title={i18nT('components.appstore.installedAppCard.sync_app_from_its_source_directory')}
@@ -178,6 +181,7 @@ export default function InstalledAppCard({
             {canUninstall && (
               <Btn
                 danger
+                className="min-h-10"
                 onClick={() => onAction(app.name, 'uninstall')}
                 disabled={actionLoading === `${app.name}:uninstall`}
               >
@@ -185,13 +189,13 @@ export default function InstalledAppCard({
               </Btn>
             )}
 
-            <button
+            <IconButton
               aria-label={expanded ? i18nT('components.appstore.installedAppCard.collapse_details') : i18nT('components.appstore.installedAppCard.expand_details')}
-              className="text-muted hover:text-text transition-colors p-1 bg-transparent border-0 cursor-pointer"
+              className="min-h-10 min-w-10"
               onClick={() => setExpanded(!expanded)}
             >
               <ChevronRight size={16} className={`transition-transform ${expanded ? 'rotate-90' : ''}`} />
-            </button>
+            </IconButton>
           </div>
         </div>
       </div>
