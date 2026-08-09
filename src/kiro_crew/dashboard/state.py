@@ -1783,7 +1783,7 @@ class _ChatSlot:
         # UI renders as "no pill" rather than "an empty list".
         self._todo: dict[str, Any] | None = None
         self._session_checkpoint: dict[str, Any] | None = None
-        self._session_timeline: list[dict[str, str]] = []
+        self._session_timeline: list[dict[str, Any]] = []
         # Callback for broadcasting messages via global SSE
         self._on_message: object | None = None  # Callable[[str, dict], None] | None
         # Announce stateless question cards this slot retires, so every client
@@ -2302,28 +2302,48 @@ class _ChatSlot:
             ),
         }
 
-    def _timeline_entry(self, value: object) -> dict[str, str] | None:
+    def _timeline_entry(self, value: object) -> dict[str, Any] | None:
         """Normalize one persisted timeline entry without trusting its metadata."""
         if not isinstance(value, dict):
             return None
         text = self._checkpoint_text(value.get("text"), SESSION_CHECKPOINT_MILESTONE_MAX)
         source = self._checkpoint_text(value.get("source"), _SESSION_TIMELINE_SOURCE_MAX)
         timestamp = value.get("timestamp")
+        kind = self._checkpoint_text(value.get("kind"), _SESSION_TIMELINE_SOURCE_MAX) or source
+        consequence = self._checkpoint_text(
+            value.get("consequence"), SESSION_CHECKPOINT_MILESTONE_MAX
+        )
+        raw_priority = value.get("priority", 0)
+        priority = raw_priority if isinstance(raw_priority, int) and not isinstance(raw_priority, bool) else 0
         if not text or not source:
             return None
         return {
             "text": text,
             "source": source,
             "timestamp": timestamp if isinstance(timestamp, str) else "",
+            "kind": kind,
+            "priority": min(max(priority, 0), 100),
+            "consequence": consequence,
         }
 
-    def append_session_timeline(self, text: object, source: str) -> bool:
+    def append_session_timeline(
+        self,
+        text: object,
+        source: str,
+        *,
+        kind: str = "",
+        priority: int = 0,
+        consequence: object = "",
+    ) -> bool:
         """Append one redacted structural milestone unless it repeats the current fact."""
         entry = self._timeline_entry(
             {
                 "text": text,
                 "source": source,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "kind": kind,
+                "priority": priority,
+                "consequence": consequence,
             }
         )
         if entry is None:
@@ -2339,7 +2359,7 @@ class _ChatSlot:
         """Restore bounded structural history, keeping only adjacent distinct facts."""
         if not isinstance(timeline, list):
             return
-        restored: list[dict[str, str]] = []
+        restored: list[dict[str, Any]] = []
         for value in timeline:
             entry = self._timeline_entry(value)
             if entry is None:
@@ -2349,7 +2369,7 @@ class _ChatSlot:
             restored.append(entry)
         self._session_timeline = restored[-SESSION_CHECKPOINT_TRAIL_MAX:]
 
-    def session_timeline_payload(self) -> list[dict[str, str]]:
+    def session_timeline_payload(self) -> list[dict[str, Any]]:
         """Return an isolated bounded timeline for the slots snapshot."""
         return [dict(entry) for entry in self._session_timeline]
 
@@ -2380,7 +2400,7 @@ class _ChatSlot:
             "progress": self._checkpoint_progress(checkpoint.get("progress")),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.append_session_timeline(milestone, "checkpoint")
+        self.append_session_timeline(milestone, "checkpoint", kind="checkpoint", priority=100)
         return True
 
     def restore_session_checkpoint(self, checkpoint: object) -> None:

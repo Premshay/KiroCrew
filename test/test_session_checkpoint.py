@@ -121,6 +121,8 @@ class TestCheckpointSlotProjection:
 
         timeline = slot.session_timeline_payload()
         assert timeline[0]["source"] == "checkpoint"
+        assert timeline[0]["kind"] == "checkpoint"
+        assert timeline[0]["priority"] == 100
         assert "AKIAIOSFODNN7EXAMPLE" not in timeline[0]["text"]
         assert "[REDACTED: credential]" in timeline[0]["text"]
         assert timeline[0]["timestamp"]
@@ -137,6 +139,53 @@ class TestCheckpointSlotProjection:
         assert [entry["text"] for entry in timeline] == [
             f"TODO progress: {number} of 9 complete." for number in range(2, 9)
         ]
+
+    def test_timeline_keeps_bounded_operator_digest_metadata(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        assert slot.append_session_timeline(
+            "Approval needed: git.",
+            "attention",
+            kind="attention",
+            priority=95,
+            consequence="Awaiting your approval.",
+        ) is True
+        assert slot.session_timeline_payload()[0]["priority"] == 95
+        assert slot.session_timeline_payload()[0]["consequence"] == "Awaiting your approval."
+        slot.restore_session_timeline([
+            {"text": "Malformed priority.", "source": "terminal", "priority": "high"},
+        ])
+
+        timeline = slot.session_timeline_payload()
+        assert timeline == [{
+            "text": "Malformed priority.",
+            "source": "terminal",
+            "timestamp": "",
+            "kind": "terminal",
+            "priority": 0,
+            "consequence": "",
+        }]
+
+    def test_todo_transition_names_the_completed_work_and_next_item(self) -> None:
+        from kiro_crew.dashboard.chat_runner import _todo_timeline_entry
+
+        milestone = _todo_timeline_entry(
+            {
+                "tasks": [
+                    {"id": "one", "text": "Install hooks", "completed": False},
+                    {"id": "two", "text": "Verify card", "completed": False},
+                ],
+                "current": "Install hooks",
+            },
+            {
+                "tasks": [
+                    {"id": "one", "text": "Install hooks", "completed": True},
+                    {"id": "two", "text": "Verify card", "completed": False},
+                ],
+                "current": "Verify card",
+            },
+        )
+
+        assert milestone == ("Completed: Install hooks.", "Next: Verify card.")
 
     def test_restore_migrates_legacy_checkpoint_trail_when_no_timeline_exists(self) -> None:
         slot = _ChatSlot("checkpoint")
