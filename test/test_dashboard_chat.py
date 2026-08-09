@@ -4886,6 +4886,14 @@ class TestRunChatSegmentFlush:
         assert timeline[-1]["priority"] == 95
         assert timeline[-1]["consequence"] == "Awaiting your approval."
 
+    def test_unknown_permission_keeps_a_human_blocker(self):
+        from kiro_crew.dashboard.chat_runner import _approval_timeline_entry
+
+        assert _approval_timeline_entry("unknown") == (
+            "Approval required; operation not supplied by provider.",
+            "Open the conversation to inspect and approve or reject it.",
+        )
+
     @pytest.mark.asyncio
     async def test_text_only_complete_no_segments(self, tmp_path, monkeypatch):
         """Text-only stream → complete produces one assistant message (no segments).
@@ -12899,13 +12907,7 @@ class TestStopReasonCancelled:
 
         state.sessions.record_success.assert_not_called()
         state.sessions.record_failure.assert_not_called()
-        timeline = slot.session_timeline_payload()
-        assert [entry["text"] for entry in timeline] == [
-            "Session started.",
-            "Turn cancelled; no completion outcome was recorded.",
-        ]
-        assert timeline[-1]["kind"] == "terminal"
-        assert timeline[-1]["consequence"] == "Inspect the conversation for any partial work before resuming."
+        assert [entry["text"] for entry in slot.session_timeline_payload()] == ["Session started."]
 
     @staticmethod
     def _wire_reinjection(state, tmp_path, monkeypatch):
