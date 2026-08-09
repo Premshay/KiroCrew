@@ -1773,7 +1773,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   return (
     <>
       <PageHeader title={i18nT('pages.artifactsPage.artifacts')} subtitle={i18nT('pages.artifactsPage.widgets_files_and_snippets_live_tracked_with_ver')} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-3 pb-8 overflow-y-auto flex-1 min-h-0 sm:px-6">
         {(errMessage || mutErr || addError) && (
           <div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise">
             <span className="text-danger text-lg shrink-0"><AlertTriangle className="lucide-inline" /></span>
@@ -1785,9 +1785,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
           </div>
         )}
 
-        <div className="flex items-center justify-between gap-3 mb-3">
+        <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
           <h3 className="text-sm font-semibold text-text-strong">{i18nT('pages.artifactsPage.your_artifacts')}</h3>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {/* Split button: creating a blank document is the common verb and
               * gets the zero-click path; importing a file keeps its muscle
               * memory one click away under the caret. */}
@@ -1795,7 +1795,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               <Btn
                 onClick={handleNewArtifact}
                 disabled={newArtifactMut.isPending}
-                className="flex items-center gap-1.5 rounded-r-none"
+                className="min-h-10 flex items-center gap-1.5 rounded-r-none"
                 title={i18nT('pages.artifactsPage.start_a_new_blank_document_in_the_library')}
               >
                 {newArtifactMut.isPending ? <Loader2 size={13} className="animate-spin" /> : <FilePlus size={13} />} {i18nT('pages.artifactsPage.new_artifact')}
@@ -1805,7 +1805,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                   <Btn
                     aria-label={i18nT('pages.artifactsPage.more_ways_to_add_an_artifact')}
                     disabled={addArtifactMut.isPending}
-                    className="rounded-l-none border-l-0 px-1"
+                    className="min-h-10 rounded-l-none border-l-0 px-1"
                   >
                     {addArtifactMut.isPending ? <Loader2 size={13} className="animate-spin" /> : <ChevronDown size={13} />}
                   </Btn>
@@ -1825,7 +1825,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               className="hidden"
               onChange={handleAddArtifactFile}
             />
-            <Btn onClick={handleNewFolder} className="flex items-center gap-1.5" title={i18nT('pages.artifactsPage.create_a_folder_to_organize_your_artifacts')}>
+            <Btn onClick={handleNewFolder} className="min-h-10 flex items-center gap-1.5" title={i18nT('pages.artifactsPage.create_a_folder_to_organize_your_artifacts')}>
               <FolderPlus size={13} /> {i18nT('pages.artifactsPage.new_folder')}
             </Btn>
             <SegmentedControl
@@ -1839,20 +1839,21 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             />
           </div>
         </div>
-        <div className="flex flex-wrap gap-2 items-center mb-3">
+        <div className="mb-3 flex flex-wrap items-center gap-2">
             <SearchInput
               placeholder={i18nT('pages.artifactsPage.filter_by_name_slug_description')}
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
+              className="w-full sm:min-w-[260px] sm:flex-1"
             />
-            <select className={sel} value={kindFilter} aria-label={i18nT('pages.artifactsPage.filter_by_kind')} onChange={(e) => setKindFilter(e.target.value)}>
+            <select className={`${sel} min-w-0 flex-1 sm:flex-none`} value={kindFilter} aria-label={i18nT('pages.artifactsPage.filter_by_kind')} onChange={(e) => setKindFilter(e.target.value)}>
               {KIND_OPTIONS.map((k) => (
                 <option key={k} value={k}>
                   {k ? `kind: ${k}` : i18nT('pages.artifactsPage.all_kinds')}
                 </option>
               ))}
             </select>
-            <select className={sel} value={tagFilter} aria-label={i18nT('pages.artifactsPage.filter_by_tag')} onChange={(e) => setTagFilter(e.target.value)}>
+            <select className={`${sel} min-w-0 flex-1 sm:flex-none`} value={tagFilter} aria-label={i18nT('pages.artifactsPage.filter_by_tag')} onChange={(e) => setTagFilter(e.target.value)}>
               <option value="">{i18nT('pages.artifactsPage.all_tags')}</option>
               {allTags.map((t) => (
                 <option key={t} value={t}>
@@ -1860,26 +1861,26 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 </option>
               ))}
             </select>
-            <Btn onClick={() => navigate('/deploy')} className="flex items-center gap-1.5 ml-auto" title={i18nT('pages.artifactsPage.artifact_deploy_aws_profiles_and_published_sites')}>
+            <Btn onClick={() => navigate('/deploy')} className="min-h-10 flex items-center gap-1.5 sm:ml-auto" title={i18nT('pages.artifactsPage.artifact_deploy_aws_profiles_and_published_sites')}>
               <Globe size={13} /> {i18nT('pages.artifactsPage.artifact_deploy')}
             </Btn>
             <div className="inline-flex items-center rounded-lg border border-border bg-bg-elevated p-0.5" role="group" aria-label={i18nT('pages.artifactsPage.filter_starred')}>
-              <button
+              <Btn
                 type="button"
                 onClick={() => { setPinnedOnly(true); safeSetItem('mc-artifacts-pinned-only', '1') }}
                 aria-pressed={pinnedOnly}
-                className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none inline-flex items-center gap-1 ${pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
+                className={`min-h-10 border-none px-2.5 py-1 text-[12px] ${pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
               >
                 <Star size={12} className={pinnedOnly ? 'fill-current' : ''} /> {i18nT('pages.artifactsPage.starred')}
-              </button>
-              <button
+              </Btn>
+              <Btn
                 type="button"
                 onClick={() => { setPinnedOnly(false); safeSetItem('mc-artifacts-pinned-only', '0') }}
                 aria-pressed={!pinnedOnly}
-                className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none ${!pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
+                className={`min-h-10 border-none px-2.5 py-1 text-[12px] ${!pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
               >
                 {i18nT('pages.artifactsPage.all')}
-              </button>
+              </Btn>
             </div>
           </div>
 
@@ -2139,4 +2140,3 @@ function RemoteBrowseSection({ provider, onForked, onCloned }: {
     </Card>
   )
 }
-
