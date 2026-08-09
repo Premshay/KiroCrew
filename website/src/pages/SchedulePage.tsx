@@ -16,6 +16,7 @@ import InfoTip from '../components/InfoTip'
 import type { CronJob } from '../types'
 import { useAgents } from '../hooks/useAgents'
 import { useCronActions } from '../hooks/useCronActions'
+import { useIsMobile } from '../hooks/useIsMobile'
 import { useAppSelector } from '../store'
 import { SaveCreateLabel } from '../utils/cronUtils'
 import { useSortableTable } from '../hooks/useSortableTable'
@@ -99,6 +100,7 @@ const fmtIn = (ts?: number | null) => {
 }
 
 export default function SchedulePage() {
+  const isMobile = useIsMobile()
   const [jobs, setJobs] = useState<CronJob[]>([])
   const { agents, defaultAgent } = useAgents(0)
   const [cronFilter, setCronFilter] = useState('')
@@ -254,7 +256,7 @@ export default function SchedulePage() {
     <div className="flex flex-1 min-h-0 overflow-hidden">
       <div className="flex-1 min-w-0 flex flex-col min-h-0">
         <PageHeader title={i18nT('pages.schedulePage.schedule')} subtitle={i18nT('pages.schedulePage.manage_recurring_cron_jobs_and_scheduled_tasks')} />
-        <div className={`flex-1 overflow-y-auto px-6 min-h-0 ${showEmptyState ? 'pb-2' : 'pb-8'}`}>
+        <div className={`flex-1 overflow-y-auto px-3 min-h-0 sm:px-6 ${showEmptyState ? 'pb-2' : 'pb-8'}`}>
           {loadError ? (
             <div className="flex flex-col items-center justify-center py-20 text-center">
               <p className="text-danger text-sm mb-3">{loadError}</p>
@@ -298,16 +300,16 @@ export default function SchedulePage() {
               </div>
             </div>
           ) : (<>
-          <div className="flex items-center gap-2 px-3 py-2.5 mb-4 rounded-lg bg-accent-subtle border border-accent/20 text-[13px] text-text">
+          <div className="mb-4 flex flex-col gap-2 rounded-lg border border-accent/20 bg-accent-subtle px-3 py-2.5 text-[13px] text-text sm:flex-row sm:items-center">
             <svg className="w-4 h-4 stroke-current fill-none shrink-0 text-accent" viewBox="0 0 24 24" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
             <span>{i18nT('pages.schedulePage.you_can_also_create_schedules_by_chatting_try')} <em>{i18nT('pages.schedulePage.remind_me_to_check_my_pipeline_every_morning_at')}</em></span>
-            <a href="/chat" className="ml-auto text-accent text-[13px] font-medium shrink-0 hover:underline">{i18nT('pages.schedulePage.open_chat')}</a>
+            <a href="/chat" className="text-[13px] font-medium text-accent hover:underline sm:ml-auto">{i18nT('pages.schedulePage.open_chat')}</a>
           </div>
 
           <Card><CardTitle>
-            <div className="flex items-center justify-between w-full">
+            <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <span className="flex items-center gap-1.5">{i18nT('pages.schedulePage.jobs')} <InfoTip text={i18nT('pages.schedulePage.scheduled_jobs_run_on_the_configured_interval_or')} /></span>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <SendBtn onClick={openBlankCreate}>
                   <span className="flex items-center gap-1.5">
                     <svg className="w-3.5 h-3.5 stroke-current fill-none" viewBox="0 0 24 24" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -340,10 +342,10 @@ export default function SchedulePage() {
             </>) : jobsView === 'executions' ? (
               <ExecutionsView selectedJobId={selected?.id} />
             ) : (<>
-            <div className="mb-3 flex items-center gap-2">
+            <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center">
               <div className="flex-1 min-w-0"><SearchInput placeholder={i18nT('pages.schedulePage.filter_jobs')} value={cronFilter} onChange={e => setCronFilter(e.target.value)} /></div>
               {selectedIds.size > 0 && (
-                <div className="flex items-center gap-2 shrink-0">
+                <div className="flex flex-wrap items-center gap-2">
                   <span className="text-[13px] text-muted whitespace-nowrap">{selectedIds.size} {i18nT('pages.schedulePage.selected')}</span>
                   <Btn onClick={clearSelection}>{i18nT('pages.schedulePage.clear')}</Btn>
                   <Btn danger onClick={openBatchConfirm} title={`Delete ${selectedIds.size} selected job(s)`}>
@@ -421,7 +423,27 @@ export default function SchedulePage() {
       </div>
 
       <AnimatePresence>
-        {(selected || creating) && (
+        {(selected || creating) && (isMobile ? (
+          <motion.div
+            key="mobile-panel"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="fixed inset-0 z-50"
+          >
+            <JobDetailPanel
+              key={selected?.id || prefill?.name || 'new'}
+              job={selected || undefined}
+              prefill={!selected ? prefill || undefined : undefined}
+              agents={agents}
+              defaultAgent={defaultAgent}
+              mobile
+              onClose={() => { setSelected(null); setCreating(false); setPrefill(null) }}
+              onSaved={() => { load(); setSelected(null); setCreating(false); setPrefill(null) }}
+            />
+          </motion.div>
+        ) : (
           <motion.div
             key="panel"
             initial={{ width: 0, opacity: 0 }}
@@ -436,11 +458,12 @@ export default function SchedulePage() {
               prefill={!selected ? prefill || undefined : undefined}
               agents={agents}
               defaultAgent={defaultAgent}
+              mobile={false}
               onClose={() => { setSelected(null); setCreating(false); setPrefill(null) }}
               onSaved={() => { load(); setSelected(null); setCreating(false); setPrefill(null) }}
             />
           </motion.div>
-        )}
+        ))}
       </AnimatePresence>
 
       {batchConfirm && (
@@ -514,8 +537,8 @@ export default function SchedulePage() {
 // flex row and reflow content off-screen (mirrors DetailPanel's reserveWidth).
 const JOB_LIST_MIN = 360
 
-function JobDetailPanel({ job, prefill, agents, defaultAgent, onClose, onSaved }: {
-  job?: CronJob; prefill?: CronPrefill; agents: KiroCrewAgent[]; defaultAgent: string; onClose: () => void; onSaved: () => void
+function JobDetailPanel({ job, prefill, agents, defaultAgent, mobile, onClose, onSaved }: {
+  job?: CronJob; prefill?: CronPrefill; agents: KiroCrewAgent[]; defaultAgent: string; mobile: boolean; onClose: () => void; onSaved: () => void
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
@@ -552,21 +575,21 @@ function JobDetailPanel({ job, prefill, agents, defaultAgent, onClose, onSaved }
   })
 
   return (
-    <div ref={panelRef} className="shrink-0 border-l border-border bg-bg flex flex-col h-full overflow-hidden relative" style={{ width, minWidth: 300 }}>
+    <div ref={panelRef} className={`flex h-full flex-col overflow-hidden bg-bg ${mobile ? 'w-full' : 'relative shrink-0 border-l border-border'}`} style={mobile ? undefined : { width, minWidth: 300 }}>
       {/* Resize splitter — Pointer Events (mouse + touch + pen) via usePointerDrag. */}
-      <div role="separator" aria-orientation="vertical" aria-label={i18nT('pages.schedulePage.resize_panel')} className="absolute left-[-2px] top-0 bottom-0 w-[5px] cursor-col-resize z-20 group/drag flex items-center justify-center" style={{ touchAction: 'none' }} {...scheduleResize}>
+      {!mobile && <div role="separator" aria-orientation="vertical" aria-label={i18nT('pages.schedulePage.resize_panel')} className="absolute left-[-2px] top-0 bottom-0 w-[5px] cursor-col-resize z-20 group/drag flex items-center justify-center" style={{ touchAction: 'none' }} {...scheduleResize}>
         <div className="w-[2px] h-full bg-transparent group-hover/drag:bg-accent group-active/drag:bg-accent-hover transition-colors duration-200" />
-      </div>
-      <div className="flex items-center justify-between px-5 py-4 border-b border-border">
+      </div>}
+      <div className="flex items-center justify-between border-b border-border px-3 py-3 sm:px-5 sm:py-4">
         <span className="text-base font-semibold text-text-strong truncate">{job ? job.name : (prefill?.name || i18nT('pages.schedulePage.new_job'))}</span>
         <Btn aria-label={i18nT('pages.schedulePage.close')} onClick={onClose}>
           <svg className="w-4 h-4 stroke-current fill-none" viewBox="0 0 24 24" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </Btn>
       </div>
       {/* Scrollable content */}
-      <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
+      <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-4 sm:px-5">
         {job && (
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <SegmentedControl
               segments={[
                 { key: 'details' as const, label: 'Details' },
@@ -611,7 +634,7 @@ function JobDetailPanel({ job, prefill, agents, defaultAgent, onClose, onSaved }
         )}
       </div>
       {/* Fixed footer */}
-      <div className="shrink-0 px-5 py-3 border-t border-border flex items-center justify-between">
+      <div className="flex shrink-0 items-center justify-between border-t border-border px-3 py-3 sm:px-5">
         {job ? (
           <Btn danger onClick={() => setConfirmDelete(true)}>
             <span className="flex items-center gap-1.5">
