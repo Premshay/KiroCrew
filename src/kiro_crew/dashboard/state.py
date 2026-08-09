@@ -2302,10 +2302,13 @@ class _ChatSlot:
         consequence = self._checkpoint_text(
             value.get("consequence"), SESSION_CHECKPOINT_MILESTONE_MAX
         )
-        raw_priority = value.get("priority", 0)
-        priority = raw_priority if isinstance(raw_priority, int) and not isinstance(raw_priority, bool) else 0
         if not text or not source:
             return None
+        raw_priority = value.get("priority")
+        if isinstance(raw_priority, int) and not isinstance(raw_priority, bool):
+            priority = raw_priority
+        else:
+            priority = self._timeline_default_priority(kind, text)
         return {
             "text": text,
             "source": source,
@@ -2315,13 +2318,47 @@ class _ChatSlot:
             "consequence": consequence,
         }
 
+    @staticmethod
+    def _timeline_default_priority(kind: str, text: str) -> int:
+        """Keep legacy lifecycle noise from displacing useful persisted outcomes."""
+        if text in {"Session started.", "Session resumed.", "Waiting for tool approval.", "Turn cancelled."}:
+            return 10
+        return {
+            "checkpoint": 100,
+            "attention": 90,
+            "terminal": 90,
+            "plan": 80,
+            "todo": 80,
+            "work": 80,
+            "subagents": 20,
+            "subagent_activity": 20,
+            "session": 10,
+            "native_lifecycle": 10,
+        }.get(kind, 0)
+
+    @staticmethod
+    def _cap_session_timeline(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Preserve important milestones when bounded history is full.
+
+        The oldest least-important entry is removed first, so a burst of routine
+        lifecycle messages cannot evict a checkpoint, decision, or actionable
+        approval from the operator digest.
+        """
+        capped = list(entries)
+        while len(capped) > SESSION_CHECKPOINT_TRAIL_MAX:
+            remove_index = min(
+                range(len(capped)), key=lambda index: (capped[index]["priority"], index)
+            )
+            capped.pop(remove_index)
+        return capped
+
     def append_session_timeline(
         self,
         text: object,
         source: str,
         *,
         kind: str = "",
-        priority: int = 0,
+        priority: int | None = None,
         consequence: object = "",
     ) -> bool:
         """Append one redacted structural milestone unless it repeats the current fact."""
@@ -2341,7 +2378,7 @@ class _ChatSlot:
             self._session_timeline[-1].get(field) == entry[field] for field in ("text", "source")
         ):
             return False
-        self._session_timeline = (self._session_timeline + [entry])[-SESSION_CHECKPOINT_TRAIL_MAX:]
+        self._session_timeline = self._cap_session_timeline(self._session_timeline + [entry])
         return True
 
     def restore_session_timeline(self, timeline: object) -> None:
@@ -2356,7 +2393,7 @@ class _ChatSlot:
             if restored and all(restored[-1].get(field) == entry[field] for field in ("text", "source")):
                 continue
             restored.append(entry)
-        self._session_timeline = restored[-SESSION_CHECKPOINT_TRAIL_MAX:]
+        self._session_timeline = self._cap_session_timeline(restored)
 
     def session_timeline_payload(self) -> list[dict[str, Any]]:
         """Return an isolated bounded timeline for the slots snapshot."""

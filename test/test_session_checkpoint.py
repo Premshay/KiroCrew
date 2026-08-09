@@ -161,9 +161,21 @@ class TestCheckpointSlotProjection:
             "source": "terminal",
             "timestamp": "",
             "kind": "terminal",
-            "priority": 0,
+            "priority": 90,
             "consequence": "",
         }]
+
+    def test_timeline_retains_high_signal_entries_over_lifecycle_noise(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot.append_session_timeline("Recorded deployment outcome.", "checkpoint")
+        for number in range(7):
+            slot.append_session_timeline(f"Session resumed: {number}.", "session")
+
+        timeline = slot.session_timeline_payload()
+        assert len(timeline) == 7
+        assert timeline[0]["text"] == "Recorded deployment outcome."
+        assert timeline[0]["priority"] == 100
+        assert "Session resumed: 0." not in [entry["text"] for entry in timeline]
 
     def test_todo_transition_names_the_completed_work_and_next_item(self) -> None:
         from kiro_crew.dashboard.chat_runner import _todo_timeline_entry
