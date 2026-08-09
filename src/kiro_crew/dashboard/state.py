@@ -1553,6 +1553,7 @@ class _ChatSlot:
         "_resumed_count",
         "_hook_continuation_depth",
         "_todo",
+        "_declared_goal",
         "_session_checkpoint",
         "_session_timeline",
         "_on_message",
@@ -1779,6 +1780,10 @@ class _ChatSlot:
         # None = the agent has never used its todo tool in this slot, which the
         # UI renders as "no pill" rather than "an empty list".
         self._todo: dict[str, Any] | None = None
+        # A dashboard owner can declare a goal independently of an agent's
+        # optional work checkpoint.  The card must never infer this from a
+        # transcript or an AutoNudge prompt.
+        self._declared_goal: str = ""
         self._session_checkpoint: dict[str, Any] | None = None
         self._session_timeline: list[dict[str, Any]] = []
         # Callback for broadcasting messages via global SSE
@@ -2326,6 +2331,7 @@ class _ChatSlot:
             return 10
         return {
             "checkpoint": 100,
+            "goal": 90,
             "attention": 90,
             "terminal": 90,
             "plan": 80,
@@ -2399,6 +2405,24 @@ class _ChatSlot:
     def session_timeline_payload(self) -> list[dict[str, Any]]:
         """Return an isolated bounded timeline for the slots snapshot."""
         return [dict(entry) for entry in self._session_timeline]
+
+    def set_declared_goal(self, goal: object) -> bool:
+        """Store an owner-declared goal and record its meaningful transition."""
+        value = self._checkpoint_text(goal, SESSION_CHECKPOINT_GOAL_MAX)
+        if value == self._declared_goal:
+            return False
+        self._declared_goal = value
+        text = f"Goal declared: {value}" if value else "Goal cleared."
+        self.append_session_timeline(text, "goal", kind="goal", priority=90)
+        return True
+
+    def restore_declared_goal(self, goal: object) -> None:
+        """Restore a persisted owner-declared goal without inventing an event."""
+        self._declared_goal = self._checkpoint_text(goal, SESSION_CHECKPOINT_GOAL_MAX)
+
+    def declared_goal_payload(self) -> str:
+        """Return the bounded goal set by the dashboard owner, if any."""
+        return self._declared_goal
 
     def set_session_checkpoint(self, checkpoint: dict[str, Any]) -> bool:
         """Replace the concise view and append one bounded milestone."""
@@ -3608,6 +3632,7 @@ class _ChatSlot:
             # /api/chat/slots (cold load) and the WS `slots` snapshot — so the
             # pill survives reconnect without a separate rehydration path.
             "todo": self.todo_payload(),
+            "declared_goal": self.declared_goal_payload(),
             "plan_goal": self._checkpoint_text(self._plan_goal, SESSION_CHECKPOINT_GOAL_MAX),
             "session_checkpoint": self.session_checkpoint_payload(),
             "session_timeline": self.session_timeline_payload(),

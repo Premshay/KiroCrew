@@ -118,6 +118,32 @@ class TestCheckpointSlotProjection:
         slot._plan_goal = "Show session intent without transcript summaries."
         assert slot.to_dict()["plan_goal"] == "Show session intent without transcript summaries."
 
+    def test_declared_goal_is_distinct_from_agent_checkpoint_and_plan_goal(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot._plan_goal = "Parsed plan objective."
+        slot.set_session_checkpoint(_checkpoint(goal="Agent checkpoint objective."))
+
+        assert slot.set_declared_goal("Owner-declared objective.") is True
+        snapshot = slot.to_dict()
+        assert snapshot["declared_goal"] == "Owner-declared objective."
+        assert snapshot["plan_goal"] == "Parsed plan objective."
+        assert snapshot["session_checkpoint"]["goal"] == "Agent checkpoint objective."
+        assert (
+            slot.session_timeline_payload()[-1]["text"]
+            == "Goal declared: Owner-declared objective."
+        )
+        assert slot.session_timeline_payload()[-1]["priority"] == 90
+
+    def test_clearing_declared_goal_does_not_clear_agent_checkpoint(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot.set_session_checkpoint(_checkpoint(goal="Agent checkpoint objective."))
+        slot.set_declared_goal("Owner-declared objective.")
+
+        assert slot.set_declared_goal("") is True
+        assert slot.declared_goal_payload() == ""
+        assert slot.session_checkpoint_payload()["goal"] == "Agent checkpoint objective."
+        assert slot.session_timeline_payload()[-1]["text"] == "Goal cleared."
+
     def test_restore_drops_malformed_progress_and_keeps_bounded_text(self) -> None:
         slot = _ChatSlot("checkpoint")
         slot.restore_session_checkpoint(
@@ -272,3 +298,22 @@ class TestCheckpointPersistence:
         assert restored is not None
         assert restored.session_checkpoint_payload() == expected
         assert restored.session_timeline_payload() == slot.session_timeline_payload()
+
+    def test_declared_goal_survives_save_and_rehydrate(self, tmp_path, monkeypatch) -> None:
+        from kiro_crew.dashboard.chat_persistence import (
+            _rehydrate_slot_from_history,
+            _save_slot_to_history,
+        )
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("declared-goal")
+        slot.set_declared_goal("Make the dashboard intent explicit.")
+        slot.append("user", "hello")
+        slot.drain()
+        _save_slot_to_history(state, slot)
+        del state._slots["declared-goal"]
+
+        restored = _rehydrate_slot_from_history(state, "declared-goal")
+        assert restored is not None
+        assert restored.declared_goal_payload() == "Make the dashboard intent explicit."
