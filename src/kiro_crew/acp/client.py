@@ -1587,6 +1587,7 @@ class AcpClient:
         mcp_gateway_settings_mcp_json: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
+        model_switch_method: str = "",
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -1600,6 +1601,10 @@ class AcpClient:
         self._agent = agent
         self._sandbox_mode = sandbox_mode
         self._acp_backend = acp_backend
+        # Most Claude-backed ACP adapters expose model selection as a config
+        # option. Codex ACP advertises the same account-scoped model list but
+        # requires the standard session/set_model RPC instead.
+        self._model_switch_method = model_switch_method
         # Claude backend permission mode (Auto-mode / permission-UI parity).
         # Inert on the kiro-cli path and unused by the public core; a companion
         # that drives the _is_claude seam reads/writes it and wires the
@@ -1865,11 +1870,14 @@ class AcpClient:
         # instead of calling into here — otherwise the same stale setting that is
         # quietly withheld on a cold start would raise and kill a warm claim,
         # making the outcome depend on whether a pooled process happened to exist.
-        if not self._is_claude and self._model_is_unusable(model_id):
+        if (
+            (not self._is_claude or self._model_switch_method == "session_set_model")
+            and self._model_is_unusable(model_id)
+        ):
             _rejected_log, _ = redact_exfiltration_urls(str(model_id))
             _rejected_log, _ = redact_credentials(_rejected_log)
             raise AcpModelUnavailable(_rejected_log, self._advertised_model_ids())
-        if self._is_claude:
+        if self._is_claude and self._model_switch_method != "session_set_model":
             await self.set_config_option("model", model_id)
         else:
             await self._send_request(
@@ -1996,7 +2004,7 @@ class AcpClient:
             # unusable id here would re-offer it on every claim.
             self._model = DEFAULT_MODEL
             return
-        if self._is_claude:
+        if self._is_claude and self._model_switch_method != "session_set_model":
             await self.set_config_option("model", self._model)
         else:
             await self._send_request(
@@ -2018,18 +2026,13 @@ class AcpClient:
     # ── Dynamic Config from ACP ──
 
     def _store_session_config(self, resp: dict) -> None:
-        """Extract effort configOptions from a session/new or session/load response.
-
-        Model lists are captured separately by ``_capture_available_models``,
-        which parses the real dict-shaped ``models`` payload
-        (``{availableModels: [...]}``); only the ``configOptions`` effort
-        selector is consumed here.
-        """
+        """Capture the dynamic selectors from a session/new or session/load response."""
         logger.debug("_store_session_config keys: %s", list(resp.keys()))
         config_options = resp.get("configOptions")
         if isinstance(config_options, list):
             self._acp_config_options = config_options
             logger.debug("ACP config options loaded: %d entries", len(config_options))
+            self._capture_models_from_config_options(config_options)
             self._sync_effort_levels()
         # Capture advertised mode ids + whether a modes list was advertised at
         # all, so step 4's set_mode can fail closed against a requested agent the
@@ -2054,7 +2057,42 @@ class AcpClient:
         if isinstance(config_options, list):
             self._acp_config_options = config_options
             logger.debug("ACP config options updated: %d entries", len(config_options))
+            self._capture_models_from_config_options(config_options)
             self._sync_effort_levels()
+
+    def _capture_models_from_config_options(self, config_options: list[dict]) -> None:
+        """Capture a current ACP adapter's model selector as a model list.
+
+        Recent claude-agent-acp versions moved model selection from the legacy
+        top-level ``models.availableModels`` response to the ``model`` session
+        config option. Keep the top-level list when an adapter supplies it;
+        only Claude uses this fallback so Codex retains its effort-qualified
+        model ids from the standard ``models`` response.
+        """
+        if self._available_models and not self._is_claude:
+            return
+        for option in config_options:
+            if not isinstance(option, dict) or option.get("id") != "model":
+                continue
+            choices = option.get("options")
+            if not isinstance(choices, list):
+                return
+            captured = [
+                {
+                    "modelId": str(choice["value"]),
+                    "name": str(choice.get("name") or choice["value"]),
+                    "description": str(choice.get("description") or ""),
+                }
+                for choice in choices
+                if isinstance(choice, dict) and isinstance(choice.get("value"), str)
+                and choice["value"]
+            ]
+            if captured:
+                self._available_models = captured
+            current = option.get("currentValue")
+            if isinstance(current, str) and current:
+                self._resolved_model_id = current
+            return
 
     def _sync_effort_levels(self) -> None:
         """Push ACP-reported effort levels to the global validation set."""

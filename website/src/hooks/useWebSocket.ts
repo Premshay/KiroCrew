@@ -7,7 +7,7 @@ import { sseStatus, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, setC
 import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, fetchNotifications } from '../store/notificationsSlice'
 import { MC_NOTIFICATION_EVENT, TURN_DONE_KIND, shouldChimeOnTurnDone, type McNotificationDetail } from './notificationEvent'
 import { emitThemeSound } from './themeSound'
-import { fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceBusy, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop } from '../store/chatSlice'
+import { fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceBusy, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, interruptActiveTurn, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop } from '../store/chatSlice'
 import { api } from '../api/client'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { nextSpeakableSpan, MIN_TTS_CHARS } from './sentenceCutter'
@@ -1170,6 +1170,9 @@ export function useWebSocket() {
       // Stale WS (e.g. from StrictMode cleanup) — ignore entirely.
       if (wsRef.current !== ws) return
 
+      dispatch(interruptActiveTurn({
+        message: 'Connection to KiroCrew was interrupted. Reconnecting to recover this turn…',
+      }))
       dispatch(sseDisconnected())
       wsRef.current = null
 
