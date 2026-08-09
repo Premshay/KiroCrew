@@ -115,6 +115,38 @@ class TestCheckpointSlotProjection:
         assert payload["trail"] == [f"step {number}" for number in range(3, 10)]
         assert payload["progress"]["kind"] == "none"
 
+    def test_checkpoint_milestone_also_updates_the_redacted_timeline(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot.set_session_checkpoint(_checkpoint(milestone="Recorded AKIAIOSFODNN7EXAMPLE in a draft."))
+
+        timeline = slot.session_timeline_payload()
+        assert timeline[0]["source"] == "checkpoint"
+        assert "AKIAIOSFODNN7EXAMPLE" not in timeline[0]["text"]
+        assert "[REDACTED: credential]" in timeline[0]["text"]
+        assert timeline[0]["timestamp"]
+
+    def test_timeline_is_bounded_and_suppresses_adjacent_repeated_facts(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        assert slot.append_session_timeline("Plan updated: 3 steps.", "plan") is True
+        assert slot.append_session_timeline("Plan updated: 3 steps.", "plan") is False
+        for number in range(9):
+            slot.append_session_timeline(f"TODO progress: {number} of 9 complete.", "todo")
+
+        timeline = slot.session_timeline_payload()
+        assert len(timeline) == 7
+        assert [entry["text"] for entry in timeline] == [
+            f"TODO progress: {number} of 9 complete." for number in range(2, 9)
+        ]
+
+    def test_restore_migrates_legacy_checkpoint_trail_when_no_timeline_exists(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot.restore_session_checkpoint(_checkpoint(trail=["Planned the slice.", "Ran focused tests."]))
+
+        assert [entry["text"] for entry in slot.session_timeline_payload()] == [
+            "Planned the slice.",
+            "Ran focused tests.",
+        ]
+
 
 class TestCheckpointApplier:
     @pytest.mark.asyncio
@@ -155,3 +187,4 @@ class TestCheckpointPersistence:
         restored = _rehydrate_slot_from_history(state, "checkpoint")
         assert restored is not None
         assert restored.session_checkpoint_payload() == expected
+        assert restored.session_timeline_payload() == slot.session_timeline_payload()

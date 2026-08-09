@@ -250,6 +250,59 @@ def _turn_outcome(stop_reason: str | None) -> str:
     return "error"
 
 
+def _record_plan_timeline(
+    slot: "_ChatSlot", metadata: tuple[list[str], str, list[list[str]]]
+) -> None:
+    """Apply parsed plan metadata and record a milestone only when it changes."""
+    titles, goal, descriptions = metadata
+    previous = (slot._stage_titles, slot._plan_goal, slot._stage_descriptions)
+    current = (titles, goal, descriptions)
+    slot._stage_titles, slot._plan_goal, slot._stage_descriptions = current
+    if current == previous:
+        return
+    label = f"Plan updated: {goal}" if goal else "Plan updated"
+    slot.append_session_timeline(f"{label} ({len(titles)} stages).", "plan")
+
+
+def _subagent_roster_snapshot(subagents: object) -> tuple[tuple[str, str], ...]:
+    """Return identity and status only; task text is not a lifecycle fact."""
+    if not isinstance(subagents, list):
+        return ()
+    roster: list[tuple[str, str]] = []
+    for subagent in subagents:
+        if not isinstance(subagent, dict):
+            continue
+        session_id = str(subagent.get("sessionId") or "")
+        status = subagent.get("status")
+        kind = str(status.get("type") or "") if isinstance(status, dict) else ""
+        if session_id:
+            roster.append((session_id, kind.lower()))
+    return tuple(sorted(roster))
+
+
+def _record_subagent_roster_timeline(slot: "_ChatSlot", roster: tuple[tuple[str, str], ...]) -> None:
+    """Record a bounded count after a meaningful native-crew roster transition."""
+    active = sum(
+        status in ("", "working", "running", "pending", "queued", "in_progress")
+        for _, status in roster
+    )
+    slot.append_session_timeline(f"Subagents: {active} active of {len(roster)}.", "subagents")
+
+
+def _record_terminal_timeline(slot: "_ChatSlot", stop_reason: str | None) -> None:
+    """Record only non-normal terminal outcomes, never an ordinary completed turn."""
+    reason = stop_reason or ""
+    if reason in ("", STOP_REASON_END_TURN, "stop", "completed"):
+        return
+    if reason == STOP_REASON_CANCELLED:
+        text = "Turn cancelled."
+    elif "timeout" in reason:
+        text = "Turn ended after a timeout."
+    else:
+        text = "Turn ended with an error."
+    slot.append_session_timeline(text, "terminal")
+
+
 def _emit_turn_metric(
     duration_ms: int | float | None,
     stop_reason: str | None,
@@ -2554,6 +2607,7 @@ async def _run_chat(
     # The slot holds the same live dict so reconnect snapshots can restore cards.
     _native_tracker: dict[str, dict] = {}
     slot._native_subagent_tracker = _native_tracker
+    _timeline_subagent_roster: tuple[tuple[str, str], ...] | None = None
     # inner tool_call_id -> native card id, from `_kiro.dev/session/update`, so a
     # sub-agent's tool calls stream onto its own card.
     _native_tc_card: dict[str, str] = {}
@@ -2803,6 +2857,7 @@ async def _run_chat(
         agent_label = kiro_agent or slot.agent or "default"
         model_label = slot.model or "auto"
         if resumed:
+            slot.append_session_timeline("Session resumed.", "session")
             state.broadcast_ws(
                 "activity_event",
                 {
@@ -2812,6 +2867,8 @@ async def _run_chat(
                 },
             )
         else:
+            if is_new:
+                slot.append_session_timeline("Session started.", "session")
             state.broadcast_ws(
                 "activity_event",
                 {
@@ -4361,6 +4418,7 @@ async def _run_chat(
                 loop = asyncio.get_running_loop()
                 fut: asyncio.Future[str] = loop.create_future()
                 slot._approval_futures[str(event.request_id)] = fut
+                slot.append_session_timeline("Waiting for tool approval.", "attention")
                 # Push via global SSE AFTER registering the future, so the
                 # slot dict reflects pending_approval=true and Board cards
                 # move into the Blocked lane without a browser refresh.
@@ -4660,6 +4718,11 @@ async def _run_chat(
                 # then push a lightweight delta so the pill updates mid-turn
                 # instead of waiting for the next full slots snapshot.
                 if slot.set_todo(event.todo):
+                    todo = slot.todo_payload() or {}
+                    slot.append_session_timeline(
+                        f"TODO progress: {todo.get('completed', 0)} of {todo.get('total', 0)} complete.",
+                        "todo",
+                    )
                     state.broadcast_ws(
                         "todo_update",
                         {"slot": slot.key, "todo": slot.todo_payload()},
@@ -4675,6 +4738,10 @@ async def _run_chat(
                 _native_subagent_sync(
                     state, slot, event.subagents, _native_tracker, _native_card_output
                 )
+                roster = _subagent_roster_snapshot(event.subagents)
+                if roster != _timeline_subagent_roster:
+                    _record_subagent_roster_timeline(slot, roster)
+                    _timeline_subagent_roster = roster
             elif event.kind == EVENT_SUBAGENT_ACTIVITY:
                 # kiro-cli's _kiro.dev/session/update tags a sub-agent's inner
                 # tool call with its sessionId. This ALWAYS arrives before the
@@ -4768,6 +4835,7 @@ async def _run_chat(
                     elapsed_ms=_turn_elapsed_ms,
                 )
                 _stop_reason = event.stop_reason
+                _record_terminal_timeline(slot, _stop_reason)
                 if _stop_reason == STOP_REASON_TOOL_STALL:
                     _stall_tool_title = event.title
                     _stall_command = event.tool_input
@@ -5012,9 +5080,7 @@ async def _run_chat(
                     _reset_auto_run_for_new_plan(slot)
                     assistant_text = ensure_go_all_option(assistant_text)
                     # Store stage count for _stage_loop
-                    slot._stage_titles, slot._plan_goal, slot._stage_descriptions = (
-                        _extract_and_redact_plan_metadata(assistant_text)
-                    )
+                    _record_plan_timeline(slot, _extract_and_redact_plan_metadata(assistant_text))
             _flush_text_stream()
             _flush_segment(state, slot, assistant_text, broadcast=False)
         elif _stop_reason == STOP_REASON_REFUSAL:
@@ -5122,9 +5188,7 @@ async def _run_chat(
                     slot.key,
                 )
                 _reset_auto_run_for_new_plan(slot)
-                slot._stage_titles, slot._plan_goal, slot._stage_descriptions = (
-                    _extract_and_redact_plan_metadata(_orch_plan_buf)
-                )
+                _record_plan_timeline(slot, _extract_and_redact_plan_metadata(_orch_plan_buf))
         # On an empty-response re-queue the turn produced nothing and will
         # immediately re-run; skip persistence / consolidation / success-recording
         # so we don't save a spurious empty turn or skew reliability metrics.
@@ -5569,6 +5633,7 @@ async def _run_chat(
             )
     except Exception as exc:
         logger.exception("Dashboard chat error in slot %s", slot.key)
+        slot.append_session_timeline("Turn ended with an error.", "terminal")
         _err_text, _ = redact_exfiltration_urls(str(exc))
         _err_text, _ = redact_credentials(_err_text)
         slot.append("error", _err_text, "msg msg-err")
