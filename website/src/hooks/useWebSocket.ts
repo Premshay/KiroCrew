@@ -713,7 +713,16 @@ export function useWebSocket() {
             // trigger (no-op unless an L2 theme with that manifest sound is
             // active + unmuted). User/tool messages don't chime.
             if (data.role === 'assistant') emitThemeSound('message-received')
-            if (data.role === 'user' || data.role === 'inject' || data.role === 'subagent') { stopVoice(); spokenLenRef.current = 0; spokeThisTurnRef.current = false; synthChainRef.current = Promise.resolve() }
+            // Voice playback and its streamed-text cursor belong to the visible
+            // conversation. A background session's user frame used to reset this
+            // shared state, which could interrupt the foreground reply and make
+            // its next sentence synthesize again from the beginning.
+            if ((data.role === 'user' || data.role === 'inject' || data.role === 'subagent') && data.slot === store.getState().chat.activeSlot) {
+              stopVoice()
+              spokenLenRef.current = 0
+              spokeThisTurnRef.current = false
+              synthChainRef.current = Promise.resolve()
+            }
             if (data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
               dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
             }
@@ -941,7 +950,10 @@ export function useWebSocket() {
           case 'chat_segment':
             flushChunks()
             dispatch(sseChatMessage({ ...data, role: '_segment' }))
-            spokenLenRef.current = 0
+            // `spokenLenRef` tracks only the active slot's streaming answer.
+            // Resetting it for a background segment makes the active answer
+            // look wholly unspoken and queues a duplicate from its first word.
+            if (data.slot === store.getState().chat.activeSlot) spokenLenRef.current = 0
             break
           case 'chat_status':
             if (data.slot && data.status) {

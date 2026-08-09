@@ -141,6 +141,39 @@ describe('useWebSocket auto-speak voice pipeline', () => {
     hook.unmount()
   })
 
+  it('keeps the foreground speech cursor when a background session segments', async () => {
+    const { hook, ws } = await mount()
+
+    act(() => {
+      ws.simulateMessage({ type: 'chat_chunk', data: { slot: 'slot-1', content: SENTENCE, seq: 1 } })
+      ws.simulateMessage({ type: 'chat_segment', data: { slot: 'slot-2' } })
+      ws.simulateMessage({ type: 'chat_chunk', data: { slot: 'slot-1', content: 'This is the second spoken sentence. ', seq: 2 } })
+    })
+    await act(async () => {})
+
+    expect(api.voiceSynthesize).toHaveBeenCalledTimes(2)
+    expect(api.voiceSynthesize).toHaveBeenNthCalledWith(1, 'slot-1', SENTENCE.trim(), SYNTH_OPTS)
+    expect(api.voiceSynthesize).toHaveBeenNthCalledWith(2, 'slot-1', 'This is the second spoken sentence.', SYNTH_OPTS)
+
+    hook.unmount()
+  })
+
+  it('does not interrupt foreground playback for a background user message', async () => {
+    const { hook, ws } = await mount()
+
+    act(() => {
+      ws.simulateMessage(voiceChunk('slot-1', 0))
+      ws.simulateMessage({ type: 'chat_message', data: { slot: 'slot-2', role: 'user', content: 'Background work.', ts: '11.0' } })
+    })
+    await act(async () => {})
+
+    expect(AUDIO_INSTANCES).toHaveLength(1)
+    expect(AUDIO_INSTANCES[0].pause).not.toHaveBeenCalled()
+    expect(store.getState().chat.voicePlaying).toBe(true)
+
+    hook.unmount()
+  })
+
   it('still speaks a reply that never went through the streaming path', async () => {
     const { hook, ws } = await mount()
 
