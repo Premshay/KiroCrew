@@ -48,6 +48,15 @@ from kiro_crew.preview_text import strip_markdown_preview
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.validation import (
+    SESSION_CHECKPOINT_MAIN_ITEM_MAX,
+    SESSION_CHECKPOINT_MAIN_ITEMS_MAX,
+    SESSION_CHECKPOINT_MILESTONE_MAX,
+    SESSION_CHECKPOINT_PROGRESS_LABEL_MAX,
+    SESSION_CHECKPOINT_SUMMARY_MAX,
+    SESSION_CHECKPOINT_TRAIL_MAX,
+    sanitize_string,
+)
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard._types import (  # noqa: F401
@@ -805,6 +814,7 @@ class _ChatSlot:
         "_artifact",
         "_resumed_count",
         "_todo",
+        "_session_checkpoint",
         "_on_message",
         "_has_reader",
         "_stop_state",
@@ -932,6 +942,7 @@ class _ChatSlot:
         # None = the agent has never used its todo tool in this slot, which the
         # UI renders as "no pill" rather than "an empty list".
         self._todo: dict[str, Any] | None = None
+        self._session_checkpoint: dict[str, Any] | None = None
         # Callback for broadcasting messages via global SSE
         self._on_message: object | None = None  # Callable[[str, dict], None] | None
         self._has_reader: bool = False  # True when HTTP SSE stream is draining
@@ -1217,6 +1228,109 @@ class _ChatSlot:
             "completed": completed,
             "total": len(tasks),
             "current": current,
+        }
+
+    @staticmethod
+    def _checkpoint_text(value: object, limit: int) -> str:
+        if not isinstance(value, str):
+            return ""
+        text = sanitize_string(value)
+        text, _ = redact_exfiltration_urls(text)
+        text, _ = redact_credentials(text)
+        return text[:limit]
+
+    def _checkpoint_progress(self, value: object) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {"kind": "none", "completed": 0, "total": 0, "label": ""}
+        kind = value.get("kind")
+        if kind not in {"plan", "goal"}:
+            return {"kind": "none", "completed": 0, "total": 0, "label": ""}
+        completed = value.get("completed")
+        total = value.get("total")
+        if (
+            isinstance(completed, bool)
+            or not isinstance(completed, int)
+            or completed < 0
+            or isinstance(total, bool)
+            or not isinstance(total, int)
+            or total < 1
+            or completed > total
+        ):
+            return {"kind": "none", "completed": 0, "total": 0, "label": ""}
+        return {
+            "kind": kind,
+            "completed": completed,
+            "total": total,
+            "label": self._checkpoint_text(
+                value.get("label", ""), SESSION_CHECKPOINT_PROGRESS_LABEL_MAX
+            ),
+        }
+
+    def set_session_checkpoint(self, checkpoint: dict[str, Any]) -> bool:
+        """Replace the concise view and append one bounded milestone."""
+        summary = self._checkpoint_text(checkpoint.get("summary"), SESSION_CHECKPOINT_SUMMARY_MAX)
+        milestone = self._checkpoint_text(
+            checkpoint.get("milestone"), SESSION_CHECKPOINT_MILESTONE_MAX
+        )
+        if not summary or not milestone:
+            raise ValueError("checkpoint summary and milestone are required")
+        raw_items = checkpoint.get("main_items")
+        main_items = [
+            text
+            for item in (raw_items if isinstance(raw_items, list) else [])
+            if (text := self._checkpoint_text(item, SESSION_CHECKPOINT_MAIN_ITEM_MAX))
+        ][:SESSION_CHECKPOINT_MAIN_ITEMS_MAX]
+        old_trail = self._session_checkpoint.get("trail", []) if self._session_checkpoint else []
+        trail = [
+            text
+            for item in (old_trail if isinstance(old_trail, list) else [])
+            if (text := self._checkpoint_text(item, SESSION_CHECKPOINT_MILESTONE_MAX))
+        ]
+        self._session_checkpoint = {
+            "summary": summary,
+            "main_items": main_items,
+            "trail": (trail + [milestone])[-SESSION_CHECKPOINT_TRAIL_MAX:],
+            "progress": self._checkpoint_progress(checkpoint.get("progress")),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return True
+
+    def restore_session_checkpoint(self, checkpoint: object) -> None:
+        """Restore a persisted checkpoint after reapplying display bounds."""
+        if not isinstance(checkpoint, dict):
+            return
+        summary = self._checkpoint_text(checkpoint.get("summary"), SESSION_CHECKPOINT_SUMMARY_MAX)
+        if not summary:
+            return
+        raw_items = checkpoint.get("main_items")
+        raw_trail = checkpoint.get("trail")
+        updated_at = checkpoint.get("updated_at")
+        self._session_checkpoint = {
+            "summary": summary,
+            "main_items": [
+                text
+                for item in (raw_items if isinstance(raw_items, list) else [])
+                if (text := self._checkpoint_text(item, SESSION_CHECKPOINT_MAIN_ITEM_MAX))
+            ][:SESSION_CHECKPOINT_MAIN_ITEMS_MAX],
+            "trail": [
+                text
+                for item in (raw_trail if isinstance(raw_trail, list) else [])
+                if (text := self._checkpoint_text(item, SESSION_CHECKPOINT_MILESTONE_MAX))
+            ][-SESSION_CHECKPOINT_TRAIL_MAX:],
+            "progress": self._checkpoint_progress(checkpoint.get("progress")),
+            "updated_at": updated_at if isinstance(updated_at, str) else "",
+        }
+
+    def session_checkpoint_payload(self) -> dict[str, Any] | None:
+        """Return an isolated checkpoint copy for the slots snapshot."""
+        if self._session_checkpoint is None:
+            return None
+        return {
+            "summary": self._session_checkpoint["summary"],
+            "main_items": list(self._session_checkpoint["main_items"]),
+            "trail": list(self._session_checkpoint["trail"]),
+            "progress": dict(self._session_checkpoint["progress"]),
+            "updated_at": self._session_checkpoint["updated_at"],
         }
 
     def append(
@@ -1721,6 +1835,7 @@ class _ChatSlot:
             # /api/chat/slots (cold load) and the WS `slots` snapshot — so the
             # pill survives reconnect without a separate rehydration path.
             "todo": self.todo_payload(),
+            "session_checkpoint": self.session_checkpoint_payload(),
             "has_options": has_options,
             "options": [_redact(o) for o in options],
             "prompt_preview": prompt_preview,

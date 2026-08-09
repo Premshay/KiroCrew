@@ -41,6 +41,13 @@ MAX_MEDIUM_STRING = 5_000  # messages, rules
 MAX_LONG_STRING = 50_000  # task specs, inline content
 MAX_RESPONSE_LEN = 100_000  # truncate tool responses
 
+SESSION_CHECKPOINT_SUMMARY_MAX = 360
+SESSION_CHECKPOINT_MAIN_ITEMS_MAX = 4
+SESSION_CHECKPOINT_MAIN_ITEM_MAX = 160
+SESSION_CHECKPOINT_MILESTONE_MAX = 220
+SESSION_CHECKPOINT_TRAIL_MAX = 7
+SESSION_CHECKPOINT_PROGRESS_LABEL_MAX = 160
+
 # Allowed categories for lessons
 ALLOWED_LESSON_CATEGORIES = frozenset({"tool", "preference", "knowledge"})
 
@@ -1268,6 +1275,66 @@ SUGGEST_FOLLOWUP_SCHEMA = ToolSchema(
     custom_validator=_validate_followup_items,
 )
 
+
+def _validate_session_checkpoint(args: dict[str, Any]) -> None:
+    """Validate the optional plan or goal progress snapshot."""
+    items = args.get("main_items") or []
+    if any(not item for item in items):
+        raise ValidationError("main_items", "items must not be empty")
+
+    progress = args.get("progress")
+    if progress is None:
+        return
+    if not isinstance(progress, dict):
+        raise ValidationError("progress", "expected object")
+    allowed = {"kind", "completed", "total", "label"}
+    unknown = set(progress) - allowed
+    if unknown:
+        raise ValidationError("progress", f"unknown fields: {', '.join(sorted(unknown))}")
+    kind = progress.get("kind")
+    if kind not in {"none", "plan", "goal"}:
+        raise ValidationError("progress", "kind must be one of: none, plan, goal")
+    if kind == "none":
+        if set(progress) != {"kind"}:
+            raise ValidationError("progress", "none progress must contain only kind")
+        return
+    completed = progress.get("completed")
+    total = progress.get("total")
+    if isinstance(completed, bool) or not isinstance(completed, int) or completed < 0:
+        raise ValidationError("progress", "completed must be a non-negative integer")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 1:
+        raise ValidationError("progress", "total must be a positive integer")
+    if completed > total:
+        raise ValidationError("progress", "completed must not exceed total")
+    label = progress.get("label", "")
+    if not isinstance(label, str):
+        raise ValidationError("progress", "label must be a string")
+    label = sanitize_string(label)
+    if len(label) > SESSION_CHECKPOINT_PROGRESS_LABEL_MAX:
+        raise ValidationError(
+            "progress",
+            f"label exceeds max length {SESSION_CHECKPOINT_PROGRESS_LABEL_MAX}",
+        )
+    progress["label"] = label
+
+
+SESSION_CHECKPOINT_SCHEMA = ToolSchema(
+    tool_name="session_checkpoint",
+    fields=[
+        FieldSpec("summary", str, required=True, max_len=SESSION_CHECKPOINT_SUMMARY_MAX),
+        FieldSpec(
+            "main_items",
+            list,
+            item_type=str,
+            item_max_len=SESSION_CHECKPOINT_MAIN_ITEM_MAX,
+            max_items=SESSION_CHECKPOINT_MAIN_ITEMS_MAX,
+        ),
+        FieldSpec("milestone", str, required=True, max_len=SESSION_CHECKPOINT_MILESTONE_MAX),
+        FieldSpec("progress", dict),
+    ],
+    custom_validator=_validate_session_checkpoint,
+)
+
 # --- Dynamic Workflows (M6) ---
 _WF_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
@@ -2091,6 +2158,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "list_sessions": LIST_SESSIONS_SCHEMA,
     "set_project": SET_PROJECT_SCHEMA,
     "suggest_followup": SUGGEST_FOLLOWUP_SCHEMA,
+    "session_checkpoint": SESSION_CHECKPOINT_SCHEMA,
     "artifact_save": ARTIFACT_SAVE_SCHEMA,
     "artifact_get": ARTIFACT_GET_SCHEMA,
     "artifact_update": ARTIFACT_UPDATE_SCHEMA,
