@@ -16,6 +16,7 @@ from kiro_crew.validation import ValidationError
 
 def _checkpoint(**over: object) -> dict:
     value = {
+        "goal": "Make session work visible to operators.",
         "summary": "Implementing the bounded checkpoint writer.",
         "main_items": ["Add the session directive", "Persist the projection"],
         "milestone": "Mapped the existing Multiplex projection seam.",
@@ -45,6 +46,7 @@ class TestCheckpointDirectiveDispatch:
         )
         schema = descriptor["inputSchema"]
         assert schema["required"] == ["summary", "milestone"]
+        assert schema["properties"]["goal"]["maxLength"] == 240
         assert schema["properties"]["main_items"]["maxItems"] == 4
         assert schema["properties"]["progress"]["additionalProperties"] is False
 
@@ -59,6 +61,10 @@ class TestCheckpointDirectiveDispatch:
                 "session_checkpoint",
                 _checkpoint(progress={"kind": "plan", "completed": 3, "total": 2}),
             )
+
+    def test_rejects_an_overlong_goal_before_emitting_a_directive(self) -> None:
+        with pytest.raises(ValidationError):
+            mcp_core._call_tool_inner("session_checkpoint", _checkpoint(goal="x" * 241))
 
     def test_outer_mcp_boundary_rejects_unknown_progress_fields(self) -> None:
         result = mcp_core._call_tool(
@@ -87,6 +93,7 @@ class TestCheckpointSlotProjection:
         payload = slot.session_checkpoint_payload()
         assert payload is not None
         assert payload["summary"] == "Current step 8"
+        assert payload["goal"] == "Make session work visible to operators."
         assert payload["trail"] == [f"Milestone {number}" for number in range(2, 9)]
         assert payload["progress"] == {
             "kind": "plan",
@@ -95,6 +102,21 @@ class TestCheckpointSlotProjection:
             "label": "Checkpoint slice",
         }
         assert slot.to_dict()["session_checkpoint"] == payload
+
+    def test_checkpoint_goal_persists_until_explicitly_replaced_or_cleared(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot.set_session_checkpoint(_checkpoint(goal="Explain work state."))
+        update_without_goal = _checkpoint(summary="Second state.", milestone="Advanced.")
+        update_without_goal.pop("goal")
+        slot.set_session_checkpoint(update_without_goal)
+        assert slot.session_checkpoint_payload()["goal"] == "Explain work state."
+        slot.set_session_checkpoint(_checkpoint(goal="", summary="Third state.", milestone="Cleared."))
+        assert slot.session_checkpoint_payload()["goal"] == ""
+
+    def test_slot_snapshot_exposes_only_the_structured_plan_goal(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot._plan_goal = "Show session intent without transcript summaries."
+        assert slot.to_dict()["plan_goal"] == "Show session intent without transcript summaries."
 
     def test_restore_drops_malformed_progress_and_keeps_bounded_text(self) -> None:
         slot = _ChatSlot("checkpoint")
@@ -110,6 +132,7 @@ class TestCheckpointSlotProjection:
 
         payload = slot.session_checkpoint_payload()
         assert payload is not None
+        assert payload["goal"] == ""
         assert len(payload["summary"]) == 360
         assert payload["main_items"] == ["one", "two", "three", "four"]
         assert payload["trail"] == [f"step {number}" for number in range(3, 10)]
