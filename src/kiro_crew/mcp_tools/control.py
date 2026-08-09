@@ -36,6 +36,7 @@ from kiro_crew.validation import (
     MONITOR_UPDATE_SCHEMA,
     REGISTER_HOOK_SCHEMA,
     SELECT_CREW_SCHEMA,
+    SESSION_CHECKPOINT_SCHEMA,
     SET_PROJECT_SCHEMA,
     SUGGEST_FOLLOWUP_SCHEMA,
     TASK_RUN_SCHEMA,
@@ -488,6 +489,53 @@ def schemas() -> list[dict[str, Any]]:
                 "required": ["items"],
             },
         },
+        {
+            "name": "session_checkpoint",
+            "description": (
+                "Record a concise checkpoint for the calling session's Multiplex card. "
+                "Use only at meaningful milestones: starting a task or goal, changing "
+                "a plan, delegating or receiving child work, making a decision, becoming "
+                "blocked, or finishing. Do NOT call every turn and do NOT summarize the "
+                "full transcript. The summary and current main_items replace the prior "
+                "view; milestone is appended to a seven-item server-capped trail. "
+                "Optional progress records a plan or goal count. This is session-bound: "
+                "it updates only the session that called the tool."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "What the session is working on now (max 360 chars).",
+                        "maxLength": 360,
+                    },
+                    "main_items": {
+                        "type": "array",
+                        "description": "Up to four short current work items (max 160 chars each).",
+                        "items": {"type": "string", "maxLength": 160},
+                        "maxItems": 4,
+                    },
+                    "milestone": {
+                        "type": "string",
+                        "description": "One short completed, changed, decided, or blocked milestone.",
+                        "maxLength": 220,
+                    },
+                    "progress": {
+                        "type": "object",
+                        "description": "Optional {kind: plan|goal, completed, total, label?}; or {kind: none}.",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["none", "plan", "goal"]},
+                            "completed": {"type": "integer", "minimum": 0},
+                            "total": {"type": "integer", "minimum": 1},
+                            "label": {"type": "string", "maxLength": 160},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["summary", "milestone"],
+                "additionalProperties": False,
+            },
+        },
     ]
 
 
@@ -908,6 +956,16 @@ def suggest_followup(name: str, args: dict[str, Any]) -> str:
     )
 
 
+def session_checkpoint(name: str, args: dict[str, Any]) -> str:
+    args = validate_tool_args(args, SESSION_CHECKPOINT_SCHEMA)
+    return session_directive.encode(
+        "session_checkpoint",
+        args,
+        "Checkpoint requested for this session. It will replace the concise "
+        "current view and append this milestone when the result is processed.",
+    )
+
+
 HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "task_run": task_run,
     "wait": wait,
@@ -919,4 +977,5 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "monitor_update": monitor_update,
     "set_project": set_project,
     "suggest_followup": suggest_followup,
+    "session_checkpoint": session_checkpoint,
 }
