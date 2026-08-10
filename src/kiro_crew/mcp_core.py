@@ -113,6 +113,7 @@ from kiro_crew.validation import (
     REGISTER_HOOK_SCHEMA,
     SEARCH_CHAT_HISTORY_SCHEMA,
     SELECT_CREW_SCHEMA,
+    SESSION_CHANNEL_POST_SCHEMA,
     SESSION_CHECKPOINT_SCHEMA,
     SET_PROJECT_SCHEMA,
     SKILL_DISCOVER_SCHEMA,
@@ -2140,6 +2141,41 @@ def _list_tools() -> list[dict[str, Any]]:
                 "maintenance_acknowledge before ending the turn."
             ),
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "session_channel_status",
+            "description": (
+                "List persistent-agent channels attached to this session and their peer IDs. "
+                "Peer reports use the KiroCrew Channel envelope, never a user-message envelope."
+            ),
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "session_channel_post",
+            "description": (
+                "Send a concise typed report to named peers in a channel attached to this session. "
+                "Use progress for updates, mention for a response or decision request, and done for a "
+                "completed handoff. This does not impersonate a human or operator."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {"type": "string", "maxLength": 32},
+                    "recipients": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 32},
+                        "minItems": 1,
+                        "maxItems": 8,
+                    },
+                    "content": {"type": "string", "maxLength": 4000},
+                    "msg_type": {
+                        "type": "string",
+                        "enum": ["progress", "mention", "done"],
+                    },
+                },
+                "required": ["channel_id", "recipients", "content"],
+                "additionalProperties": False,
+            },
         },
         {
             "name": "maintenance_acknowledge",
@@ -5863,12 +5899,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             key = r["key"]
             title = r.get("title") or key
             agent = r.get("agent")
-            msgs = r.get("messages", 0)
             created = r.get("created", "")
             meta_bits = []
             if agent:
                 meta_bits.append(f"agent={agent}")
-            meta_bits.append(f"~{msgs} msgs")
             if created:
                 meta_bits.append(str(created)[:16])
             lines.append("\n---")
@@ -6205,6 +6239,39 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return "Checkpoint recorded for this session's Multiplex view."
         detail = str(result.get("error") or "the gateway rejected the checkpoint")
         return f"Error: checkpoint was not recorded: {detail}"
+
+    if name == "session_channel_status":
+        if args:
+            return "Error: session_channel_status takes no arguments."
+        result = _post("/api/session-channel", {"action": "status"}, require_strict_session=True)
+        if result.get("ok") is not True:
+            return f"Error: channel status unavailable: {result.get('error', 'unknown error')}"
+        channels = result.get("channels") or []
+        if not channels:
+            return "No persistent-agent channel is attached to this session."
+        summaries = []
+        for channel in channels:
+            peers = channel.get("peers") or []
+            peer_text = ", ".join(
+                f"{peer.get('role', 'Peer')} ({peer.get('id', 'unknown')}, {peer.get('state', 'unknown')})"
+                for peer in peers
+            )
+            summaries.append(
+                f"{channel.get('id', 'unknown')} — {channel.get('topic', '')}: {peer_text or 'no peers'}"
+            )
+        return "Attached persistent-agent channels:\n" + "\n".join(summaries)
+
+    if name == "session_channel_post":
+        args = validate_tool_args(args, SESSION_CHANNEL_POST_SCHEMA)
+        result = _post(
+            "/api/session-channel",
+            {"action": "post", **args},
+            require_strict_session=True,
+        )
+        if result.get("ok") is True:
+            message = result.get("message") or {}
+            return f"Peer report recorded as {message.get('id', 'a channel message')}."
+        return f"Error: peer report was not recorded: {result.get('error', 'unknown error')}"
 
     if name == "maintenance_status":
         if args:

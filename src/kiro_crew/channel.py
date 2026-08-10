@@ -121,6 +121,7 @@ class ChannelAgent:
     is_orchestrator: bool = False
     approval_policy: ApprovalPolicy = ApprovalPolicy.WRITES
     listen_mode: ListenMode = ListenMode.MENTION
+    attached_session: bool = False
     inbox: asyncio.Queue[ChannelMessage] = field(default_factory=asyncio.Queue)
     _approval_future: asyncio.Future | None = field(default=None, repr=False)
     _task: asyncio.Task | None = field(default=None, repr=False)
@@ -136,6 +137,7 @@ class ChannelAgent:
             "is_orchestrator": self.is_orchestrator,
             "approval_policy": self.approval_policy.value,
             "listen_mode": self.listen_mode.value,
+            "attached_session": self.attached_session,
         }
 
 
@@ -154,6 +156,7 @@ class Channel:
     trusted: bool = False  # channel-level trust — auto-approve all tools
     _broadcast_fn: Any = None  # set by ChannelManager
     _save_fn: Any = None  # set by ChannelManager
+    _delivery_fn: Any = None  # set by ChannelManager
     _max_agents: int = _MAX_AGENTS
     max_exchanges: int = _MAX_A2A_EXCHANGES
 
@@ -202,6 +205,39 @@ class Channel:
                 "agent": agent.to_dict(),
             },
         )
+        self._save()
+        return agent
+
+    def attach_session(
+        self,
+        session_key: str,
+        role: str,
+        agent_name: str = "",
+        listen_mode: ListenMode | str = ListenMode.MENTION,
+    ) -> ChannelAgent | None:
+        """Attach one existing dashboard session without creating a provider."""
+        if not session_key.startswith("dashboard:") or len(self.members) >= self._max_agents:
+            return None
+        if any(member.session_key == session_key for member in self.members.values()):
+            return None
+        if isinstance(listen_mode, str):
+            try:
+                listen_mode = ListenMode(listen_mode)
+            except ValueError:
+                listen_mode = ListenMode.MENTION
+        agent_id = uuid.uuid4().hex[:8]
+        agent = ChannelAgent(
+            id=agent_id,
+            role=role,
+            agent_name=agent_name,
+            task="",
+            session_key=session_key,
+            state="listening",
+            listen_mode=listen_mode,
+            attached_session=True,
+        )
+        self.members[agent_id] = agent
+        self._broadcast("channel_agent_joined", {"channel_id": self.id, "agent": agent.to_dict()})
         self._save()
         return agent
 
@@ -276,7 +312,7 @@ class Channel:
 
             # Thread routing: default listener = parent sender
             if thread_id and reply_to == agent.id and not mentions:
-                await agent.inbox.put(msg)
+                await self._deliver(agent, msg)
                 continue
 
             # Thread fallback: if reply_to doesn't match any agent (e.g. system message),
@@ -288,12 +324,12 @@ class Channel:
                 and agent.is_orchestrator
                 and reply_to not in self.members
             ):
-                await agent.inbox.put(msg)
+                await self._deliver(agent, msg)
                 continue
 
             # Orchestrator gets all top-level human messages (no @mention needed)
             if is_human and not mentions and not thread_id and agent.is_orchestrator:
-                await agent.inbox.put(msg)
+                await self._deliver(agent, msg)
                 continue
 
             # Everyone else: strict @mention only
@@ -313,7 +349,7 @@ class Channel:
                     continue
                 self.exchange_counts[pair] = self.exchange_counts.get(pair, 0) + 1
 
-            await agent.inbox.put(msg)
+            await self._deliver(agent, msg)
 
         # Dead agent bounce
         for mid in mentions:
@@ -346,6 +382,12 @@ class Channel:
         )
         self._save()
         return msg
+
+    async def _deliver(self, agent: ChannelAgent, msg: ChannelMessage) -> None:
+        if agent.attached_session and self._delivery_fn:
+            await self._delivery_fn(self, agent, msg)
+            return
+        await agent.inbox.put(msg)
 
     async def subscribe(self, agent_id: str):
         """Async generator yielding messages for an agent."""
@@ -397,7 +439,13 @@ class Channel:
         }
 
     @classmethod
-    def deserialize(cls, data: dict[str, Any], broadcast_fn: Any = None, save_fn: Any = None) -> "Channel":
+    def deserialize(
+        cls,
+        data: dict[str, Any],
+        broadcast_fn: Any = None,
+        save_fn: Any = None,
+        delivery_fn: Any = None,
+    ) -> "Channel":
         """Restore a channel from serialized data."""
         ch = cls(id=data["id"], topic=data["topic"])
         ch.orchestrator_id = data.get("orchestrator_id")
@@ -406,6 +454,7 @@ class Channel:
         ch.max_exchanges = data.get("max_exchanges", _MAX_A2A_EXCHANGES)
         ch._broadcast_fn = broadcast_fn
         ch._save_fn = save_fn
+        ch._delivery_fn = delivery_fn
         for aid, ad in data.get("members", {}).items():
             agent = ChannelAgent(
                 id=ad["id"],
@@ -413,9 +462,11 @@ class Channel:
                 agent_name=ad.get("agent_name", ""),
                 task=ad.get("task", ""),
                 session_key=ad.get("session_key", f"channel:{data['id']}:{ad['id']}"),
-                state="done",  # always restore as done
+                state="listening" if ad.get("attached_session") else "done",
                 is_orchestrator=ad.get("is_orchestrator", False),
+                approval_policy=ApprovalPolicy(ad.get("approval_policy", "writes")),
                 listen_mode=ListenMode(ad.get("listen_mode", "all" if ad.get("is_orchestrator") else "mention")),
+                attached_session=bool(ad.get("attached_session")),
             )
             ch.members[aid] = agent
         for md in data.get("messages", []):
@@ -449,11 +500,13 @@ class ChannelManager:
         max_channels: int = _MAX_CHANNELS,
         max_agents: int = _MAX_AGENTS,
         channels_dir: str | None = None,
+        delivery_fn: Any = None,
     ):
         self._channels: dict[str, Channel] = {}
         self._broadcast_fn = broadcast_fn
         self._max_channels = max_channels
         self._max_agents = max_agents
+        self._delivery_fn = delivery_fn
         # Resolve the channels dir lazily in __init__ (not as a class attr) so
         # merely importing this module never triggers config_dir() and its
         # one-time data-home migration as an import side effect — that must fire
@@ -491,7 +544,12 @@ class ChannelManager:
             try:
                 with open(path) as f:
                     data = json.load(f)
-                ch = Channel.deserialize(data, broadcast_fn=self._broadcast_fn, save_fn=self._save_channel)
+                ch = Channel.deserialize(
+                    data,
+                    broadcast_fn=self._broadcast_fn,
+                    save_fn=self._save_channel,
+                    delivery_fn=self._delivery_fn,
+                )
                 ch._max_agents = self._max_agents
                 self._channels[ch.id] = ch
                 logger.info("Restored channel %s (%s)", ch.id, ch.topic)
@@ -508,6 +566,7 @@ class ChannelManager:
             topic=topic,
             _broadcast_fn=self._broadcast_fn,
             _save_fn=self._save_channel,
+            _delivery_fn=self._delivery_fn,
             _max_agents=self._max_agents,
         )
         self._channels[channel_id] = channel

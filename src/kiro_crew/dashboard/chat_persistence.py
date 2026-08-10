@@ -451,6 +451,7 @@ def _rehydrate_slot_from_history(
         slot.restore_declared_goal(meta.get("declared_goal"))
         slot.restore_session_checkpoint(meta.get("session_checkpoint"))
         slot.restore_session_timeline(meta.get("session_timeline"))
+        slot.restore_peer_channel_inbox(meta.get("peer_channel_inbox"))
         # Re-validate the companion binding against the slug grammar on restore
         # (same gate as slot create) — history JSONL is a file an attacker with
         # disk access could tamper, and this value flows into to_dict()/WS
@@ -765,6 +766,7 @@ def _restore_recent_sessions_steps(
         slot.restore_declared_goal(meta.get("declared_goal"))
         slot.restore_session_checkpoint(meta.get("session_checkpoint"))
         slot.restore_session_timeline(meta.get("session_timeline"))
+        slot.restore_peer_channel_inbox(meta.get("peer_channel_inbox"))
         # Same tamper gate as _rehydrate_slot_from_history: re-validate the
         # companion binding against the slug grammar before it reaches
         # to_dict()/WS broadcasts.
@@ -1460,6 +1462,9 @@ def _save_slot_to_history(
             timeline = slot.session_timeline_payload()
             if timeline:
                 meta_line["session_timeline"] = timeline
+            peer_channel_inbox = slot.peer_channel_inbox_payload()
+            if peer_channel_inbox:
+                meta_line["peer_channel_inbox"] = peer_channel_inbox
             # Artifact companion binding — persisted so a bound
             # session restored after a gateway restart (or resumed from the
             # History page) comes back as the artifact's active bound session.

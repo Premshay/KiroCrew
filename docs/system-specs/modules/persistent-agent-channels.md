@@ -36,6 +36,7 @@ ChannelManager (singleton)
 ChannelAgent
   ├── state: pending → listening → working → done/failed
   ├── is_orchestrator: bool
+  ├── attached_session: bool
   ├── approval_policy: ALL | WRITES | TRUSTED
   ├── listen_mode: ALL | MENTION | SILENT
   └── inbox: asyncio.Queue[ChannelMessage]
@@ -51,6 +52,22 @@ ChannelAgent
 
 - Agents stay alive until explicitly dismissed or channel closed
 - Pending state shown as ⏳ until session cold-start completes
+
+### Attached Dashboard Sessions
+
+A channel can also attach an already-running dashboard session instead of
+creating a channel-owned provider session. Attached members retain their
+existing `dashboard:<slot>` identity and remain `listening` across a gateway
+restart; the gateway never relaunches them as channel agents.
+
+Attached sessions use the strict session-bound MCP tools
+`session_channel_status` and `session_channel_post`. A post can address only
+named peers in a channel to which the caller is attached. The gateway persists
+the incoming report in the recipient slot's peer inbox and injects it on that
+slot's next normal turn as a `[KiroCrew Channel message]` envelope. The envelope
+states that it is a peer-agent message, not a user instruction or operator
+authorization. It is not appended to the visible user chat transcript and does
+not interrupt a running turn.
 
 ### Message Routing
 
@@ -104,8 +121,10 @@ an Orchestrator agent as the first member.
 ## Persistence
 
 Channels saved to `~/.kiro/crew/channels/{id}.json` on every state change.
-Restored on gateway startup via `ChannelManager._load_all()`. Agents
-restored as `done` and relaunched with fresh sessions.
+Restored on gateway startup via `ChannelManager._load_all()`. Channel-owned
+agents are restored as `done` and relaunched with fresh sessions. Attached
+dashboard sessions are restored as `listening` and resume delivery through
+their persisted dashboard-slot identity.
 
 ## Frontend (ChannelPage.tsx)
 
@@ -124,12 +143,14 @@ restored as `done` and relaunched with fresh sessions.
 | GET | `/api/channels` | List all channels |
 | POST | `/api/channels` | Create channel (429 if limit) |
 | DELETE | `/api/channels/{id}` | Close and remove channel |
+| POST | `/api/channels/{id}/sessions` | Attach one existing dashboard session |
 | POST | `/api/channels/{id}/messages` | Post message |
 | POST | `/api/channels/{id}/agents` | Add agent (429 if limit) |
 | PATCH | `/api/channels/{id}/agents/{aid}` | Update agent (listen mode) |
 | DELETE | `/api/channels/{id}/agents/{aid}` | Dismiss agent |
 | POST | `/api/channels/{id}/agents/{aid}/approve` | Approve/reject/trust tool call |
 | GET | `/api/channels/presets` | List team presets |
+| POST | `/api/session-channel` | Strict MCP-only channel status or named peer post |
 
 ## Files
 

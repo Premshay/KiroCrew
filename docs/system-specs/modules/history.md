@@ -27,7 +27,7 @@ workspace-scoped by default (fail-closed via `_caller_workspace`/`_ws_bucket`,
 - `search_chat_history` — keyword lookup over past transcripts (ranked snippets).
 - `get_chat_session` — read one full transcript by `session_key`.
 - `list_sessions` — browse/overview counterpart to search: returns recent
-  sessions newest-first (title, owning agent, message count, timestamps) built
+  sessions newest-first (title, owning agent, timestamps) built
   on `ConversationLog.list_sessions()`, with `limit` (default 20, max 100).
   Opt-in `summarize=true` calls `POST /api/sessions/summarize` to attach a fresh
   one-line LLM summary per session — MCP core has no LLM access, so the LLM leg

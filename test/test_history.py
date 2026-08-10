@@ -236,6 +236,14 @@ class TestConversationLog:
         assert by_key["t-with"].get("agent") == "kiro-v2"
         assert "agent" not in by_key["t-without"]
 
+    def test_list_sessions_does_not_fabricate_message_counts(self, tmp_path):
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("count-free", "user", "x" * 1000)
+
+        session = next(item for item in log.list_sessions() if item["key"] == "count-free")
+
+        assert "messages" not in session
+
     def test_list_sessions_surfaces_folder_id(self, tmp_path):
         """list_sessions() should surface folder_id from the metadata line when present."""
         log = ConversationLog(base_dir=tmp_path)

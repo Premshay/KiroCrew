@@ -260,6 +260,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/computer-use/frame",
         "/api/session-keepalive",
         "/api/session-checkpoint",
+        "/api/session-channel",
         "/api/session-maintenance",
         "/api/session-tool-policy",
         "/api/hooks/agent",
@@ -916,6 +917,7 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/computer-use/frame", handlers.api_computer_use_frame)
     app.router.add_post("/api/session-keepalive", handlers.api_session_keepalive)
     app.router.add_post("/api/session-checkpoint", handlers.api_session_checkpoint)
+    app.router.add_post("/api/session-channel", handlers.api_session_channel)
     app.router.add_post("/api/session-maintenance", handlers.api_session_maintenance)
     app.router.add_get("/api/session-tool-policy", handlers.api_session_tool_policy)
     app.router.add_post("/api/slack-profile", handlers.api_slack_profile)
@@ -2380,6 +2382,9 @@ async def start_dashboard(
     app.router.add_get("/api/channels/{id}", handlers_channel.api_channel_get)
     app.router.add_delete("/api/channels/{id}", handlers_channel.api_channel_close)
     app.router.add_post(
+        "/api/channels/{id}/sessions", handlers_channel.api_channel_attach_session
+    )
+    app.router.add_post(
         "/api/channels/{id}/clear-context", handlers_channel.api_channel_clear_context
     )
     app.router.add_post("/api/channels/{id}/messages", handlers_channel.api_channel_post)
@@ -3205,10 +3210,15 @@ async def start_dashboard(
         broadcast_fn=state.broadcast_ws,
         max_channels=cfg.agent.max_channels,
         max_agents=cfg.agent.max_channel_agents,
+        delivery_fn=lambda channel, member, message: handlers_channel.deliver_attached_channel_message(
+            state, channel, member, message
+        ),
     )
     state.channel_manager = mgr
     for ch in mgr._channels.values():
         for agent in ch.members.values():
+            if agent.attached_session:
+                continue
             agent.state = "pending"
             _spawn_agent_task(
                 agent, run_channel_agent(agent, ch, state.sessions, is_yolo=lambda: state._yolo)

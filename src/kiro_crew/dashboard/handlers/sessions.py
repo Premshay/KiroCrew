@@ -24,8 +24,8 @@ from aiohttp import web
 import kiro_crew.dashboard.handlers as _h
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.dashboard.handlers import kiro_usage_api
 from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.handlers import kiro_usage_api
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
 from kiro_crew.dashboard.state import DashboardState
@@ -1179,6 +1179,126 @@ async def api_session_checkpoint(request: web.Request) -> web.Response:
         _publish_restart_barrier(state)
     state.push_slots_update()
     return web.json_response({"ok": True, "session_checkpoint": slot.session_checkpoint_payload()})
+
+
+async def api_session_channel(request: web.Request) -> web.Response:
+    """Read or post through the caller's attached persistent-agent channels."""
+    state: DashboardState = request.app["state"]
+    session_key = request.headers.get("X-Session-Key", "").strip()
+    if not session_key:
+        return web.json_response(
+            {"error": "X-Session-Key required", "code": "missing_session_key"}, status=400
+        )
+    slots = [slot for slot in state._slots.values() if effective_session_key(slot) == session_key]
+    if len(slots) != 1:
+        return web.json_response(
+            {
+                "error": "the calling session has no unique live dashboard slot",
+                "code": "channel_slot_not_found",
+            },
+            status=404,
+        )
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "invalid_channel_request"},
+            status=400,
+        )
+    manager = getattr(state, "channel_manager", None)
+    if manager is None:
+        return web.json_response(
+            {"error": "persistent channels are unavailable", "code": "channels_unavailable"},
+            status=503,
+        )
+    attached = []
+    for channel in manager._channels.values():
+        member = next(
+            (
+                item
+                for item in channel.members.values()
+                if item.attached_session and item.session_key == session_key
+            ),
+            None,
+        )
+        if member is not None:
+            attached.append((channel, member))
+    action = body.get("action")
+    if action == "status":
+        return web.json_response(
+            {
+                "ok": True,
+                "channels": [
+                    {
+                        "id": channel.id,
+                        "topic": channel.topic,
+                        "self": {"id": member.id, "role": member.role},
+                        "peers": [
+                            {"id": peer.id, "role": peer.role, "state": peer.state}
+                            for peer in channel.members.values()
+                            if peer.id != member.id
+                        ],
+                    }
+                    for channel, member in attached
+                ],
+            }
+        )
+    if action != "post":
+        return web.json_response(
+            {"error": "action must be status or post", "code": "invalid_channel_action"}, status=400
+        )
+    channel_id = body.get("channel_id")
+    if not isinstance(channel_id, str) or len(channel_id) > 32:
+        return web.json_response(
+            {"error": "channel_id required", "code": "invalid_channel_id"}, status=400
+        )
+    selected = next(((channel, member) for channel, member in attached if channel.id == channel_id), None)
+    if selected is None:
+        return web.json_response(
+            {"error": "caller is not attached to that channel", "code": "channel_membership_required"},
+            status=403,
+        )
+    recipients = body.get("recipients")
+    if (
+        not isinstance(recipients, list)
+        or not recipients
+        or len(recipients) > 8
+        or any(not isinstance(recipient, str) for recipient in recipients)
+        or len(set(recipients)) != len(recipients)
+    ):
+        return web.json_response(
+            {"error": "recipients must be one to eight distinct agent ids", "code": "invalid_recipients"},
+            status=400,
+        )
+    channel, member = selected
+    if member.id in recipients or any(recipient not in channel.members for recipient in recipients):
+        return web.json_response(
+            {"error": "recipients must name other channel members", "code": "invalid_recipients"},
+            status=400,
+        )
+    content = body.get("content")
+    if not isinstance(content, str) or not content.strip() or len(content) > 4000:
+        return web.json_response(
+            {"error": "content must be 1 to 4000 characters", "code": "invalid_channel_content"},
+            status=400,
+        )
+    msg_type = body.get("msg_type", "progress")
+    if not isinstance(msg_type, str) or msg_type not in {"progress", "mention", "done"}:
+        return web.json_response(
+            {"error": "invalid message type", "code": "invalid_channel_message_type"}, status=400
+        )
+    content, _ = redact_exfiltration_urls(content.strip())
+    content, _ = redact_credentials(content)
+    message = await channel.post(
+        member.id,
+        content,
+        from_role=member.role,
+        mention=recipients,
+        msg_type=msg_type,
+    )
+    return web.json_response({"ok": True, "message": {"id": message.id, "recipients": recipients}})
 
 
 async def api_session_maintenance(request: web.Request) -> web.Response:
