@@ -77,6 +77,15 @@ class TestChannel:
             assert ch.add_agent(role=f"Agent{i}", agent_name="a", task="t") is not None
         assert ch.add_agent(role="Extra", agent_name="a", task="t") is None
 
+    def test_attach_dashboard_session(self):
+        ch, _ = self._make_channel()
+        member = ch.attach_session("dashboard:crew-codex", role="Codex", agent_name="crew-codex")
+        assert member is not None
+        assert member.attached_session is True
+        assert member.session_key == "dashboard:crew-codex"
+        assert member.state == "listening"
+        assert ch.attach_session("dashboard:crew-codex", role="Duplicate") is None
+
     def test_remove_agent(self):
         ch, events = self._make_channel()
         agent = ch.add_agent(role="X", agent_name="a", task="t")
@@ -130,6 +139,23 @@ class TestChannelRouting:
         await ch.post(orch.id, "check logs", from_role="Orchestrator", mention=spec.id)
         assert not spec.inbox.empty()
         assert orch.inbox.empty()  # sender skipped
+
+    @pytest.mark.asyncio
+    async def test_attached_session_receives_delivery_callback(self):
+        deliveries = []
+
+        async def deliver(channel, member, message):
+            deliveries.append((channel.id, member.session_key, message.content))
+
+        ch = Channel(id="ch1", topic="test", _delivery_fn=deliver)
+        sender = ch.add_agent(role="Sender", agent_name="sender", task="work")
+        sender.state = "listening"
+        attached = ch.attach_session("dashboard:crew-claude", role="Claude")
+
+        await ch.post(sender.id, "verified report", from_role="Sender", mention=attached.id)
+
+        assert deliveries == [("ch1", "dashboard:crew-claude", "verified report")]
+        assert attached.inbox.empty()
 
     @pytest.mark.asyncio
     async def test_multi_mention(self):
@@ -239,6 +265,16 @@ class TestChannelPersistence:
         agent = list(restored.members.values())[0]
         assert agent.state == "done"  # always restored as done
         assert agent.is_orchestrator is True
+
+    def test_attached_session_remains_listening_after_restore(self):
+        ch = Channel(id="ch1", topic="test")
+        member = ch.attach_session("dashboard:crew-codex", role="Codex")
+
+        restored = Channel.deserialize(ch.serialize())
+
+        saved = restored.members[member.id]
+        assert saved.attached_session is True
+        assert saved.state == "listening"
 
 
 class TestChannelManager:
