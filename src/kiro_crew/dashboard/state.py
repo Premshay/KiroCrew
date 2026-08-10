@@ -498,6 +498,8 @@ CRON_NOTIFY_PREFIX = "[Cron notification from "
 CRON_NOTIFY_END = "[End of cron notification]"
 CRON_NOTIFY_RE = re.compile(rf'^{re.escape(CRON_NOTIFY_PREFIX)}"(.*)"\]')
 SUBAGENT_COMPLETION_PREFIX = "[Subagent completion event]"
+PEER_CHANNEL_REQUEST_PREFIX = "[Peer channel request]"
+PEER_CHANNEL_REQUEST_KIND = "peer_channel_request"
 # One-shot synthesis turn fired after ALL sub-agents in a fan-out complete and
 # each result has been processed in its own turn (see gateway._subagent_done arm
 # + chat_runner drain/idle branch). Its visible reply is the consolidated,

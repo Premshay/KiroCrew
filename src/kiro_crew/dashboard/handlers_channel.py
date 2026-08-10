@@ -12,6 +12,7 @@ from aiohttp import web
 from kiro_crew.channel import ChannelManager, run_channel_agent
 from kiro_crew.config.loader import config_path
 from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.state import PEER_CHANNEL_REQUEST_KIND, PEER_CHANNEL_REQUEST_PREFIX
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -280,9 +281,21 @@ async def deliver_attached_channel_message(state, channel, member, message) -> N
         }
     ):
         return
+
+    if message.msg_type == "mention":
+        slot.queue_append(
+            f"{PEER_CHANNEL_REQUEST_PREFIX}\n"
+            "A named peer requested your attention. Review the peer channel message "
+            "above and respond only if an action or acknowledgement is needed.",
+            kind=PEER_CHANNEL_REQUEST_KIND,
+        )
     from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 
     await save_slot_off_loop(state, slot, force=True, best_effort=False)
+    if message.msg_type == "mention" and not slot.running and not slot._in_stage_execution:
+        from kiro_crew.dashboard.chat_runner import _start_next_queued_turn
+
+        await _start_next_queued_turn(state, slot)
     state.push_slots_update()
 
 
@@ -310,7 +323,7 @@ async def api_channel_post(request: web.Request) -> web.Response:
         content,
         from_role="You",
         mention=raw_mention,
-        msg_type="broadcast",
+        msg_type="mention" if raw_mention else "broadcast",
         thread_id=thread_id,
     )
     return web.json_response({"ok": True, "message": msg.to_dict()})

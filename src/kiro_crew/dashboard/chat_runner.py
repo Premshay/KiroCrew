@@ -82,6 +82,7 @@ from kiro_crew.dashboard.chat_utils import (
     _remove_queued_by_id,
     _validate_tool_name,
     effective_session_key,
+    is_peer_channel_request_item,
     is_system_injection,
 )
 from kiro_crew.dashboard.handlers import (
@@ -2389,29 +2390,40 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     next_msg, _ = redact_credentials(next_msg)
     is_cron = next_msg.startswith(CRON_NOTIFY_PREFIX)
     is_subagent = next_msg.startswith(SUBAGENT_COMPLETION_PREFIX)
+    is_peer_channel_request = any(is_peer_channel_request_item(item) for item in consumed)
     is_recovery = (
         next_msg.startswith(REFUSAL_RECOVERY_PREFIX)
         or next_msg.startswith(STALE_RECOVERY_PREFIX)
         or next_msg.startswith(TOOL_STALL_RECOVERY_PREFIX)
         or any(is_synthetic_recovery_item(item) for item in consumed)
     )
-    if not (is_cron or is_subagent or is_recovery):
+    if not (is_cron or is_subagent or is_recovery or is_peer_channel_request):
         slot._pending_synthesis = False
     match = CRON_NOTIFY_RE.match(next_msg) if is_cron else None
     cron_label = match.group(1) if match else "cron"
     cron_label, _ = redact_exfiltration_urls(cron_label)
     cron_label, _ = redact_credentials(cron_label)
     slot.append(
-        "subagent" if is_subagent else "inject" if (is_cron or is_recovery) else "user",
+        "subagent"
+        if is_subagent
+        else "inject"
+        if (is_cron or is_recovery or is_peer_channel_request)
+        else "user",
         next_msg,
         (
             json.dumps({"cronLabel": cron_label})
             if is_cron
-            else "msg msg-inject" if is_recovery else "msg msg-u"
+            else "msg msg-inject"
+            if (is_recovery or is_peer_channel_request)
+            else "msg msg-u"
         ),
     )
 
-    task = spawn_guarded_turn(state, slot, _run_chat(state, slot, next_msg))
+    task = spawn_guarded_turn(
+        state,
+        slot,
+        _run_chat(state, slot, next_msg, _peer_channel_request=is_peer_channel_request),
+    )
     slot.task = task
     return True
 
@@ -2502,6 +2514,7 @@ async def _run_chat(
     *,
     _prompt_depth: int = 0,
     regenerate_hint: str = "",
+    _peer_channel_request: bool = False,
 ) -> None:
     """Stream LLM response into *slot*.  Survives browser disconnect."""
 
@@ -2751,7 +2764,11 @@ async def _run_chat(
     # The post-fan-out synthesis prompt is a synthetic continuation too: never
     # mirror it to linked surfaces (Slack/Telegram) as if the user typed it —
     # only its assistant reply is delivered.
-    _is_synthetic = _is_recovery or message.startswith(SUBAGENT_SYNTHESIS_PREFIX)
+    _is_synthetic = (
+        _is_recovery
+        or message.startswith(SUBAGENT_SYNTHESIS_PREFIX)
+        or _peer_channel_request
+    )
 
     # ── Slash commands: detect early, before session acquisition ──
     first_word = message.split()[0] if message.strip() else ""

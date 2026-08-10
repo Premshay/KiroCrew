@@ -2,9 +2,11 @@
 
 ## Overview
 
-`channel.py` + `handlers_channel.py` + `ChannelPage.tsx` — multi-agent
-collaboration spaces where specialized agents work on assigned roles,
-communicate via @mentions, and persist across sessions.
+`channel.py` + `handlers_channel.py` + `ChannelPage.tsx` — persistent
+collaboration spaces that attach existing dashboard sessions as peers,
+communicate through typed @mentions, and persist across gateway restarts.
+Provider-owned role agents are an optional second mode, not a replacement for
+the sessions the operator is already using.
 
 ## Problem
 
@@ -16,9 +18,10 @@ orchestrator.
 ## Solution
 
 Persistent agent channels — shared communication spaces with:
-- An always-on orchestrator agent that coordinates work
-- Specialist agents that wake on @mention
-- Human approval for mutating tool calls
+- Existing dashboard sessions as the default collaboration peers
+- Explicit @mentions that request one safe peer turn without interrupting work
+- Optional provider-owned orchestrator and specialist roles for new work
+- Human approval for mutating provider-agent tool calls
 - Disk persistence for channel state across gateway restarts
 
 ## Architecture
@@ -29,7 +32,7 @@ Persistent agent channels — shared communication spaces with:
 ChannelManager (singleton)
   └── Channel (max 1 active, configurable)
         ├── topic: str
-        ├── orchestrator_id: str
+        ├── orchestrator_id: str | None (provider-owned mode only)
         ├── members: dict[str, ChannelAgent] (max 3 per channel, configurable)
         ├── messages: list[ChannelMessage] (max 200, O(1) index)
 
@@ -63,19 +66,23 @@ restart; the gateway never relaunches them as channel agents.
 Attached sessions use the strict session-bound MCP tools
 `session_channel_status` and `session_channel_post`. A post can address only
 named peers in a channel to which the caller is attached. The gateway persists
-the incoming report in the recipient slot's peer inbox and injects it on that
-slot's next normal turn as a `[KiroCrew Channel message]` envelope. The envelope
-states that it is a peer-agent message, not a user instruction or operator
-authorization. It is not appended to the visible user chat transcript and does
-not interrupt a running turn.
+the incoming report in the recipient slot's peer inbox as a
+`[KiroCrew Channel message]` envelope. A named peer request (`msg_type: mention`)
+also schedules one synthetic recipient turn when the slot is idle, or waits in
+the slot queue when it is busy. Broadcast, progress, and done reports remain
+passive. The envelope states that it is a peer-agent message, not a user
+instruction or operator authorization; it is not appended to the visible user
+chat transcript and never interrupts a running turn.
 
 ### Message Routing
 
-1. Human messages → orchestrator (top-level, no @mention needed)
-2. @mention → targeted agent only (bounce message if done/failed)
+1. Human broadcast → attached sessions listening to all, plus an optional orchestrator
+2. @mention → targeted peer only (bounce message if done/failed)
 3. Agent-to-agent → capped at 3 exchanges per pair (prevent loops)
 4. Thread replies → routed to parent message sender (fallback to orchestrator)
 5. System messages → orchestrator ready, agent joined notifications
+6. Attached-session named request → one queued synthetic peer turn; passive
+   reports wait for the recipient's next normal turn
 
 ### Approval Flow
 

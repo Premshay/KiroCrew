@@ -22,6 +22,7 @@ from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
     EMPTY_RESPONSE_RECOVERY_PREFIX,
     MANUAL_RESUME_RECOVERY_PREFIX,
+    PEER_CHANNEL_REQUEST_KIND,
     POSTTOKEN_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
     DashboardState,
@@ -775,6 +776,11 @@ def is_synthetic_recovery_item(item: dict) -> bool:
     return item.get("kind") == SYNTHETIC_RECOVERY_KIND
 
 
+def is_peer_channel_request_item(item: dict) -> bool:
+    """True when a queue entry is a named peer request."""
+    return item.get("kind") == PEER_CHANNEL_REQUEST_KIND
+
+
 def is_system_injection_item(item: dict) -> bool:
     """Item-aware system-injection predicate for queue-entry consumers.
 
@@ -784,7 +790,11 @@ def is_system_injection_item(item: dict) -> bool:
     channel-mirrored history), keep draining during sub-agent runs, and never
     consume the session-reset notice — same treatment as sub-agent completion
     and cron injections."""
-    return is_synthetic_recovery_item(item) or is_system_injection(item["content"])
+    return (
+        is_synthetic_recovery_item(item)
+        or is_peer_channel_request_item(item)
+        or is_system_injection(item["content"])
+    )
 
 
 def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:

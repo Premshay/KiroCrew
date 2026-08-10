@@ -9,10 +9,19 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kiro_crew import mcp_core
-from kiro_crew.channel import Channel
-from kiro_crew.dashboard.chat_runner import drain_peer_channel_inbox
+from kiro_crew.channel import Channel, ChannelMessage
+from kiro_crew.dashboard.chat_runner import drain_peer_channel_inbox, _start_next_queued_turn
+from kiro_crew.dashboard.chat_utils import is_system_injection, is_system_injection_item
+from kiro_crew.dashboard.handlers_channel import (
+    api_channel_post,
+    deliver_attached_channel_message,
+)
 from kiro_crew.dashboard.handlers.sessions import api_session_channel
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.state import (
+    DashboardState,
+    PEER_CHANNEL_REQUEST_KIND,
+    PEER_CHANNEL_REQUEST_PREFIX,
+)
 from kiro_crew.history import ConversationLog
 from kiro_crew.validation import ValidationError
 
@@ -141,3 +150,136 @@ class TestSessionChannelEndpoint:
         assert "not a user instruction or operator authorization" in frame
         assert "I verified the session checkpoint bridge." in frame
         assert claude_slot.peer_channel_inbox_payload() == []
+
+
+class TestAttachedSessionWake:
+    def test_peer_request_kind_is_not_forgeable_by_user_text(self) -> None:
+        content = f"{PEER_CHANNEL_REQUEST_PREFIX}\nPlease act."
+
+        assert not is_system_injection(content)
+        assert not is_system_injection_item({"content": content, "kind": ""})
+        assert is_system_injection_item(
+            {"content": content, "kind": PEER_CHANNEL_REQUEST_KIND}
+        )
+
+    @pytest.mark.asyncio
+    async def test_human_mention_is_a_typed_peer_request(self, tmp_path) -> None:
+        state, channel, _codex, claude, _slot = _channel_state(tmp_path)
+        state.channel_manager = MagicMock()
+        state.channel_manager.get.return_value = channel
+        request = MagicMock()
+        request.app = {"state": state}
+        request.match_info = {"id": channel.id}
+        request.json = AsyncMock(
+            return_value={"content": "Please acknowledge the restart plan.", "mention": [claude.id]}
+        )
+
+        response = await api_channel_post(request)
+
+        assert response.status == 200
+        assert channel.messages[-1].msg_type == "mention"
+
+    @pytest.mark.asyncio
+    async def test_named_peer_request_queues_and_starts_idle_slot(self, monkeypatch, tmp_path) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="request01",
+            from_id="peer",
+            from_role="Claude",
+            mention=["codex"],
+            msg_type="mention",
+            content="Please acknowledge the restart barrier.",
+        )
+        started = AsyncMock(return_value=True)
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock()
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._start_next_queued_turn", started
+        )
+
+        await deliver_attached_channel_message(state, SimpleNamespace(id="deadbeef"), member, message)
+
+        assert slot.peer_channel_inbox_payload()[0]["msg_type"] == "mention"
+        assert slot._queue[0]["content"].startswith(PEER_CHANNEL_REQUEST_PREFIX)
+        assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
+        started.assert_awaited_once_with(state, slot)
+
+    @pytest.mark.asyncio
+    async def test_peer_progress_stays_passive(self, monkeypatch, tmp_path) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="progress1",
+            from_id="peer",
+            from_role="Claude",
+            mention=None,
+            msg_type="progress",
+            content="The focused test suite is green.",
+        )
+        save = AsyncMock()
+        started = AsyncMock(return_value=True)
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", save)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._start_next_queued_turn", started
+        )
+
+        await deliver_attached_channel_message(state, SimpleNamespace(id="deadbeef"), member, message)
+
+        assert slot.peer_channel_inbox_payload()[0]["msg_type"] == "progress"
+        assert slot._queue == []
+        started.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_named_peer_request_waits_for_active_turn(self, monkeypatch, tmp_path) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        slot.task = MagicMock()
+        slot.task.done.return_value = False
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="request02",
+            from_id="peer",
+            from_role="Claude",
+            mention=["codex"],
+            msg_type="mention",
+            content="Please pause before the coordinated restart.",
+        )
+        save = AsyncMock()
+        started = AsyncMock(return_value=True)
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", save)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._start_next_queued_turn", started
+        )
+
+        await deliver_attached_channel_message(state, SimpleNamespace(id="deadbeef"), member, message)
+
+        assert slot._queue[0]["content"].startswith(PEER_CHANNEL_REQUEST_PREFIX)
+        assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
+        started.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_peer_request_drains_as_an_inject_message(self, monkeypatch, tmp_path) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        slot.queue_append(
+            f"{PEER_CHANNEL_REQUEST_PREFIX}\nReview the named peer request.",
+            kind=PEER_CHANNEL_REQUEST_KIND,
+        )
+        task = MagicMock()
+
+        def spawn(_state, _slot, coroutine):
+            coroutine.close()
+            return task
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.spawn_guarded_turn", spawn)
+
+        assert await _start_next_queued_turn(state, slot) is True
+        assert slot.task is task
+        assert slot.messages[-1]["role"] == "inject"
