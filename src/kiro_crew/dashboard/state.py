@@ -70,6 +70,7 @@ from kiro_crew.validation import (
     SESSION_CHECKPOINT_MAIN_ITEM_MAX,
     SESSION_CHECKPOINT_MAIN_ITEMS_MAX,
     SESSION_CHECKPOINT_MILESTONE_MAX,
+    SESSION_CHECKPOINT_GOAL_MAX,
     SESSION_CHECKPOINT_PROGRESS_LABEL_MAX,
     SESSION_CHECKPOINT_SUMMARY_MAX,
     SESSION_CHECKPOINT_TRAIL_MAX,
@@ -98,6 +99,7 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 _CHANNEL_ID_PREFIX_RE = re.compile(r"^([a-z][a-z0-9_-]*):(.*)$", re.IGNORECASE)
+_SESSION_TIMELINE_SOURCE_MAX = 32
 _CHANNEL_LABELS = {
     "slack": "Slack",
     "discord": "Discord DM",
@@ -1555,7 +1557,9 @@ class _ChatSlot:
         "_resumed_count",
         "_hook_continuation_depth",
         "_todo",
+        "_declared_goal",
         "_session_checkpoint",
+        "_session_timeline",
         "_on_message",
         "_on_question_retired",
         "_has_reader_flag",
@@ -1781,7 +1785,12 @@ class _ChatSlot:
         # None = the agent has never used its todo tool in this slot, which the
         # UI renders as "no pill" rather than "an empty list".
         self._todo: dict[str, Any] | None = None
+        # A dashboard owner can declare a goal independently of an agent's
+        # optional work checkpoint.  The card must never infer this from a
+        # transcript or an AutoNudge prompt.
+        self._declared_goal: str = ""
         self._session_checkpoint: dict[str, Any] | None = None
+        self._session_timeline: list[dict[str, Any]] = []
         # Callback for broadcasting messages via global SSE
         self._on_message: object | None = None  # Callable[[str, dict], None] | None
         # Announce stateless question cards this slot retires, so every client
@@ -2300,6 +2309,133 @@ class _ChatSlot:
             ),
         }
 
+    def _timeline_entry(self, value: object) -> dict[str, Any] | None:
+        """Normalize one persisted timeline entry without trusting its metadata."""
+        if not isinstance(value, dict):
+            return None
+        text = self._checkpoint_text(value.get("text"), SESSION_CHECKPOINT_MILESTONE_MAX)
+        source = self._checkpoint_text(value.get("source"), _SESSION_TIMELINE_SOURCE_MAX)
+        timestamp = value.get("timestamp")
+        kind = self._checkpoint_text(value.get("kind"), _SESSION_TIMELINE_SOURCE_MAX) or source
+        consequence = self._checkpoint_text(
+            value.get("consequence"), SESSION_CHECKPOINT_MILESTONE_MAX
+        )
+        if not text or not source:
+            return None
+        raw_priority = value.get("priority")
+        if isinstance(raw_priority, int) and not isinstance(raw_priority, bool):
+            priority = raw_priority
+        else:
+            priority = self._timeline_default_priority(kind, text)
+        return {
+            "text": text,
+            "source": source,
+            "timestamp": timestamp if isinstance(timestamp, str) else "",
+            "kind": kind,
+            "priority": min(max(priority, 0), 100),
+            "consequence": consequence,
+        }
+
+    @staticmethod
+    def _timeline_default_priority(kind: str, text: str) -> int:
+        """Keep legacy lifecycle noise from displacing useful persisted outcomes."""
+        if text in {"Session started.", "Session resumed.", "Waiting for tool approval.", "Turn cancelled."}:
+            return 10
+        return {
+            "checkpoint": 100,
+            "goal": 90,
+            "attention": 90,
+            "terminal": 90,
+            "plan": 80,
+            "todo": 80,
+            "work": 80,
+            "subagents": 20,
+            "subagent_activity": 20,
+            "session": 10,
+            "native_lifecycle": 10,
+        }.get(kind, 0)
+
+    @staticmethod
+    def _cap_session_timeline(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Preserve important milestones when bounded history is full.
+
+        The oldest least-important entry is removed first, so a burst of routine
+        lifecycle messages cannot evict a checkpoint, decision, or actionable
+        approval from the operator digest.
+        """
+        capped = list(entries)
+        while len(capped) > SESSION_CHECKPOINT_TRAIL_MAX:
+            remove_index = min(
+                range(len(capped)), key=lambda index: (capped[index]["priority"], index)
+            )
+            capped.pop(remove_index)
+        return capped
+
+    def append_session_timeline(
+        self,
+        text: object,
+        source: str,
+        *,
+        kind: str = "",
+        priority: int | None = None,
+        consequence: object = "",
+    ) -> bool:
+        """Append one redacted structural milestone unless it repeats the current fact."""
+        entry = self._timeline_entry(
+            {
+                "text": text,
+                "source": source,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "kind": kind,
+                "priority": priority,
+                "consequence": consequence,
+            }
+        )
+        if entry is None:
+            return False
+        if self._session_timeline and all(
+            self._session_timeline[-1].get(field) == entry[field] for field in ("text", "source")
+        ):
+            return False
+        self._session_timeline = self._cap_session_timeline(self._session_timeline + [entry])
+        return True
+
+    def restore_session_timeline(self, timeline: object) -> None:
+        """Restore bounded structural history, keeping only adjacent distinct facts."""
+        if not isinstance(timeline, list):
+            return
+        restored: list[dict[str, Any]] = []
+        for value in timeline:
+            entry = self._timeline_entry(value)
+            if entry is None:
+                continue
+            if restored and all(restored[-1].get(field) == entry[field] for field in ("text", "source")):
+                continue
+            restored.append(entry)
+        self._session_timeline = self._cap_session_timeline(restored)
+
+    def session_timeline_payload(self) -> list[dict[str, Any]]:
+        """Return an isolated bounded timeline for the slots snapshot."""
+        return [dict(entry) for entry in self._session_timeline]
+
+    def set_declared_goal(self, goal: object) -> bool:
+        """Store an owner-declared goal and record its meaningful transition."""
+        value = self._checkpoint_text(goal, SESSION_CHECKPOINT_GOAL_MAX)
+        if value == self._declared_goal:
+            return False
+        self._declared_goal = value
+        text = f"Goal declared: {value}" if value else "Goal cleared."
+        self.append_session_timeline(text, "goal", kind="goal", priority=90)
+        return True
+
+    def restore_declared_goal(self, goal: object) -> None:
+        """Restore a persisted owner-declared goal without inventing an event."""
+        self._declared_goal = self._checkpoint_text(goal, SESSION_CHECKPOINT_GOAL_MAX)
+
+    def declared_goal_payload(self) -> str:
+        """Return the bounded goal set by the dashboard owner, if any."""
+        return self._declared_goal
+
     def set_session_checkpoint(self, checkpoint: dict[str, Any]) -> bool:
         """Replace the concise view and append one bounded milestone."""
         summary = self._checkpoint_text(checkpoint.get("summary"), SESSION_CHECKPOINT_SUMMARY_MAX)
@@ -2314,6 +2450,9 @@ class _ChatSlot:
             for item in (raw_items if isinstance(raw_items, list) else [])
             if (text := self._checkpoint_text(item, SESSION_CHECKPOINT_MAIN_ITEM_MAX))
         ][:SESSION_CHECKPOINT_MAIN_ITEMS_MAX]
+        goal = self._checkpoint_text(checkpoint.get("goal"), SESSION_CHECKPOINT_GOAL_MAX)
+        if "goal" not in checkpoint and self._session_checkpoint is not None:
+            goal = self._session_checkpoint["goal"]
         old_trail = self._session_checkpoint.get("trail", []) if self._session_checkpoint else []
         trail = [
             text
@@ -2321,12 +2460,14 @@ class _ChatSlot:
             if (text := self._checkpoint_text(item, SESSION_CHECKPOINT_MILESTONE_MAX))
         ]
         self._session_checkpoint = {
+            "goal": goal,
             "summary": summary,
             "main_items": main_items,
             "trail": (trail + [milestone])[-SESSION_CHECKPOINT_TRAIL_MAX:],
             "progress": self._checkpoint_progress(checkpoint.get("progress")),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        self.append_session_timeline(milestone, "checkpoint", kind="checkpoint", priority=100)
         return True
 
     def restore_session_checkpoint(self, checkpoint: object) -> None:
@@ -2340,6 +2481,7 @@ class _ChatSlot:
         raw_trail = checkpoint.get("trail")
         updated_at = checkpoint.get("updated_at")
         self._session_checkpoint = {
+            "goal": self._checkpoint_text(checkpoint.get("goal"), SESSION_CHECKPOINT_GOAL_MAX),
             "summary": summary,
             "main_items": [
                 text
@@ -2354,12 +2496,20 @@ class _ChatSlot:
             "progress": self._checkpoint_progress(checkpoint.get("progress")),
             "updated_at": updated_at if isinstance(updated_at, str) else "",
         }
+        if not self._session_timeline:
+            self.restore_session_timeline(
+                [
+                    {"text": text, "source": "checkpoint", "timestamp": self._session_checkpoint["updated_at"]}
+                    for text in self._session_checkpoint["trail"]
+                ]
+            )
 
     def session_checkpoint_payload(self) -> dict[str, Any] | None:
         """Return an isolated checkpoint copy for the slots snapshot."""
         if self._session_checkpoint is None:
             return None
         return {
+            "goal": self._session_checkpoint["goal"],
             "summary": self._session_checkpoint["summary"],
             "main_items": list(self._session_checkpoint["main_items"]),
             "trail": list(self._session_checkpoint["trail"]),
@@ -3504,7 +3654,10 @@ class _ChatSlot:
             # /api/chat/slots (cold load) and the WS `slots` snapshot — so the
             # pill survives reconnect without a separate rehydration path.
             "todo": self.todo_payload(),
+            "declared_goal": self.declared_goal_payload(),
+            "plan_goal": self._checkpoint_text(self._plan_goal, SESSION_CHECKPOINT_GOAL_MAX),
             "session_checkpoint": self.session_checkpoint_payload(),
+            "session_timeline": self.session_timeline_payload(),
             "has_options": has_options,
             "options": [_redact(o) for o in options],
             "prompt_preview": prompt_preview,

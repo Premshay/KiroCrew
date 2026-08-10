@@ -58,6 +58,7 @@ MAX_CRON_MESSAGE = 50_000
 MAX_RESPONSE_LEN = 100_000  # truncate tool responses
 
 SESSION_CHECKPOINT_SUMMARY_MAX = 360
+SESSION_CHECKPOINT_GOAL_MAX = 240
 SESSION_CHECKPOINT_MAIN_ITEMS_MAX = 4
 SESSION_CHECKPOINT_MAIN_ITEM_MAX = 160
 SESSION_CHECKPOINT_MILESTONE_MAX = 220
@@ -1430,6 +1431,7 @@ def _validate_session_checkpoint(args: dict[str, Any]) -> None:
 SESSION_CHECKPOINT_SCHEMA = ToolSchema(
     tool_name="session_checkpoint",
     fields=[
+        FieldSpec("goal", str, max_len=SESSION_CHECKPOINT_GOAL_MAX),
         FieldSpec("summary", str, required=True, max_len=SESSION_CHECKPOINT_SUMMARY_MAX),
         FieldSpec(
             "main_items",
