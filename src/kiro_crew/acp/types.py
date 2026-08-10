@@ -96,21 +96,14 @@ TODO_TEXT_MAX = 500
 
 # Capabilities we advertise during `initialize`.
 #
-# `elicitation` is a deliberate forward-bet: kiro-cli 2.14.0 compiles the
-# `elicitation/create` schema (form + url modes) and gates it on this
-# capability, but does NOT yet route an MCP server's `elicitation/create` out
-# over ACP — a stub MCP server issuing one gets back
-# `-32601 method not found`. Declaring support costs nothing today and means
-# the agent can start using the richer prompt the moment kiro-cli ships the
-# bridge.
-#
-# `fs` and `terminal` stay false: KiroCrew does not serve the agent's file or
-# terminal requests over ACP — the agent uses its own tools for that, and
-# advertising them would invite requests we have no handler for.
+# `fs`, `terminal`, and `elicitation` stay absent or false until KiroCrew has
+# handlers for them. Advertising a request capability before its matching
+# handler exists makes ACP agents use a path that deterministically fails with
+# JSON-RPC ``-32601``. Agents that use elicitation for MCP confirmation fall
+# back to the supported ``session/request_permission`` path when it is absent.
 ACP_CLIENT_CAPABILITIES: dict = {
     "fs": {"readTextFile": False, "writeTextFile": False},
     "terminal": False,
-    "elicitation": {"form": {}, "url": {}},
 }
 
 # ── ACP Backend Identifiers ──
