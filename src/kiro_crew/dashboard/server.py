@@ -2192,6 +2192,7 @@ async def start_dashboard(
     app.router.add_patch("/api/chat/slots/{slot}/color", chat.api_chat_slot_color)
     # Context injection (App Kit — silent background context)
     app.router.add_post("/api/chat/slots/{slot}/context", chat.api_chat_slot_context)
+    app.router.add_post("/api/chat/slots/{slot}/return-handoff", chat.api_chat_slot_return_handoff)
     app.router.add_post("/api/chat/slots/{slot}/fork", chat.api_chat_slot_fork)
     app.router.add_post("/api/chat/slots/{slot}/side/open", handlers.api_side_open)
     app.router.add_post("/api/chat/slots/{slot}/side/turn", handlers.api_side_turn)

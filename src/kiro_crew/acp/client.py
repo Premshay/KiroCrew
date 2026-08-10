@@ -2713,6 +2713,7 @@ class AcpClient:
                         # session/new above). Pooled stubs are re-declared so a
                         # resumed session keeps talking to the broker.
                         "mcpServers": [
+                            *self._session_capability_mcp_servers(),
                             *self._claude_session_mcp_servers(),
                             *(await asyncio.to_thread(self._pooled_mcp_servers)),
                         ],

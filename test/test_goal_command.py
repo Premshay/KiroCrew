@@ -20,6 +20,7 @@ def _make_slot(key: str = "slot-1", agent: str = "kirocrew") -> MagicMock:
     slot.key = key
     slot.agent = agent
     slot.append = MagicMock()
+    slot.set_declared_goal = MagicMock(return_value=True)
     return slot
 
 
@@ -46,6 +47,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, svc: MagicMock | None) -> MagicMoc
     # Avoid real SEL side effects; return the mock so callers can inspect it.
     audit = MagicMock()
     monkeypatch.setattr(chat_runner, "sel", lambda: audit)
+    monkeypatch.setattr(chat_runner, "save_slot_off_loop", AsyncMock())
     return audit
 
 
@@ -129,6 +131,8 @@ async def test_arm_default_budget(
     assert not stale_sentinel.exists()
     body = _last_assistant_body(slot)
     assert "Goal set" in body and "50-turn budget" in body
+    slot.set_declared_goal.assert_called_once_with("ship the feature")
+    chat_runner.save_slot_off_loop.assert_awaited_once_with(state, slot, force=True)
     audit.log_tool_invocation.assert_called_once()
     assert audit.log_tool_invocation.call_args.kwargs["session_key"] == "a/b:c"
 
@@ -145,6 +149,7 @@ async def test_arm_with_max_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     assert call.kwargs["max_cycles"] == 5
     assert "do the thing" in call.kwargs["message"]
     assert "do the thing" in _last_assistant_body(slot)
+    slot.set_declared_goal.assert_called_once_with("do the thing")
 
 
 @pytest.mark.asyncio
@@ -193,6 +198,7 @@ async def test_clear_active_goal(monkeypatch: pytest.MonkeyPatch) -> None:
     await chat_runner._handle_goal_command(state, slot, "/goal clear")
 
     svc.remove.assert_awaited_once_with("loop-xyz")
+    slot.set_declared_goal.assert_called_once_with("")
     assert "cleared" in _last_assistant_body(slot).lower()
 
 
@@ -201,6 +207,7 @@ async def test_clear_when_no_goal(monkeypatch: pytest.MonkeyPatch) -> None:
     svc = _fake_service(loop=None)
     _install(monkeypatch, svc)
     slot, state = _make_slot(), _make_state()
+    slot.set_declared_goal.return_value = False
 
     await chat_runner._handle_goal_command(state, slot, "/goal clear")
 
@@ -216,6 +223,9 @@ async def test_autonudge_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     await chat_runner._handle_goal_command(state, slot, "/goal do a thing")
 
     body = _last_assistant_body(slot)
+    assert "Goal declared" in body
     assert "unavailable" in body.lower()
+    slot.set_declared_goal.assert_called_once_with("do a thing")
+    chat_runner.save_slot_off_loop.assert_awaited_once_with(state, slot, force=True)
     # Turn is still finalized even on the disabled path.
     state.push_slots_update.assert_called_once()

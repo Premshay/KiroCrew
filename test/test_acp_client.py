@@ -3577,6 +3577,13 @@ class TestInitializeSession:
         """session/load succeeds when file exists and kiro-cli supports it."""
         client = self._make_client(tmp_path)
         client._resume_session_id = "old-sess"
+        sent: list[tuple[str, dict]] = []
+
+        async def send(method, params):
+            sent.append((method, params))
+            return len(sent)
+
+        client._send_request = send
 
         # Create the session file
         session_dir = Path.home() / ".kiro" / "sessions" / "cli"
@@ -3599,6 +3606,9 @@ class TestInitializeSession:
             await client._initialize_session()
             assert client._session_id == "old-sess"
             assert client._resumed is True
+            load_params = next(params for method, params in sent if method == "session/load")
+            core = next(server for server in load_params["mcpServers"] if server["name"] == "kirocrew-core")
+            assert core["args"][-1] == "mcp-core"
         finally:
             session_file.unlink(missing_ok=True)
 
