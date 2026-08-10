@@ -12,6 +12,7 @@ from kiro_crew.channel import (
     ChannelManager,
     ChannelMessage,
     ListenMode,
+    _stream_task,
 )
 
 
@@ -337,3 +338,24 @@ class TestChannelManager:
         mgr.create("a")
         mgr.create("b")
         assert len(mgr.list_channels()) == 2
+
+
+class TestChannelAgentFailures:
+    @pytest.mark.asyncio
+    async def test_stream_failure_posts_actionable_redacted_detail(self) -> None:
+        class FailingProvider:
+            async def stream(self, _message):
+                raise RuntimeError(
+                    "Monthly usage limit reached; secret AKIAABCDEFGHIJKLMNOP must not be shown"
+                )
+                yield  # pragma: no cover - preserves async-generator shape
+
+        channel = Channel(id="ch1", topic="test")
+        agent = channel.add_agent(role="Orchestrator", agent_name="agent", task="coordinate")
+
+        await _stream_task(agent, channel, FailingProvider(), "coordinate")
+
+        posted = channel.messages[-1]
+        assert posted.msg_type == "system"
+        assert posted.content.startswith("❌ Orchestrator stopped: Monthly usage limit reached")
+        assert "AKIAABCDEFGHIJKLMNOP" not in posted.content
