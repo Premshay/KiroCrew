@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-
-import json
 
 import pytest
 
 from kiro_crew import mcp_core, session_directive
+from kiro_crew.dashboard import handlers
 from kiro_crew.dashboard.handlers.sessions import api_session_checkpoint, api_session_maintenance
 from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.dashboard.session_directive_apply import apply_session_directive
@@ -45,6 +45,10 @@ def _make_state(tmp_path) -> DashboardState:
 
 
 class TestCheckpointDirectiveDispatch:
+    def test_dashboard_router_exports_checkpoint_and_maintenance_handlers(self) -> None:
+        assert handlers.api_session_checkpoint is api_session_checkpoint
+        assert handlers.api_session_maintenance is api_session_maintenance
+
     def test_advertises_the_bounded_tool_contract(self) -> None:
         descriptor = next(
             tool for tool in mcp_core._list_tools() if tool["name"] == "session_checkpoint"
