@@ -10,6 +10,8 @@ import pytest
 
 from kiro_crew import mcp_core, session_directive
 from kiro_crew.dashboard import handlers
+from kiro_crew.dashboard.chat_handlers import api_chat_slot_return_handoff
+from kiro_crew.dashboard.chat_runner import drain_pending_context
 from kiro_crew.dashboard.handlers.sessions import api_session_checkpoint, api_session_maintenance
 from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.dashboard.session_directive_apply import apply_session_directive
@@ -59,22 +61,18 @@ class TestCheckpointDirectiveDispatch:
         assert schema["properties"]["main_items"]["maxItems"] == 4
         assert schema["properties"]["progress"]["additionalProperties"] is False
 
-    def test_persists_through_the_strict_internal_checkpoint_route(self, monkeypatch) -> None:
+    def test_emits_a_validated_checkpoint_directive_for_the_calling_session(self, monkeypatch) -> None:
         checkpoint = _checkpoint()
-        post = MagicMock(return_value={"ok": True})
-        monkeypatch.setattr(mcp_core, "_post", post)
         result = mcp_core._call_tool_inner("session_checkpoint", checkpoint)
-        assert result == "Checkpoint recorded for this session's Multiplex view."
-        post.assert_called_once_with(
-            "/api/session-checkpoint", checkpoint, require_strict_session=True
-        )
+        assert result.startswith("Checkpoint requested for this session.")
+        assert session_directive.decode(result, "session_checkpoint") == checkpoint
 
     def test_refuses_an_unverified_session_before_making_a_checkpoint_request(
         self, monkeypatch
     ) -> None:
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
-        result = mcp_core._post("/api/session-checkpoint", {}, require_strict_session=True)
-        assert result["code"] == "unverified_session"
+        result = mcp_core._call_tool_inner("maintenance_acknowledge", {})
+        assert result == "Error: maintenance_acknowledge requires a verified session identity."
 
     def test_rejects_invalid_progress_before_emitting_a_directive(self) -> None:
         with pytest.raises(ValidationError):
@@ -113,11 +111,9 @@ class TestCheckpointDirectiveDispatch:
         result = mcp_core._call_tool_inner("maintenance_acknowledge", {})
 
         assert result.startswith("Reset acknowledgement recorded")
-        post.assert_called_once_with(
-            "/api/session-maintenance",
-            {"action": "acknowledge"},
-            require_strict_session=True,
-        )
+        path, payload = post.call_args.args
+        assert (path, payload) == ("/api/session-maintenance", {"action": "acknowledge"})
+        assert post.call_args.kwargs["session_key"].startswith("dashboard:")
 
 
 class TestCheckpointSlotProjection:
@@ -379,6 +375,67 @@ class TestCheckpointInternalEndpoint:
         assert accepted.status == 200
         assert json.loads(accepted.text)["maintenance"]["ready"] is True
         assert slot.session_checkpoint_payload() is not None
+
+
+class TestReturnHandoff:
+    @pytest.mark.asyncio
+    async def test_queues_and_records_a_handoff_for_an_active_loop(self, tmp_path, monkeypatch) -> None:
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        slot = state.get_or_create_slot("loop")
+        save = AsyncMock()
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.save_slot_off_loop", save)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.get_autonudge_instance",
+            lambda: SimpleNamespace(get_by_slot=lambda _key: SimpleNamespace(active=True)),
+        )
+        request = MagicMock()
+        request.app = {"state": state}
+        request.match_info = {"slot": "loop"}
+        request.get.side_effect = lambda _key, default="": default
+        request.json = AsyncMock(return_value={"instruction": "Resume with the reviewed plan."})
+
+        response = await api_chat_slot_return_handoff(request)
+
+        assert response.status == 200
+        assert json.loads(response.text) == {"ok": True, "pending": 1}
+        save.assert_awaited_once_with(state, slot, force=True)
+        assert "[End of background context]\n" in drain_pending_context(slot)
+        assert slot.session_timeline_payload()[-1]["text"] == "Human handoff delivered to the next turn."
+
+    def test_expired_handoff_records_non_delivery(self) -> None:
+        slot = _ChatSlot("loop")
+        slot._pending_context.append(
+            {
+                "content": "Resume.",
+                "source": "multiplex-return-handoff",
+                "returnHandoff": True,
+                "injectedAt": 0,
+                "maxAge": 1,
+            }
+        )
+
+        assert drain_pending_context(slot) == ""
+        assert slot.session_timeline_payload()[-1]["text"] == "Human handoff expired before delivery."
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_handoff_when_the_loop_is_not_active(self, tmp_path, monkeypatch) -> None:
+        state = _make_state(tmp_path)
+        state.get_or_create_slot("loop")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.get_autonudge_instance",
+            lambda: SimpleNamespace(get_by_slot=lambda _key: None),
+        )
+        request = MagicMock()
+        request.app = {"state": state}
+        request.match_info = {"slot": "loop"}
+        request.get.side_effect = lambda _key, default="": default
+        request.json = AsyncMock(return_value={"instruction": "Resume."})
+
+        response = await api_chat_slot_return_handoff(request)
+
+        assert response.status == 409
+        assert json.loads(response.text)["code"] == "no_active_loop"
 
 
 class TestRestartBarrier:

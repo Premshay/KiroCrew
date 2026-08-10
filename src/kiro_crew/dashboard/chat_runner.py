@@ -300,6 +300,14 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
     ctx_parts: list[str] = []
     for entry in slot._pending_context:
         if context_entry_expired(entry, now):
+            if entry.get("returnHandoff") is True:
+                slot.append_session_timeline(
+                    "Human handoff expired before delivery.",
+                    "handoff",
+                    kind="handoff",
+                    priority=90,
+                    consequence="The next turn did not receive the instruction.",
+                )
             continue  # expired — silently discard
         # `or "app"` (not a dict default): api_chat_slot_context always writes
         # the key — as "" when the caller omitted it — so a plain .get() default
@@ -312,6 +320,14 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
             f'{entry["content"]}\n'
             f"[End of background context]\n"
         )
+        if entry.get("returnHandoff") is True:
+            slot.append_session_timeline(
+                "Human handoff delivered to the next turn.",
+                "handoff",
+                kind="handoff",
+                priority=90,
+                consequence="The active loop received the operator instruction.",
+            )
     slot._pending_context.clear()
     return "\n".join(ctx_parts) + "\n" if ctx_parts else ""
 
