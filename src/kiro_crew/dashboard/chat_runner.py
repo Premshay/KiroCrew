@@ -250,6 +250,122 @@ def _turn_outcome(stop_reason: str | None) -> str:
     return "error"
 
 
+def _record_plan_timeline(
+    slot: "_ChatSlot", metadata: tuple[list[str], str, list[list[str]]]
+) -> None:
+    """Apply parsed plan metadata and record a milestone only when it changes."""
+    titles, goal, descriptions = metadata
+    previous = (slot._stage_titles, slot._plan_goal, slot._stage_descriptions)
+    current = (titles, goal, descriptions)
+    slot._stage_titles, slot._plan_goal, slot._stage_descriptions = current
+    if current == previous:
+        return
+    label = f"Plan updated: {goal}" if goal else "Plan updated"
+    slot.append_session_timeline(
+        f"{label} ({len(titles)} stages).",
+        "plan",
+        kind="plan",
+        priority=80,
+    )
+
+
+def _todo_timeline_entry(previous: object, current: object) -> tuple[str, str] | None:
+    """Return one operator-facing TODO outcome from two structured snapshots."""
+    if not isinstance(current, dict):
+        return None
+    current_tasks = current.get("tasks")
+    if not isinstance(current_tasks, list):
+        return None
+    previous_tasks = previous.get("tasks") if isinstance(previous, dict) else []
+    if not isinstance(previous_tasks, list):
+        previous_tasks = []
+    completed_before = {
+        str(task.get("id") or task.get("text") or "")
+        for task in previous_tasks
+        if isinstance(task, dict) and task.get("completed")
+    }
+    newly_completed = [
+        str(task.get("text") or "").strip()
+        for task in current_tasks
+        if isinstance(task, dict)
+        and task.get("completed")
+        and str(task.get("id") or task.get("text") or "") not in completed_before
+        and str(task.get("text") or "").strip()
+    ]
+    current_item = str(current.get("current") or "").strip()
+    previous_item = str(previous.get("current") or "").strip() if isinstance(previous, dict) else ""
+    if newly_completed:
+        consequence = f"Next: {current_item}." if current_item else "All current TODO items are complete."
+        return f"Completed: {newly_completed[-1]}.", consequence
+    if current_item and current_item != previous_item:
+        return f"Current item: {current_item}.", "Structured TODO state changed."
+    return None
+
+
+def _subagent_roster_snapshot(subagents: object) -> tuple[tuple[str, str], ...]:
+    """Return identity and status only; task text is not a lifecycle fact."""
+    if not isinstance(subagents, list):
+        return ()
+    roster: list[tuple[str, str]] = []
+    for subagent in subagents:
+        if not isinstance(subagent, dict):
+            continue
+        session_id = str(subagent.get("sessionId") or "")
+        status = subagent.get("status")
+        kind = str(status.get("type") or "") if isinstance(status, dict) else ""
+        if session_id:
+            roster.append((session_id, kind.lower()))
+    return tuple(sorted(roster))
+
+
+def _record_subagent_roster_timeline(slot: "_ChatSlot", roster: tuple[tuple[str, str], ...]) -> None:
+    """Record a bounded count after a meaningful native-crew roster transition."""
+    active = sum(
+        status in ("", "working", "running", "pending", "queued", "in_progress")
+        for _, status in roster
+    )
+    slot.append_session_timeline(
+        f"Subagents: {active} active of {len(roster)}.",
+        "subagents",
+        kind="subagent_activity",
+        priority=20,
+    )
+
+
+def _record_terminal_timeline(slot: "_ChatSlot", stop_reason: str | None) -> None:
+    """Record only non-normal terminal outcomes, never an ordinary completed turn."""
+    reason = stop_reason or ""
+    if reason in ("", STOP_REASON_END_TURN, "stop", "completed"):
+        return
+    if reason == STOP_REASON_CANCELLED:
+        return
+    elif "timeout" in reason:
+        text = "Turn timed out."
+        consequence = "Verify partial work before resuming."
+        priority = 90
+    else:
+        text = "Turn ended with an error."
+        consequence = "Inspect the conversation before retrying."
+        priority = 90
+    slot.append_session_timeline(
+        text,
+        "terminal",
+        kind="terminal",
+        priority=priority,
+        consequence=consequence,
+    )
+
+
+def _approval_timeline_entry(operation: str) -> tuple[str, str]:
+    """Describe a human blocker even when the provider omits its operation label."""
+    if operation.strip().lower() in {"", "unknown", "tool", "command"}:
+        return (
+            "Approval required; operation not supplied by provider.",
+            "Open the conversation to inspect and approve or reject it.",
+        )
+    return f"Approval needed: {operation}.", "Awaiting your approval."
+
+
 def _emit_turn_metric(
     duration_ms: int | float | None,
     stop_reason: str | None,
@@ -1988,31 +2104,30 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
     ``clear``, else arm with an optional ``--max N`` budget (default 50, clamped
     1..50).
     """
+
     _goal_svc = get_instance()
     _parts = message.split(None, 1)
     _rest = _parts[1].strip() if len(_parts) > 1 else ""
-    if _goal_svc is None:
-        body = (
-            "🎯 Goal loops are unavailable (AutoNudge is disabled). "
-            "Set `KIROCREW_AUTONUDGE=1` and restart the gateway."
-        )
-    elif _rest in ("", "status"):
-        _loop = _goal_svc.get_by_slot(slot.key)
-        if _loop is not None:
-            _cap = _loop.max_cycles or "∞"
-            body = f"🎯 Active goal (budget {_cap} turns). " "Use `/goal clear` to stop it."
+    changed = False
+    if _rest in ("", "status"):
+        if _goal_svc is None:
+            body = "No active goal loop (AutoNudge is disabled)."
         else:
-            body = (
-                "No active goal. Set one with `/goal <objective>` "
-                "(optionally `/goal --max N <objective>`)."
-            )
+            _loop = _goal_svc.get_by_slot(slot.key)
+            if _loop is not None:
+                _cap = _loop.max_cycles or "∞"
+                body = f"🎯 Active goal (budget {_cap} turns). " "Use `/goal clear` to stop it."
+            else:
+                body = (
+                    "No active goal. Set one with `/goal <objective>` "
+                    "(optionally `/goal --max N <objective>`)."
+                )
     elif _rest == "clear":
-        _loop = _goal_svc.get_by_slot(slot.key)
+        changed = slot.set_declared_goal("")
+        _loop = _goal_svc.get_by_slot(slot.key) if _goal_svc is not None else None
         if _loop is not None:
             await _goal_svc.remove(_loop.id)
-            body = "🎯 Goal cleared."
-        else:
-            body = "No active goal to clear."
+        body = "🎯 Goal cleared." if changed or _loop is not None else "No active goal to clear."
     else:
         _max_cycles = 50
         _objective = _rest
@@ -2025,34 +2140,41 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
         if not _objective:
             body = "Usage: `/goal <objective>` or `/goal --max N <objective>`."
         else:
-            _slug = re.sub(r"[^A-Za-z0-9._-]", "_", slot.key)
-            _sentinel = str(data_home() / "goal-stop" / f"{_slug}.stop")
-            Path(_sentinel).unlink(missing_ok=True)
-            _nudge = (
-                f"Goal: {_objective}\n"
-                "Each idle cycle, in order: "
-                f'(1) if the file {_sentinel} exists -> autonudge_stop(reason="sentinel") and stop; '
-                "(2) if the goal is fully met by concrete evidence (a passing test, a built file, "
-                'command output — not a guess) -> autonudge_stop(reason="goal met"), post a one-line '
-                "summary citing the evidence, and stop; "
-                "(3) else do ONE atomic step (<=5 tool calls) and make the deliverable durable "
-                "(write the file / run the check) before claiming progress.\n"
-                "Guardrails: never git push; never read credential files. Hard blocker -> state it once and "
-                f'autonudge_stop(reason="blocked"). Budget {_max_cycles} cycles (service stops at '
-                "the cap). One short progress line per cycle."
-            )
-            await _goal_svc.add(
-                slot.key,
-                message=_nudge,
-                idle_secs=15,
-                max_cycles=_max_cycles,
-                stop_sentinel_path=_sentinel,
-            )
-            body = (
-                f"⊙ Goal set ({_max_cycles}-turn budget): {_objective}\n\n"
-                "I'll work toward it across turns and stop when it's met "
-                "(verified by evidence) — or run `/goal clear` to stop."
-            )
+            changed = slot.set_declared_goal(_objective)
+            if _goal_svc is None:
+                body = (
+                    "🎯 Goal declared. Automatic goal loops are unavailable "
+                    "(set `KIROCREW_AUTONUDGE=1` and restart the gateway)."
+                )
+            else:
+                _slug = re.sub(r"[^A-Za-z0-9._-]", "_", slot.key)
+                _sentinel = str(data_home() / "goal-stop" / f"{_slug}.stop")
+                Path(_sentinel).unlink(missing_ok=True)
+                _nudge = (
+                    f"Goal: {_objective}\n"
+                    "Each idle cycle, in order: "
+                    f'(1) if the file {_sentinel} exists -> autonudge_stop(reason="sentinel") and stop; '
+                    "(2) if the goal is fully met by concrete evidence (a passing test, a built file, "
+                    'command output — not a guess) -> autonudge_stop(reason="goal met"), post a one-line '
+                    "summary citing the evidence, and stop; "
+                    "(3) else do ONE atomic step (<=5 tool calls) and make the deliverable durable "
+                    "(write the file / run the check) before claiming progress.\n"
+                    "Guardrails: never git push; never read credential files. Hard blocker -> state it once and "
+                    f'autonudge_stop(reason="blocked"). Budget {_max_cycles} cycles (service stops at '
+                    "the cap). One short progress line per cycle."
+                )
+                await _goal_svc.add(
+                    slot.key,
+                    message=_nudge,
+                    idle_secs=15,
+                    max_cycles=_max_cycles,
+                    stop_sentinel_path=_sentinel,
+                )
+                body = (
+                    f"⊙ Goal set ({_max_cycles}-turn budget): {_objective}\n\n"
+                    "I'll work toward it across turns and stop when it's met "
+                    "(verified by evidence) — or run `/goal clear` to stop."
+                )
     body = _redact_for_display(body)
     sel().log_tool_invocation(
         session_key=slot.key,
@@ -2064,6 +2186,8 @@ async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", messa
         metadata={"slot": slot.key},
     )
     slot.append("assistant", body, "msg msg-a")
+    if changed:
+        await save_slot_off_loop(state, slot, force=True)
     state.push_slots_update()
     slot.append("done", "", "done")
 
@@ -2554,6 +2678,7 @@ async def _run_chat(
     # The slot holds the same live dict so reconnect snapshots can restore cards.
     _native_tracker: dict[str, dict] = {}
     slot._native_subagent_tracker = _native_tracker
+    _timeline_subagent_roster: tuple[tuple[str, str], ...] | None = None
     # inner tool_call_id -> native card id, from `_kiro.dev/session/update`, so a
     # sub-agent's tool calls stream onto its own card.
     _native_tc_card: dict[str, str] = {}
@@ -2805,6 +2930,7 @@ async def _run_chat(
         agent_label = kiro_agent or slot.agent or "default"
         model_label = slot.model or "auto"
         if resumed:
+            slot.append_session_timeline("Session resumed.", "session")
             state.broadcast_ws(
                 "activity_event",
                 {
@@ -2814,6 +2940,8 @@ async def _run_chat(
                 },
             )
         else:
+            if is_new:
+                slot.append_session_timeline("Session started.", "session")
             state.broadcast_ws(
                 "activity_event",
                 {
@@ -4363,6 +4491,15 @@ async def _run_chat(
                 loop = asyncio.get_running_loop()
                 fut: asyncio.Future[str] = loop.create_future()
                 slot._approval_futures[str(event.request_id)] = fut
+                approval_operation = _base or _extract_base_command(_safe_title) or _safe_title
+                approval_text, approval_consequence = _approval_timeline_entry(approval_operation)
+                slot.append_session_timeline(
+                    approval_text,
+                    "attention",
+                    kind="attention",
+                    priority=95,
+                    consequence=approval_consequence,
+                )
                 # Push via global SSE AFTER registering the future, so the
                 # slot dict reflects pending_approval=true and Board cards
                 # move into the Blocked lane without a browser refresh.
@@ -4661,7 +4798,17 @@ async def _run_chat(
                 # and the WS `slots` snapshot rehydrate it after a reconnect),
                 # then push a lightweight delta so the pill updates mid-turn
                 # instead of waiting for the next full slots snapshot.
+                previous_todo = slot.todo_payload()
                 if slot.set_todo(event.todo):
+                    todo = slot.todo_payload() or {}
+                    if milestone := _todo_timeline_entry(previous_todo, todo):
+                        slot.append_session_timeline(
+                            milestone[0],
+                            "todo",
+                            kind="work",
+                            priority=80,
+                            consequence=milestone[1],
+                        )
                     state.broadcast_ws(
                         "todo_update",
                         {"slot": slot.key, "todo": slot.todo_payload()},
@@ -4677,6 +4824,10 @@ async def _run_chat(
                 _native_subagent_sync(
                     state, slot, event.subagents, _native_tracker, _native_card_output
                 )
+                roster = _subagent_roster_snapshot(event.subagents)
+                if roster != _timeline_subagent_roster:
+                    _record_subagent_roster_timeline(slot, roster)
+                    _timeline_subagent_roster = roster
             elif event.kind == EVENT_SUBAGENT_ACTIVITY:
                 # kiro-cli's _kiro.dev/session/update tags a sub-agent's inner
                 # tool call with its sessionId. This ALWAYS arrives before the
@@ -4770,6 +4921,7 @@ async def _run_chat(
                     elapsed_ms=_turn_elapsed_ms,
                 )
                 _stop_reason = event.stop_reason
+                _record_terminal_timeline(slot, _stop_reason)
                 if _stop_reason == STOP_REASON_TOOL_STALL:
                     _stall_tool_title = event.title
                     _stall_command = event.tool_input
@@ -5014,9 +5166,7 @@ async def _run_chat(
                     _reset_auto_run_for_new_plan(slot)
                     assistant_text = ensure_go_all_option(assistant_text)
                     # Store stage count for _stage_loop
-                    slot._stage_titles, slot._plan_goal, slot._stage_descriptions = (
-                        _extract_and_redact_plan_metadata(assistant_text)
-                    )
+                    _record_plan_timeline(slot, _extract_and_redact_plan_metadata(assistant_text))
             _flush_text_stream()
             _flush_segment(state, slot, assistant_text, broadcast=False)
         elif _stop_reason == STOP_REASON_REFUSAL:
@@ -5124,9 +5274,7 @@ async def _run_chat(
                     slot.key,
                 )
                 _reset_auto_run_for_new_plan(slot)
-                slot._stage_titles, slot._plan_goal, slot._stage_descriptions = (
-                    _extract_and_redact_plan_metadata(_orch_plan_buf)
-                )
+                _record_plan_timeline(slot, _extract_and_redact_plan_metadata(_orch_plan_buf))
         # On an empty-response re-queue the turn produced nothing and will
         # immediately re-run; skip persistence / consolidation / success-recording
         # so we don't save a spurious empty turn or skew reliability metrics.
@@ -5571,6 +5719,13 @@ async def _run_chat(
             )
     except Exception as exc:
         logger.exception("Dashboard chat error in slot %s", slot.key)
+        slot.append_session_timeline(
+            "Turn ended with an error.",
+            "terminal",
+            kind="terminal",
+            priority=90,
+            consequence="Inspect the conversation before retrying.",
+        )
         _err_text, _ = redact_exfiltration_urls(str(exc))
         _err_text, _ = redact_credentials(_err_text)
         slot.append("error", _err_text, "msg msg-err")

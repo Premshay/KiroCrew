@@ -696,6 +696,17 @@ Security properties (enforced in `session_directive.decode` plus the applier):
 
 The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, `post_question_card` for `ask_question`, and the slot's persisted checkpoint projection for `session_checkpoint` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions"). `session_checkpoint` is intentionally a low-frequency operator aid: it replaces one short current-work summary and up to four main items, appends one milestone to a seven-entry trail, and may include one validated plan or goal count. It does not summarize the transcript, call an LLM, or carry a session key.
 
+### Dashboard-declared goals (`dashboard/chat_runner.py`)
+
+`/goal <objective>` records the dashboard owner's bounded objective on the caller's slot as
+`declared_goal`, persists it with that slot's history metadata, publishes the updated slot
+snapshot, and appends one `Goal declared: …` timeline entry. `/goal clear` removes only that
+declared goal and records `Goal cleared.`. This is distinct from the model-authored
+`session_checkpoint.goal` and from the plan parser's `plan_goal`: neither source is overwritten,
+and a card consumer may choose the declared goal first. A disabled AutoNudge service prevents
+automatic cycles but does not prevent recording the owner's objective. No external control-plane
+goal is mirrored into this field without an explicit adapter.
+
 Gateway-off (the default topology this targets), the model's tool result is the tool's OWN returned line delivered over kiro-cli's MCP pipe; the applier's confirmation string and SEL audit are recorded on KiroCrew's own surfaces (transcript / WS / hooks) and do NOT rewrite the model's tool result. Each tool therefore phrases its own message as a *request* that the consumer applies (and may refuse — no interactive session, invalid/sensitive path, capped/paused loop) rather than asserting the effect already landed.
 
 ```mermaid
