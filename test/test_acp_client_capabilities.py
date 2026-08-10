@@ -10,9 +10,9 @@ from pathlib import Path
 from kiro_crew.acp.types import ACP_CLIENT_CAPABILITIES
 
 
-def test_elicitation_is_declared() -> None:
-    """kiro-cli gates `elicitation/create` on this capability being present."""
-    assert ACP_CLIENT_CAPABILITIES["elicitation"] == {"form": {}, "url": {}}
+def test_unimplemented_request_capabilities_are_absent() -> None:
+    """Agents must use the supported permission path for MCP confirmations."""
+    assert "elicitation" not in ACP_CLIENT_CAPABILITIES
 
 
 def test_fs_and_terminal_stay_false() -> None:
