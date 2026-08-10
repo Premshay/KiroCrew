@@ -9,8 +9,30 @@ they need a marker the model and the frontend can both recognise.
 though someone is waiting for a conversational reply.
 
 Every prefix is defined once, in `src/kiro_crew/dashboard/state.py`, so the
-frontend has one list to mirror and no second copy can drift. Classification is by
-`str.startswith` on the resolved prefix, never by a loose regex.
+frontend has one list to mirror and no second copy can drift. Prefixes classify
+the model-facing envelope; queue entries that must not be forgeable by user text
+also carry a structural `kind`.
+
+## Peer channel request
+
+An attached dashboard session receives a named peer request through a persistent
+agent channel. The peer payload remains in the slot's peer inbox and the runner
+frames it as a `[KiroCrew Channel message]` envelope. A separate synthetic queue
+entry carries `kind == "peer_channel_request"` and the
+`PEER_CHANNEL_REQUEST_PREFIX` marker.
+
+- Only a named request (`msg_type: "mention"`) creates this queue entry. Peer
+  progress and done reports, and human broadcasts without an @mention, remain
+  passive.
+- An idle recipient starts one guarded turn. A busy recipient keeps the request
+  queued until its active turn completes; the request never interrupts work.
+- The runner records the scheduler entry as an `inject` message and suppresses
+  linked messaging mirrors, so it cannot be mistaken for a human request.
+- The peer envelope states that it is neither user instruction nor operator
+  authorization. It is not added to the visible chat transcript.
+
+**How to treat it:** review the peer report, then respond or acknowledge only
+when the named request needs action.
 
 ## Cron notification
 

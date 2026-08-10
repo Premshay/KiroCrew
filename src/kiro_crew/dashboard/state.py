@@ -1037,6 +1037,8 @@ SUBAGENT_COMPLETION_PREFIXES = (
     SUBAGENT_COMPLETION_PREFIX,
     SUBAGENT_BATCH_COMPLETION_PREFIX,
 )
+PEER_CHANNEL_REQUEST_PREFIX = "[Peer channel request]"
+PEER_CHANNEL_REQUEST_KIND = "peer_channel_request"
 # One-shot synthesis turn fired after ALL sub-agents in a fan-out complete and
 # each result has been processed in its own turn (see gateway._subagent_done arm
 # + chat_runner drain/idle branch). Its visible reply is the consolidated,

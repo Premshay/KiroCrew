@@ -95,6 +95,7 @@ from kiro_crew.dashboard.chat_utils import (
     build_recovery_requeue,
     effective_session_key,
     expire_slack_options,
+    is_peer_channel_request_item,
     is_system_injection_item,
     mirror_is_paused,
     remember_slack_options,
@@ -4281,10 +4282,12 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         return False
 
     is_recovery = any(is_synthetic_recovery_item(item) for item in consumed)
+    is_peer_channel_request = any(is_peer_channel_request_item(item) for item in consumed)
     # Orthogonal to `is_recovery`, which decides how the row renders: this decides
     # whether the runner may mirror the text to a linked thread as user speech.
     # They diverge on a recovery that replays the user's own message.
     synthetic_payload = any(is_synthetic_payload_item(item) for item in consumed)
+    synthetic_payload = synthetic_payload or is_peer_channel_request
     is_system_injection = any(is_system_injection_item(item) for item in consumed)
     if slot._stopping and not is_system_injection:
         slot.append(
@@ -4311,7 +4314,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     next_msg, _ = redact_credentials(next_msg)
     is_cron = next_msg.startswith(CRON_NOTIFY_PREFIX)
     is_subagent = next_msg.startswith(SUBAGENT_COMPLETION_PREFIXES)
-    if not (is_cron or is_subagent or is_recovery):
+    if not (is_cron or is_subagent or is_recovery or is_peer_channel_request):
         slot._pending_synthesis = False
     match = CRON_NOTIFY_RE.match(next_msg) if is_cron else None
     cron_label = match.group(1) if match else "cron"
@@ -4319,7 +4322,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     cron_label, _ = redact_credentials(cron_label)
     if is_subagent:
         row_role = "subagent"
-    elif is_cron or is_recovery:
+    elif is_cron or is_recovery or is_peer_channel_request:
         row_role = "inject"
     else:
         row_role = "user"
@@ -4327,7 +4330,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         # A cron row's `cls` slot carries a JSON payload, not a CSS class name:
         # `cronLabel` is structured data the frontend reads off the row.
         row_cls = json.dumps({"cronLabel": cron_label})
-    elif is_recovery:
+    elif is_recovery or is_peer_channel_request:
         row_cls = "msg msg-inject"
     else:
         row_cls = "msg msg-u"
@@ -4383,6 +4386,8 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     if row_role == "inject":
         if is_cron:
             _inject_kind = "cron"
+        elif is_peer_channel_request:
+            _inject_kind = "peer_channel_request"
         elif synthetic_payload:
             _inject_kind = "recovery"
         else:
