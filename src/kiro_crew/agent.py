@@ -456,6 +456,28 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
 }
 
 
+def session_capability_servers() -> list[dict]:
+    """Return ACP entries for session-bound KiroCrew capabilities.
+
+    ACP backends receive these entries through ``session/new`` instead of a
+    provider-global configuration file.  The process inherits the gateway's
+    session identity, and ``mcp_shared`` applies the caller's managed tool
+    policy before advertising any tools.
+    """
+    command, args = _kirocrew_mcp_invocation("mcp-core")
+    return [
+        {
+            "name": "kirocrew-core",
+            "command": command,
+            "args": args,
+            "env": [
+                {"name": key, "value": value}
+                for key, value in _managed_mcp_env().items()
+            ],
+        }
+    ]
+
+
 def _extra_mcp_servers() -> dict[str, dict]:
     """Edition-contributed MCP servers from the active PlatformContext.
 

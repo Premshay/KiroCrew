@@ -21,12 +21,17 @@ def _make_restart_request():
     state.sessions._lock = asyncio.Lock()
     state.sessions._sessions = {}
     state.sessions._pool_started = False
+    state.sessions.restart_barrier_snapshot = AsyncMock(return_value=[])
     state.sessions.drain_all_providers = AsyncMock(return_value=[])
     state.sessions.start_pool = AsyncMock()
     state.broadcast_ws = MagicMock()
     state.push_refresh = MagicMock()
     state.push_slots_update = MagicMock()
     state._background_tasks = set()
+    state._slots = {}
+    from kiro_crew.dashboard.restart_barrier import RestartBarrier
+
+    state.restart_barrier = RestartBarrier()
     request = MagicMock(spec=web.Request)
     request.app = {"state": state}
     return request
@@ -126,6 +131,39 @@ class TestApiSessionsRestartMcpSync:
 
         body = json.loads(resp.body)
         assert body["mcp_synced"] == 3
+
+    @pytest.mark.asyncio
+    async def test_busy_session_opens_acknowledgement_barrier_before_sync(self):
+        from kiro_crew.dashboard.handlers.sessions import api_sessions_restart
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        request = _make_restart_request()
+        request.app["state"]._slots = {"owner": _ChatSlot("owner")}
+        request.app["state"].sessions.restart_barrier_snapshot = AsyncMock(
+            return_value=[{"session_key": "dashboard:owner", "busy": True}]
+        )
+
+        resp = await api_sessions_restart(request)
+
+        body = json.loads(resp.body)
+        assert resp.status == 409
+        assert body["code"] == "restart_ack_required"
+        assert body["maintenance"]["pending"] == ["dashboard:owner"]
+
+    @pytest.mark.asyncio
+    async def test_busy_slotless_worker_blocks_reset_without_false_ack(self):
+        from kiro_crew.dashboard.handlers.sessions import api_sessions_restart
+
+        request = _make_restart_request()
+        request.app["state"].sessions.restart_barrier_snapshot = AsyncMock(
+            return_value=[{"session_key": "subagent:worker", "busy": True}]
+        )
+
+        resp = await api_sessions_restart(request)
+
+        body = json.loads(resp.body)
+        assert resp.status == 409
+        assert body["maintenance"]["unmanaged_busy"] == ["subagent:worker"]
 
 
 # ---------------------------------------------------------------------------

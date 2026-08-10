@@ -2126,6 +2126,26 @@ def _list_tools() -> list[dict[str, Any]]:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "maintenance_status",
+            "description": (
+                "Check whether a coordinated KiroCrew session reset is waiting for this "
+                "session. This is a READ. When it reports that your acknowledgement is "
+                "required, finish a concise session_checkpoint and then call "
+                "maintenance_acknowledge before ending the turn."
+            ),
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "maintenance_acknowledge",
+            "description": (
+                "Acknowledge a coordinated KiroCrew session reset after writing a fresh "
+                "session_checkpoint. Call only when the maintenance_status result names "
+                "this session as pending. On success, stop further work and end the turn "
+                "so the operator can safely reset sessions."
+            ),
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
         # --- Dynamic workflows (M6): author + run + monitor from chat ---
         {
             "name": "workflow_author",
@@ -2848,10 +2868,21 @@ def _session_key_header_error(sk: str) -> str | None:
         )
 
 
-def _post(path: str, body: dict | None = None, *, timeout: float = 30) -> dict:
+def _post(
+    path: str,
+    body: dict | None = None,
+    *,
+    timeout: float = 30,
+    require_strict_session: bool = False,
+) -> dict:
     data = json.dumps(body or {}).encode()
     headers = {"Content-Type": "application/json", "X-Internal-Secret": _internal_secret()}
-    sk = _resolve_session_key()
+    sk = _resolve_session_key_strict() if require_strict_session else _resolve_session_key()
+    if require_strict_session and not sk:
+        return {
+            "error": "cannot verify caller session identity; request was not sent",
+            "code": "unverified_session",
+        }
     _sk_err = _session_key_header_error(sk)
     if _sk_err:
         return {"error": _sk_err}
@@ -6160,12 +6191,46 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
 
     if name == "session_checkpoint":
         args = validate_tool_args(args, SESSION_CHECKPOINT_SCHEMA)
-        return session_directive.encode(
-            "session_checkpoint",
+        result = _post(
+            "/api/session-checkpoint",
             args,
-            "Checkpoint requested for this session. It will replace the concise "
-            "current view and append this milestone when the result is processed.",
+            require_strict_session=True,
         )
+        if result.get("ok") is True:
+            return "Checkpoint recorded for this session's Multiplex view."
+        detail = str(result.get("error") or "the gateway rejected the checkpoint")
+        return f"Error: checkpoint was not recorded: {detail}"
+
+    if name == "maintenance_status":
+        if args:
+            return "Error: maintenance_status takes no arguments."
+        result = _post("/api/session-maintenance", {"action": "status"}, require_strict_session=True)
+        if result.get("ok") is not True:
+            return f"Error: maintenance status unavailable: {result.get('error', 'unknown error')}"
+        maintenance = result.get("maintenance") or {}
+        if not maintenance.get("active"):
+            return "No coordinated session reset is active."
+        pending = maintenance.get("pending") or []
+        unmanaged = maintenance.get("unmanaged_busy") or []
+        if maintenance.get("ready"):
+            return "The coordinated reset barrier is ready; wait for the operator to restart sessions."
+        return (
+            "A coordinated reset is waiting. Pending dashboard sessions: "
+            f"{', '.join(pending) or 'none'}; busy slotless workers: "
+            f"{', '.join(unmanaged) or 'none'}."
+        )
+
+    if name == "maintenance_acknowledge":
+        if args:
+            return "Error: maintenance_acknowledge takes no arguments."
+        result = _post(
+            "/api/session-maintenance",
+            {"action": "acknowledge"},
+            require_strict_session=True,
+        )
+        if result.get("ok") is not True:
+            return f"Error: reset acknowledgement was not recorded: {result.get('error', 'unknown error')}"
+        return "Reset acknowledgement recorded. Stop work and end this turn now."
 
     def _redact_obj(obj: Any) -> Any:
         """Recursively redact credentials + exfiltration URLs from a response.

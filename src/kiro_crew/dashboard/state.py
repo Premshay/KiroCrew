@@ -27,6 +27,7 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import DASHBOARD_PORT, config_dir
 from kiro_crew.constants import OPTIONS_RE_LINE
 from kiro_crew.dashboard.chat_compaction_notice import deliver_channel_compaction_notice
+from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.dashboard.side_state import SideState
 from kiro_crew.history import monotonic_transcript_ts
 from kiro_crew.knowledge.store import KnowledgeStore
@@ -2046,6 +2047,9 @@ class DashboardState:
         # Sidebar columns — flat list of {id, name, tag_ids, mode, order, include_untagged}
         self._tag_boards: list[dict[str, Any]] = []
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # A process-local safety gate for coordinated session resets.  The
+        # handlers refresh its live work set immediately before any reset.
+        self.restart_barrier = RestartBarrier()
         self.no_crons: bool = False  # --no-crons flag: cron execution disabled
         self._hook_store: Any = None  # Lazy-init ScriptHookStore
         # Task refine state (background LLM spec generation)

@@ -13,8 +13,10 @@ from kiro_crew.dashboard.state import DashboardState
 
 def _make_state(monkeypatch, tmp_path) -> DashboardState:
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    sessions = MagicMock(count=0)
+    sessions.restart_barrier_snapshot = AsyncMock(return_value=[])
     return DashboardState(
-        sessions=MagicMock(count=0),
+        sessions=sessions,
         crons=MagicMock(),
         lessons=MagicMock(),
         start_time=0.0,
@@ -153,6 +155,24 @@ class TestRestartGateway:
     """Tests for the _restart_gateway helper."""
 
     @pytest.mark.asyncio
+    async def test_busy_session_blocks_gateway_self_restart(self, monkeypatch, tmp_path) -> None:
+        from kiro_crew.dashboard.handlers.updates import _restart_gateway
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        state = _make_state(monkeypatch, tmp_path)
+        state._slots = {"owner": _ChatSlot("owner")}
+        state.sessions.restart_barrier_snapshot = AsyncMock(
+            return_value=[{"session_key": "dashboard:owner", "busy": True}]
+        )
+        execv_called: list[bool] = []
+        monkeypatch.setattr("os.execv", lambda *a, **k: execv_called.append(True))
+
+        await _restart_gateway(state)
+
+        assert execv_called == []
+        assert state.restart_barrier.payload()["pending"] == ["dashboard:owner"]
+
+    @pytest.mark.asyncio
     async def test_invalid_executable_pushes_error_and_returns(
         self, monkeypatch, tmp_path
     ) -> None:
@@ -179,6 +199,7 @@ class TestRestartGateway:
 
         state = _make_state(monkeypatch, tmp_path)
         state.sessions = MagicMock()
+        state.sessions.restart_barrier_snapshot = AsyncMock(return_value=[])
         state.sessions.close_all = AsyncMock(return_value=None)
 
         save_called: list[bool] = []
@@ -208,6 +229,7 @@ class TestRestartGateway:
 
         state = _make_state(monkeypatch, tmp_path)
         state.sessions = MagicMock()
+        state.sessions.restart_barrier_snapshot = AsyncMock(return_value=[])
         state.sessions.close_all = AsyncMock(return_value=None)
 
         execv_called: list[tuple] = []
@@ -235,6 +257,7 @@ class TestRestartGateway:
 
         state = _make_state(monkeypatch, tmp_path)
         state.sessions = MagicMock()
+        state.sessions.restart_barrier_snapshot = AsyncMock(return_value=[])
         state.sessions.close_all = AsyncMock(side_effect=RuntimeError("net down"))
 
         execv_called: list[tuple] = []
@@ -253,6 +276,26 @@ class TestRestartGateway:
 
 class TestApiUpdateApplyVenvDispatch:
     """Tests for the install-path dispatch logic in api_update_apply."""
+
+    @pytest.mark.asyncio
+    async def test_busy_session_blocks_update_before_git_work(self, monkeypatch, tmp_path) -> None:
+        from kiro_crew.dashboard.handlers.updates import api_update_apply
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        proj = _make_pip_proj(tmp_path)
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
+        state = _make_state(monkeypatch, tmp_path)
+        state._slots = {"owner": _ChatSlot("owner")}
+        state.sessions.restart_barrier_snapshot = AsyncMock(
+            return_value=[{"session_key": "dashboard:owner", "busy": True}]
+        )
+        request = MagicMock(spec=web.Request)
+        request.app = {"state": state}
+
+        response = await api_update_apply(request)
+
+        assert response.status == 409
+        assert response.body and b"restart_ack_required" in response.body
 
     @pytest.mark.asyncio
     async def test_pip_path_invokes_pip_install_then_restarts(

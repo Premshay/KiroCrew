@@ -3554,6 +3554,25 @@ class TestInitializeSession:
         client._drain_notifications.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_new_session_injects_core_session_capabilities(self, tmp_path):
+        client = self._make_client(tmp_path)
+        sent: list[tuple[str, dict]] = []
+
+        async def send(method, params):
+            sent.append((method, params))
+            return 1
+
+        client._send_request = send
+        client._wait_for_response = AsyncMock(return_value={"sessionId": "sess-abc"})
+
+        await client._new_session_following_substitution()
+
+        _, params = sent[0]
+        core = next(server for server in params["mcpServers"] if server["name"] == "kirocrew-core")
+        assert core["args"][-1] == "mcp-core"
+        assert all(set(item) == {"name", "value"} for item in core["env"])
+
+    @pytest.mark.asyncio
     async def test_session_resume_success(self, tmp_path):
         """session/load succeeds when file exists and kiro-cli supports it."""
         client = self._make_client(tmp_path)

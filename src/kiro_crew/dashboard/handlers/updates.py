@@ -823,6 +823,25 @@ async def _venv_pip_install(proj: str, state: DashboardState) -> bool:
 
 async def _restart_gateway(state: DashboardState) -> None:
     """Save state, close sessions, and exec the same Python process."""
+    # This route bypasses ``/api/sessions/restart`` and would otherwise kill
+    # active ACP turns during a self-update. Keep the lifecycle gate shared
+    # with the ordinary reset endpoint rather than inventing an update-only
+    # acknowledgement protocol.
+    from kiro_crew.dashboard.handlers.sessions import (
+        _publish_restart_barrier,
+        _restart_barrier_status,
+    )
+
+    status = await _restart_barrier_status(state, open_if_busy=True)
+    if status["ready"] is not True:
+        _publish_restart_barrier(state)
+        state.push_update_progress(
+            "blocked",
+            "Gateway restart is waiting for session acknowledgements; no sessions were stopped.",
+        )
+        return
+    state.restart_barrier.clear()
+    _publish_restart_barrier(state)
     state.push_update_progress("restarting", "Restarting server…")
     exe = sys.executable
     if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
@@ -861,6 +880,21 @@ async def _restart_gateway(state: DashboardState) -> None:
 async def api_update_apply(request: web.Request) -> web.Response:
     """POST /api/update — git pull, rebuild, restart gateway."""
     state: DashboardState = request.app["state"]
+
+    # Refuse before pulling or reinstalling when the resulting self-restart is
+    # unsafe. The second check in ``_restart_gateway`` still covers work that
+    # starts while the update is running.
+    from kiro_crew.dashboard.handlers.sessions import (
+        _publish_restart_barrier,
+        _restart_barrier_status,
+    )
+
+    status = await _restart_barrier_status(state, open_if_busy=True)
+    if status["ready"] is not True:
+        _publish_restart_barrier(state)
+        return web.json_response(
+            {"ok": False, "code": "restart_ack_required", "maintenance": status}, status=409
+        )
 
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
     if not proj:
