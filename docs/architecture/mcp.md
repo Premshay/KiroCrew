@@ -831,8 +831,7 @@ and let a sub-agent's card land in its parent's slot.
 
 **Return a session directive and let the session-aware consumer apply it.** This
 is what the `ask_question` MCP tool itself now does, along with `monitor_start`,
-`monitor_update`, `autonudge_stop`, `set_project`, `suggest_followup`, and
-`session_checkpoint`
+`monitor_update`, `autonudge_stop`, `set_project`, and `suggest_followup`.
 (`session_directive.DIRECTIVE_TOOLS`). The tool validates its arguments and
 returns a human-readable confirmation plus a marker line carrying the validated
 payload and **no session key**. `dashboard/chat_runner`'s tool-result handler
@@ -841,6 +840,13 @@ strips the marker from the stored transcript. Sub-agent isolation is therefore
 structural rather than cryptographic: a sub-agent's tool result flows through the
 sub-agent's own runner, so it can only bind to the sub-agent's session. There is
 no walk to get wrong.
+
+**Session checkpoints use the session-bound core server directly.** Every ACP
+session receives `kirocrew-core` in both `session/new` and `session/load`.
+`session_checkpoint` and the coordinated-reset tools resolve the authenticated
+caller and persist through strict internal routes, so a resumed Codex, Claude,
+or local session has the same bounded Multiplex coordination surface without a
+provider-specific bridge or a caller-supplied slot key.
 
 The directive marker is model-visible, since it comes back as tool-result text,
 so the consumer defends against forgery by honoring a directive only when the
