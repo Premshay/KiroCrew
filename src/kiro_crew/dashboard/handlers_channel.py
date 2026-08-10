@@ -166,6 +166,20 @@ async def api_channel_create(request: web.Request) -> web.Response:
     topic = body.get("topic", "").strip()[:500]
     if not topic:
         return web.json_response({"error": "topic required"}, status=400)
+    session_only = body.get("session_only", False)
+    if not isinstance(session_only, bool):
+        return web.json_response(
+            {"error": "session_only must be a boolean", "code": "invalid_session_only"}, status=400
+        )
+    agents_def = body.get("agents", [])
+    if session_only and agents_def:
+        return web.json_response(
+            {
+                "error": "session-only channels cannot include channel-owned agents",
+                "code": "invalid_session_only",
+            },
+            status=400,
+        )
 
     ch = _mgr(request).create(topic)
     if not ch:
@@ -177,9 +191,8 @@ async def api_channel_create(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
 
     # Spawn agents from preset
-    agents_def = body.get("agents", [])
     has_orchestrator = any(a.get("is_orchestrator") for a in agents_def)
-    if not has_orchestrator:
+    if agents_def and not has_orchestrator:
         agents_def = [
             {"role": "Orchestrator", "is_orchestrator": True, "task": topic},
             *agents_def,
