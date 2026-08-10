@@ -113,9 +113,11 @@ cfg = KiroCrewConfig.load()
 ctx = boot_platform(cfg)      # platform/bootstrap.py (idempotent)
 ```
 
-`boot_platform` is the single idempotent entry point — `cli.main` and
-`run_gateway` both call it; only the first call resolves the profile and
-installs the context. `bootstrap_context`:
+`boot_platform` is the single idempotent entry point. `cli.main`, `run_gateway`,
+and the separately spawned MCP gateway daemon call it before their event loops;
+only the first call in a process resolves the profile and installs the context.
+The daemon needs the composed credential policy when it launches pooled MCP
+backends. `bootstrap_context`:
 1. `build_default_context(cfg, profile=resolve_profile(...))` — all `Default*`.
 2. If profile != standalone: `discover_companion_context` (fail-closed).
 3. Validate `contract_version` and the security floor; `set_context`.

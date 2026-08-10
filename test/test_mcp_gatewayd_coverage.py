@@ -1478,6 +1478,33 @@ class TestBuildArgparser:
         assert gw._build_argparser().parse_args([]).log_level == "DEBUG"
 
 
+class TestMain:
+    def test_boots_platform_before_starting_the_event_loop(self, monkeypatch) -> None:
+        events: list[str] = []
+        config = object()
+
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.ensure_data_home", lambda: events.append("home")
+        )
+        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", lambda: config)
+        monkeypatch.setattr(
+            "kiro_crew.platform.bootstrap.boot_platform",
+            lambda received: events.append("platform") if received is config else None,
+        )
+
+        def run(coro):
+            coro.close()
+            events.append("event_loop")
+            return 0
+
+        monkeypatch.setattr(gw.asyncio, "run", run)
+        with pytest.raises(SystemExit) as exc:
+            gw.main()
+
+        assert exc.value.code == 0
+        assert events == ["home", "platform", "event_loop"]
+
+
 @pytest.fixture
 def _quiet_amain(monkeypatch, tmp_path):
     """Neutralise ``_amain``'s process-level side effects (root logging config
