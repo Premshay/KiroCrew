@@ -602,7 +602,10 @@ export default function ChannelPage() {
   return (
     <>
       <PageHeader title={i18nT('pages.channelPage.channels')} subtitle={i18nT('pages.channelPage.multi_agent_collaboration_spaces')} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-3 sm:px-6 pb-4 sm:pb-8 overflow-y-auto flex-1 min-h-0">
+    <div className="md:hidden flex justify-end pb-2">
+      <Btn onClick={() => setShowNew(true)} primary>{i18nT('pages.channelPage.new')}</Btn>
+    </div>
     <div className="flex h-full relative">
       {showNew && <NewChannelDialog onClose={() => setShowNew(false)} presets={presets} onCreate={handleCreateChannel} />}
 
@@ -619,7 +622,7 @@ export default function ChannelPage() {
       )}
 
       {/* Channel list sidebar */}
-      <div className="w-64 shrink-0 border-r border-border flex flex-col">
+      <div className="hidden md:flex w-64 shrink-0 border-r border-border flex-col">
         <div className="px-3 py-3 border-b border-border flex items-center justify-between">
           <span className="text-sm font-semibold text-text-strong">{i18nT('pages.channelPage.channels')}</span>
           <Btn onClick={() => setShowNew(true)} primary title={i18nT('pages.channelPage.new_channel_2')}>{i18nT('pages.channelPage.new')}</Btn>
@@ -635,9 +638,14 @@ export default function ChannelPage() {
       {/* Channel content */}
       {channel ? (
         <div className="flex-1 flex flex-col min-w-0">
-          <div className="border-b border-border px-4 py-2.5 flex items-center justify-between">
-            <h2 className="text-base font-semibold text-text-strong truncate">{channel.topic}</h2>
-            <div className="flex items-center gap-1.5 shrink-0">
+          <div className="border-b border-border px-3 sm:px-4 py-2.5 flex flex-wrap items-center justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <Select aria-label={i18nT('pages.channelPage.channels')} value={channel.id} onChange={e => setActiveId(e.target.value)} className="md:hidden w-full text-sm">
+                {channels.map(item => <option key={item.id} value={item.id}>{item.topic}</option>)}
+              </Select>
+              <h2 className="hidden md:block text-base font-semibold text-text-strong truncate">{channel.topic}</h2>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5 shrink-0">
               <Btn onClick={() => setShowAgents(!showAgents)}>
                 <Users className="lucide-inline" /> {i18nT('pages.channelPage.agent_2', { count: channel.agents.length })}
                 {channel.agents.some(a => a.state === 'working' || a.state === 'tool_running') && <Badge variant="ok">●</Badge>}
@@ -715,7 +723,7 @@ export default function ChannelPage() {
             </AnimatePresence>
 
             {showAgents && (
-              <div className="w-64 shrink-0 border-l border-border flex flex-col bg-bg-elevated">
+              <div className="fixed inset-x-3 top-20 bottom-3 z-40 rounded-lg border border-border shadow-xl flex flex-col bg-bg-elevated md:static md:inset-auto md:z-auto md:w-64 md:shrink-0 md:rounded-none md:border-y-0 md:border-r-0 md:border-l md:shadow-none">
                 <div className="px-3 py-2.5 border-b border-border flex items-center justify-between">
                   <span className="text-sm font-semibold text-text-strong">{i18nT('pages.channelPage.agents')}</span>
                   <Btn onClick={() => setShowAgents(false)} aria-label={i18nT('pages.channelPage.close_agents_panel')} className="!p-0 !border-none !rounded-none text-muted hover:text-text text-sm"><X className="lucide-inline" /></Btn>
@@ -768,7 +776,7 @@ export default function ChannelPage() {
             )}
           </div>
 
-          <div className="border-t border-border px-4 py-3">
+          <div className="border-t border-border px-3 sm:px-4 py-3">
             <div className="flex gap-2">
               <MentionInput agents={channel.agents} value={input} onChange={setInput} onSend={handleSend} />
               <Btn onClick={handleSend} primary>{i18nT('pages.channelPage.send')}</Btn>

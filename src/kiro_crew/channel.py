@@ -213,7 +213,7 @@ class Channel:
         session_key: str,
         role: str,
         agent_name: str = "",
-        listen_mode: ListenMode | str = ListenMode.MENTION,
+        listen_mode: ListenMode | str = ListenMode.ALL,
     ) -> ChannelAgent | None:
         """Attach one existing dashboard session without creating a provider."""
         if not session_key.startswith("dashboard:") or len(self.members) >= self._max_agents:
@@ -327,13 +327,16 @@ class Channel:
                 await self._deliver(agent, msg)
                 continue
 
-            # Orchestrator gets all top-level human messages (no @mention needed)
+            # An all-listening member is a channel participant, not merely a
+            # mention target. This is the default for an attached dashboard
+            # session so a human coordination message reaches the sessions the
+            # operator deliberately added to the channel.
+            receives_message = agent.listen_mode == ListenMode.ALL and not mentions
             if is_human and not mentions and not thread_id and agent.is_orchestrator:
-                await self._deliver(agent, msg)
-                continue
-
-            # Everyone else: strict @mention only
-            if agent.id not in mentions:
+                receives_message = True
+            if agent.id in mentions:
+                receives_message = True
+            if not receives_message:
                 continue
 
             # A2A exchange limit

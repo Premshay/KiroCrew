@@ -64,7 +64,8 @@ describe('ChannelPage — attach live dashboard session', () => {
     const user = userEvent.setup()
     renderWithProviders(<ChannelPage />)
 
-    await user.click(await screen.findByRole('button', { name: /New/ }))
+    const [mobileNew] = await screen.findAllByRole('button', { name: /New/ })
+    await user.click(mobileNew)
     await user.type(screen.getByRole('textbox', { name: 'Topic' }), 'Multiplex coordination')
     await user.click(screen.getByRole('button', { name: 'Create' }))
 
@@ -72,5 +73,11 @@ describe('ChannelPage — attach live dashboard session', () => {
       'Multiplex coordination', [], true,
     ))
     expect(await screen.findByRole('combobox', { name: 'Sessions' })).toBeInTheDocument()
+  })
+
+  it('offers a compact channel switcher on small screens', async () => {
+    renderWithProviders(<ChannelPage />)
+
+    expect(await screen.findByRole('combobox', { name: 'Channels' })).toBeInTheDocument()
   })
 })
