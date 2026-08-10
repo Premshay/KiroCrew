@@ -430,6 +430,16 @@ class TestConfigDirTriggersMigration:
         first_run = src.index("asyncio.run")
         assert first_ensure < first_run, "ensure_data_home() must precede asyncio.run in main()"
 
+    def test_gatewayd_main_boots_platform_before_asyncio_run(self) -> None:
+        """The daemon owns its own process-global companion context."""
+        import inspect
+
+        from kiro_crew.mcp_gateway import gatewayd
+
+        src = inspect.getsource(gatewayd.main)
+        assert "boot_platform(KiroCrewConfig.load())" in src
+        assert src.index("boot_platform(KiroCrewConfig.load())") < src.index("asyncio.run")
+
     def test_recovery_breadcrumb_written_outside_kiro(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
