@@ -4843,6 +4843,58 @@ class TestRunChatSegmentFlush:
         assert any(m["content"] == "Analyzing..." for m in assistant_msgs)
 
     @pytest.mark.asyncio
+    async def test_interactive_permission_records_attention_timeline(self, tmp_path, monkeypatch):
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, LLMEvent
+
+        events = [
+            LLMEvent(
+                kind=EVENT_PERMISSION_REQUEST,
+                title="bash",
+                tool_kind="execute",
+                request_id="req-1",
+            ),
+            LLMEvent(kind=EVENT_COMPLETE),
+        ]
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        # This timeline assertion exercises the interactive approval boundary,
+        # not the independent account-change reconciliation preflight.
+        state.kiro_prerequisite_service = None
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._drain_session_init_oauth_requests", AsyncMock()
+        )
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client(events)
+        client.approve_tool = AsyncMock()
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        turn = asyncio.create_task(_run_chat(state, slot, "run ls"))
+        for _ in range(10):
+            if "req-1" in slot._approval_futures:
+                break
+            await asyncio.sleep(0)
+        assert state.resolve_approval("req-1", True) is True
+        await turn
+
+        timeline = slot.session_timeline_payload()
+        assert [entry["text"] for entry in timeline] == [
+            "Session started.",
+            "Approval needed: bash.",
+        ]
+        assert timeline[-1]["kind"] == "attention"
+        assert timeline[-1]["priority"] == 95
+        assert timeline[-1]["consequence"] == "Awaiting your approval."
+
+    def test_unknown_permission_keeps_a_human_blocker(self):
+        from kiro_crew.dashboard.chat_runner import _approval_timeline_entry
+
+        assert _approval_timeline_entry("unknown") == (
+            "Approval required; operation not supplied by provider.",
+            "Open the conversation to inspect and approve or reject it.",
+        )
+
+    @pytest.mark.asyncio
     async def test_text_only_complete_no_segments(self, tmp_path, monkeypatch):
         """Text-only stream → complete produces one assistant message (no segments).
 
@@ -5055,6 +5107,51 @@ class TestRunChatNativeSubagentAttribution:
         assert len(dones) == 1
         assert "Reading foo.py:1" in dones[0]["result"]
         assert "file body XYZ" in dones[0]["result"]
+
+        assert [entry["text"] for entry in slot.session_timeline_payload()] == [
+            "Session started.",
+            "Subagents: 1 active of 1.",
+            "Subagents: 0 active of 1.",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_timeline_uses_changed_todo_progress_not_turn_text(self, tmp_path, monkeypatch):
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            EVENT_TODO_UPDATE,
+            LLMEvent,
+        )
+
+        todo = {
+            "description": "work",
+            "tasks": [
+                {"id": "one", "text": "first", "completed": True},
+                {"id": "two", "text": "second", "completed": False},
+            ],
+        }
+        events = [
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="ordinary assistant response must not be a timeline item"),
+            LLMEvent(kind=EVENT_TODO_UPDATE, todo=todo),
+            LLMEvent(kind=EVENT_TODO_UPDATE, todo=todo),
+            LLMEvent(kind=EVENT_COMPLETE),
+        ]
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, False, True))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "a user request must not be a timeline item")
+
+        timeline = slot.session_timeline_payload()
+        assert [entry["text"] for entry in timeline] == [
+            "Session resumed.",
+            "TODO progress: 1 of 2 complete.",
+        ]
+        assert all("ordinary assistant response" not in entry["text"] for entry in timeline)
+        assert all("user request" not in entry["text"] for entry in timeline)
 
 
 class TestRunChatCompactDeferredWait:
@@ -8532,6 +8629,10 @@ class TestOrchestratorPlanGateArming:
 
         assert slot._stage_titles == ["Alpha", "Beta"]
         assert slot._plan_goal == "demo"
+        assert [entry["text"] for entry in slot.session_timeline_payload()] == [
+            "Session started.",
+            "Plan updated: demo (2 stages).",
+        ]
 
     @pytest.mark.asyncio
     async def test_stage_execution_turn_never_rearms(self, tmp_path, monkeypatch):
@@ -12806,6 +12907,7 @@ class TestStopReasonCancelled:
 
         state.sessions.record_success.assert_not_called()
         state.sessions.record_failure.assert_not_called()
+        assert [entry["text"] for entry in slot.session_timeline_payload()] == ["Session started."]
 
     @staticmethod
     def _wire_reinjection(state, tmp_path, monkeypatch):
