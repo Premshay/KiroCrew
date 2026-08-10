@@ -11,6 +11,8 @@ from aiohttp import web
 
 from kiro_crew.channel import ChannelManager, run_channel_agent
 from kiro_crew.config.loader import config_path
+from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
 if TYPE_CHECKING:
@@ -202,6 +204,73 @@ async def api_channel_create(request: web.Request) -> web.Response:
 async def api_channel_close(request: web.Request) -> web.Response:
     ok = _mgr(request).close(request.match_info["id"])
     return web.json_response({"ok": ok})
+
+
+async def api_channel_attach_session(request: web.Request) -> web.Response:
+    """Attach one live dashboard session to an existing channel."""
+    ch, body = await _get_channel_body(request)
+    slot_name = body.get("slot")
+    if not isinstance(slot_name, str):
+        return web.json_response({"error": "slot required", "code": "slot_required"}, status=400)
+    state: DashboardState = request.app["state"]
+    slot = state._slots.get(slot_name)
+    if slot is None:
+        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
+    request_app = request.get("app", "")
+    if request_app and request_app != slot._app:
+        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
+    session_key = effective_session_key(slot)
+    if not session_key.startswith("dashboard:"):
+        return web.json_response(
+            {"error": "slot is not a dashboard session", "code": "unsupported_session"}, status=409
+        )
+    role = body.get("role")
+    if not isinstance(role, str) or not role.strip():
+        role = slot.title or slot.key
+    listen_mode = body.get("listen", "mention")
+    if listen_mode not in {"all", "mention", "silent"}:
+        return web.json_response(
+            {"error": "invalid listen mode", "code": "invalid_listen_mode"}, status=400
+        )
+    member = ch.attach_session(
+        session_key,
+        role=role.strip()[:100],
+        agent_name=(slot.agent or "")[:100],
+        listen_mode=listen_mode,
+    )
+    if member is None:
+        return web.json_response(
+            {"error": "session is already attached or channel is full", "code": "attach_rejected"},
+            status=409,
+        )
+    return web.json_response({"ok": True, "agent": member.to_dict()})
+
+
+async def deliver_attached_channel_message(state, channel, member, message) -> None:
+    """Persist a channel delivery on its uniquely bound dashboard slot."""
+    slots = [
+        slot for slot in state._slots.values() if effective_session_key(slot) == member.session_key
+    ]
+    if len(slots) != 1:
+        logger.warning("Channel %s cannot deliver to %s", channel.id, member.session_key)
+        return
+    content, _ = redact_exfiltration_urls(message.content)
+    content, _ = redact_credentials(content)
+    slot = slots[0]
+    if not slot.queue_peer_channel_message(
+        {
+            "channel_id": channel.id,
+            "message_id": message.id,
+            "from_role": message.from_role,
+            "content": content,
+            "msg_type": message.msg_type,
+        }
+    ):
+        return
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+    await save_slot_off_loop(state, slot, force=True, best_effort=False)
+    state.push_slots_update()
 
 
 # ── Messages ──

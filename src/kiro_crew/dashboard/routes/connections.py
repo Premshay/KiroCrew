@@ -65,6 +65,7 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/channels", handlers_channel.api_channel_create)
     app.router.add_get("/api/channels/{id}", handlers_channel.api_channel_get)
     app.router.add_delete("/api/channels/{id}", handlers_channel.api_channel_close)
+    app.router.add_post("/api/channels/{id}/sessions", handlers_channel.api_channel_attach_session)
     app.router.add_post(
         "/api/channels/{id}/clear-context", handlers_channel.api_channel_clear_context
     )

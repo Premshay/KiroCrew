@@ -36,6 +36,7 @@ from kiro_crew.validation import (
     MONITOR_UPDATE_SCHEMA,
     REGISTER_HOOK_SCHEMA,
     SELECT_CREW_SCHEMA,
+    SESSION_CHANNEL_POST_SCHEMA,
     SESSION_CHECKPOINT_SCHEMA,
     SET_PROJECT_SCHEMA,
     SUGGEST_FOLLOWUP_SCHEMA,
@@ -542,6 +543,42 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "session_channel_status",
+            "description": (
+                "List persistent-agent channels attached to this session and their peers. "
+                "Peer reports use the KiroCrew Channel envelope, never a user-message envelope."
+            ),
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "session_channel_post",
+            "description": (
+                "Send a concise typed report to named peers in a channel attached to this session. "
+                "Use progress for updates, mention for a response or decision request, and done "
+                "for a completed handoff. This does not impersonate a human or operator."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {"type": "string", "maxLength": 8},
+                    "recipients": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 8},
+                        "minItems": 1,
+                        "maxItems": 8,
+                    },
+                    "content": {"type": "string", "maxLength": 4000},
+                    "msg_type": {
+                        "type": "string",
+                        "enum": ["progress", "mention", "done"],
+                        "default": "progress",
+                    },
+                },
+                "required": ["channel_id", "recipients", "content"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "maintenance_status",
             "description": (
                 "Check whether a coordinated session reset is waiting for this session. "
@@ -988,6 +1025,49 @@ def session_checkpoint(name: str, args: dict[str, Any]) -> str:
     )
 
 
+def _session_channel_post(body: dict[str, Any]) -> dict[str, Any] | None:
+    """Call the attached-channel endpoint with a verified session identity."""
+    session_key = mcp_core._resolve_session_key_strict()
+    if not session_key:
+        return None
+    return mcp_core._post("/api/session-channel", body, session_key=session_key)
+
+
+def session_channel_status(name: str, args: dict[str, Any]) -> str:
+    if args:
+        return "Error: session_channel_status takes no arguments."
+    result = _session_channel_post({"action": "status"})
+    if result is None:
+        return "Error: session_channel_status requires a verified session identity."
+    if result.get("ok") is not True:
+        return f"Error: channel status unavailable: {result.get('error', 'unknown error')}"
+    channels = result.get("channels") or []
+    if not channels:
+        return "No persistent-agent channel is attached to this session."
+    summaries = []
+    for channel in channels:
+        peers = channel.get("peers") or []
+        peer_text = ", ".join(
+            f"{peer.get('role', 'Peer')} ({peer.get('id', 'unknown')}, {peer.get('state', 'unknown')})"
+            for peer in peers
+        )
+        summaries.append(
+            f"{channel.get('id', 'unknown')} — {channel.get('topic', '')}: {peer_text or 'no peers'}"
+        )
+    return "Attached persistent-agent channels:\n" + "\n".join(summaries)
+
+
+def session_channel_post(name: str, args: dict[str, Any]) -> str:
+    args = validate_tool_args(args, SESSION_CHANNEL_POST_SCHEMA)
+    result = _session_channel_post({"action": "post", **args})
+    if result is None:
+        return "Error: session_channel_post requires a verified session identity."
+    if result.get("ok") is True:
+        message = result.get("message") or {}
+        return f"Peer report recorded as {message.get('id', 'a channel message')}."
+    return f"Error: peer report was not recorded: {result.get('error', 'unknown error')}"
+
+
 def _maintenance_post(action: str) -> dict[str, Any] | None:
     """Call the session-scoped maintenance endpoint with a verified identity."""
     session_key = mcp_core._resolve_session_key_strict()
@@ -1044,6 +1124,8 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "set_project": set_project,
     "suggest_followup": suggest_followup,
     "session_checkpoint": session_checkpoint,
+    "session_channel_status": session_channel_status,
+    "session_channel_post": session_channel_post,
     "maintenance_status": maintenance_status,
     "maintenance_acknowledge": maintenance_acknowledge,
 }

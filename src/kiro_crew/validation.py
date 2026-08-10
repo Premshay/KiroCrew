@@ -1446,6 +1446,48 @@ SESSION_CHECKPOINT_SCHEMA = ToolSchema(
     custom_validator=_validate_session_checkpoint,
 )
 
+
+_PERSISTENT_AGENT_CHANNEL_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _validate_session_channel_post(args: dict[str, Any]) -> None:
+    recipients = args["recipients"]
+    if not recipients:
+        raise ValidationError("recipients", "must name at least one peer")
+    if len(set(recipients)) != len(recipients):
+        raise ValidationError("recipients", "must not contain duplicates")
+
+
+SESSION_CHANNEL_POST_SCHEMA = ToolSchema(
+    tool_name="session_channel_post",
+    fields=[
+        FieldSpec(
+            "channel_id",
+            str,
+            required=True,
+            max_len=8,
+            pattern=_PERSISTENT_AGENT_CHANNEL_ID_RE,
+        ),
+        FieldSpec(
+            "recipients",
+            list,
+            required=True,
+            item_type=str,
+            item_max_len=8,
+            item_pattern=_PERSISTENT_AGENT_CHANNEL_ID_RE,
+            max_items=8,
+        ),
+        FieldSpec("content", str, required=True, max_len=4000),
+        FieldSpec(
+            "msg_type",
+            str,
+            default="progress",
+            allowed=frozenset({"progress", "mention", "done"}),
+        ),
+    ],
+    custom_validator=_validate_session_channel_post,
+)
+
 # --- Dynamic Workflows (M6) ---
 _WF_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
@@ -2652,6 +2694,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "set_project": SET_PROJECT_SCHEMA,
     "suggest_followup": SUGGEST_FOLLOWUP_SCHEMA,
     "session_checkpoint": SESSION_CHECKPOINT_SCHEMA,
+    "session_channel_post": SESSION_CHANNEL_POST_SCHEMA,
     "artifact_save": ARTIFACT_SAVE_SCHEMA,
     "artifact_get": ARTIFACT_GET_SCHEMA,
     "artifact_update": ARTIFACT_UPDATE_SCHEMA,

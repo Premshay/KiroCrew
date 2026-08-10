@@ -66,10 +66,10 @@ from kiro_crew.safety_override import safety_override
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.validation import (
+    SESSION_CHECKPOINT_GOAL_MAX,
     SESSION_CHECKPOINT_MAIN_ITEM_MAX,
     SESSION_CHECKPOINT_MAIN_ITEMS_MAX,
     SESSION_CHECKPOINT_MILESTONE_MAX,
-    SESSION_CHECKPOINT_GOAL_MAX,
     SESSION_CHECKPOINT_PROGRESS_LABEL_MAX,
     SESSION_CHECKPOINT_SUMMARY_MAX,
     SESSION_CHECKPOINT_TRAIL_MAX,
@@ -99,6 +99,7 @@ _T = TypeVar("_T")
 
 _CHANNEL_ID_PREFIX_RE = re.compile(r"^([a-z][a-z0-9_-]*):(.*)$", re.IGNORECASE)
 _SESSION_TIMELINE_SOURCE_MAX = 32
+_PEER_CHANNEL_INBOX_MAX = 20
 _CHANNEL_LABELS = {
     "slack": "Slack",
     "discord": "Discord DM",
@@ -1618,6 +1619,7 @@ class _ChatSlot:
         "_ephemeral",
         "_pending_context",
         "_deferred_notes",
+        "_peer_channel_inbox",
         "_app",
         "_human_seen",
         "_origin",
@@ -1983,6 +1985,7 @@ class _ChatSlot:
         self._ephemeral: bool = ephemeral  # Incognito mode: no memory writes
         self._pending_context: list[dict[str, Any]] = []
         self._deferred_notes: list[dict[str, Any]] = []
+        self._peer_channel_inbox: list[dict[str, Any]] = []
         self._app: str = ""  # App identity tag (App Kit §5.2)
         # FIX 1 (unattended approval park). Evidence that a HUMAN has driven
         # this slot through a dashboard-user route (typed a message, answered an
@@ -2406,6 +2409,59 @@ class _ChatSlot:
     def session_timeline_payload(self) -> list[dict[str, Any]]:
         """Return an isolated bounded timeline for the slots snapshot."""
         return [dict(entry) for entry in self._session_timeline]
+
+    def queue_peer_channel_message(self, message: object) -> bool:
+        """Persist one bounded, machine-originated peer delivery for the next turn."""
+        if not isinstance(message, dict):
+            return False
+
+        def clean(value: object, limit: int) -> str:
+            return sanitize_string(value)[:limit] if isinstance(value, str) else ""
+
+        channel_id = clean(message.get("channel_id"), 32)
+        message_id = clean(message.get("message_id"), 32)
+        from_role = clean(message.get("from_role"), 100)
+        content = clean(message.get("content"), 4000)
+        msg_type = clean(message.get("msg_type"), 32) or "progress"
+        content, _ = redact_exfiltration_urls(content)
+        content, _ = redact_credentials(content)
+        if not channel_id or not message_id or not from_role or not content:
+            return False
+        if any(
+            item.get("channel_id") == channel_id and item.get("message_id") == message_id
+            for item in self._peer_channel_inbox
+        ):
+            return False
+        self._peer_channel_inbox = (
+            self._peer_channel_inbox
+            + [
+                {
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                    "from_role": from_role,
+                    "content": content,
+                    "msg_type": msg_type,
+                }
+            ]
+        )[-_PEER_CHANNEL_INBOX_MAX:]
+        return True
+
+    def restore_peer_channel_inbox(self, inbox: object) -> None:
+        """Restore valid peer deliveries without changing their persisted order."""
+        if not isinstance(inbox, list):
+            return
+        for message in inbox:
+            self.queue_peer_channel_message(message)
+
+    def drain_peer_channel_inbox(self) -> list[dict[str, Any]]:
+        """Return and clear pending peer deliveries after prompt framing."""
+        messages = [dict(message) for message in self._peer_channel_inbox]
+        self._peer_channel_inbox.clear()
+        return messages
+
+    def peer_channel_inbox_payload(self) -> list[dict[str, Any]]:
+        """Return a copy suitable for durable slot metadata."""
+        return [dict(message) for message in self._peer_channel_inbox]
 
     def set_declared_goal(self, goal: object) -> bool:
         """Store an owner-declared goal and record its meaningful transition."""
@@ -3602,6 +3658,7 @@ class _ChatSlot:
             # resolves the active bound session for an artifact from here.
             "artifact": self._artifact,
             "messages": len(self.messages),
+            "peer_channel_inbox_count": len(self._peer_channel_inbox),
             "running": self.running,
             "orchestrating": self._in_stage_execution,
             "queue_depth": self.queue_depth,

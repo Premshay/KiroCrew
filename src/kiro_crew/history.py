@@ -3548,7 +3548,6 @@ class ConversationLog:
                 continue
             meta: dict = {
                 "key": key,
-                "messages": max(1, int(stat.st_size / 200)),
                 "modified": stat.st_mtime,
                 "created": datetime.fromtimestamp(stat.st_mtime).isoformat(),
             }
