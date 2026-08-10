@@ -1584,7 +1584,10 @@ export const api = {
   channelsList: () => fetch('/api/channels').then(j),
   channelPresets: () => fetch('/api/channels/presets').then(j),
   channelGet: (id: string) => fetch('/api/channels/' + encodeURIComponent(id)).then(j),
-  channelCreate: (topic: string, agents: object[]) => post('/api/channels', { topic, agents }).then(j),
+  channelCreate: (topic: string, agents: object[], sessionOnly = false) => post(
+    '/api/channels',
+    { topic, agents, ...(sessionOnly ? { session_only: true } : {}) },
+  ).then(j),
   channelClose: (id: string) => del('/api/channels/' + encodeURIComponent(id)).then(j),
   channelPost: (id: string, content: string, mention?: string | string[], thread_id?: string) => post('/api/channels/' + encodeURIComponent(id) + '/messages', { content, mention, thread_id }).then(j),
   channelAddAgent: (id: string, agent: object) => post('/api/channels/' + encodeURIComponent(id) + '/agents', agent).then(j),

@@ -282,7 +282,9 @@ function presetLabel(p: Preset): string {
 
 function NewChannelDialog({ onClose, onCreate, presets }: { onClose: () => void; onCreate: (topic: string, presetId: string) => void; presets: Preset[] }) {
   const [topic, setTopic] = useState('')
-  const [preset, setPreset] = useState(presets[0]?.id || 'custom')
+  const [preset, setPreset] = useState(
+    () => presets.find(candidate => candidate.agents.length === 0)?.id || presets[0]?.id || 'custom',
+  )
 
   const handleCreate = () => {
     if (!topic.trim()) return
@@ -495,7 +497,12 @@ export default function ChannelPage() {
     setLoading(false)
   }, [activeId])
 
-  useEffect(() => { reload(); api.channelPresets().then(r => setPresets(r.presets || FALLBACK_PRESETS)).catch(() => {}) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    reload()
+    api.channelPresets().then(r => {
+      if (r.presets?.length) setPresets(r.presets)
+    }).catch(() => {})
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load full channel (with messages) when switching
   useEffect(() => {
@@ -572,15 +579,20 @@ export default function ChannelPage() {
   const handleCreateChannel = async (topic: string, presetId: string) => {
     setShowNew(false)
     const tmpl = presets.find(p => p.id === presetId) || presets[0]
+    const sessionOnly = tmpl?.agents.length === 0
     try {
       const res = await api.channelCreate(topic, (tmpl?.agents || []).map(a => ({
         role: a.role, task: (a.task || '{topic}').replace('{topic}', topic),
         is_orchestrator: a.is_orchestrator || false,
-      })))
+      })), sessionOnly)
       if (res.channel) {
         const ch = mapChannel(res.channel)
         setChannels(prev => prev.some(c => c.id === ch.id) ? prev : [ch, ...prev])
         setActiveId(res.channel.id)
+        if (sessionOnly) {
+          setShowAgents(true)
+          setShowAttachSession(true)
+        }
       }
     } catch (err) {
       setError(apiError(err, i18nT('pages.channelPage.failed_to_create_channel')))

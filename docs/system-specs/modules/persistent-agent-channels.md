@@ -107,8 +107,11 @@ suggested action (e.g., "Close an existing channel first").
 | Code Review | Reviewer (orchestrator) | Review code changes |
 | Research | Orchestrator | Research and synthesize findings |
 
-If no preset agent has `is_orchestrator: true`, the backend auto-injects
-an Orchestrator agent as the first member.
+If a team preset includes agents but none has `is_orchestrator: true`, the
+backend auto-injects an Orchestrator agent as the first member. The empty preset
+creates a session-only channel instead: it contains no provider-owned agent and
+opens the live-session picker immediately, so an operator can attach existing
+dashboard sessions without assigning replacement roles.
 
 ## Security
 
@@ -132,7 +135,7 @@ their persisted dashboard-slot identity.
 - Thread panel with nested replies
 - @mention autocomplete with keyboard navigation and ARIA attributes
 - Agent sidebar with state icons (⏳ pending, 🟢 working, 👂 listening, ✅ done, 💥 failed)
-- Session picker that lists live dashboard slots and omits channel members already attached
+- The empty preset opens the session picker immediately; it lists live dashboard slots and omits channel members already attached
 - Listen mode dropdown per agent
 - Error modal for limit violations
 - Design tokens only (no hardcoded colors), `encodeURIComponent` on all URL params

@@ -35,6 +35,7 @@ describe('ChannelPage — attach live dashboard session', () => {
       { key: 'chat-claude', title: 'Claude Multiplex', agent: 'crew-claude' },
     ])
     vi.mocked(api).channelAttachSession = vi.fn().mockResolvedValue({ ok: true })
+    vi.mocked(api).channelCreate = vi.fn().mockResolvedValue({ channel })
   })
 
   async function openSessionPicker() {
@@ -57,5 +58,19 @@ describe('ChannelPage — attach live dashboard session', () => {
     await user.click(screen.getByRole('button', { name: 'Add' }))
     await waitFor(() => expect(vi.mocked(api).channelAttachSession).toHaveBeenCalledWith('ch1', 'chat-claude'))
     await waitFor(() => expect(vi.mocked(api).channelGet).toHaveBeenCalledWith('ch1'))
+  })
+
+  it('defaults to a session-only channel and opens its session picker', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(<ChannelPage />)
+
+    await user.click(await screen.findByRole('button', { name: /New/ }))
+    await user.type(screen.getByRole('textbox', { name: 'Topic' }), 'Multiplex coordination')
+    await user.click(screen.getByRole('button', { name: 'Create' }))
+
+    await waitFor(() => expect(vi.mocked(api).channelCreate).toHaveBeenCalledWith(
+      'Multiplex coordination', [], true,
+    ))
+    expect(await screen.findByRole('combobox', { name: 'Sessions' })).toBeInTheDocument()
   })
 })
