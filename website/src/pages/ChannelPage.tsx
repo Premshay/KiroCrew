@@ -6,7 +6,8 @@ import type { RootState } from '../store'
 import { api } from '../api/client'
 import { useQuery } from '@tanstack/react-query'
 import ApprovalCard from '../components/ApprovalCard'
-import { Btn, Input, Badge, EmptyState, PageHeader, Select } from '../components/ui'
+import { Btn, Input, Badge, EmptyState, PageHeader } from '../components/ui'
+import SimpleSelect from '../components/SimpleSelect'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import AgentSelector from '../components/AgentSelector'
 import { useAgents } from '../hooks/useAgents'
@@ -291,7 +292,9 @@ function presetLabel(p: Preset): string {
 
 function NewChannelDialog({ onClose, onCreate, presets }: { onClose: () => void; onCreate: (topic: string, presetId: string) => void; presets: Preset[] }) {
   const [topic, setTopic] = useState('')
-  const [preset, setPreset] = useState(presets[0]?.id || 'custom')
+  const [preset, setPreset] = useState(
+    () => presets.find(candidate => candidate.agents.length === 0)?.id || presets[0]?.id || 'custom',
+  )
 
   const handleCreate = () => {
     if (!topic.trim()) return
@@ -442,12 +445,16 @@ function AttachSessionForm({ attachedSessionKeys, onAttach, onCancel }: {
 
   return (
     <div className="p-2 space-y-2 border-t border-border">
-      <label htmlFor="channel-session-picker" className="text-[11px] text-muted font-medium block">{i18nT('pages.agentsPage.sessions')}</label>
-      <Select id="channel-session-picker" aria-label={i18nT('pages.agentsPage.sessions')} value={selected} onChange={e => setSelected(e.target.value)} className="w-full">
-        {attachable.map(slot => (
-          <option key={slot.key} value={slot.key}>{slot.title || slot.key}{slot.agent ? ` · ${slot.agent}` : ''}</option>
-        ))}
-      </Select>
+      <label htmlFor="channel-session-picker" className="text-[11px] text-muted font-medium block">{i18nT('pages.chatSidebar.sessions')}</label>
+      <SimpleSelect
+        id="channel-session-picker"
+        aria-label={i18nT('pages.chatSidebar.sessions')}
+        options={attachable.map(slot => slot.key)}
+        optionLabels={attachable.map(slot => `${slot.title || slot.key}${slot.agent ? ` · ${slot.agent}` : ''}`)}
+        value={selected}
+        onChange={setSelected}
+        className="w-full"
+      />
       <div className="flex gap-1">
         <Btn onClick={() => { if (selected) onAttach(selected) }} disabled={!selected} primary className="flex-1">{i18nT('pages.channelPage.add')}</Btn>
         <Btn onClick={onCancel}>{i18nT('pages.channelPage.cancel')}</Btn>
@@ -491,6 +498,7 @@ export default function ChannelPage() {
   const { isMobile, showList, showDetail, openDetail, closeDetail } = useListDetailView()
   const [showAddAgent, setShowAddAgent] = useState(false)
   const [showAttachSession, setShowAttachSession] = useState(false)
+  const [sessionOnlyPickerFor, setSessionOnlyPickerFor] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [threadId, setThreadId] = useState<string | null>(null)
@@ -515,7 +523,12 @@ export default function ChannelPage() {
     setLoading(false)
   }, [activeId])
 
-  useEffect(() => { reload(); api.channelPresets().then(r => setPresets(r.presets || FALLBACK_PRESETS)).catch(() => {}) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    reload()
+    api.channelPresets().then(r => {
+      if (r.presets?.length) setPresets(r.presets)
+    }).catch(() => {})
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // A thread id and the agents panel both belong to one channel: `threadId` names a
   // message in it, and the panel lists its members. Leaving either set across a change
@@ -525,6 +538,13 @@ export default function ChannelPage() {
     setThreadId(null)
     setShowAgents(false)
   }, [activeId])
+
+  useEffect(() => {
+    if (!sessionOnlyPickerFor || sessionOnlyPickerFor !== activeId) return
+    setShowAgents(true)
+    setShowAttachSession(true)
+    setSessionOnlyPickerFor(null)
+  }, [activeId, sessionOnlyPickerFor])
 
   // Load full channel (with messages) when switching
   useEffect(() => {
@@ -617,16 +637,20 @@ export default function ChannelPage() {
   const handleCreateChannel = async (topic: string, presetId: string) => {
     setShowNew(false)
     const tmpl = presets.find(p => p.id === presetId) || presets[0]
+    const sessionOnly = tmpl?.agents.length === 0
     try {
       const res = await api.channelCreate(topic, (tmpl?.agents || []).map(a => ({
         role: a.role, task: (a.task || '{topic}').replace('{topic}', topic),
         is_orchestrator: a.is_orchestrator || false,
-      })))
+      })), sessionOnly)
       if (res.channel) {
         const ch = mapChannel(res.channel)
         setChannels(prev => prev.some(c => c.id === ch.id) ? prev : [ch, ...prev])
         setActiveId(res.channel.id)
         openDetail()
+        if (sessionOnly) {
+          setSessionOnlyPickerFor(res.channel.id)
+        }
       }
     } catch (err) {
       setError(apiError(err, i18nT('pages.channelPage.failed_to_create_channel')))
@@ -803,7 +827,7 @@ export default function ChannelPage() {
                   ) : (
                     <div className="flex gap-1">
                       <Btn onClick={() => setShowAddAgent(true)} primary className="flex-1">{i18nT('pages.channelPage.add_agent')}</Btn>
-                      <Btn onClick={() => setShowAttachSession(true)} className="flex-1">{i18nT('pages.agentsPage.sessions')}</Btn>
+                      <Btn onClick={() => setShowAttachSession(true)} className="flex-1">{i18nT('pages.chatSidebar.sessions')}</Btn>
                     </div>
                   )}
                 </div>
