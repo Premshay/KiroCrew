@@ -11,6 +11,7 @@ from kiro_crew.channel import (
     ChannelAgent,
     ChannelManager,
     ChannelMessage,
+    ListenMode,
 )
 
 
@@ -156,6 +157,26 @@ class TestChannelRouting:
 
         assert deliveries == [("ch1", "dashboard:crew-claude", "verified report")]
         assert attached.inbox.empty()
+
+    @pytest.mark.asyncio
+    async def test_human_message_reaches_all_listening_attached_sessions(self):
+        deliveries = []
+
+        async def deliver(channel, member, message):
+            deliveries.append((member.session_key, message.content))
+
+        ch = Channel(id="ch1", topic="test", _delivery_fn=deliver)
+        codex = ch.attach_session("dashboard:crew-codex", role="Codex")
+        claude = ch.attach_session("dashboard:crew-claude", role="Claude")
+
+        await ch.post("human", "Please coordinate this change.", from_role="Human")
+
+        assert codex.listen_mode == ListenMode.ALL
+        assert claude.listen_mode == ListenMode.ALL
+        assert deliveries == [
+            ("dashboard:crew-codex", "Please coordinate this change."),
+            ("dashboard:crew-claude", "Please coordinate this change."),
+        ]
 
     @pytest.mark.asyncio
     async def test_multi_mention(self):

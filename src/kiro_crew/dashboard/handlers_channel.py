@@ -240,7 +240,7 @@ async def api_channel_attach_session(request: web.Request) -> web.Response:
     role = body.get("role")
     if not isinstance(role, str) or not role.strip():
         role = slot.title or slot.key
-    listen_mode = body.get("listen", "mention")
+    listen_mode = body.get("listen", "all")
     if listen_mode not in {"all", "mention", "silent"}:
         return web.json_response(
             {"error": "invalid listen mode", "code": "invalid_listen_mode"}, status=400
