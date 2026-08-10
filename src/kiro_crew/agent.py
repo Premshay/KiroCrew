@@ -456,15 +456,19 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
 }
 
 
-def session_capability_servers() -> list[dict]:
+def session_capability_servers(session_key: str | None = None) -> list[dict]:
     """Return ACP entries for session-bound KiroCrew capabilities.
 
     ACP backends receive these entries through ``session/new`` instead of a
-    provider-global configuration file.  The process inherits the gateway's
-    session identity, and ``mcp_shared`` applies the caller's managed tool
-    policy before advertising any tools.
+    provider-global configuration file.  ACP backends may spawn the MCP
+    process themselves, so carry the gateway-owned session key in the server
+    definition rather than assuming process-tree inheritance.  ``mcp_shared``
+    then applies the caller's managed tool policy before advertising tools.
     """
     command, args = _kirocrew_mcp_invocation("mcp-core")
+    env = _managed_mcp_env()
+    if session_key:
+        env["KIROCREW_SESSION_KEY"] = session_key
     return [
         {
             "name": "kirocrew-core",
@@ -472,7 +476,7 @@ def session_capability_servers() -> list[dict]:
             "args": args,
             "env": [
                 {"name": key, "value": value}
-                for key, value in _managed_mcp_env().items()
+                for key, value in env.items()
             ],
         }
     ]

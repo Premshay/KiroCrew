@@ -1787,7 +1787,7 @@ class AcpClient:
 
     def _session_capability_mcp_servers(self) -> list[dict[str, Any]]:
         """Session-bound MCP capabilities available to every ACP backend."""
-        return session_capability_servers()
+        return session_capability_servers(self._session_key)
 
     def _claude_session_mcp_servers(self) -> list:
         """MCP server array passed to a claude ``session/new`` / ``session/load``.

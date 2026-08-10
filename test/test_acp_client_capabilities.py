@@ -7,6 +7,7 @@ agent assumed the all-false default.
 
 from pathlib import Path
 
+from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.types import ACP_CLIENT_CAPABILITIES
 
 
@@ -42,3 +43,13 @@ def test_both_acp_transports_send_capabilities() -> None:
         # is cp1252 on the Windows CI shards, and these files contain non-ASCII
         # (em dashes / arrows) in their comments.
         assert "ACP_CLIENT_CAPABILITIES" in src.read_text(encoding="utf-8"), rel
+
+
+def test_session_capability_server_carries_the_bound_session_key() -> None:
+    """A backend-spawned MCP process must not lose its dashboard binding."""
+    client = AcpClient(session_key="dashboard:bound-slot")
+
+    [server] = client._session_capability_mcp_servers()
+    env = {entry["name"]: entry["value"] for entry in server["env"]}
+
+    assert env["KIROCREW_SESSION_KEY"] == "dashboard:bound-slot"

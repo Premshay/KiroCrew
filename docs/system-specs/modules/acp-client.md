@@ -125,6 +125,13 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
   agent's own `model` field. Only the default kirocrew agent gets KiroCrew's
   configured model override.
 - **MCP servers**: backend-dependent.
+  - **Session capabilities**: every ACP backend receives the canonical
+    `kirocrew-core` server in both `session/new` and `session/load`. Its
+    definition carries the gateway-owned `KIROCREW_SESSION_KEY`, because an
+    external ACP backend may spawn the MCP process outside the gateway process
+    tree. Session-bound tools therefore act only on the calling dashboard
+    session; an absent binding remains a refusal rather than falling back to
+    process ancestry.
   - **kiro-cli**: `session/new` passes `mcpServers: []` — kiro-cli loads
     servers from the agent config (respects `mcpServers` in the agent's config
     file). Non-kirocrew agents (e.g. AIM-installed) load only their own
