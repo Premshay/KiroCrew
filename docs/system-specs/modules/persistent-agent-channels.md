@@ -123,6 +123,8 @@ dashboard sessions without assigning replacement roles.
 ## Security
 
 - **LLM output sanitization**: `redact_exfiltration_urls` + `redact_credentials` on all agent output
+- **Failure visibility**: a channel-owned agent posts its bounded, redacted failure detail as a
+  system message; the gateway retains the traceback in logs for diagnosis.
 - **Tool input sanitization**: Credentials and URLs redacted in approval messages
 - **SEL audit**: All trust escalations and approval decisions logged via `sel().log_tool_invocation()`
 - **Approval validation**: Decision allowlist (`approved`, `rejected`, `trust`) enforced in both handler and channel
