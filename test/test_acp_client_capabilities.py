@@ -7,6 +7,7 @@ agent assumed the all-false default.
 
 from pathlib import Path
 
+from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.types import ACP_CLIENT_CAPABILITIES
 
 
@@ -61,3 +62,13 @@ def test_both_acp_transports_send_client_info_name() -> None:
         assert '"clientInfo": {"name": CLIENT_NAME' in text, rel
         # The flat key kiro-cli ignores must not come back.
         assert '"clientName": CLIENT_NAME' not in text, rel
+
+
+def test_session_capability_server_carries_the_bound_session_key() -> None:
+    """A backend-spawned MCP process must not lose its dashboard binding."""
+    client = AcpClient(session_key="dashboard:bound-slot")
+
+    [server] = client._session_capability_mcp_servers()
+    env = {entry["name"]: entry["value"] for entry in server["env"]}
+
+    assert env["KIROCREW_SESSION_KEY"] == "dashboard:bound-slot"
