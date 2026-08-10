@@ -2673,6 +2673,7 @@ export const api = {
   channelClose: (id: string) => del('/api/channels/' + encodeURIComponent(id)).then(j),
   channelPost: (id: string, content: string, mention?: string | string[], thread_id?: string) => post('/api/channels/' + encodeURIComponent(id) + '/messages', { content, mention, thread_id }).then(j),
   channelAddAgent: (id: string, agent: object) => post('/api/channels/' + encodeURIComponent(id) + '/agents', agent).then(j),
+  channelAttachSession: (id: string, slot: string) => post('/api/channels/' + encodeURIComponent(id) + '/sessions', { slot }).then(j),
   channelUpdateAgent: (id: string, aid: string, updates: object) => patch('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid), updates).then(j),
   channelDismissAgent: (id: string, aid: string) => del('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid)).then(j),
   channelWakeAgent: (id: string, aid: string) => post('/api/channels/' + encodeURIComponent(id) + '/agents/' + encodeURIComponent(aid) + '/wake', {}).then(j),
