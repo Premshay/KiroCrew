@@ -1,10 +1,26 @@
 import { describe, expect, it } from 'vitest'
-import { selectedRowRange, selectionTouchesContainer } from '../utils/selectionRetention'
+import {
+  clampSelectionToTranscript,
+  selectedRowRange,
+  selectionTouchesContainer,
+} from '../utils/selectionRetention'
 
 function selection(anchorNode: Node, focusNode: Node): Selection {
   // DOM Ranges normalize start/end and so cannot model a backward mobile-handle
   // selection. The helper only reads these public Selection fields.
-  return { anchorNode, focusNode, isCollapsed: false } as Selection
+  return {
+    anchorNode,
+    anchorOffset: 0,
+    focusNode,
+    focusOffset: 0,
+    isCollapsed: false,
+    setBaseAndExtent(anchor, anchorOffset, focus, focusOffset) {
+      this.anchorNode = anchor
+      this.anchorOffset = anchorOffset
+      this.focusNode = focus
+      this.focusOffset = focusOffset
+    },
+  } as Selection
 }
 
 describe('selectionRetention', () => {
@@ -31,5 +47,46 @@ describe('selectionRetention', () => {
 
     expect(selectedRowRange(container, selected)).toBeNull()
     expect(selectionTouchesContainer(container, selected)).toBe(true)
+  })
+
+  it('clamps a transcript selection that reaches a preceding overlay', () => {
+    const host = document.createElement('div')
+    host.innerHTML = '<p>title chrome</p><div><i></i><div data-display-index="4">chat text</div><i></i></div><p>composer chrome</p>'
+    document.body.append(host)
+    const [title, container] = Array.from(host.children)
+    const [start, row, end] = Array.from(container.children)
+    const selected = selection(row.firstChild!, title.firstChild!)
+
+    expect(clampSelectionToTranscript(container as HTMLElement, selected, start, end, 12))
+      .toEqual({ start: 0, end: 5 })
+    expect(selected.anchorNode).toBe(row.firstChild)
+    expect(selected.focusNode).toBe(start)
+  })
+
+  it('clamps a transcript selection that reaches a following composer', () => {
+    const host = document.createElement('div')
+    host.innerHTML = '<p>title chrome</p><div><i></i><div data-display-index="4">chat text</div><i></i></div><p>composer chrome</p>'
+    document.body.append(host)
+    const [, container, composer] = Array.from(host.children)
+    const [start, row, end] = Array.from(container.children)
+    const selected = selection(row.firstChild!, composer.firstChild!)
+
+    expect(clampSelectionToTranscript(container as HTMLElement, selected, start, end, 12))
+      .toEqual({ start: 4, end: 12 })
+    expect(selected.focusNode).toBe(end)
+  })
+
+  it('leaves a selection that started in the composer alone', () => {
+    const host = document.createElement('div')
+    host.innerHTML = '<p>title chrome</p><div><i></i><div data-display-index="4">chat text</div><i></i></div><p>composer text</p>'
+    document.body.append(host)
+    const [title, container, composer] = Array.from(host.children)
+    const [start, , end] = Array.from(container.children)
+    const selected = selection(title.firstChild!, composer.firstChild!)
+
+    expect(clampSelectionToTranscript(container as HTMLElement, selected, start, end, 12))
+      .toBeNull()
+    expect(selected.anchorNode).toBe(title.firstChild)
+    expect(selected.focusNode).toBe(composer.firstChild)
   })
 })

@@ -70,7 +70,7 @@ import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { parseFiles, prepareSendPayload, resolveFileSegment, buildFileLabels, buildRelMap, findUnreferencedAttachments, parseDirTokens, serializeDirTokens, parseDirs, resolveDirSegment, spliceDirTokens } from '../utils/fileTokens'
 import { classifyDrop } from '../utils/dropClassify'
 import { makeRelative } from '../components/FilePickerMenu'
-import { selectedRowRange, selectionTouchesContainer } from '../utils/selectionRetention'
+import { clampSelectionToTranscript } from '../utils/selectionRetention'
 import { type PasteBlock, expandAll as expandPasteTokens, findTokenRanges, pruneBlocks as pruneBlocksUtil, remapCarriedBlocks, saveStoredPaste, recollapsePastes } from '../utils/pasteTokens'
 import { extractPromptFromToken, extractSlackContextFromToken } from '../utils/tokenPrompt'
 /** Delay (ms) before scrolling to bottom after a state update, giving React time to commit. */
@@ -5659,21 +5659,26 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   })
   const { retainRange } = virt
 
-  // Keep a touch selection's DOM endpoints mounted while its handles scroll
-  // across transcript rows. Without this, a virtual-window recompute can detach
-  // the anchor or focus node; mobile WebKit then repairs the selection against
-  // the document and includes content outside the chat pane in Copy.
+  // Keep native selection endpoints within the transcript while a touch handle
+  // scrolls. Absolute title and composer siblings cannot become copy endpoints.
   useEffect(() => {
     const scroller = scrollerRef.current
     if (!scroller) return
     const syncSelectionRetention = () => {
       const selection = window.getSelection()
-      if (!selection || selection.isCollapsed || !selectionTouchesContainer(scroller, selection)) {
+      if (!selection || selection.isCollapsed) {
         retainRange(null)
         return
       }
-      const range = selectedRowRange(scroller, selection)
+      const range = clampSelectionToTranscript(
+        scroller,
+        selection,
+        virt.topSentinelRef.current,
+        virt.bottomSentinelRef.current,
+        displayItemsRef.current.length,
+      )
       if (range) retainRange(range)
+      else retainRange(null)
     }
     document.addEventListener('selectionchange', syncSelectionRetention)
     syncSelectionRetention()
