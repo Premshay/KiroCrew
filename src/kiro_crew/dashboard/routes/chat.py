@@ -89,6 +89,7 @@ def register(app: web.Application) -> None:
     app.router.add_patch("/api/chat/slots/{slot}/color", chat.api_chat_slot_color)
     # Context injection (App Kit — silent background context)
     app.router.add_post("/api/chat/slots/{slot}/context", chat.api_chat_slot_context)
+    app.router.add_post("/api/chat/slots/{slot}/return-handoff", chat.api_chat_slot_return_handoff)
     # Note — visible transcript line + silent next-turn context, no LLM turn
     app.router.add_post("/api/chat/slots/{slot}/note", chat.api_chat_slot_note)
     app.router.add_post("/api/chat/slots/{slot}/fork", chat.api_chat_slot_fork)
