@@ -81,6 +81,15 @@ send time.
 
 ## Key Behaviors
 
+- **Explicit post-restart verification**: an agent that is about to restart the
+  gateway can call `session_restart_continuation` with a concise operational
+  checklist. The strict session-bound endpoint persists that checklist only on
+  the caller's dashboard slot. After startup rehydrates slots, it schedules one
+  synthetic `inject` turn for the armed slot. The marker is cleared only when
+  that turn begins, so a second restart before dispatch leaves the check armed.
+  This is deployment recovery, not general task auto-resume: slots without an
+  explicit marker remain passive after restart.
+
 - **Empty-response recovery ladder** (dashboard chat runner, depth-0 turns
   only): a completed turn with no visible output, no refusal reasons, and no
   cancellation is treated as a transient provider failure and recovered

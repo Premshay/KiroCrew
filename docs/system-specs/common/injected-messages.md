@@ -34,6 +34,20 @@ entry carries `kind == "peer_channel_request"` and the
 **How to treat it:** review the peer report, then respond or acknowledge only
 when the named request needs action.
 
+## Post-restart verification
+
+Before an intentional gateway restart, a session can arm one concise operational
+checklist through the strict `session_restart_continuation` tool. Startup restores
+that checklist only for the calling slot, then queues a synthetic entry carrying
+`kind == "post_restart_continuation"` and `POST_RESTART_CONTINUATION_PREFIX`.
+
+- The marker is cleared only when the verification turn begins. A second restart
+  before dispatch therefore leaves the check armed.
+- The turn is an `inject` message with synthetic provenance, so it is not
+  mirrored to linked surfaces as human speech.
+- It completes only the armed checklist and reports its result. It never resumes
+  an interrupted user request or activates an unarmed session.
+
 ## Cron notification
 
 A cron job called `send_message(session="origin")` and the origin dashboard slot
@@ -153,6 +167,8 @@ boundary:
 |---|---|---|
 | `synthesis` | The post-fan-out consolidation prompt | Collapsed one-line note |
 | `recovery` | A runner-authored continuation | Its own recovery card, or a generic note if the marker is unrecognised |
+| `peer_channel_request` | A named peer request | Its own compact peer-request note |
+| `post_restart_continuation` | An explicitly armed deployment check | Its own compact verification note |
 | `cron` | A scheduled job's output — the user's own | Labelled bubble (also carries `cronLabel`) |
 | `user_replay` | The user's original message, replayed because the turn emitted nothing | Ordinary bubble; it is speech |
 
