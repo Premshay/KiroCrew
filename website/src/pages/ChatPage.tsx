@@ -52,6 +52,7 @@ import { deriveLoadedMcpTools } from '../lib/mcpLoadedTools'
 import type { McpServer } from '../types'
 import { useScrollManager } from './chat/useScrollManager'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
+import { selectedRowRange, selectionTouchesContainer } from '../utils/selectionRetention'
 import { parseFiles, prepareSendPayload, resolveFileSegment, buildFileLabels, findUnreferencedAttachments } from '../utils/fileTokens'
 import { type PasteBlock, expandAll as expandPasteTokens, findTokenRanges, pruneBlocks as pruneBlocksUtil, remapCarriedBlocks, saveStoredPaste, recollapsePastes } from '../utils/pasteTokens'
 import { extractPromptFromToken, extractSlackContextFromToken } from '../utils/tokenPrompt'
@@ -4310,6 +4311,31 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // option's doc and useVirtualChat.spacerLurch.test.tsx).
     streamingIndex: isStreaming && displayItems.length > 0 ? displayItems.length - 1 : undefined,
   })
+  const { retainRange } = virt
+
+  // Keep a touch selection's DOM endpoints mounted while its handles scroll
+  // across transcript rows. Without this, a virtual-window recompute can detach
+  // the anchor or focus node; mobile WebKit then repairs the selection against
+  // the document and includes content outside the chat pane in Copy.
+  useEffect(() => {
+    const scroller = scrollerRef.current
+    if (!scroller) return
+    const syncSelectionRetention = () => {
+      const selection = window.getSelection()
+      if (!selection || selection.isCollapsed || !selectionTouchesContainer(scroller, selection)) {
+        retainRange(null)
+        return
+      }
+      const range = selectedRowRange(scroller, selection)
+      if (range) retainRange(range)
+    }
+    document.addEventListener('selectionchange', syncSelectionRetention)
+    syncSelectionRetention()
+    return () => {
+      document.removeEventListener('selectionchange', syncSelectionRetention)
+      retainRange(null)
+    }
+  }, [activeSlot, scrollerRef, retainRange])
 
   // Single scroll controller wiring: expose the virtualizer's follow API to
   // the early effects/handlers (declared above) via refs, and derive the

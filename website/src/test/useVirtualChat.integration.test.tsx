@@ -257,6 +257,20 @@ describe('useVirtualChat integration: follow / pin wiring', () => {
     expect(el.scrollTop).toBe(300)
   })
 
+  it('retains every selected row while the virtual window moves', () => {
+    const { view } = render(
+      { scrollTop: 0, scrollHeight: 4000, clientHeight: 400 },
+      mkItems(40),
+      'text-selection',
+    )
+
+    act(() => view.result.current.retainRange({ start: 3, end: 18 }))
+
+    const mounted = view.result.current.virtualItems.map((item) => item.index)
+    expect(mounted).toContain(3)
+    expect(mounted).toContain(17)
+  })
+
   it('streaming growth across many ticks issues INSTANT pins landing exactly on bottomTarget', () => {
     // T3/#4: while following, each streamed chunk grows the bottom target. The
     // pin must be INSTANT (behavior:'auto') and land EXACTLY on the new bottom

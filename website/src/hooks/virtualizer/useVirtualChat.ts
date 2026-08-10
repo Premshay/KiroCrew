@@ -92,6 +92,7 @@ import type {
   UseVirtualChatReturn,
   VirtualItem,
   ScrollToIndexOptions,
+  RetainedVirtualRange,
 } from './types'
 
 const DEFAULT_ESTIMATED = 80
@@ -273,6 +274,13 @@ export function useVirtualChat<T>(
   const getKeyRef = useRef(getKey)
   getKeyRef.current = getKey
 
+  // A native selection keeps DOM Range endpoints, not item identities. If a
+  // scroll recompute unmounts either endpoint while an iOS selection handle is
+  // being dragged, WebKit repairs the Range against the document and can select
+  // surrounding dashboard chrome. This short-lived range keeps the complete
+  // selected span real until the selection collapses.
+  const retainedRangeRef = useRef<RetainedVirtualRange | null>(null)
+
   // ---- Follow / stick-to-bottom state (see FollowController) ----
   //
   // `stickRef`: should the viewport stay pinned to the bottom. Turned OFF only
@@ -322,10 +330,27 @@ export function useVirtualChat<T>(
   // the list (last ~overscan+1 items) — chat sessions always open at the
   // bottom, and starting here avoids a commit-timing race where the slot-entry
   // pin runs before the tail items have rendered.
-  const [windowRange, setWindowRange] = useState<{ start: number; end: number }>(() => {
+  type WindowRange = { start: number; end: number }
+  const [windowRange, setWindowRangeState] = useState<WindowRange>(() => {
     const tailSize = Math.min(itemCount, overscan + 1)
     return { start: Math.max(0, itemCount - tailSize), end: itemCount }
   })
+  // Every writer to the virtual window flows through this wrapper, including
+  // explicit jumps and the IntersectionObserver. That makes selection
+  // retention structural rather than a best-effort rule at each call site.
+  const setWindowRange = useCallback((update: WindowRange | ((previous: WindowRange) => WindowRange)) => {
+    setWindowRangeState((previous) => {
+      const next = typeof update === 'function' ? update(previous) : update
+      const retained = retainedRangeRef.current
+      if (!retained) return next
+      const count = itemsRef.current.length
+      const start = Math.max(0, Math.min(retained.start, count))
+      const end = Math.max(start, Math.min(retained.end, count))
+      return end > start
+        ? { start: Math.min(next.start, start), end: Math.max(next.end, end) }
+        : next
+    })
+  }, [])
   // Live mirror of windowRange for imperative reads (debug probe).
   const windowRangeRef = useRef(windowRange)
   windowRangeRef.current = windowRange
@@ -357,6 +382,7 @@ export function useVirtualChat<T>(
   const sessionIdRef = useRef<string>(sessionId)
   if (sessionIdRef.current !== sessionId) {
     sessionIdRef.current = sessionId
+    retainedRangeRef.current = null
     const tailSize = Math.min(itemCount, overscan + 1)
     setWindowRange({ start: Math.max(0, itemCount - tailSize), end: itemCount })
     stickRef.current = followOutput
@@ -600,7 +626,7 @@ export function useVirtualChat<T>(
       if (prev.start === merged.start && prev.end === merged.end) return prev
       return merged
     })
-  }, [getH, overscan, scrollerRef, captureTopAnchor])
+  }, [getH, overscan, scrollerRef, captureTopAnchor, setWindowRange])
 
   // ---- Pin helpers (the only code that writes el.scrollTop for follow) ----
 
@@ -1000,7 +1026,7 @@ export function useVirtualChat<T>(
     if (topSentinelRef.current) io.observe(topSentinelRef.current)
     if (bottomSentinelRef.current) io.observe(bottomSentinelRef.current)
     return () => io.disconnect()
-  }, [overscan, scrollerEl, captureTopAnchor])
+  }, [overscan, scrollerEl, captureTopAnchor, setWindowRange])
 
   // ---- Scroll-anchor preservation: hold the viewport steady across an
   //      upward window shift ----
@@ -1039,7 +1065,7 @@ export function useVirtualChat<T>(
       // cannot be forgotten here (see writeScrollTop).
       writeScrollTop(el, el.scrollTop + delta, 'auto', 'pin')
     }
-  }, [windowRange, scrollerRef, writeScrollTop])
+  }, [windowRange, scrollerRef, writeScrollTop, setWindowRange])
 
   // ---- Follow-output: pin to bottom when items append ----
   const prevItemCountRef = useRef(itemCount)
@@ -1080,7 +1106,7 @@ export function useVirtualChat<T>(
       pinAuto()
     })
     return () => cancelAnimationFrame(id)
-  }, [itemCount, overscan, pinAuto, forcePin, scrollerRef])
+  }, [itemCount, overscan, pinAuto, forcePin, scrollerRef, setWindowRange])
 
   // ---- Slot entry: force the scroller to the true bottom ----
   // Runs after the new session's tail window has committed (windowRange reset
@@ -1194,7 +1220,7 @@ export function useVirtualChat<T>(
         writeScrollTop(el, scrollTop, behavior, 'release')
       })
     },
-    [overscan, getH, scrollerRef, writeScrollTop],
+    [overscan, getH, scrollerRef, writeScrollTop, setWindowRange],
   )
 
   // "Human-like" smooth scroll to a (possibly off-window) index. UNLIKE
@@ -1281,7 +1307,7 @@ export function useVirtualChat<T>(
         requestAnimationFrame(settle)
       })
     },
-    [overscan, followOutput, scrollerRef, writeScrollTop],
+    [overscan, followOutput, scrollerRef, writeScrollTop, setWindowRange],
   )
 
   // Ensure `index` is mounted (in the window) so callers can scroll to an
@@ -1310,8 +1336,25 @@ export function useVirtualChat<T>(
       })
       return far
     },
-    [overscan],
+    [overscan, setWindowRange],
   )
+
+  const retainRange = useCallback((range: RetainedVirtualRange | null) => {
+    const count = itemsRef.current.length
+    const next = range
+      ? {
+          start: Math.max(0, Math.min(Math.floor(range.start), count)),
+          end: Math.max(0, Math.min(Math.floor(range.end), count)),
+        }
+      : null
+    const normalized = next && next.end > next.start ? next : null
+    const previous = retainedRangeRef.current
+    if (previous?.start === normalized?.start && previous?.end === normalized?.end) return
+    retainedRangeRef.current = normalized
+    // Apply a newly retained span immediately, before the next scroll rAF can
+    // replace the current window and detach the native Range endpoint.
+    if (normalized) setWindowRange((current) => current)
+  }, [setWindowRange])
 
   // ---- Build virtualItems list ----
   //
@@ -1447,6 +1490,7 @@ export function useVirtualChat<T>(
     scrollToIndexSmooth,
     scrollToBottom,
     mountIndex,
+    retainRange,
     measureRef,
   }
 }

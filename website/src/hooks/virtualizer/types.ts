@@ -85,6 +85,13 @@ export interface ScrollToIndexOptions {
   behavior?: ScrollBehavior
 }
 
+/** Inclusive-start, exclusive-end item range retained while native selection
+ * handles cross a virtualized transcript. */
+export interface RetainedVirtualRange {
+  start: number
+  end: number
+}
+
 export interface UseVirtualChatReturn<T> {
   /** Attach to the scroll container (`overflow-y: auto`). */
   scrollerRef: React.RefObject<HTMLDivElement | null>
@@ -117,6 +124,10 @@ export interface UseVirtualChatReturn<T> {
    * it took the FAR path (window replaced, leaving an unmounted gap to the
    * target) so callers can teleport instead of gliding through blank space. */
   mountIndex: (index: number) => boolean
+  /** Keep every item in `range` mounted until the caller clears it. This is
+   * for a native text selection whose endpoints would otherwise be unmounted
+   * while the user scrolls a selection handle. */
+  retainRange: (range: RetainedVirtualRange | null) => void
   /** Ref callback used per-item to register ResizeObserver measurement. */
   measureRef: (index: number) => (el: HTMLElement | null) => void
 }
