@@ -4,8 +4,9 @@ import { Hourglass, Ear, Check, X, Wrench, Radio, VolumeX, User, MessageSquare, 
 import { useAppSelector } from '../store'
 import type { RootState } from '../store'
 import { api } from '../api/client'
+import { useQuery } from '@tanstack/react-query'
 import ApprovalCard from '../components/ApprovalCard'
-import { Btn, Input, Badge, EmptyState, PageHeader } from '../components/ui'
+import { Btn, Input, Badge, EmptyState, PageHeader, Select } from '../components/ui'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import AgentSelector from '../components/AgentSelector'
 import { useAgents } from '../hooks/useAgents'
@@ -24,6 +25,7 @@ interface ChannelAgent {
   id: string
   role: string
   agentName: string
+  sessionKey?: string
   state: 'pending' | 'working' | 'listening' | 'done' | 'failed' | 'tool_running'
   listenMode: 'all' | 'mention' | 'silent'
   approvalPolicy: 'all' | 'writes' | 'trusted'
@@ -53,9 +55,16 @@ interface Channel {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mapAgent = (a: any): ChannelAgent => ({
   id: a.id, role: a.role, agentName: a.agent_name || a.agentName || '', state: a.state || 'pending',
+  sessionKey: a.session_key || a.sessionKey,
   listenMode: a.listen_mode || a.listenMode || 'mention',
   approvalPolicy: a.approval_policy || a.approvalPolicy || 'writes',
 })
+
+interface DashboardSlot {
+  key: string
+  title?: string
+  agent?: string
+}
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mapMsg = (m: any): ChannelMessage => ({
   id: m.id, fromId: m.from_id || m.fromId, fromRole: m.from_role || m.fromRole,
@@ -417,6 +426,36 @@ function AddAgentForm({ onAdd, onCancel }: { onAdd: (role: string, task: string,
   )
 }
 
+function AttachSessionForm({ attachedSessionKeys, onAttach, onCancel }: {
+  attachedSessionKeys: Set<string>; onAttach: (slot: string) => void; onCancel: () => void
+}) {
+  const { data: slots = [] } = useQuery<DashboardSlot[]>({
+    queryKey: ['channel-attachable-slots'],
+    queryFn: () => api.chatSlots(),
+  })
+  const attachable = slots.filter(slot => slot.key && !attachedSessionKeys.has(`dashboard:${slot.key}`))
+  const [selected, setSelected] = useState('')
+
+  useEffect(() => {
+    if (!selected && attachable[0]) setSelected(attachable[0].key)
+  }, [attachable, selected])
+
+  return (
+    <div className="p-2 space-y-2 border-t border-border">
+      <label htmlFor="channel-session-picker" className="text-[11px] text-muted font-medium block">{i18nT('pages.agentsPage.sessions')}</label>
+      <Select id="channel-session-picker" aria-label={i18nT('pages.agentsPage.sessions')} value={selected} onChange={e => setSelected(e.target.value)} className="w-full">
+        {attachable.map(slot => (
+          <option key={slot.key} value={slot.key}>{slot.title || slot.key}{slot.agent ? ` · ${slot.agent}` : ''}</option>
+        ))}
+      </Select>
+      <div className="flex gap-1">
+        <Btn onClick={() => { if (selected) onAttach(selected) }} disabled={!selected} primary className="flex-1">{i18nT('pages.channelPage.add')}</Btn>
+        <Btn onClick={onCancel}>{i18nT('pages.channelPage.cancel')}</Btn>
+      </div>
+    </div>
+  )
+}
+
 // ── Sidebar ──
 
 function ChannelListItem({ ch, active, onClick }: { ch: Channel; active: boolean; onClick: () => void }) {
@@ -451,6 +490,7 @@ export default function ChannelPage() {
   // it 2px -- a column that cannot hold one character per line.
   const { isMobile, showList, showDetail, openDetail, closeDetail } = useListDetailView()
   const [showAddAgent, setShowAddAgent] = useState(false)
+  const [showAttachSession, setShowAttachSession] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [threadId, setThreadId] = useState<string | null>(null)
@@ -745,8 +785,26 @@ export default function ChannelPage() {
                       setShowAddAgent(false)
                       try { await api.channelAddAgent(channel.id, { role, task: task || channel.topic, agent }) } catch (err) { setError(apiError(err, i18nT('pages.channelPage.failed_to_add_agent'))) }
                     }} />
+                  ) : showAttachSession ? (
+                    <AttachSessionForm
+                      attachedSessionKeys={new Set(channel.agents.map(agent => agent.sessionKey).filter(Boolean) as string[])}
+                      onCancel={() => setShowAttachSession(false)}
+                      onAttach={async slot => {
+                        try {
+                          await api.channelAttachSession(channel.id, slot)
+                          const res = await api.channelGet(channel.id)
+                          setChannels(prev => prev.map(c => c.id === channel.id ? mapChannel(res) : c))
+                          setShowAttachSession(false)
+                        } catch (err) {
+                          setError(apiError(err, i18nT('pages.channelPage.failed_to_add_agent')))
+                        }
+                      }}
+                    />
                   ) : (
-                    <Btn onClick={() => setShowAddAgent(true)} primary className="w-full">{i18nT('pages.channelPage.add_agent')}</Btn>
+                    <div className="flex gap-1">
+                      <Btn onClick={() => setShowAddAgent(true)} primary className="flex-1">{i18nT('pages.channelPage.add_agent')}</Btn>
+                      <Btn onClick={() => setShowAttachSession(true)} className="flex-1">{i18nT('pages.agentsPage.sessions')}</Btn>
+                    </div>
                   )}
                 </div>
               </div>

@@ -132,6 +132,7 @@ their persisted dashboard-slot identity.
 - Thread panel with nested replies
 - @mention autocomplete with keyboard navigation and ARIA attributes
 - Agent sidebar with state icons (⏳ pending, 🟢 working, 👂 listening, ✅ done, 💥 failed)
+- Session picker that lists live dashboard slots and omits channel members already attached
 - Listen mode dropdown per agent
 - Error modal for limit violations
 - Design tokens only (no hardcoded colors), `encodeURIComponent` on all URL params
