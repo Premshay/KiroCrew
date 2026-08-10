@@ -28,6 +28,7 @@ from kiro_crew import session_ledger
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.handlers import kiro_usage_api
+from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
 from kiro_crew.dashboard.state import DashboardState
@@ -42,7 +43,12 @@ from kiro_crew.sandbox import (
     wrap_argv,
 )
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
-from kiro_crew.validation import sanitize_string
+from kiro_crew.validation import (
+    SESSION_CHECKPOINT_SCHEMA,
+    ValidationError,
+    sanitize_string,
+    validate_tool_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +60,31 @@ def _sel():
     import kiro_crew.dashboard.handlers as _pkg  # noqa: F811 — circular import
 
     return _pkg.sel()
+
+
+async def _restart_barrier_status(
+    state: DashboardState, *, open_if_busy: bool
+) -> dict[str, object]:
+    """Refresh the reset barrier against every currently busy ACP session."""
+    snapshot = await state.sessions.restart_barrier_snapshot()
+    busy = {
+        str(row["session_key"]): float(row.get("activity_marker", 0.0))
+        for row in snapshot
+        if row.get("busy") is True and isinstance(row.get("session_key"), str)
+    }
+    slot_keys = {effective_session_key(slot) for slot in state._slots.values()}
+    managed_busy = {key: marker for key, marker in busy.items() if key in slot_keys}
+    unmanaged_busy = set(busy) - slot_keys
+    barrier = state.restart_barrier
+    if barrier.active:
+        barrier.refresh(managed_busy, unmanaged_busy)
+    elif open_if_busy and busy:
+        barrier.open(managed_busy, unmanaged_busy)
+    return barrier.payload()
+
+
+def _publish_restart_barrier(state: DashboardState) -> None:
+    state.broadcast_ws("restart_barrier", state.restart_barrier.payload())
 
 
 async def api_sessions_context(request: web.Request) -> web.Response:
@@ -1737,6 +1768,100 @@ def _read_managed_tool_policy_sync(agent_path: Path) -> dict[str, Any] | None:
     return policy if isinstance(policy, dict) else None
 
 
+async def api_session_checkpoint(request: web.Request) -> web.Response:
+    """Persist a checkpoint on the uniquely bound calling dashboard slot."""
+    state: DashboardState = request.app["state"]
+    session_key = request.headers.get("X-Session-Key", "").strip()
+    if not session_key:
+        return web.json_response(
+            {"error": "X-Session-Key required", "code": "missing_session_key"}, status=400
+        )
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "invalid_checkpoint"},
+            status=400,
+        )
+    try:
+        checkpoint = validate_tool_args(body, SESSION_CHECKPOINT_SCHEMA)
+    except ValidationError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_checkpoint"}, status=400)
+    slots = [slot for slot in state._slots.values() if effective_session_key(slot) == session_key]
+    if len(slots) != 1:
+        return web.json_response(
+            {
+                "error": "the calling session has no unique live dashboard slot",
+                "code": "checkpoint_slot_not_found",
+            },
+            status=404,
+        )
+    slot = slots[0]
+    try:
+        slot.set_session_checkpoint(checkpoint)
+        from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+        await save_slot_off_loop(state, slot, force=True, best_effort=False)
+    except Exception:
+        slot._dirty = True
+        logger.warning("session checkpoint persistence failed for %s", slot.key, exc_info=True)
+        return web.json_response(
+            {
+                "error": "checkpoint persistence failed; the gateway will retry the in-memory update",
+                "code": "checkpoint_persistence_failed",
+            },
+            status=500,
+        )
+    state.restart_barrier.note_checkpoint(session_key)
+    if state.restart_barrier.active:
+        _publish_restart_barrier(state)
+    state.push_slots_update()
+    return web.json_response({"ok": True, "session_checkpoint": slot.session_checkpoint_payload()})
+
+
+async def api_session_maintenance(request: web.Request) -> web.Response:
+    """Read or acknowledge the active coordinated session-reset barrier.
+
+    This endpoint is strict-internal only. The caller key is resolved by the
+    MCP process identity; a browser cannot forge an acknowledgement for an
+    agent it does not control.
+    """
+    state: DashboardState = request.app["state"]
+    session_key = request.headers.get("X-Session-Key", "").strip()
+    if not session_key:
+        return web.json_response(
+            {"error": "X-Session-Key required", "code": "missing_session_key"}, status=400
+        )
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "invalid_request"},
+            status=400,
+        )
+    action = body.get("action")
+    if action not in {"status", "acknowledge"}:
+        return web.json_response(
+            {"error": "action must be status or acknowledge", "code": "invalid_action"},
+            status=400,
+        )
+    status = await _restart_barrier_status(state, open_if_busy=False)
+    if action == "acknowledge":
+        ok, detail = state.restart_barrier.acknowledge(session_key)
+        status = await _restart_barrier_status(state, open_if_busy=False)
+        _publish_restart_barrier(state)
+        if not ok:
+            return web.json_response(
+                {"error": detail, "code": "acknowledgement_rejected", "maintenance": status},
+                status=409,
+            )
+    return web.json_response({"ok": True, "maintenance": status})
+
+
 async def api_session_tool_policy(request: web.Request) -> web.Response:
     """GET /api/session-tool-policy — return managedToolPolicy for the
     calling session's agent.
@@ -1903,6 +2028,17 @@ async def api_sessions_restart(request: web.Request) -> web.Response:
     Also syncs MCP servers from mcp.json → kirocrew.json so newly
     installed servers (e.g. via AIM) are picked up on restart.
     """
+    # Open or refresh the barrier before doing any slow sync work. A reset
+    # drains every ACP process, so busy slotless workers are a hard block rather
+    # than an acknowledgement we cannot truthfully obtain.
+    state: DashboardState = request.app["state"]
+    status = await _restart_barrier_status(state, open_if_busy=True)
+    if status["ready"] is not True:
+        _publish_restart_barrier(state)
+        return web.json_response(
+            {"ok": False, "code": "restart_ack_required", "maintenance": status}, status=409
+        )
+
     # Sync MCP servers before restarting so new installs take effect.
     # Run in thread — the sync does blocking file I/O. Cap at 30s so a hung
     # rebuild doesn't stall the restart. sync_discovered_servers serializes
@@ -1918,6 +2054,16 @@ async def api_sessions_restart(request: web.Request) -> web.Response:
         # the on-disk config does not back.
         sync_ok = False
         logger.warning("MCP server sync failed before restart", exc_info=True)
+    # Synchronisation can take up to 30 seconds; repeat the live check just
+    # before draining providers so a new in-flight turn cannot slip through.
+    status = await _restart_barrier_status(state, open_if_busy=True)
+    if status["ready"] is not True:
+        _publish_restart_barrier(state)
+        return web.json_response(
+            {"ok": False, "code": "restart_ack_required", "maintenance": status}, status=409
+        )
+    state.restart_barrier.clear()
+    _publish_restart_barrier(state)
     count = await _reset_all_sessions(request)
     return web.json_response(
         {"ok": True, "sessions_reset": count, "mcp_synced": synced, "mcp_sync_ok": sync_ok}

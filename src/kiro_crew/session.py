@@ -937,6 +937,23 @@ class SessionManager:
         """
         return any(_provider_has_active_turn(sess.provider) for sess in self._sessions.values())
 
+    async def restart_barrier_snapshot(self) -> list[dict[str, object]]:
+        """Return the live sessions and whether each currently owns a turn.
+
+        Reset coordination must include every pooled ACP session, not only
+        dashboard tabs: slotless workers would otherwise be killed midway
+        through work without an acknowledgement path.
+        """
+        async with self._lock:
+            return [
+                {
+                    "session_key": key,
+                    "busy": sess.semaphore.locked(),
+                    "activity_marker": sess.last_used,
+                }
+                for key, sess in self._sessions.items()
+            ]
+
     def get_pid(self, key: str) -> int | None:
         """Return the kiro-cli PID for a session, or None."""
         sess = self._sessions.get(self._fold_key(key))

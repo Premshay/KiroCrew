@@ -498,12 +498,17 @@ def schemas() -> list[dict[str, Any]]:
                 "blocked, or finishing. Do NOT call every turn and do NOT summarize the "
                 "full transcript. The summary and current main_items replace the prior "
                 "view; milestone is appended to a seven-item server-capped trail. "
-                "Optional progress records a plan or goal count. This is session-bound: "
+                "Optional goal and progress describe the current objective. This is session-bound: "
                 "it updates only the session that called the tool."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "The session's current objective (max 240 chars).",
+                        "maxLength": 240,
+                    },
                     "summary": {
                         "type": "string",
                         "description": "What the session is working on now (max 360 chars).",
@@ -535,6 +540,23 @@ def schemas() -> list[dict[str, Any]]:
                 "required": ["summary", "milestone"],
                 "additionalProperties": False,
             },
+        },
+        {
+            "name": "maintenance_status",
+            "description": (
+                "Check whether a coordinated session reset is waiting for this session. "
+                "When acknowledgement is required, finish a concise session_checkpoint "
+                "then call maintenance_acknowledge before ending the turn."
+            ),
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "maintenance_acknowledge",
+            "description": (
+                "Acknowledge a coordinated session reset after writing a fresh "
+                "session_checkpoint. On success, stop work and end the turn."
+            ),
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     ]
 
@@ -966,6 +988,50 @@ def session_checkpoint(name: str, args: dict[str, Any]) -> str:
     )
 
 
+def _maintenance_post(action: str) -> dict[str, Any] | None:
+    """Call the session-scoped maintenance endpoint with a verified identity."""
+    session_key = mcp_core._resolve_session_key_strict()
+    if not session_key:
+        return None
+    return mcp_core._post(
+        "/api/session-maintenance", {"action": action}, session_key=session_key
+    )
+
+
+def maintenance_status(name: str, args: dict[str, Any]) -> str:
+    if args:
+        return "Error: maintenance_status takes no arguments."
+    result = _maintenance_post("status")
+    if result is None:
+        return "Error: maintenance_status requires a verified session identity."
+    if result.get("ok") is not True:
+        return f"Error: maintenance status unavailable: {result.get('error', 'unknown error')}"
+    maintenance = result.get("maintenance") or {}
+    if not maintenance.get("active"):
+        return "No coordinated session reset is active."
+    if maintenance.get("ready"):
+        return "The coordinated reset barrier is ready; wait for the operator to restart sessions."
+    return (
+        "A coordinated reset is waiting. Pending dashboard sessions: "
+        f"{', '.join(maintenance.get('pending') or []) or 'none'}; busy slotless workers: "
+        f"{', '.join(maintenance.get('unmanaged_busy') or []) or 'none'}."
+    )
+
+
+def maintenance_acknowledge(name: str, args: dict[str, Any]) -> str:
+    if args:
+        return "Error: maintenance_acknowledge takes no arguments."
+    result = _maintenance_post("acknowledge")
+    if result is None:
+        return "Error: maintenance_acknowledge requires a verified session identity."
+    if result.get("ok") is not True:
+        return (
+            "Error: reset acknowledgement was not recorded: "
+            f"{result.get('error', 'unknown error')}"
+        )
+    return "Reset acknowledgement recorded. Stop work and end this turn now."
+
+
 HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "task_run": task_run,
     "wait": wait,
@@ -978,4 +1044,6 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "set_project": set_project,
     "suggest_followup": suggest_followup,
     "session_checkpoint": session_checkpoint,
+    "maintenance_status": maintenance_status,
+    "maintenance_acknowledge": maintenance_acknowledge,
 }

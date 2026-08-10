@@ -108,7 +108,7 @@ from kiro_crew.acp.types import (
     JsonRpcRequest,
     TurnUsage,
 )
-from kiro_crew.agent import ensure_agent_materialized
+from kiro_crew.agent import ensure_agent_materialized, session_capability_servers
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import (
     COMPACT_WAIT_TIMEOUT_SECS,
@@ -2248,6 +2248,10 @@ class AcpClient:
             self._mcp_gateway_overlay, self._agent, self._channel_id
         )
 
+    def _session_capability_mcp_servers(self) -> list[dict[str, Any]]:
+        """Session-bound MCP capabilities available to every ACP backend."""
+        return session_capability_servers()
+
     def _claude_session_mcp_servers(self) -> list:
         """MCP server array passed to a claude ``session/new`` / ``session/load``.
 
@@ -3181,6 +3185,7 @@ class AcpClient:
             # server outranks the same-named entry in the agent spec, which is
             # how pooling takes effect without writing a spec anywhere.
             "mcpServers": [
+                *self._session_capability_mcp_servers(),
                 *self._claude_session_mcp_servers(),
                 *(await asyncio.to_thread(self._pooled_mcp_servers)),
             ],
