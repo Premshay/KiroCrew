@@ -3753,6 +3753,8 @@ def _wire_model_id(provider: AcpProvider, model_name: str) -> str:
     # The dashboard sends "" for Auto, but the literal "auto" also passes the
     # guard (stale clients / direct API calls), so both mean "provider default".
     is_default = model_name in ("", "auto")
+    if getattr(provider, "model_switch_method", "") == "session_set_model":
+        return "" if is_default else model_name
     if provider.is_claude_backend:
         # The claude backend has no id meaning "let the server choose", so
         # returning to default needs a reset.

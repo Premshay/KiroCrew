@@ -7020,6 +7020,28 @@ class TestCaptureAvailableModels:
         )
         assert c.available_models()[0]["modelId"] == "m1"
 
+    def test_claude_model_config_option_is_a_live_discovery_fallback(self):
+        c = self._client()
+        c._store_session_config(
+            {
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "claude-sonnet-4-6",
+                        "options": [
+                            {"value": "claude-sonnet-4-6", "name": "Sonnet 4.6"},
+                            {"value": "claude-opus-4-8", "name": "Opus 4.8"},
+                        ],
+                    }
+                ]
+            }
+        )
+        assert [m["modelId"] for m in c.available_models()] == [
+            "claude-sonnet-4-6",
+            "claude-opus-4-8",
+        ]
+        assert c._resolved_model_id == "claude-sonnet-4-6"
+
 
 def _scripted_process(lines, *, returncode=None):
     """Build a mock subprocess whose stdout.readline yields *lines* in order.
@@ -9637,8 +9659,8 @@ class TestSetModelRebasesContextStats:
     the token text stayed scaled to the OLD model's window.
     """
 
-    def _client(self, tmp_path):
-        client = AcpClient(work_dir=tmp_path)
+    def _client(self, tmp_path, **kwargs):
+        client = AcpClient(work_dir=tmp_path, **kwargs)
         client._session_id = "s1"
         client._send_request = AsyncMock()
         return client
@@ -9649,6 +9671,25 @@ class TestSetModelRebasesContextStats:
         return JsonRpcMessage(
             method="session/update",
             params={"update": {"sessionUpdate": "usage_update", "used": used, "size": size}},
+        )
+
+    @pytest.mark.asyncio
+    async def test_codex_compat_provider_uses_native_model_method(self, tmp_path):
+        """Codex ACP advertises its subscription models but has no config option."""
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+
+        client = self._client(
+            tmp_path,
+            acp_backend=ACP_BACKEND_CLAUDE,
+            model_switch_method="session_set_model",
+        )
+        client._available_models = [{"modelId": "gpt-5.6-sol"}]
+
+        await client.set_model("gpt-5.6-sol")
+
+        assert client._send_request.await_args.args == (
+            "session/set_model",
+            {"sessionId": "s1", "modelId": "gpt-5.6-sol"},
         )
 
     @pytest.mark.asyncio

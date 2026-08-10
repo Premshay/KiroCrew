@@ -3197,6 +3197,15 @@ class KiroCrewAgentConfig:
             "fallback. A per-session pick still overrides this.",
         ),
     )
+    reasoning_effort: str = field(
+        default="",
+        metadata=_meta(
+            "Reasoning Effort",
+            "Default reasoning effort for new sessions on this agent. Empty "
+            "inherits the provider/model default. A per-session override wins.",
+            enum=["", *EFFORT_LEVELS],
+        ),
+    )
     description: str = field(
         default="",
         metadata=_meta("Description", "Human-readable agent description."),
@@ -4342,6 +4351,9 @@ class ResolvedBindings:
     # agent.model fallback. Defaulted so existing keyword constructions and
     # test doubles built before this field stay valid.
     model: str = ""
+    # The KiroCrew agent's default effort. It ranks below a per-session pick
+    # and above the provider/model default, mirroring ``model`` above.
+    reasoning_effort: str = ""
     # Whether the REQUESTED agent name was actually honored. False means the
     # resolver fell back to the default agent, so dispatching these bindings runs
     # a different agent than the caller asked for. Callers that store the
@@ -6670,6 +6682,7 @@ class KiroCrewConfig:
                     # raise AttributeError from the resolver instead of simply
                     # being ignored.
                     raw_model = entry.get("model", "")
+                    raw_effort = entry.get("reasoning_effort", "")
                     # Same guard as model: a non-string triggers (e.g. `1`) must
                     # not survive load — select_crew's roster calls .strip() on it.
                     raw_triggers = entry.get("triggers", "")
@@ -6678,6 +6691,12 @@ class KiroCrewConfig:
                         workspace=entry.get("workspace", "default"),
                         memory_store=entry.get("memory_store", "default"),
                         model=raw_model if isinstance(raw_model, str) else "",
+                        reasoning_effort=(
+                            raw_effort
+                            if isinstance(raw_effort, str)
+                            and (not raw_effort or is_valid_effort(raw_effort))
+                            else ""
+                        ),
                         description=entry.get("description", ""),
                         triggers=raw_triggers if isinstance(raw_triggers, str) else "",
                         source=entry.get("source", "kirocrew"),
@@ -8479,6 +8498,9 @@ def resolve_agent_bindings(
         effective_memory_config=effective_memory,
         kiro_agent=kiro_agent,
         model=normalize_agent_model(agent_cfg.model),
+        reasoning_effort=(
+            agent_cfg.reasoning_effort if is_valid_effort(agent_cfg.reasoning_effort) else ""
+        ),
         requested_resolved=requested_resolved,
         resolved_alias=resolved_alias,
     )

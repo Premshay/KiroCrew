@@ -81,6 +81,17 @@ class ProviderRegistry(Protocol):
         """
         ...
 
+    def agent_runtime_policy(self, agent_name: str) -> dict[str, Any] | None:
+        """Return optional dashboard policy for one configured crew.
+
+        The public registry returns ``None`` so the dashboard retains its
+        Kiro-ACP controls. A companion may describe a mapped engine's model
+        and reasoning-effort capabilities without putting vendor behavior in
+        the public core. The returned mapping is presentation metadata only;
+        the companion remains responsible for enforcing it at dispatch.
+        """
+        ...
+
 
 class PublishRegistry(Protocol):
     """The artifact-publish-provider registration seam.
