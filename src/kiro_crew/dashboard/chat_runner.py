@@ -208,6 +208,7 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
     Returns the concatenated ``[Background context from "<source>"] … [End of
     background context]`` blocks (empty string when there is nothing to inject)
     and clears the queue. Expired entries (``maxAge`` elapsed) are discarded.
+    Return-handoff entries record delivery or expiry on the session timeline.
 
     Extracted from ``_run_chat`` so the entry contract — the ``content`` /
     ``source`` keys and the delimiter frame — is pinned by a unit test and
@@ -224,6 +225,14 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
         if max_age is not None:
             injected_at = entry.get("injectedAt", 0)
             if injected_at + max_age < now:
+                if entry.get("returnHandoff") is True:
+                    slot.append_session_timeline(
+                        "Human handoff expired before delivery.",
+                        "handoff",
+                        kind="handoff",
+                        priority=90,
+                        consequence="The next turn did not receive the instruction.",
+                    )
                 continue  # expired — silently discard
         source = entry.get("source", "app")
         ctx_parts.append(
@@ -231,6 +240,14 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
             f'{entry["content"]}\n'
             f"[End of background context]\n"
         )
+        if entry.get("returnHandoff") is True:
+            slot.append_session_timeline(
+                "Human handoff delivered to the next turn.",
+                "handoff",
+                kind="handoff",
+                priority=90,
+                consequence="The agent can now act on the instruction.",
+            )
     slot._pending_context.clear()
     return "\n".join(ctx_parts) + "\n" if ctx_parts else ""
 

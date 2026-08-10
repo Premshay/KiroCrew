@@ -21,6 +21,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
+from kiro_crew.autonudge import get_instance as get_autonudge_instance
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     _workspace_name_for_dir,
@@ -3396,6 +3397,9 @@ async def api_chat_slot_color(request: web.Request) -> web.Response:
 
 
 _MAX_CONTEXT_PER_SOURCE = 10
+_MAX_RETURN_HANDOFF_CHARS = 240
+_RETURN_HANDOFF_SOURCE = "multiplex-return-handoff"
+_RETURN_HANDOFF_MAX_AGE_SECS = 86400
 
 
 async def api_chat_slot_context(request: web.Request) -> web.Response:
@@ -3501,4 +3505,76 @@ async def api_chat_slot_context(request: web.Request) -> web.Response:
         resources=f"slot={name}",
     )
 
+    return web.json_response({"ok": True, "pending": len(slot._pending_context)})
+
+
+async def api_chat_slot_return_handoff(request: web.Request) -> web.Response:
+    """Return one bounded operator instruction to an active automatic loop."""
+
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
+
+    request_app = request.get("app", "")
+    if request_app and request_app != slot._app:
+        sel().log_api_access(
+            caller=request_app,
+            operation="return_handoff",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={name}",
+            error="app does not own this slot",
+        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+
+    instruction = body.get("instruction")
+    if not isinstance(instruction, str) or not (instruction := instruction.strip()):
+        return web.json_response(
+            {"error": "instruction is required", "code": "instruction_required"}, status=400
+        )
+    if len(instruction) > _MAX_RETURN_HANDOFF_CHARS:
+        return web.json_response(
+            {
+                "error": f"instruction exceeds {_MAX_RETURN_HANDOFF_CHARS} char limit",
+                "code": "instruction_too_long",
+            },
+            status=400,
+        )
+
+    service = get_autonudge_instance()
+    loop = service.get_by_slot(slot.key) if service is not None else None
+    if loop is None or not loop.active:
+        return web.json_response(
+            {"error": "slot has no active automatic loop", "code": "no_active_loop"}, status=409
+        )
+
+    while len(slot._pending_context) >= _MAX_PENDING_CONTEXT:
+        slot._pending_context.pop(0)
+    slot._pending_context.append(
+        {
+            "content": instruction,
+            "source": _RETURN_HANDOFF_SOURCE,
+            "returnHandoff": True,
+            "ephemeral": True,
+            "injectedAt": time.time(),
+            "maxAge": _RETURN_HANDOFF_MAX_AGE_SECS,
+        }
+    )
+    slot.append_session_timeline(
+        f"Human handoff: {instruction}",
+        "handoff",
+        kind="handoff",
+        priority=90,
+        consequence="Will be delivered to the next turn.",
+    )
+    slot._dirty = True
+    await save_slot_off_loop(state, slot, force=True)
+    state.push_slots_update()
     return web.json_response({"ok": True, "pending": len(slot._pending_context)})

@@ -10,6 +10,8 @@ import pytest
 
 from kiro_crew import mcp_core, session_directive
 from kiro_crew.dashboard import handlers
+from kiro_crew.dashboard.chat_handlers import api_chat_slot_return_handoff
+from kiro_crew.dashboard.chat_runner import drain_pending_context
 from kiro_crew.dashboard.handlers.sessions import api_session_checkpoint, api_session_maintenance
 from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.dashboard.session_directive_apply import apply_session_directive
@@ -379,6 +381,52 @@ class TestCheckpointInternalEndpoint:
         assert accepted.status == 200
         assert json.loads(accepted.text)["maintenance"]["ready"] is True
         assert slot.session_checkpoint_payload() is not None
+
+
+class TestReturnHandoff:
+    @pytest.mark.asyncio
+    async def test_queues_and_records_a_handoff_for_an_active_loop(self, tmp_path, monkeypatch) -> None:
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        slot = state.get_or_create_slot("loop")
+        save = AsyncMock()
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.save_slot_off_loop", save)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.get_autonudge_instance",
+            lambda: SimpleNamespace(get_by_slot=lambda _key: SimpleNamespace(active=True)),
+        )
+        request = MagicMock()
+        request.app = {"state": state}
+        request.match_info = {"slot": "loop"}
+        request.get.side_effect = lambda _key, default="": default
+        request.json = AsyncMock(return_value={"instruction": "Resume with the reviewed plan."})
+
+        response = await api_chat_slot_return_handoff(request)
+
+        assert response.status == 200
+        assert json.loads(response.text) == {"ok": True, "pending": 1}
+        save.assert_awaited_once_with(state, slot, force=True)
+        assert drain_pending_context(slot).endswith("[End of background context]\n")
+        assert slot.session_timeline_payload()[-1]["text"] == "Human handoff delivered to the next turn."
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_handoff_when_the_loop_is_not_active(self, tmp_path, monkeypatch) -> None:
+        state = _make_state(tmp_path)
+        state.get_or_create_slot("loop")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.get_autonudge_instance",
+            lambda: SimpleNamespace(get_by_slot=lambda _key: None),
+        )
+        request = MagicMock()
+        request.app = {"state": state}
+        request.match_info = {"slot": "loop"}
+        request.get.side_effect = lambda _key, default="": default
+        request.json = AsyncMock(return_value={"instruction": "Resume."})
+
+        response = await api_chat_slot_return_handoff(request)
+
+        assert response.status == 409
+        assert json.loads(response.text)["code"] == "no_active_loop"
 
 
 class TestRestartBarrier:
