@@ -820,11 +820,14 @@ async def _stream_task(
 
             elif event.kind == EVENT_COMPLETE:
                 break
-    except Exception:
+    except Exception as exc:
         logger.exception("LLM stream error for agent %s (%s)", agent.id, agent.role)
+        detail = str(exc).strip() or exc.__class__.__name__
+        detail, _ = redact_exfiltration_urls(detail)
+        detail, _ = redact_credentials(detail)
         await channel.post(
             agent.id,
-            "❌ An error occurred while processing. Check logs for details.",
+            f"❌ {agent.role} stopped: {detail[:500]}",
             from_role=agent.role,
             msg_type="system",
             thread_id=thread_id,
