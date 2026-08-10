@@ -33,6 +33,7 @@ from kiro_crew.constants import (
 )
 from kiro_crew.dashboard.chat_compaction_notice import deliver_channel_compaction_notice
 from kiro_crew.dashboard.session_pulse_counter import increment_user_session_count
+from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.dashboard.side_state import SideState
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.history import latest_transcript_ts, monotonic_transcript_ts
@@ -3796,6 +3797,9 @@ class DashboardState:
         self._bg_turn_cap: int = 0
         self._bg_turns_running: int = 0
         self._bg_turns_waiting: int = 0
+        # A process-local safety gate for coordinated session resets.  The
+        # handlers refresh its live work set immediately before any reset.
+        self.restart_barrier = RestartBarrier()
         self.no_crons: bool = False  # --no-crons flag: cron execution disabled
         self._hook_store: Any = None  # Lazy-init ScriptHookStore
         # Task refine state (background LLM spec generation)

@@ -297,6 +297,8 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # ``local_only=False`` deployment reclassifies strict paths as mixed.
         "/api/computer-use/frame",
         "/api/session-keepalive",
+        "/api/session-checkpoint",
+        "/api/session-maintenance",
         "/api/session-tool-policy",
         # NOTE: "/api/hooks/agent" is deliberately NOT here. It is an inbound
         # webhook for EXTERNAL callers (CI runners, review bots) that hold no
@@ -1110,6 +1112,8 @@ def _register_mcp_routes(app: web.Application) -> None:
     # dashboard-less state simply has no owner sockets to deliver to.
     app.router.add_post("/api/computer-use/frame", handlers.api_computer_use_frame)
     app.router.add_post("/api/session-keepalive", handlers.api_session_keepalive)
+    app.router.add_post("/api/session-checkpoint", handlers.api_session_checkpoint)
+    app.router.add_post("/api/session-maintenance", handlers.api_session_maintenance)
     app.router.add_get("/api/session-tool-policy", handlers.api_session_tool_policy)
     app.router.add_post("/api/slack-profile", handlers.api_slack_profile)
     app.router.add_get("/api/notifications", handlers.api_notifications)
