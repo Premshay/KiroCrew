@@ -16,6 +16,17 @@ export interface KiroCrewAgent {
   /** This agent's own default model. '' means inherit (kiro template pin, then
    *  the global fallback). Optional: older payloads predate the field. */
   model?: string
+  /** Crew default; '' means let the provider/model choose. */
+  reasoning_effort?: string
+  /** Optional companion-owned capabilities for this crew's runtime. */
+  runtime_policy?: {
+    runtime?: string
+    model?: 'selectable' | 'managed' | 'unsupported'
+    models?: string[]
+    effort?: 'selectable' | 'managed' | 'unsupported'
+    model_label?: string
+    effort_label?: string
+  } | null
   description: string
   /** Free-text routing intent read by the orchestrator's select_crew. Optional:
    *  older payloads predate the field, and it falls back to `description`. */

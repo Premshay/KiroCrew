@@ -46,6 +46,7 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.effort import EFFORT_VALUES
 from kiro_crew.executors import discovery_executor, maintenance_executor
 from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
 
@@ -1122,9 +1123,27 @@ async def api_capability_mcp_registry(request: web.Request) -> web.Response:
 async def api_kirocrew_agents(request: web.Request) -> web.Response:
     """GET /api/agents — list all KiroCrew agent definitions, most-used first."""
     cfg = KiroCrewConfig.load()
-    agents = [
-        {"name": name, **dataclasses.asdict(agent_cfg)} for name, agent_cfg in cfg.agents.items()
-    ]
+    # The gateway places its already-booted context on the app. Lightweight
+    # handler tests and embedding callers intentionally omit it, which leaves
+    # the public no-policy behavior intact without a read endpoint composing
+    # runtime state as a side effect.
+    platform_context = request.app.get("platform_context")
+    policy_for = (
+        getattr(platform_context.providers, "agent_runtime_policy", None)
+        if platform_context
+        else None
+    )
+    agents = []
+    for name, agent_cfg in cfg.agents.items():
+        policy: dict[str, Any] | None = None
+        if callable(policy_for):
+            try:
+                candidate = policy_for(name)
+                if isinstance(candidate, dict):
+                    policy = candidate
+            except Exception:
+                logger.warning("Agent runtime policy lookup failed for %s", name, exc_info=True)
+        agents.append({"name": name, **dataclasses.asdict(agent_cfg), "runtime_policy": policy})
 
     # Reorder by usage frequency (most-used first). Derived read-only from chat
     # history; degrade to config-insertion order on any failure so the dropdown
@@ -1155,6 +1174,72 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
             "default_agent": cfg.default_agent,
         }
     )
+
+
+async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
+    """GET /api/agents/{name}/models — discover one crew's live ACP options.
+
+    A subscription's entitlement is only authoritative after its adapter has
+    opened an ACP session and returned ``models.availableModels``. Discovery
+    uses an isolated, short-lived dashboard session so opening the crew editor
+    cannot inspect or alter an operator's working conversation.
+    """
+    name = request.match_info["name"]
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    if name not in cfg.agents:
+        return web.json_response({"error": "agent not found", "code": "agent_not_found"}, status=404)
+    platform_context = request.app.get("platform_context")
+    policy_for = (
+        getattr(platform_context.providers, "agent_runtime_policy", None)
+        if platform_context
+        else None
+    )
+    policy = policy_for(name) if callable(policy_for) else None
+    if not isinstance(policy, dict) or policy.get("model") != "selectable":
+        return web.json_response({"models": [], "effort_levels": []})
+    state: DashboardState | None = request.app.get("state")
+    if state is None:
+        return web.json_response(
+            {"error": "session manager unavailable", "code": "session_manager_unavailable"},
+            status=503,
+        )
+    key = f"dashboard:model-discovery:{name}"
+    try:
+        provider, _is_new, _resumed = await asyncio.wait_for(
+            state.sessions.get_or_create(key, agent=name), timeout=30
+        )
+        available = getattr(provider, "available_models", lambda: [])()
+        efforts = getattr(provider, "get_valid_effort_levels", lambda: [])()
+        models = [
+            {
+                "modelId": str(model.get("modelId") or ""),
+                "name": str(model.get("name") or model.get("modelId") or ""),
+                "description": str(model.get("description") or ""),
+            }
+            for model in available
+            if isinstance(model, dict) and model.get("modelId")
+        ]
+        if not models:
+            return web.json_response(
+                {"error": "subscription returned no models", "code": "models_unavailable"},
+                status=503,
+            )
+        return web.json_response(
+            {"models": models, "effort_levels": [level for level in efforts if isinstance(level, str)]}
+        )
+    except asyncio.TimeoutError:
+        return web.json_response(
+            {"error": "model discovery timed out", "code": "models_timeout"}, status=503
+        )
+    except Exception:
+        logger.warning("Model discovery failed for crew %s", name, exc_info=True)
+        return web.json_response(
+            {"error": "model discovery unavailable", "code": "models_unavailable"}, status=503
+        )
+    finally:
+        if state.sessions.has_session(key):
+            state.sessions.release(key)
+            await state.sessions.destroy(key)
 
 
 _config_lock: asyncio.Lock | None = None
@@ -1353,6 +1438,12 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             # turn {"model": 123} into the literal "123", which normalizes to a
             # string the backend then rejects as an unknown model id.
             model=normalize_agent_model(body.get("model")),
+            reasoning_effort=(
+                body.get("reasoning_effort", "")
+                if isinstance(body.get("reasoning_effort", ""), str)
+                and body.get("reasoning_effort", "") in EFFORT_VALUES
+                else ""
+            ),
             description=body.get("description", ""),
             triggers=body.get("triggers", ""),
             source=body.get("source", "kirocrew"),
@@ -1397,6 +1488,12 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             # str()-coerced — see the create path for why.
             agent.model = normalize_agent_model(body["model"])
             changed.append("model")
+        if "reasoning_effort" in body:
+            effort = body["reasoning_effort"]
+            if not isinstance(effort, str) or effort not in EFFORT_VALUES:
+                return web.json_response({"error": "invalid reasoning effort"}, status=400)
+            agent.reasoning_effort = effort
+            changed.append("reasoning_effort")
         if "description" in body:
             agent.description = body["description"]
             changed.append("description")

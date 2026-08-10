@@ -84,6 +84,16 @@ branch is unreachable in this build. Its binary-resolution + config-isolation
 details live in [`acp-client.md`](acp-client.md); do not re-add the registration
 glue or a provider selector (see the repo-root `CLAUDE.md`).
 
+**Companion runtime policy:** a composed `ProviderRegistry` may optionally
+implement `agent_runtime_policy(agent_name)`. The dashboard reads that
+already-booted policy when editing a crew and uses it only to choose which
+generic controls to render: a companion can make model/effort selectable,
+runtime-managed, or unsupported for its mapped engine. The public registry
+returns no policy and retains the normal Kiro-ACP controls. This is strictly
+presentation metadata; the companion factory must independently ignore
+disallowed overrides at dispatch, so a crafted request cannot defeat a router
+or adapter constraint.
+
 **Key APIs:**
 - `start()` → `AcpClient.ensure_ready()` (spawns process, handshake, session/new)
 - `stream()` → maps events from `stream_events()`
@@ -117,6 +127,13 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
   }
 }
 ```
+
+Each entry under `agents.<name>` may also set `reasoning_effort` to one of
+`low`, `medium`, `high`, `xhigh`, or `max`. Empty or absent inherits the
+provider/model default. For a new session, precedence is per-session effort
+override, then this crew default, then the provider/model default. A companion
+policy can mark the setting runtime-managed or unsupported; such a setting is
+then neither rendered as a selector nor applied by that companion.
 
 - `agent.provider` is fixed to `"acp"` (enum `["acp"]`); there is no provider to choose.
 - `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`.

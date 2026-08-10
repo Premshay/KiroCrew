@@ -244,6 +244,7 @@ class AcpProvider(LLMProvider):
         mcp_gateway_settings_mcp_json: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
+        model_switch_method: str = "",
     ) -> None:
         kwargs: dict[str, Any] = {
             "work_dir": work_dir,
@@ -260,10 +261,12 @@ class AcpProvider(LLMProvider):
             # kiro-cli path — fully inert; a companion-registered backend threads
             # it.
             "permission_mode": permission_mode,
+            "model_switch_method": model_switch_method,
         }
         if agent:
             kwargs["agent"] = agent
         self._client = AcpClient(**kwargs)
+        self.model_switch_method = model_switch_method
         # F2 load-recovery: set True by _start_kiro_runtime_impl when a resume
         # falls back to a FRESH native session (the prior session's lock never
         # cleared). Signals SessionManager.get_or_create to replay KiroCrew's

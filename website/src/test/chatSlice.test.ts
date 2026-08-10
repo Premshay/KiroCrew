@@ -10,6 +10,7 @@ import reducer, {
   removeThinking,
   setSlotRunning,
   setSlotStopping,
+  interruptActiveTurn,
   startLocalTurn,
   syncSlotRunningFromServer,
   setSlotState,
@@ -210,6 +211,22 @@ describe('chatSlice reducers', () => {
     // Idle clears
     const state3 = reducer(state2, setSlotStatusDetail({ slot: 'test-slot', kind: 'idle', text: 'Ready', ts: now }))
     expect(state3.slotStatusDetail['test-slot'].kind).toBe('idle')
+  })
+
+  it('interruptActiveTurn closes a dropped stream and exposes recovery', () => {
+    let state = reducer(initial, setActiveSlot('test-slot'))
+    state = reducer(state, appendMessage({ role: 'user', content: 'continue the work', cls: '' }))
+    state = reducer(state, updateStreamingMessage('partial answer'))
+    state = reducer(state, setSlotRunning(true))
+
+    state = reducer(state, interruptActiveTurn({ message: 'Connection interrupted. Reconnecting…' }))
+
+    expect(state.messages.map(message => message.role)).toEqual(['user', 'assistant', 'error'])
+    expect(state.messages[1].content).toBe('partial answer')
+    expect(state.messages[2].content).toBe('Connection interrupted. Reconnecting…')
+    expect(state.slotRunning).toBe(false)
+    expect(state.slotState).toBe('idle')
+    expect(state.slotStatusDetail['test-slot'].text).toBe('Reconnecting…')
   })
 
   it('clearMessages resets messages and pagination', () => {

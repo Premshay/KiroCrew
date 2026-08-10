@@ -2758,12 +2758,14 @@ async def _run_chat(
         # agent.model fallback, both of which get_or_create resolves when this
         # and slot.model are empty.
         agent_model = ""
+        agent_reasoning_effort = ""
         try:
             cfg = KiroCrewConfig.load()
             bindings = resolve_agent_bindings(cfg, slot.agent or None)
             kiro_agent = bindings.kiro_agent
             memory_store = bindings.memory_store_name
             agent_model = normalize_agent_model(bindings.model)
+            agent_reasoning_effort = bindings.reasoning_effort
         except Exception:
             logger.warning("Failed to resolve agent bindings in _run_chat", exc_info=True)
 
@@ -2780,7 +2782,7 @@ async def _run_chat(
             agent=kiro_agent or slot.agent or None,
             model=slot.model or agent_model or None,
             cwd=slot.project or None,
-            reasoning_effort_override=slot.reasoning_effort or None,
+            reasoning_effort_override=slot.reasoning_effort or agent_reasoning_effort or None,
         )
         _acquired = True
         # Publish the live inner AcpClient onto the slot so a concurrent request

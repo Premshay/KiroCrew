@@ -1567,6 +1567,35 @@ const chatSlice = createSlice({
       // prior turn can't falsely show a "stopping" state on the new turn.
     },
     setSlotStopping(state, action: PayloadAction<boolean>) { state.slotStopping = action.payload },
+    /**
+     * A dropped dashboard socket cannot tell the browser whether the gateway
+     * kept running the turn. Close the local stream immediately so the UI does
+     * not pretend to generate forever; reconnect hydration replaces this
+     * notice with the gateway's canonical state when it becomes available.
+     */
+    interruptActiveTurn(state, action: PayloadAction<{ message: string }>) {
+      const slot = state.activeSlot
+      const hasStreaming = state.messages.some(message => message.role === 'streaming')
+      if (!slot || (!state.slotRunning && !hasStreaming)) return
+      finalizeTrailingStreaming(state.messages)
+      state.messages.push(ensureMsgId({
+        role: 'error',
+        content: action.payload.message,
+        cls: 'msg msg-error',
+        meta: { clientTs: mintMsgId(), kind: 'connection_interrupted' },
+      }))
+      state.slotRunning = false
+      state.slotStopping = false
+      state.slotState = 'idle'
+      state.pendingTurnSlot = null
+      state.lastChunkSeq = undefined
+      state._wsChunkedDuringFetch = false
+      state.slotStatusDetail[safeKey(slot)] = {
+        kind: 'idle',
+        text: 'Reconnecting…',
+        ts: Date.now(),
+      }
+    },
     setStopPressedAt(state, action: PayloadAction<{ slotId: string; ts: number }>) {
       if (isUnsafeKey(action.payload.slotId)) return
       state.stopPressedAt[safeKey(action.payload.slotId)] = action.payload.ts
@@ -2720,7 +2749,7 @@ const chatSlice = createSlice({
 
 export const {
   setActiveSlot, clearSlotState, setPendingInput, setQuestionCard, clearQuestionCard, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage,
+  removeThinking, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, interruptActiveTurn, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage,
   sseContextUsage, setVoicePlaying, setVoiceBusy, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,

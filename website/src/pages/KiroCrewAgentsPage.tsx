@@ -35,6 +35,7 @@ interface CreatePayload {
   workspace: string
   memory_store: string
   triggers: string
+  reasoning_effort?: string
 }
 
 /** Editable fields sent when updating an existing agent binding. */
@@ -46,6 +47,7 @@ interface AgentUpdatePayload {
   triggers: string
   /** '' = inherit (the kiro template's pin, then the global fallback). */
   model: string
+  reasoning_effort: string
 }
 
 /** The stored spelling for "no per-agent pin, inherit the next tier down". The
@@ -261,13 +263,15 @@ function BindingFields({
   templateLabel, kiroAgentOptions, kiroAgent, setKiroAgent,
   workspaceOptions, workspace, setWorkspace, onNewWorkspace,
   memoryStoreOptions, memoryStore, setMemoryStore,
-  modelOptions, model, setModel,
+  modelOptions, model, setModel, effortOptions, reasoningEffort, setReasoningEffort, runtimePolicy,
 }: {
   templateLabel: string
   kiroAgentOptions: string[]; kiroAgent: string; setKiroAgent: (v: string) => void
   workspaceOptions: string[]; workspace: string; setWorkspace: (v: string) => void; onNewWorkspace: () => void
   memoryStoreOptions: string[]; memoryStore: string; setMemoryStore: (v: string) => void
   modelOptions?: string[]; model?: string; setModel?: (v: string) => void
+  effortOptions?: string[]; reasoningEffort?: string; setReasoningEffort?: (v: string) => void
+  runtimePolicy?: KiroCrewAgent['runtime_policy']
 }) {
   const withCurrent = (opts: string[], cur: string) => (opts.includes(cur) ? opts : [...opts, cur])
   return (
@@ -297,7 +301,11 @@ function BindingFields({
           </span>
         )}
       </Field>
-      {modelOptions && setModel && model !== undefined && (
+      {runtimePolicy && runtimePolicy.model !== 'selectable' ? (
+        <Field label={i18nT('pages.kiroCrewAgentsPage.model')}>
+          <span className="text-[12px] italic text-muted">{runtimePolicy.model_label || runtimePolicy.runtime || i18nT('pages.kiroCrewAgentsPage.inherited')}</span>
+        </Field>
+      ) : modelOptions && setModel && model !== undefined && (
         <Field label={i18nT('pages.kiroCrewAgentsPage.model')}>
           <SimpleSelect
             options={withCurrent(modelOptions, model)}
@@ -309,6 +317,21 @@ function BindingFields({
             value={model}
             onChange={setModel}
             aria-label={i18nT('pages.kiroCrewAgentsPage.edit_model')}
+          />
+        </Field>
+      )}
+      {runtimePolicy && runtimePolicy.effort !== 'selectable' ? (
+        <Field label={i18nT('pages.kiroCrewAgentsPage.reasoning_effort')}>
+          <span className="text-[12px] italic text-muted">{runtimePolicy.effort_label || runtimePolicy.runtime || i18nT('pages.kiroCrewAgentsPage.inherited')}</span>
+        </Field>
+      ) : runtimePolicy?.effort !== 'unsupported' && effortOptions && setReasoningEffort && reasoningEffort !== undefined && (
+        <Field label={i18nT('pages.kiroCrewAgentsPage.reasoning_effort')}>
+          <SimpleSelect
+            options={['', ...effortOptions]}
+            optionLabels={[i18nT('pages.kiroCrewAgentsPage.inherited'), ...effortOptions]}
+            value={reasoningEffort}
+            onChange={setReasoningEffort}
+            aria-label={i18nT('pages.kiroCrewAgentsPage.reasoning_effort')}
           />
         </Field>
       )}
@@ -512,7 +535,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     queryKey: ['available-models', provider.id],
     queryFn: () => provider.fetchAvailableModels(),
   })
-  const modelOptions = [
+  const nativeModelOptions = [
     INHERIT_MODEL,
     ...(availableModels || []).map((m: { name: string }) => m.name).filter((n: string) => n && n !== INHERIT_MODEL),
   ]
@@ -527,6 +550,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const [memoryStore, setMemoryStore] = useState('default')
   const [triggers, setTriggers] = useState('')
   const [editModel, setEditModel] = useState(INHERIT_MODEL)
+  const [editReasoningEffort, setEditReasoningEffort] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
   /** The armed confirm row, scrolled into view when it appears: the danger zone
    *  is the last section, so on a short window the confirm buttons land under
@@ -572,6 +596,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     setKiroAgent(a.kiro_agent); setWorkspace(a.workspace); setMemoryStore(a.memory_store)
     setTriggers(a.triggers || '')
     setEditModel(a.model || INHERIT_MODEL)
+    setEditReasoningEffort(a.reasoning_effort || '')
     setSheet({ mode: 'edit', name: a.name })
   }, [defaultAgent])
 
@@ -652,6 +677,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
         // INHERIT_MODEL is normalized to '' server-side; send it verbatim so
         // clearing a pin is a real write rather than a skipped field.
         model: editModel,
+        reasoning_effort: editReasoningEffort,
       },
     })
   }
@@ -682,6 +708,20 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const filtered = agents.filter(a =>
     !filter || (a.name + ' ' + a.kiro_agent + ' ' + a.workspace + ' ' + a.memory_store).toLowerCase().includes(filter.toLowerCase())
   )
+
+  const runtimePolicy = editingAgent?.runtime_policy || null
+  const { data: subscriptionOptions } = useQuery({
+    queryKey: ['crew-models', editing],
+    queryFn: () => api.crewModels(editing),
+    enabled: !!editing && runtimePolicy?.model === 'selectable',
+    retry: false,
+  })
+  const modelOptions = runtimePolicy?.model === 'selectable'
+    ? [INHERIT_MODEL, ...(subscriptionOptions?.models || []).map(m => m.modelId).filter(m => m && m !== INHERIT_MODEL)]
+    : nativeModelOptions
+  const effortLevels = runtimePolicy?.effort === 'selectable'
+    ? subscriptionOptions?.effort_levels || []
+    : []
 
   /** Workspaces and memory stores that more than one crew points at. Surfacing
    *  this is the one thing a flat list cannot show: two crews on one store
@@ -923,6 +963,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
             onNewWorkspace={() => setWsModalOpen(true)}
             memoryStoreOptions={memoryStoreOptions} memoryStore={memoryStore} setMemoryStore={setMemoryStore}
             {...(creating ? {} : { modelOptions, model: editModel, setModel: setEditModel })}
+            {...(creating ? {} : { effortOptions: effortLevels, reasoningEffort: editReasoningEffort, setReasoningEffort: setEditReasoningEffort, runtimePolicy })}
           />
           {!creating && collidingCrews.length > 0 && (
             <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">

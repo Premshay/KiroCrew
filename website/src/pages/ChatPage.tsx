@@ -922,13 +922,29 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [dispatch])
   const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(installedAgents)
   const filteredAgents = filteredAgentsByName
+  const modelPickerAgent = slots.find(s => s.key === activeSlot)?.agent || defaultAgent || ''
+  const modelPickerPolicy = installedAgents.find(a => a.name === modelPickerAgent)?.runtime_policy
   const { data: availableModels = [{ name: 'auto', description: 'Default' }] } = useQuery({
-    queryKey: ['available-models', provider.id],
+    queryKey: ['model-picker-options', modelPickerAgent, modelPickerPolicy?.model, provider.id],
     queryFn: async () => {
-      const models = await provider.fetchAvailableModels()
-      return [{ name: 'auto', description: 'Default' }, ...models.filter(m => m.name !== 'auto')]
+      if (!modelPickerAgent) return [{ name: 'auto', description: 'Default' }]
+      // A managed runtime (the fleet router) makes the routing decision. It
+      // intentionally has no per-session model picker, unlike subscription
+      // runtimes whose ACP session reports the entitled model list.
+      if (modelPickerPolicy?.model === 'managed' || modelPickerPolicy?.model === 'unsupported') {
+        return [{ name: 'auto', description: 'Default' }]
+      }
+      if (modelPickerPolicy?.model !== 'selectable') {
+        return provider.fetchAvailableModels()
+      }
+      const result = await api.crewModels(modelPickerAgent)
+      return [
+        { name: 'auto', description: 'Default' },
+        ...result.models.filter(m => m.modelId !== 'auto').map(m => ({ name: m.modelId, description: m.description })),
+      ]
     },
-    refetchInterval: modelListRefetchInterval,
+    refetchInterval: modelPickerAgent ? modelListRefetchInterval : false,
+    retry: false,
   })
   const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(availableModels)
   // Roving-focus keyboard nav for the agent + model dropdowns (shared with StyledSelect/AgentSelector).
@@ -5708,4 +5724,3 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     </RowDisclosureProvider>
   )
 }
-

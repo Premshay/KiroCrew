@@ -1077,6 +1077,11 @@ export const api = {
   agentDelete: (name: string) => fetch('/api/agents/detail/' + encodeURIComponent(name), { method: 'DELETE' }).then(j),
   // KiroCrew agents
   kirocrewAgents: () => fetch('/api/agents').then(j),
+  crewModels: (name: string) =>
+    fetch('/api/agents/' + encodeURIComponent(name) + '/models').then(j) as Promise<{
+      models: { modelId: string; name: string; description: string }[]
+      effort_levels: string[]
+    }>,
   /** The model a new session on this KiroCrew agent would run on. Empty
    *  `agent` resolves the configured default agent. */
   agentResolvedModel: (agent: string) =>

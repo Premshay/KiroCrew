@@ -1866,6 +1866,9 @@ async def start_dashboard(
         client_max_size=60 * 1024 * 1024
     )  # 60 MB: covers 50 MB upload + multipart overhead
     app["state"] = state
+    from kiro_crew.platform import current_context
+
+    app["platform_context"] = current_context()
     # Voice settings live in slack/handler's module state and were historically
     # loaded only on the Slack startup path — a dashboard-only gateway (no
     # Slack tokens) reset TTS to defaults on every restart
@@ -2208,6 +2211,7 @@ async def start_dashboard(
     app.router.add_delete("/api/agents/detail/{name}", handlers.api_agent_detail)
     # KiroCrew Agent CRUD
     app.router.add_get("/api/agents", handlers.api_kirocrew_agents)
+    app.router.add_get("/api/agents/{name}/models", handlers.api_kirocrew_agent_models)
     app.router.add_get(
         "/api/agents/resolved-model", handlers.api_kirocrew_agent_resolved_model
     )
@@ -3294,6 +3298,9 @@ async def start_api_server(
         client_max_size=60 * 1024 * 1024
     )  # 60 MB: covers 50 MB upload + multipart overhead
     app["state"] = state
+    from kiro_crew.platform import current_context
+
+    app["platform_context"] = current_context()
     # Voice settings live in slack/handler's module state and were historically
     # loaded only on the Slack startup path — a dashboard-only gateway (no
     # Slack tokens) reset TTS to defaults on every restart
