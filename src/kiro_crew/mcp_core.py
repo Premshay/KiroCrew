@@ -115,6 +115,8 @@ from kiro_crew.validation import (
     SELECT_CREW_SCHEMA,
     SESSION_CHANNEL_POST_SCHEMA,
     SESSION_CHECKPOINT_SCHEMA,
+    SESSION_RESTART_CONTINUATION_MAX,
+    SESSION_RESTART_CONTINUATION_SCHEMA,
     SET_PROJECT_SCHEMA,
     SKILL_DISCOVER_SCHEMA,
     SKILL_FETCH_SCHEMA,
@@ -2174,6 +2176,25 @@ def _list_tools() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["channel_id", "recipients", "content"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "session_restart_continuation",
+            "description": (
+                "Before you initiate a gateway restart, arm one post-restart verification turn for "
+                "this same session. Call immediately before the restart with only the checks you "
+                "must perform afterward. This never resumes unrelated user work."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "checklist": {
+                        "type": "string",
+                        "maxLength": SESSION_RESTART_CONTINUATION_MAX,
+                    }
+                },
+                "required": ["checklist"],
                 "additionalProperties": False,
             },
         },
@@ -6272,6 +6293,17 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             message = result.get("message") or {}
             return f"Peer report recorded as {message.get('id', 'a channel message')}."
         return f"Error: peer report was not recorded: {result.get('error', 'unknown error')}"
+
+    if name == "session_restart_continuation":
+        args = validate_tool_args(args, SESSION_RESTART_CONTINUATION_SCHEMA)
+        result = _post(
+            "/api/session-restart-continuation",
+            args,
+            require_strict_session=True,
+        )
+        if result.get("ok") is True:
+            return "Post-restart verification is armed for this session."
+        return f"Error: post-restart verification was not armed: {result.get('error', 'unknown error')}"
 
     if name == "maintenance_status":
         if args:

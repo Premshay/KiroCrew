@@ -147,6 +147,13 @@ none is mirrored to a linked Slack or Telegram thread as though the user typed i
 | `[Tool stall — automatic recovery]` | The per-session watchdog judged an in-flight tool dead and cancelled the session. Hands over the stall context so the model can check partial results and continue. |
 | `[Interrupted turn — automatic recovery]` | A transient backend 5xx cut a turn short after tokens or tool calls had already streamed. |
 | `[Empty response — automatic recovery]` | The model returned no output twice. Continue the pending request; do not restart from scratch or re-run steps that already succeeded. |
+| `[Post-restart verification]` | The same session explicitly armed a deployment checklist immediately before the gateway restart. Complete only that checklist and report its result. |
+
+The post-restart verification path is deliberately opt-in. The strict
+`session_restart_continuation` MCP tool persists one bounded checklist on the
+calling dashboard slot. Startup dispatches it after slot restoration; the runner
+clears the persisted marker only after the verification turn begins. A gateway
+restart never resumes a user request or any slot that did not arm this marker.
 
 The recovery classification for the last two is **structural**: the queue entry
 carries `kind == "synthetic_recovery"` (`SYNTHETIC_RECOVERY_KIND`), set at insert

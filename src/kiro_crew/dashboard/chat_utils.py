@@ -23,6 +23,7 @@ from kiro_crew.dashboard.state import (
     EMPTY_RESPONSE_RECOVERY_PREFIX,
     MANUAL_RESUME_RECOVERY_PREFIX,
     PEER_CHANNEL_REQUEST_KIND,
+    POST_RESTART_CONTINUATION_KIND,
     POSTTOKEN_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
     DashboardState,
@@ -781,6 +782,11 @@ def is_peer_channel_request_item(item: dict) -> bool:
     return item.get("kind") == PEER_CHANNEL_REQUEST_KIND
 
 
+def is_post_restart_continuation_item(item: dict) -> bool:
+    """True when a queue entry runs an explicitly armed restart check."""
+    return item.get("kind") == POST_RESTART_CONTINUATION_KIND
+
+
 def is_system_injection_item(item: dict) -> bool:
     """Item-aware system-injection predicate for queue-entry consumers.
 
@@ -793,6 +799,7 @@ def is_system_injection_item(item: dict) -> bool:
     return (
         is_synthetic_recovery_item(item)
         or is_peer_channel_request_item(item)
+        or is_post_restart_continuation_item(item)
         or is_system_injection(item["content"])
     )
 

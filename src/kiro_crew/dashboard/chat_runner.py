@@ -55,7 +55,11 @@ from kiro_crew.context_management import (
     strip_plan_markers,
     validate_plan_format,
 )
-from kiro_crew.dashboard.chat_persistence import _build_history_prefix, save_slot_off_loop
+from kiro_crew.dashboard.chat_persistence import (
+    _build_history_prefix,
+    persist_post_restart_continuation,
+    save_slot_off_loop,
+)
 from kiro_crew.dashboard.chat_title import (
     _extract_and_redact_plan_metadata,
     _maybe_auto_title,
@@ -83,6 +87,7 @@ from kiro_crew.dashboard.chat_utils import (
     _validate_tool_name,
     effective_session_key,
     is_peer_channel_request_item,
+    is_post_restart_continuation_item,
     is_system_injection,
 )
 from kiro_crew.dashboard.handlers import (
@@ -106,6 +111,8 @@ from kiro_crew.dashboard.state import (
     NATIVE_SUBAGENT_OUTPUT_TAIL,
     NATIVE_SUBAGENT_TERMINAL_KEEP,
     NATIVE_SUBAGENT_TERMINAL_TTL_SECS,
+    POST_RESTART_CONTINUATION_KIND,
+    POST_RESTART_CONTINUATION_PREFIX,
     REFUSAL_RECOVERY_PREFIX,
     STALE_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
@@ -2391,13 +2398,22 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     is_cron = next_msg.startswith(CRON_NOTIFY_PREFIX)
     is_subagent = next_msg.startswith(SUBAGENT_COMPLETION_PREFIX)
     is_peer_channel_request = any(is_peer_channel_request_item(item) for item in consumed)
+    is_post_restart_continuation = any(
+        is_post_restart_continuation_item(item) for item in consumed
+    )
     is_recovery = (
         next_msg.startswith(REFUSAL_RECOVERY_PREFIX)
         or next_msg.startswith(STALE_RECOVERY_PREFIX)
         or next_msg.startswith(TOOL_STALL_RECOVERY_PREFIX)
         or any(is_synthetic_recovery_item(item) for item in consumed)
     )
-    if not (is_cron or is_subagent or is_recovery or is_peer_channel_request):
+    if not (
+        is_cron
+        or is_subagent
+        or is_recovery
+        or is_peer_channel_request
+        or is_post_restart_continuation
+    ):
         slot._pending_synthesis = False
     match = CRON_NOTIFY_RE.match(next_msg) if is_cron else None
     cron_label = match.group(1) if match else "cron"
@@ -2407,14 +2423,14 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         "subagent"
         if is_subagent
         else "inject"
-        if (is_cron or is_recovery or is_peer_channel_request)
+        if (is_cron or is_recovery or is_peer_channel_request or is_post_restart_continuation)
         else "user",
         next_msg,
         (
             json.dumps({"cronLabel": cron_label})
             if is_cron
             else "msg msg-inject"
-            if (is_recovery or is_peer_channel_request)
+            if (is_recovery or is_peer_channel_request or is_post_restart_continuation)
             else "msg msg-u"
         ),
     )
@@ -2422,10 +2438,38 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     task = spawn_guarded_turn(
         state,
         slot,
-        _run_chat(state, slot, next_msg, _peer_channel_request=is_peer_channel_request),
+        _run_chat(
+            state,
+            slot,
+            next_msg,
+            _peer_channel_request=is_peer_channel_request,
+            _post_restart_continuation=is_post_restart_continuation,
+        ),
     )
     slot.task = task
     return True
+
+
+async def start_post_restart_continuations(state: DashboardState) -> int:
+    """Dispatch each explicitly armed post-restart verification exactly once per boot."""
+    started = 0
+    for slot in list(state._slots.values()):
+        checklist = slot.post_restart_continuation()
+        if not checklist:
+            continue
+        if any(is_post_restart_continuation_item(item) for item in slot._queue):
+            continue
+        slot.queue_insert(
+            0,
+            f"{POST_RESTART_CONTINUATION_PREFIX}\n"
+            "The gateway restarted after you armed this verification. Complete only the "
+            "following operational checks, report their result, and do not resume unrelated work.\n\n"
+            f"{checklist}",
+            kind=POST_RESTART_CONTINUATION_KIND,
+        )
+        if await _start_next_queued_turn(state, slot):
+            started += 1
+    return started
 
 
 async def _run_pending_synthesis(state: DashboardState, slot: _ChatSlot) -> None:
@@ -2515,10 +2559,23 @@ async def _run_chat(
     _prompt_depth: int = 0,
     regenerate_hint: str = "",
     _peer_channel_request: bool = False,
+    _post_restart_continuation: bool = False,
 ) -> None:
     """Stream LLM response into *slot*.  Survives browser disconnect."""
 
     session_key = effective_session_key(slot)
+    if _post_restart_continuation:
+        pending = slot.post_restart_continuation()
+        if not pending:
+            slot.append("error", "Post-restart verification was no longer armed.", "msg msg-err")
+            return
+        slot.clear_post_restart_continuation()
+        try:
+            await persist_post_restart_continuation(state, slot)
+        except Exception:
+            slot.arm_post_restart_continuation(pending)
+            slot.append("error", "Post-restart verification could not be persisted.", "msg msg-err")
+            return
     sessions = getattr(state, "sessions", None)
 
     # Inherit Slack link: if this dashboard session mirrors a Slack thread,
@@ -2768,6 +2825,7 @@ async def _run_chat(
         _is_recovery
         or message.startswith(SUBAGENT_SYNTHESIS_PREFIX)
         or _peer_channel_request
+        or _post_restart_continuation
     )
 
     # ── Slash commands: detect early, before session acquisition ──

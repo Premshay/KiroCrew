@@ -48,6 +48,7 @@ SESSION_CHECKPOINT_MAIN_ITEM_MAX = 160
 SESSION_CHECKPOINT_MILESTONE_MAX = 220
 SESSION_CHECKPOINT_TRAIL_MAX = 7
 SESSION_CHECKPOINT_PROGRESS_LABEL_MAX = 160
+SESSION_RESTART_CONTINUATION_MAX = 2_000
 
 # Allowed categories for lessons
 ALLOWED_LESSON_CATEGORIES = frozenset({"tool", "preference", "knowledge"})
@@ -1338,6 +1339,12 @@ SESSION_CHECKPOINT_SCHEMA = ToolSchema(
 )
 
 
+SESSION_RESTART_CONTINUATION_SCHEMA = ToolSchema(
+    tool_name="session_restart_continuation",
+    fields=[FieldSpec("checklist", str, required=True, max_len=SESSION_RESTART_CONTINUATION_MAX)],
+)
+
+
 _PERSISTENT_AGENT_CHANNEL_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 
@@ -2203,6 +2210,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "set_project": SET_PROJECT_SCHEMA,
     "suggest_followup": SUGGEST_FOLLOWUP_SCHEMA,
     "session_checkpoint": SESSION_CHECKPOINT_SCHEMA,
+    "session_restart_continuation": SESSION_RESTART_CONTINUATION_SCHEMA,
     "session_channel_post": SESSION_CHANNEL_POST_SCHEMA,
     "artifact_save": ARTIFACT_SAVE_SCHEMA,
     "artifact_get": ARTIFACT_GET_SCHEMA,

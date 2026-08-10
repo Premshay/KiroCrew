@@ -10,17 +10,25 @@ import pytest
 
 from kiro_crew import mcp_core
 from kiro_crew.channel import Channel, ChannelMessage
-from kiro_crew.dashboard.chat_runner import drain_peer_channel_inbox, _start_next_queued_turn
+from kiro_crew.dashboard.chat_runner import (
+    _start_next_queued_turn,
+    drain_peer_channel_inbox,
+    start_post_restart_continuations,
+)
 from kiro_crew.dashboard.chat_utils import is_system_injection, is_system_injection_item
+from kiro_crew.dashboard.handlers.sessions import (
+    api_session_channel,
+    api_session_restart_continuation,
+)
 from kiro_crew.dashboard.handlers_channel import (
     api_channel_post,
     deliver_attached_channel_message,
 )
-from kiro_crew.dashboard.handlers.sessions import api_session_channel
 from kiro_crew.dashboard.state import (
-    DashboardState,
     PEER_CHANNEL_REQUEST_KIND,
     PEER_CHANNEL_REQUEST_PREFIX,
+    POST_RESTART_CONTINUATION_KIND,
+    DashboardState,
 )
 from kiro_crew.history import ConversationLog
 from kiro_crew.validation import ValidationError
@@ -77,7 +85,11 @@ def _channel_state(tmp_path):
 class TestSessionChannelTools:
     def test_advertises_explicit_peer_tools(self) -> None:
         names = {tool["name"] for tool in mcp_core._list_tools()}
-        assert {"session_channel_status", "session_channel_post"} <= names
+        assert {
+            "session_channel_status",
+            "session_channel_post",
+            "session_restart_continuation",
+        } <= names
 
     def test_post_uses_strict_calling_session(self, monkeypatch) -> None:
         post = MagicMock(return_value={"ok": True, "message": {"id": "cafebabe"}})
@@ -105,6 +117,22 @@ class TestSessionChannelTools:
             require_strict_session=True,
         )
 
+    def test_arms_a_strict_post_restart_verification(self, monkeypatch) -> None:
+        post = MagicMock(return_value={"ok": True})
+        monkeypatch.setattr(mcp_core, "_post", post)
+
+        result = mcp_core._call_tool_inner(
+            "session_restart_continuation",
+            {"checklist": "Check gateway health and the changed endpoint."},
+        )
+
+        assert result == "Post-restart verification is armed for this session."
+        post.assert_called_once_with(
+            "/api/session-restart-continuation",
+            {"checklist": "Check gateway health and the changed endpoint."},
+            require_strict_session=True,
+        )
+
     def test_rejects_invalid_persistent_channel_identifier(self) -> None:
         with pytest.raises(ValidationError):
             mcp_core._call_tool_inner(
@@ -126,6 +154,102 @@ class TestSessionChannelEndpoint:
         assert body["channels"][0]["peers"] == [
             {"id": claude.id, "role": "Claude", "state": "listening"}
         ]
+
+    @pytest.mark.asyncio
+    async def test_peer_mention_reaches_and_wakes_the_attached_recipient(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        state = _state(tmp_path)
+        codex_slot = state.get_or_create_slot("crew-codex")
+        claude_slot = state.get_or_create_slot("crew-claude")
+        channel = Channel(id="deadbeef", topic="Multiplex validation")
+        codex = channel.attach_session("dashboard:crew-codex", role="Codex")
+        claude = channel.attach_session("dashboard:crew-claude", role="Claude")
+        assert codex is not None and claude is not None
+        channel._delivery_fn = lambda ch, member, message: deliver_attached_channel_message(
+            state, ch, member, message
+        )
+        state.channel_manager = SimpleNamespace(_channels={channel.id: channel})
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock()
+        )
+        started = AsyncMock(return_value=True)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._start_next_queued_turn", started)
+
+        response = await api_session_channel(
+            _request(
+                state,
+                {
+                    "action": "post",
+                    "channel_id": channel.id,
+                    "recipients": [claude.id],
+                    "content": "Please acknowledge the deployed check.",
+                    "msg_type": "mention",
+                },
+                session_key="dashboard:crew-codex",
+            )
+        )
+
+        assert response.status == 200
+        assert claude_slot.peer_channel_inbox_payload()[0]["from_role"] == "Codex"
+        assert claude_slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
+        started.assert_awaited_once_with(state, claude_slot)
+        assert not codex_slot.peer_channel_inbox_payload()
+
+    @pytest.mark.asyncio
+    async def test_restart_continuation_arms_only_the_calling_slot(self, monkeypatch, tmp_path) -> None:
+        state, _channel, _codex, _claude, _slot = _channel_state(tmp_path)
+        save = AsyncMock()
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_persistence.persist_post_restart_continuation", save
+        )
+
+        response = await api_session_restart_continuation(
+            _request(
+                state,
+                {"checklist": "Verify health and report the deployment result."},
+            )
+        )
+
+        assert response.status == 200
+        assert state._slots["crew-codex"].post_restart_continuation().startswith("Verify health")
+        assert not state._slots["crew-claude"].post_restart_continuation()
+        save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_restart_continuation_does_not_arm_when_persistence_fails(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        state, _channel, _codex, _claude, _slot = _channel_state(tmp_path)
+        save = AsyncMock(side_effect=OSError("disk unavailable"))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_persistence.persist_post_restart_continuation", save
+        )
+
+        response = await api_session_restart_continuation(
+            _request(state, {"checklist": "Check health after restart."})
+        )
+
+        assert response.status == 500
+        assert not state._slots["crew-codex"].post_restart_continuation()
+
+
+class TestPostRestartContinuation:
+    @pytest.mark.asyncio
+    async def test_dispatches_an_armed_check_once_without_consuming_it_first(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        assert slot.arm_post_restart_continuation("Verify health then inspect the changed route.")
+        started = AsyncMock(return_value=True)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._start_next_queued_turn", started)
+
+        assert await start_post_restart_continuations(state) == 1
+        assert slot._queue[0]["kind"] == POST_RESTART_CONTINUATION_KIND
+        assert slot.post_restart_continuation().startswith("Verify health")
+        assert await start_post_restart_continuations(state) == 0
+        started.assert_awaited_once_with(state, slot)
 
     @pytest.mark.asyncio
     async def test_post_delivers_a_peer_envelope_not_a_user_message(self, tmp_path) -> None:
