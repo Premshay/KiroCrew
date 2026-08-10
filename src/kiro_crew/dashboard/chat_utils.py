@@ -28,6 +28,7 @@ from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
     EMPTY_RESPONSE_RECOVERY_PREFIX,
     MANUAL_RESUME_RECOVERY_PREFIX,
+    PEER_CHANNEL_REQUEST_KIND,
     POSTTOKEN_RECOVERY_PREFIX,
     PROMISE_ONLY_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIXES,
@@ -1835,7 +1836,12 @@ CRON_NOTIFICATION_KIND = "cron_notification"
 
 #: All system-injection kinds (for set-membership checks).
 _SYSTEM_INJECTION_KINDS = frozenset(
-    (SUBAGENT_COMPLETION_KIND, CRON_NOTIFICATION_KIND, SYNTHETIC_RECOVERY_KIND)
+    (
+        SUBAGENT_COMPLETION_KIND,
+        CRON_NOTIFICATION_KIND,
+        SYNTHETIC_RECOVERY_KIND,
+        PEER_CHANNEL_REQUEST_KIND,
+    )
 )
 
 
@@ -1849,6 +1855,11 @@ def is_synthetic_recovery_item(item: dict) -> bool:
     transcript-visible recovery text verbatim (which must classify as a plain
     user message)."""
     return item.get("kind") == SYNTHETIC_RECOVERY_KIND
+
+
+def is_peer_channel_request_item(item: dict) -> bool:
+    """True when a queue entry is a named peer request."""
+    return item.get("kind") == PEER_CHANNEL_REQUEST_KIND
 
 
 class RecoveryPayload(str, Enum):
