@@ -563,6 +563,19 @@ def _session_model(cfg: "KiroCrewConfig", agent: str | None) -> "str | None":
     return _model_fallback(per_agent_model, cfg.agent.model)
 
 
+def _session_crew_effort(cfg: "KiroCrewConfig", agent: str | None) -> "str | None":
+    """Return a configured crew effort for non-dashboard session surfaces.
+
+    Slack, cron, and workflow callers pass the KiroCrew alias directly to
+    :meth:`SessionManager.get_or_create`; the dashboard resolves it first and
+    supplies the same value explicitly. Keeping this resolver alias-only means
+    a template session never accidentally inherits an unrelated crew's setting.
+    """
+    crew = cfg.agents.get(agent) if agent else None
+    effort = getattr(crew, "reasoning_effort", "") if crew is not None else ""
+    return effort if isinstance(effort, str) and effort else None
+
+
 # Type alias for provider factory — accepts optional session key
 ProviderFactory = Callable[..., LLMProvider]
 
@@ -2741,6 +2754,15 @@ class SessionManager:
             model = await asyncio.get_running_loop().run_in_executor(
                 None, _session_model, self._cfg, agent
             )
+
+        # The dashboard resolves and passes its crew default before arriving
+        # here. Every other surface passes the crew alias, so fill only an
+        # absent kwarg with that crew's default and preserve explicit callers
+        # (slot/role overrides) unchanged.
+        if "reasoning_effort_override" not in extra_factory_kwargs:
+            crew_effort = _session_crew_effort(self._cfg, agent)
+            if crew_effort:
+                extra_factory_kwargs["reasoning_effort_override"] = crew_effort
 
         # Check session map for resume — only for long-lived sessions.
         # ``_hb`` is stateless alongside ``_bg``: heartbeat's published

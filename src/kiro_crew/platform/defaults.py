@@ -47,6 +47,10 @@ class DefaultProviderRegistry:
         # seam.
         return None
 
+    def agent_runtime_policy(self, agent_name: str) -> dict[str, Any] | None:
+        """Public Kiro-ACP has no companion-specific runtime policy."""
+        return None
+
 
 class DefaultPublishRegistry:
     """Registers no publish provider — the public edition has no artifact-publish
