@@ -38,6 +38,7 @@ from kiro_crew.validation import (
     SELECT_CREW_SCHEMA,
     SESSION_CHANNEL_POST_SCHEMA,
     SESSION_CHECKPOINT_SCHEMA,
+    SESSION_RESTART_CONTINUATION_SCHEMA,
     SET_PROJECT_SCHEMA,
     SUGGEST_FOLLOWUP_SCHEMA,
     TASK_RUN_SCHEMA,
@@ -579,6 +580,22 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "session_restart_continuation",
+            "description": (
+                "Before an intentional gateway restart, arm one concise verification "
+                "checklist for this dashboard session. After startup, the checklist runs "
+                "once as a synthetic turn; it never resumes unrelated work."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "checklist": {"type": "string", "maxLength": 2000},
+                },
+                "required": ["checklist"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "maintenance_status",
             "description": (
                 "Check whether a coordinated session reset is waiting for this session. "
@@ -1068,6 +1085,23 @@ def session_channel_post(name: str, args: dict[str, Any]) -> str:
     return f"Error: peer report was not recorded: {result.get('error', 'unknown error')}"
 
 
+def session_restart_continuation(name: str, args: dict[str, Any]) -> str:
+    """Arm one persisted verification turn for the verified calling session."""
+    args = validate_tool_args(args, SESSION_RESTART_CONTINUATION_SCHEMA)
+    session_key = mcp_core._resolve_session_key_strict()
+    if not session_key:
+        return "Error: session_restart_continuation requires a verified session identity."
+    result = mcp_core._post(
+        "/api/session-restart-continuation", args, session_key=session_key
+    )
+    if result.get("ok") is True:
+        return "Post-restart verification is armed for this session."
+    return (
+        "Error: post-restart verification was not armed: "
+        f"{result.get('error', 'unknown error')}"
+    )
+
+
 def _maintenance_post(action: str) -> dict[str, Any] | None:
     """Call the session-scoped maintenance endpoint with a verified identity."""
     session_key = mcp_core._resolve_session_key_strict()
@@ -1126,6 +1160,7 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "session_checkpoint": session_checkpoint,
     "session_channel_status": session_channel_status,
     "session_channel_post": session_channel_post,
+    "session_restart_continuation": session_restart_continuation,
     "maintenance_status": maintenance_status,
     "maintenance_acknowledge": maintenance_acknowledge,
 }

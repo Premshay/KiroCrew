@@ -73,6 +73,7 @@ from kiro_crew.validation import (
     SESSION_CHECKPOINT_PROGRESS_LABEL_MAX,
     SESSION_CHECKPOINT_SUMMARY_MAX,
     SESSION_CHECKPOINT_TRAIL_MAX,
+    SESSION_RESTART_CONTINUATION_MAX,
     sanitize_string,
 )
 
@@ -1036,6 +1037,8 @@ SUBAGENT_COMPLETION_PREFIXES = (
 )
 PEER_CHANNEL_REQUEST_PREFIX = "[Peer channel request]"
 PEER_CHANNEL_REQUEST_KIND = "peer_channel_request"
+POST_RESTART_CONTINUATION_PREFIX = "[Post-restart verification]"
+POST_RESTART_CONTINUATION_KIND = "post_restart_continuation"
 # One-shot synthesis turn fired after ALL sub-agents in a fan-out complete and
 # each result has been processed in its own turn (see gateway._subagent_done arm
 # + chat_runner drain/idle branch). Its visible reply is the consolidated,
@@ -1622,6 +1625,7 @@ class _ChatSlot:
         "_pending_context",
         "_deferred_notes",
         "_peer_channel_inbox",
+        "_post_restart_continuation",
         "_app",
         "_human_seen",
         "_origin",
@@ -1988,6 +1992,7 @@ class _ChatSlot:
         self._pending_context: list[dict[str, Any]] = []
         self._deferred_notes: list[dict[str, Any]] = []
         self._peer_channel_inbox: list[dict[str, Any]] = []
+        self._post_restart_continuation: str = ""
         self._app: str = ""  # App identity tag (App Kit §5.2)
         # FIX 1 (unattended approval park). Evidence that a HUMAN has driven
         # this slot through a dashboard-user route (typed a message, answered an
@@ -2464,6 +2469,28 @@ class _ChatSlot:
     def peer_channel_inbox_payload(self) -> list[dict[str, Any]]:
         """Return a copy suitable for durable slot metadata."""
         return [dict(message) for message in self._peer_channel_inbox]
+
+    def arm_post_restart_continuation(self, checklist: object) -> bool:
+        """Arm one explicit post-restart verification turn for this slot."""
+        value = self._checkpoint_text(checklist, SESSION_RESTART_CONTINUATION_MAX)
+        if not value:
+            return False
+        self._post_restart_continuation = value
+        return True
+
+    def restore_post_restart_continuation(self, checklist: object) -> None:
+        """Restore an explicitly armed verification turn after gateway startup."""
+        self._post_restart_continuation = self._checkpoint_text(
+            checklist, SESSION_RESTART_CONTINUATION_MAX
+        )
+
+    def post_restart_continuation(self) -> str:
+        """Return the pending verification checklist without consuming it."""
+        return self._post_restart_continuation
+
+    def clear_post_restart_continuation(self) -> None:
+        """Mark the persisted verification checklist consumed after its turn begins."""
+        self._post_restart_continuation = ""
 
     def set_declared_goal(self, goal: object) -> bool:
         """Store an owner-declared goal and record its meaningful transition."""

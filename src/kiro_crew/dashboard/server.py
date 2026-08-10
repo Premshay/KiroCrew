@@ -298,6 +298,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/computer-use/frame",
         "/api/session-keepalive",
         "/api/session-checkpoint",
+        "/api/session-restart-continuation",
         "/api/session-channel",
         "/api/session-maintenance",
         "/api/session-tool-policy",
@@ -1114,6 +1115,9 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/computer-use/frame", handlers.api_computer_use_frame)
     app.router.add_post("/api/session-keepalive", handlers.api_session_keepalive)
     app.router.add_post("/api/session-checkpoint", handlers.api_session_checkpoint)
+    app.router.add_post(
+        "/api/session-restart-continuation", handlers.api_session_restart_continuation
+    )
     app.router.add_post("/api/session-channel", handlers.api_session_channel)
     app.router.add_post("/api/session-maintenance", handlers.api_session_maintenance)
     app.router.add_get("/api/session-tool-policy", handlers.api_session_tool_policy)
@@ -3508,6 +3512,12 @@ async def start_dashboard(
     # Publish readiness at the exact boundary measured as boot-to-ready.
     state.ready = True
     record_boot_to_ready((time.time() - state.start_time) * 1000.0, server="dashboard")
+
+    from kiro_crew.dashboard.chat_runner import start_post_restart_continuations
+
+    resumed_checks = await start_post_restart_continuations(state)
+    if resumed_checks:
+        logger.info("Started %d explicit post-restart verification turn(s)", resumed_checks)
 
     return runner, state
 

@@ -584,6 +584,7 @@ def _rehydrate_slot_from_history(
         slot.restore_session_checkpoint(meta.get("session_checkpoint"))
         slot.restore_session_timeline(meta.get("session_timeline"))
         slot.restore_peer_channel_inbox(meta.get("peer_channel_inbox"))
+        slot.restore_post_restart_continuation(meta.get("post_restart_continuation"))
         # Re-validate the companion binding against the slug grammar on restore
         # (same gate as slot create) — history JSONL is a file an attacker with
         # disk access could tamper, and this value flows into to_dict()/WS
@@ -955,6 +956,7 @@ def _restore_recent_sessions_steps(
         slot.restore_session_checkpoint(meta.get("session_checkpoint"))
         slot.restore_session_timeline(meta.get("session_timeline"))
         slot.restore_peer_channel_inbox(meta.get("peer_channel_inbox"))
+        slot.restore_post_restart_continuation(meta.get("post_restart_continuation"))
         # Same tamper gate as _rehydrate_slot_from_history: re-validate the
         # companion binding against the slug grammar before it reaches
         # to_dict()/WS broadcasts.
@@ -2008,6 +2010,8 @@ def _save_slot_to_history(
             peer_channel_inbox = slot.peer_channel_inbox_payload()
             if peer_channel_inbox:
                 meta_line["peer_channel_inbox"] = peer_channel_inbox
+            if continuation := slot.post_restart_continuation():
+                meta_line["post_restart_continuation"] = continuation
             # Artifact companion binding — persisted so a bound
             # session restored after a gateway restart (or resumed from the
             # History page) comes back as the artifact's active bound session.
@@ -2339,6 +2343,17 @@ async def save_slot_off_loop(
     # Non-best-effort: propagate so the caller can roll back (do NOT remove the
     # session until the durable write is confirmed).
     await loop.run_in_executor(None, _do)
+
+
+async def persist_post_restart_continuation(state: DashboardState, slot: _ChatSlot) -> None:
+    """Persist an armed restart check even before the slot has any messages."""
+    if state.conversation_log is None:
+        raise RuntimeError("conversation history is unavailable")
+    await asyncio.to_thread(
+        state.conversation_log.update_metadata,
+        effective_session_key(slot),
+        {"post_restart_continuation": slot.post_restart_continuation()},
+    )
 
 
 def _build_history_prefix(slot: _ChatSlot) -> str:

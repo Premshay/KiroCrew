@@ -43,6 +43,7 @@ from kiro_crew.sandbox import (
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import (
     SESSION_CHECKPOINT_SCHEMA,
+    SESSION_RESTART_CONTINUATION_SCHEMA,
     ValidationError,
     sanitize_string,
     validate_tool_args,
@@ -1819,6 +1820,62 @@ async def api_session_checkpoint(request: web.Request) -> web.Response:
         _publish_restart_barrier(state)
     state.push_slots_update()
     return web.json_response({"ok": True, "session_checkpoint": slot.session_checkpoint_payload()})
+
+
+async def api_session_restart_continuation(request: web.Request) -> web.Response:
+    """Arm one post-restart verification turn on the calling dashboard slot."""
+    state: DashboardState = request.app["state"]
+    session_key = request.headers.get("X-Session-Key", "").strip()
+    if not session_key:
+        return web.json_response(
+            {"error": "X-Session-Key required", "code": "missing_session_key"}, status=400
+        )
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "invalid_restart_continuation"},
+            status=400,
+        )
+    try:
+        continuation = validate_tool_args(body, SESSION_RESTART_CONTINUATION_SCHEMA)
+    except ValidationError as exc:
+        return web.json_response(
+            {"error": str(exc), "code": "invalid_restart_continuation"}, status=400
+        )
+    slots = [slot for slot in state._slots.values() if effective_session_key(slot) == session_key]
+    if len(slots) != 1:
+        return web.json_response(
+            {
+                "error": "the calling session has no unique live dashboard slot",
+                "code": "restart_continuation_slot_not_found",
+            },
+            status=404,
+        )
+    slot = slots[0]
+    previous_continuation = slot.post_restart_continuation()
+    if not slot.arm_post_restart_continuation(continuation["checklist"]):
+        return web.json_response(
+            {"error": "checklist required", "code": "invalid_restart_continuation"}, status=400
+        )
+    try:
+        from kiro_crew.dashboard.chat_persistence import persist_post_restart_continuation
+
+        await persist_post_restart_continuation(state, slot)
+    except Exception:
+        slot.restore_post_restart_continuation(previous_continuation)
+        logger.warning("restart continuation persistence failed for %s", slot.key, exc_info=True)
+        return web.json_response(
+            {
+                "error": "restart continuation persistence failed",
+                "code": "restart_continuation_persistence_failed",
+            },
+            status=500,
+        )
+    state.push_slots_update()
+    return web.json_response({"ok": True})
 
 
 async def api_session_channel(request: web.Request) -> web.Response:

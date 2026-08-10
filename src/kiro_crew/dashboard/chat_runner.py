@@ -63,7 +63,11 @@ from kiro_crew.context_management import (
     strip_plan_markers,
     validate_plan_format,
 )
-from kiro_crew.dashboard.chat_persistence import _build_history_prefix, save_slot_off_loop
+from kiro_crew.dashboard.chat_persistence import (
+    _build_history_prefix,
+    persist_post_restart_continuation,
+    save_slot_off_loop,
+)
 from kiro_crew.dashboard.chat_summary import generate_session_summary
 from kiro_crew.dashboard.chat_title import (
     _extract_and_redact_plan_metadata,
@@ -96,6 +100,7 @@ from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
     expire_slack_options,
     is_peer_channel_request_item,
+    is_post_restart_continuation_item,
     is_system_injection_item,
     mirror_is_paused,
     remember_slack_options,
@@ -126,6 +131,8 @@ from kiro_crew.dashboard.state import (
     NATIVE_SUBAGENT_OUTPUT_TAIL,
     NATIVE_SUBAGENT_TERMINAL_KEEP,
     NATIVE_SUBAGENT_TERMINAL_TTL_SECS,
+    POST_RESTART_CONTINUATION_KIND,
+    POST_RESTART_CONTINUATION_PREFIX,
     REFUSAL_INBAND_RECOVERY_PREFIX,
     REFUSAL_RECOVERY_PREFIX,
     STALE_RECOVERY_PREFIX,
@@ -4266,11 +4273,14 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
 
     is_recovery = any(is_synthetic_recovery_item(item) for item in consumed)
     is_peer_channel_request = any(is_peer_channel_request_item(item) for item in consumed)
+    is_post_restart_continuation = any(
+        is_post_restart_continuation_item(item) for item in consumed
+    )
     # Orthogonal to `is_recovery`, which decides how the row renders: this decides
     # whether the runner may mirror the text to a linked thread as user speech.
     # They diverge on a recovery that replays the user's own message.
     synthetic_payload = any(is_synthetic_payload_item(item) for item in consumed)
-    synthetic_payload = synthetic_payload or is_peer_channel_request
+    synthetic_payload = synthetic_payload or is_peer_channel_request or is_post_restart_continuation
     is_system_injection = any(is_system_injection_item(item) for item in consumed)
     if slot._stopping and not is_system_injection:
         slot.append(
@@ -4297,7 +4307,13 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     next_msg, _ = redact_credentials(next_msg)
     is_cron = next_msg.startswith(CRON_NOTIFY_PREFIX)
     is_subagent = next_msg.startswith(SUBAGENT_COMPLETION_PREFIXES)
-    if not (is_cron or is_subagent or is_recovery or is_peer_channel_request):
+    if not (
+        is_cron
+        or is_subagent
+        or is_recovery
+        or is_peer_channel_request
+        or is_post_restart_continuation
+    ):
         slot._pending_synthesis = False
     match = CRON_NOTIFY_RE.match(next_msg) if is_cron else None
     cron_label = match.group(1) if match else "cron"
@@ -4318,7 +4334,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         _row_meta = {**_row_meta, "synthesisPending": True}
     if is_subagent:
         row_role = "subagent"
-    elif is_cron or is_recovery or is_peer_channel_request:
+    elif is_cron or is_recovery or is_peer_channel_request or is_post_restart_continuation:
         row_role = "inject"
     else:
         row_role = "user"
@@ -4326,7 +4342,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         # A cron row's `cls` slot carries a JSON payload, not a CSS class name:
         # `cronLabel` is structured data the frontend reads off the row.
         row_cls = json.dumps({"cronLabel": cron_label})
-    elif is_recovery or is_peer_channel_request:
+    elif is_recovery or is_peer_channel_request or is_post_restart_continuation:
         row_cls = "msg msg-inject"
     else:
         row_cls = "msg msg-u"
@@ -4346,6 +4362,8 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
             _inject_kind = "cron"
         elif is_peer_channel_request:
             _inject_kind = "peer_channel_request"
+        elif is_post_restart_continuation:
+            _inject_kind = "post_restart_continuation"
         elif synthetic_payload:
             _inject_kind = "recovery"
         else:
@@ -4392,7 +4410,10 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         # (first empty response), so the delivery that counts has not happened yet.
         _consumed[0] = consumed
 
-    _run_kwargs: dict[str, Any] = {"_synthetic_payload": synthetic_payload}
+    _run_kwargs: dict[str, Any] = {
+        "_synthetic_payload": synthetic_payload,
+        "_post_restart_continuation": is_post_restart_continuation,
+    }
     if _settleable:
         _run_kwargs["_on_consumed"] = _note_consumed
     task = spawn_guarded_turn(
@@ -4412,6 +4433,26 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         # queue-entry id is freshly minted and would match no debt.
         _arm_queued_delivery_settlement(state, slot, task, _settleable, _consumed)
     return True
+
+
+async def start_post_restart_continuations(state: DashboardState) -> int:
+    """Dispatch each explicitly armed post-restart verification once per boot."""
+    started = 0
+    for slot in list(state._slots.values()):
+        checklist = slot.post_restart_continuation()
+        if not checklist or any(is_post_restart_continuation_item(item) for item in slot._queue):
+            continue
+        slot.queue_insert(
+            0,
+            f"{POST_RESTART_CONTINUATION_PREFIX}\n"
+            "The gateway restarted after you armed this verification. Complete only the "
+            "following operational checks, report their result, and do not resume unrelated work.\n\n"
+            f"{checklist}",
+            kind=POST_RESTART_CONTINUATION_KIND,
+        )
+        if await _start_next_queued_turn(state, slot):
+            started += 1
+    return started
 
 
 async def _run_pending_synthesis(state: DashboardState, slot: _ChatSlot) -> None:
@@ -4592,6 +4633,7 @@ async def _run_chat(
     *,
     _prompt_depth: int = 0,
     _synthetic_payload: bool = False,
+    _post_restart_continuation: bool = False,
     regenerate_hint: str = "",
     _on_consumed: "Callable[[bool], None] | None" = None,
 ) -> None:
@@ -4603,6 +4645,18 @@ async def _run_chat(
     _stop_gen_at_entry = slot._stop_generation
 
     session_key = effective_session_key(slot)
+    if _post_restart_continuation:
+        pending = slot.post_restart_continuation()
+        if not pending:
+            slot.append("error", "Post-restart verification was no longer armed.", "msg msg-err")
+            return
+        slot.clear_post_restart_continuation()
+        try:
+            await persist_post_restart_continuation(state, slot)
+        except Exception:
+            slot.arm_post_restart_continuation(pending)
+            slot.append("error", "Post-restart verification could not be persisted.", "msg msg-err")
+            return
     sessions = getattr(state, "sessions", None)
 
     # Time-to-first-token clock: starts when the user's message reaches the

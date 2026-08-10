@@ -29,6 +29,7 @@ from kiro_crew.dashboard.state import (
     EMPTY_RESPONSE_RECOVERY_PREFIX,
     MANUAL_RESUME_RECOVERY_PREFIX,
     PEER_CHANNEL_REQUEST_KIND,
+    POST_RESTART_CONTINUATION_KIND,
     POSTTOKEN_RECOVERY_PREFIX,
     PROMISE_ONLY_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIXES,
@@ -1841,6 +1842,7 @@ _SYSTEM_INJECTION_KINDS = frozenset(
         CRON_NOTIFICATION_KIND,
         SYNTHETIC_RECOVERY_KIND,
         PEER_CHANNEL_REQUEST_KIND,
+        POST_RESTART_CONTINUATION_KIND,
     )
 )
 
@@ -1860,6 +1862,11 @@ def is_synthetic_recovery_item(item: dict) -> bool:
 def is_peer_channel_request_item(item: dict) -> bool:
     """True when a queue entry is a named peer request."""
     return item.get("kind") == PEER_CHANNEL_REQUEST_KIND
+
+
+def is_post_restart_continuation_item(item: dict) -> bool:
+    """True when a queue entry runs an explicitly armed restart check."""
+    return item.get("kind") == POST_RESTART_CONTINUATION_KIND
 
 
 class RecoveryPayload(str, Enum):
