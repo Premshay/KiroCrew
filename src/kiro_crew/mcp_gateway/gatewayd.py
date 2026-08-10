@@ -3552,9 +3552,14 @@ def main() -> None:
     # watchdog (no-blocking-call-on-event-loop). Idempotent + process-cached, so
     # every later config_dir() is a cheap lookup; a fresh install with no legacy
     # home just creates the directory.
+    from kiro_crew.config.loader import KiroCrewConfig
     from kiro_crew.config.paths import ensure_data_home
+    from kiro_crew.platform.bootstrap import boot_platform
 
     ensure_data_home()
+    # gatewayd is a separate process and its backend launch path redacts through
+    # the active credential policy, so it must compose the companion before serving.
+    boot_platform(KiroCrewConfig.load())
     try:
         rc = asyncio.run(_amain())
     except KeyboardInterrupt:
