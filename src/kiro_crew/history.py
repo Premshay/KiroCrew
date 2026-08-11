@@ -7401,7 +7401,9 @@ class HistoryConsolidator:
             try:
                 client = await stack.enter_async_context(
                     background_turn(
-                        self._sessions, task="consolidation", agent="kirocrew-lite"
+                        self._sessions,
+                        task="consolidation",
+                        agent="kirocrew-consolidate",
                     )
                 )
             except Exception as exc:
@@ -7417,7 +7419,7 @@ class HistoryConsolidator:
             t_acquired = _time.monotonic()
             wait_s = t_acquired - t_start
             # Reject all tools: this is a text/JSON-only generation turn. kiro
-            # scopes the kirocrew-lite session to tools:[] via set_mode, but the
+            # scopes the background session to tools:[] via set_mode, but the
             # Claude Code backend skips set_mode and injects the full
             # kirocrew-core/cron toolset — without REJECT_ALL a background
             # consolidation turn could fire side-effecting tools (send_message,

@@ -42,6 +42,7 @@ from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.agent_files import (
     AGENT_FILENAME,
 )
+from kiro_crew.agent_files import CONSOLIDATE_AGENT_FILENAME as _CONSOLIDATE_AGENT_FILENAME
 from kiro_crew.agent_files import HEARTBEAT_AGENT_FILENAME as _HEARTBEAT_AGENT_FILENAME
 from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_FILENAME
 from kiro_crew.agent_files import LITE_AGENT_FILENAME as _LITE_AGENT_FILENAME
@@ -4121,6 +4122,12 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     except Exception:
         logger.debug("kirocrew-heartbeat agent install failed", exc_info=True)
 
+    # Install kirocrew-consolidate agent (history consolidation's own identity)
+    try:
+        _install_consolidate_agent()
+    except Exception:
+        logger.debug("kirocrew-consolidate agent install failed", exc_info=True)
+
     # Bidirectional sync: ensure packages installed for one provider
     # are also available for the other (agents↔plugins, skills).
     sync_aim_packages()
@@ -4216,6 +4223,28 @@ def _install_lite_agent_fallback() -> None:
     # cheap default when the role is unpinned. Stored in the sidecar (kiro spec
     # stays schema-clean).
     agent_state.set_cc_model("kirocrew-lite", _background_cc_model())
+
+
+def _install_consolidate_agent() -> None:
+    """Write the kirocrew-consolidate config (history consolidation).
+
+    Identical shell to kirocrew-lite — no tools, no MCP, no prompt — under its
+    own name so deployments can route it independently: consolidation feeds an
+    entire session tail into one prompt, which overflows a small-context lane
+    that lite's micro-jobs (titles, link labels) fit comfortably (observed
+    2026-08-11: four consolidation attempts rejected as oversized on a 32k
+    lane while lite titles succeeded).
+    """
+    path = kiro_agents_dir_path() / _CONSOLIDATE_AGENT_FILENAME
+    config = {
+        "name": "kirocrew-consolidate",
+        "model": _background_agent_model(),
+        "tools": [],
+        "mcpServers": {},
+        "prompt": "",
+    }
+    _atomic_json_write(path, config)
+    agent_state.set_cc_model("kirocrew-consolidate", _background_cc_model())
 
 
 _KNOWLEDGE_SYSTEM_PROMPT = (
