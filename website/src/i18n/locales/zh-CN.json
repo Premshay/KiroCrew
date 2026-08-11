@@ -6461,7 +6461,10 @@
         "continue_hint": "从中断处继续。已经写入磁盘的改动都还在。"
       }
     },
-    "chatPage": {
+      "chatPage": {
+        "voice_audio_stream_could_not_be_played_check_voice_settings_and_try_again": "无法播放音频流。请检查语音设置后重试。",
+        "voice_playback_failed": "语音播放失败",
+        "voice_synthesis_failed_check_voice_settings_and_try_again": "语音合成失败。请检查语音设置后重试。",
       "agent_list": "代理列表",
       "agent_selector": "代理选择器",
       "autopilot_plans_before_executing_each_stage_need": "自动驾驶会先规划再执行。每个阶段都需要你批准（或选择“Go All”以自主运行）。子代理会自动委派。规划经验会跨会话保留。",
@@ -9172,6 +9175,8 @@
         "fastest": "最快",
         "normal": "正常",
         "piper_local_offline": "Piper（本地、离线）",
+        "pocket_tts_local": "Pocket TTS（本地）",
+        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS 在本地运行，并为按需回放流式传输 Ogg Opus。",
         "slow": "慢",
         "slower": "更慢",
         "slowest": "最慢"

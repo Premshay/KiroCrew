@@ -4194,7 +4194,24 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       return
     }
     dispatch(setVoiceAudio(null))
-    api.voiceSynthesize(activeSlotRef.current || '', content).catch(() => {})
+    api.voiceReplay(activeSlotRef.current || '', content)
+      .then((result: { mode?: string; url?: string }) => {
+        if (result.mode === 'stream' && result.url) {
+          window.dispatchEvent(new CustomEvent('voice-play-url', { detail: result.url }))
+          return
+        }
+        return api.voiceSynthesize(activeSlotRef.current || '', content)
+      })
+      .catch((error: unknown) => {
+        dispatch(addNotification({
+          ts: uniqueNotificationTs(),
+          kind: 'agent',
+          priority: 'critical',
+          title: i18nT('pages.chatPage.voice_playback_failed'),
+          body: createFailReason(error),
+          ...(activeSlotRef.current ? { slot: activeSlotRef.current } : {}),
+        }))
+      })
   }, [dispatch])
 
   const handleApplyPlan = useCallback(async (steps: PlanStepInput[]) => {

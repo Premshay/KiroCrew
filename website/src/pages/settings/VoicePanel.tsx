@@ -13,7 +13,7 @@ type VoiceConfig = {
   piper_binary: string; piper_model: string; piper_model_config: string; piper_length_scale: number
 }
 
-const PROVIDER_OPTIONS = ['piper', 'polly']
+const PROVIDER_OPTIONS = ['pocket', 'piper', 'polly']
 /**
  * Catalog KEY per provider — not the label itself. This table is evaluated at
  * module load, so an `i18nT()` call here would freeze the boot language and
@@ -25,6 +25,7 @@ const PROVIDER_OPTIONS = ['piper', 'polly']
  * can resolve statically.
  */
 const PROVIDER_LABEL_KEY: Record<string, string> = {
+  pocket: 'pages.settings.voicePanel.pocket_tts_local',
   piper: 'pages.settings.voicePanel.piper_local_offline',
   polly: 'pages.settings.voicePanel.amazon_polly_cloud',
 }
@@ -64,8 +65,8 @@ const SPEED_OPTIONS = ['80%', '90%', '95%', '100%', '110%', '120%', '130%', '150
 
 /**
  * Voice settings — the single home for all voice config:
- *  - Text-to-Speech: spoken replies. Provider is Piper (local, offline, the
- *    default) or Amazon Polly (cloud). The field set switches with the provider.
+ *  - Text-to-Speech: spoken replies. Providers include local Pocket TTS and
+ *    Piper, plus cloud Amazon Polly. The field set switches with the provider.
  *  - Speech-to-Text (Whisper / MLX / Transcribe): dictation + install flow.
  */
 export function VoicePanel() {
@@ -75,6 +76,7 @@ export function VoicePanel() {
   const [localRegion, setLocalRegion] = useState('')
   const [localPiperBinary, setLocalPiperBinary] = useState('')
   const [localPiperModel, setLocalPiperModel] = useState('')
+  const [localPocketVoice, setLocalPocketVoice] = useState('')
 
   // ── Text-to-Speech config (server-side) ──
   const voiceQ = useQuery<VoiceConfig>({ queryKey: ['voiceConfig'], queryFn: () => api.voiceConfig() })
@@ -91,11 +93,16 @@ export function VoicePanel() {
       setLocalRegion(voiceQ.data.region || '')
       setLocalPiperBinary(voiceQ.data.piper_binary || '')
       setLocalPiperModel(voiceQ.data.piper_model || '')
+      setLocalPocketVoice(voiceQ.data.voice || '')
     }
   }, [voiceQ.data])
 
   const voiceCfg = voiceQ.data ?? { enabled: false, provider: 'piper', voice: 'Ruth', engine: 'generative', rate: '100%', autoSpeak: false, aws_profile: '', region: '', piper_binary: '', piper_model: '', piper_model_config: '', piper_length_scale: 1.0 }
   const isPolly = voiceCfg.provider === 'polly'
+  const isPocket = voiceCfg.provider === 'pocket'
+  useEffect(() => {
+    if (isPocket) setLocalPocketVoice(voiceCfg.voice || '')
+  }, [isPocket, voiceCfg.voice])
   const voiceOptions = voicesQ.data?.voices
     ? voicesQ.data.voices.map(v => ({ value: v.id, label: `${v.name} (${v.languageCode} ${v.gender[0]})`, engines: v.engines }))
     : VOICE_OPTIONS_FALLBACK.map(v => ({ ...v, engines: ENGINE_OPTIONS }))
@@ -120,6 +127,7 @@ export function VoicePanel() {
         setLocalRegion(ctx.prev.region || '')
         setLocalPiperBinary(ctx.prev.piper_binary || '')
         setLocalPiperModel(ctx.prev.piper_model || '')
+        setLocalPocketVoice(ctx.prev.voice || '')
         window.dispatchEvent(new CustomEvent('voice-config-changed', { detail: ctx.prev }))
       }
       setSaveError(i18nT('pages.settings.voicePanel.failed_to_save_voice_config'))
@@ -146,7 +154,7 @@ export function VoicePanel() {
           ) : (
             <>
               <SettingsToggle label={i18nT('pages.settings.voicePanel.auto_speak_responses')} description={i18nT('pages.settings.voicePanel.speak_every_assistant_reply_automatically')} checked={voiceCfg.autoSpeak} onChange={v => setVoice({ autoSpeak: v, ...(v ? { enabled: true } : {}) })} disabled={voiceDisabled} />
-              <SettingsSelect label={i18nT('pages.settings.voicePanel.provider')} description={i18nT('pages.settings.voicePanel.piper_runs_locally_and_offline_polly_uses_aws_cr')} value={voiceCfg.provider} options={PROVIDER_OPTIONS} optionLabels={PROVIDER_OPTIONS.map(p => i18nT(PROVIDER_LABEL_KEY[p]))} onChange={v => setVoice({ provider: v })} disabled={voiceDisabled} />
+              <SettingsSelect label={i18nT('pages.settings.voicePanel.provider')} description={voiceCfg.provider === 'pocket' ? i18nT('pages.settings.voicePanel.pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay') : i18nT('pages.settings.voicePanel.piper_runs_locally_and_offline_polly_uses_aws_cr')} value={voiceCfg.provider} options={PROVIDER_OPTIONS} optionLabels={PROVIDER_OPTIONS.map(p => i18nT(PROVIDER_LABEL_KEY[p]))} onChange={v => setVoice({ provider: v, ...(v === 'pocket' ? { voice: 'michael' } : {}) })} disabled={voiceDisabled} />
               {isPolly ? (
                 <>
                   <SettingsSelect label={i18nT('pages.settings.voicePanel.voice')} description={i18nT('pages.settings.voicePanel.amazon_polly_voice_for_tts')} value={voiceCfg.voice} options={voiceOptions.map(o => o.value)} optionLabels={voiceOptions.map(o => o.label)} onChange={v => { const engines = voiceOptions.find(o => o.value === v)?.engines ?? ENGINE_OPTIONS; const patch: Partial<VoiceConfig> = { voice: v }; if (!engines.includes(voiceCfg.engine)) patch.engine = engines[0]; setVoice(patch) }} disabled={voiceDisabled} />
@@ -155,6 +163,8 @@ export function VoicePanel() {
                   <SettingsInput label={i18nT('pages.settings.voicePanel.aws_profile_polly')} description={i18nT('pages.settings.voicePanel.aws_credentials_profile_for_polly')} value={localProfile} onChange={setLocalProfile} onBlur={() => setVoice({ aws_profile: localProfile.trim() })} placeholder={i18nT('pages.settings.voicePanel.default')} disabled={voiceDisabled} />
                   <SettingsInput label={i18nT('pages.settings.voicePanel.aws_region_polly')} description={i18nT('pages.settings.voicePanel.aws_region_for_polly_api')} value={localRegion} onChange={setLocalRegion} onBlur={() => setVoice({ region: localRegion.trim() })} placeholder={i18nT('pages.settings.voicePanel.us_east_1')} disabled={voiceDisabled} />
                 </>
+              ) : isPocket ? (
+                <SettingsInput label={i18nT('pages.settings.voicePanel.voice')} value={localPocketVoice} onChange={setLocalPocketVoice} onBlur={() => setVoice({ voice: localPocketVoice.trim() })} placeholder="michael" disabled={voiceDisabled} />
               ) : (
                 <>
                   <SettingsInput label={i18nT('pages.settings.voicePanel.piper_model')} description={i18nT('pages.settings.voicePanel.path_to_the_piper_voice_model_onnx_required_down')} value={localPiperModel} onChange={setLocalPiperModel} onBlur={() => setVoice({ piper_model: localPiperModel.trim() })} placeholder={i18nT('pages.settings.voicePanel.piper_en_us_lessac_medium_onnx')} disabled={voiceDisabled} />

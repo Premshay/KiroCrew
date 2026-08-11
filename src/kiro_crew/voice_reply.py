@@ -1,7 +1,7 @@
 """KiroCrew voice reply — generate TTS audio and upload to Slack thread.
 
 Post-response hook: strips markdown, generates audio via the configured
-TTS provider (Amazon Polly or local Piper), uploads to the same Slack thread.
+TTS provider (Amazon Polly, local Piper, or local Pocket TTS), uploads to the same Slack thread.
 Fire-and-forget — never blocks the text response.
 
 Supported providers:
@@ -14,18 +14,21 @@ Supported providers:
 - ``piper`` (recommended offline default): Local neural TTS via the ``piper``
   CLI (https://github.com/rhasspy/piper). Produces WAV. Requires the ``piper``
   binary and a voice model (.onnx + .onnx.json) on disk. Fully offline.
+- ``pocket``: Pocket TTS through KiroCrew's Piper-compatible local shim. On-demand
+  dashboard replay streams progressive Ogg Opus; Slack delivery remains file-based.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
 import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, AsyncGenerator
 
 from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -38,7 +41,8 @@ logger = logging.getLogger(__name__)
 # ── Provider constants ──
 PROVIDER_POLLY = "polly"
 PROVIDER_PIPER = "piper"
-VALID_PROVIDERS = frozenset({PROVIDER_POLLY, PROVIDER_PIPER})
+PROVIDER_POCKET = "pocket"
+VALID_PROVIDERS = frozenset({PROVIDER_POLLY, PROVIDER_PIPER, PROVIDER_POCKET})
 # Local offline TTS (Piper) is the documented recommended default — it needs no
 # AWS credentials or network. Polly remains fully supported when explicitly
 # selected (``provider="polly"``) with the ``aws`` CLI + credentials present.
@@ -63,7 +67,7 @@ def is_available(
     """
     if provider == PROVIDER_POLLY:
         return shutil.which("aws") is not None
-    if provider == PROVIDER_PIPER:
+    if provider in {PROVIDER_PIPER, PROVIDER_POCKET}:
         bin_path = _resolve_piper_binary(piper_binary)
         if not bin_path:
             return False
@@ -103,12 +107,14 @@ def _resolve_piper_binary(configured: str = "") -> str | None:
 
 # ── Config defaults ──
 DEFAULT_VOICE = "Ruth"
+DEFAULT_POCKET_VOICE = "michael"
 DEFAULT_ENGINE = "generative"
 DEFAULT_RATE = "100%"
 DEFAULT_PITCH = "+0%"
 DEFAULT_LENGTH_SCALE = 1.0  # Piper speed: <1 faster, >1 slower
 OUTPUT_FORMAT = "mp3"
 MAX_CHARS = 2900  # Polly SSML limit ~3000 chars, leave margin
+POCKET_STREAM_READ_TIMEOUT = 60
 
 VALID_ENGINES = frozenset({"neural", "generative", "long-form", "standard"})
 _RATE_RE = re.compile(r"^\d{1,3}%$")
@@ -249,6 +255,7 @@ async def _synthesize_piper(
     piper_model: str = "",
     piper_model_config: str = "",
     length_scale: float = 1.0,
+    runtime_env: dict[str, str] | None = None,
 ) -> str | None:
     """Call local piper TTS to generate WAV. Returns temp file path or None.
 
@@ -291,10 +298,12 @@ async def _synthesize_piper(
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, **runtime_env} if runtime_env else None,
             )
             try:
                 _stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(text.encode("utf-8")), timeout=60,
+                    proc.communicate(text.encode("utf-8")),
+                    timeout=60,
                 )
             except asyncio.TimeoutError:
                 # asyncio.wait_for cancels communicate() on timeout but does NOT
@@ -315,7 +324,11 @@ async def _synthesize_piper(
                     pass
                 return None
             if proc.returncode != 0:
-                logger.error("piper failed (rc=%d): %s", proc.returncode, stderr.decode(errors="replace")[:500])
+                logger.error(
+                    "piper failed (rc=%d): %s",
+                    proc.returncode,
+                    stderr.decode(errors="replace")[:500],
+                )
                 os.unlink(path)
                 return None
             if os.path.getsize(path) < 100:
@@ -385,19 +398,100 @@ async def synthesize_speech(
             aws_profile=aws_profile,
             region=region,
         )
-    if provider == PROVIDER_PIPER:
+    if provider in {PROVIDER_PIPER, PROVIDER_POCKET}:
         plain = strip_markdown(text).strip()
         if not plain:
             return None
+        runtime_env = None
+        if provider == PROVIDER_POCKET:
+            runtime_env = {
+                "KIROCREW_TTS_ENGINE": "pocket",
+                "KIROCREW_TTS_VOICE": voice_id,
+            }
         return await _synthesize_piper(
             plain,
             piper_binary=piper_binary,
             piper_model=piper_model,
             piper_model_config=piper_model_config,
             length_scale=length_scale,
+            runtime_env=runtime_env,
         )
     logger.error("synthesize_speech: unknown provider %r", provider)
     return None
+
+
+async def stream_pocket_speech(
+    text: str,
+    *,
+    voice_id: str,
+    piper_binary: str,
+    piper_model: str,
+    piper_model_config: str = "",
+    length_scale: float = 1.0,
+) -> AsyncGenerator[bytes, None]:
+    """Yield Pocket's progressive Ogg Opus output through the local shim."""
+    text, _ = redact_exfiltration_urls(text)
+    text, _ = redact_credentials(text)
+    plain = strip_markdown(text).strip()
+    if not plain:
+        raise RuntimeError("no speakable text")
+    bin_path = _resolve_piper_binary(piper_binary)
+    model = os.path.expanduser(piper_model) if piper_model else ""
+    if not bin_path or not model or not os.path.isfile(model):
+        raise RuntimeError("Pocket TTS is not configured")
+    cfg = os.path.expanduser(piper_model_config) if piper_model_config else ""
+    cmd: list[str] = [bin_path, "--stream", "-m", model]
+    if cfg:
+        cmd += ["-c", cfg]
+    if length_scale != 1.0:
+        cmd += ["--length-scale", str(length_scale)]
+    sandbox_cleanup: str | None = None
+    proc: asyncio.subprocess.Process | None = None
+    stderr_task: asyncio.Task[bytes] | None = None
+    yielded = False
+    try:
+        cmd, sandbox_cleanup = wrap_argv(cmd, mode="standard")
+        proc = await create_subprocess_limited(
+            *cgroup_scope_argv(cmd),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={
+                **os.environ,
+                "KIROCREW_TTS_ENGINE": "pocket",
+                "KIROCREW_TTS_VOICE": voice_id,
+            },
+        )
+        assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+        proc.stdin.write(plain.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
+        stderr_task = asyncio.create_task(proc.stderr.read())
+        while chunk := await asyncio.wait_for(
+            proc.stdout.read(64 * 1024), timeout=POCKET_STREAM_READ_TIMEOUT
+        ):
+            yielded = True
+            yield chunk
+        returncode = await proc.wait()
+        stderr = await stderr_task
+        if returncode != 0 or not yielded:
+            detail = stderr.decode(errors="replace")[:500]
+            raise RuntimeError(f"Pocket stream failed (rc={returncode}): {detail}")
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError("Pocket stream timed out") from exc
+    finally:
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+        if stderr_task is not None and not stderr_task.done():
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stderr_task
+        if sandbox_cleanup:
+            with contextlib.suppress(OSError):
+                os.unlink(sandbox_cleanup)
 
 
 async def _synthesize_polly(
@@ -602,9 +696,13 @@ async def streaming_voice_reply(
     response_text, cred_warns = redact_credentials(response_text)
     response_text, url_warns = redact_exfiltration_urls(response_text)
     if cred_warns:
-        logger.warning("stream_voice_chunks: redacted %d credential pattern(s) before TTS", len(cred_warns))
+        logger.warning(
+            "stream_voice_chunks: redacted %d credential pattern(s) before TTS", len(cred_warns)
+        )
     if url_warns:
-        logger.warning("stream_voice_chunks: redacted %d suspicious URL(s) before TTS", len(url_warns))
+        logger.warning(
+            "stream_voice_chunks: redacted %d suspicious URL(s) before TTS", len(url_warns)
+        )
 
     sentences = split_sentences(response_text)
     for i, sentence in enumerate(sentences):

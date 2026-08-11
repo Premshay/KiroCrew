@@ -209,6 +209,38 @@ export function useWebSocket() {
     updateVoiceBusy()
   }, [dispatch, updateVoiceBusy])
 
+  const playVoiceUrl = useCallback((url: string) => {
+    voiceMutedRef.current = false
+    const audio = new Audio(url)
+    activeAudioRef.current = audio
+    voicePlayingRef.current = true
+    dispatch(setVoicePlaying(true))
+    updateVoiceBusy()
+    let failureReported = false
+    const finish = () => {
+      if (activeAudioRef.current !== audio) return
+      activeAudioRef.current = null
+      voicePlayingRef.current = false
+      dispatch(setVoicePlaying(false))
+      updateVoiceBusy()
+    }
+    const fail = () => {
+      finish()
+      if (failureReported) return
+      failureReported = true
+      dispatch(addNotification({
+        ts: String(Date.now()),
+        kind: 'agent',
+        priority: 'critical',
+        title: i18nT('pages.chatPage.voice_playback_failed'),
+        body: i18nT('pages.chatPage.voice_audio_stream_could_not_be_played_check_voice_settings_and_try_again'),
+      } as Notification))
+    }
+    audio.onended = finish
+    audio.onerror = fail
+    audio.play().then(markFirstAudio).catch(fail)
+  }, [dispatch, updateVoiceBusy])
+
   const playNextVoiceChunk = useCallback(() => {
     if (voicePlayingRef.current || voiceQueueRef.current.length === 0) return
     voicePlayingRef.current = true
@@ -1051,11 +1083,11 @@ export function useWebSocket() {
             if (voiceMutedRef.current) break
             if (data.slot !== store.getState().chat.activeSlot) break
             // Queue and play audio chunks as they arrive
-            const b64 = (data as { audio: string }).audio
+            const { audio: b64, audioMime } = data as { audio: string; audioMime?: string }
             if (b64) {
               try {
                 const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
-                const blob = new Blob([bytes], { type: 'audio/mpeg' })
+                const blob = new Blob([bytes], { type: audioMime === 'audio/wav' ? 'audio/wav' : 'audio/mpeg' })
                 const url = URL.createObjectURL(blob)
                 voiceQueueRef.current.push(url)
                 dispatch(setVoicePlaying(true))
@@ -1068,6 +1100,20 @@ export function useWebSocket() {
           case 'voice_complete': {
             const b64 = (data as { audio: string }).audio
             if (b64) dispatch(setVoiceAudio(b64))
+            break
+          }
+          case 'voice_error': {
+            const voiceError = typeof data.error === 'string' && data.error.trim()
+              ? data.error
+              : i18nT('pages.chatPage.voice_synthesis_failed_check_voice_settings_and_try_again')
+            dispatch(addNotification({
+              ts: String(Date.now()),
+              kind: 'agent',
+              priority: 'critical',
+              title: i18nT('pages.chatPage.voice_playback_failed'),
+              body: voiceError,
+              ...(typeof data.slot === 'string' && data.slot ? { slot: data.slot } : {}),
+            } as Notification))
             break
           }
           case 'log':
@@ -1224,8 +1270,13 @@ export function useWebSocket() {
       const detail = (e as CustomEvent).detail
       autoSpeakRef.current = !!detail?.autoSpeak
     }
+    const onVoicePlayUrl = (e: Event) => {
+      const url = (e as CustomEvent<unknown>).detail
+      if (typeof url === 'string') playVoiceUrl(url)
+    }
     window.addEventListener('voice-stop', onVoiceStop)
     window.addEventListener('voice-config-changed', onVoiceConfigChanged)
+    window.addEventListener('voice-play-url', onVoicePlayUrl)
     return () => {
       closingRef.current = true
       clearTimeout(reconnectTimerRef.current)
@@ -1235,8 +1286,9 @@ export function useWebSocket() {
       wsRef.current = null
       window.removeEventListener('voice-stop', onVoiceStop)
       window.removeEventListener('voice-config-changed', onVoiceConfigChanged)
+      window.removeEventListener('voice-play-url', onVoicePlayUrl)
     }
-  }, [connect, stopVoice])
+  }, [connect, playVoiceUrl, stopVoice])
 
   /** Subscribe to log events — call with callback on mount, null on unmount. */
   const subscribeLogs = useCallback((cb: LogCallback) => {

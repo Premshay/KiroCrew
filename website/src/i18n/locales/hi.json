@@ -6535,7 +6535,10 @@
         "continue_hint": "जहाँ रुका था वहीं से फिर शुरू करें। डिस्क पर लिखा हुआ काम जैसा है वैसा रहेगा।"
       }
     },
-    "chatPage": {
+      "chatPage": {
+        "voice_audio_stream_could_not_be_played_check_voice_settings_and_try_again": "ऑडियो स्ट्रीम चल नहीं सकी। वॉइस सेटिंग्स जाँचें और फिर कोशिश करें।",
+        "voice_playback_failed": "वॉइस प्लेबैक विफल",
+        "voice_synthesis_failed_check_voice_settings_and_try_again": "वॉइस संश्लेषण विफल। वॉइस सेटिंग्स जाँचें और फिर कोशिश करें।",
       "agent_list": "एजेंट सूची",
       "agent_selector": "एजेंट चयनकर्ता",
       "autopilot_plans_before_executing_each_stage_need": "ऑटोपायलट पहले योजना बनाता है, फिर चलाता है। हर चरण के लिए तुम्हारी स्वीकृति चाहिए (या बिना रुके चलाने के लिए 'Go All' चुनें)। सब-एजेंट अपने-आप सौंपे जाते हैं। योजना से मिली सीख सेशनों के बीच बनी रहती है।",
@@ -9259,6 +9262,8 @@
         "fastest": "सबसे तेज़",
         "normal": "सामान्य",
         "piper_local_offline": "Piper (स्थानीय, ऑफ़लाइन)",
+        "pocket_tts_local": "Pocket TTS (स्थानीय)",
+        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS स्थानीय रूप से चलता है और मांग पर पुनः चलाने के लिए Ogg Opus स्ट्रीम करता है।",
         "slow": "धीमा",
         "slower": "और धीमा",
         "slowest": "सबसे धीमा"

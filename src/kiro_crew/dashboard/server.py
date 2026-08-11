@@ -2274,6 +2274,8 @@ async def start_dashboard(
     app.router.add_patch("/api/chat/tag-columns/{id}", chat.api_chat_tag_column_update)
     app.router.add_delete("/api/chat/tag-columns/{id}", chat.api_chat_tag_column_delete)
     app.router.add_post("/api/voice/synthesize", chat.api_voice_synthesize)
+    app.router.add_post("/api/voice/replay", chat.api_voice_replay)
+    app.router.add_get("/api/voice/replay/{job_id}", chat.api_voice_replay_stream)
     app.router.add_get("/api/voice/config", chat.api_voice_config)
     app.router.add_put("/api/voice/config", chat.api_voice_config)
     app.router.add_get("/api/voice/voices", chat.api_voice_voices)

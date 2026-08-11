@@ -6609,7 +6609,10 @@
         "continue_hint": "Retomar de onde parou. O trabalho já gravado no disco permanece intacto."
       }
     },
-    "chatPage": {
+      "chatPage": {
+        "voice_audio_stream_could_not_be_played_check_voice_settings_and_try_again": "Não foi possível reproduzir o fluxo de áudio. Verifique as configurações de voz e tente novamente.",
+        "voice_playback_failed": "Falha na reprodução de voz",
+        "voice_synthesis_failed_check_voice_settings_and_try_again": "Falha na síntese de voz. Verifique as configurações de voz e tente novamente.",
       "agent_list": "Lista de agentes",
       "agent_selector": "Seletor de agentes",
       "autopilot_plans_before_executing_each_stage_need": "O Autopilot planeja antes de executar. Cada etapa precisa da sua aprovação (ou selecione 'Go All' para executar de forma autônoma). Subagentes são delegados automaticamente. As lições do plano persistem entre sessões.",
@@ -9346,6 +9349,8 @@
         "fastest": "O mais rápido",
         "normal": "Normal",
         "piper_local_offline": "Piper (local, offline)",
+        "pocket_tts_local": "Pocket TTS (local)",
+        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS é executado localmente e transmite Ogg Opus para reprodução sob demanda.",
         "slow": "Lento",
         "slower": "Mais lento",
         "slowest": "O mais lento"

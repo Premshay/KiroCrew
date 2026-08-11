@@ -6535,7 +6535,10 @@
         "continue_hint": "যেখানে থেমেছিল সেখান থেকে চালান। ডিস্কে লেখা কাজ অপরিবর্তিত থাকে।"
       }
     },
-    "chatPage": {
+      "chatPage": {
+        "voice_audio_stream_could_not_be_played_check_voice_settings_and_try_again": "অডিও স্ট্রিম চালানো যায়নি। ভয়েস সেটিংস পরীক্ষা করে আবার চেষ্টা করুন।",
+        "voice_playback_failed": "ভয়েস প্লেব্যাক ব্যর্থ হয়েছে",
+        "voice_synthesis_failed_check_voice_settings_and_try_again": "ভয়েস সংশ্লেষণ ব্যর্থ হয়েছে। ভয়েস সেটিংস পরীক্ষা করে আবার চেষ্টা করুন।",
       "agent_list": "এজেন্ট তালিকা",
       "agent_selector": "এজেন্ট নির্বাচক",
       "autopilot_plans_before_executing_each_stage_need": "Autopilot চালানোর আগে পরিকল্পনা করে। প্রতিটি ধাপে তোমার অনুমোদন লাগে (বা নিজে থেকে চালাতে 'Go All' বেছে নাও)। সাবএজেন্টকে স্বয়ংক্রিয়ভাবে দায়িত্ব দেওয়া হয়। পরিকল্পনার শিক্ষা সেশনজুড়ে থেকে যায়।",
@@ -9259,6 +9262,8 @@
         "fastest": "দ্রুততম",
         "normal": "সাধারণ",
         "piper_local_offline": "Piper (লোকাল, অফলাইন)",
+        "pocket_tts_local": "Pocket TTS (লোকাল)",
+        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS লোকালভাবে চলে এবং চাহিদামতো পুনঃপ্লেব্যাকের জন্য Ogg Opus স্ট্রিম করে।",
         "slow": "ধীর",
         "slower": "ধীরতর",
         "slowest": "ধীরতম"

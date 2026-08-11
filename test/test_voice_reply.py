@@ -10,9 +10,11 @@ import pytest
 from kiro_crew.voice_reply import (
     DEFAULT_LENGTH_SCALE,
     DEFAULT_PITCH,
+    DEFAULT_POCKET_VOICE,
     DEFAULT_PROVIDER,
     DEFAULT_RATE,
     PROVIDER_PIPER,
+    PROVIDER_POCKET,
     PROVIDER_POLLY,
     VALID_ENGINES,
     VALID_PROVIDERS,
@@ -23,6 +25,7 @@ from kiro_crew.voice_reply import (
     _validate_rate,
     is_available,
     split_sentences,
+    stream_pocket_speech,
     strip_markdown,
     synthesize_speech,
     text_to_ssml,
@@ -232,6 +235,8 @@ class TestProviderConstants:
         assert DEFAULT_PROVIDER == PROVIDER_PIPER
         assert PROVIDER_POLLY in VALID_PROVIDERS
         assert PROVIDER_PIPER in VALID_PROVIDERS
+        assert PROVIDER_POCKET in VALID_PROVIDERS
+        assert DEFAULT_POCKET_VOICE == "michael"
 
 
 # ── is_available() ──────────────────────────────────────────────────────
@@ -580,6 +585,47 @@ class TestSynthesizePiper:
 # ── _synthesize_polly() ──────────────────────────────────────────────────
 
 
+class TestStreamPocketSpeech:
+    @pytest.mark.asyncio
+    async def test_uses_stream_shim_and_yields_ogg_bytes(self, tmp_path) -> None:
+        model = tmp_path / "voice.onnx"
+        model.write_bytes(b"m")
+        stdin = MagicMock()
+        stdin.drain = AsyncMock()
+        stdout = MagicMock()
+        stdout.read = AsyncMock(side_effect=[b"OggSfirst", b"second", b""])
+        stderr = MagicMock()
+        stderr.read = AsyncMock(return_value=b"")
+        proc = MagicMock(stdin=stdin, stdout=stdout, stderr=stderr, returncode=0)
+        proc.wait = AsyncMock(return_value=0)
+        captured: dict[str, object] = {}
+
+        async def fake_create(*cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            return proc
+
+        with (
+            patch("kiro_crew.voice_reply._resolve_piper_binary", return_value="/bin/piper"),
+            patch("kiro_crew.voice_reply.wrap_argv", side_effect=lambda cmd, mode: (cmd, None)),
+            patch("kiro_crew.voice_reply.create_subprocess_limited", side_effect=fake_create),
+        ):
+            chunks = [
+                chunk
+                async for chunk in stream_pocket_speech(
+                    "hello",
+                    voice_id="michael",
+                    piper_binary="/bin/piper",
+                    piper_model=str(model),
+                )
+            ]
+
+        assert chunks == [b"OggSfirst", b"second"]
+        assert "--stream" in captured["cmd"]
+        assert captured["env"]["KIROCREW_TTS_ENGINE"] == "pocket"
+        assert captured["env"]["KIROCREW_TTS_VOICE"] == "michael"
+
+
 class TestSynthesizePolly:
     @pytest.fixture(autouse=True)
     def _passthrough_sandbox(self, monkeypatch):
@@ -784,6 +830,21 @@ class TestSynthesizeSpeechDispatcher:
         assert out == "/tmp/out.wav"
         mock_piper.assert_awaited_once()
         mock_polly.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pocket_dispatches_voice_to_local_runtime(self) -> None:
+        with patch(
+            "kiro_crew.voice_reply._synthesize_piper",
+            new=AsyncMock(return_value="/tmp/out.wav"),
+        ) as mock_piper:
+            output = await synthesize_speech(
+                "hello world", provider=PROVIDER_POCKET, voice_id="michael"
+            )
+        assert output == "/tmp/out.wav"
+        assert mock_piper.await_args.kwargs["runtime_env"] == {
+            "KIROCREW_TTS_ENGINE": "pocket",
+            "KIROCREW_TTS_VOICE": "michael",
+        }
 
     @pytest.mark.asyncio
     async def test_unknown_provider_returns_none(self) -> None:

@@ -6535,7 +6535,10 @@
         "continue_hint": "Ab der Unterbrechung fortsetzen. Bereits auf die Festplatte geschriebene Arbeit bleibt unberührt."
       }
     },
-    "chatPage": {
+      "chatPage": {
+        "voice_audio_stream_could_not_be_played_check_voice_settings_and_try_again": "Der Audiostream konnte nicht wiedergegeben werden. Überprüfen Sie die Spracheinstellungen und versuchen Sie es erneut.",
+        "voice_playback_failed": "Sprachwiedergabe fehlgeschlagen",
+        "voice_synthesis_failed_check_voice_settings_and_try_again": "Sprachsynthese fehlgeschlagen. Überprüfen Sie die Spracheinstellungen und versuchen Sie es erneut.",
       "agent_list": "Agenten-Liste",
       "agent_selector": "Agenten-Auswahl",
       "autopilot_plans_before_executing_each_stage_need": "Autopilot plant, bevor er ausführt. Jede Phase benötigt deine Genehmigung (oder wähle „Go All“, um autonom auszuführen). Subagenten werden automatisch delegiert. Plan-Lektionen bleiben über Sitzungen hinweg erhalten.",
@@ -9259,6 +9262,8 @@
         "fastest": "Am schnellsten",
         "normal": "Normal",
         "piper_local_offline": "Piper (lokal, offline)",
+        "pocket_tts_local": "Pocket TTS (lokal)",
+        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS läuft lokal und streamt Ogg Opus für die Wiedergabe auf Abruf.",
         "slow": "Langsam",
         "slower": "Langsamer",
         "slowest": "Am langsamsten"

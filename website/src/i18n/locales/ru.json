@@ -6683,7 +6683,10 @@
         "continue_hint": "Продолжить с места остановки. Уже записанные на диск изменения не тронуты."
       }
     },
-    "chatPage": {
+      "chatPage": {
+        "voice_audio_stream_could_not_be_played_check_voice_settings_and_try_again": "Не удалось воспроизвести аудиопоток. Проверьте настройки голоса и повторите попытку.",
+        "voice_playback_failed": "Не удалось воспроизвести голос",
+        "voice_synthesis_failed_check_voice_settings_and_try_again": "Не удалось синтезировать речь. Проверьте настройки голоса и повторите попытку.",
       "agent_list": "Список агентов",
       "agent_selector": "Выбор агента",
       "autopilot_plans_before_executing_each_stage_need": "Автопилот сначала строит план, затем выполняет. Каждый этап требует твоего подтверждения (или выбери «Go All» для автономного запуска). Субагенты делегируются автоматически. Выводы по планам сохраняются между сессиями.",
@@ -9433,6 +9436,8 @@
         "fastest": "Самая быстрая",
         "normal": "Обычная",
         "piper_local_offline": "Piper (локально, офлайн)",
+        "pocket_tts_local": "Pocket TTS (локально)",
+        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS работает локально и передаёт Ogg Opus для воспроизведения по запросу.",
         "slow": "Медленная",
         "slower": "Медленнее",
         "slowest": "Самая медленная"
