@@ -86,10 +86,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
-
     from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
-    from kiro_crew.acp.types import AcpEvent
 
 from kiro_crew import model_registry, platform_compat, shutdown_event
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
@@ -109,6 +106,7 @@ from kiro_crew.messaging.link import (
     telemetry_channel_of,
 )
 from kiro_crew.metrics.provider import get_recorder
+from kiro_crew.platform.acp_binding import apply_runtime_client_binding, runtime_client_binding
 from kiro_crew.providers.base import CancelOutcome, LLMProvider
 from kiro_crew.sandbox import cleanup_stale_sandbox_profiles
 from kiro_crew.sel import sel
@@ -549,56 +547,6 @@ class _Session:
     cancelled: set[str] = field(default_factory=set)
 
 
-class _ProviderBgSession:
-    """``AcpSessionHandle``-compatible handle over the shared ``BACKGROUND_KEY``
-    ``_Session``, for non-kiro providers (claude_code / bedrock) that cannot use
-    the multiplexed kiro-only ``AcpRuntime``.
-
-    All ``_bg`` callers share this ONE provider session, so turns are serialized
-    by the existing per-session ``Semaphore(1)`` — exactly the old pre-multiplex
-    behavior. It yields the SAME ``AcpEvent`` type as ``AcpSessionHandle`` and
-    both paths parse frames through the shared ``_dispatch.parse_session_update``
-    — so the two ``_bg`` code paths cannot drift: this adapter is pure plumbing
-    over ``provider.stream`` / ``provider.reject_tool``, adding no second parser.
-    """
-
-    def __init__(self, sess: "_Session") -> None:
-        self._sess = sess
-        self._sem_held = False
-
-    @property
-    def session_id(self) -> str:
-        try:
-            return self._sess.provider.session_id
-        except Exception:
-            return ""
-
-    def _release(self) -> None:
-        if self._sem_held:
-            self._sem_held = False
-            self._sess.semaphore.release()
-
-    async def prompt(self, message: str, timeout: float | None = None) -> "AsyncIterator[AcpEvent]":
-        # timeout is accepted for AcpSessionHandle signature parity; the
-        # underlying provider/client manages its own stale-turn watchdog.
-        await self._sess.semaphore.acquire()
-        self._sem_held = True
-        try:
-            async for event in self._sess.provider.stream(message):
-                yield event
-        finally:
-            self._release()
-
-    async def reject_tool(self, request_id: str | int) -> None:
-        await self._sess.provider.reject_tool(request_id)
-
-    async def destroy(self) -> None:
-        # The BACKGROUND_KEY _Session is persistent and shared — never tear it
-        # down here. Just release the turn semaphore deterministically so the
-        # next _bg caller isn't blocked on generator finalization.
-        self._release()
-
-
 class SessionManager:
     """Thread-keyed LLM provider pool with warm session pre-spawning."""
 
@@ -966,34 +914,12 @@ class SessionManager:
 
     # ── Warm Pool ──
 
-    def _bg_provider_is_kiro(self) -> bool:
-        """True when the ``kirocrew-lite`` ``_bg`` agent resolves to the kiro
-        (``acp``) backend — the only backend the multiplexed ``AcpRuntime``
-        supports. For non-kiro backends ``_bg`` falls back to the provider-backed
-        ``_Session`` path serialized by ``Semaphore(1)``.
-        """
-        try:
-            prov = getattr(self._cfg.agent, "provider", "acp") or "acp"
-        except Exception:
-            prov = "acp"
-        return prov == "acp"
+    async def get_bg_session(self) -> "AcpSessionHandle":
+        """Acquire an ephemeral session on the shared background runtime.
 
-    async def get_bg_session(self) -> "AcpSessionHandle | _ProviderBgSession":
-        """Acquire a ``_bg`` session handle, dispatching by provider backend.
-
-        kiro (``acp``) → ephemeral ``AcpSessionHandle`` on the shared multiplexed
-        ``AcpRuntime`` (each caller gets its own ``sessionId``; runtime creation
-        guarded by ``_bg_runtime_lock``; respawn-once on death). non-kiro →
-        ``_ProviderBgSession`` over the shared ``BACKGROUND_KEY`` ``_Session``
-        serialized by its ``Semaphore(1)``. Caller MUST call ``session.destroy()``
-        in a finally block when done.
+        The runtime's backend is selected through the direct ACP binding seam.
+        Caller MUST call ``session.destroy()`` in a finally block when done.
         """
-        if not self._bg_provider_is_kiro():
-            await self._ensure_background()
-            sess = self._sessions.get(BACKGROUND_KEY)
-            if sess is None:
-                raise RuntimeError("background session unavailable for non-kiro _bg provider")
-            return _ProviderBgSession(sess)
 
         # circular import: session -> acp.runtime -> acp.client -> session
         from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead
@@ -1059,10 +985,12 @@ class SessionManager:
                     # passes the config mode (default "off", which kiro-cli's own
                     # internal sandbox covers); mirror it here so the bg session
                     # has the same posture rather than a stricter accidental one.
-                    runtime = AcpRuntime(
-                        agent="kirocrew-lite",
-                        sandbox_mode=getattr(self._cfg.agent, "sandbox", "auto"),
-                    )
+                    agent = "kirocrew-lite"
+                    runtime_kwargs: dict[str, Any] = {
+                        "sandbox_mode": getattr(self._cfg.agent, "sandbox", "auto"),
+                    }
+                    apply_runtime_client_binding(runtime_kwargs, runtime_client_binding(agent))
+                    runtime = AcpRuntime(agent=agent, **runtime_kwargs)
                     await runtime.spawn()
                     self._bg_runtime = runtime
             try:
@@ -1135,6 +1063,7 @@ class SessionManager:
                 # Mirror the parent's security posture (sandbox + MCP gateway +
                 # env) so companion-runtime subagents never run unsandboxed.
                 rt_kwargs = self._parent_runtime_kwargs(parent_session_key)
+                apply_runtime_client_binding(rt_kwargs, runtime_client_binding(agent))
                 runtime = AcpRuntime(agent=agent, **rt_kwargs)
                 try:
                     await runtime.spawn()

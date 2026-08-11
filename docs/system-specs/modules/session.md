@@ -39,28 +39,26 @@ Callers: heartbeat callback, taskrunner lesson extraction.
 
 ### Multiplexed _bg runtime
 
-`get_bg_session()` acquires a `_bg` handle, dispatching by provider backend and
-returning `AcpSessionHandle | _ProviderBgSession`. Provider dispatch is via
-`_bg_provider_is_kiro()`, which resolves the `kirocrew-lite` agent backend:
+`get_bg_session()` acquires an `AcpSessionHandle` from the shared `_bg_runtime`.
+Each caller (title generation, suggestions, folders, nav) gets its **own**
+ephemeral `sessionId`, multiplexed on a runtime created lazily under
+`_bg_runtime_lock`; `create_session()` runs **outside** that lock so independent
+callers are not serialized. The runtime is respawned-and-retried once on
+`AcpRuntimeDead` (`max_retries=1`, 2 attempts total).
 
-- **kiro (`acp`)** — the only backend the multiplexed `AcpRuntime` supports.
-  Each caller (title generation, suggestions, folders, nav) gets its **own**
-  ephemeral `sessionId` multiplexed on a single shared `_bg_runtime` (an
-  `AcpRuntime`, kiro-cli only), created lazily under `_bg_runtime_lock`.
-  `create_session()` runs **outside** the lock so independent callers aren't
-  serialized. The runtime is respawned-and-retried once on `AcpRuntimeDead`
-  (`max_retries=1`, 2 attempts total).
-- **non-kiro** — falls back to a `_ProviderBgSession` over the shared
-  `BACKGROUND_KEY` `_Session`, serialized by its `Semaphore(1)`. `AcpRuntime` is
-  kiro-only, so any non-kiro backend must use the provider path. In the public
-  KiroCrew edition `agent.provider` is fixed to `acp`, so this branch is the
-  dormant fallback for the reserved `ACP_BACKEND_CLAUDE` seam only.
+The `get_bg_session()` direct runtime construction reads the narrow
+`ProviderRegistry.agent_client_binding("kirocrew-lite")` seam. A companion can
+therefore route the lightweight background agent to its ACP backend without
+discarding the configured sandbox. Unbound public installs still spawn the
+native Kiro CLI path. Other `BACKGROUND_KEY` callers that use
+`get_or_create()` retain their ordinary persistent provider session. Subagent
+runtimes and Code Review Sage's review runtime use the same binding helper; a
+missing requested subagent name defaults to `"kirocrew"` before lookup, so it
+cannot silently bypass the default mapping.
 
-Both paths yield `AcpEvent` through the shared
-`acp/_dispatch.parse_session_update` parser, so there is no behavioral drift
-between them. Callers **MUST** call `session.destroy()` in a `finally` block
-when done. See [acp-client.md](acp-client.md) for `AcpRuntime` /
-`AcpSessionHandle`.
+The runtime yields `AcpEvent` through the shared `acp/_dispatch.parse_session_update`
+parser. Callers **MUST** call `session.destroy()` in a `finally` block when done.
+See [acp-client.md](acp-client.md) for `AcpRuntime` / `AcpSessionHandle`.
 
 **Cheapest-model bg tasks**: the categorical/classification background tasks
 (folder-icon `chat_folders.py`, link-summary `chat_nav.py`, session title

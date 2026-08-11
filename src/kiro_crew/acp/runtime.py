@@ -33,8 +33,14 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.client import (
     _NOT_LOGGED_IN_RE,
+    CLAUDE_ACP_BIN,
+    CLAUDE_ACP_NPM_PKG,
+    CLAUDE_CODE_BIN,
+    PROTOCOL_VERSION_CLAUDE,
     _get_start_time,
     _KiroExecutableTrustError,
+    _resolve_claude_acp_bin,
+    _resolve_claude_code_executable,
     _resolve_kiro_bin_for_spawn,
 )
 from kiro_crew.acp.session_handle import (
@@ -44,6 +50,7 @@ from kiro_crew.acp.session_handle import (
     AcpSessionHandle,
 )
 from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
     ACP_CLIENT_CAPABILITIES,
     METHOD_MCP_OAUTH_REQUEST,
     METHOD_SESSION_LOAD,
@@ -404,6 +411,8 @@ class AcpRuntime:
         max_age_secs: float = _DEFAULT_MAX_AGE_SECS,
         max_rss_mb: float = _DEFAULT_MAX_RSS_MB,
         model: str | None = None,
+        acp_backend: str = "",
+        model_switch_method: str = "",
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -421,6 +430,8 @@ class AcpRuntime:
                     f"^[a-zA-Z0-9][a-zA-Z0-9._-]{{0,127}}$"
                 )
         self._model = model
+        self._acp_backend = acp_backend
+        self._model_switch_method = model_switch_method
         self._sandbox_mode = sandbox_mode
         self._extra_env = extra_env or {}
         self._mcp_gateway_overlay = str(mcp_gateway_overlay) if mcp_gateway_overlay else None
@@ -485,6 +496,11 @@ class AcpRuntime:
         # called exactly once, in spawn(), and never re-entered.
         self._dropped_frames: dict[tuple[str, str], int] = {}
         self._dropped_frames_flushed_at: float = 0.0
+
+    @property
+    def _is_claude(self) -> bool:
+        """Whether this runtime uses the companion's Claude ACP backend."""
+        return self._acp_backend == ACP_BACKEND_CLAUDE
 
     @property
     def pid(self) -> int | None:
@@ -571,31 +587,33 @@ class AcpRuntime:
 
         self._work_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            kiro_bin = await _resolve_kiro_bin_for_spawn()
-        except _KiroExecutableTrustError as exc:
-            raise AcpRuntimeError(str(exc)) from exc
-        if not kiro_bin:
-            raise AcpRuntimeError(f"{KIRO_CLI_BIN} not found in PATH")
+        if self._is_claude:
+            claude_argv = await asyncio.to_thread(_resolve_claude_acp_bin)
+            if not claude_argv:
+                raise AcpRuntimeError(
+                    f"{CLAUDE_ACP_BIN} not found. Install it with "
+                    f"'npm i -g {CLAUDE_ACP_NPM_PKG}' or set "
+                    "CLAUDE_AGENT_ACP_BIN."
+                )
+            argv: list[str] = claude_argv
+        else:
+            try:
+                kiro_bin = await _resolve_kiro_bin_for_spawn()
+            except _KiroExecutableTrustError as exc:
+                raise AcpRuntimeError(str(exc)) from exc
+            if not kiro_bin:
+                raise AcpRuntimeError(f"{KIRO_CLI_BIN} not found in PATH")
 
-        # Self-heal (B): kiro-cli discovers its selectable modes at startup from
-        # ~/.kiro/agents/*.json, so the managed default agent file must exist
-        # BEFORE this --agent spawn or set_mode later fails with
-        # "Mode '<agent>' not found". Regenerate it if missing (best-effort, off
-        # the loop). Non-managed agents can't be materialized here — the
-        # create_session guard fails those closed instead.
-        try:
-            await asyncio.to_thread(ensure_agent_materialized, self._agent)
-        except Exception:
-            logger.warning("pre-spawn agent materialization failed", exc_info=True)
+            # Kiro CLI discovers selectable agents from its on-disk specs before
+            # it accepts session/set_mode. The Claude ACP adapter has no modes.
+            try:
+                await asyncio.to_thread(ensure_agent_materialized, self._agent)
+            except Exception:
+                logger.warning("pre-spawn agent materialization failed", exc_info=True)
 
-        argv: list[str] = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
-        if self._model:
-            # Pin the model at process start (mirrors `kiro-cli chat --model X`).
-            # This is the ONLY reliable way to run a non-default provider model
-            # (e.g. GPT for image generation) — post-session set_model cannot
-            # cross provider boundaries, and agent configs may pin a model.
-            argv += ["--model", self._model]
+            argv = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
+            if self._model:
+                argv += ["--model", self._model]
 
         # OSS sandbox.wrap_argv supports (argv, mode, strip_python_env). The
         # MCP-gateway overlay is NOT delivered through the sandbox: its broker
@@ -607,7 +625,7 @@ class AcpRuntime:
             argv,
             mode=self._sandbox_mode,
             strip_python_env=True,
-            is_kiro_cli=True,
+            is_kiro_cli=not self._is_claude,
         )
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
@@ -618,6 +636,17 @@ class AcpRuntime:
         env = {**os.environ}
         if self._extra_env:
             env.update(self._extra_env)
+
+        if self._is_claude and not env.get("CLAUDE_CODE_EXECUTABLE"):
+            claude_exe = _resolve_claude_code_executable()
+            if claude_exe:
+                env["CLAUDE_CODE_EXECUTABLE"] = claude_exe
+            else:
+                logger.warning(
+                    "%s not found on PATH; the claude-agent-acp adapter will fail. "
+                    "Set CLAUDE_CODE_EXECUTABLE.",
+                    CLAUDE_CODE_BIN,
+                )
 
         # Parent-level scrub of gateway-owned channel credentials. The default
         # auto/standard sandbox launcher strips _AGENT_DENIED_ENV_KEYS only for
@@ -660,7 +689,11 @@ class AcpRuntime:
         self._start_time = _get_start_time(self._pid)
         self._spawn_monotonic = time.monotonic()
         self._last_activity = time.monotonic()
-        logger.info("AcpRuntime spawned kiro-cli acp (PID %d)", self._pid)
+        logger.info(
+            "AcpRuntime spawned %s (PID %d)",
+            "claude-agent-acp" if self._is_claude else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}",
+            self._pid,
+        )
 
         # Track the PID for orphan cleanup (mirrors AcpClient._spawn). Without
         # this, a kiro-cli process leaked by a gateway crash/restart is never
@@ -695,15 +728,25 @@ class AcpRuntime:
             self._reader_task = asyncio.ensure_future(self._reader_loop())
 
             # Protocol handshake
-            init_resp = await self._send_and_await(
-                "initialize",
-                {
-                    "clientName": CLIENT_NAME,
-                    "clientVersion": CLIENT_VERSION,
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "clientCapabilities": ACP_CLIENT_CAPABILITIES,
-                },
-            )
+            init_params: dict[str, Any] = {
+                "clientCapabilities": ACP_CLIENT_CAPABILITIES,
+            }
+            if self._is_claude:
+                init_params.update(
+                    {
+                        "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
+                        "protocolVersion": PROTOCOL_VERSION_CLAUDE,
+                    }
+                )
+            else:
+                init_params.update(
+                    {
+                        "clientName": CLIENT_NAME,
+                        "clientVersion": CLIENT_VERSION,
+                        "protocolVersion": PROTOCOL_VERSION,
+                    }
+                )
+            init_resp = await self._send_and_await("initialize", init_params)
             self._can_load_session = bool(
                 init_resp.get("agentCapabilities", {}).get("loadSession", False)
             )
@@ -1278,6 +1321,10 @@ class AcpRuntime:
             cwd if cwd else self._work_dir,
             mcp_servers=mcp_servers,
         )
+        if self._is_claude:
+            # claude-agent-acp requires this adapter-owned metadata and does
+            # not load Kiro agent specs or support session/set_mode.
+            params["_meta"] = {"claudeCode": {"options": {}}}
 
         self._session_inits_in_flight += 1
         session_id = ""
@@ -1304,6 +1351,16 @@ class AcpRuntime:
         # Populate state from session/new response (configOptions, available models)
         handle.store_session_config(resp)
 
+        # The local Claude adapter selects a configured model after session/new;
+        # Kiro CLI instead receives it at process start. The binding is resolved
+        # before construction, so it wins over an agent-spec pin without changing
+        # unbound runtimes.
+        if self._is_claude and self._model:
+            if self._model_switch_method == "session_set_model":
+                await handle.set_model(self._model)
+            else:
+                await handle.set_config_option("model", self._model)
+
         # Set agent mode if specified. If set_mode raises, no handle is returned
         # to the caller, so terminate the session we just created above —
         # session/new already succeeded so the session exists in kiro-cli; a
@@ -1319,7 +1376,7 @@ class AcpRuntime:
         # rather than silently leaving the session on kiro-cli's default mode: for
         # a restricted/app agent that would run a BROADER agent than requested (a
         # privilege escalation), so we terminate and raise an actionable error.
-        if agent and self._mode_available(agent, resp):
+        if not self._is_claude and agent and self._mode_available(agent, resp):
             try:
                 await self._send_and_await(
                     METHOD_SET_MODE,
@@ -1328,7 +1385,7 @@ class AcpRuntime:
             except Exception:
                 await self.terminate_session(session_id)
                 raise
-        elif agent:
+        elif not self._is_claude and agent:
             _ids, _current, _adv = parse_session_modes(resp)
             await self.terminate_session(session_id)
             raise AcpRuntimeError(
@@ -1416,7 +1473,7 @@ class AcpRuntime:
         # succeeded so kiro-cli holds it; a plain local unregister would leak it
         # in the shared process (and leave the reader routing late transcript-
         # replay frames to an abandoned queue). terminate_session unregisters too.
-        if agent and self._mode_available(agent, resp):
+        if not self._is_claude and agent and self._mode_available(agent, resp):
             try:
                 await self._send_and_await(
                     METHOD_SET_MODE,
@@ -1425,7 +1482,7 @@ class AcpRuntime:
             except Exception:
                 await self.terminate_session(resume_sid)
                 raise
-        elif agent:
+        elif not self._is_claude and agent:
             # Guard (A) — see create_session. A resumed session always echoes a
             # `modes` list (checked above), so an absent agent means its config
             # isn't loaded. Fail closed rather than silently resuming on a

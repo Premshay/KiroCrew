@@ -131,6 +131,38 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         ReviewPool(work_dir="/tmp/x")
         self.assertEqual(FakeRuntime.instances, [])   # nothing spawned on construction
 
+    async def test_runtime_receives_review_agent_binding_without_losing_isolation(self):
+        captured: dict = {}
+
+        def factory(agent=None, work_dir=None, sandbox_mode="auto", **kwargs):
+            captured.update(
+                agent=agent,
+                work_dir=work_dir,
+                sandbox_mode=sandbox_mode,
+                **kwargs,
+            )
+            return FakeRuntime(agent=agent, work_dir=work_dir, sandbox_mode=sandbox_mode)
+
+        original_runtime = rp.AcpRuntime
+        original_binding = rp.runtime_client_binding
+        rp.AcpRuntime = factory  # type: ignore[assignment]
+        rp.runtime_client_binding = lambda _agent: {
+            "acp_backend": "claude",
+            "extra_env": {"ANTHROPIC_MODEL": "fast"},
+        }
+        self.addCleanup(lambda: setattr(rp, "AcpRuntime", original_runtime))
+        self.addCleanup(lambda: setattr(rp, "runtime_client_binding", original_binding))
+
+        pool = ReviewPool(work_dir="/tmp/x")
+        await pool.begin_batch()
+        await pool.end_batch()
+
+        self.assertEqual(captured["agent"], "kirocrew")
+        self.assertEqual(captured["work_dir"], "/tmp/x")
+        self.assertEqual(captured["sandbox_mode"], "auto")
+        self.assertEqual(captured["acp_backend"], "claude")
+        self.assertEqual(captured["extra_env"], {"ANTHROPIC_MODEL": "fast"})
+
     async def test_begin_batch_spawns_one_runtime_shared_across_sends(self):
         _install_fake_runtime(self, script=[_ev(rp.EVENT_TEXT_CHUNK, text="hi")])
         pool = ReviewPool(work_dir="/tmp/x")
