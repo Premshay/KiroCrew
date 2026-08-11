@@ -1223,7 +1223,8 @@ def _is_transient_raw_error(
         # Session expiry is terminal — retrying can't refresh an expired login.
         return False
     if _RE_CONNECTION.search(haystack):
-        # A temporary endpoint failure is safe for the bounded retry ladder.
+        # Recognized terminal signals above take precedence; an otherwise unknown
+        # cause with connection wording may consume only this bounded retry budget.
         return True
     return bool(
         _RE_5XX_NAMED.search(haystack)
