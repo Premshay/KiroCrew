@@ -54,6 +54,7 @@ from kiro_crew.validation import (
     SESSION_CHECKPOINT_MAIN_ITEM_MAX,
     SESSION_CHECKPOINT_MAIN_ITEMS_MAX,
     SESSION_CHECKPOINT_MILESTONE_MAX,
+    SESSION_CHECKPOINT_NEXT_ACTION_MAX,
     SESSION_CHECKPOINT_PROGRESS_LABEL_MAX,
     SESSION_CHECKPOINT_SUMMARY_MAX,
     SESSION_CHECKPOINT_TRAIL_MAX,
@@ -1512,6 +1513,9 @@ class _ChatSlot:
             if (text := self._checkpoint_text(item, SESSION_CHECKPOINT_MAIN_ITEM_MAX))
         ][:SESSION_CHECKPOINT_MAIN_ITEMS_MAX]
         goal = self._checkpoint_text(checkpoint.get("goal"), SESSION_CHECKPOINT_GOAL_MAX)
+        next_action = self._checkpoint_text(
+            checkpoint.get("next_action"), SESSION_CHECKPOINT_NEXT_ACTION_MAX
+        )
         if "goal" not in checkpoint and self._session_checkpoint is not None:
             goal = self._session_checkpoint["goal"]
         old_trail = self._session_checkpoint.get("trail", []) if self._session_checkpoint else []
@@ -1522,6 +1526,7 @@ class _ChatSlot:
         ]
         self._session_checkpoint = {
             "goal": goal,
+            "next_action": next_action,
             "summary": summary,
             "main_items": main_items,
             "trail": (trail + [milestone])[-SESSION_CHECKPOINT_TRAIL_MAX:],
@@ -1543,6 +1548,9 @@ class _ChatSlot:
         updated_at = checkpoint.get("updated_at")
         self._session_checkpoint = {
             "goal": self._checkpoint_text(checkpoint.get("goal"), SESSION_CHECKPOINT_GOAL_MAX),
+            "next_action": self._checkpoint_text(
+                checkpoint.get("next_action"), SESSION_CHECKPOINT_NEXT_ACTION_MAX
+            ),
             "summary": summary,
             "main_items": [
                 text
@@ -1571,6 +1579,7 @@ class _ChatSlot:
             return None
         return {
             "goal": self._session_checkpoint["goal"],
+            "next_action": self._session_checkpoint["next_action"],
             "summary": self._session_checkpoint["summary"],
             "main_items": list(self._session_checkpoint["main_items"]),
             "trail": list(self._session_checkpoint["trail"]),
