@@ -1082,6 +1082,17 @@ def _is_transient_raw_error(
         # local lane that is a restarting router or a lane mid-swap; the
         # bounded retry ladder spans the recovery window, and the ingestion
         # layer's own per-item retry covers anything longer.
+        #
+        # Precedence caveat: the terminal checks above only recognise their
+        # own vocabulary (AWS class names, the listed limit phrasings). A
+        # terminal cause phrased outside it — "invalid bearer token", "you
+        # have exceeded your usage limit" — used to fall through to the
+        # terminal default; with incidental connection wording it now retries.
+        # Accepted: the cost is one bounded ladder (~14s), and the rerouted
+        # local lane speaks errno forms, not those phrasings. Bare
+        # "terminated" (undici's abrupt-close word) is deliberately NOT
+        # matched: too generic ("session terminated", "terminated by
+        # policy"), and undici pairs a real drop with an errno we do match.
         return True
     return bool(
         _RE_5XX_NAMED.search(haystack)
