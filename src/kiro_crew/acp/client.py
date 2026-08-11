@@ -1015,6 +1015,16 @@ _RE_5XX_NAMED = re.compile(
     r"|DispatchFailure|ConnectionReset(?:Error)?)\b"
 )
 _RE_5XX_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE)
+_RE_CONNECTION = re.compile(
+    r"\bE(?:CONNREFUSED|CONNRESET|CONNABORTED|TIMEDOUT|PIPE|HOSTUNREACH|AI_AGAIN)\b"
+    r"|\bsocket hang ?up\b"
+    r"|\bfetch failed\b"
+    r"|\bconnection (?:refused|reset|closed|error|timed ?out)\b",
+    re.IGNORECASE,
+)
+_RE_5XX_PHRASE = re.compile(
+    r"\binternal server error\b|\bservice unavailable\b", re.IGNORECASE
+)
 # Genuine retry hint only. "response stream" is deliberately NOT matched here,
 # because that would make this branch a catch-all: kiro-cli wraps EVERY mid-stream
 # provider failure as "Encountered an error in the response stream: <real cause>",
@@ -1174,6 +1184,7 @@ def _is_transient_raw_error(
     retry layer (``llm_helpers``, ``chat_runner``). Precedence mirrors
     :func:`_format_acp_error`: unentitled-model(terminal) →
     usage-limit(terminal) → model-unavailable → throttle → auth(terminal) →
+    session-expired(terminal) → connection failure(transient) →
     generic 5xx / pre-stream generation failure → unknown(terminal).
 
     *available_models* is this account's advertised set when the caller knows
@@ -1211,10 +1222,14 @@ def _is_transient_raw_error(
     if _is_session_expired(haystack):
         # Session expiry is terminal — retrying can't refresh an expired login.
         return False
+    if _RE_CONNECTION.search(haystack):
+        # A temporary endpoint failure is safe for the bounded retry ladder.
+        return True
     return bool(
         _RE_5XX_NAMED.search(haystack)
         or _RE_5XX_STATUS.search(haystack)
         or _RE_5XX_HINT.search(haystack)
+        or _RE_5XX_PHRASE.search(haystack)
         or _RE_GENERATE_FAILED.search(data)
     )
 
@@ -1430,10 +1445,20 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
                 "sign-in issue, not a backend error."
                 f"{req_id_suffix}"
             )
+        elif _RE_CONNECTION.search(haystack):
+            formatted = (
+                "Could not reach the model backend (connection refused, reset, "
+                "or timed out). On a local lane this is usually a router "
+                "restart or a model swap and clears within seconds — retry in "
+                "a moment. If it keeps happening, check that the backend "
+                "endpoint is up and listening."
+                f"{req_id_suffix}"
+            )
         elif (
             _RE_5XX_NAMED.search(haystack)
             or _RE_5XX_STATUS.search(haystack)
             or _RE_5XX_HINT.search(haystack)
+            or _RE_5XX_PHRASE.search(haystack)
         ):
             # Transient backend 5xx — Bedrock/Codewhisperer surfaces a
             # momentary InternalServerError (often wrapped in a
