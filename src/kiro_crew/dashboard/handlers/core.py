@@ -491,7 +491,6 @@ _STT_LANGUAGE_CODES: tuple[str, ...] = (
     "it-IT",
     "pt-BR",
     "he-IL",
-    "ro-RO",
     "ja-JP",
     "zh-CN",
 )
