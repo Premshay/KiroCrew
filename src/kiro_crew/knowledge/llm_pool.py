@@ -20,9 +20,10 @@ from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort
 from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
 
 try:
-    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.acp.client import AcpClient, AcpTimeoutError
 except ImportError:
     AcpClient = None  # type: ignore[assignment,misc]
+    AcpTimeoutError = ()  # type: ignore[assignment,misc]
 
 # Sweep-protection shield for AcpClient-backed workers. These are direct,
 # long-lived AcpClient sessions (not SessionMap sessions / warm-pool providers),
@@ -969,24 +970,35 @@ class LLMPool:
 
         results: list[str] = [""] * len(prompts)
         terminal: list[BaseException] = []
+        floor_hit: list[BaseException] = []
 
         async def _do_one(idx: int, prompt: str) -> None:
-            if terminal:
+            if terminal or floor_hit:
                 return
             slot, worker = await self.acquire()
             sent = False
             try:
                 # Re-checked after the wait: a prompt queued behind a full pool
                 # may have been waiting while an earlier one proved the backend
-                # terminal, and spending its slot would buy nothing.
-                if terminal:
+                # terminal or exceeded the bound-lane floor, and spending its
+                # slot would buy nothing.
+                if terminal or floor_hit:
                     return
                 sent = True
                 results[idx] = await worker.send_message(
                     prompt, timeout=max(timeout, self._timeout_floor)
                 )
             except Exception as e:
-                if getattr(e, "transient", None) is False:
+                if self._timeout_floor > 0 and isinstance(e, AcpTimeoutError):
+                    if not floor_hit:
+                        floor_hit.append(e)
+                        logger.warning(
+                            "LLMPool: prompt exceeded the %.0fs timeout floor; "
+                            "the serving lane is unhealthy, abandoning the remaining "
+                            "batch. The floor is an alarm, not a budget.",
+                            self._timeout_floor,
+                        )
+                elif getattr(e, "transient", None) is False:
                     if terminal:
                         logger.debug("LLMPool: batch item %d hit the same terminal error", idx)
                     else:
