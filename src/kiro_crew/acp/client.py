@@ -775,6 +775,30 @@ _RE_5XX_NAMED = re.compile(
     r"|DispatchFailure|ConnectionReset(?:Error)?)\b"
 )
 _RE_5XX_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE)
+# Connection-level failures between the agent process and its configured
+# endpoint: the errno tokens Node/undici stringify into error messages
+# (ECONNREFUSED against a closed port, ECONNRESET/EPIPE on a dropped
+# connection, ETIMEDOUT on a hung one, EAI_AGAIN on a flaky resolver) plus the
+# spelled-out phrasings ("socket hang up", "fetch failed", "Connection
+# error."). Transient: against a local lane these are the signature of a
+# router restart, a model swap, or a yielded GPU — conditions that clear
+# within the bounded retry ladder. ENOTFOUND is deliberately absent: a name
+# that does not resolve is configuration, and every retry reproduces it.
+_RE_CONNECTION = re.compile(
+    r"\bE(?:CONNREFUSED|CONNRESET|CONNABORTED|TIMEDOUT|PIPE|HOSTUNREACH|AI_AGAIN)\b"
+    r"|\bsocket hang ?up\b"
+    r"|\bfetch failed\b"
+    r"|\bconnection (?:refused|reset|closed|error|timed ?out)\b",
+    re.IGNORECASE,
+)
+# Spaced/lowercase 5xx phrasings a plain HTTP proxy or local router emits as
+# body text. The string-fallback marker list (llm_helpers._TRANSIENT_MARKERS)
+# has treated these as transient all along; the raw classifier only knew the
+# CamelCase exception names, so the two classifiers disagreed on the same
+# error — the #1550 failure shape, in the other direction.
+_RE_5XX_PHRASE = re.compile(
+    r"\binternal server error\b|\bservice unavailable\b", re.IGNORECASE
+)
 # Genuine retry hint only. "response stream" USED TO BE matched here, which made
 # this branch a catch-all: kiro-cli wraps EVERY mid-stream provider failure as
 # "Encountered an error in the response stream: <real cause>", so the wrapper
@@ -880,6 +904,7 @@ def _is_transient_raw_error(
     retry layer (``llm_helpers``, ``chat_runner``). Precedence mirrors
     :func:`_format_acp_error`: unentitled-model(terminal) →
     usage-limit(terminal) → model-unavailable → throttle → auth(terminal) →
+    session-expired(terminal) → connection failure(transient) →
     generic 5xx / pre-stream generation failure → unknown(terminal).
 
     *available_models* is this account's advertised set when the caller knows
@@ -907,10 +932,20 @@ def _is_transient_raw_error(
     if _RE_AUTH.search(haystack):
         # Auth is terminal — a retry can't fix an expired/denied credential.
         return False
+    if _is_session_expired(haystack):
+        # Session expiry is terminal — retrying can't refresh an expired login.
+        return False
+    if _RE_CONNECTION.search(haystack):
+        # The endpoint refused, dropped, or timed out the connection. On a
+        # local lane that is a restarting router or a lane mid-swap; the
+        # bounded retry ladder spans the recovery window, and the ingestion
+        # layer's own per-item retry covers anything longer.
+        return True
     return bool(
         _RE_5XX_NAMED.search(haystack)
         or _RE_5XX_STATUS.search(haystack)
         or _RE_5XX_HINT.search(haystack)
+        or _RE_5XX_PHRASE.search(haystack)
         or _RE_GENERATE_FAILED.search(data)
     )
 
@@ -1100,10 +1135,36 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
                 "Bedrock InvokeModel access."
                 f"{req_id_suffix}"
             )
+        elif _is_session_expired(haystack):
+            # Session expiry (401/403, or prose saying as much) — distinct from
+            # the Bedrock credential errors above. Retrying or switching models
+            # cannot succeed, so the message must not suggest either.
+            formatted = (
+                "Your session has expired. Run `kiro-cli login` in your "
+                "terminal to sign back in, then start a new chat. "
+                "Retrying or switching models will not help — this is a "
+                "sign-in issue, not a backend error."
+                f"{req_id_suffix}"
+            )
+        elif _RE_CONNECTION.search(haystack):
+            # Connection-level failure: the agent process could not reach (or
+            # lost) its configured endpoint. Against a local lane this is the
+            # normal signature of a restarting router or a serving lane
+            # mid-swap and clears in seconds; persistent repetition means the
+            # endpoint is actually down.
+            formatted = (
+                "Could not reach the model backend (connection refused, reset, "
+                "or timed out). On a local lane this is usually a router "
+                "restart or a model swap and clears within seconds — retry in "
+                "a moment. If it keeps happening, check that the backend "
+                "endpoint is up and listening."
+                f"{req_id_suffix}"
+            )
         elif (
             _RE_5XX_NAMED.search(haystack)
             or _RE_5XX_STATUS.search(haystack)
             or _RE_5XX_HINT.search(haystack)
+            or _RE_5XX_PHRASE.search(haystack)
         ):
             # Transient backend 5xx — Bedrock/Codewhisperer surfaces a
             # momentary InternalServerError (often wrapped in a

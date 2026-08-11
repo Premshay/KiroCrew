@@ -77,6 +77,17 @@ _TRANSIENT_MARKERS = (
     "is unavailable on the backend",
     "is unavailable on bedrock",
     "transient error (http 5xx)",  # _format_acp_error's generic-5xx message
+    # Connection-level failures (client._RE_CONNECTION): the raw errno tokens
+    # for history-restored messages that still carry the original error text,
+    # plus _format_acp_error's own connection wording for fresh ones. On a
+    # local lane these mean a restarting router or a serving lane mid-swap.
+    "econnrefused",
+    "econnreset",
+    "econnaborted",
+    "etimedout",
+    "socket hang up",
+    "fetch failed",
+    "could not reach the model backend",
 )
 
 
