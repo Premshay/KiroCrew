@@ -104,6 +104,69 @@ def _get_provider_type(config: Optional[dict] = None) -> str:
     return provider if isinstance(provider, str) and provider else "acp"
 
 
+def _clean_binding(raw: dict) -> dict:
+    """Keep the binding keys this pool applies, with the types AcpClient wants.
+
+    A companion describes an engine here; it does not get to hand arbitrary
+    kwargs to a constructor, so anything outside ``ACP_CLIENT_BINDING_KEYS`` is
+    dropped. The surviving values are coerced rather than trusted — a typo in a
+    hand-edited engine map must not reach ``AcpClient`` as an int or a nested
+    dict and fail somewhere far from its cause.
+    """
+    from kiro_crew.platform.interfaces import ACP_CLIENT_BINDING_KEYS
+
+    binding: dict = {}
+    for key, value in raw.items():
+        if key not in ACP_CLIENT_BINDING_KEYS:
+            continue
+        if key == "extra_env":
+            if isinstance(value, dict) and value:
+                binding[key] = {str(k): str(v) for k, v in value.items()}
+        elif isinstance(value, str) and value:
+            binding[key] = value
+    return binding
+
+
+def _resolve_client_binding() -> tuple[dict, str]:
+    """Resolve this agent's engine binding; name the registry that had none.
+
+    ``config.loader.build_provider_factory`` is the documented route for every
+    provider-factory build site, so an edition that supplies an alternate factory
+    — a companion binding agents to an operator's own subscription or a local
+    lane — takes effect everywhere that route is used. This pool is the one build
+    site that cannot use it: :class:`AcpWorker` needs its own ``audit_source``
+    (the per-tool SEL audit worker-pool clients emit for themselves), sandbox
+    mode and work dir, none of which survive a factory-built provider. It reads
+    the binding directly instead, through the narrow
+    :meth:`ProviderRegistry.agent_client_binding` seam.
+
+    Returns ``(binding, unbound_registry)``. Exactly one is ever non-empty. A
+    registry name comes back when an edition supplies a factory but nothing for
+    THIS agent: the pool keeps working, on a provider the operator did not
+    choose, and without this nothing in the logs would connect the two. Both are
+    empty under the Default registry, where there is no binding to miss, and on
+    any lookup failure — resolving a binding must not break the pool.
+    """
+    try:
+        from kiro_crew.platform.context import current_context
+        from kiro_crew.platform.defaults import DefaultProviderRegistry
+
+        providers = current_context().providers
+    except Exception:
+        return {}, ""
+    if isinstance(providers, DefaultProviderRegistry):
+        return {}, ""
+    lookup = getattr(providers, "agent_client_binding", None)
+    raw = None
+    if callable(lookup):
+        try:
+            raw = lookup(AGENT_NAME)
+        except Exception:
+            logger.debug("AcpWorker: agent_client_binding lookup failed", exc_info=True)
+    binding = _clean_binding(raw) if isinstance(raw, dict) else {}
+    return (binding, "") if binding else ({}, type(providers).__name__)
+
+
 def _get_sandbox_mode(config: Optional[dict] = None) -> str:
     """OS-level sandbox mode for knowledge-worker subprocesses.
 
@@ -203,9 +266,25 @@ class AcpWorker(Worker):
             if self._sandbox_mode is not None
             else await asyncio.to_thread(_get_sandbox_mode)
         )
-        logger.info("AcpWorker: starting with agent=%s", AGENT_NAME)
+        binding, unbound_registry = await asyncio.to_thread(_resolve_client_binding)
+        if unbound_registry:
+            logger.warning(
+                "AcpWorker: %s supplies a provider factory but no client binding for "
+                "agent %s, so the worker runs on the native path and any provider "
+                "binding for it (subscription or local lane) does not apply here",
+                unbound_registry,
+                AGENT_NAME,
+            )
+        logger.info(
+            "AcpWorker: starting with agent=%s binding=%s",
+            AGENT_NAME,
+            sorted(binding) or "none",
+        )
         self._client = AcpClient(
-            agent=AGENT_NAME, sandbox_mode=sandbox_mode, audit_source="subagent"
+            agent=AGENT_NAME,
+            sandbox_mode=sandbox_mode,
+            audit_source="subagent",
+            **binding,
         )
         await self._client.ensure_ready()
         # Shield the live worker PID from the periodic orphan sweep for as long

@@ -92,6 +92,35 @@ class ProviderRegistry(Protocol):
         """
         ...
 
+    def agent_client_binding(self, agent_name: str) -> dict[str, Any] | None:
+        """Return optional ACP-client kwargs binding one agent to an engine.
+
+        For the build sites that construct an :class:`~kiro_crew.acp.client.
+        AcpClient` DIRECTLY rather than through ``create_factory`` — today only
+        ``knowledge.llm_pool``, whose worker needs its own ``audit_source``,
+        sandbox mode and work dir and so cannot take a factory-built provider.
+        Without this those sites are unreachable by any companion binding: the
+        operator configures an engine, and the worker silently runs on the
+        native path anyway.
+
+        The public registry returns ``None``, so the public edition is
+        byte-identical. Consumers apply only the keys in
+        ``ACP_CLIENT_BINDING_KEYS`` and ignore everything else — a companion
+        describes an engine here, it does not get to hand arbitrary kwargs to a
+        client constructor.
+        """
+        ...
+
+
+#: Keys a consumer of :meth:`ProviderRegistry.agent_client_binding` may apply to
+#: an ``AcpClient`` constructor. Deliberately narrow: these four describe WHICH
+#: engine serves the agent. Everything else about the client — ``audit_source``,
+#: ``sandbox_mode``, ``work_dir`` — stays owned by the build site, which is the
+#: only layer that knows why it set them.
+ACP_CLIENT_BINDING_KEYS = frozenset(
+    {"acp_backend", "extra_env", "model", "model_switch_method"}
+)
+
 
 class PublishRegistry(Protocol):
     """The artifact-publish-provider registration seam.

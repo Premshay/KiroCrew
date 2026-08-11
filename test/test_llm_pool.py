@@ -15,11 +15,193 @@ from kiro_crew.knowledge.llm_pool import (
     CCWorker,
     LLMPool,
     Worker,
+    _clean_binding,
     _get_idle_ttl,
     _get_provider_type,
     _get_sandbox_mode,
     _read_config,
+    _resolve_client_binding,
 )
+
+
+def _ctx_with(registry):
+    return type("Ctx", (), {"providers": registry})()
+
+
+class TestCleanBinding:
+    """A companion describes an engine here; it does not get to hand arbitrary
+    kwargs to a constructor."""
+
+    def test_keeps_the_four_binding_keys(self):
+        binding = _clean_binding(
+            {
+                "acp_backend": "claude",
+                "extra_env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8484"},
+                "model": "fast",
+                "model_switch_method": "session_set_model",
+            }
+        )
+        assert binding == {
+            "acp_backend": "claude",
+            "extra_env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8484"},
+            "model": "fast",
+            "model_switch_method": "session_set_model",
+        }
+
+    def test_drops_keys_outside_the_whitelist(self):
+        # audit_source and sandbox_mode belong to the build site, and work_dir
+        # would move the worker's whole session. None may arrive from a registry.
+        binding = _clean_binding(
+            {
+                "model": "fast",
+                "audit_source": None,
+                "sandbox_mode": "off",
+                "work_dir": "/tmp/elsewhere",
+                "permission_mode": "bypassPermissions",
+            }
+        )
+        assert binding == {"model": "fast"}
+
+    def test_coerces_env_values_to_strings(self):
+        binding = _clean_binding({"extra_env": {"API_TIMEOUT_MS": 3000000}})
+        assert binding == {"extra_env": {"API_TIMEOUT_MS": "3000000"}}
+
+    def test_drops_wrong_typed_and_empty_values(self):
+        # A hand-edited engine map must not reach AcpClient as an int or a list
+        # and fail somewhere far from its cause.
+        assert _clean_binding(
+            {"model": 7, "acp_backend": "", "extra_env": [], "model_switch_method": None}
+        ) == {}
+
+
+class TestResolveClientBinding:
+    """The pool cannot take a factory-built provider, so it reads the binding
+    through the narrow seam instead. These cover both of its outcomes."""
+
+    def test_default_registry_has_nothing_to_miss(self):
+        from kiro_crew.platform.defaults import DefaultProviderRegistry
+
+        with patch(
+            "kiro_crew.platform.context.current_context",
+            return_value=_ctx_with(DefaultProviderRegistry()),
+        ):
+            assert _resolve_client_binding() == ({}, "")
+
+    def test_binding_is_returned_with_no_warning(self):
+        class NexusProviderRegistry:
+            def agent_client_binding(self, agent_name):
+                assert agent_name == "kirocrew-knowledge"
+                return {"acp_backend": "claude", "extra_env": {"ANTHROPIC_MODEL": "fast"}}
+
+        with patch(
+            "kiro_crew.platform.context.current_context",
+            return_value=_ctx_with(NexusProviderRegistry()),
+        ):
+            binding, unbound = _resolve_client_binding()
+        assert unbound == ""
+        assert binding == {
+            "acp_backend": "claude",
+            "extra_env": {"ANTHROPIC_MODEL": "fast"},
+        }
+
+    def test_registry_with_no_binding_for_this_agent_is_named(self):
+        class NexusProviderRegistry:
+            def agent_client_binding(self, agent_name):
+                return None
+
+        with patch(
+            "kiro_crew.platform.context.current_context",
+            return_value=_ctx_with(NexusProviderRegistry()),
+        ):
+            assert _resolve_client_binding() == ({}, "NexusProviderRegistry")
+
+    def test_registry_predating_the_seam_is_named(self):
+        # An older companion has no agent_client_binding at all. It must be
+        # reported, not crashed on.
+        class NexusProviderRegistry:
+            pass
+
+        with patch(
+            "kiro_crew.platform.context.current_context",
+            return_value=_ctx_with(NexusProviderRegistry()),
+        ):
+            assert _resolve_client_binding() == ({}, "NexusProviderRegistry")
+
+    def test_raising_lookup_is_reported_not_propagated(self):
+        class NexusProviderRegistry:
+            def agent_client_binding(self, agent_name):
+                raise RuntimeError("bad engine map")
+
+        with patch(
+            "kiro_crew.platform.context.current_context",
+            return_value=_ctx_with(NexusProviderRegistry()),
+        ):
+            assert _resolve_client_binding() == ({}, "NexusProviderRegistry")
+
+    def test_missing_context_stays_silent(self):
+        # Resolving a binding must never break the pool that needs one.
+        with patch(
+            "kiro_crew.platform.context.current_context",
+            side_effect=RuntimeError("no context"),
+        ):
+            assert _resolve_client_binding() == ({}, "")
+
+
+class TestWorkerAppliesBinding:
+    """The wiring, not just the helpers."""
+
+    @pytest.mark.asyncio
+    async def test_binding_reaches_the_client_without_displacing_pool_kwargs(self):
+        worker = AcpWorker(sandbox_mode="off")
+        binding = {"acp_backend": "claude", "extra_env": {"ANTHROPIC_MODEL": "fast"}}
+        with patch(
+            "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+            return_value=(binding, ""),
+        ), patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls:
+            client_cls.return_value = AsyncMock()
+            await worker.start()
+
+        kwargs = client_cls.call_args.kwargs
+        assert kwargs["acp_backend"] == "claude"
+        assert kwargs["extra_env"] == {"ANTHROPIC_MODEL": "fast"}
+        # The three the pool owns survive the binding.
+        assert kwargs["agent"] == "kirocrew-knowledge"
+        assert kwargs["sandbox_mode"] == "off"
+        assert kwargs["audit_source"] == "subagent"
+
+    @pytest.mark.asyncio
+    async def test_unbound_registry_warns_naming_registry_and_agent(self, caplog):
+        worker = AcpWorker(sandbox_mode="off")
+        with patch(
+            "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+            return_value=({}, "NexusProviderRegistry"),
+        ), patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls:
+            client_cls.return_value = AsyncMock()
+            with caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"):
+                await worker.start()
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "NexusProviderRegistry" in m and "kirocrew-knowledge" in m for m in warnings
+        )
+        # No binding to apply: the client is built exactly as it was before.
+        assert set(client_cls.call_args.kwargs) == {
+            "agent",
+            "sandbox_mode",
+            "audit_source",
+        }
+
+    @pytest.mark.asyncio
+    async def test_default_registry_is_quiet(self, caplog):
+        worker = AcpWorker(sandbox_mode="off")
+        with patch(
+            "kiro_crew.knowledge.llm_pool._resolve_client_binding", return_value=({}, "")
+        ), patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls:
+            client_cls.return_value = AsyncMock()
+            with caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"):
+                await worker.start()
+
+        assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == []
 
 
 @pytest.fixture(autouse=True)
