@@ -53,6 +53,8 @@ from kiro_crew.vector_memory_constants import (
     _MAX_SEMANTIC_PER_CONSOLIDATION,
 )
 
+_CONSOLIDATE_SESSION_KEY = "_consolidate"
+
 if TYPE_CHECKING:
     from kiro_crew.learn import LessonStore
     from kiro_crew.memory import MemoryStore
@@ -7367,9 +7369,8 @@ class HistoryConsolidator:
                 )
 
     async def _call_llm(self, prompt: str) -> dict | None:
-        """Call LLM for consolidation via the persistent background session.
+        """Call LLM for consolidation via a dedicated session.
 
-        Uses the shared background kiro-cli process (no spawn/teardown cost).
         Returns the parsed JSON dict, or ``None`` when the turn reached the
         provider but produced nothing usable (a failed or unparsable answer).
 
@@ -7391,9 +7392,11 @@ class HistoryConsolidator:
             logger.warning("LLM consolidation skipped — no session manager")
             raise _ConsolidationNotDispatched("no session manager")
 
-        # Timing instrumentation: measure both the wait to acquire the shared
-        # `_bg` session (queue contention behind other `_bg` consumers like
-        # chat_nav link-preview) and the LLM turn itself. Logged at DEBUG:
+        # The key must be unique: a session binds its agent at cold start, and
+        # the shared background key is already initialized as kirocrew-lite.
+        # It also prevents long consolidation turns from queueing behind short
+        # title and metadata jobs.
+        # Timing instrumentation measures the dedicated-session wait and turn.
         # silent in normal operation, surfaced only when log_level is raised
         # to investigate a consolidation stall.
         t_start = _time.monotonic()
@@ -7404,6 +7407,7 @@ class HistoryConsolidator:
                         self._sessions,
                         task="consolidation",
                         agent="kirocrew-consolidate",
+                        session_key=_CONSOLIDATE_SESSION_KEY,
                     )
                 )
             except Exception as exc:

@@ -44,3 +44,18 @@ class TestConsolidateAgent:
 
         src = inspect.getsource(history)
         assert 'agent="kirocrew-consolidate"' in src
+
+    def test_consolidation_uses_its_own_session_key(self) -> None:
+        """Pin the dedicated session key: under the shared BACKGROUND_KEY the
+        agent identity never binds (the ``_bg`` session is cold-started at
+        gateway startup as kirocrew-lite, and get_or_create ignores ``agent``
+        for an existing key) — verified live 2026-08-11 when the rerouted
+        identity produced zero factory traffic."""
+        from kiro_crew.history import _CONSOLIDATE_SESSION_KEY
+        from kiro_crew.session import BACKGROUND_KEY
+
+        assert _CONSOLIDATE_SESSION_KEY != BACKGROUND_KEY
+        import kiro_crew.history as history
+
+        src = inspect.getsource(history)
+        assert "session_key=_CONSOLIDATE_SESSION_KEY" in src
