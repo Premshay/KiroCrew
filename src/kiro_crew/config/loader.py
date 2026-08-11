@@ -2250,6 +2250,18 @@ class KnowledgeConfig:
             "0 keeps the workers warm indefinitely.",
         ),
     )
+    # The LLM pool reads this directly at each spawn, so the schema must retain
+    # it across unrelated configuration saves.
+    llm_timeout_secs: float = field(
+        default=0.0,
+        metadata=_meta(
+            "LLM Prompt Timeout Floor (secs)",
+            "Overrides the bound-pool prompt timeout floor (built-in 300s). "
+            "The floor is an alarm, not a budget: reaching it means the "
+            "serving lane cannot meet its healthy budget. 0 or unset keeps "
+            "the default.",
+        ),
+    )
     auto_add_documents: bool = field(
         default=False,
         metadata=_meta(
@@ -6736,6 +6748,8 @@ class KiroCrewConfig:
                     knowledge_data.get("pool_idle_ttl_secs", 300),
                     300,
                 ),
+                llm_timeout_secs=_safe_float(
+                    knowledge_data.get("llm_timeout_secs", 0.0), 0.0),
                 auto_add_documents=_read_auto_add_documents(knowledge_data),
                 auto_register_project_docs=bool(
                     knowledge_data.get("auto_register_project_docs", False)
