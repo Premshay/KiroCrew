@@ -37,15 +37,15 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "local_knowledge_search",
             "description": (
-                "Search the user's knowledge library. Call ONLY when the user's "
-                "message contains one of these explicit signals:\n"
-                "- Asks 'what do we know about X' or 'check knowledge for X'\n"
-                "- References a specific document, wiki, or stored content by name\n"
-                "- Says 'in my docs', 'in my notes', 'according to our knowledge'\n"
-                "- Asks a factual question AND mentions a topic you know is in "
-                "their knowledge base\n\n"
-                "Do NOT call for: general coding questions, file operations, "
-                "debugging, or any task you can answer from context alone."
+                "Search the user's indexed knowledge library: project docs, "
+                "measurements, past decisions, and cross-session notes. Call it "
+                "before re-deriving prior work that may already be settled: when "
+                "you need a project fact from memory or a summary, do not know "
+                "which document holds it, or the user references earlier work. "
+                "Skip it when you know the exact file (read that instead) or the "
+                "answer is fully in context. Use one default-limit query; this "
+                "index spans projects, so treat results as leads and verify "
+                "load-bearing facts in their cited source."
             ),
             "inputSchema": {
                 "type": "object",
