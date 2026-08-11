@@ -1005,7 +1005,9 @@ _RE_INVALID_MODEL_ID = re.compile(r"[Ii]nvalid model ID:\s*([^\s,;'\"]+)")
 _RE_THROTTLE_NAMED = re.compile(
     r"\b(ThrottlingException|TooManyRequestsException|ServiceQuotaExceededException)\b"
 )
-_RE_THROTTLE_GENERIC = re.compile(r"\b(rate.?limit|throttl(?:e|ed|ing))\b", re.IGNORECASE)
+_RE_THROTTLE_GENERIC = re.compile(
+    r"\b(rate.?limit|throttl(?:e|ed|ing)|too many requests)\b", re.IGNORECASE
+)
 _RE_AUTH = re.compile(
     r"\b(AccessDenied(?:Exception)?|UnauthorizedException|ExpiredToken(?:Exception)?"
     r"|InvalidSignatureException|UnrecognizedClientException)\b"
@@ -1014,7 +1016,9 @@ _RE_5XX_NAMED = re.compile(
     r"\b(InternalServerError|InternalFailure|ServiceUnavailable(?:Exception)?"
     r"|DispatchFailure|ConnectionReset(?:Error)?)\b"
 )
-_RE_5XX_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE)
+_RE_5XX_STATUS = re.compile(
+    r"(?:HTTP|status|API\s+Error:?)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE
+)
 _RE_CONNECTION = re.compile(
     r"\bE(?:CONNREFUSED|CONNRESET|CONNABORTED|TIMEDOUT|PIPE|HOSTUNREACH|AI_AGAIN)\b"
     r"|\bsocket hang ?up\b"
@@ -1023,7 +1027,7 @@ _RE_CONNECTION = re.compile(
     re.IGNORECASE,
 )
 _RE_5XX_PHRASE = re.compile(
-    r"\binternal server error\b|\bservice unavailable\b", re.IGNORECASE
+    r"\binternal server error\b|\bservice unavailable\b|\bno available lane\b", re.IGNORECASE
 )
 # Genuine retry hint only. "response stream" is deliberately NOT matched here,
 # because that would make this branch a catch-all: kiro-cli wraps EVERY mid-stream
