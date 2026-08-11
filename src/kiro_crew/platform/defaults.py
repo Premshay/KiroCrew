@@ -51,6 +51,10 @@ class DefaultProviderRegistry:
         """Public Kiro-ACP has no companion-specific runtime policy."""
         return None
 
+    def agent_client_binding(self, agent_name: str) -> dict[str, Any] | None:
+        """Public Kiro-ACP binds every agent to the native kiro-cli path."""
+        return None
+
 
 class DefaultPublishRegistry:
     """Registers no publish provider — the public edition has no artifact-publish
