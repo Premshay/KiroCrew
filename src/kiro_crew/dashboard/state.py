@@ -2428,10 +2428,10 @@ class _ChatSlot:
         """Return an isolated bounded timeline for the slots snapshot."""
         return [dict(entry) for entry in self._session_timeline]
 
-    def queue_peer_channel_message(self, message: object) -> bool:
-        """Persist one bounded, machine-originated peer delivery for the next turn."""
+    def queue_peer_channel_message(self, message: object) -> str:
+        """Persist one peer delivery or return its explicit delivery outcome."""
         if not isinstance(message, dict):
-            return False
+            return "invalid"
 
         def clean(value: object, limit: int) -> str:
             return sanitize_string(value)[:limit] if isinstance(value, str) else ""
@@ -2441,28 +2441,29 @@ class _ChatSlot:
         from_role = clean(message.get("from_role"), 100)
         content = clean(message.get("content"), 4000)
         msg_type = clean(message.get("msg_type"), 32) or "progress"
+        delivery = clean(message.get("delivery"), 32) or "next_turn"
         content, _ = redact_exfiltration_urls(content)
         content, _ = redact_credentials(content)
         if not channel_id or not message_id or not from_role or not content:
-            return False
+            return "invalid"
         if any(
             item.get("channel_id") == channel_id and item.get("message_id") == message_id
             for item in self._peer_channel_inbox
         ):
-            return False
-        self._peer_channel_inbox = (
-            self._peer_channel_inbox
-            + [
-                {
-                    "channel_id": channel_id,
-                    "message_id": message_id,
-                    "from_role": from_role,
-                    "content": content,
-                    "msg_type": msg_type,
-                }
-            ]
-        )[-_PEER_CHANNEL_INBOX_MAX:]
-        return True
+            return "duplicate"
+        if len(self._peer_channel_inbox) >= _PEER_CHANNEL_INBOX_MAX:
+            return "backpressure"
+        self._peer_channel_inbox.append(
+            {
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "from_role": from_role,
+                "content": content,
+                "msg_type": msg_type,
+                "delivery": delivery,
+            }
+        )
+        return "queued"
 
     def restore_peer_channel_inbox(self, inbox: object) -> None:
         """Restore valid peer deliveries without changing their persisted order."""
@@ -2476,6 +2477,14 @@ class _ChatSlot:
         messages = [dict(message) for message in self._peer_channel_inbox]
         self._peer_channel_inbox.clear()
         return messages
+
+    def remove_peer_channel_message(self, channel_id: str, message_id: str) -> bool:
+        """Remove one delivered peer message once a live steer accepts it."""
+        for index, message in enumerate(self._peer_channel_inbox):
+            if message.get("channel_id") == channel_id and message.get("message_id") == message_id:
+                del self._peer_channel_inbox[index]
+                return True
+        return False
 
     def peer_channel_inbox_payload(self) -> list[dict[str, Any]]:
         """Return a copy suitable for durable slot metadata."""

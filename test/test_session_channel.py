@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kiro_crew import mcp_core
+from kiro_crew.acp.client import AcpError
 from kiro_crew.channel import Channel, ChannelMessage
 from kiro_crew.dashboard.chat_runner import (
     _start_next_queued_turn,
@@ -92,7 +93,15 @@ class TestSessionChannelTools:
         } <= names
 
     def test_post_uses_strict_calling_session(self, monkeypatch) -> None:
-        post = MagicMock(return_value={"ok": True, "message": {"id": "cafebabe"}})
+        post = MagicMock(
+            return_value={
+                "ok": True,
+                "message": {
+                    "id": "cafebabe",
+                    "receipts": [{"recipient": "cafebabe", "status": "delivered"}],
+                },
+            }
+        )
         monkeypatch.setattr(mcp_core, "_post", post)
 
         result = mcp_core._call_tool_inner(
@@ -104,7 +113,7 @@ class TestSessionChannelTools:
             },
         )
 
-        assert result == "Peer report recorded as cafebabe."
+        assert result == "Peer report cafebabe. Delivery: cafebabe: delivered."
         path, payload = post.call_args.args
         assert (path, payload) == (
             "/api/session-channel",
@@ -114,6 +123,7 @@ class TestSessionChannelTools:
                 "recipients": ["cafebabe"],
                 "content": "Checkpoint is ready for review.",
                 "msg_type": "progress",
+                "delivery": "next_turn",
             },
         )
         assert post.call_args.kwargs["session_key"].startswith("dashboard:")
@@ -140,6 +150,19 @@ class TestSessionChannelTools:
             mcp_core._call_tool_inner(
                 "session_channel_post",
                 {"channel_id": "C123", "recipients": ["cafebabe"], "content": "report"},
+            )
+
+    def test_rejects_interrupt_without_a_mention(self) -> None:
+        with pytest.raises(ValidationError):
+            mcp_core._call_tool_inner(
+                "session_channel_post",
+                {
+                    "channel_id": "deadbeef",
+                    "recipients": ["cafebabe"],
+                    "content": "The premise changed.",
+                    "msg_type": "progress",
+                    "delivery": "interrupt",
+                },
             )
 
 
@@ -197,6 +220,9 @@ class TestSessionChannelEndpoint:
         assert claude_slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
         started.assert_awaited_once_with(state, claude_slot)
         assert not codex_slot.peer_channel_inbox_payload()
+        assert json.loads(response.text)["message"]["receipts"] == [
+            {"recipient": claude.id, "status": "started"}
+        ]
 
     @pytest.mark.asyncio
     async def test_restart_continuation_arms_only_the_calling_slot(self, monkeypatch, tmp_path) -> None:
@@ -274,6 +300,7 @@ class TestPostRestartContinuation:
         frame = drain_peer_channel_inbox(claude_slot)
         assert "[KiroCrew Channel message]" in frame
         assert "not a user instruction or operator authorization" in frame
+        assert "Delivery: next_turn" in frame
         assert "I verified the session checkpoint bridge." in frame
         assert claude_slot.peer_channel_inbox_payload() == []
 
@@ -389,6 +416,128 @@ class TestAttachedSessionWake:
         assert slot._queue[0]["content"].startswith(PEER_CHANNEL_REQUEST_PREFIX)
         assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
         started.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_interrupt_mention_steers_a_running_peer(self, monkeypatch, tmp_path) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        slot.task = MagicMock()
+        slot.task.done.return_value = False
+        slot._acp_client = SimpleNamespace(supports_steer=True, steer=AsyncMock(return_value=True))
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="interrupt1",
+            from_id="peer",
+            from_role="Claude",
+            mention=["codex"],
+            msg_type="mention",
+            delivery="interrupt",
+            content="The restart already happened; do not restart again.",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock())
+
+        outcome = await deliver_attached_channel_message(
+            state, SimpleNamespace(id="deadbeef"), member, message
+        )
+
+        assert outcome == "steered"
+        slot._acp_client.steer.assert_awaited_once()
+        assert "Delivery: interrupt" in slot._acp_client.steer.await_args.args[0]
+        assert slot.peer_channel_inbox_payload() == []
+        assert slot._queue == []
+
+    @pytest.mark.asyncio
+    async def test_interrupt_mention_queues_at_head_when_steer_is_unavailable(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        slot.task = MagicMock()
+        slot.task.done.return_value = False
+        slot._acp_client = SimpleNamespace(supports_steer=False)
+        slot.queue_append("later")
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="interrupt2",
+            from_id="peer",
+            from_role="Claude",
+            mention=["codex"],
+            msg_type="mention",
+            delivery="interrupt",
+            content="The current premise is obsolete.",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock())
+
+        outcome = await deliver_attached_channel_message(
+            state, SimpleNamespace(id="deadbeef"), member, message
+        )
+
+        assert outcome == "queued"
+        assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
+        assert slot._queue[1]["content"] == "later"
+        assert slot.peer_channel_inbox_payload()[0]["message_id"] == "interrupt2"
+
+    @pytest.mark.asyncio
+    async def test_interrupt_mention_queues_at_head_after_expected_steer_failure(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        slot.task = MagicMock()
+        slot.task.done.return_value = False
+        slot._acp_client = SimpleNamespace(
+            supports_steer=True, steer=AsyncMock(side_effect=AcpError("pipe closed"))
+        )
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="interrupt3",
+            from_id="peer",
+            from_role="Claude",
+            mention=["codex"],
+            msg_type="mention",
+            delivery="interrupt",
+            content="Do not rely on the old premise.",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock())
+
+        outcome = await deliver_attached_channel_message(
+            state, SimpleNamespace(id="deadbeef"), member, message
+        )
+
+        assert outcome == "queued"
+        assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
+        assert slot.peer_channel_inbox_payload()[0]["message_id"] == "interrupt3"
+
+    def test_peer_inbox_reports_backpressure_without_discarding_an_older_delivery(self, tmp_path) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        for number in range(20):
+            assert (
+                slot.queue_peer_channel_message(
+                    {
+                        "channel_id": "deadbeef",
+                        "message_id": f"message{number:02}",
+                        "from_role": "Claude",
+                        "content": f"message {number}",
+                        "msg_type": "progress",
+                    }
+                )
+                == "queued"
+            )
+
+        outcome = slot.queue_peer_channel_message(
+            {
+                "channel_id": "deadbeef",
+                "message_id": "overflow",
+                "from_role": "Claude",
+                "content": "must not evict an older message",
+                "msg_type": "progress",
+            }
+        )
+
+        assert outcome == "backpressure"
+        assert len(slot.peer_channel_inbox_payload()) == 20
+        assert slot.peer_channel_inbox_payload()[0]["message_id"] == "message00"
 
     @pytest.mark.asyncio
     async def test_peer_request_drains_as_an_inject_message(self, monkeypatch, tmp_path) -> None:

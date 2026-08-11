@@ -1463,6 +1463,8 @@ def _validate_session_channel_post(args: dict[str, Any]) -> None:
         raise ValidationError("recipients", "must name at least one peer")
     if len(set(recipients)) != len(recipients):
         raise ValidationError("recipients", "must not contain duplicates")
+    if args["delivery"] == "interrupt" and args["msg_type"] != "mention":
+        raise ValidationError("delivery", "interrupt delivery requires msg_type=mention")
 
 
 SESSION_CHANNEL_POST_SCHEMA = ToolSchema(
@@ -1490,6 +1492,12 @@ SESSION_CHANNEL_POST_SCHEMA = ToolSchema(
             str,
             default="progress",
             allowed=frozenset({"progress", "mention", "done"}),
+        ),
+        FieldSpec(
+            "delivery",
+            str,
+            default="next_turn",
+            allowed=frozenset({"next_turn", "interrupt"}),
         ),
     ],
     custom_validator=_validate_session_channel_post,

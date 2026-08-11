@@ -131,8 +131,10 @@ where continued thread engagement is undesirable.
 > channel message flow, but `channel_history.py` is the ephemeral Slack
 > message buffer only.
 
-Agent-to-agent (A2A) conversations in persistent agent channels are gated
-by an exchange budget (`max_exchanges`, default: 3, configurable per channel).
-Previously, the budget accumulated over the channel's lifetime and permanently
-blocked agent pairs. Now the budget resets whenever a human sends a message,
-giving agents a fresh round of autonomous discussion.
+Provider-owned agent-to-agent (A2A) conversations in persistent agent channels
+are gated by an exchange budget (`max_exchanges`, default: 3, configurable per
+channel). The budget protects bounded internal agent loops; it does not apply to
+attached persistent dashboard peers, whose reports must either receive an
+explicit delivery receipt or an explicit failure outcome. The provider-agent
+budget resets whenever a human sends a message, giving those agents a fresh
+round of autonomous discussion.
