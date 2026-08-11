@@ -31,6 +31,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from kiro_crew.apps.proxy_auth import verify_proxy_request
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.platform.bootstrap import boot_platform
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.workflows.runner import WorkflowRunner
 from kiro_crew.workflows.validate import validate
@@ -238,6 +240,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    boot_platform(KiroCrewConfig.load())
     server = ThreadingHTTPServer(("127.0.0.1", PORT), _Handler)
     logger.info("workflows app backend on 127.0.0.1:%d", PORT)
     server.serve_forever()

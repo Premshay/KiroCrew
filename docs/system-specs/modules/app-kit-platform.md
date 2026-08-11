@@ -222,6 +222,17 @@ skills/crons/MCP registration overwrite in place.
 
 Writer: `apps/bridges.py::reconcile_enabled_app_resources`.
 
+### Backend process bootstrap
+
+Every separately spawned App Kit backend calls `boot_platform(KiroCrewConfig.load())`
+before creating its HTTP server. Backend responses, sandboxed commands, and
+credential redaction consume the process-global platform context; skipping this
+bootstrap on an enterprise host fails those operations closed, including an
+otherwise simple health response. The bootstrap is idempotent, so it is safe for
+a backend that shares a process with another supported entrypoint.
+
+Writers: builtin backend `main()` entrypoints; contract: `platform/bootstrap.py::boot_platform`.
+
 ## 8. An app's EventBus only exists with a real broadcast function
 
 `build_app_context` returns `events=None` when `broadcast_fn` is None, and

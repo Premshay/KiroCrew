@@ -1641,6 +1641,20 @@ def test_create_app_returns_aiohttp_application():
     assert "/api/restart-gateway" in routes
 
 
+def test_main_bootstraps_platform_before_creating_app(monkeypatch):
+    config = MagicMock()
+    calls: list[str] = []
+    app = object()
+    monkeypatch.setattr(mod.KiroCrewConfig, "load", lambda: config)
+    monkeypatch.setattr(mod, "boot_platform", lambda received: calls.append("boot"))
+    monkeypatch.setattr(mod, "create_app", lambda: calls.append("app") or app)
+    monkeypatch.setattr(mod.web, "run_app", lambda received, **_kwargs: calls.append("run"))
+
+    assert mod.main() == 0
+
+    assert calls == ["boot", "app", "run"]
+
+
 # ---- platform fixes discovered during pod QA of the builtin re-shell ----
 
 
