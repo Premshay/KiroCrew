@@ -884,6 +884,15 @@ mv "$f.premutation" "$f"                 # exact pre-mutation bytes, unrelated e
 git diff --stat "$f"                     # should show only what you had before
 ```
 
+### Compare source from the checkout that owns the test
+
+The repository's `setup.cfg` sets `pythonpath = src`, so pytest prepends the
+current checkout's `src/` directory before a `PYTHONPATH` supplied to compare an
+older worktree. A purported old-versus-new mutation check can therefore import
+the new module twice and pass for the wrong reason. Run the test with its
+rootdir in each checkout, or drive the test's own helper under plain Python when
+the comparison must keep one test harness.
+
 ### Shard balance
 
 `ci.yml` splits the backend suite into 4 `pytest-split` groups. Splitting is balanced by
