@@ -830,18 +830,48 @@ class LLMPool:
         """Send multiple prompts concurrently, bounded by pool size.
 
         Returns responses in same order as prompts.
+
+        A terminal backend error abandons the rest of the batch. The ACP layer
+        already classifies retry-eligibility on the exception itself
+        (``AcpError.transient``, computed by ``_is_transient_raw_error``, which
+        puts an exhausted usage allowance in its terminal branch), so once one
+        prompt has proved the backend cannot serve this batch, dispatching the
+        remainder only reproduces the same failure once per prompt. Prompts
+        already handed to a worker still finish; only those still waiting for a
+        pool slot are skipped, and the cause is logged once instead of per item.
+
+        An unclassified or transient failure keeps the previous behaviour: that
+        item fails alone and the rest of the batch proceeds.
         """
         if not prompts:
             return []
 
         results: list[str] = [""] * len(prompts)
+        terminal: list[BaseException] = []
 
         async def _do_one(idx: int, prompt: str) -> None:
+            if terminal:
+                return
+            slot, worker = await self.acquire()
             try:
-                results[idx] = await self.send(prompt, timeout=timeout)
+                # Re-checked after the wait: a prompt queued behind a full pool
+                # may have been waiting while an earlier one proved the backend
+                # terminal, and spending its slot would buy nothing.
+                if terminal:
+                    return
+                results[idx] = await worker.send_message(prompt, timeout=timeout)
             except Exception as e:
-                logger.warning("LLMPool: batch item %d failed: %s", idx, e)
+                if getattr(e, "transient", None) is False:
+                    if terminal:
+                        logger.debug("LLMPool: batch item %d hit the same terminal error", idx)
+                    else:
+                        terminal.append(e)
+                        logger.warning("LLMPool: batch abandoned, backend is terminal: %s", e)
+                else:
+                    logger.warning("LLMPool: batch item %d failed: %s", idx, e)
                 results[idx] = ""
+            finally:
+                self.release(slot)
 
         await asyncio.gather(*[_do_one(i, p) for i, p in enumerate(prompts)])
         return results
