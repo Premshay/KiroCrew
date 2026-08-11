@@ -777,6 +777,8 @@ class TestConfigPutRoundTrip:
             assert isinstance(data["language_codes"], list)
             assert "en-US" in data["language_codes"]
             assert "fr-FR" in data["language_codes"]
+            assert "he-IL" in data["language_codes"]
+            assert "ro-RO" in data["language_codes"]
 
 
 class TestSttLanguageCodes:
