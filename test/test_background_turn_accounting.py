@@ -46,6 +46,7 @@ class _Sessions:
         self._bg_client = client
         self.acquire_calls: list[tuple[str, dict]] = []
         self.order: list[str] = []
+        self.recycle_calls: list[dict[str, object]] = []
 
     async def get_or_create(self, key: str, **kw: object):
         self.acquire_calls.append((key, dict(kw)))
@@ -54,8 +55,9 @@ class _Sessions:
     def release(self, key: str) -> None:
         self.order.append("release")
 
-    async def recycle_background(self) -> None:
+    async def recycle_background(self, **kwargs: object) -> None:
         self.order.append("recycle")
+        self.recycle_calls.append(dict(kwargs))
 
 
 class TestBackgroundTurnAccounting(unittest.IsolatedAsyncioTestCase):
@@ -202,6 +204,26 @@ class TestBackgroundTurnAccounting(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sessions.acquire_calls[0][1], {})
         self.assertEqual(sessions.acquire_calls[1][1], {"agent": "kirocrew-lite"})
+
+    async def test_dedicated_key_owns_its_session_and_recycle(self):
+        sessions = _Sessions(_Client())
+        with patch(_USAGE_TARGET) as persist:
+            async with background_turn(
+                sessions,
+                task="consolidation",
+                agent="kirocrew-consolidate",
+                session_key="_consolidate",
+            ) as client:
+                client.begin_turn(1.0)
+
+        self.assertEqual(
+            sessions.acquire_calls, [("_consolidate", {"agent": "kirocrew-consolidate"})]
+        )
+        self.assertEqual(
+            sessions.recycle_calls,
+            [{"session_key": "_consolidate", "agent": "kirocrew-consolidate"}],
+        )
+        self.assertEqual(persist.await_args.args[0], "_consolidate")
 
 
 class TestBillingStatsReachThroughTheAdapter(unittest.TestCase):

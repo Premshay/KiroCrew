@@ -2393,8 +2393,10 @@ class SessionManager:
         cache[agent] = (model, dir_mtime, now)
         return model
 
-    async def recycle_background(self) -> None:
-        """Check background session context and recycle if too full.
+    async def recycle_background(
+        self, session_key: str = BACKGROUND_KEY, *, agent: str = BACKGROUND_AGENT
+    ) -> None:
+        """Check a background-style session context and recycle if too full.
 
         Background tasks are stateless (cron, heartbeat, lessons), so we
         don't need compaction — just swap in a fresh provider.  Called after
@@ -2410,7 +2412,7 @@ class SessionManager:
         here, and a waiter can take it in that gap, so deciding or tearing down
         outside it would SIGKILL a turn that had already started.
         """
-        session = self._sessions.get(BACKGROUND_KEY)
+        session = self._sessions.get(session_key)
         if not session:
             return
 
@@ -2421,7 +2423,7 @@ class SessionManager:
         # and must not tear anything down. No caller holds the semaphore at this
         # point (they release immediately before calling), so this cannot
         # self-deadlock.
-        if not await self._reacquire_and_validate(BACKGROUND_KEY, session):
+        if not await self._reacquire_and_validate(session_key, session):
             return
         try:
             provider = session.provider
@@ -2464,7 +2466,7 @@ class SessionManager:
             # spawn then leaves the working session in place instead of leaving
             # _bg with nothing, and the registered entry is never absent.
             try:
-                replacement = self._provider_factory(BACKGROUND_KEY, agent=BACKGROUND_AGENT)
+                replacement = self._provider_factory(session_key, agent=agent)
                 async with self._start_sem:
                     await replacement.start()
             except Exception:
@@ -2480,7 +2482,7 @@ class SessionManager:
                 # the entry can still have moved out from under us while the
                 # replacement was starting. Whoever owns it now owns the
                 # lifecycle; discard ours rather than overwrite theirs.
-                adopted = self._sessions.get(BACKGROUND_KEY) is session
+                adopted = self._sessions.get(session_key) is session
                 if adopted:
                     session.adopt_provider(replacement)
 

@@ -675,6 +675,7 @@ async def background_turn(
     *,
     task: str,
     agent: "str | None" = None,
+    session_key: str | None = None,
 ) -> "AsyncIterator[Any]":
     """Take the shared background session for ONE turn, then release and account.
 
@@ -706,10 +707,11 @@ async def background_turn(
     """
     from kiro_crew.session import BACKGROUND_AGENT, BACKGROUND_KEY  # circular import
 
+    key = session_key or BACKGROUND_KEY
     if agent is None:
-        client, _new, _resumed = await sessions.get_or_create(BACKGROUND_KEY)
+        client, _new, _resumed = await sessions.get_or_create(key)
     else:
-        client, _new, _resumed = await sessions.get_or_create(BACKGROUND_KEY, agent=agent)
+        client, _new, _resumed = await sessions.get_or_create(key, agent=agent)
     # The stats object as it stands BEFORE this turn. The shared session serves
     # many turns, and the runner replaces this object only once a turn actually
     # begins, so identity is what separates a turn that ran from one whose
@@ -737,7 +739,7 @@ async def background_turn(
         # and an await ordered ahead of this would let a cancelled task hold the
         # shared semaphore forever.
         try:
-            sessions.release(BACKGROUND_KEY)
+            sessions.release(key)
         except Exception:
             logger.debug("background session release failed task=%s", task, exc_info=True)
         # Recycle sits in a finally for the same cancellation reason, and follows
@@ -757,7 +759,7 @@ async def background_turn(
                 # acquire-time failures from landing as zero-credit noise.
                 if usage.credits or usage.input_tokens or usage.output_tokens:
                     await persist_token_record_async(
-                        BACKGROUND_KEY,
+                        key,
                         "",
                         usage,
                         _provider_label(client),
@@ -770,7 +772,12 @@ async def background_turn(
                 logger.debug("background turn accounting failed task=%s", task, exc_info=True)
         finally:
             try:
-                await sessions.recycle_background()
+                if key == BACKGROUND_KEY:
+                    await sessions.recycle_background()
+                else:
+                    await sessions.recycle_background(
+                        session_key=key, agent=agent or BACKGROUND_AGENT
+                    )
             except Exception:
                 logger.debug("background recycle failed task=%s", task, exc_info=True)
 
