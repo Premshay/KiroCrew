@@ -676,6 +676,8 @@ async def _transcribe_native(audio_path: str, stt_config) -> str | None:  # type
             out_dir,
             "--output_format",
             "txt",
+            "--language",
+            (stt_config.language_code or "en-US").split("-", 1)[0].lower(),
             "--fp16",
             "False",
         ],

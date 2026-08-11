@@ -335,13 +335,20 @@ class TestTranscribeAudio:
         binary.chmod(0o755)
         audio = tmp_path / "test.webm"
         audio.write_text("fake audio")
-        cfg = SttConfig(enabled=True, whisper_path=str(binary), timeout_secs=10)
+        cfg = SttConfig(
+            enabled=True,
+            whisper_path=str(binary),
+            language_code="he-IL",
+            timeout_secs=10,
+        )
+        captured = {}
 
         mock_proc = AsyncMock()
         mock_proc.returncode = 0
         mock_proc.communicate = AsyncMock(return_value=(b"", b""))
 
         async def fake_exec(*args, **kwargs):
+            captured["args"] = args
             out_dir = args[args.index("--output_dir") + 1]
             Path(out_dir).joinpath("test.txt").write_text("Hello world")
             return mock_proc
@@ -351,6 +358,7 @@ class TestTranscribeAudio:
         ):
             result = await transcribe_audio(str(audio), cfg)
         assert result == "Hello world"
+        assert captured["args"][captured["args"].index("--language") + 1] == "he"
 
     @pytest.mark.asyncio
     async def test_whisper_failure_returns_none(self, tmp_path):
