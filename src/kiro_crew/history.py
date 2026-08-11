@@ -32,17 +32,17 @@ from kiro_crew.messaging.link import legacy_key
 from kiro_crew.preview_text import strip_markdown_preview
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
-from kiro_crew.session import BACKGROUND_KEY
+from kiro_crew.session import BACKGROUND_KEY, CONSOLIDATE_KEY
 from kiro_crew.skills import AUTO_SKILL_MAX_PROCEDURE_CHARS, AutoSkillProvenance
 
-# Session key for history consolidation's dedicated session. Separate from
-# BACKGROUND_KEY because get_or_create binds an agent identity only at
-# cold-start: the shared ``_bg`` session is created at gateway startup as
-# kirocrew-lite, so any agent passed for the ``_bg`` key afterwards is
-# silently ignored. Consolidation needs its kirocrew-consolidate identity to
-# reach the provider factory (and the engine map behind it), which requires a
-# key whose cold-start it owns.
-_CONSOLIDATE_SESSION_KEY = "_consolidate"
+# Consolidation's dedicated session key (defined next to its stateless
+# registration in session.py). Separate from BACKGROUND_KEY because
+# get_or_create binds an agent identity only at cold-start: the shared ``_bg``
+# session is created at gateway startup as kirocrew-lite, so any agent passed
+# for the ``_bg`` key afterwards is silently ignored. Consolidation needs its
+# kirocrew-consolidate identity to reach the provider factory (and the engine
+# map behind it), which requires a key whose cold-start it owns.
+_CONSOLIDATE_SESSION_KEY = CONSOLIDATE_KEY
 from kiro_crew.skills_dedupe import (
     VERDICT_DUP,
     VERDICT_NEW,
@@ -4037,6 +4037,24 @@ class HistoryConsolidator:
             client, _is_new, _resumed = await self._sessions.get_or_create(
                 session_key, agent="kirocrew-consolidate"
             )
+            # Reset the conversation before every reused turn: each
+            # consolidation is self-contained (the prompt carries the whole
+            # tail), so a prior turn's transcript adds only input-token cost —
+            # and unbounded, it re-creates the oversized-rejection failure on
+            # the large lane within days (adversarial review, 2026-08-12).
+            # Done while holding the session semaphore, so no other consumer's
+            # turn can be reset mid-flight. A failed reset degrades to the
+            # accumulating behavior for one turn, so it warns rather than
+            # aborts.
+            if not _is_new and hasattr(client, "new_conversation"):
+                try:
+                    await client.new_conversation()
+                except Exception:
+                    logger.warning(
+                        "Consolidation session reset failed — this turn reuses "
+                        "the prior transcript",
+                        exc_info=True,
+                    )
             t_acquired = _time.monotonic()
             wait_s = t_acquired - t_start
             # Reject all tools: this is a text/JSON-only generation turn. kiro
@@ -4065,5 +4083,13 @@ class HistoryConsolidator:
             )
             return None
         finally:
+            # Release ONLY — no recycle_background() here. That call was the
+            # _bg session's bounding mechanism from when consolidation rode
+            # the _bg key; after the move to _consolidate it bounded nothing
+            # for this session while being able to shut down _bg mid-turn
+            # under a bystander consumer (dedupe judge, skill merge, titles),
+            # since this caller no longer holds _bg's semaphore. _bg's own
+            # consumers recycle it after their turns; _consolidate is bounded
+            # by the per-turn new_conversation() reset above plus its
+            # stateless key (no session_map persistence).
             self._sessions.release(session_key)
-            await self._sessions.recycle_background()
