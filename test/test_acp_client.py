@@ -9070,3 +9070,48 @@ def _record(sink):
         return 1
 
     return _send_request
+
+
+class TestLocalLaneAdmission503:
+    """Admission-control 503s from the local lane classify transient.
+
+    Observed 2026-08-11: the fleet router answers saturation with
+    ``503 {"error": "no available lane", ...}`` plus ``Retry-After: 30``, and
+    the Claude CLI surfaces it as ``API Error: 503 {...}`` — no "HTTP", no
+    "status", no CamelCase exception name. The classifier called that unknown,
+    unknown is terminal, and send_batch abandoned whole batches on the first
+    rejection. An upstream explicitly sending Retry-After is the definition of
+    transient.
+    """
+
+    def test_api_error_503_prefix_is_transient(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        err = {"data": 'API Error: 503 {"error":"no available lane"}'}
+        assert _is_transient_raw_error(err) is True
+
+    def test_no_available_lane_body_alone_is_transient(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert _is_transient_raw_error({"data": "no available lane"}) is True
+
+    def test_too_many_requests_phrase_is_transient(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert _is_transient_raw_error({"data": "503 Too many requests"}) is True
+        assert _is_transient_raw_error({"message": "Too Many Requests", "data": ""}) is True
+
+    def test_usage_limit_still_beats_throttle_wording(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        # The precedence guard: exhausted-allowance wording stays terminal
+        # even when the same message also reads as rate-limiting.
+        err = {"data": "Monthly usage limit has been reached; too many requests"}
+        assert _is_transient_raw_error(err) is False
+
+    def test_api_error_401_stays_terminal(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        # The new prefix only widens the 5xx family; a 4xx behind the same
+        # CLI wording is still unknown/terminal.
+        assert _is_transient_raw_error({"data": "API Error: 401 unauthorized"}) is False

@@ -18,9 +18,12 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
 
 try:
-    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.acp.client import AcpClient, AcpTimeoutError
 except ImportError:
     AcpClient = None  # type: ignore[assignment,misc]
+    # Empty tuple keeps isinstance() checks valid (and always False) when the
+    # ACP layer is absent, mirroring the AcpClient fallback above.
+    AcpTimeoutError = ()  # type: ignore[assignment,misc]
 
 # Sweep-protection shield for AcpClient-backed workers. These are direct,
 # long-lived AcpClient sessions (not SessionMap sessions / warm-pool providers),
@@ -193,6 +196,24 @@ def _get_timeout_floor(config: Optional[dict] = None, bound: bool = False) -> fl
     if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
         return float(raw)
     return BOUND_TIMEOUT_FLOOR
+
+
+def _get_pool_size(config: Optional[dict] = None) -> int:
+    """Worker count for pools that did not fix a size at construction.
+
+    ``knowledge.llm_pool_size`` (int, 1-16) sizes the pool per deployment: a
+    single-slot serving lane wants 1 — extra workers cannot run concurrently
+    there, they only queue behind each other until every prompt exceeds its
+    timeout (and, against an admission-controlled router, turn the excess into
+    503 storms). A malformed or out-of-range value falls back to the default
+    rather than silently starving the pool.
+    """
+    data = _read_config() if config is None else config
+    knowledge = data.get("knowledge") if isinstance(data, dict) else None
+    raw = knowledge.get("llm_pool_size") if isinstance(knowledge, dict) else None
+    if isinstance(raw, int) and not isinstance(raw, bool) and 1 <= raw <= 16:
+        return raw
+    return DEFAULT_POOL_SIZE
 
 
 def _get_sandbox_mode(config: Optional[dict] = None) -> str:
@@ -484,9 +505,14 @@ class LLMPool:
     Dead workers are replaced transparently on acquire.
     """
 
-    def __init__(self, pool_size: int = DEFAULT_POOL_SIZE):
-        self._pool_size = pool_size
-        self._semaphore = asyncio.Semaphore(pool_size)
+    def __init__(self, pool_size: Optional[int] = None):
+        # An explicit constructor size is fixed for the pool's lifetime; when
+        # omitted, start() resolves ``knowledge.llm_pool_size`` from config on
+        # every (re)spawn, so an operator resize takes effect at the next
+        # idle-TTL respawn without a code change.
+        self._fixed_pool_size = pool_size
+        self._pool_size = pool_size if pool_size is not None else DEFAULT_POOL_SIZE
+        self._semaphore = asyncio.Semaphore(self._pool_size)
         self._workers: list[Worker] = []
         self._available: asyncio.Queue[int] = asyncio.Queue()
         self._started = False
@@ -525,6 +551,15 @@ class LLMPool:
             self._idle_ttl = _get_idle_ttl(config)
             self._config = config
             binding, _ = await asyncio.to_thread(_resolve_client_binding)
+            if self._fixed_pool_size is None:
+                size = _get_pool_size(config)
+                if size != self._pool_size:
+                    # Safe to swap here: _started is False under the lock, so no
+                    # caller holds a permit and any acquire() blocked on the old
+                    # semaphore re-checks _started and retries against the new
+                    # one (same invariant _maybe_scale_to_zero relies on).
+                    self._pool_size = size
+                    self._semaphore = asyncio.Semaphore(size)
             self._timeout_floor = _get_timeout_floor(config, bound=bool(binding))
             if self._timeout_floor:
                 logger.info(
@@ -726,28 +761,58 @@ class LLMPool:
 
         An unclassified or transient failure keeps the previous behaviour: that
         item fails alone and the rest of the batch proceeds.
+
+        A timeout in a BOUND pool also abandons the batch, loudly: the floor
+        (see BOUND_TIMEOUT_FLOOR) is sized for a healthy lane's worst case, so
+        exhausting it means the lane itself is unhealthy and the queued
+        remainder would only reproduce the wait. Unbound pools keep the
+        per-item timeout behaviour — their callers chose fast-fail budgets
+        deliberately.
         """
         if not prompts:
             return []
 
         results: list[str] = [""] * len(prompts)
         terminal: list[BaseException] = []
+        # A bound-pool prompt that exhausts the timeout FLOOR is an alarm, not
+        # an item failure: the floor already covers a healthy lane's worst
+        # case (service + cold swap), so reaching it means the lane cannot
+        # meet its budget right now and every queued sibling will meet the
+        # same fate — dispatching them just extends the outage and re-queues
+        # work the lane may still be chewing on for a departed client
+        # (operator ruling 2026-08-11: "we shouldn't be getting there; if we
+        # do, re-evaluate strategy", not raise the number).
+        floor_hit: list[BaseException] = []
 
         async def _do_one(idx: int, prompt: str) -> None:
-            if terminal:
+            if terminal or floor_hit:
                 return
             slot, worker = await self.acquire()
             try:
                 # Re-checked after the wait: a prompt queued behind a full pool
                 # may have been waiting while an earlier one proved the backend
-                # terminal, and spending its slot would buy nothing.
-                if terminal:
+                # terminal (or hit the floor), and spending its slot would buy
+                # nothing.
+                if terminal or floor_hit:
                     return
                 results[idx] = await worker.send_message(
                     prompt, timeout=max(timeout, self._timeout_floor)
                 )
             except Exception as e:
-                if getattr(e, "transient", None) is False:
+                if self._timeout_floor > 0 and isinstance(e, AcpTimeoutError):
+                    if floor_hit:
+                        logger.debug("LLMPool: batch item %d also hit the floor", idx)
+                    else:
+                        floor_hit.append(e)
+                        logger.warning(
+                            "LLMPool: prompt exceeded the %.0fs timeout floor — "
+                            "the serving lane cannot meet its healthy budget; "
+                            "abandoning the remaining batch. The floor is an "
+                            "alarm, not a budget: fix lane health or pool "
+                            "concurrency instead of raising it.",
+                            self._timeout_floor,
+                        )
+                elif getattr(e, "transient", None) is False:
                     if terminal:
                         logger.debug("LLMPool: batch item %d hit the same terminal error", idx)
                     else:
