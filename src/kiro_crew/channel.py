@@ -88,6 +88,8 @@ class ChannelMessage:
     content: str
     mention: str | list[str] | None = None  # target agent id(s)
     msg_type: str = "progress"  # progress|mention|broadcast|approval|done|system
+    delivery: str = "next_turn"  # next_turn|interrupt; meaningful for mentions
+    delivery_status: dict[str, str] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
     thread_id: str | None = None  # parent message ID (None = top-level)
     reply_to: str | None = None  # agent ID of parent message sender
@@ -101,6 +103,8 @@ class ChannelMessage:
             "content": self.content,
             "mention": self.mention,
             "msg_type": self.msg_type,
+            "delivery": self.delivery,
+            "delivery_status": self.delivery_status,
             "timestamp": self.timestamp,
             "thread_id": self.thread_id,
             "reply_to": self.reply_to,
@@ -264,6 +268,7 @@ class Channel:
         from_role: str = "",
         mention: str | list[str] | None = None,
         msg_type: str = "progress",
+        delivery: str = "next_turn",
         thread_id: str | None = None,
     ) -> ChannelMessage:
         # Normalize mentions to a set
@@ -289,6 +294,7 @@ class Channel:
             content=content,
             mention=list(mentions) if mentions else None,
             msg_type=msg_type,
+            delivery=delivery,
             thread_id=thread_id,
             reply_to=reply_to,
         )
@@ -304,15 +310,19 @@ class Channel:
 
         for agent in self.members.values():
             if agent.id == from_id or agent.state in ("done", "failed"):
+                if agent.id in mentions:
+                    msg.delivery_status[agent.id] = "unavailable"
                 continue
             if agent.listen_mode == ListenMode.SILENT:
+                if agent.id in mentions:
+                    msg.delivery_status[agent.id] = "not_listening"
                 continue
 
             is_human = from_id == "human"
 
             # Thread routing: default listener = parent sender
             if thread_id and reply_to == agent.id and not mentions:
-                await self._deliver(agent, msg)
+                msg.delivery_status[agent.id] = await self._deliver(agent, msg)
                 continue
 
             # Thread fallback: if reply_to doesn't match any agent (e.g. system message),
@@ -324,7 +334,7 @@ class Channel:
                 and agent.is_orchestrator
                 and reply_to not in self.members
             ):
-                await self._deliver(agent, msg)
+                msg.delivery_status[agent.id] = await self._deliver(agent, msg)
                 continue
 
             # An all-listening member is a channel participant, not merely a
@@ -339,8 +349,13 @@ class Channel:
             if not receives_message:
                 continue
 
-            # A2A exchange limit
-            if not is_human:
+            # The legacy exchange cap protects bounded provider-owned agent
+            # loops. Attached dashboard sessions are persistent peers: never
+            # silently suppress their reports.
+            sender = self.members.get(from_id)
+            if not is_human and not agent.attached_session and not (
+                sender and sender.attached_session
+            ):
                 pair = (from_id, agent.id)
                 if self.exchange_counts.get(pair, 0) >= self.max_exchanges:
                     logger.info(
@@ -349,10 +364,11 @@ class Channel:
                         agent.id,
                         self.id,
                     )
+                    msg.delivery_status[agent.id] = "backpressure"
                     continue
                 self.exchange_counts[pair] = self.exchange_counts.get(pair, 0) + 1
 
-            await self._deliver(agent, msg)
+            msg.delivery_status[agent.id] = await self._deliver(agent, msg)
 
         # Dead agent bounce
         for mid in mentions:
@@ -386,11 +402,12 @@ class Channel:
         self._save()
         return msg
 
-    async def _deliver(self, agent: ChannelAgent, msg: ChannelMessage) -> None:
+    async def _deliver(self, agent: ChannelAgent, msg: ChannelMessage) -> str:
         if agent.attached_session and self._delivery_fn:
-            await self._delivery_fn(self, agent, msg)
-            return
+            outcome = await self._delivery_fn(self, agent, msg)
+            return outcome if isinstance(outcome, str) else "delivered"
         await agent.inbox.put(msg)
+        return "delivered"
 
     async def subscribe(self, agent_id: str):
         """Async generator yielding messages for an agent."""
@@ -480,6 +497,8 @@ class Channel:
                 content=md["content"],
                 mention=md.get("mention"),
                 msg_type=md.get("msg_type", "progress"),
+                delivery=md.get("delivery", "next_turn"),
+                delivery_status=dict(md.get("delivery_status") or {}),
                 timestamp=md.get("timestamp", 0),
                 thread_id=md.get("thread_id"),
                 reply_to=md.get("reply_to"),

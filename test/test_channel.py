@@ -38,6 +38,7 @@ class TestChannelMessage:
         msg = ChannelMessage(id="x", from_id="a", from_role="A", content="hi")
         assert msg.mention is None
         assert msg.msg_type == "progress"
+        assert msg.delivery == "next_turn"
         assert msg.timestamp > 0
 
 
@@ -203,6 +204,25 @@ class TestChannelRouting:
             spec.inbox.get_nowait()
         await ch.post(orch.id, "one more", from_role="Orch", mention=spec.id)
         assert spec.inbox.empty()  # blocked by A2A limit
+
+    @pytest.mark.asyncio
+    async def test_attached_sessions_bypass_legacy_a2a_exchange_limit(self):
+        delivered = []
+
+        async def deliver(_channel, member, message):
+            delivered.append((member.id, message.id))
+            return "delivered"
+
+        ch = Channel(id="ch1", topic="test", _delivery_fn=deliver)
+        codex = ch.attach_session("dashboard:crew-codex", role="Codex")
+        claude = ch.attach_session("dashboard:crew-claude", role="Claude")
+        assert codex is not None and claude is not None
+
+        for _ in range(_MAX_A2A_EXCHANGES + 1):
+            await ch.post(codex.id, "report", from_role="Codex", mention=claude.id)
+
+        assert len(delivered) == _MAX_A2A_EXCHANGES + 1
+        assert (codex.id, claude.id) not in ch.exchange_counts
 
     @pytest.mark.asyncio
     async def test_done_agents_skipped(self):

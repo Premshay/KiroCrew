@@ -2157,7 +2157,9 @@ def _list_tools() -> list[dict[str, Any]]:
             "description": (
                 "Send a concise typed report to named peers in a channel attached to this session. "
                 "Use progress for updates, mention for a response or decision request, and done for a "
-                "completed handoff. This does not impersonate a human or operator."
+                "completed handoff. A mention uses next_turn delivery by default; use interrupt only "
+                "when changed premises require a running peer to reassess now. This does not "
+                "impersonate a human or operator."
             ),
             "inputSchema": {
                 "type": "object",
@@ -2173,6 +2175,10 @@ def _list_tools() -> list[dict[str, Any]]:
                     "msg_type": {
                         "type": "string",
                         "enum": ["progress", "mention", "done"],
+                    },
+                    "delivery": {
+                        "type": "string",
+                        "enum": ["next_turn", "interrupt"],
                     },
                 },
                 "required": ["channel_id", "recipients", "content"],
@@ -6291,7 +6297,14 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         )
         if result.get("ok") is True:
             message = result.get("message") or {}
-            return f"Peer report recorded as {message.get('id', 'a channel message')}."
+            receipts = message.get("receipts") or []
+            receipt_text = ", ".join(
+                f"{item.get('recipient', 'unknown')}: {item.get('status', 'not_delivered')}"
+                for item in receipts
+                if isinstance(item, dict)
+            )
+            suffix = f" Delivery: {receipt_text}." if receipt_text else ""
+            return f"Peer report {message.get('id', 'recorded')}.{suffix}"
         return f"Error: peer report was not recorded: {result.get('error', 'unknown error')}"
 
     if name == "session_restart_continuation":

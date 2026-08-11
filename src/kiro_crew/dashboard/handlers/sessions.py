@@ -1346,6 +1346,19 @@ async def api_session_channel(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "invalid message type", "code": "invalid_channel_message_type"}, status=400
         )
+    delivery = body.get("delivery", "next_turn")
+    if not isinstance(delivery, str) or delivery not in {"next_turn", "interrupt"}:
+        return web.json_response(
+            {"error": "invalid delivery mode", "code": "invalid_channel_delivery"}, status=400
+        )
+    if delivery == "interrupt" and msg_type != "mention":
+        return web.json_response(
+            {
+                "error": "interrupt delivery requires a mention",
+                "code": "interrupt_requires_mention",
+            },
+            status=400,
+        )
     content, _ = redact_exfiltration_urls(content.strip())
     content, _ = redact_credentials(content)
     message = await channel.post(
@@ -1354,8 +1367,23 @@ async def api_session_channel(request: web.Request) -> web.Response:
         from_role=member.role,
         mention=recipients,
         msg_type=msg_type,
+        delivery=delivery,
     )
-    return web.json_response({"ok": True, "message": {"id": message.id, "recipients": recipients}})
+    receipts = [
+        {"recipient": recipient, "status": message.delivery_status.get(recipient, "not_delivered")}
+        for recipient in recipients
+    ]
+    return web.json_response(
+        {
+            "ok": True,
+            "message": {
+                "id": message.id,
+                "recipients": recipients,
+                "delivery": delivery,
+                "receipts": receipts,
+            },
+        }
+    )
 
 
 async def api_session_maintenance(request: web.Request) -> web.Response:
