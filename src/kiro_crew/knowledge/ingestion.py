@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -42,6 +43,9 @@ DUPLICATE_JOB_STATUS = 'skipped_duplicate'
 
 DEFAULT_MAX_INGEST_FILE_MB = 100.0
 _MB = 1024 * 1024
+# A dispatch cap, not a claim about the backend's physical token batch.  The
+# llama.cpp backend remains responsible for splitting oversized prompt groups.
+_INGEST_EMBED_BATCH_SIZE = 32
 
 
 class FileTooLargeError(RuntimeError):
@@ -89,6 +93,30 @@ def _redact_for_ingest(text: str) -> str:
     cleaned, _ = redact_credentials(text)
     cleaned, _ = redact_exfiltration_urls(cleaned)
     return cleaned
+
+
+def _embed_items_sync(
+    embedder, items: list[tuple[str, str | None, str | None]]
+) -> list[list[float] | None]:
+    """Embed a bounded item group, retaining compatibility with test/custom embedders."""
+    embed_batch = getattr(embedder, "embed_for_items", None)
+    if callable(embed_batch):
+        vectors = embed_batch(items)
+        if isinstance(vectors, list) and len(vectors) == len(items):
+            return vectors
+        result_count = len(vectors) if isinstance(vectors, list) else 0
+        logger.warning("Embedding batch returned %d results for %d items", result_count, len(items))
+        return [None] * len(items)
+    return [embedder.embed_for_item(title, summary, content) for title, summary, content in items]
+
+
+async def _embed_items(
+    embedder, items: list[tuple[str, str | None, str | None]]
+) -> list[list[float] | None]:
+    """Offload one bounded embedding group to the dedicated embed bulkhead."""
+    if not items:
+        return []
+    return await run_in_embed_pool(_embed_items_sync, embedder, items)
 
 
 def _coerce_chunk_param(value: object, default: int, minimum: int) -> int:
@@ -460,6 +488,7 @@ class IngestionPipeline:
         extractions = await self.extractor.extract_batch(chunk_contents)
 
         processed = 0
+        pending_embeddings: list[tuple[str, str, str | None, str | None]] = []
         for i, (chunk, extraction) in enumerate(zip(chunks, extractions)):
             try:
                 extraction['summary'] = _redact(extraction.get('summary'))
@@ -495,14 +524,20 @@ class IngestionPipeline:
                 # dashboard "connection lost"). Offloaded: the graph is RLock-guarded
                 # and sqlite connections are thread-local, so this is thread-safe.
                 await asyncio.to_thread(self._store_entities, extraction, item_id)
-                await self._embed_item(
-                    item_id, item_title, extraction.get('summary'), chunk['content']
+                pending_embeddings.append(
+                    (item_id, item_title, extraction.get('summary'), chunk['content'])
                 )
+                if len(pending_embeddings) == _INGEST_EMBED_BATCH_SIZE:
+                    await self._embed_item_batch(pending_embeddings)
+                    pending_embeddings.clear()
                 processed += 1
             except Exception:
                 logger.exception("Failed to process chunk %d of %s", i, path)
             if on_progress:
                 on_progress('extracting', i + 1, total)
+
+        if pending_embeddings:
+            await self._embed_item_batch(pending_embeddings)
 
         # 6. Finalize
         now = datetime.now().isoformat()
@@ -604,6 +639,7 @@ class IngestionPipeline:
         extractions = await self.extractor.extract_batch(chunk_contents)
 
         processed = 0
+        pending_embeddings: list[tuple[str, str, str | None, str | None]] = []
         for i, (chunk, extraction) in enumerate(zip(chunks, extractions)):
             try:
                 extraction['summary'] = _redact(extraction.get('summary'))
@@ -631,15 +667,23 @@ class IngestionPipeline:
                 # dashboard "connection lost"). Offloaded: the graph is RLock-guarded
                 # and sqlite connections are thread-local, so this is thread-safe.
                 await asyncio.to_thread(self._store_entities, extraction, item_id)
-                await self._embed_item(
-                    item_id,
-                    chunk.get('section_title') or f"{title} chunk {i}",
-                    extraction.get('summary'),
-                    chunk['content'],
+                pending_embeddings.append(
+                    (
+                        item_id,
+                        chunk.get('section_title') or f"{title} chunk {i}",
+                        extraction.get('summary'),
+                        chunk['content'],
+                    )
                 )
+                if len(pending_embeddings) == _INGEST_EMBED_BATCH_SIZE:
+                    await self._embed_item_batch(pending_embeddings)
+                    pending_embeddings.clear()
                 processed += 1
             except Exception:
                 logger.exception("Failed to process chunk %d of text '%s'", i, title)
+
+        if pending_embeddings:
+            await self._embed_item_batch(pending_embeddings)
 
         now = datetime.now().isoformat()
         if processed == total:
@@ -713,12 +757,18 @@ class IngestionPipeline:
     async def _embed_item(
         self, item_id: str, title: str, summary: str | None, content: str | None = None
     ) -> None:
-        """Generate and store embedding for an item. No-op if embedder is None.
+        """Generate and store one embedding through the bounded batch path."""
+        await self._embed_item_batch([(item_id, title, summary, content)])
+
+    async def _embed_item_batch(
+        self, items: list[tuple[str, str, str | None, str | None]]
+    ) -> None:
+        """Generate and store a bounded batch of item embeddings.
 
         Includes chunk ``content`` so vector search matches body text, not just
         the title/summary (which previously left body-only queries unmatchable).
         """
-        if not self.embedder:
+        if not self.embedder or not items:
             return
         # Capture the signature BEFORE the embed, and stamp the row with THAT
         # value — the same discipline _write_item_embedding already follows by
@@ -737,16 +787,17 @@ class IngestionPipeline:
         # swap lands mid-embed, the vector is new but the sig is old, so the
         # sweep re-embeds it — wasteful, never wrong.
         sig = embedder_signature(self.embedder)
-        loop = asyncio.get_running_loop()
-        vec = await loop.run_in_executor(
-            None, self.embedder.embed_for_item, title, summary, content
+        vectors = await _embed_items(
+            self.embedder, [(title, summary, content) for _, title, summary, content in items]
         )
-        if vec:
+        for (item_id, _, _, _), vec in zip(items, vectors):
+            if not vec:
+                continue
             self.store.db.execute(
                 "UPDATE items SET embedding = ?, embedding_sig = ?, embedded_at = ? WHERE id = ?",
                 (floats_to_bytes(vec), sig,
                  datetime.now().isoformat(), item_id))
-            self.store.db.commit()
+        self.store.db.commit()
 
     async def generate_source_summary(self, source_id: str) -> None:
         """Generate a file-level summary from chunk summaries via LLM pool. No-op if pool unavailable."""
@@ -957,10 +1008,9 @@ async def rebuild_embeddings(store, embedder, *, job_id: str | None = None,
     same function powers the dashboard trigger and the watcher self-heal. Returns the
     number of items successfully re-embedded.
 
-    Serial single-item embed (the in-process embedder is the CPU floor and fans out
-    internally); batch size is only the commit/progress cadence, not a throttle.
+    Embeddings are dispatched in bounded groups while SQLite writes stay per-item,
+    preserving query availability, lost-update protection, and job heartbeats.
     """
-    loop = asyncio.get_running_loop()
     sig = embedder_signature(embedder)
     processed = 0
     failed = 0
@@ -989,56 +1039,43 @@ async def rebuild_embeddings(store, embedder, *, job_id: str | None = None,
             _fetch_rebuild_page, store, page_where, params_tail, last_id)
         if not rows:
             break
-        for row in rows:
-            vec = await loop.run_in_executor(
-                None, embedder.embed_for_item, row["title"], row["summary"], row["content"]
-            )
-            now_iso = datetime.now().isoformat()
-            # Per-item SQLite writes are OFFLOADED (asyncio.to_thread): a sync
-            # write can block up to the busy_timeout under a concurrent writer,
-            # and rebuild_embeddings is awaited on the gateway event loop — an
-            # inline write would freeze chat/liveness (the
-            # no-blocking-call-on-event-loop rule). store.db is a per-thread connection
-            # (threading.local, WAL); the loop awaits each serially, so there is
-            # no concurrent-connection use.
-            if vec:
-                # Guard against a lost update: if ingestion (file-change re-ingest)
-                # rewrote title/content while we were embedding, its updated_at moved
-                # past our snapshot's -- skip our stale-vector UPDATE and let that
-                # item re-embed via its own _embed_item. ``snap`` is the row's
-                # updated_at at read time.
-                snap = row["updated_at"]
-                landed = await asyncio.to_thread(
-                    _write_item_embedding, store, row["id"], floats_to_bytes(vec), sig, now_iso, snap
-                )
-                if landed:
-                    processed += 1
-                else:
-                    failed += 1  # raced with a concurrent writer; counts as not-done
-            else:
-                # Transient embed failure: leave sig stale (so it's retried) but stamp
-                # embedded_at as the attempt time so the watcher backs off this item.
-                await asyncio.to_thread(_stamp_embed_attempt, store, row["id"], now_iso)
-                failed += 1
-            last_id = row["id"]
+        for batch_start in range(0, len(rows), _INGEST_EMBED_BATCH_SIZE):
+            batch_rows = rows[batch_start : batch_start + _INGEST_EMBED_BATCH_SIZE]
+            # Advance the heartbeat before a batch starts. The bounded dispatch
+            # is intentionally far shorter than the stale-job threshold, while
+            # each row still receives its usual post-write heartbeat below.
             if job_id is not None:
-                # Heartbeat the job row PER ITEM, not just per batch: a single embed
-                # is the CPU floor (Ollama), so 50 serial embeds can exceed
-                # _REBUILD_STALE_AFTER on a slow/cold host. If updated_at only
-                # advanced at end-of-batch, the single-flight claimer would judge a
-                # live rebuild abandoned mid-batch and start a second one (duplicated
-                # embedding work). Committing the timestamp each item keeps the job
-                # demonstrably alive within the staleness window. The heavier
-                # progress counters still land once per batch below.
-                #
-                # OFFLOAD the write: rebuild_embeddings is awaited on the gateway
-                # event loop, and a synchronous SQLite write can block up to the
-                # busy_timeout when another writer holds the lock — freezing chat /
-                # liveness (the no-blocking-call-on-event-loop rule). ``store.db`` is
-                # a per-thread connection (threading.local, WAL), so the worker
-                # thread safely uses its OWN connection to the same db; the loop
-                # awaits it serially, so there is no concurrent-connection use.
-                await asyncio.to_thread(_heartbeat_rebuild_job, store, job_id, now_iso)
+                await asyncio.to_thread(
+                    _heartbeat_rebuild_job, store, job_id, datetime.now().isoformat()
+                )
+            vectors = await _embed_items(
+                embedder,
+                [(row["title"], row["summary"], row["content"]) for row in batch_rows],
+            )
+            for row, vec in zip(batch_rows, vectors):
+                now_iso = datetime.now().isoformat()
+                if vec:
+                    # A re-ingest may update the item after this batch was read.  The
+                    # compare-and-set write then skips the stale vector rather than
+                    # overwriting newer text.
+                    snap = row["updated_at"]
+                    landed = await asyncio.to_thread(
+                        _write_item_embedding, store, row["id"], floats_to_bytes(vec), sig, now_iso, snap
+                    )
+                    if landed:
+                        processed += 1
+                    else:
+                        failed += 1  # raced with a concurrent writer; counts as not-done
+                else:
+                    # Transient embed failure: leave sig stale (so it's retried) but stamp
+                    # embedded_at as the attempt time so the watcher backs off this item.
+                    await asyncio.to_thread(_stamp_embed_attempt, store, row["id"], now_iso)
+                    failed += 1
+                last_id = row["id"]
+                if job_id is not None:
+                    # Heartbeat each row, not merely each dispatch group, so a
+                    # later SQLite write cannot make a live rebuild look abandoned.
+                    await asyncio.to_thread(_heartbeat_rebuild_job, store, job_id, now_iso)
         # OFFLOADED end-of-batch progress write + commit (same no-blocking rule).
         await asyncio.to_thread(_commit_rebuild_progress, store, job_id, processed, failed)
 

@@ -1127,6 +1127,65 @@ class _FakeEmbedder:
         return [0.1, 0.2, 0.3, 0.4]
 
 
+class _BatchRecordingEmbedder(_FakeEmbedder):
+    """Production-shape fake that records each batch dispatch."""
+
+    def __init__(self):
+        super().__init__()
+        self.batches: list[list[tuple[str, str | None, str | None]]] = []
+
+    def embed_for_items(self, items):
+        self.batches.append(list(items))
+        return [[0.1, 0.2, 0.3, 0.4] for _ in items]
+
+
+@pytest.mark.asyncio
+async def test_ingest_text_dispatches_item_embeddings_in_bounded_batches(store):
+    """The normal ingestion path must use the same production batch seam as rebuilds."""
+    from kiro_crew.knowledge.ingestion import (
+        _INGEST_EMBED_BATCH_SIZE,
+        IngestionPipeline,
+    )
+
+    class _Chunker:
+        def chunk(self, _text):
+            return [
+                {
+                    "content": f"body {index}",
+                    "chunk_index": index,
+                    "line_start": index + 1,
+                    "line_end": index + 1,
+                    "section_title": f"section {index}",
+                }
+                for index in range(_INGEST_EMBED_BATCH_SIZE + 1)
+            ]
+
+    class _Extractor:
+        _pool = None
+
+        async def extract_batch(self, contents):
+            return [
+                {"category": "document", "summary": "summary", "entities": [], "relations": []}
+                for _ in contents
+            ]
+
+    embedder = _BatchRecordingEmbedder()
+    pipeline = IngestionPipeline(
+        store=store,
+        extractor=_Extractor(),
+        chunker=_Chunker(),
+        reader=FileReader(),
+        embedder=embedder,
+        dedup_enabled=False,
+    )
+
+    job_id = await pipeline.ingest_text("batch source", "Batch source")
+
+    assert job_id is not None
+    assert [len(batch) for batch in embedder.batches] == [_INGEST_EMBED_BATCH_SIZE, 1]
+    assert store.db.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"] == 33
+
+
 @pytest.mark.asyncio
 class TestRebuildEmbeddingsJob:
     async def _run(self, store, embedder, n_items):
@@ -1173,6 +1232,21 @@ class TestRebuildEmbeddingsJob:
         assert row["embedding"] == floats_to_bytes([0.1, 0.2, 0.3, 0.4])
         assert row["embedding_sig"] == embed_signature(embedder.model)
         assert row["embedded_at"]
+
+    async def test_rebuild_uses_bounded_embed_batches_when_supported(self, store):
+        """A capable embedder gets real multi-item dispatches, not serial fallback calls."""
+        from kiro_crew.knowledge.ingestion import _INGEST_EMBED_BATCH_SIZE, rebuild_embeddings
+
+        embedder = _BatchRecordingEmbedder()
+        for index in range(_INGEST_EMBED_BATCH_SIZE + 1):
+            store.add_item(f"batch {index:03d}", "body", "document")
+        store.db.commit()
+
+        processed = await rebuild_embeddings(store, embedder)
+
+        assert processed == _INGEST_EMBED_BATCH_SIZE + 1
+        assert [len(batch) for batch in embedder.batches] == [_INGEST_EMBED_BATCH_SIZE, 1]
+        assert embedder.embedded_titles == []
 
     async def test_rebuild_is_idempotent_skips_current_sig(self, store):
         # First rebuild stamps every item with the current sig.

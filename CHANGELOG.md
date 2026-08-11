@@ -2,6 +2,12 @@
 
 All notable changes to KiroCrew are documented in this file.
 
+## Unreleased
+
+- Knowledge ingestion and stale-vector rebuilds now dispatch bounded embedding
+  groups to the local backend while preserving per-item persistence and retry
+  behavior.
+
 ## [0.1.2] — 2026-07-30
 
 First public release of KiroCrew — an open-source personal AI agent that runs on
