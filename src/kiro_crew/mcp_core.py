@@ -2097,7 +2097,9 @@ def _list_tools() -> list[dict[str, Any]]:
                 "blocked, or finishing. Do NOT call every turn and do NOT summarize the "
                 "full transcript. The summary and current main_items replace the prior "
                 "view; milestone is appended to a seven-item server-capped trail. "
-                "Optional goal, next_action, and progress describe the current objective. "
+                "Optional goal and progress describe the current objective. Whenever work "
+                "remains, include one concrete next_action; omit it only when there is "
+                "genuinely no known next step. "
                 "This is session-bound: it updates only the session that called the tool."
             ),
             "inputSchema": {
@@ -2110,7 +2112,10 @@ def _list_tools() -> list[dict[str, Any]]:
                     },
                     "next_action": {
                         "type": "string",
-                        "description": "The one action the session should take next (max 160 chars).",
+                        "description": (
+                            "The one concrete action the session should take next (max 160 chars). "
+                            "Include it whenever work remains."
+                        ),
                         "maxLength": 160,
                     },
                     "summary": {

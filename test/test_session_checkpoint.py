@@ -58,8 +58,12 @@ class TestCheckpointDirectiveDispatch:
         )
         schema = descriptor["inputSchema"]
         assert schema["required"] == ["summary", "milestone"]
+        assert "Whenever work remains" in descriptor["description"]
         assert schema["properties"]["goal"]["maxLength"] == 240
         assert schema["properties"]["next_action"]["maxLength"] == 160
+        assert "Include it whenever work remains" in schema["properties"]["next_action"][
+            "description"
+        ]
         assert schema["properties"]["main_items"]["maxItems"] == 4
         assert schema["properties"]["progress"]["additionalProperties"] is False
 
