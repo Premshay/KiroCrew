@@ -40,10 +40,16 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.client import (
     _NOT_LOGGED_IN_RE,
+    CLAUDE_ACP_BIN,
+    CLAUDE_ACP_NPM_PKG,
+    CLAUDE_CODE_BIN,
     OversizeLineUnrecoverable,
+    PROTOCOL_VERSION_CLAUDE,
     _drain_oversize_line,
     _get_start_time,
     _KiroExecutableTrustError,
+    _resolve_claude_acp_bin,
+    _resolve_claude_code_executable,
     _resolve_kiro_bin_for_spawn,
     finish_suspended_spawn,
 )
@@ -71,6 +77,7 @@ from kiro_crew.acp.session_handle import (
     _load_watchdog_settings,
 )
 from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_INTERNAL_SANDBOX,
@@ -623,6 +630,7 @@ class AcpRuntime:
         model: str | None = None,
         expect_mcp_reports: bool = True,
         acp_backend: str = ACP_BACKEND_KIRO,
+        model_switch_method: str = "",
         crew_agent: str = "",
     ):
         if work_dir:
@@ -641,6 +649,7 @@ class AcpRuntime:
         # later sessions inherit the claiming crew, not the pool's spawn state.
         self._crew_agent = crew_agent
         self._acp_backend = acp_backend
+        self._model_switch_method = model_switch_method
         if model is not None:
             if not MODEL_ID_RE.match(model):
                 raise ValueError(
@@ -789,6 +798,11 @@ class AcpRuntime:
         return self._acp_backend
 
     @property
+    def _is_claude(self) -> bool:
+        """Whether this runtime speaks the Claude ACP adapter protocol."""
+        return self._acp_backend == ACP_BACKEND_CLAUDE
+
+    @property
     def uses_kiro_identity_store(self) -> bool:
         """True when this runtime's process signs in from kiro-cli's own store.
 
@@ -930,6 +944,15 @@ class AcpRuntime:
         Explicit per-backend construction: the two agents share no flags, and
         only kiro-cli needs its agent file materialized first.
         """
+        if self._is_claude:
+            claude_argv = await asyncio.to_thread(_resolve_claude_acp_bin)
+            if not claude_argv:
+                raise AcpRuntimeError(
+                    f"{CLAUDE_ACP_BIN} not found. Install it with "
+                    f"'npm i -g {CLAUDE_ACP_NPM_PKG}' or set CLAUDE_AGENT_ACP_BIN."
+                )
+            return claude_argv
+
         if self._acp_backend == ACP_BACKEND_KAS:
             if kas_override_active():
                 # Escape hatch (airgap/debug): launch the operator's pinned
@@ -1024,6 +1047,15 @@ class AcpRuntime:
         env = {**os.environ}
         if self._extra_env:
             env.update(self._extra_env)
+        if self._is_claude and not env.get("CLAUDE_CODE_EXECUTABLE"):
+            claude_exe = _resolve_claude_code_executable()
+            if claude_exe:
+                env["CLAUDE_CODE_EXECUTABLE"] = claude_exe
+            else:
+                logger.warning(
+                    "%s not found on PATH; set CLAUDE_CODE_EXECUTABLE for the adapter.",
+                    CLAUDE_CODE_BIN,
+                )
 
         # Parent-level scrub of gateway-owned channel credentials. The default
         # auto/standard sandbox launcher strips _AGENT_DENIED_ENV_KEYS only for
@@ -1179,9 +1211,15 @@ class AcpRuntime:
             self._reader_task = asyncio.ensure_future(self._reader_loop())
 
             # Protocol handshake
-            init_resp = await self._send_and_await(
-                "initialize",
-                {
+            init_params: dict[str, Any]
+            if self._is_claude:
+                init_params = {
+                    "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
+                    "protocolVersion": PROTOCOL_VERSION_CLAUDE,
+                    "clientCapabilities": ACP_CLIENT_CAPABILITIES,
+                }
+            else:
+                init_params = {
                     # kiro-cli reads the driving client name from `clientInfo.name`
                     # (agent/acp/acp_agent.rs: `if let Some(info) = request.client_info`),
                     # NOT from a flat `clientName` key. Sending it flat left every
@@ -1199,8 +1237,8 @@ class AcpRuntime:
                         if self._acp_backend == ACP_BACKEND_KAS
                         else ACP_CLIENT_CAPABILITIES
                     ),
-                },
-            )
+                }
+            init_resp = await self._send_and_await("initialize", init_params)
             self._can_load_session = bool(
                 init_resp.get("agentCapabilities", {}).get("loadSession", False)
             )
@@ -2621,6 +2659,10 @@ class AcpRuntime:
             mcp_servers=mcp_servers,
             kas_custom_agents=kas_agents,
         )
+        if self._is_claude:
+            # Claude's adapter owns session metadata and does not load Kiro
+            # agent specs or support Kiro's session/set_mode protocol.
+            params["_meta"] = {"claudeCode": {"options": {}}}
 
         budget = await self._session_start_budget()
         self._session_inits_in_flight += 1
@@ -2662,6 +2704,12 @@ class AcpRuntime:
         # Populate state from session/new response (configOptions, available models)
         handle.store_session_config(resp)
 
+        if self._is_claude and self._model:
+            if self._model_switch_method == "session_set_model":
+                await handle.set_model(self._model)
+            else:
+                await handle.set_config_option("model", self._model)
+
         mode_switched = False
         # Set agent mode if specified. If set_mode raises, no handle is returned
         # to the caller, so terminate the session we just created above —
@@ -2686,7 +2734,7 @@ class AcpRuntime:
         # None and the --agent spawn already selected the default, so only an
         # explicit override reaches set_mode here.
         mode_agent = agent or (self._agent if kas_agents else None)
-        if mode_agent and self._mode_available(mode_agent, resp):
+        if not self._is_claude and mode_agent and self._mode_available(mode_agent, resp):
             try:
                 await self._send_and_await(
                     METHOD_SET_MODE,
@@ -2703,7 +2751,7 @@ class AcpRuntime:
             # agent's own servers may still be booting.
             _ids, _current, _adv = parse_session_modes(resp)
             mode_switched = bool(_current) and mode_agent != _current
-        elif mode_agent:
+        elif not self._is_claude and mode_agent:
             _ids, _current, _adv = parse_session_modes(resp)
             await self.terminate_session(session_id)
             raise AcpRuntimeError(
@@ -2859,7 +2907,7 @@ class AcpRuntime:
         # succeeded so kiro-cli holds it; a plain local unregister would leak it
         # in the shared process (and leave the reader routing late transcript-
         # replay frames to an abandoned queue). terminate_session unregisters too.
-        if agent and self._mode_available(agent, resp):
+        if not self._is_claude and agent and self._mode_available(agent, resp):
             try:
                 await self._send_and_await(
                     METHOD_SET_MODE,
@@ -2872,7 +2920,7 @@ class AcpRuntime:
             # staged during session/load describe the pre-switch roster.
             _ids, _current, _adv = parse_session_modes(resp)
             mode_switched = bool(_current) and agent != _current
-        elif agent:
+        elif not self._is_claude and agent:
             # Guard (A) — see create_session. A resumed session always echoes a
             # `modes` list (checked above), so an absent agent means its config
             # isn't loaded. Fail closed rather than silently resuming on a

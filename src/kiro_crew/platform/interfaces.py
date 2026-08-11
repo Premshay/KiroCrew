@@ -93,15 +93,15 @@ class ProviderRegistry(Protocol):
         ...
 
     def agent_client_binding(self, agent_name: str) -> dict[str, Any] | None:
-        """Return optional ACP-client kwargs binding one agent to an engine.
+        """Return optional ACP transport kwargs binding one agent to an engine.
 
-        For the build sites that construct an :class:`~kiro_crew.acp.client.
-        AcpClient` DIRECTLY rather than through ``create_factory`` — today only
-        ``knowledge.llm_pool``, whose worker needs its own ``audit_source``,
-        sandbox mode and work dir and so cannot take a factory-built provider.
-        Without this those sites are unreachable by any companion binding: the
-        operator configures an engine, and the worker silently runs on the
-        native path anyway.
+        For build sites that construct an :class:`~kiro_crew.acp.client.AcpClient`
+        or :class:`~kiro_crew.acp.runtime.AcpRuntime` directly rather than through
+        ``create_factory``. The knowledge worker needs its own ``audit_source``,
+        sandbox mode, and work dir; runtime consumers likewise retain their
+        caller-owned isolation and session settings. Without this, those sites
+        are unreachable by a companion binding and silently run on the native
+        path.
 
         The public registry returns ``None``, so the public edition is
         byte-identical. Consumers apply only the keys in
@@ -113,13 +113,11 @@ class ProviderRegistry(Protocol):
 
 
 #: Keys a consumer of :meth:`ProviderRegistry.agent_client_binding` may apply to
-#: an ``AcpClient`` constructor. Deliberately narrow: these four describe WHICH
-#: engine serves the agent. Everything else about the client — ``audit_source``,
+#: an ACP client or runtime constructor. Deliberately narrow: these four describe
+#: WHICH engine serves the agent. Everything else — ``audit_source``,
 #: ``sandbox_mode``, ``work_dir`` — stays owned by the build site, which is the
 #: only layer that knows why it set them.
-ACP_CLIENT_BINDING_KEYS = frozenset(
-    {"acp_backend", "extra_env", "model", "model_switch_method"}
-)
+ACP_CLIENT_BINDING_KEYS = frozenset({"acp_backend", "extra_env", "model", "model_switch_method"})
 
 
 class PublishRegistry(Protocol):

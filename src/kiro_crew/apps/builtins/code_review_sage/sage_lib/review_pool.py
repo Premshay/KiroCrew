@@ -64,6 +64,20 @@ except ImportError:  # pragma: no cover - standalone / test fallback
     STOP_REASON_STALE_RECOVER = "stale_recover"  # type: ignore[assignment]
     STOP_REASON_TOOL_STALL = "error: tool stall"  # type: ignore[assignment]
 
+try:
+    from kiro_crew.platform.acp_binding import (
+        apply_runtime_client_binding,
+        runtime_client_binding,
+    )
+except ImportError:  # pragma: no cover - standalone / pre-binding core fallback
+
+    def runtime_client_binding(_agent_name: str) -> dict:
+        return {}
+
+    def apply_runtime_client_binding(runtime_kwargs: dict, binding: dict) -> None:
+        return None
+
+
 try:  # agents dir resolver — honors KIRO_HOME so a pod reads its own specs
     from kiro_crew.config.paths import kiro_agents_dir
 except Exception:  # pragma: no cover - standalone / test fallback
@@ -357,7 +371,12 @@ class _BatchRuntimeHolder:
         # OS sandbox scrubs credential paths/env for this LLM-directed subprocess
         # (GitHub fetch/post run via the `gh` CLI's own auth; the worker only
         # writes data/results and runs `python3 sage_lib/pipeline.py`).
-        rt = AcpRuntime(agent=self._agent, work_dir=self._work_dir, sandbox_mode="auto")
+        runtime_kwargs: dict = {
+            "work_dir": self._work_dir,
+            "sandbox_mode": "auto",
+        }
+        apply_runtime_client_binding(runtime_kwargs, runtime_client_binding(self._agent))
+        rt = AcpRuntime(agent=self._agent, **runtime_kwargs)
         await rt.spawn()
         self._runtime = rt
         logger.info("code-review-sage runtime spawned (agent=%s, cwd=%s)",

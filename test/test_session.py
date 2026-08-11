@@ -4136,6 +4136,59 @@ class TestGetBgSessionRecycle:
         await mgr.close_all()
 
 
+class TestDirectRuntimeBindings:
+    """Direct runtime consumers retain local policy while accepting a binding."""
+
+    @pytest.mark.asyncio
+    async def test_background_runtime_receives_its_agent_binding(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        runtime = AsyncMock()
+        runtime.spawn = AsyncMock()
+        runtime.is_alive = lambda: True
+        runtime.create_session = AsyncMock(return_value=object())
+        binding = {"acp_backend": "claude", "extra_env": {"ANTHROPIC_MODEL": "fast"}}
+
+        with (
+            patch("kiro_crew.session.runtime_client_binding", return_value=binding),
+            patch("kiro_crew.acp.runtime.AcpRuntime", return_value=runtime) as runtime_cls,
+        ):
+            await mgr.get_bg_session()
+
+        assert runtime_cls.call_args.kwargs == {
+            "agent": "kirocrew-lite",
+            "acp_backend": "claude",
+            "extra_env": {"ANTHROPIC_MODEL": "fast"},
+            "expect_mcp_reports": False,
+            "sandbox_mode": cfg.agent.sandbox,
+        }
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_subagent_none_uses_default_agent_binding(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mgr._parent_runtime_kwargs = MagicMock(return_value={"sandbox_mode": "auto"})
+        runtime = AsyncMock()
+        runtime.spawn = AsyncMock()
+        runtime.is_alive = lambda: True
+        binding = {"acp_backend": "claude", "model": "fast"}
+
+        with (
+            patch("kiro_crew.session.runtime_client_binding", return_value=binding) as lookup,
+            patch("kiro_crew.acp.runtime.AcpRuntime", return_value=runtime) as runtime_cls,
+        ):
+            result = await mgr.get_subagent_runtime("dashboard:slot", agent=None)
+
+        assert result is runtime
+        lookup.assert_called_once_with("kirocrew")
+        assert runtime_cls.call_args.kwargs == {
+            "agent": "kirocrew",
+            "acp_backend": "claude",
+            "model": "fast",
+            "sandbox_mode": "auto",
+        }
+        await mgr.close_all()
+
+
 def _run_runtime_factory(created_runtimes: list):
     """Factory whose providers each carry a fully-configured shared AcpRuntime.
 

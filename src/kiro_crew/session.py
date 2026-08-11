@@ -124,6 +124,7 @@ from kiro_crew.messaging.link import (
 )
 from kiro_crew.metrics.events import SESSION_IDLE_EXPIRED, emit_counter
 from kiro_crew.metrics.provider import get_recorder
+from kiro_crew.platform.acp_binding import apply_runtime_client_binding, runtime_client_binding
 from kiro_crew.providers.base import CancelOutcome, LLMProvider
 from kiro_crew.pycache_gc import PYCACHE_GC_INTERVAL_SECS, prune_pycache
 from kiro_crew.sandbox import cleanup_stale_sandbox_profiles
@@ -1352,17 +1353,21 @@ class SessionManager:
                     # passes the config mode (default "off", which kiro-cli's own
                     # internal sandbox covers); mirror it here so the bg session
                     # has the same posture rather than a stricter accidental one.
-                    runtime = AcpRuntime(
-                        agent="kirocrew-lite",
-                        sandbox_mode=getattr(self._cfg.agent, "sandbox", "auto"),
+                    agent = "kirocrew-lite"
+                    runtime_kwargs: dict[str, Any] = {
+                        "sandbox_mode": getattr(self._cfg.agent, "sandbox", "auto"),
                         # kirocrew-lite's config is written by Kiro Crew itself
                         # with an empty mcpServers map, so no MCP server can
                         # ever report on this runtime. Opting out keeps hot
                         # one-liner paths (chat titles, suggestions, STT
                         # endpointing) from holding drain_init() open for a
                         # first report that cannot arrive.
-                        expect_mcp_reports=False,
+                        "expect_mcp_reports": False,
+                    }
+                    apply_runtime_client_binding(
+                        runtime_kwargs, runtime_client_binding(agent)
                     )
+                    runtime = AcpRuntime(agent=agent, **runtime_kwargs)
                     await runtime.spawn()
                     self._bg_runtime = runtime
             try:
@@ -1435,6 +1440,7 @@ class SessionManager:
                 # Mirror the parent's security posture (sandbox + MCP gateway +
                 # env) so companion-runtime subagents never run unsandboxed.
                 rt_kwargs = self._parent_runtime_kwargs(parent_session_key)
+                apply_runtime_client_binding(rt_kwargs, runtime_client_binding(agent))
                 runtime = AcpRuntime(agent=agent, **rt_kwargs)
                 try:
                     await runtime.spawn()

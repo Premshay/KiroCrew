@@ -930,7 +930,13 @@ new module/class names.
   companion-attached `_write_claude_local_settings()` (via `getattr`) on the
   PRIMARY spawn path; `AcpClient`/`AcpProvider` take a `permission_mode` kwarg
   (Default `None`); `acp/types.py` adds `CC_PERMISSION_MODE_DEFAULT` /
-  `CC_PERMISSION_MODE_AUTO`.
+  `CC_PERMISSION_MODE_AUTO`. `ProviderRegistry.agent_client_binding()` is also
+  consumed by direct `AcpRuntime` build sites (`SessionManager`'s `_bg` and
+  subagent runtimes plus Code Review Sage's `ReviewPool`) through the narrow
+  `platform.acp_binding` adapter. It accepts only the established transport
+  keys and merges `extra_env`; caller-owned sandbox, work directory, MCP overlay,
+  and audit settings cannot be replaced by a binding. The standalone registry
+  remains unbound, so its runtime construction is byte-identical.
 - Slack message-gate seams (let an edition compose a fail-closed
   challenge-and-redirect posture without editing the core; `InterceptDecision`
   enum = `PROCESS | REDIRECTED | DROPPED`):
