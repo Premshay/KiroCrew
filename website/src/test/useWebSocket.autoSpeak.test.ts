@@ -252,4 +252,23 @@ describe('useWebSocket auto-speak voice pipeline', () => {
 
     hook.unmount()
   })
+
+  it('reports a replay stream failure instead of leaving the speaker button silent', async () => {
+    const notificationsBefore = store.getState().notifications.items.length
+    const { hook } = await mount()
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('voice-play-url', { detail: '/api/voice/replay/test' }))
+    })
+    await act(async () => {})
+    expect(AUDIO_INSTANCES).toHaveLength(1)
+
+    act(() => { AUDIO_INSTANCES[0].onerror?.() })
+    const notifications = store.getState().notifications.items
+    expect(notifications).toHaveLength(notificationsBefore + 1)
+    expect(notifications.at(-1)?.title).toBe('Voice playback failed')
+    expect(store.getState().chat.voicePlaying).toBe(false)
+
+    hook.unmount()
+  })
 })

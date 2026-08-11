@@ -8131,7 +8131,10 @@
         "tree_error": "ファイルツリーを読み込めませんでした"
       }
     },
-    "chatPage": {
+      "chatPage": {
+        "voice_audio_stream_could_not_be_played_check_voice_settings_and_try_again": "音声ストリームを再生できませんでした。音声設定を確認して、もう一度お試しください。",
+        "voice_playback_failed": "音声再生に失敗しました",
+        "voice_synthesis_failed_check_voice_settings_and_try_again": "音声合成に失敗しました。音声設定を確認して、もう一度お試しください。",
       "agent_list": "エージェント一覧",
       "agent_selector": "エージェント選択",
       "autopilot_plans_before_executing_each_stage_need": "オートパイロットは実行前に計画を作成します。各ステージには承認が必要です (自律実行するには「Go All」を選択)。サブエージェントは自動的に委任されます。計画の学習内容はセッション間で保持されます。",
@@ -11531,6 +11534,8 @@
         "piper_binary": "Piperバイナリ",
         "piper_en_us_lessac_medium_onnx": "~/piper/en_US-lessac-medium.onnx",
         "piper_local_offline": "Piper (ローカル、オフライン)",
+        "pocket_tts_local": "Pocket TTS（ローカル）",
+        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS はローカルで実行され、オンデマンド再生用に Ogg Opus をストリーミングします。",
         "piper_model": "Piperモデル",
         "piper_runs_locally_and_offline_polly_uses_aws_cr": "Piperはローカルおよびオフラインで実行;Amazon Polly は AWS 認証情報+ネットワークを使用",
         "piper_speech_speed_length_scale": "Piperスピーチスピード (長さスケール)",

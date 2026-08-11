@@ -3017,6 +3017,9 @@
     "chatPage": {
       "autopilot_plans_before_executing_each_stage_need": "Autopilot plans before executing. Each stage needs your approval (or select 'Go All' to run autonomously). Sub-agents are delegated automatically. Plan lessons persist across sessions.",
       "collapse_knowledge_context": "Collapse knowledge context",
+      "voice_audio_stream_could_not_be_played_check_voice_settings_and_try_again": "The audio stream could not be played. Check Voice settings and try again.",
+      "voice_playback_failed": "Voice playback failed",
+      "voice_synthesis_failed_check_voice_settings_and_try_again": "Voice synthesis failed. Check Voice settings and try again.",
       "connection_error": "Connection error",
       "could_not_start_a_new_session": "Could not start a new session",
       "could_not_start_session_message_restored": "Could not start a new session: {{error}}. Your message was restored — send it again to retry.",
@@ -4509,6 +4512,8 @@
         "fastest": "Fastest",
         "normal": "Normal",
         "piper_local_offline": "Piper (local, offline)",
+        "pocket_tts_local": "Pocket TTS (local)",
+        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS runs locally and streams Ogg Opus for on-demand replay.",
         "slow": "Slow",
         "slower": "Slower",
         "slowest": "Slowest"

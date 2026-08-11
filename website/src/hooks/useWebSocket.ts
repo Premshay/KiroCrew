@@ -285,6 +285,38 @@ export function useWebSocket() {
     updateVoiceBusy()
   }, [dispatch, updateVoiceBusy])
 
+  const playVoiceUrl = useCallback((url: string) => {
+    voiceMutedRef.current = false
+    const audio = new Audio(url)
+    activeAudioRef.current = audio
+    voicePlayingRef.current = true
+    dispatch(setVoicePlaying(true))
+    updateVoiceBusy()
+    let failureReported = false
+    const finish = () => {
+      if (activeAudioRef.current !== audio) return
+      activeAudioRef.current = null
+      voicePlayingRef.current = false
+      dispatch(setVoicePlaying(false))
+      updateVoiceBusy()
+    }
+    const fail = () => {
+      finish()
+      if (failureReported) return
+      failureReported = true
+      dispatch(addNotification({
+        ts: String(Date.now()),
+        kind: 'agent',
+        priority: 'critical',
+        title: i18nT('pages.chatPage.voice_playback_failed'),
+        body: i18nT('pages.chatPage.voice_audio_stream_could_not_be_played_check_voice_settings_and_try_again'),
+      } as Notification))
+    }
+    audio.onended = finish
+    audio.onerror = fail
+    audio.play().then(markFirstAudio).catch(fail)
+  }, [dispatch, updateVoiceBusy])
+
   const voiceProgressFor = useCallback((slot: string, message: ChatMessage): VoiceProgress | null => {
     const messageId = voiceMessageId(message)
     if (!messageId) return null
@@ -1714,8 +1746,13 @@ export function useWebSocket() {
       const detail = (e as CustomEvent).detail
       autoSpeakRef.current = !!detail?.autoSpeak
     }
+    const onVoicePlayUrl = (e: Event) => {
+      const url = (e as CustomEvent<unknown>).detail
+      if (typeof url === 'string') playVoiceUrl(url)
+    }
     window.addEventListener('voice-stop', onVoiceStop)
     window.addEventListener('voice-config-changed', onVoiceConfigChanged)
+    window.addEventListener('voice-play-url', onVoicePlayUrl)
     // Slot-focus intent signal (resume prefetch). One shared sender for
     // every focus source — Redux activeSlot changes (sidebar, keyboard,
     // deep links, history), tab visibility, and split-view pane focus via
@@ -1753,11 +1790,12 @@ export function useWebSocket() {
       wsRef.current = null
       window.removeEventListener('voice-stop', onVoiceStop)
       window.removeEventListener('voice-config-changed', onVoiceConfigChanged)
+      window.removeEventListener('voice-play-url', onVoicePlayUrl)
       document.removeEventListener('visibilitychange', onVisibility)
       unsubFocus()
       sendSlotFocusedImpl = () => {}
     }
-  }, [connect, stopVoice, flushSlotActivity])
+  }, [connect, playVoiceUrl, stopVoice, flushSlotActivity])
 
   /** Subscribe to log events — call with callback on mount, null on unmount. */
   const subscribeLogs = useCallback((cb: LogCallback) => {

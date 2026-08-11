@@ -11659,6 +11659,8 @@
         "piper_binary": "Piper-Binärdatei",
         "piper_en_us_lessac_medium_onnx": "~/piper/en_US-lessac-medium.onnx",
         "piper_local_offline": "Piper (lokal, offline)",
+        "pocket_tts_local": "Pocket TTS (lokal)",
+        "pocket_tts_runs_locally_and_streams_ogg_opus_for_on_demand_replay": "Pocket TTS läuft lokal und streamt Ogg Opus für die Wiedergabe auf Abruf.",
         "piper_model": "Piper-Modell",
         "piper_runs_locally_and_offline_polly_uses_aws_cr": "Piper läuft lokal und offline; Amazon Polly verwendet AWS-Anmeldedaten + Netzwerk",
         "piper_speech_speed_length_scale": "Piper-Sprechgeschwindigkeit (Längenskala)",
