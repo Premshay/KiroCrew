@@ -3451,6 +3451,16 @@ class TestKnowledgePoolIdleTtl:
         assert cfg.knowledge.pool_idle_ttl_secs == 300
 
 
+class TestKnowledgePoolTimeoutRoundTrip:
+    """The raw pool timeout override must survive a configuration save."""
+
+    def test_llm_timeout_secs_survives_round_trip(self) -> None:
+        cfg = _load_from_dict({"knowledge": {"llm_timeout_secs": 600}})
+
+        assert cfg.knowledge.llm_timeout_secs == 600.0
+        assert cfg.to_dict()["knowledge"]["llm_timeout_secs"] == 600.0
+
+
 class TestSaveRoundTripPreservesAllSections:
     """to_dict() (which save() writes as the ENTIRE config.json) previously
     omitted knowledge/heartbeat/snapshot_dir/watchdog, so any save silently
