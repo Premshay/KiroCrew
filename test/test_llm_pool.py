@@ -72,6 +72,43 @@ class FakeWorker(Worker):
         return self._alive
 
 
+class _TerminalError(Exception):
+    """Mirrors an ``AcpError`` the ACP layer classified as non-retryable."""
+
+    transient = False
+
+
+class _TransientError(Exception):
+    """Mirrors an ``AcpError`` a retry could still satisfy."""
+
+    transient = True
+
+
+class _FailingWorker(Worker):
+    """Raises *error* for the first *fail_times* calls, then answers 'ok'."""
+
+    def __init__(self, error: Exception, fail_times: int | None = None):
+        self._error = error
+        self._fail_times = fail_times
+        self.calls = 0
+        self._alive = True
+
+    async def start(self) -> None:
+        self._alive = True
+
+    async def send_message(self, prompt: str, timeout: float = 60.0) -> str:
+        self.calls += 1
+        if self._fail_times is None or self.calls <= self._fail_times:
+            raise self._error
+        return "ok"
+
+    async def shutdown(self) -> None:
+        self._alive = False
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
 class DeadOnSecondCallWorker(Worker):
     """Dies after first send_message call."""
 
@@ -143,6 +180,35 @@ class TestLLMPoolBasics:
         pool = _make_pool_with_fake_workers(pool_size=2)
         results = await pool.send_batch([])
         assert results == []
+
+    @pytest.mark.asyncio
+    async def test_send_batch_abandons_after_terminal_error(self):
+        """A backend the ACP layer called terminal is not asked again.
+
+        An exhausted usage allowance arrives as ``transient=False``; re-sending
+        the rest of the batch reproduces it once per prompt and spends the
+        allowance's error budget for nothing.
+        """
+        pool = _make_pool_with_fake_workers(pool_size=1)
+        worker = _FailingWorker(_TerminalError("monthly usage limit reached"))
+        pool._workers[0] = worker
+
+        results = await pool.send_batch(["a", "b", "c"])
+
+        assert results == ["", "", ""]
+        assert worker.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_send_batch_continues_after_transient_error(self):
+        """A transient failure still costs only its own item."""
+        pool = _make_pool_with_fake_workers(pool_size=1)
+        worker = _FailingWorker(_TransientError("bedrock 503"), fail_times=1)
+        pool._workers[0] = worker
+
+        results = await pool.send_batch(["a", "b", "c"])
+
+        assert worker.calls == 3
+        assert results.count("ok") == 2
 
     @pytest.mark.asyncio
     async def test_shutdown_clears_workers(self):
