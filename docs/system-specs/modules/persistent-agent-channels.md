@@ -19,7 +19,7 @@ orchestrator.
 
 Persistent agent channels — shared communication spaces with:
 - Existing dashboard sessions as the default collaboration peers
-- Explicit @mentions that request one safe peer turn without interrupting work
+- Typed peer reports with delivery receipts: `progress`, `mention`, and `done`
 - Optional provider-owned orchestrator and specialist roles for new work
 - Human approval for mutating provider-agent tool calls
 - Disk persistence for channel state across gateway restarts
@@ -67,22 +67,28 @@ Attached sessions use the strict session-bound MCP tools
 `session_channel_status` and `session_channel_post`. A post can address only
 named peers in a channel to which the caller is attached. The gateway persists
 the incoming report in the recipient slot's peer inbox as a
-`[KiroCrew Channel message]` envelope. A named peer request (`msg_type: mention`)
-also schedules one synthetic recipient turn when the slot is idle, or waits in
-the slot queue when it is busy. Broadcast, progress, and done reports remain
-passive. The envelope states that it is a peer-agent message, not a user
-instruction or operator authorization; it is not appended to the visible user
-chat transcript and never interrupts a running turn.
+`[KiroCrew Channel message]` envelope and returns a per-recipient receipt.
+`progress` and `done` are durable, passive reports. `mention` is the only
+attention semantic: with the default `delivery: next_turn`, it schedules one
+recipient turn when the slot is idle or waits in its queue when busy. A sender
+may use `delivery: interrupt` only with `mention` when new information may
+invalidate a running peer's premise. The gateway steers a steer-capable running
+turn; otherwise it preserves the report and places its synthetic request at the
+head of that peer's queue. This is a delivery policy, not a fourth message type.
+The envelope states that it is a peer-agent message, not a user instruction or
+operator authorization; ordinary queued delivery is not appended to the visible
+user chat transcript.
 
 ### Message Routing
 
 1. Human broadcast → attached sessions listening to all, plus an optional orchestrator
 2. @mention → targeted peer only (bounce message if done/failed)
-3. Agent-to-agent → capped at 3 exchanges per pair (prevent loops)
+3. Provider-owned agent-to-agent → capped at 3 exchanges per pair (prevent loops)
 4. Thread replies → routed to parent message sender (fallback to orchestrator)
 5. System messages → orchestrator ready, agent joined notifications
-6. Attached-session named request → one queued synthetic peer turn; passive
-   reports wait for the recipient's next normal turn
+6. Attached-session named request → one queued synthetic peer turn, or an
+   explicit interrupt steer with a durable queue-head fallback; passive reports
+   wait for the recipient's next normal turn
 
 ### Approval Flow
 
@@ -100,7 +106,7 @@ chat transcript and never interrupts a running turn.
 | Max active channels | 1 (configurable) | `ChannelManager.create()` |
 | Max agents per channel | 3 (configurable) | `Channel.add_agent()` |
 | Max messages per channel | 200 | `Channel.post()` — oldest trimmed with index cleanup |
-| Max A2A exchanges per pair | 3 | `Channel.post()` — prevents infinite ping-pong |
+| Max provider-agent A2A exchanges per pair | 3 | `Channel.post()` — prevents infinite ping-pong; attached persistent peers are exempt |
 
 Backend returns HTTP 429 with descriptive error messages when limits are hit.
 Frontend shows a modal dialog (⚠️ Limit Reached) with the specific limit and
