@@ -202,8 +202,14 @@ class TestChannelRouting:
             await ch.post(orch.id, "msg", from_role="Orch", mention=spec.id)
         while not spec.inbox.empty():
             spec.inbox.get_nowait()
-        await ch.post(orch.id, "one more", from_role="Orch", mention=spec.id)
+        blocked = await ch.post(orch.id, "one more", from_role="Orch", mention=spec.id)
         assert spec.inbox.empty()  # blocked by A2A limit
+        assert blocked.delivery_status == {spec.id: "backpressure"}
+        restored = Channel.deserialize(ch.serialize())
+        assert restored.messages[-1].delivery_status == {spec.id: "backpressure"}
+        notice = orch.inbox.get_nowait()
+        assert notice.from_id == "system"
+        assert "Delivery to @Specialist was deferred" in notice.content
 
     @pytest.mark.asyncio
     async def test_attached_sessions_bypass_legacy_a2a_exchange_limit(self):

@@ -360,6 +360,33 @@ class TestAttachedSessionWake:
         started.assert_awaited_once_with(state, slot)
 
     @pytest.mark.asyncio
+    async def test_sender_echo_never_queues_or_wakes_its_own_slot(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        member = SimpleNamespace(id="codex-member", session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="echo01",
+            from_id="codex-member",
+            from_role="Codex",
+            mention=["codex-member"],
+            msg_type="mention",
+            content="Outbound post must not wake its sender.",
+        )
+        started = AsyncMock(return_value=True)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._start_next_queued_turn", started)
+
+        outcome = await deliver_attached_channel_message(
+            state, SimpleNamespace(id="deadbeef"), member, message
+        )
+
+        assert outcome == "sender"
+        assert slot.peer_channel_inbox_payload() == []
+        assert slot._queue == []
+        started.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_peer_progress_stays_passive(self, monkeypatch, tmp_path) -> None:
         state = _state(tmp_path)
         slot = state.get_or_create_slot("crew-codex")

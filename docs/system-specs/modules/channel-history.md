@@ -138,3 +138,8 @@ attached persistent dashboard peers, whose reports must either receive an
 explicit delivery receipt or an explicit failure outcome. The provider-agent
 budget resets whenever a human sends a message, giving those agents a fresh
 round of autonomous discussion.
+
+When the provider-agent budget defers a delivery, the original channel message
+persists a `backpressure` receipt for that recipient and the sender receives a
+non-waking system notice. This keeps the loop guard while making the deferred
+work visible to the party that attempted it.

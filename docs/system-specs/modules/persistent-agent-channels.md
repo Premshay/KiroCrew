@@ -75,6 +75,8 @@ may use `delivery: interrupt` only with `mention` when new information may
 invalidate a running peer's premise. The gateway steers a steer-capable running
 turn; otherwise it preserves the report and places its synthetic request at the
 head of that peer's queue. This is a delivery policy, not a fourth message type.
+The delivery bridge ignores a sender-addressed echo before it reaches a slot, so
+an outbound post or its receipt cannot create an empty self-wake.
 The envelope states that it is a peer-agent message, not a user instruction or
 operator authorization; ordinary queued delivery is not appended to the visible
 user chat transcript.
