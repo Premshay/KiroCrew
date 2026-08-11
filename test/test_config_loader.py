@@ -4179,3 +4179,31 @@ def test_agent_triggers_load() -> None:
     # A non-string triggers value is normalized to "" on load (never survives to
     # select_crew's .strip()).
     assert cfg.agents["weird"].triggers == ""
+
+
+class TestKnowledgePoolKnobsRoundTrip:
+    """The pool knobs must survive a load() -> to_dict() round-trip.
+
+    llm_pool.py reads these keys from RAW config.json at each pool (re)spawn —
+    they are not consumed through the dataclass — so their only schema duty is
+    to survive serialization. On 2026-08-11 an operator-staged llm_pool_size=1
+    was silently erased because the schema did not declare the field: to_dict()
+    dropped it and the pool respawned at the default 3. These tests red if
+    either knob falls out of the schema again.
+    """
+
+    def test_llm_pool_size_survives_round_trip(self):
+        cfg = _load_from_dict({"knowledge": {"llm_pool_size": 1}})
+        assert cfg.knowledge.llm_pool_size == 1
+        assert cfg.to_dict()["knowledge"]["llm_pool_size"] == 1
+
+    def test_llm_timeout_secs_survives_round_trip(self):
+        cfg = _load_from_dict({"knowledge": {"llm_timeout_secs": 600}})
+        assert cfg.knowledge.llm_timeout_secs == 600.0
+        assert cfg.to_dict()["knowledge"]["llm_timeout_secs"] == 600.0
+
+    def test_unset_knobs_serialize_as_zero_meaning_unset(self):
+        """0 is the unset sentinel: llm_pool treats non-positive as absent."""
+        cfg = _load_from_dict({})
+        assert cfg.to_dict()["knowledge"]["llm_pool_size"] == 0
+        assert cfg.to_dict()["knowledge"]["llm_timeout_secs"] == 0.0
