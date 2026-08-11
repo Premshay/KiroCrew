@@ -10185,3 +10185,21 @@ class TestMiseNodeInstallsDir:
         script.write_text("#!/usr/bin/env node\n")
 
         assert client_mod._resolve_node_for_script(str(script)) is None
+
+
+class TestLocalLaneAdmission503:
+    """Local-lane admission responses are retryable, not terminal failures."""
+
+    def test_router_admission_503_is_transient(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert _is_transient_raw_error(
+            {"data": 'API Error: 503 {"error":"no available lane"}'}
+        ) is True
+
+    def test_usage_limit_still_beats_admission_wording(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert _is_transient_raw_error(
+            {"data": "Monthly usage limit has been reached; too many requests"}
+        ) is False
