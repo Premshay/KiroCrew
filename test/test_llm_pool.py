@@ -170,6 +170,28 @@ class TestWorkerAppliesBinding:
         assert kwargs["audit_source"] == "subagent"
 
     @pytest.mark.asyncio
+    async def test_binding_model_beats_the_agent_spec_pin(self):
+        """A bound engine's model must reach the wire, not the agent spec's.
+
+        ``~/.kiro/agents/kirocrew-knowledge.json`` pins a backend model id; a
+        mapped engine may name something else entirely (a fleet-router ROLE, not
+        an Anthropic id). AcpClient sends ``self._model`` and falls back to the
+        agent spec only when it is unset, so passing the binding's model through
+        is what makes the engine authoritative. Pinned here because an ambiguous
+        merge would surface as an invalid-model error at runtime, on whichever
+        edition resolved the other way.
+        """
+        worker = AcpWorker(sandbox_mode="off")
+        with patch(
+            "kiro_crew.knowledge.llm_pool._resolve_client_binding",
+            return_value=({"model": "fast"}, ""),
+        ), patch("kiro_crew.knowledge.llm_pool.AcpClient") as client_cls:
+            client_cls.return_value = AsyncMock()
+            await worker.start()
+
+        assert client_cls.call_args.kwargs["model"] == "fast"
+
+    @pytest.mark.asyncio
     async def test_unbound_registry_warns_naming_registry_and_agent(self, caplog):
         worker = AcpWorker(sandbox_mode="off")
         with patch(
