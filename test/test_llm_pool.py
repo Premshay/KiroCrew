@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -1311,3 +1312,97 @@ class TestBoundTimeoutFloor:
         await pool.send_batch(["a", "b"], timeout=60.0)
 
         assert worker.timeouts == [300.0, 300.0]
+
+
+class TestPoolSizeKnob:
+    """``knowledge.llm_pool_size`` sizes config-driven pools per deployment.
+
+    A single-slot serving lane wants 1 worker: extra workers cannot run
+    concurrently there — they queue behind each other until every prompt
+    exceeds its timeout, and against an admission-controlled router the
+    excess becomes 503 storms. A constructor-fixed size stays fixed: callers
+    like auto_research chose it deliberately.
+    """
+
+    def test_config_size_wins_for_default_pools(self):
+        from kiro_crew.knowledge.llm_pool import _get_pool_size
+
+        assert _get_pool_size({"knowledge": {"llm_pool_size": 1}}) == 1
+
+    def test_absent_config_keeps_default(self):
+        from kiro_crew.knowledge.llm_pool import DEFAULT_POOL_SIZE, _get_pool_size
+
+        assert _get_pool_size({}) == DEFAULT_POOL_SIZE
+
+    @pytest.mark.parametrize("raw", [0, -1, 17, "2", 2.5, True, None, [1]])
+    def test_malformed_or_out_of_range_falls_back(self, raw):
+        """A broken knob must not starve or explode the pool."""
+        from kiro_crew.knowledge.llm_pool import DEFAULT_POOL_SIZE, _get_pool_size
+
+        cfg = {"knowledge": {"llm_pool_size": raw}}
+        assert _get_pool_size(cfg) == DEFAULT_POOL_SIZE
+
+    def test_constructor_size_is_marked_fixed(self):
+        pool = LLMPool(pool_size=1)
+        assert pool._fixed_pool_size == 1
+        assert pool._pool_size == 1
+
+    def test_default_construction_is_config_driven(self):
+        from kiro_crew.knowledge.llm_pool import DEFAULT_POOL_SIZE
+
+        pool = LLMPool()
+        assert pool._fixed_pool_size is None
+        assert pool._pool_size == DEFAULT_POOL_SIZE
+
+
+class TestFloorHitAlarm:
+    """Exhausting the timeout floor in a bound pool abandons the batch loudly.
+
+    The floor covers a healthy lane's worst case, so reaching it means the
+    lane cannot meet its budget and every queued sibling would meet the same
+    fate — dispatching them extends the outage and re-queues work the lane may
+    still be generating for a departed client. Unbound pools keep per-item
+    timeout failures: their callers chose fast-fail budgets deliberately.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bound_pool_abandons_batch_on_floor_timeout(self, caplog):
+        from kiro_crew.acp.client import AcpTimeoutError
+
+        pool = _make_pool_with_fake_workers(pool_size=1)
+        pool._timeout_floor = 300.0
+        worker = _FailingWorker(AcpTimeoutError())
+        pool._workers[0] = worker
+
+        with caplog.at_level(logging.WARNING):
+            results = await pool.send_batch(["a", "b", "c"])
+
+        assert results == ["", "", ""]
+        assert worker.calls == 1
+        assert "alarm, not a budget" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unbound_pool_keeps_per_item_timeout_failures(self):
+        from kiro_crew.acp.client import AcpTimeoutError
+
+        pool = _make_pool_with_fake_workers(pool_size=1)
+        worker = _FailingWorker(AcpTimeoutError())
+        pool._workers[0] = worker
+
+        results = await pool.send_batch(["a", "b", "c"])
+
+        assert results == ["", "", ""]
+        assert worker.calls == 3
+
+    @pytest.mark.asyncio
+    async def test_bound_pool_non_timeout_transient_still_per_item(self):
+        """The abandon path is timeout-specific; transient errors keep retrying."""
+        pool = _make_pool_with_fake_workers(pool_size=1)
+        pool._timeout_floor = 300.0
+        worker = _FailingWorker(_TransientError("connection reset"), fail_times=1)
+        pool._workers[0] = worker
+
+        results = await pool.send_batch(["a", "b", "c"])
+
+        assert worker.calls == 3
+        assert results.count("ok") == 2

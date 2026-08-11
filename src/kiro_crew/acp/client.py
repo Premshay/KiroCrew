@@ -765,7 +765,16 @@ _RE_INVALID_MODEL_ID = re.compile(r"[Ii]nvalid model ID:\s*([^\s,;'\"]+)")
 _RE_THROTTLE_NAMED = re.compile(
     r"\b(ThrottlingException|TooManyRequestsException|ServiceQuotaExceededException)\b"
 )
-_RE_THROTTLE_GENERIC = re.compile(r"\b(rate.?limit|throttl(?:e|ed|ing))\b", re.IGNORECASE)
+# "too many requests" is the plain-phrase form of the same verdict the
+# CamelCase names above carry; the local fleet router and llama.cpp both emit
+# it as body text on admission-control 503s, which are momentary by
+# definition (the router even sends Retry-After). Safe against the
+# usage-limit caveat: exhausted-allowance wording is checked BEFORE this
+# branch, so a limit message that also says "too many requests" stays
+# terminal.
+_RE_THROTTLE_GENERIC = re.compile(
+    r"\b(rate.?limit|throttl(?:e|ed|ing)|too many requests)\b", re.IGNORECASE
+)
 _RE_AUTH = re.compile(
     r"\b(AccessDenied(?:Exception)?|UnauthorizedException|ExpiredToken(?:Exception)?"
     r"|InvalidSignatureException|UnrecognizedClientException)\b"
@@ -774,7 +783,14 @@ _RE_5XX_NAMED = re.compile(
     r"\b(InternalServerError|InternalFailure|ServiceUnavailable(?:Exception)?"
     r"|DispatchFailure|ConnectionReset(?:Error)?)\b"
 )
-_RE_5XX_STATUS = re.compile(r"(?:HTTP|status)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE)
+# "API Error: 503 {...}" is the Claude CLI's wording for an HTTP-level
+# rejection from its configured endpoint — the only prefix the local lane's
+# 503s ever arrive under, and it carries neither "HTTP" nor "status", so the
+# original pattern classified a retryable admission 503 as unknown/terminal
+# and send_batch abandoned whole batches on the first one.
+_RE_5XX_STATUS = re.compile(
+    r"(?:HTTP|status|API\s+Error:?)\s*(?:code\s*)?(?:50[0234]|529)\b", re.IGNORECASE
+)
 # Connection-level failures between the agent process and its configured
 # endpoint: the errno tokens Node/undici stringify into error messages
 # (ECONNREFUSED against a closed port, ECONNRESET/EPIPE on a dropped
@@ -796,8 +812,12 @@ _RE_CONNECTION = re.compile(
 # has treated these as transient all along; the raw classifier only knew the
 # CamelCase exception names, so the two classifiers disagreed on the same
 # error — the #1550 failure shape, in the other direction.
+# "no available lane" is the fleet router's admission-control 503 body
+# (fleet_router.py answers it with Retry-After: 30) — the upstream is
+# explicitly telling us to come back, which is the definition of transient.
 _RE_5XX_PHRASE = re.compile(
-    r"\binternal server error\b|\bservice unavailable\b", re.IGNORECASE
+    r"\binternal server error\b|\bservice unavailable\b|\bno available lane\b",
+    re.IGNORECASE,
 )
 # Genuine retry hint only. "response stream" USED TO BE matched here, which made
 # this branch a catch-all: kiro-cli wraps EVERY mid-stream provider failure as
