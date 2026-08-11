@@ -381,6 +381,17 @@ BACKGROUND_AGENT = "kirocrew-lite"
 # ``HEARTBEAT_SAFE_TOOLS`` allowlist in ``slack/gateway.py``.
 HEARTBEAT_KEY = "_hb"
 
+# History consolidation session key — runs as ``kirocrew-consolidate`` (its own
+# identity so the engine map can route the whole-session-tail payload to a
+# large-context seat). Stateless like ``_bg``/``_hb``: every consolidation is
+# self-contained (the prompt carries the tail), so resuming a prior transcript
+# supplies nothing while re-paying it as input tokens each turn — and, worse,
+# accumulating tails across restarts until the large lane rejects the turn as
+# oversized. The consolidator also resets the conversation per turn
+# (history._call_llm), so within one process lifetime the transcript never
+# grows either.
+CONSOLIDATE_KEY = "_consolidate"
+
 
 # Context usage thresholds.
 #
@@ -2777,9 +2788,12 @@ class SessionManager:
         # contract is "fresh context each cycle" (config/prompt.md), and each
         # entry is re-read from HEARTBEAT.md every cycle, so resuming a prior
         # transcript supplies nothing while costing input tokens every tick.
+        # ``_consolidate`` likewise: each consolidation prompt carries its own
+        # tail, and resuming would accumulate prior tails across restarts
+        # until the large-context lane rejects the turn as oversized.
         resume_sid: str | None = None
         is_stateless = (
-            key in (BACKGROUND_KEY, HEARTBEAT_KEY)
+            key in (BACKGROUND_KEY, HEARTBEAT_KEY, CONSOLIDATE_KEY)
             or any(key.startswith(p) for p in _STATELESS_PREFIXES)
         ) and not self._is_continuable_key(key)
         if not is_stateless:

@@ -676,6 +676,7 @@ async def background_turn(
     task: str,
     agent: "str | None" = None,
     session_key: str | None = None,
+    reset_conversation: bool = False,
 ) -> "AsyncIterator[Any]":
     """Take the shared background session for ONE turn, then release and account.
 
@@ -709,9 +710,9 @@ async def background_turn(
 
     key = session_key or BACKGROUND_KEY
     if agent is None:
-        client, _new, _resumed = await sessions.get_or_create(key)
+        client, is_new, _resumed = await sessions.get_or_create(key)
     else:
-        client, _new, _resumed = await sessions.get_or_create(key, agent=agent)
+        client, is_new, _resumed = await sessions.get_or_create(key, agent=agent)
     # The stats object as it stands BEFORE this turn. The shared session serves
     # many turns, and the runner replaces this object only once a turn actually
     # begins, so identity is what separates a turn that ran from one whose
@@ -723,6 +724,15 @@ async def background_turn(
     # so this is the only duration a background row can carry.
     turn_started = time.monotonic()
     try:
+        if reset_conversation and not is_new and hasattr(client, "new_conversation"):
+            try:
+                await client.new_conversation()
+            except Exception:
+                logger.warning(
+                    "background session reset failed task=%s; continuing with the prior transcript",
+                    task,
+                    exc_info=True,
+                )
         yield client
     finally:
         turn_elapsed_ms = int((time.monotonic() - turn_started) * 1000)
