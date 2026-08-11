@@ -59,3 +59,17 @@ class TestConsolidateAgent:
 
         src = inspect.getsource(history)
         assert "session_key=_CONSOLIDATE_SESSION_KEY" in src
+
+    def test_consolidation_session_is_bounded(self) -> None:
+        import kiro_crew.history as history
+        from kiro_crew.history import HistoryConsolidator
+        from kiro_crew.session import CONSOLIDATE_KEY
+
+        call_llm_src = inspect.getsource(HistoryConsolidator._call_llm)
+        assert "reset_conversation=True" in call_llm_src
+        assert history._CONSOLIDATE_SESSION_KEY == CONSOLIDATE_KEY
+
+    def test_consolidate_key_registered_stateless(self) -> None:
+        import kiro_crew.session as session
+
+        assert "CONSOLIDATE_KEY" in inspect.getsource(session.SessionManager.get_or_create)

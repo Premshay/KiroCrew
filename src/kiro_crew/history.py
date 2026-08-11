@@ -39,6 +39,7 @@ from kiro_crew.messaging.link import canonical_key, legacy_key
 from kiro_crew.preview_text import strip_markdown_preview
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.session import CONSOLIDATE_KEY
 from kiro_crew.skills import AUTO_SKILL_MAX_PROCEDURE_CHARS, AutoSkillProvenance
 from kiro_crew.skills_dedupe import (
     VERDICT_DUP,
@@ -53,7 +54,7 @@ from kiro_crew.vector_memory_constants import (
     _MAX_SEMANTIC_PER_CONSOLIDATION,
 )
 
-_CONSOLIDATE_SESSION_KEY = "_consolidate"
+_CONSOLIDATE_SESSION_KEY = CONSOLIDATE_KEY
 
 if TYPE_CHECKING:
     from kiro_crew.learn import LessonStore
@@ -7408,6 +7409,7 @@ class HistoryConsolidator:
                         task="consolidation",
                         agent="kirocrew-consolidate",
                         session_key=_CONSOLIDATE_SESSION_KEY,
+                        reset_conversation=True,
                     )
                 )
             except Exception as exc:

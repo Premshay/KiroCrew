@@ -35,10 +35,14 @@ class _Client:
 
     def __init__(self, prior_credits: float = 0.0) -> None:
         self.last_prompt_stats = _Stats(prior_credits)
+        self.reset_calls = 0
 
     def begin_turn(self, credits: float) -> None:
         """Install fresh stats, as the runner does when a turn actually starts."""
         self.last_prompt_stats = _Stats(credits)
+
+    async def new_conversation(self) -> None:
+        self.reset_calls += 1
 
 
 class _Sessions:
@@ -213,6 +217,7 @@ class TestBackgroundTurnAccounting(unittest.IsolatedAsyncioTestCase):
                 task="consolidation",
                 agent="kirocrew-consolidate",
                 session_key="_consolidate",
+                reset_conversation=True,
             ) as client:
                 client.begin_turn(1.0)
 
@@ -224,6 +229,7 @@ class TestBackgroundTurnAccounting(unittest.IsolatedAsyncioTestCase):
             [{"session_key": "_consolidate", "agent": "kirocrew-consolidate"}],
         )
         self.assertEqual(persist.await_args.args[0], "_consolidate")
+        self.assertEqual(client.reset_calls, 1)
 
 
 class TestBillingStatsReachThroughTheAdapter(unittest.TestCase):
