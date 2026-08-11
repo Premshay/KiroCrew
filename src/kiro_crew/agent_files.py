@@ -24,6 +24,11 @@ LITE_AGENT_FILENAME = "kirocrew-lite.json"
 KNOWLEDGE_AGENT_FILENAME = "kirocrew-knowledge.json"
 RESEARCH_AGENT_FILENAME = "kirocrew-research.json"
 HEARTBEAT_AGENT_FILENAME = "kirocrew-heartbeat.json"
+# History consolidation's own identity. Same empty shell as lite, split out
+# because its payload class differs: consolidation feeds a whole session tail
+# into one prompt, so deployments route it to a large-context engine while
+# lite's micro-jobs (titles, link labels) stay on the cheap seat.
+CONSOLIDATE_AGENT_FILENAME = "kirocrew-consolidate.json"
 
 # The Claude Code MCP sidecar filename under ~/.claude/agents/.
 CC_MCP_SIDECAR_FILENAME = "kirocrew.mcp.json"
@@ -38,6 +43,7 @@ OWNED_KIRO_AGENT_FILES = (
     KNOWLEDGE_AGENT_FILENAME,
     RESEARCH_AGENT_FILENAME,
     HEARTBEAT_AGENT_FILENAME,
+    CONSOLIDATE_AGENT_FILENAME,
 )
 OWNED_CC_AGENT_FILES = (CC_MCP_SIDECAR_FILENAME,)
 

@@ -4012,13 +4012,20 @@ class HistoryConsolidator:
         # consolidation stall.
         t_start = _time.monotonic()
         try:
+            # kirocrew-consolidate, NOT kirocrew-lite: consolidation feeds an
+            # entire session tail into one prompt, a payload class of its own.
+            # On the shared lite identity it inherited lite's cheap small-
+            # context routing and every attempt was rejected as oversized
+            # (observed 2026-08-11: 4/4 failures on a 32k lane while lite's
+            # titles succeeded). The dedicated identity lets the engine map
+            # route consolidation to a large-context seat by itself.
             client, _is_new, _resumed = await self._sessions.get_or_create(
-                session_key, agent="kirocrew-lite"
+                session_key, agent="kirocrew-consolidate"
             )
             t_acquired = _time.monotonic()
             wait_s = t_acquired - t_start
             # Reject all tools: this is a text/JSON-only generation turn. kiro
-            # scopes the kirocrew-lite session to tools:[] via set_mode, but the
+            # scopes the background session to tools:[] via set_mode, but the
             # Claude Code backend skips set_mode and injects the full
             # kirocrew-core/cron toolset — without REJECT_ALL a background
             # consolidation turn could fire side-effecting tools (send_message,
