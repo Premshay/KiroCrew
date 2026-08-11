@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+from unittest.mock import MagicMock
 
 from kiro_crew.apps.builtins.workflows.server import (
     handle_examples,
@@ -76,6 +77,26 @@ def test_app_json_ships_opt_in() -> None:
     with open(_APP_JSON, encoding="utf-8") as fh:
         raw = json.load(fh)
     assert raw.get("defaultEnabled") is False
+
+
+def test_main_bootstraps_platform_before_serving(monkeypatch) -> None:
+    import kiro_crew.apps.builtins.workflows.server as mod
+
+    config = MagicMock()
+    calls: list[str] = []
+    server = MagicMock()
+    monkeypatch.setattr(mod.KiroCrewConfig, "load", lambda: config)
+    monkeypatch.setattr(mod, "boot_platform", lambda received: calls.append("boot"))
+    monkeypatch.setattr(
+        mod,
+        "ThreadingHTTPServer",
+        lambda *_args: calls.append("server") or server,
+    )
+
+    mod.main()
+
+    assert calls == ["boot", "server"]
+    server.serve_forever.assert_called_once_with()
 
 
 # --------------------------------------------------------------------------- #
