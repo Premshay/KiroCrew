@@ -14,8 +14,11 @@ import contextlib
 import json
 import logging
 import os
+import shutil
+import secrets
 import tempfile
 import time
+from dataclasses import dataclass
 
 from aiohttp import web
 
@@ -25,18 +28,51 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.slack.handler import _vc
 from kiro_crew.voice_reply import (
+    DEFAULT_POCKET_VOICE,
     PROVIDER_PIPER,
     PROVIDER_POLLY,
+    PROVIDER_POCKET,
     VALID_ENGINES,
     VALID_PROVIDERS,
     resolve_polly_cli,
     stitch_mp3s,
+    stream_pocket_speech,
     streaming_voice_reply,
     synthesize_speech,
     validate_length_scale,
 )
 
 logger = logging.getLogger(__name__)
+
+_REPLAY_JOB_TTL_SECS = 120
+_MAX_REPLAY_JOBS = 32
+
+
+@dataclass(frozen=True)
+class _PocketReplayJob:
+    text: str
+    voice_id: str
+    piper_binary: str
+    piper_model: str
+    piper_model_config: str
+    length_scale: float
+    expires_at: float
+
+
+_pocket_replay_jobs: dict[str, _PocketReplayJob] = {}
+
+
+def _purge_expired_pocket_replay_jobs(now: float) -> None:
+    for candidate, job in list(_pocket_replay_jobs.items()):
+        if job.expires_at <= now:
+            _pocket_replay_jobs.pop(candidate, None)
+
+
+def _take_pocket_replay_job(job_id: str) -> _PocketReplayJob | None:
+    now = time.monotonic()
+    _purge_expired_pocket_replay_jobs(now)
+    job = _pocket_replay_jobs.pop(job_id, None)
+    return job if job and job.expires_at > now else None
 
 
 async def api_voice_config(request: web.Request) -> web.Response:
@@ -69,8 +105,12 @@ async def api_voice_config(request: web.Request) -> web.Response:
     # Update in-memory
     # ``in VALID_PROVIDERS`` would raise TypeError on an unhashable JSON value
     # (list/dict), 500ing the PUT — require a str first.
+    selected_provider = None
     if "provider" in body and isinstance(body["provider"], str) and body["provider"] in VALID_PROVIDERS:
-        _vc.provider = body["provider"]
+        selected_provider = body["provider"]
+        _vc.provider = selected_provider
+        if selected_provider == PROVIDER_POCKET and "voice" not in body:
+            _vc.default_voice = DEFAULT_POCKET_VOICE
     if "voice" in body:
         _vc.default_voice = str(body["voice"])
     # Same as provider above: ``in VALID_ENGINES`` raises TypeError on an
@@ -169,7 +209,7 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
     # streaming_voice_reply is Polly-only, so route the selected provider through
     # the provider-aware synthesize_speech and emit one chunk + complete —
     # otherwise the DEFAULT (Piper) provider would yield no dashboard audio.
-    if _vc.provider == PROVIDER_PIPER:
+    if _vc.provider in {PROVIDER_PIPER, PROVIDER_POCKET}:
         return await _synthesize_nonstreaming(state, text, slot_key)
 
     chunk_paths: list[str] = []
@@ -265,6 +305,7 @@ async def _synthesize_nonstreaming(
             return web.json_response({"ok": False, "error": msg}, status=502)
         with open(audio_path, "rb") as f:
             audio_b64 = base64.b64encode(f.read()).decode()
+        audio_mime = "audio/wav" if audio_path.lower().endswith(".wav") else "audio/mpeg"
         state.broadcast_ws(
             "voice_chunk",
             {
@@ -272,12 +313,12 @@ async def _synthesize_nonstreaming(
                 "index": 0,
                 "sentence": text,
                 "audio": audio_b64,
-                "audioMime": "audio/wav",
+                "audioMime": audio_mime,
             },
         )
         state.broadcast_ws(
             "voice_complete",
-            {"slot": slot_key, "audio": audio_b64, "chunks": 1, "audioMime": "audio/wav"},
+            {"slot": slot_key, "audio": audio_b64, "chunks": 1, "audioMime": audio_mime},
         )
         return web.json_response({"ok": True, "chunks": 1})
     except Exception as exc:
@@ -290,6 +331,100 @@ async def _synthesize_nonstreaming(
         if audio_path:
             with contextlib.suppress(OSError):
                 os.unlink(audio_path)
+
+
+async def api_voice_replay(request: web.Request) -> web.Response:
+    """Create a one-time Pocket replay URL, or select the legacy path."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response(
+            {"code": "voice_replay_invalid_json", "error": "invalid JSON"}, status=400
+        )
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"code": "voice_replay_invalid_json", "error": "invalid JSON"}, status=400
+        )
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return web.json_response(
+            {"code": "voice_replay_text_required", "error": "text required"}, status=400
+        )
+    if _vc.provider != PROVIDER_POCKET:
+        return web.json_response({"mode": "legacy"})
+
+    text, _ = redact_exfiltration_urls(text)
+    text, _ = redact_credentials(text)
+    now = time.monotonic()
+    _purge_expired_pocket_replay_jobs(now)
+    if len(_pocket_replay_jobs) >= _MAX_REPLAY_JOBS:
+        oldest = min(_pocket_replay_jobs, key=lambda key: _pocket_replay_jobs[key].expires_at)
+        _pocket_replay_jobs.pop(oldest, None)
+    job_id = secrets.token_urlsafe(24)
+    _pocket_replay_jobs[job_id] = _PocketReplayJob(
+        text=text,
+        voice_id=_vc.default_voice,
+        piper_binary=_vc.piper_binary,
+        piper_model=_vc.piper_model,
+        piper_model_config=_vc.piper_model_config,
+        length_scale=_vc.piper_length_scale,
+        expires_at=now + _REPLAY_JOB_TTL_SECS,
+    )
+    return web.json_response(
+        {"mode": "stream", "mime": "audio/ogg; codecs=opus", "url": f"/api/voice/replay/{job_id}"}
+    )
+
+
+async def api_voice_replay_stream(request: web.Request) -> web.StreamResponse:
+    """Stream a one-time Pocket replay URL as browser-playable Ogg Opus."""
+    job = _take_pocket_replay_job(request.match_info["job_id"])
+    if job is None:
+        return web.json_response(
+            {"code": "voice_replay_missing", "error": "voice replay is no longer available"},
+            status=404,
+        )
+    stream = stream_pocket_speech(
+        job.text,
+        voice_id=job.voice_id,
+        piper_binary=job.piper_binary,
+        piper_model=job.piper_model,
+        piper_model_config=job.piper_model_config,
+        length_scale=job.length_scale,
+    )
+    try:
+        first_chunk = await anext(stream)
+    except StopAsyncIteration:
+        with contextlib.suppress(Exception):
+            await stream.aclose()
+        return web.json_response(
+            {"code": "voice_replay_empty", "error": "voice replay produced no audio"}, status=502
+        )
+    except Exception:
+        with contextlib.suppress(Exception):
+            await stream.aclose()
+        logger.exception("Pocket replay could not start")
+        return web.json_response(
+            {"code": "voice_replay_unavailable", "error": "voice replay is unavailable"}, status=502
+        )
+
+    response = web.StreamResponse(
+        status=200,
+        headers={"Content-Type": "audio/ogg; codecs=opus", "Cache-Control": "no-store"},
+    )
+    await response.prepare(request)
+    try:
+        await response.write(first_chunk)
+        async for chunk in stream:
+            await response.write(chunk)
+        await response.write_eof()
+    except ConnectionError:
+        logger.debug("Pocket replay client disconnected")
+    except Exception:
+        logger.exception("Pocket replay stream failed after response started")
+    finally:
+        with contextlib.suppress(Exception):
+            await stream.aclose()
+    return response
 
 
 # ── Voices list (cached) ──

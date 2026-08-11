@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -12,13 +14,20 @@ from chat_test_helpers import _make_state
 
 
 def _make_voice_app(state):
-    from kiro_crew.dashboard.chat_voice import api_voice_config, api_voice_synthesize
+    from kiro_crew.dashboard.chat_voice import (
+        api_voice_config,
+        api_voice_replay,
+        api_voice_replay_stream,
+        api_voice_synthesize,
+    )
 
     app = web.Application()
     app["state"] = state
     app.router.add_get("/api/voice/config", api_voice_config)
     app.router.add_put("/api/voice/config", api_voice_config)
     app.router.add_post("/api/voice/synthesize", api_voice_synthesize)
+    app.router.add_post("/api/voice/replay", api_voice_replay)
+    app.router.add_get("/api/voice/replay/{job_id}", api_voice_replay_stream)
     return app
 
 
@@ -108,6 +117,27 @@ class TestVoiceConfig:
         persisted = json.loads(cfg_path.read_text(encoding="utf-8"))
         assert persisted["voice_reply"]["provider"] == "piper"
         assert persisted["voice_reply"]["piper_model"] == "~/voices/en.onnx"
+
+    @pytest.mark.asyncio
+    async def test_selecting_pocket_sets_a_compatible_default_voice(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(
+            global_enabled=False, provider="piper", default_voice="Ruth",
+            default_engine="generative", default_rate="100%", default_pitch="+0%",
+            aws_profile="", region="", piper_binary="", piper_model="",
+            piper_model_config="", piper_length_scale=1.0,
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({}))
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.config_path", lambda: cfg_path)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            response = await client.put("/api/voice/config", json={"provider": "pocket"})
+            assert response.status == 200
+        assert mock_vc.provider == "pocket"
+        assert mock_vc.default_voice == "michael"
+        assert json.loads(cfg_path.read_text())["voice_reply"]["voice_id"] == "michael"
 
     @pytest.mark.asyncio
     async def test_put_config_rejects_invalid_provider(self, tmp_path, monkeypatch):
@@ -344,6 +374,98 @@ class TestVoiceSynthesize:
         call_args = state.broadcast_ws.call_args
         assert call_args[0][0] == "voice_error"
         assert call_args[0][1]["slot"] == "s1"
+
+
+class TestVoiceReplay:
+    @pytest.mark.asyncio
+    async def test_replay_uses_legacy_path_for_non_pocket_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", MagicMock(provider="piper"))
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            response = await client.post("/api/voice/replay", json={"slot": "s1", "text": "hello"})
+            assert response.status == 200
+            assert await response.json() == {"mode": "legacy"}
+
+    @pytest.mark.asyncio
+    async def test_pocket_replay_streams_one_time_ogg_url(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice._vc",
+            MagicMock(
+                provider="pocket", default_voice="michael", piper_binary="/bin/piper",
+                piper_model="/models/pocket.onnx", piper_model_config="", piper_length_scale=1.0,
+            ),
+        )
+
+        async def stream(*args, **kwargs):
+            assert args == ("hello",)
+            assert kwargs["voice_id"] == "michael"
+            yield b"OggSfirst"
+            yield b"second"
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.stream_pocket_speech", stream)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            created = await client.post("/api/voice/replay", json={"slot": "s1", "text": "hello"})
+            assert created.status == 200
+            body = await created.json()
+            assert body["mode"] == "stream"
+            assert "audio" not in body
+
+            replay = await client.get(body["url"])
+            assert replay.status == 200
+            assert replay.headers["Content-Type"].startswith("audio/ogg")
+            assert await replay.read() == b"OggSfirstsecond"
+
+            expired = await client.get(body["url"])
+            assert expired.status == 404
+
+    @pytest.mark.asyncio
+    async def test_pocket_replay_closes_generator_after_client_disconnect(self, monkeypatch):
+        from kiro_crew.dashboard import chat_voice
+
+        closed = asyncio.Event()
+
+        async def stream(*args, **kwargs):
+            try:
+                yield b"OggSfirst"
+                yield b"second"
+            finally:
+                closed.set()
+
+        class DisconnectingResponse:
+            def __init__(self, **kwargs):
+                self.headers = kwargs["headers"]
+
+            async def prepare(self, request):
+                return None
+
+            async def write(self, chunk):
+                if chunk == b"second":
+                    raise ConnectionError("client disconnected")
+
+            async def write_eof(self):
+                raise AssertionError("a disconnected stream must not write EOF")
+
+        monkeypatch.setattr(chat_voice, "stream_pocket_speech", stream)
+        monkeypatch.setattr(chat_voice.web, "StreamResponse", DisconnectingResponse)
+        chat_voice._pocket_replay_jobs["one-time"] = chat_voice._PocketReplayJob(
+            text="hello",
+            voice_id="michael",
+            piper_binary="/bin/piper",
+            piper_model="/models/pocket.onnx",
+            piper_model_config="",
+            length_scale=1.0,
+            expires_at=time.monotonic() + 60,
+        )
+
+        response = await chat_voice.api_voice_replay_stream(
+            MagicMock(match_info={"job_id": "one-time"})
+        )
+
+        assert isinstance(response, DisconnectingResponse)
+        assert closed.is_set()
 
 
 def _consent_to_polly(*, profile: str, region: str) -> None:

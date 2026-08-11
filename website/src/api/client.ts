@@ -1691,6 +1691,7 @@ export interface WebhookTestResult {
 }
 
 export const api = {
+  voiceReplay: (slot: string, text: string) => post('/api/voice/replay', { slot, text }).then(j),
   status: () => fetch('/api/status').then(j),
   tunnelStatus: () => fetch('/api/tunnel/status').then(j) as Promise<TunnelStatus>,
   system: () => fetch('/api/system').then(j),

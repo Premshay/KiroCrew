@@ -15,6 +15,7 @@ from kiro_crew.voice_reply import (
     DEFAULT_PROVIDER,
     DEFAULT_RATE,
     PROVIDER_PIPER,
+    PROVIDER_POCKET,
     PROVIDER_POLLY,
     VALID_ENGINES,
     VALID_PROVIDERS,
@@ -26,6 +27,7 @@ from kiro_crew.voice_reply import (
     is_available,
     split_sentences,
     strip_markdown,
+    stream_pocket_speech,
     synthesize_speech,
     text_to_ssml,
     upload_voice_to_slack,
@@ -765,6 +767,47 @@ def _polly_consented(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(
         aws_consent, "probe_identity", _matching_identity(aws_consent, "111122223333")
     )
+
+
+class TestStreamPocketSpeech:
+    @pytest.mark.asyncio
+    async def test_uses_stream_shim_and_yields_ogg_bytes(self, tmp_path) -> None:
+        model = tmp_path / "voice.onnx"
+        model.write_bytes(b"m")
+        stdin = MagicMock()
+        stdin.drain = AsyncMock()
+        stdout = MagicMock()
+        stdout.read = AsyncMock(side_effect=[b"OggSfirst", b"second", b""])
+        stderr = MagicMock()
+        stderr.read = AsyncMock(return_value=b"")
+        proc = MagicMock(stdin=stdin, stdout=stdout, stderr=stderr, returncode=0)
+        proc.wait = AsyncMock(return_value=0)
+        captured: dict[str, object] = {}
+
+        async def fake_create(*cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            return proc
+
+        with (
+            patch("kiro_crew.voice_reply._resolve_piper_binary", return_value="/bin/piper"),
+            patch("kiro_crew.voice_reply.wrap_argv", side_effect=lambda cmd, mode: (cmd, None)),
+            patch("kiro_crew.voice_reply.create_subprocess_limited", side_effect=fake_create),
+        ):
+            chunks = [
+                chunk
+                async for chunk in stream_pocket_speech(
+                    "hello",
+                    voice_id="michael",
+                    piper_binary="/bin/piper",
+                    piper_model=str(model),
+                )
+            ]
+
+        assert chunks == [b"OggSfirst", b"second"]
+        assert "--stream" in captured["cmd"]
+        assert captured["env"]["KIROCREW_TTS_ENGINE"] == "pocket"
+        assert captured["env"]["KIROCREW_TTS_VOICE"] == "michael"
 
 
 class TestSynthesizePolly:

@@ -135,7 +135,31 @@ subprocess, reusing the same runner as the `whisper` and `mlx` providers.
 
 ## Voice Output (Text-to-Speech)
 
-Kiro Crew can speak responses aloud using Amazon Polly. Two modes are available:
+Kiro Crew supports three text-to-speech providers:
+
+- **Pocket TTS** is local and optimised for on-demand replay of a completed
+  dashboard response. It streams compact Ogg Opus audio to the browser.
+- **Piper** is local and offline. It produces a complete WAV clip.
+- **Amazon Polly** is cloud-backed and supports sentence-by-sentence auto-speak
+  while a response is still streaming.
+
+Choose a provider in **Settings → Chat → Voice (TTS)**. Pocket is the best
+choice when you normally listen after a response has completed.
+
+### Pocket On-Demand Replay
+
+With **Pocket TTS** selected, hover over a completed assistant message and click
+the 🔊 **Speak** button. Kiro Crew creates a short-lived, one-time replay URL;
+the browser starts playback as soon as Pocket produces the first Ogg Opus bytes.
+The clip is not retained as a dashboard asset.
+
+Pocket replay works with **Auto-speak Responses** off. Sentence cutting is an
+auto-speak latency feature for listening while text is still arriving; it does
+not improve replay of a response that is already complete.
+
+Pocket is supplied by the local deployment. If selecting Pocket or clicking
+Speak reports an unavailable voice service, the deployment owner must restore
+the local Pocket runtime; no AWS credential is involved.
 
 ### Auto-Speak (Non-Interruptive Streaming)
 
@@ -164,6 +188,9 @@ you can interrupt at any time by typing or speaking your next message.
 
 Hover over any assistant message (≥50 chars) and click the 🔊 **Speak** button
 to hear it read aloud. This works independently of auto-speak.
+
+For Pocket, replay is an on-demand Ogg Opus stream. Piper and Polly retain the
+existing synthesis path for manual replay.
 
 ### Slack Voice Replies
 
@@ -194,7 +221,7 @@ Settings are in **Settings → Chat → Voice (TTS)**, or directly in
 {
   "voice_reply": {
     "enabled": true,
-    "provider": "polly",
+    "provider": "piper",
     "auto_reply_to_voice": true,
 
     "voice_id": "Ruth",
@@ -215,10 +242,10 @@ Settings are in **Settings → Chat → Voice (TTS)**, or directly in
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `enabled` | `false` | Turn on voice replies for **every** Kiro Crew response (text-triggered). Also seeds the `auto_reply_to_voice` default — see below. |
-| `provider` | `"polly"` | TTS backend: `"polly"` (AWS, cloud) or `"piper"` (local, offline). Invalid values fall back to `polly` with a warning logged. |
+| `provider` | `"piper"` | TTS backend: `"pocket"` (local on-demand replay), `"piper"` (local, offline), or `"polly"` (AWS, cloud). Invalid values fall back to `polly` with a warning logged. |
 | `auto_reply_to_voice` | _follows `enabled`_ | **Voice-triggered**: when the user sends a voice memo, auto-respond with voice. Defaults to whatever `enabled` is — set explicitly to override. |
-| **Polly-specific** | | ignored when `provider="piper"` |
-| `voice_id` | `Ruth` | Any [Amazon Polly voice](https://docs.aws.amazon.com/polly/latest/dg/voicelist.html) |
+| **Polly-specific** | | ignored by Piper; Pocket uses only `voice_id` |
+| `voice_id` | `Ruth` | Any [Amazon Polly voice](https://docs.aws.amazon.com/polly/latest/dg/voicelist.html); Pocket's supplied local voice is `michael` |
 | `engine` | `generative` | `generative`, `neural`, `long-form`, `standard` |
 | `rate` | `100%` | 50%–200% |
 | `pitch` | `+0%` | -20% to +20% (neural/standard only) |
@@ -229,6 +256,13 @@ Settings are in **Settings → Chat → Voice (TTS)**, or directly in
 | `piper_model` | _(required)_ | Absolute path to a piper voice `.onnx` model |
 | `piper_model_config` | _(optional)_ | Path to `.onnx.json` config; piper auto-detects one next to the `.onnx` |
 | `piper_length_scale` | `1.0` | Speech speed. `<1` faster, `>1` slower |
+
+### Pocket TTS (`provider: "pocket"`)
+
+Pocket uses the locally supplied `michael` voice for the Ogg Opus replay path.
+The dashboard exposes this voice field, but the local runtime and its
+compatibility bridge are deployment configuration rather than a per-user setup
+step. Pocket does not require AWS credentials.
 
 ### Voice-in → voice-out (symmetric voice)
 

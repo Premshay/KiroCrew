@@ -2,11 +2,12 @@
 
 ## Overview
 
-Real-time text-to-speech for dashboard chat responses. Two providers: **Piper**
-(local, offline, the default — no AWS needed) and **Amazon Polly** (cloud). For
-Polly, voice playback starts as soon as the first sentence finishes streaming —
-no waiting for the full response. Piper produces a single local clip delivered
-whole. Sending a new message interrupts playback immediately.
+Real-time text-to-speech for dashboard chat responses. **Piper** is local and
+offline, **Amazon Polly** is cloud, and a locally configured **Pocket** runtime
+supplies compact on-demand replay. Polly auto-speak starts as soon as the first
+sentence finishes streaming. Pocket starts a manual replay from the first
+progressively encoded Ogg Opus bytes. Sending a new message interrupts playback
+immediately.
 
 ## Architecture
 
@@ -15,6 +16,8 @@ Polly:  chat_chunk (WS) → sentence detection (frontend) → POST /api/voice/sy
     → Polly TTS (per sentence) → voice_chunk (WS) → Audio playback (browser)
 Piper:  POST /api/voice/synthesize → synthesize_speech() one WAV
     → single voice_chunk + voice_complete (WS) → Audio playback (browser)
+Pocket replay: speaker click → POST /api/voice/replay → one-time GET URL
+    → Pocket shim --stream → Ogg Opus response → Audio playback (browser)
 ```
 
 ### Components
@@ -27,9 +30,10 @@ Piper:  POST /api/voice/synthesize → synthesize_speech() one WAV
 | Turn-taking hold | `website/src/hooks/useHandsFreeLoop.ts` + `website/src/pages/ChatPage.tsx` | Hands-free conversation mode: mic stays closed while the reply speaks; barge-in on mic tap (see Hands-Free Conversation Turn-Taking) |
 | Turn latency marks | `website/src/utils/voiceTurnMetrics.ts` | Debug-level per-turn spans: end-of-speech → first token / first audio |
 | Synthesize endpoint | `src/kiro_crew/dashboard/chat_voice.py` | `POST /api/voice/synthesize` — Polly: splits text into sentences + broadcasts chunks; Piper: `_synthesize_nonstreaming()` emits one clip (re-exported via `chat.py`) |
+| Replay endpoint | `src/kiro_crew/dashboard/chat_voice.py` | Pocket-only `POST /api/voice/replay` mints a short-lived, single-use URL; its GET streams Ogg Opus directly to the browser without WebSocket audio payloads |
 | Voice config endpoint | `src/kiro_crew/dashboard/chat_voice.py` | `GET/PUT /api/voice/config` — read/update voice settings incl. `provider` + `piper_*` (re-exported via `chat.py`) |
-| TTS synthesis | `src/kiro_crew/voice_reply.py` | `synthesize_speech()` provider dispatcher (Polly `aws polly` / local `piper`), `streaming_voice_reply()` (Polly-only), `validate_length_scale()`, `stitch_mp3s()` |
-| Settings UI | `website/src/pages/settings/VoicePanel.tsx` | Provider selector + auto-speak toggle; Polly fields (voice/engine/speed/profile/region) or Piper fields (model/binary/speed) |
+| TTS synthesis | `src/kiro_crew/voice_reply.py` | `synthesize_speech()` dispatches Polly and local file synthesis; `stream_pocket_speech()` streams Pocket Ogg Opus replay through the local compatibility executable |
+| Settings UI | `website/src/pages/settings/VoicePanel.tsx` | Provider selector + auto-speak toggle; Pocket exposes its runtime voice, Piper exposes model/binary/speed, and Polly exposes voice/engine/speed/profile/region |
 
 ## Streaming Auto-Speak Flow
 
@@ -100,16 +104,16 @@ Stored in `~/.kiro/crew/config.json` under `voice_reply`:
 
 | Setting | Default | Range |
 |---------|---------|-------|
-| `provider` | piper | `piper` (local) or `polly` (AWS). Invalid values fall back to `polly` on load |
-| `voice_id` | Ruth | Any Polly voice ID (Polly only) |
+| `provider` | piper | `piper` (local), `pocket` (local streamed replay), or `polly` (AWS). Invalid values fall back to `polly` on load |
+| `voice_id` | Ruth | Any Polly voice ID; Pocket uses the supplied local `michael` voice |
 | `engine` | generative | generative, neural, long-form, standard (Polly only) |
 | `rate` | 100% | 50%–200% (Polly only) |
 | `pitch` | +0% | -20% to +20% (Polly only) |
 | `enabled` | true | Controls auto-speak and Slack voice replies |
 | `aws_profile` | _(empty)_ | AWS CLI profile name for Polly calls. Empty = use default credentials |
 | `region` | _(empty)_ | AWS region for Polly. Empty = use CLI default |
-| `piper_model` | _(empty)_ | Path to a Piper `.onnx` voice model. Required for Piper |
-| `piper_binary` | _(empty)_ | Path to the `piper` executable. Empty = auto-detect on PATH / `~/piper-venv/bin/piper` |
+| `piper_model` | _(empty)_ | Path to a Piper `.onnx` voice model. Required for Piper and the current Pocket compatibility executable |
+| `piper_binary` | _(empty)_ | Path to the Piper executable. Pocket currently uses a Piper-compatible local bridge |
 | `piper_model_config` | _(empty)_ | Optional `.onnx.json` config (auto-detected next to the model if empty) |
 | `piper_length_scale` | 1.0 | Piper speed (lower = faster); coerced finite/positive by `validate_length_scale()` |
 
@@ -157,6 +161,8 @@ instruction for two of the three kinds.
 - `GET /api/voice/config` — returns current settings + `autoSpeak` flag
 - `PUT /api/voice/config` — update settings (partial patch), persists to config.json
 - `POST /api/voice/synthesize` — `{ slot, text, voice?, engine?, rate?, pitch? }`
+- `POST /api/voice/replay` — `{ slot, text }`; returns either `legacy` or a one-time Pocket Ogg Opus URL
+- `GET /api/voice/replay/{job_id}` — streams the single-use Pocket replay URL; it expires after two minutes
 - `GET /api/voice/voices` — list available Polly voices via `aws polly
   describe-voices` (respects `aws_profile`/`region`), cached in-process for 1
   hour. Each entry: `{ id, name, language, languageCode, gender, engines }`,
@@ -252,5 +258,7 @@ Redux state in `chatSlice`:
 ## Manual Replay
 
 The 🔊 Speak button appears on hover over assistant messages ≥50 chars.
-Clicking it calls `api.voiceSynthesize(slot, content)` which streams the
-full message through the same pipeline. This works independently of auto-speak.
+Clicking it first asks `api.voiceReplay(slot, content)` for a provider-aware
+playback path. Pocket returns a one-time Ogg Opus URL and the browser plays it
+as it grows; Piper and Polly retain `api.voiceSynthesize(slot, content)` as the
+legacy fallback. Manual replay works independently of auto-speak.
