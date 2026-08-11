@@ -71,6 +71,14 @@ device.
 5. Click **📦 Install Whisper** in the Speech-to-Text card — this installs
    the `openai-whisper` Python package and downloads the selected model.
 
+### Choose the spoken language
+
+Set **Language** in the Speech-to-Text card before recording. Kiro Crew passes
+that choice to Whisper, so Hebrew uses `he` and Romanian uses `ro` rather than
+being guessed as English. On Nexus, English dictation can use the resident
+Moonshine fast path; non-English input uses multilingual Whisper and may take
+a little longer to start.
+
 ### MLX provider (Apple Silicon GPU)
 
 On Apple Silicon (M-series) Macs, the `mlx` provider runs Whisper on the Metal
