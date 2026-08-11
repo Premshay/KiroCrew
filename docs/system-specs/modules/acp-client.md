@@ -79,6 +79,16 @@ Sending the wrong shape yields `-32602 Invalid params` or `-32601 Method not fou
 
 **`clientCapabilities` in the `initialize` request.** Both transports (`AcpClient._initialize_session` and `AcpRuntime`) send the shared `ACP_CLIENT_CAPABILITIES` dict from `acp/types.py`. Previously the key was omitted entirely, so the agent assumed the all-false default.
 
+**Direct runtime bindings.** `AcpRuntime` accepts the same narrowly validated
+engine binding as `AcpClient`: `acp_backend`, `extra_env`, `model`, and
+`model_switch_method`. `platform.acp_binding` applies it only at explicitly
+opted-in direct construction sites, retaining their caller-owned sandbox, work
+directory, MCP overlay, and audit policy. A Claude-bound runtime resolves the
+adapter, uses Claude's numeric initialization protocol, supplies its required
+`session/new` metadata, skips Kiro's `session/set_mode`, and applies a bound
+model by the binding's declared switch method. An unbound runtime keeps the
+native Kiro CLI path unchanged.
+
 | Key | Value | Why |
 |---|---|---|
 | `fs.readTextFile` / `fs.writeTextFile` | `false` | We serve no `fs/*` handler; advertising them would invite requests that hit `_reject_unknown_server_request`. |
