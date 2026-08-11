@@ -34,6 +34,15 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.session import BACKGROUND_KEY
 from kiro_crew.skills import AUTO_SKILL_MAX_PROCEDURE_CHARS, AutoSkillProvenance
+
+# Session key for history consolidation's dedicated session. Separate from
+# BACKGROUND_KEY because get_or_create binds an agent identity only at
+# cold-start: the shared ``_bg`` session is created at gateway startup as
+# kirocrew-lite, so any agent passed for the ``_bg`` key afterwards is
+# silently ignored. Consolidation needs its kirocrew-consolidate identity to
+# reach the provider factory (and the engine map behind it), which requires a
+# key whose cold-start it owns.
+_CONSOLIDATE_SESSION_KEY = "_consolidate"
 from kiro_crew.skills_dedupe import (
     VERDICT_DUP,
     VERDICT_NEW,
@@ -3994,22 +4003,28 @@ class HistoryConsolidator:
                 )
 
     async def _call_llm(self, prompt: str) -> dict | None:
-        """Call LLM for consolidation via the persistent background session.
+        """Call LLM for consolidation via a dedicated consolidation session.
 
-        Uses the shared background kiro-cli process (no spawn/teardown cost).
         Returns parsed JSON dict or None on failure.
         """
         if not self._sessions:
             logger.warning("LLM consolidation skipped — no session manager")
             return None
 
-        session_key = BACKGROUND_KEY
-        # Timing instrumentation (_bg stall investigation): measure both the
-        # wait to acquire the shared `_bg` session (queue contention behind
-        # other `_bg` consumers like chat_nav link-preview) and the LLM turn
-        # itself. No behavior change. Logged at DEBUG: silent in normal
-        # operation, surfaced only when log_level is raised to investigate a
-        # consolidation stall.
+        # A DEDICATED key, not BACKGROUND_KEY: get_or_create only binds the
+        # agent identity at cold-start, and the shared ``_bg`` session is
+        # cold-started once at gateway startup as BACKGROUND_AGENT
+        # (kirocrew-lite) — so under ``_bg`` the kirocrew-consolidate identity
+        # below never reached the provider factory and consolidation kept
+        # riding lite's small-context routing (verified 2026-08-11: the
+        # rerouting change produced zero factory traffic under the new
+        # identity). An own key also stops consolidation's minutes-long turn
+        # from queueing behind — or blocking — ``_bg``'s subsecond micro-jobs.
+        session_key = _CONSOLIDATE_SESSION_KEY
+        # Timing instrumentation: measure both the wait to acquire the
+        # consolidation session and the LLM turn itself. Logged at DEBUG:
+        # silent in normal operation, surfaced only when log_level is raised
+        # to investigate a consolidation stall.
         t_start = _time.monotonic()
         try:
             # kirocrew-consolidate, NOT kirocrew-lite: consolidation feeds an
