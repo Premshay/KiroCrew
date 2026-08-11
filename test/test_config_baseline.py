@@ -56,6 +56,14 @@ def _run_generator(tmp_path: str) -> dict:
 class TestBaselineGenerator:
     """Unit tests for the baseline generator script."""
 
+    def test_checked_in_baseline_matches_registry(self, tmp_path: str) -> None:
+        """The tracked baseline must stay synchronized with the schema registry."""
+        generated = _run_generator(tmp_path)
+        with open(os.path.join(_REPO_ROOT, "config-baseline.json"), encoding="utf-8") as f:
+            checked_in = json.load(f)
+
+        assert checked_in == generated, "Run scripts/generate_config_baseline.py and commit the result."
+
     def test_output_has_required_top_level_keys(self, tmp_path: str) -> None:
         """Output JSON has generatedBy and entries keys."""
         data = _run_generator(tmp_path)
