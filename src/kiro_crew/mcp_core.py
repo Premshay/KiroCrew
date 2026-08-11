@@ -1814,15 +1814,21 @@ def _list_tools() -> list[dict[str, Any]]:
         {
             "name": "local_knowledge_search",
             "description": (
-                "Search the user's knowledge library. Call ONLY when the user's "
-                "message contains one of these explicit signals:\n"
-                "- Asks 'what do we know about X' or 'check knowledge for X'\n"
-                "- References a specific document, wiki, or stored content by name\n"
-                "- Says 'in my docs', 'in my notes', 'according to our knowledge'\n"
-                "- Asks a factual question AND mentions a topic you know is in "
-                "their knowledge base\n\n"
-                "Do NOT call for: general coding questions, file operations, "
-                "debugging, or any task you can answer from context alone."
+                "Search the user's indexed knowledge library: project docs, "
+                "measurements, past decisions, and cross-session notes, kept "
+                "current within minutes of a document changing.\n\n"
+                "Call it BEFORE re-deriving anything prior work may have "
+                "settled. Triggers on YOUR need, not only the user's wording:\n"
+                "- You are about to state a fact about this project's history, "
+                "decisions, or measurements from memory or a summary\n"
+                "- You need a doc but don't know which file holds it\n"
+                "- The user references prior work ('what did we decide', a "
+                "named document, 'in my notes')\n\n"
+                "Skip it when you already know the exact file (Read it "
+                "instead) or the answer is fully in context. One query, "
+                "default limit — results are large. The index spans ALL of "
+                "the user's projects, so treat hits as leads and verify "
+                "load-bearing facts in the cited source file."
             ),
             "inputSchema": {
                 "type": "object",
