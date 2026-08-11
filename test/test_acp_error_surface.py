@@ -254,3 +254,89 @@ class TestTransientMarkerCoupling:
         formatted = _format_acp_error(_MODEL_UNAVAILABLE, ["claude-sonnet-4-5"])
         assert "does not have access" in formatted
         assert not is_transient_backend_error(formatted)
+
+
+class TestConnectionErrorClassification:
+    """Connection-level failures classify transient; the reroute made this real.
+
+    Before a provider binding could point the knowledge pool at a local lane,
+    ACP traffic never met a socket-level failure — the classifier had no
+    connection patterns and every ECONN* message fell through to the terminal
+    default, so a 30-second lane swap aborted a whole batch. These pin the
+    errno tokens and phrasings a Node agent process stringifies into JSON-RPC
+    errors, and that the terminal branches (usage limit, auth) keep precedence
+    even when connection wording appears in the same payload.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "fetch failed",
+            "connect ECONNREFUSED 127.0.0.1:8484",
+            "Connection error.",
+            "socket hang up",
+            "read ECONNRESET",
+            "connect ETIMEDOUT 127.0.0.1:8484",
+            "getaddrinfo EAI_AGAIN fleet-router",
+            "write EPIPE",
+        ],
+    )
+    def test_connection_failures_are_transient(self, text):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert _is_transient_raw_error({"code": -32603, "message": text, "data": ""})
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Internal server error",
+            "503 Service Unavailable",
+        ],
+    )
+    def test_spaced_5xx_phrases_are_transient(self, text):
+        """The marker list has always retried these; the raw classifier now agrees."""
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert _is_transient_raw_error({"code": -32603, "message": text, "data": ""})
+
+    def test_dns_resolution_failure_stays_terminal(self):
+        """ENOTFOUND is configuration, not weather — every retry reproduces it."""
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert not _is_transient_raw_error(
+            {"code": -32603, "message": "getaddrinfo ENOTFOUND fleet-rooter", "data": ""}
+        )
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            "Monthly usage limit has been reached. connect ECONNREFUSED 127.0.0.1:8484",
+            "AccessDeniedException after connect ETIMEDOUT 127.0.0.1:8484",
+        ],
+    )
+    def test_terminal_branches_keep_precedence_over_connection(self, data):
+        """A terminal cause with incidental connection wording stays terminal."""
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert not _is_transient_raw_error({"code": -32603, "message": "", "data": data})
+
+    def test_formatted_connection_wording_classifies_via_fallback(self):
+        """The string-fallback path must agree with the structured verdict.
+
+        Same coupling as TestTransientMarkerCoupling: rewording the connection
+        branch without updating _TRANSIENT_MARKERS makes a retryable failure
+        look terminal to history-restored messages.
+        """
+        from kiro_crew.acp.client import _format_acp_error
+        from kiro_crew.llm_helpers import is_transient_backend_error
+
+        error = {"code": -32603, "message": "connect ECONNREFUSED 127.0.0.1:8484", "data": ""}
+        formatted = _format_acp_error(error)
+        assert "Could not reach the model backend" in formatted
+        assert is_transient_backend_error(formatted)
+
+    def test_raw_errno_text_classifies_via_fallback(self):
+        """History-restored messages carry raw error text, not formatted prose."""
+        from kiro_crew.llm_helpers import is_transient_backend_error
+
+        assert is_transient_backend_error("Error: read ECONNRESET")
