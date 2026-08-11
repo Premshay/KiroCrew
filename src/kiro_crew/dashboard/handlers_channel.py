@@ -280,6 +280,9 @@ def _peer_interrupt_text(channel, message, content: str) -> str:
 
 async def deliver_attached_channel_message(state, channel, member, message) -> str:
     """Persist and, when requested, actively deliver one peer-channel message."""
+    if getattr(member, "id", "") == message.from_id:
+        logger.info("Channel %s ignored sender echo for %s", channel.id, member.id)
+        return "sender"
     slots = [
         slot for slot in state._slots.values() if effective_session_key(slot) == member.session_key
     ]

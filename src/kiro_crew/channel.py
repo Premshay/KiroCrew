@@ -381,6 +381,19 @@ class Channel:
                         self.id,
                     )
                     msg.delivery_status[agent.id] = "backpressure"
+                    if sender is not None:
+                        await sender.inbox.put(
+                            ChannelMessage(
+                                id=uuid.uuid4().hex[:8],
+                                from_id="system",
+                                from_role="System",
+                                content=(
+                                    f"Delivery to @{agent.role} was deferred because the "
+                                    f"agent-to-agent exchange limit ({self.max_exchanges}) was reached."
+                                ),
+                                msg_type="system",
+                            )
+                        )
                     continue
                 self.exchange_counts[pair] = self.exchange_counts.get(pair, 0) + 1
 
