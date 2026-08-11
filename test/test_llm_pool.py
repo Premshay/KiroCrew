@@ -302,6 +302,7 @@ class _FailingWorker(Worker):
         self._error = error
         self._fail_times = fail_times
         self.calls = 0
+        self.calls_since_reset = 0
         self._alive = True
 
     async def start(self) -> None:
@@ -318,6 +319,9 @@ class _FailingWorker(Worker):
 
     def is_alive(self) -> bool:
         return self._alive
+
+    async def reset_conversation(self) -> None:
+        self.calls_since_reset = 0
 
 
 class DeadOnSecondCallWorker(Worker):
@@ -1563,3 +1567,92 @@ class TestWorkerConversationRecycle:
         client.last_prompt_stats.context_pct = 63.5
         worker._client = client
         assert worker.context_pct() == 63.5
+class _TimeoutRecordingWorker(FakeWorker):
+    """FakeWorker that records the timeout each send arrived with."""
+
+    def __init__(self):
+        super().__init__()
+        self.timeouts: list[float] = []
+
+    async def send_message(self, prompt: str, timeout: float = 60.0) -> str:
+        self.timeouts.append(timeout)
+        return await super().send_message(prompt, timeout=timeout)
+
+
+class TestBoundTimeoutFloor:
+    """Bound pools floor caller timeouts; unbound pools leave them alone.
+
+    Every production caller passes an explicit cloud-tuned timeout (30-120 s),
+    so a bound pool cannot fix the local-lane queueing problem by changing
+    defaults — it has to raise the effective value at the send site. Unbound
+    pools must stay byte-identical: a fast-fail intent against a cloud
+    backend is deliberate.
+    """
+
+    def test_unbound_floor_is_zero_even_with_config(self):
+        from kiro_crew.knowledge.llm_pool import _get_timeout_floor
+
+        assert _get_timeout_floor({"knowledge": {"llm_timeout_secs": 45}}, bound=False) == 0.0
+
+    def test_bound_default_floor(self):
+        from kiro_crew.knowledge.llm_pool import BOUND_TIMEOUT_FLOOR, _get_timeout_floor
+
+        assert _get_timeout_floor({}, bound=True) == BOUND_TIMEOUT_FLOOR
+
+    @pytest.mark.parametrize("raw,expected", [(45, 45.0), (12.5, 12.5), (900, 900.0)])
+    def test_bound_config_override(self, raw, expected):
+        from kiro_crew.knowledge.llm_pool import _get_timeout_floor
+
+        cfg = {"knowledge": {"llm_timeout_secs": raw}}
+        assert _get_timeout_floor(cfg, bound=True) == expected
+
+    @pytest.mark.parametrize("raw", ["x", -1, 0, True, None, [300]])
+    def test_bound_malformed_config_falls_back_not_off(self, raw):
+        """A broken knob must not silently disable the floor."""
+        from kiro_crew.knowledge.llm_pool import BOUND_TIMEOUT_FLOOR, _get_timeout_floor
+
+        cfg = {"knowledge": {"llm_timeout_secs": raw}}
+        assert _get_timeout_floor(cfg, bound=True) == BOUND_TIMEOUT_FLOOR
+
+    @pytest.mark.asyncio
+    async def test_bound_pool_floors_caller_timeout(self):
+        pool = _make_pool_with_fake_workers(pool_size=1)
+        pool._timeout_floor = 300.0
+        worker = _TimeoutRecordingWorker()
+        pool._workers[0] = worker
+
+        await pool.send("p", timeout=30.0)
+
+        assert worker.timeouts == [300.0]
+
+    @pytest.mark.asyncio
+    async def test_bound_pool_respects_larger_caller_timeout(self):
+        pool = _make_pool_with_fake_workers(pool_size=1)
+        pool._timeout_floor = 300.0
+        worker = _TimeoutRecordingWorker()
+        pool._workers[0] = worker
+
+        await pool.send("p", timeout=600.0)
+
+        assert worker.timeouts == [600.0]
+
+    @pytest.mark.asyncio
+    async def test_unbound_pool_leaves_caller_timeout(self):
+        pool = _make_pool_with_fake_workers(pool_size=1)
+        worker = _TimeoutRecordingWorker()
+        pool._workers[0] = worker
+
+        await pool.send("p", timeout=30.0)
+
+        assert worker.timeouts == [30.0]
+
+    @pytest.mark.asyncio
+    async def test_send_batch_floors_every_item(self):
+        pool = _make_pool_with_fake_workers(pool_size=1)
+        pool._timeout_floor = 300.0
+        worker = _TimeoutRecordingWorker()
+        pool._workers[0] = worker
+
+        await pool.send_batch(["a", "b"], timeout=60.0)
+
+        assert worker.timeouts == [300.0, 300.0]

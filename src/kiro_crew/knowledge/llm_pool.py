@@ -46,6 +46,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_POOL_SIZE = 3
 DEFAULT_TIMEOUT = 60.0
 FETCH_TIMEOUT = 120.0
+# Minimum seconds any pool prompt may wait when the pool is BOUND to an
+# edition engine (a local lane). Local prompts queue behind up to
+# pool_size - 1 peers on a single serving slot, and behind a cold model
+# swap, so caller intents tuned for cloud latency (30-120 s here) expire
+# before the queue drains — after the 2026-08-11 reroute every extraction
+# blew its 60 s budget in groups of pool_size, zero completions. Unbound
+# pools keep caller values untouched: cloud prompts do not queue this way,
+# and a fast-fail intent there is deliberate. ``knowledge.llm_timeout_secs``
+# in config.json overrides this floor.
+BOUND_TIMEOUT_FLOOR = 300.0
 AGENT_NAME = "kirocrew-knowledge"
 # Knowledge extraction is deliberately high-effort by default. URL fetching uses
 # a separate pool and passes no explicit effort, so it retains provider default.
@@ -186,6 +196,24 @@ def _resolve_client_binding() -> tuple[dict, str]:
             logger.debug("AcpWorker: agent_client_binding lookup failed", exc_info=True)
     binding = _clean_binding(raw) if isinstance(raw, dict) else {}
     return (binding, "") if binding else ({}, type(providers).__name__)
+
+
+def _get_timeout_floor(config: Optional[dict] = None, bound: bool = False) -> float:
+    """Effective minimum prompt timeout: zero unless bound to an edition engine.
+
+    ``knowledge.llm_timeout_secs`` (any positive number) overrides the bound
+    floor; a malformed or non-positive value falls back to the default floor
+    rather than silently disabling it. Never consulted for unbound pools —
+    their callers' timeouts stand as written.
+    """
+    if not bound:
+        return 0.0
+    data = _read_config() if config is None else config
+    knowledge = data.get("knowledge") if isinstance(data, dict) else None
+    raw = knowledge.get("llm_timeout_secs") if isinstance(knowledge, dict) else None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return float(raw)
+    return BOUND_TIMEOUT_FLOOR
 
 
 def _get_sandbox_mode(config: Optional[dict] = None) -> str:
@@ -652,6 +680,9 @@ class LLMPool:
         self._provider_type: str = ""
         self._sandbox_mode: str = "auto"
         self._config: dict = {}
+        # Raised above zero in start() when the pool is bound to an edition
+        # engine; applied as max(caller timeout, floor) after every acquire.
+        self._timeout_floor: float = 0.0
         self._start_lock = asyncio.Lock()
         # Idle-TTL scale-to-zero (see DEFAULT_IDLE_TTL_SECS). Set from config in
         # start(); the reaper shuts all workers down once the pool has been fully
@@ -694,6 +725,14 @@ class LLMPool:
                 self._semaphore = asyncio.Semaphore(configured_size)
             self._idle_ttl = _get_idle_ttl(config)
             self._config = config
+            binding, _ = await asyncio.to_thread(_resolve_client_binding)
+            self._timeout_floor = _get_timeout_floor(config, bound=bool(binding))
+            if self._timeout_floor:
+                logger.info(
+                    "LLMPool: bound to an edition engine — prompt timeouts "
+                    "floored at %.0fs",
+                    self._timeout_floor,
+                )
             try:
                 for i in range(self._pool_size):
                     worker = await self._create_worker()
@@ -868,7 +907,10 @@ class LLMPool:
         """Convenience: acquire a worker, send prompt, release, return response."""
         idx, worker = await self.acquire()
         try:
-            return await worker.send_message(prompt, timeout=timeout)
+            # After acquire: start() has run, so the bound floor is resolved.
+            return await worker.send_message(
+                prompt, timeout=max(timeout, self._timeout_floor)
+            )
         finally:
             try:
                 await self._maybe_recycle(idx, worker)
@@ -932,13 +974,17 @@ class LLMPool:
             if terminal:
                 return
             slot, worker = await self.acquire()
+            sent = False
             try:
                 # Re-checked after the wait: a prompt queued behind a full pool
                 # may have been waiting while an earlier one proved the backend
                 # terminal, and spending its slot would buy nothing.
                 if terminal:
                     return
-                results[idx] = await worker.send_message(prompt, timeout=timeout)
+                sent = True
+                results[idx] = await worker.send_message(
+                    prompt, timeout=max(timeout, self._timeout_floor)
+                )
             except Exception as e:
                 if getattr(e, "transient", None) is False:
                     if terminal:
@@ -950,7 +996,11 @@ class LLMPool:
                     logger.warning("LLMPool: batch item %d failed: %s", idx, e)
                 results[idx] = ""
             finally:
-                self.release(slot)
+                try:
+                    if sent:
+                        await self._maybe_recycle(slot, worker)
+                finally:
+                    self.release(slot)
 
         await asyncio.gather(*[_do_one(i, p) for i, p in enumerate(prompts)])
         return results
