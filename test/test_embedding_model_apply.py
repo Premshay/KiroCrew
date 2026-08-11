@@ -42,6 +42,14 @@ class TestGatedCandidateLifecycle:
         assert cand._serving is False, "a candidate must not serve before activation"
         assert cand.model_id, "an empty id would collapse distinct spaces together"
 
+    def test_candidate_inherits_the_configured_thread_budget(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.embeddings._read_memory_config", lambda: {"embed_threads": 5}
+        )
+        cand = embeddings_mod.build_gated_candidate(_write_model(tmp_path / "bge.gguf"))
+
+        assert cand._n_threads == 5
+
     def test_a_gated_candidate_hands_out_no_vectors(self, tmp_path) -> None:
         """The window between load and reconcile is the corruption window."""
         from kiro_crew.embeddings import build_gated_candidate
@@ -342,9 +350,9 @@ class TestKnowledgeIngestSignatureBinding:
 
         from kiro_crew.knowledge.ingestion import IngestionPipeline
 
-        src = inspect.getsource(IngestionPipeline._embed_item)
+        src = inspect.getsource(IngestionPipeline._embed_item_batch)
         cap = src.find("sig = embedder_signature(self.embedder)")
-        embed = src.find("embed_for_item")
+        embed = src.find("vectors = await _embed_items")
         update = src.find("UPDATE items SET embedding")
         assert cap != -1, "the signature must be captured into a local"
         assert cap < embed, (

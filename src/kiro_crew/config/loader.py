@@ -1382,6 +1382,15 @@ class MemoryConfig:
         default=1024,
         metadata=_meta("Embedding Dimension", "Dimensionality of embedding vectors."),
     )
+    embed_threads: int = field(
+        default=0,
+        metadata=_meta(
+            "Embedding Threads",
+            "Optional llama.cpp compute-thread budget. Zero uses a conservative automatic "
+            "budget that leaves CPU capacity for local model serving; applies when the "
+            "embedding backend is next created.",
+        ),
+    )
     embed_model_url: str = field(
         default="",
         metadata=_meta(
@@ -4682,6 +4691,7 @@ class KiroCrewConfig:
                     memory_data.get("embedding_provider", "llama_cpp")
                 ),
                 embedding_dim=memory_data.get("embedding_dim", 1024),
+                embed_threads=_safe_int(memory_data.get("embed_threads", 0), 0, lo=0),
                 embed_model_url=memory_data.get("embed_model_url", ""),
                 embed_model_path=memory_data.get("embed_model_path", ""),
                 embed_model_id=memory_data.get("embed_model_id", ""),

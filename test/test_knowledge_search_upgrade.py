@@ -205,15 +205,18 @@ class TestInProcessEmbedder:
         emb.embed_for_item("My Title", "A summary")
         assert captured["text"] == "My Title A summary"
 
-    def test_embed_for_items_uses_one_backend_batch_with_singular_text_shape(self, monkeypatch):
-        """The production batch path must preserve the singular item assembly exactly."""
+    def test_embed_for_items_uses_singular_backend_calls_with_singular_text_shape(self, monkeypatch):
+        """Dispatch groups preserve the exact scalar vector path for every item."""
         emb = InProcessEmbedder()
         captured = []
 
         class _Backend:
-            def embed_batch(self, texts):
-                captured.append(texts)
-                return [[float(index)] for index, _ in enumerate(texts)]
+            def embed(self, text):
+                captured.append(text)
+                return [float(len(captured))]
+
+            def embed_batch(self, _texts):
+                raise AssertionError("knowledge dispatch must not change embedding arithmetic")
 
         monkeypatch.setattr(emb, "is_available", lambda: True)
         monkeypatch.setattr(emb, "_get_embedder", lambda: _Backend())
@@ -221,8 +224,8 @@ class TestInProcessEmbedder:
             [("First", "summary", "body"), ("Second", None, "content")]
         )
 
-        assert captured == [["First summary body", "Second content"]]
-        assert vectors == [[0.0], [1.0]]
+        assert captured == ["First summary body", "Second content"]
+        assert vectors == [[1.0], [2.0]]
 
 
 class TestSearchForContext:

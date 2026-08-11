@@ -368,6 +368,7 @@ _memory_config_st = st.builds(
     MemoryConfig,
     embedding_provider=st.sampled_from(["llama_cpp"]),
     embedding_dim=st.sampled_from([256, 512, 1024]),
+    embed_threads=st.integers(min_value=0, max_value=32),
     semantic_confidence_threshold=st.floats(min_value=0.0, max_value=1.0),
     episodic_dedup_threshold=st.floats(min_value=0.0, max_value=1.0),
     episodic_max_results=st.integers(min_value=1, max_value=50),
@@ -463,6 +464,7 @@ class TestConfigLoaderProperties:
         # Compare memory fields
         assert loaded.memory.embedding_provider == config.memory.embedding_provider
         assert loaded.memory.embedding_dim == config.memory.embedding_dim
+        assert loaded.memory.embed_threads == config.memory.embed_threads
         assert loaded.memory.migrated == config.memory.migrated
         assert loaded.memory.episodic_max_results == config.memory.episodic_max_results
         assert loaded.memory.episodic_max_count == config.memory.episodic_max_count

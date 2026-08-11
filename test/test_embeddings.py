@@ -202,6 +202,47 @@ class TestLlamaCppEmbedder:
         assert len(vec) == _DIM
         assert emb.is_ready()
 
+    def test_load_passes_the_explicit_thread_budget(self, tmp_path: Path, monkeypatch) -> None:
+        fake_cls = _make_fake_llama_class()
+        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
+        emb = LlamaCppEmbedder(model_path=_write_model_file(tmp_path / "model.gguf"), n_threads=5)
+
+        assert emb.wait_ready(timeout=5)
+        assert fake_cls.instances[0].kwargs["n_threads"] == 5
+        assert fake_cls.instances[0].kwargs["n_threads_batch"] == 5
+
+    @pytest.mark.parametrize(
+        ("cpu_count", "expected"),
+        [(1, 1), (3, 1), (6, 2), (24, 8), (96, 8)],
+    )
+    def test_auto_thread_budget_leaves_capacity_for_local_serving(
+        self, cpu_count: int, expected: int
+    ) -> None:
+        assert embeddings_mod._coerce_embed_threads(None, cpu_count=cpu_count) == expected
+
+    def test_configured_thread_budget_overrides_the_automatic_value(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.embeddings._read_memory_config", lambda: {"embed_threads": 5}
+        )
+        assert embeddings_mod.configured_embed_threads() == 5
+
+    def test_configured_thread_budget_accepts_a_legacy_numeric_string(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.embeddings._read_memory_config", lambda: {"embed_threads": "5"}
+        )
+        assert embeddings_mod.configured_embed_threads() == 5
+
+    def test_default_backend_receives_the_configured_thread_budget(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.embeddings._read_memory_config", lambda: {"embed_threads": 5}
+        )
+        monkeypatch.setattr("kiro_crew.embeddings.resolve_custom_model", lambda: None)
+
+        backend = embeddings_mod.default_embedding_backend()
+
+        assert isinstance(backend, LlamaCppEmbedder)
+        assert backend._n_threads == 5
+
     def test_embed_returns_none_when_model_file_missing(
         self, tmp_path: Path, monkeypatch
     ) -> None:

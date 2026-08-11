@@ -255,6 +255,7 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 - `LlamaCppEmbedder.embed(text)` / `embed_batch(texts)` → returns 1024-dim vectors or `None` on any failure (graceful degradation)
 - **Non-blocking model load**: the GGUF load runs on a background daemon thread (`_kick_background_load()`, thread name `kc-embed-load`) — `embed()`/`embed_batch()` NEVER block on the load. When the model isn't in memory yet, the call kicks the background load and returns `None` immediately; memory degrades to keyword search until the load lands. The gateway/dashboard event loop is never stalled by embedding work. `wait_ready(timeout)` exists for sync contexts (tests, one-shot CLI flows) that legitimately want to block — never call it from an event-loop thread
 - The underlying `Llama` object is NOT thread-safe — inference on a loaded model is serialized behind a lock (tens of ms per short text)
+- `memory.embed_threads` optionally sets both llama.cpp compute-pool sizes; `0` selects `min(8, max(1, cpu_count // 3))` so background embedding leaves cores for interactive local-model serving. The setting applies when the shared backend is created and does not alter vector identity.
 - `get_shared_embedder()` — process-wide singleton (~700MB RSS when loaded), shared by vector memory AND the knowledge library; `close()` unloads the model to free RSS
 - Per-platform native libs live in `_vendor/llama_cpp_libs/{linux_x86_64,linux_aarch64,macos_arm64,macos_x86_64,win_amd64}`, selected at import time via `LLAMA_CPP_LIB_PATH` (upstream-supported override; an operator-set value wins, enabling e.g. a GPU build). Unsupported platforms and import failures degrade to keyword-only memory search. See `_vendor/README.md`
 - Failed model loads (corrupt file, bad native libs) are retried only after a 300s cooldown so a broken state can't spawn a loader thread per embed call
@@ -445,13 +446,12 @@ episodic writes persist normally without vectors and continue to use keyword
 retrieval.
 
 Episodic import writes are **deliberately deferred** (`defer_embedding=True`) even
-when the model IS ready: per-chunk inference costs ~0.4s for a 2000-char chunk and
-an import writes hundreds, so embedding inline held the apply request for minutes.
+when the model IS ready: a large import writes hundreds of chunks, so embedding
+inline can hold the apply request for minutes.
 The row is keyword-searchable at once, and the embedding sweep runs afterwards off
 the request (the dashboard handler schedules it; a self-owned store sweeps before
-closing). Batching is not an alternative — `embed_batch` is measurably slower than
-looping `embed` at import chunk sizes. See `onboarding-import.md` → "Deferred
-embedding".
+closing). The sweep uses scalar `embed` calls so vectors retain the same arithmetic
+as query-time embeddings. See `onboarding-import.md` → "Deferred embedding".
 
 Hermes Markdown import is limited to exact `memories/MEMORY.md` and
 `memories/USER.md` files under the main home and each profile; arbitrary memory

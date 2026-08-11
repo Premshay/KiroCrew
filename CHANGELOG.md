@@ -4,9 +4,9 @@ All notable changes to KiroCrew are documented in this file.
 
 ## Unreleased
 
-- Knowledge ingestion and stale-vector rebuilds now dispatch bounded embedding
-  groups to the local backend while preserving per-item persistence and retry
-  behavior.
+- Knowledge ingestion and stale-vector rebuilds now dispatch bounded groups
+  while retaining scalar embedding arithmetic, and the local embedder has a
+  conservative configurable compute-thread budget for co-serving hosts.
 
 ## [0.1.2] — 2026-07-30
 

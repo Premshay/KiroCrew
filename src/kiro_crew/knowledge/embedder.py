@@ -133,26 +133,14 @@ class InProcessEmbedder:
     def embed_for_items(
         self, items: list[tuple[str, str | None, str | None]]
     ) -> list[list[float] | None]:
-        """Embed knowledge-item inputs in one backend batch.
+        """Embed knowledge-item inputs through the singular backend path.
 
         The returned list always has one entry per input, so an ingestion sweep
         can preserve each row's retry and lost-update handling when the backend
-        degrades.  It deliberately shares :meth:`_item_text` with the singular
-        path: batching may change runtime arithmetic, never what each vector
-        represents.
+        degrades. The surrounding dispatch groups amortize executor hops, while
+        per-item calls keep stored and query vectors bit-identical.
         """
-        if not items:
-            return []
-        texts = [self._item_text(title, summary, content) for title, summary, content in items]
-        if not self.is_available():
-            return [None] * len(texts)
-        vectors = self._get_embedder().embed_batch(texts)
-        if vectors is None or len(vectors) != len(texts):
-            # A partial backend response has no trustworthy item-to-vector
-            # mapping. Leave every row stale so the normal retry path owns it.
-            self._available = None
-            return [None] * len(texts)
-        return vectors
+        return [self.embed_for_item(title, summary, content) for title, summary, content in items]
 
     def _item_text(self, title: str, summary: str | None, content: str | None = None) -> str:
         """Assemble one knowledge-item embedding input for both call paths."""

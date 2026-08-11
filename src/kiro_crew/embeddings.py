@@ -104,6 +104,10 @@ _N_CTX = 2048
 # n_ctx after clipping (dense CJK/code) fail the embed call and return None.
 _MAX_EMBED_CHARS = 6_000
 _LLM_LOAD_RETRY_SECS = 300.0  # re-attempt a failed model load after this long
+# Embedding shares host CPU with local model serving, so its automatic pool
+# budget intentionally leaves most cores available for interactive inference.
+_EMBED_THREADS_MAX = 8
+_EMBED_THREADS_DIVISOR = 3
 # How long close() waits for the inference thread to finish its current job and
 # exit. Bounded so an unload never wedges a shutdown; the thread is a daemon, so
 # a straggler cannot hold the interpreter open either.
@@ -265,6 +269,24 @@ def _read_memory_config() -> dict:
     return {}
 
 
+def _coerce_embed_threads(value: object, cpu_count: int | None = None) -> int:
+    """Return a safe compute-pool size from an optional config value."""
+    if not isinstance(value, bool):
+        try:
+            configured = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            configured = 0
+        if configured > 0:
+            return configured
+    cores = cpu_count if isinstance(cpu_count, int) and cpu_count > 0 else os.cpu_count() or 1
+    return min(_EMBED_THREADS_MAX, max(1, cores // _EMBED_THREADS_DIVISOR))
+
+
+def configured_embed_threads() -> int:
+    """Resolve ``memory.embed_threads`` for the process-wide embedding backend."""
+    return _coerce_embed_threads(_read_memory_config().get("embed_threads"))
+
+
 class CustomModelSpec(NamedTuple):
     """A user-configured local embedding model.
 
@@ -403,7 +425,11 @@ def build_gated_candidate(path: Path) -> LlamaCppEmbedder:
     same file — otherwise a real model change could look like no change.
     """
     return LlamaCppEmbedder(
-        model_path=path, dim=0, model_id=_custom_model_id(path, ""), serving=False
+        model_path=path,
+        dim=0,
+        model_id=_custom_model_id(path, ""),
+        serving=False,
+        n_threads=configured_embed_threads(),
     )
 
 
@@ -423,7 +449,11 @@ def build_gated_bundled() -> LlamaCppEmbedder:
     # with the bundled model_id, stamping custom vectors as bundled and keeping
     # them across restarts.
     return LlamaCppEmbedder(
-        model_path=default_model_path(), dim=_DEFAULT_DIM, model_id=_MODEL_ID, serving=False
+        model_path=default_model_path(),
+        dim=_DEFAULT_DIM,
+        model_id=_MODEL_ID,
+        serving=False,
+        n_threads=configured_embed_threads(),
     )
 
 
@@ -818,10 +848,12 @@ class LlamaCppEmbedder(EmbeddingBackend):
         dim: int = _DEFAULT_DIM,
         model_id: str = _MODEL_ID,
         serving: bool = True,
+        n_threads: int | None = None,
     ):
         self._model_path = model_path or active_model_path()
         self._dim = dim
         self._model_id = model_id
+        self._n_threads = _coerce_embed_threads(n_threads)
         self._llm: object | None = None
         # Gate: a candidate installed by a model change LOADS but serves nobody
         # until activate(). Returning None from embed* is the ABC's documented
@@ -934,6 +966,8 @@ class LlamaCppEmbedder(EmbeddingBackend):
                 n_ctx=_N_CTX,
                 n_batch=_N_CTX,
                 n_ubatch=_N_CTX,
+                n_threads=self._n_threads,
+                n_threads_batch=self._n_threads,
                 verbose=False,
             )
             # Validate the model's REAL output width against the configured dim
@@ -981,9 +1015,10 @@ class LlamaCppEmbedder(EmbeddingBackend):
                 self._llm = None
                 return
             logger.info(
-                "Loaded embedding model %s in %.1fs",
+                "Loaded embedding model %s in %.1fs with %d compute threads",
                 self._model_path.name,
                 time.monotonic() - started,
+                self._n_threads,
             )
             if self._closed:
                 # close() ran while this load was in flight (a timed-out or
@@ -1205,8 +1240,9 @@ def default_embedding_backend() -> EmbeddingBackend:
     :func:`register_embedding_backend` still overrides it for other runtimes.
     """
     spec = resolve_custom_model()
+    n_threads = configured_embed_threads()
     if spec is None:
-        return LlamaCppEmbedder()
+        return LlamaCppEmbedder(n_threads=n_threads)
     # A broken custom path is still honoured as "custom": the embedder will not
     # load, embeddings stay unavailable, and memory degrades to keyword search.
     # Falling back to the bundled model here would silently swap the vector
@@ -1226,11 +1262,17 @@ def default_embedding_backend() -> EmbeddingBackend:
             model_path=models_dir() / _REJECTED_MODEL_SENTINEL,
             dim=spec.dim,
             model_id=spec.model_id,
+            n_threads=n_threads,
         )
     logger.info(
         "Using custom embedding model %s (id=%s, dim=%d)", spec.path, spec.model_id, spec.dim
     )
-    return LlamaCppEmbedder(model_path=spec.path, dim=spec.dim, model_id=spec.model_id)
+    return LlamaCppEmbedder(
+        model_path=spec.path,
+        dim=spec.dim,
+        model_id=spec.model_id,
+        n_threads=n_threads,
+    )
 
 
 def get_shared_embedder() -> EmbeddingBackend:
