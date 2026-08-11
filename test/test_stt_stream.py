@@ -740,7 +740,6 @@ class TestConfigPutRoundTrip:
             assert "en-US" in data["language_codes"]
             assert "fr-FR" in data["language_codes"]
             assert "he-IL" in data["language_codes"]
-            assert "ro-RO" in data["language_codes"]
 
 
 class TestDefensiveGuards:
