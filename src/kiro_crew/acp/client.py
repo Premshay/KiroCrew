@@ -932,9 +932,6 @@ def _is_transient_raw_error(
     if _RE_AUTH.search(haystack):
         # Auth is terminal — a retry can't fix an expired/denied credential.
         return False
-    if _is_session_expired(haystack):
-        # Session expiry is terminal — retrying can't refresh an expired login.
-        return False
     if _RE_CONNECTION.search(haystack):
         # The endpoint refused, dropped, or timed out the connection. On a
         # local lane that is a restarting router or a lane mid-swap; the
@@ -1144,17 +1141,6 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
                 "(e.g. re-run your SSO/login or 'aws sso login'), then retry. If "
                 "the failure persists, check that the configured AWS profile has "
                 "Bedrock InvokeModel access."
-                f"{req_id_suffix}"
-            )
-        elif _is_session_expired(haystack):
-            # Session expiry (401/403, or prose saying as much) — distinct from
-            # the Bedrock credential errors above. Retrying or switching models
-            # cannot succeed, so the message must not suggest either.
-            formatted = (
-                "Your session has expired. Run `kiro-cli login` in your "
-                "terminal to sign back in, then start a new chat. "
-                "Retrying or switching models will not help — this is a "
-                "sign-in issue, not a backend error."
                 f"{req_id_suffix}"
             )
         elif _RE_CONNECTION.search(haystack):
