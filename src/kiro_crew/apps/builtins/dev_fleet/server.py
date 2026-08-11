@@ -52,8 +52,10 @@ from aiohttp import web
 
 from kiro_crew import frontend, hooks, platform_compat
 from kiro_crew.apps.builtins.dev_fleet import gateway_service
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.env import find_node_tool, node_bin_dirs
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.platform.bootstrap import boot_platform
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_BUILD,
     create_subprocess_limited,
@@ -4377,6 +4379,7 @@ def create_app() -> web.Application:
 
 def main() -> int:
     """Entry point when run as a module by the app backend system."""
+    boot_platform(KiroCrewConfig.load())
     app = create_app()
     logger.info("Dev Fleet backend starting on 127.0.0.1:%d", PORT)
     web.run_app(app, host="127.0.0.1", port=PORT, print=None)
