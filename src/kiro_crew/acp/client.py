@@ -2510,6 +2510,84 @@ class AcpClient:
             )
         logger.info("ACP model: %s", self._model)
 
+    async def new_conversation(self) -> None:
+        """Clean-slate reset to a fresh conversation on the SAME warm process.
+
+        Parity with ``AcpSessionProvider.new_conversation`` (the kiro runtime
+        path): issue a fresh ``session/new`` on the already-running backend and
+        re-run the cold-start session configuration (steps 4–5 of
+        ``_initialize_session``: set_mode + startup model), skipping the
+        expensive parts of a cold start — subprocess spawn and the
+        ``initialize`` handshake. This is the primitive per-turn resets
+        (history consolidation) and warm pool reuse rely on; without it the
+        transcript accumulates across turns until the backend rejects every
+        prompt as oversized (observed 2026-08-12: "Prompt is too long" after a
+        morning of failed resets).
+
+        Failure contract: on ANY failure the client is restored to the prior
+        session, which remains fully usable — callers that warn-and-continue on
+        a failed reset (history.py) then genuinely reuse the old conversation
+        rather than a half-configured new one. The advertised models/modes
+        captured from the fresh response are not rolled back: the process is
+        the same, so the backend advertises the same sets.
+
+        The prior session is left idle on the backend — this single-session
+        client has no session-teardown verb (the runtime path destroys handles
+        via its multi-session facility). Its memory cost is bounded by the
+        pool's process recycling.
+        """
+        if not self.is_process_alive():
+            raise AcpProcessDied("Process is not alive — cannot start a new conversation")
+        if not self._session_id:
+            raise AcpError("Cannot reset a conversation before the session is initialized")
+        if self.has_active_turn():
+            raise AcpError("Cannot reset a conversation while a turn is in flight")
+
+        old_sid = self._session_id
+        session_resp = await self._new_session_following_substitution()
+        new_sid = session_resp.get("sessionId")
+        if not new_sid:
+            raise AcpError(
+                "session/new returned no sessionId during conversation reset; "
+                "the prior conversation remains active"
+            )
+
+        self._session_id = new_sid
+        try:
+            self._capture_available_models(session_resp)
+            self._store_session_config(session_resp)
+            # Step 4 parity: a fresh session needs the agent mode activated
+            # again, under the same fail-closed guard as the cold start.
+            if not self._is_claude:
+                if not self._modes_advertised or self._agent in self._available_mode_ids:
+                    await self._send_request(
+                        METHOD_SET_MODE,
+                        {"sessionId": new_sid, "modeId": self._agent},
+                    )
+                else:
+                    raise AcpError(
+                        f"Agent mode {self._agent!r} is not available on this "
+                        f"session (advertised modes: "
+                        f"{self._available_mode_ids or 'none'}); refusing to "
+                        f"reset onto the backend default mode."
+                    )
+            # Step 5 parity: session/new reverts to the agent-config default
+            # model; re-apply the configured override (or its withhold logic).
+            await self._apply_startup_model()
+        except BaseException:
+            self._session_id = old_sid
+            raise
+
+        self._resumed = False
+        if not self._is_claude:
+            _jpath = kiro_sessions_dir() / f"{new_sid}.jsonl"
+            try:
+                self._jsonl_pos = _jpath.stat().st_size if _jpath.exists() else 0
+            except OSError:
+                self._jsonl_pos = 0
+        self._last_activity = time.monotonic()
+        logger.info("ACP conversation reset: %s -> %s", old_sid, new_sid)
+
     async def set_config_option(self, config_id: str, value: str) -> None:
         """Set a session config option (e.g. effort level) via session/set_config_option."""
         if not self._session_id:
