@@ -10203,3 +10203,81 @@ class TestLocalLaneAdmission503:
         assert _is_transient_raw_error(
             {"data": "Monthly usage limit has been reached; too many requests"}
         ) is False
+
+
+class TestNewConversation:
+    """Warm ACP reset retains the original session on any setup failure."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    def _make_warm_client(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path)
+        proc = MagicMock()
+        proc.returncode = None
+        client._process = proc
+        client._session_id = "sess-old"
+        client._turn_done.set()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_swaps_session_and_reconfigures(self, tmp_path):
+        client = self._make_warm_client(tmp_path)
+        sent: list[tuple[str, dict]] = []
+
+        async def fake_send(method, params):
+            sent.append((method, params))
+            return len(sent)
+
+        client._send_request = fake_send
+        client._wait_for_response = AsyncMock(return_value={"sessionId": "sess-new"})
+        client._apply_startup_model = AsyncMock()
+
+        await client.new_conversation()
+
+        assert client._session_id == "sess-new"
+        assert sent[0][0] == "session/new"
+        assert next(params for method, params in sent if method == "session/set_mode")["sessionId"] == "sess-new"
+        client._apply_startup_model.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_or_unusable_session_keeps_prior_session(self, tmp_path):
+        client = self._make_warm_client(tmp_path)
+        client._send_request = AsyncMock(return_value=1)
+        client._wait_for_response = AsyncMock(return_value={})
+
+        with pytest.raises(AcpError, match="no sessionId"):
+            await client.new_conversation()
+
+        assert client._session_id == "sess-old"
+
+    @pytest.mark.asyncio
+    async def test_configuration_failure_restores_prior_session(self, tmp_path):
+        client = self._make_warm_client(tmp_path)
+
+        async def fake_send(method, params):
+            if method == "session/set_mode":
+                raise AcpError("mode rejected")
+            return 1
+
+        client._send_request = fake_send
+        client._wait_for_response = AsyncMock(return_value={"sessionId": "sess-new"})
+
+        with pytest.raises(AcpError, match="mode rejected"):
+            await client.new_conversation()
+
+        assert client._session_id == "sess-old"
+
+    @pytest.mark.asyncio
+    async def test_refuses_active_turn_and_dead_process(self, tmp_path):
+        client = self._make_warm_client(tmp_path)
+        client.has_active_turn = lambda: True
+
+        with pytest.raises(AcpError, match="turn is in flight"):
+            await client.new_conversation()
+
+        client.has_active_turn = lambda: False
+        client._process = None
+        with pytest.raises(AcpProcessDied):
+            await client.new_conversation()
