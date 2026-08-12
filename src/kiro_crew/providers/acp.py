@@ -1166,14 +1166,14 @@ class AcpProvider(LLMProvider):
 
         Delegates to the backing client — ``AcpSessionProvider.new_conversation``
         on the kiro path (``self._client`` is swapped to the session provider by
-        ``start()``), which issues a fresh ``session/new`` on the already-running
-        process, skipping subprocess spawn + the ``initialize`` handshake. This is
-        the primitive a warm session pool uses to reuse one worker across
-        independent tasks without leaking context between them. The dormant
-        claude-backend seam would delegate to its own client-side reset the same
-        way (the fork's ``AcpClient`` does not ship it — hence the type ignore).
+        ``start()``), or ``AcpClient.new_conversation`` on the direct path
+        (claude backend included). Both issue a fresh ``session/new`` on the
+        already-running process, skipping subprocess spawn + the ``initialize``
+        handshake. This is the primitive a warm session pool uses to reuse one
+        worker across independent tasks without leaking context between them,
+        and the per-turn reset history consolidation relies on.
         """
-        await self._client.new_conversation()  # type: ignore[attr-defined]
+        await self._client.new_conversation()
 
     def is_alive(self) -> bool:
         return self._client.is_responsive()

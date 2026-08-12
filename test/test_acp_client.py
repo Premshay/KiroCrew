@@ -9115,3 +9115,104 @@ class TestLocalLaneAdmission503:
         # The new prefix only widens the 5xx family; a 4xx behind the same
         # CLI wording is still unknown/terminal.
         assert _is_transient_raw_error({"data": "API Error: 401 unauthorized"}) is False
+
+
+# ── Coverage: warm conversation reset (new_conversation) ──
+
+
+class TestNewConversation:
+    """``AcpClient.new_conversation`` — the warm clean-slate reset.
+
+    history.py resets the consolidation session before every reused turn;
+    until AcpClient shipped this method the provider wrapper delegated into
+    an AttributeError, every reset failed, and the transcript accumulated
+    across turns until the backend rejected every prompt as oversized
+    (observed live 2026-08-12: "Prompt is too long").
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    def _make_warm_client(self, tmp_path, **kwargs):
+        """A client that looks idle-after-a-turn: live process, bound session,
+        turn-done set. ``has_active_turn`` reads a never-prompted client as
+        in-flight (``_turn_done`` starts unset), and real reset callers only
+        fire between completed turns — model that state, not cold-start."""
+        client = AcpClient(work_dir=tmp_path, **kwargs)
+        proc = MagicMock()
+        proc.returncode = None
+        client._process = proc
+        client._session_id = "sess-old"
+        client._turn_done.set()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_swaps_session_and_reconfigures(self, tmp_path):
+        """Happy path: session/new, set_mode on the NEW sid, startup model."""
+        client = self._make_warm_client(tmp_path)
+        sent: list[tuple[str, dict]] = []
+
+        async def fake_send(method, params):
+            sent.append((method, params))
+            return len(sent)
+
+        client._send_request = fake_send
+        client._wait_for_response = AsyncMock(return_value={"sessionId": "sess-new"})
+        client._apply_startup_model = AsyncMock()
+
+        await client.new_conversation()
+
+        assert client._session_id == "sess-new"
+        assert client._resumed is False
+        assert sent[0][0] == "session/new"
+        set_mode_params = next(p for m, p in sent if m == "session/set_mode")
+        assert set_mode_params["sessionId"] == "sess-new"
+        client._apply_startup_model.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_sessionid_keeps_prior_session(self, tmp_path):
+        """A reset that yields no session must leave the old one bound."""
+        client = self._make_warm_client(tmp_path)
+        client._send_request = AsyncMock(return_value=1)
+        client._wait_for_response = AsyncMock(return_value={})
+
+        with pytest.raises(AcpError, match="no sessionId"):
+            await client.new_conversation()
+        assert client._session_id == "sess-old"
+
+    @pytest.mark.asyncio
+    async def test_configuration_failure_restores_prior_session(self, tmp_path):
+        """set_mode failing rolls back to the old session — a failed reset
+        must degrade to 'prior conversation still usable', never to a
+        half-configured fresh session."""
+        client = self._make_warm_client(tmp_path)
+
+        async def fake_send(method, params):
+            if method == "session/set_mode":
+                raise AcpError("mode rejected")
+            return 1
+
+        client._send_request = fake_send
+        client._wait_for_response = AsyncMock(return_value={"sessionId": "sess-new"})
+
+        with pytest.raises(AcpError, match="mode rejected"):
+            await client.new_conversation()
+        assert client._session_id == "sess-old"
+
+    @pytest.mark.asyncio
+    async def test_refuses_active_turn(self, tmp_path):
+        client = self._make_warm_client(tmp_path)
+        client.has_active_turn = lambda: True
+
+        with pytest.raises(AcpError, match="turn is in flight"):
+            await client.new_conversation()
+        assert client._session_id == "sess-old"
+
+    @pytest.mark.asyncio
+    async def test_dead_process_raises_process_died(self, tmp_path):
+        client = self._make_warm_client(tmp_path)
+        client._process = None
+
+        with pytest.raises(AcpProcessDied):
+            await client.new_conversation()
