@@ -3082,6 +3082,27 @@ class HistoryConsolidator:
             if not unconsolidated:
                 return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
 
+            # The sensitive guard belongs HERE, not only on the entry points.
+            # ``consolidate_now`` and ``consolidate_session`` each check before
+            # calling, and ``consolidate_now``'s docstring already promised this
+            # was "also checked inside _consolidate()" — it was not. The backlog
+            # trigger in ``maybe_consolidate`` reaches this method directly, so
+            # without a check here a session the CLI permanently refuses would
+            # have its history digested anyway the next time it received a
+            # message, writing content from a session that touched credential
+            # paths into durable memory.
+            #
+            # Scoped to the history arm on purpose: the prefs/projects pass has
+            # always run for these sessions and narrowing that is a separate
+            # decision, not this trigger's to make. Checks the FULL transcript
+            # like the other guards, not just the unconsolidated tail — a
+            # sensitive touch anywhere taints the session (read is cached).
+            if include_history and _session_touched_sensitive(self._log._read_messages(key)):
+                logger.info("History consolidation skipped for %s: sensitive session", key)
+                return ConsolidationOutcome(
+                    "skipped", detail="sensitive", old_offset=old_offset, new_offset=old_offset
+                )
+
             # Resolve workspace-scoped memory from session metadata
             meta = self._log.get_metadata(key)
             ws_name = meta.get("workspace")

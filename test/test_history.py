@@ -1817,10 +1817,20 @@ class TestProcessAutoSkillsIntegration:
             return {"history_entry": "sensitive session"}
 
         with patch.object(consolidator, "_call_llm", side_effect=fake_llm):
-            await consolidator._consolidate("dashboard:chat-3", include_history=True)
+            outcome = await consolidator._consolidate("dashboard:chat-3", include_history=True)
 
-        assert llm_called  # consolidation still happened for memory
-        # But no auto skill written
+        # Contract tightened: history consolidation is now refused outright for a
+        # sensitive session rather than merely stripped of auto-skill creation.
+        # Reaching _consolidate(include_history=True) on a sensitive session was
+        # previously unreachable in production — both entry points
+        # (consolidate_now, consolidate_session) pre-filter — so this asserted a
+        # state no caller could produce. The backlog trigger DOES reach it
+        # directly, so the guard moved to where it cannot be bypassed and the
+        # prompt is never built at all.
+        assert outcome.status == "skipped"
+        assert outcome.detail == "sensitive"
+        assert not llm_called, "a sensitive session's transcript must not reach the LLM"
+        # Original guarantee, unchanged: no auto skill written.
         assert skills.list_auto_skills() == []
 
     @pytest.mark.asyncio
@@ -3775,3 +3785,65 @@ class TestConsolidationOutcomeReporting:
         assert outcome.new_offset == 3
         assert outcome.describe() == "consolidated 0 → 3"
         assert conv_log.get_metadata(key).get("last_consolidated") == 3
+
+
+class TestLagTriggerRespectsSensitiveGuard:
+    """The backlog trigger must not consolidate what the CLI refuses.
+
+    ``consolidate_now`` and ``consolidate_session`` both check
+    ``_session_touched_sensitive`` before calling ``_consolidate``, but
+    ``maybe_consolidate`` reaches it directly — so the lag trigger would have
+    digested a credential-touching session the CLI permanently skips, writing
+    its content into durable history on the next message it received.
+    """
+
+    def _consolidator(self, tmp_path):
+        from kiro_crew.memory import MemoryStore
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        return conv_log, HistoryConsolidator(log=conv_log, memory=mem)
+
+    @pytest.mark.asyncio
+    async def test_sensitive_session_is_not_history_consolidated(self, tmp_path):
+        conv_log, consolidator = self._consolidator(tmp_path)
+        key = "dashboard:chat-sensitive-lag"
+        conv_log.append(key, "assistant", "reading key", tools=["cat .ssh/id_ed25519"])
+        conv_log.append(key, "user", "ok")
+
+        called = []
+
+        async def _llm(prompt):
+            called.append(prompt)
+            return {"history_entry": "should never be written"}
+
+        with patch.object(consolidator, "_call_llm", side_effect=_llm):
+            outcome = await consolidator._consolidate(key, include_history=True)
+
+        assert outcome.status == "skipped"
+        assert outcome.detail == "sensitive"
+        assert called == [], "the LLM must not see a sensitive session's history prompt"
+        assert conv_log.get_metadata(key).get("last_consolidated", 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_prefs_pass_on_sensitive_session_is_unchanged(self, tmp_path):
+        """Scoped to the history arm: the prefs/projects pass has always run for
+        these sessions, and narrowing that is a separate decision."""
+        conv_log, consolidator = self._consolidator(tmp_path)
+        key = "dashboard:chat-sensitive-prefs"
+        conv_log.append(key, "assistant", "reading key", tools=["cat .ssh/id_ed25519"])
+
+        # Non-empty: an empty dict is falsy and is correctly reported as a
+        # failure, which would mask what this test is checking.
+        async def _llm(prompt):
+            return {"preferences_update": "# User Preferences"}
+
+        with patch.object(consolidator, "_call_llm", side_effect=_llm) as llm:
+            outcome = await consolidator._consolidate(key, include_history=False)
+
+        assert outcome.status == "skipped"
+        assert outcome.detail != "sensitive"
+        assert "history not requested" in outcome.detail
+        llm.assert_called_once()
