@@ -517,6 +517,37 @@ def _safe_mtime(path: Path) -> float | None:
         return None
 
 
+def _cache_identity(st: os.stat_result) -> tuple[float, float, int]:
+    """Cache-invalidation identity for a session file: mtime, ctime and inode.
+
+    **mtime alone is not sufficient, because a writer here deliberately lies
+    about it.** :func:`_restore_mtime` puts the previous mtime back after
+    ``mark_consolidated`` and other housekeeping rewrites, so the file's mtime
+    stays fixed across a real content change — by design, to keep consolidation
+    from floating stale sessions to the top of ``list_sessions``. Any cache keyed
+    on mtime therefore serves pre-write content indefinitely: on 2026-08-13 a
+    consolidation offset committed by the CLI was read back as its stale value
+    and written over, which is what let a 6,645-message backlog accumulate.
+
+    ``st_ctime`` is the structural tell: it is the inode-change time, and
+    ``os.utime`` updates it as a *side effect* of setting mtime, with no syscall
+    to move it backwards. The very call that creates the lie stamps the evidence.
+
+    ``st_ino`` is carried too rather than relying on ctime alone, because on
+    Windows ``st_ctime`` is the *creation* time — it does not move on rewrite,
+    and NTFS tunnelling can even preserve it across the rename that
+    :func:`~kiro_crew.atomic_write.atomic_write` performs. Every write here goes
+    through that temp-file-plus-replace, so the inode changes even when both
+    timestamps are held still. Inode numbers alone would be weaker in turn: ext4
+    reuses freed inodes, so a recycled number could in principle collide.
+
+    Reproduced directly (temp file, ``os.replace``, then ``os.utime`` to restore
+    mtime exactly as ``mark_consolidated`` does): mtime did NOT move, while
+    ctime, inode and size all did.
+    """
+    return (st.st_mtime, st.st_ctime, st.st_ino)
+
+
 def _restore_mtime(path: Path, prev_mtime: float | None) -> None:
     """Restore a session file's mtime after a *housekeeping* rewrite.
 
@@ -918,8 +949,10 @@ class ConversationLog:
         # parsed-transcript working set without limit. Eviction is
         # least-recently-used and deterministic; writes invalidate per-key via
         # _invalidate_cache so a stale entry can never outlive a file change.
-        self._msg_cache: _LRUCache[tuple[float, list[dict]]] = _LRUCache(cache_max)
-        self._meta_cache: _LRUCache[tuple[float, dict]] = _LRUCache(cache_max)
+        self._msg_cache: _LRUCache[tuple[tuple[float, float, int], list[dict]]] = _LRUCache(
+            cache_max
+        )
+        self._meta_cache: _LRUCache[tuple[tuple[float, float, int], dict]] = _LRUCache(cache_max)
         #: Bounded, mtime-keyed LRU of formatted ``recent()`` windows keyed by
         #: (key, max_messages, roles). The tail-read fast path intentionally
         #: never warms ``_msg_cache`` (it returns a partial view), so a session
@@ -928,7 +961,9 @@ class ConversationLog:
         #: call. This memoizes the formatted window; the stored mtime guards
         #: staleness (an append bumps the file mtime, so the entry is
         #: recomputed on the next call). Own ``_LRUCache`` → own internal lock.
-        self._recent_cache: _LRUCache[tuple[float, list[dict]]] = _LRUCache(cache_max)
+        self._recent_cache: _LRUCache[tuple[tuple[float, float, int], list[dict]]] = _LRUCache(
+            cache_max
+        )
         #: tab_id → [session keys] chain index. ``None`` means "stale, rebuild
         #: on next chained read"; a dict is an authoritative snapshot. Rebuilt
         #: lazily by _rebuild_tab_id_index, invalidated by
@@ -1669,8 +1704,9 @@ class ConversationLog:
                 "created": datetime.fromtimestamp(stat.st_mtime).isoformat(),
             }
             # Try metadata cache first (populated by _read_metadata calls)
+            ident = _cache_identity(stat)
             cached_meta = self._meta_cache.get(key)
-            if cached_meta and cached_meta[0] == stat.st_mtime:
+            if cached_meta and cached_meta[0] == ident:
                 d = cached_meta[1]
                 if d.get("created_at"):
                     meta["created"] = d["created_at"]
@@ -1698,7 +1734,7 @@ class ConversationLog:
                             meta["memory_mode"] = d.get("memory_mode", "persistent")
                             if d.get("folder_id"):
                                 meta["folder_id"] = d["folder_id"]
-                            self._meta_cache[key] = (stat.st_mtime, d)
+                            self._meta_cache[key] = (ident, d)
                 except Exception:
                     pass
             # Ensure memory_mode is always present (old sessions lack it)
@@ -1706,7 +1742,7 @@ class ConversationLog:
             # Extract first user message as title fallback
             if "title" not in meta:
                 msg_cached = self._msg_cache.get(key)
-                if msg_cached and msg_cached[0] == stat.st_mtime:
+                if msg_cached and msg_cached[0] == ident:
                     for m in msg_cached[1]:
                         if m.get("role") == "user" and m.get("content"):
                             meta["title"] = m["content"][:80]
@@ -2197,11 +2233,11 @@ class ConversationLog:
             self._msg_cache.pop(key, None)
             return []
         try:
-            mtime = path.stat().st_mtime
+            ident = _cache_identity(path.stat())
         except OSError:
             return []
         cached = self._msg_cache.get(key)
-        if cached and cached[0] == mtime:
+        if cached and cached[0] == ident:
             return cached[1]
         messages: list[dict] = []
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -2215,7 +2251,7 @@ class ConversationLog:
             if data.get("_type") == "metadata":
                 continue
             messages.append(data)
-        self._msg_cache[key] = (mtime, messages)
+        self._msg_cache[key] = (ident, messages)
         return messages
 
     #: Starting tail window (bytes) for :meth:`_read_tail_messages`. Sized to
@@ -2253,19 +2289,19 @@ class ConversationLog:
         """
         path = self._path(key)
         try:
-            mtime = path.stat().st_mtime
+            ident = _cache_identity(path.stat())
         except OSError:
             return None  # missing/unreadable → let the full path return []
         cached = self._msg_cache.get(key)
-        if cached and cached[0] == mtime:
+        if cached and cached[0] == ident:
             return None  # fresh full cache → full path is a cheap O(1) hit
         rc_key = self._recent_cache_key(key, max_messages, roles)
         rc = self._recent_cache.get(rc_key)
-        if rc is not None and rc[0] == mtime:
+        if rc is not None and rc[0] == ident:
             return [dict(m) for m in rc[1]]  # memo hit — no disk I/O
         tail = self._read_tail_messages(path, max_messages, roles)
         formatted = [{"role": m["role"], "content": m["content"]} for m in tail]
-        self._recent_cache[rc_key] = (mtime, formatted)
+        self._recent_cache[rc_key] = (ident, formatted)
         return [dict(m) for m in formatted]
 
     @staticmethod
@@ -2476,9 +2512,9 @@ class ConversationLog:
             return {}
         for attempt in range(_METADATA_READ_ATTEMPTS):
             try:
-                mtime = path.stat().st_mtime
+                ident = _cache_identity(path.stat())
                 cached = self._meta_cache.get(key)
-                if cached and cached[0] == mtime:
+                if cached and cached[0] == ident:
                     return cached[1]
                 # Read ONLY the first line. The previous form slurped the entire
                 # file via read_text() and then threw all but the first line away
@@ -2531,7 +2567,7 @@ class ConversationLog:
                 meta = data if data.get("_type") == "metadata" else {}
             except json.JSONDecodeError:
                 meta = {}
-            self._meta_cache[key] = (mtime, meta)
+            self._meta_cache[key] = (ident, meta)
             return meta
         return {}
 
