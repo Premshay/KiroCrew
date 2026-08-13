@@ -19,6 +19,7 @@ import threading
 import time as _time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Generic, TypeVar
@@ -69,12 +70,62 @@ SESSIONS_DIR_NAME = "sessions"
 ARCHIVE_DIR_NAME = "archive"
 ARCHIVE_RETENTION_DAYS = 7
 _CONSOLIDATION_THRESHOLD = 30  # preferences/projects update threshold (messages)
+# Backlog at which the frequent pass ALSO writes history, rather than waiting for
+# the idle gap that is otherwise the only trigger advancing ``last_consolidated``.
+# A session that never goes idle never reaches that path: the largest observed one
+# ran ~2 days without a single 3h gap while producing 6,645 messages, and the
+# frequent pass ran throughout — so the system looked healthy while writing no
+# history at all (2026-08-07 to 08-13). Sized well above
+# ``_CONSOLIDATION_THRESHOLD`` so ordinary sessions still consolidate on idle
+# exactly as they do today; this is a safety net, not a replacement for it.
+_HISTORY_LAG_THRESHOLD = 300  # unconsolidated messages
 # Skill detection judges a wider window than the incremental history tail: a
 # reusable procedure usually spans the whole session, not just the slice since
 # the last consolidation, so a tail-only view systematically misses skills in
 # any session consolidated more than once. Bound the window so pathologically
 # long sessions stay cost-safe.
 _SKILL_DETECTION_WINDOW = 200
+
+
+@dataclass(frozen=True)
+class ConsolidationOutcome:
+    """What a consolidation attempt actually did.
+
+    Exists because the three outcomes were indistinguishable to callers: a
+    swallowed LLM failure, a deliberate skip and a real consolidation all
+    returned ``None``, so the CLI reported ``done`` for every one of them. That
+    produced two false completion reports during the 2026-08-13 backlog run and
+    made a reverted offset look identical to a sensitive-session skip.
+
+    ``status`` is one of:
+
+    ``consolidated``
+        History was written and the offset advanced from ``old_offset`` to
+        ``new_offset``.
+    ``skipped``
+        Deliberately not consolidated — ``detail`` says why. Not an error.
+    ``failed``
+        Attempted and did not complete; ``detail`` carries the reason.
+    ``empty``
+        Nothing unconsolidated to do.
+    """
+
+    status: str
+    detail: str = ""
+    old_offset: int = 0
+    new_offset: int = 0
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "failed"
+
+    def describe(self) -> str:
+        """One-line human summary, for the CLI and run logs."""
+        if self.status == "consolidated":
+            return f"consolidated {self.old_offset} → {self.new_offset}"
+        if self.status == "empty":
+            return "nothing to consolidate"
+        return f"{self.status}: {self.detail}" if self.detail else self.status
 
 
 def _fmt_message(m: dict) -> str:
@@ -2852,6 +2903,10 @@ class HistoryConsolidator:
         self._history_consolidated: dict[str, float] = {}  # key → last history consolidation time
         # Separate offset for prefs-only consolidation (doesn't advance main offset)
         self._prefs_offset: dict[str, int] = {}
+        # Reason the last LLM call failed, so _consolidate can report WHY rather
+        # than only that nothing happened. Read immediately after the awaited
+        # call returns falsy, within the per-key _running guard.
+        self._last_llm_error: str = ""
         # Session length at the last skill-detection pass, so an unchanged
         # (rotation_generation, message_count) at the last skill-detection
         # pass, so an unchanged session isn't re-judged on every history
@@ -2860,22 +2915,51 @@ class HistoryConsolidator:
         self._last_skillgen_marker: dict[str, tuple[int, int]] = {}
 
     def maybe_consolidate(self, key: str) -> None:
-        """Fire preferences/projects consolidation if message threshold exceeded."""
+        """Fire consolidation on message volume: preferences/projects always,
+        history too once the unconsolidated backlog is large enough.
+
+        Without the history arm, ``last_consolidated`` advances only on the idle
+        path, so a session that is continuously active never has its history
+        written at all — the failure this method's lag trigger exists to prevent.
+        """
         self._last_activity[key] = _time.time()
         if key in self._running:
             return
         total = len(self._log._read_messages(key))
         prefs_off = self._prefs_offset.get(key, 0)
-        if total - prefs_off < _CONSOLIDATION_THRESHOLD:
+        # Backlog against the DURABLE offset, not the in-memory prefs offset:
+        # only the former tracks what history extraction has actually consumed,
+        # and it is an absolute message index (``messages[offset:]``).
+        history_lag = self._log.unconsolidated_count(key)
+        include_history = history_lag >= _HISTORY_LAG_THRESHOLD
+        if not include_history and total - prefs_off < _CONSOLIDATION_THRESHOLD:
             return
+        if include_history:
+            logger.info(
+                "Consolidating history for %s on backlog (%d unconsolidated >= %d); "
+                "the idle trigger has not fired for this session",
+                key,
+                history_lag,
+                _HISTORY_LAG_THRESHOLD,
+            )
         self._running.add(key)
-        t = asyncio.create_task(self._consolidate(key, include_history=False))
+        t = asyncio.create_task(self._consolidate(key, include_history=include_history))
         self._tasks.add(t)
 
-        def _on_done(fut: asyncio.Task, k: str = key, off: int = total) -> None:  # type: ignore[type-arg]
+        def _on_done(  # type: ignore[type-arg]
+            fut: asyncio.Task,
+            k: str = key,
+            off: int = total,
+            wrote_history: bool = include_history,
+        ) -> None:
             self._tasks.discard(fut)
             if not fut.cancelled() and fut.exception() is None:
                 self._prefs_offset[k] = off
+                if wrote_history:
+                    # Stamp the idle path's clock too, so a lag-triggered write
+                    # is not immediately followed by an idle-triggered one over
+                    # the few messages that arrived since.
+                    self._history_consolidated[k] = _time.time()
 
         t.add_done_callback(_on_done)
 
@@ -2946,27 +3030,39 @@ class HistoryConsolidator:
 
         t.add_done_callback(_on_done)
 
-    async def consolidate_now(self, key: str) -> None:
-        """Consolidate a session synchronously (blocking).
+    async def consolidate_now(self, key: str) -> ConsolidationOutcome:
+        """Consolidate a session synchronously (blocking), reporting the outcome.
 
         Unlike consolidate_session() which is fire-and-forget, this awaits
-        completion. Used by the CLI command.
+        completion. Used by the CLI command, which needs to distinguish a real
+        consolidation from a skip and from a failure — all three used to return
+        ``None`` and print as success.
 
         Safety: defense-in-depth — also checked inside _consolidate().
         """
+        offset = self._log.get_metadata(key).get("last_consolidated", 0) or 0
         if self._log.unconsolidated_count(key) < 1:
-            return
+            return ConsolidationOutcome("empty", old_offset=offset, new_offset=offset)
         messages = self._log._read_messages(key)
         if _session_touched_sensitive(messages):
             logger.info("consolidate_now skipped for %s: sensitive session", key)
-            return
-        await self._consolidate(key, include_history=True)
+            return ConsolidationOutcome(
+                "skipped", detail="sensitive", old_offset=offset, new_offset=offset
+            )
+        return await self._consolidate(key, include_history=True)
 
-    async def _consolidate(self, key: str, include_history: bool = True) -> None:
-        """Run LLM consolidation for a session."""
+    async def _consolidate(self, key: str, include_history: bool = True) -> ConsolidationOutcome:
+        """Run LLM consolidation for a session and report what it did.
+
+        Fire-and-forget callers ignore the return; the CLI depends on it, since
+        a swallowed LLM failure and a real consolidation were otherwise
+        indistinguishable.
+        """
         # Capture the gateway loop so the thread-offloaded _process_auto_skills
         # can schedule the async dedupe judge back onto it.
         self._event_loop = asyncio.get_running_loop()
+        old_offset = self._log.get_metadata(key).get("last_consolidated", 0) or 0
+        self._last_llm_error = ""
         try:
             # Atomically snapshot the unconsolidated tail, the total message
             # count (the absolute offset handed to mark_consolidated below), and
@@ -2984,7 +3080,7 @@ class HistoryConsolidator:
                 generation_at_snapshot,
             ) = await asyncio.to_thread(self._log.snapshot_for_consolidation, key)
             if not unconsolidated:
-                return
+                return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
 
             # Resolve workspace-scoped memory from session metadata
             meta = self._log.get_metadata(key)
@@ -3100,7 +3196,12 @@ class HistoryConsolidator:
 
             result = await self._call_llm(prompt)
             if not result:
-                return
+                return ConsolidationOutcome(
+                    "failed",
+                    detail=self._last_llm_error or "LLM returned no usable result",
+                    old_offset=old_offset,
+                    new_offset=old_offset,
+                )
 
             if entry := result.get("history_entry"):
                 # Offloaded to a worker thread: append_history takes a blocking
@@ -3186,6 +3287,21 @@ class HistoryConsolidator:
                     total,
                     generation_at_snapshot,
                 )
+                # Report the offset that was actually committed, not the one we
+                # asked for: mark_consolidated resets to 0 when a rotation fired
+                # between snapshot and write, and a caller told "consolidated
+                # 0 → 6724" when the file says 0 is exactly the false report
+                # this outcome type exists to prevent.
+                committed = self._log.get_metadata(key).get("last_consolidated", 0) or 0
+                return ConsolidationOutcome(
+                    "consolidated", old_offset=old_offset, new_offset=committed
+                )
+            return ConsolidationOutcome(
+                "skipped",
+                detail="preferences/projects pass only, history not requested",
+                old_offset=old_offset,
+                new_offset=old_offset,
+            )
 
         except Exception:
             logger.exception("Consolidation failed for %s", key)
@@ -4075,7 +4191,16 @@ class HistoryConsolidator:
                 result is not None,
             )
             return result
-        except Exception:
+        except Exception as exc:
+            # Keep the reason, not just the log line. This exception is
+            # swallowed so one bad session cannot abort a batch, which is right
+            # — but it left every caller unable to tell a failure from a success,
+            # and the CLI printed "done" for both. ``_consolidate`` reads this to
+            # build a truthful ConsolidationOutcome.
+            detail = str(exc).strip() or exc.__class__.__name__
+            detail, _ = redact_exfiltration_urls(detail)
+            detail, _ = redact_credentials(detail)
+            self._last_llm_error = detail[:300]
             logger.warning(
                 "LLM consolidation call failed after %.1fs",
                 _time.monotonic() - t_start,
