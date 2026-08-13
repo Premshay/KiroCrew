@@ -1787,7 +1787,9 @@ class TestConsolidateIsTheEligibilityChokePoint:
         self._arm_backoff(log)
 
         with patch.object(c, "_call_llm", new_callable=AsyncMock) as spy:
-            assert await c.consolidate_now(KEY) is False
+            outcome = await c.consolidate_now(KEY)
+            assert outcome.status == "skipped"
+            assert outcome.detail == "consolidation retry backoff"
 
         spy.assert_not_awaited()
 
@@ -1801,7 +1803,21 @@ class TestConsolidateIsTheEligibilityChokePoint:
         with patch.object(
             c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})
         ) as spy:
-            assert await c.consolidate_now(KEY) is True
+            outcome = await c.consolidate_now(KEY)
+            assert outcome.status == "consolidated"
 
         spy.assert_awaited_once()
         assert log.unconsolidated_count(KEY) == 0
+
+    @pytest.mark.asyncio
+    async def test_consolidate_now_reports_a_spent_turn_failure(self, tmp_path):
+        """A provider response that cannot be used must not look successful."""
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+
+        with patch.object(c, "_call_llm", AsyncMock(return_value=None)):
+            outcome = await c.consolidate_now(KEY)
+
+        assert outcome.status == "failed"
+        assert outcome.detail == "empty LLM result"
+        assert log.unconsolidated_count(KEY) == 3

@@ -14,9 +14,11 @@ from windows_sim import builtin_open_sharing_violation
 
 from kiro_crew import history
 from kiro_crew.history import (
+    _HISTORY_LAG_THRESHOLD,
     _CONSOLIDATION_THRESHOLD,
     _SESSION_KEEP_LINES,
     _SESSION_MAX_BYTES,
+    ConsolidationOutcome,
     ConversationLog,
     HistoryConsolidator,
 )
@@ -2332,6 +2334,7 @@ class TestConsolidationOffset:
     def _make_consolidator(self, msg_count=_CONSOLIDATION_THRESHOLD):
         log = MagicMock()
         log._read_messages = MagicMock(return_value=[{}] * msg_count)
+        log.unconsolidated_count.return_value = 0
         # A fresh span is eligible; maybe_consolidate's pre-check reads this.
         log.consolidation_retry_state.return_value = (0, 0.0)
         return HistoryConsolidator(log=log, memory=MagicMock(), sessions=None)
@@ -2341,7 +2344,12 @@ class TestConsolidationOffset:
         c = self._make_consolidator()
 
         async def run():
-            with patch.object(c, "_consolidate", new_callable=AsyncMock):
+            with patch.object(
+                c,
+                "_consolidate",
+                new_callable=AsyncMock,
+                return_value=ConsolidationOutcome("consolidated"),
+            ):
                 c.maybe_consolidate("k")
                 await asyncio.gather(*c._tasks, return_exceptions=True)
 
@@ -2373,11 +2381,30 @@ class TestConsolidationOffset:
                 c._running.discard("k")
 
                 m.side_effect = None
+                m.return_value = ConsolidationOutcome("consolidated")
                 c.maybe_consolidate("k")
                 await asyncio.gather(*c._tasks, return_exceptions=True)
 
         asyncio.run(run())
         assert c._prefs_offset["k"] == _CONSOLIDATION_THRESHOLD
+
+    def test_large_history_backlog_runs_history_without_an_idle_gap(self):
+        """A busy session must advance its durable history offset eventually."""
+        c = self._make_consolidator(msg_count=1)
+        c._log.unconsolidated_count.return_value = _HISTORY_LAG_THRESHOLD
+
+        async def run():
+            with patch.object(
+                c,
+                "_consolidate",
+                new_callable=AsyncMock,
+                return_value=ConsolidationOutcome("consolidated"),
+            ) as consolidate:
+                c.maybe_consolidate("k")
+                await asyncio.gather(*c._tasks, return_exceptions=True)
+            consolidate.assert_awaited_once_with("k", include_history=True)
+
+        asyncio.run(run())
 
 
 class TestConsolidationDoesNotBlockLoop:
