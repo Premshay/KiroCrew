@@ -20,6 +20,7 @@ import time as _time
 from collections import OrderedDict
 from collections.abc import Callable, Container, Iterator
 from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar
@@ -74,6 +75,35 @@ ARCHIVE_RETENTION_DAYS = 7
 # make a right-most-dot parse attribute a segment to the wrong session.
 ARCHIVE_SEGMENT_DELIMITER = "__"
 _CONSOLIDATION_THRESHOLD = 30  # preferences/projects update threshold (messages)
+# A continuously active session never reaches the idle-only history path.  This
+# durable-offset threshold is its safety net; preferences can keep updating
+# without silently leaving the transcript unprocessed forever.
+_HISTORY_LAG_THRESHOLD = 300
+
+
+@dataclass(frozen=True)
+class ConsolidationOutcome:
+    """The observable result of one requested history consolidation."""
+
+    status: str
+    detail: str = ""
+    old_offset: int = 0
+    new_offset: int = 0
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "failed"
+
+    @property
+    def completed(self) -> bool:
+        return self.status == "consolidated"
+
+    def describe(self) -> str:
+        if self.status == "consolidated":
+            return f"consolidated {self.old_offset} → {self.new_offset}"
+        if self.detail:
+            return f"{self.status}: {self.detail}"
+        return self.status
 
 
 # Returned by _consolidate when its retry-eligibility gate refuses the span.
@@ -5981,13 +6011,15 @@ class HistoryConsolidator:
         )
 
     def maybe_consolidate(self, key: str) -> None:
-        """Fire preferences/projects consolidation if message threshold exceeded."""
+        """Fire memory consolidation for volume, including a large history backlog."""
         self._last_activity[key] = _time.time()
         if key in self._running:
             return
         total = len(self._log._read_messages(key))
         prefs_off = self._prefs_offset.get(key, 0)
-        if total - prefs_off < _CONSOLIDATION_THRESHOLD:
+        history_lag = self._log.unconsolidated_count(key)
+        include_history = history_lag >= _HISTORY_LAG_THRESHOLD
+        if not include_history and total - prefs_off < _CONSOLIDATION_THRESHOLD:
             return
         # Cheap pre-check mirroring the other automatic entry points. This
         # runs on every user turn, so during a backoff window every message
@@ -5998,23 +6030,32 @@ class HistoryConsolidator:
         # the inner gate remains the enforcement backstop.
         if not self.retry_eligible(key, message_count=total):
             return
+        if include_history:
+            logger.info(
+                "Consolidating history for %s on backlog (%d unconsolidated >= %d)",
+                key,
+                history_lag,
+                _HISTORY_LAG_THRESHOLD,
+            )
         self._running.add(key)
-        t = asyncio.create_task(self._consolidate(key, include_history=False))
+        t = asyncio.create_task(self._consolidate(key, include_history=include_history))
         self._tasks.add(t)
 
-        def _on_done(fut: asyncio.Task, k: str = key, off: int = total) -> None:  # type: ignore[type-arg]
+        def _on_done(  # type: ignore[type-arg]
+            fut: asyncio.Task,
+            k: str = key,
+            off: int = total,
+            wrote_history: bool = include_history,
+        ) -> None:
             self._tasks.discard(fut)
             if (
                 not fut.cancelled()
                 and fut.exception() is None
-                # A refusal ran no pass over the window. Advancing the offset
-                # anyway would mark the window consolidated, so once the
-                # backoff expires the threshold test skips it until a whole new
-                # threshold of messages accumulates — silently dropping its
-                # preference/project extraction.
-                and fut.result() is not _CONSOLIDATION_REFUSED
+                and fut.result().completed
             ):
                 self._prefs_offset[k] = off
+                if wrote_history:
+                    self._history_consolidated[k] = _time.time()
 
         t.add_done_callback(_on_done)
 
@@ -6052,9 +6093,7 @@ class HistoryConsolidator:
                 if (
                     not fut.cancelled()
                     and fut.exception() is None
-                    # A refusal is not a completed pass; setting the throttle
-                    # for it would delay the retry past the backoff deadline.
-                    and fut.result() is not _CONSOLIDATION_REFUSED
+                    and fut.result().completed
                 ):
                     self._history_consolidated[k] = ts
 
@@ -6106,46 +6145,38 @@ class HistoryConsolidator:
                 return
             exc = fut.exception()
             if exc is None:
-                # A refusal is not a completed pass; leave the throttle unset.
-                if fut.result() is not _CONSOLIDATION_REFUSED:
+                if fut.result().completed:
                     self._history_consolidated[k] = _time.time()
             else:
                 logger.warning("consolidate_session failed for %s: %s", k, exc)
 
         t.add_done_callback(_on_done)
 
-    async def consolidate_now(self, key: str) -> bool:
-        """Consolidate a session synchronously (blocking).
+    async def consolidate_now(self, key: str) -> ConsolidationOutcome:
+        """Consolidate a session synchronously and report its durable result.
 
         Unlike consolidate_session() which is fire-and-forget, this awaits
         completion. Used by the CLI command.
-
-        Returns ``False`` when the consolidation retry backoff refused the
-        span — so the CLI can report the skip instead of a false success —
-        and ``True`` for every other completion (including the nothing-to-do
-        and sensitive-session skips, which were already reported as done).
 
         Safety: defense-in-depth — the consolidation retry backoff is also
         checked inside _consolidate(), and _run_skill_detection() re-checks
         the sensitive-session guard over its own window.
         """
+        old_offset = int(self._log.get_metadata(key).get("last_consolidated", 0) or 0)
         if self._log.unconsolidated_count(key) < 1:
-            return True
+            return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
         messages = self._log._read_messages(key)
         if _session_touched_sensitive(messages):
             logger.info("consolidate_now skipped for %s: sensitive session", key)
-            return True
-        outcome = await self._consolidate(key, include_history=True)
-        return outcome is not _CONSOLIDATION_REFUSED
+            return ConsolidationOutcome(
+                "skipped", detail="sensitive session", old_offset=old_offset, new_offset=old_offset
+            )
+        return await self._consolidate(key, include_history=True)
 
     async def _consolidate(
         self, key: str, include_history: bool = True
-    ) -> _ConsolidationRefusedSentinel | None:
-        """Run LLM consolidation for a session.
-
-        Returns :data:`_CONSOLIDATION_REFUSED` when the retry-eligibility gate
-        refuses the span; every other completion returns ``None``.
-        """
+    ) -> ConsolidationOutcome:
+        """Run LLM consolidation and return an outcome without hiding failures."""
         # Capture the gateway loop so the thread-offloaded _process_auto_skills
         # can schedule the async dedupe judge back onto it.
         self._event_loop = asyncio.get_running_loop()
@@ -6155,6 +6186,7 @@ class HistoryConsolidator:
         billed = False
         total = 0
         generation_at_snapshot = 0
+        old_offset = int(self._log.get_metadata(key).get("last_consolidated", 0) or 0)
         # The span identity any failure charge is stamped with. Rebuilt from the
         # snapshot below; the zero value only ever reaches a charge if the snapshot
         # itself raised, and that path is not billed.
@@ -6176,7 +6208,7 @@ class HistoryConsolidator:
                 generation_at_snapshot,
             ) = await asyncio.to_thread(self._log.snapshot_for_consolidation, key)
             if not unconsolidated:
-                return None
+                return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
             # Retry-eligibility choke point: every entry point funnels through
             # this function, so a span inside its durable backoff is refused
             # here — before anything that can bill a provider turn — even if a
@@ -6198,7 +6230,12 @@ class HistoryConsolidator:
                 logger.info(
                     "_consolidate refused for %s: consolidation retry backoff", key
                 )
-                return _CONSOLIDATION_REFUSED
+                return ConsolidationOutcome(
+                    "skipped",
+                    detail="consolidation retry backoff",
+                    old_offset=old_offset,
+                    new_offset=old_offset,
+                )
             # Freeze the whole span identity from that one snapshot. The offset is
             # derived rather than returned because the snapshot slices at it
             # (``messages[offset:]``), so the subtraction is exact and comes from
@@ -6364,7 +6401,9 @@ class HistoryConsolidator:
                 # on a widening interval instead of on every 60s tick.
                 if include_history:
                     await self._note_environment_failure(key, str(exc))
-                return None
+                return ConsolidationOutcome(
+                    "failed", detail=str(exc), old_offset=old_offset, new_offset=old_offset
+                )
             billed = True
             if not result:
                 # The turn reached the provider and produced nothing usable, so it
@@ -6377,7 +6416,12 @@ class HistoryConsolidator:
                     await self._note_failed_attempt(
                         key, attempted, "empty LLM result"
                     )
-                return None
+                return ConsolidationOutcome(
+                    "failed",
+                    detail="empty LLM result",
+                    old_offset=old_offset,
+                    new_offset=old_offset,
+                )
 
             if entry := result.get("history_entry"):
                 # Offloaded to a worker thread: append_history takes a blocking
@@ -6516,7 +6560,10 @@ class HistoryConsolidator:
             raise
         finally:
             self._running.discard(key)
-        return None
+        new_offset = int(self._log.get_metadata(key).get("last_consolidated", 0) or 0)
+        return ConsolidationOutcome(
+            "consolidated", old_offset=old_offset, new_offset=new_offset
+        )
 
     async def _run_skill_detection(self, key: str) -> None:
         """Detect a reusable skill from the FULL session (bounded window).

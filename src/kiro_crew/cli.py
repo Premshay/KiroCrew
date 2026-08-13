@@ -659,7 +659,8 @@ def _consolidate_cmd(args) -> None:
         judge_model=cfg.skills.judge_model,
     )
 
-    async def _run(keys: list[str]) -> None:
+    async def _run(keys: list[str]) -> int:
+        failures = 0
         for key in keys:
             try:
                 sel().log_api_access(
@@ -674,12 +675,14 @@ def _consolidate_cmd(args) -> None:
                     print(f"  {key}: no unconsolidated messages, skipping")
                     continue
                 print(f"  {key}: consolidating {count} messages...")
-                if await consolidator.consolidate_now(key):
-                    print(f"  {key}: done ✓")
-                else:
-                    print(f"  {key}: skipped (consolidation retry backoff)")
-            except Exception:
+                outcome = await consolidator.consolidate_now(key)
+                print(f"  {key}: {outcome.describe()}")
+                failures += int(outcome.failed)
+            except Exception as exc:
                 logger.debug("consolidate (or SEL) failed for %s", key, exc_info=True)
+                print(f"  {key}: failed: {exc}")
+                failures += 1
+        return failures
 
     if consolidate_all:
         keys = [
@@ -691,11 +694,13 @@ def _consolidate_cmd(args) -> None:
             print("No sessions with unconsolidated messages.")
             return
         print(f"Consolidating {len(keys)} session(s)...")
-        asyncio.run(_run(keys))
+        failures = asyncio.run(_run(keys))
     else:
         print(f"Consolidating session: {session_key}")
-        asyncio.run(_run([session_key]))
+        failures = asyncio.run(_run([session_key]))
 
+    if failures:
+        raise SystemExit(1)
     print("\nDone. Check ~/.kiro/crew/skills/auto/ for new skills.")
 
 

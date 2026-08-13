@@ -6,6 +6,10 @@ import argparse
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from kiro_crew.history import ConsolidationOutcome
+
 
 class TestConsolidateCmd:
     """Cover _consolidate_cmd paths in cli.py."""
@@ -91,7 +95,9 @@ class TestConsolidateCmd:
         mock_log.unconsolidated_count.return_value = 3
 
         mock_consolidator = mock_consolidator_cls.return_value
-        mock_consolidator.consolidate_now = AsyncMock()
+        mock_consolidator.consolidate_now = AsyncMock(
+            return_value=ConsolidationOutcome("consolidated", old_offset=0, new_offset=3)
+        )
 
         from kiro_crew.cli import _consolidate_cmd
 
@@ -100,7 +106,8 @@ class TestConsolidateCmd:
 
         captured = capsys.readouterr()
         assert "Consolidating" in captured.out
-        assert "done" in captured.out
+        # The real offset movement, not a bare "done" that meant nothing.
+        assert "consolidated 0 \u2192 3" in captured.out
         assert mock_sel.return_value.log_api_access.call_count >= 1
 
     @patch("kiro_crew.cli.sel")
@@ -149,7 +156,9 @@ class TestConsolidateCmd:
         mock_log.unconsolidated_count.return_value = 7
 
         mock_consolidator = mock_consolidator_cls.return_value
-        mock_consolidator.consolidate_now = AsyncMock()
+        mock_consolidator.consolidate_now = AsyncMock(
+            return_value=ConsolidationOutcome("consolidated", old_offset=12, new_offset=19)
+        )
 
         from kiro_crew.cli import _consolidate_cmd
 
@@ -158,7 +167,7 @@ class TestConsolidateCmd:
 
         captured = capsys.readouterr()
         assert "Consolidating session: test_session" in captured.out
-        assert "done" in captured.out
+        assert "consolidated 12 \u2192 19" in captured.out
         mock_sel.return_value.log_api_access.assert_called_with(
             caller="cli", operation="consolidate", outcome="allowed",
             source="cli", resources="test_session",
@@ -300,7 +309,11 @@ class TestConsolidateCmdExceptionPath:
         mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
         tmp_path, capsys,
     ):
-        """When consolidate_now raises, the exception is caught and logged."""
+        """A raising consolidate_now is REPORTED and exits non-zero.
+
+        It used to be debug-logged only, so a crashed session was
+        indistinguishable from a quiet one in the CLI output.
+        """
         sessions_dir = self._make_session_file(tmp_path)
         mock_cfg_cls.load.return_value = MagicMock()
         mock_log = mock_log_cls.return_value
@@ -313,11 +326,13 @@ class TestConsolidateCmdExceptionPath:
         from kiro_crew.cli import _consolidate_cmd
 
         args = argparse.Namespace(session_key="test_session", consolidate_all=False)
-        _consolidate_cmd(args)
+        with pytest.raises(SystemExit) as exc:
+            _consolidate_cmd(args)
+        assert exc.value.code == 1
 
         captured = capsys.readouterr()
         assert "Consolidating session: test_session" in captured.out
-        assert "done" not in captured.out
+        assert "failed: LLM down" in captured.out
 
 
 class TestExpireIdleSelFailure:
