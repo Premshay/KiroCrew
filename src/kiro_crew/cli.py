@@ -53,7 +53,7 @@ from kiro_crew.dashboard.state import set_build_info
 from kiro_crew.dashboard.urls import parse_dashboard_url
 from kiro_crew.env import git_build_info
 from kiro_crew.gateway_lock import GatewayLock, GatewayLockError
-from kiro_crew.history import ConversationLog, HistoryConsolidator
+from kiro_crew.history import _HISTORY_LAG_THRESHOLD, ConversationLog, HistoryConsolidator
 from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.memory import MemoryStore
@@ -628,8 +628,22 @@ def _consolidate_cmd(args) -> None:
             print("No sessions with unconsolidated messages.")
             return
         print(f"Sessions with unconsolidated messages ({len(found)}):\n")
+        lagging = 0
         for key, count in sorted(found, key=lambda x: -x[1]):
-            print(f"  {key}  ({count} messages)")
+            # Flag backlog at the threshold the gateway itself acts on, so a
+            # session whose history stopped being written is visible here
+            # without anyone reading metadata by hand.
+            if count >= _HISTORY_LAG_THRESHOLD:
+                lagging += 1
+                print(f"  {key}  ({count} messages)  ⚠ lag >= {_HISTORY_LAG_THRESHOLD}")
+            else:
+                print(f"  {key}  ({count} messages)")
+        if lagging:
+            print(
+                f"\n{lagging} session(s) past the {_HISTORY_LAG_THRESHOLD}-message "
+                "lag threshold. The gateway consolidates history at this backlog; "
+                "a session sitting here means that is not happening."
+            )
         print("\nRun with a session key or --all to consolidate.")
         return
 
@@ -658,6 +672,12 @@ def _consolidate_cmd(args) -> None:
         judge_model=cfg.skills.judge_model,
     )
 
+    # Sessions whose consolidation did not complete. Printing "done" for these
+    # produced two false completion reports during the 2026-08-13 backlog run:
+    # a context-overflow failure and a silent skip were indistinguishable from
+    # success, so the run looked clean while writing nothing.
+    failures: list[tuple[str, str]] = []
+
     async def _run(keys: list[str]) -> None:
         for key in keys:
             try:
@@ -673,9 +693,16 @@ def _consolidate_cmd(args) -> None:
                     print(f"  {key}: no unconsolidated messages, skipping")
                     continue
                 print(f"  {key}: consolidating {count} messages...")
-                await consolidator.consolidate_now(key)
-                print(f"  {key}: done ✓")
-            except Exception:
+                outcome = await consolidator.consolidate_now(key)
+                print(f"  {key}: {outcome.describe()}")
+                if outcome.failed:
+                    failures.append((key, outcome.detail))
+            except Exception as exc:
+                # Previously debug-logged and invisible: a crash here left the
+                # session looking merely quiet.
+                detail = str(exc).strip() or exc.__class__.__name__
+                print(f"  {key}: failed: {detail}")
+                failures.append((key, detail))
                 logger.debug("consolidate (or SEL) failed for %s", key, exc_info=True)
 
     if consolidate_all:
@@ -693,7 +720,26 @@ def _consolidate_cmd(args) -> None:
         print(f"Consolidating session: {session_key}")
         asyncio.run(_run([session_key]))
 
+    # Post-run lag report: what is STILL behind after this run, which is the
+    # question a caller actually has. Read from durable state, never from the
+    # outcomes above — an offset can be committed and then reverted by another
+    # process, and only re-reading catches that.
+    remaining = [
+        (key, conv_log.unconsolidated_count(key))
+        for key in (keys if consolidate_all else [session_key])
+    ]
+    still_lagging = [(k, n) for k, n in remaining if n >= _HISTORY_LAG_THRESHOLD]
+
     print("\nDone. Check ~/.kiro/crew/skills/auto/ for new skills.")
+    if still_lagging:
+        print(f"\nStill lagging (>= {_HISTORY_LAG_THRESHOLD} unconsolidated):")
+        for key, n in sorted(still_lagging, key=lambda x: -x[1]):
+            print(f"  {key}  ({n} messages)")
+    if failures:
+        print(f"\n{len(failures)} session(s) failed:")
+        for key, detail in failures:
+            print(f"  {key}: {detail}")
+        sys.exit(1)
 
 
 def main() -> None:

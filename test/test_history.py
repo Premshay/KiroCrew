@@ -1334,9 +1334,14 @@ class TestConsolidationToolPolicy:
 class TestConsolidationOffset:
     """Verify _prefs_offset only advances when _consolidate succeeds."""
 
-    def _make_consolidator(self, msg_count=_CONSOLIDATION_THRESHOLD):
+    def _make_consolidator(self, msg_count=_CONSOLIDATION_THRESHOLD, lag=None):
         log = MagicMock()
         log._read_messages = MagicMock(return_value=[{}] * msg_count)
+        # maybe_consolidate now also reads the DURABLE backlog to decide whether
+        # to write history. Left as a bare MagicMock it is not comparable to an
+        # int; these tests are about the prefs offset, so keep the lag under the
+        # history threshold and let them exercise the path they were written for.
+        log.unconsolidated_count = MagicMock(return_value=msg_count if lag is None else lag)
         return HistoryConsolidator(log=log, memory=MagicMock(), sessions=None)
 
     def test_offset_advances_on_success(self):
@@ -3588,3 +3593,185 @@ class TestMetadataReadSurvivesATransientSharingViolation:
         assert any(
             "could not read metadata" in r.getMessage() for r in caplog.records
         ), f"no warning recorded; got {[r.getMessage() for r in caplog.records]}"
+
+
+class TestHistoryLagSelfHeal:
+    """History must be written on backlog, not only on an idle gap.
+
+    Between 2026-08-07 and 08-13 no digests were written at all: the only
+    trigger that sets ``include_history`` (and therefore advances
+    ``last_consolidated``) is the 3h idle gap, and the busiest sessions never
+    went idle. The frequent every-30-messages pass ran throughout, so the
+    system looked healthy while producing nothing.
+    """
+
+    def _consolidator(self, tmp_path):
+        from kiro_crew.memory import MemoryStore
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        return conv_log, HistoryConsolidator(log=conv_log, memory=mem)
+
+    @pytest.mark.asyncio
+    async def test_backlog_past_threshold_requests_history(self, tmp_path):
+        """The acceptance case: no idle gap, backlog over the threshold, and
+        history is requested anyway."""
+        from kiro_crew.history import _HISTORY_LAG_THRESHOLD
+
+        conv_log, consolidator = self._consolidator(tmp_path)
+        key = "dashboard:chat-busy"
+        for i in range(_HISTORY_LAG_THRESHOLD):
+            conv_log.append(key, "user", f"m{i}")
+
+        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock:
+            consolidator.maybe_consolidate(key)
+            await asyncio.sleep(0)
+        mock.assert_called_once_with(key, include_history=True)
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_keeps_prefs_only_behaviour(self, tmp_path):
+        """Ordinary sessions are untouched: they still consolidate prefs only
+        and wait for the idle path to write history."""
+        from kiro_crew.history import _CONSOLIDATION_THRESHOLD
+
+        conv_log, consolidator = self._consolidator(tmp_path)
+        key = "dashboard:chat-ordinary"
+        for i in range(_CONSOLIDATION_THRESHOLD):
+            conv_log.append(key, "user", f"m{i}")
+
+        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock:
+            consolidator.maybe_consolidate(key)
+            await asyncio.sleep(0)
+        mock.assert_called_once_with(key, include_history=False)
+
+    @pytest.mark.asyncio
+    async def test_lag_measured_against_durable_offset(self, tmp_path):
+        """Lag is total minus ``last_consolidated``, not minus the in-memory
+        prefs offset — only the former tracks what history actually consumed.
+
+        A session whose prefs pass is fully caught up but whose history offset
+        is far behind is exactly the failure case, so it must still fire.
+        """
+        from kiro_crew.history import _HISTORY_LAG_THRESHOLD
+
+        conv_log, consolidator = self._consolidator(tmp_path)
+        key = "dashboard:chat-prefs-current"
+        for i in range(_HISTORY_LAG_THRESHOLD):
+            conv_log.append(key, "user", f"m{i}")
+        # Prefs pass has seen everything; history has seen nothing.
+        consolidator._prefs_offset[key] = _HISTORY_LAG_THRESHOLD
+
+        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock:
+            consolidator.maybe_consolidate(key)
+            await asyncio.sleep(0)
+        mock.assert_called_once_with(key, include_history=True)
+
+    @pytest.mark.asyncio
+    async def test_lag_write_stamps_the_idle_clock(self, tmp_path):
+        """A lag-triggered history write must stamp ``_history_consolidated``,
+        or the idle path fires again immediately over the few messages that
+        arrived since."""
+        from kiro_crew.history import _HISTORY_LAG_THRESHOLD
+
+        conv_log, consolidator = self._consolidator(tmp_path)
+        key = "dashboard:chat-stamp"
+        for i in range(_HISTORY_LAG_THRESHOLD):
+            conv_log.append(key, "user", f"m{i}")
+
+        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock):
+            consolidator.maybe_consolidate(key)
+            for _ in range(5):
+                await asyncio.sleep(0)
+        assert key in consolidator._history_consolidated
+
+
+class TestConsolidationOutcomeReporting:
+    """Callers must be able to tell success from skip from failure.
+
+    All three returned ``None``, so the CLI printed ``done`` for every one —
+    which produced two false completion reports on 2026-08-13 and made a
+    reverted offset indistinguishable from a deliberate skip.
+    """
+
+    def _consolidator(self, tmp_path):
+        from kiro_crew.memory import MemoryStore
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        return conv_log, HistoryConsolidator(log=conv_log, memory=mem)
+
+    @pytest.mark.asyncio
+    async def test_sensitive_session_reports_skipped(self, tmp_path):
+        conv_log, consolidator = self._consolidator(tmp_path)
+        key = "dashboard:chat-sensitive-outcome"
+        conv_log.append(key, "assistant", "read it", tools=["cat .ssh/id_rsa"])
+
+        outcome = await consolidator.consolidate_now(key)
+
+        assert outcome.status == "skipped"
+        assert outcome.detail == "sensitive"
+        assert outcome.failed is False
+        assert "skipped: sensitive" == outcome.describe()
+
+    @pytest.mark.asyncio
+    async def test_empty_session_reports_empty(self, tmp_path):
+        conv_log, consolidator = self._consolidator(tmp_path)
+        outcome = await consolidator.consolidate_now("dashboard:chat-nothing")
+        assert outcome.status == "empty"
+        assert outcome.failed is False
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_reports_the_reason(self, tmp_path):
+        """The acceptance case: a context-overflow failure names the overflow
+        instead of printing success."""
+        conv_log, consolidator = self._consolidator(tmp_path)
+        key = "dashboard:chat-overflow"
+        conv_log.append(key, "user", "hello")
+
+        overflow = "Prompt is too long · the request is ~1301485 tokens (limit 1000000)"
+
+        # Fail where the LLM actually fails, so the REAL _call_llm catches it —
+        # patching _call_llm itself would test the mock, not the capture path
+        # that has to survive the swallow.
+        client = AsyncMock()
+        consolidator._sessions = MagicMock()
+        consolidator._sessions.get_or_create = AsyncMock(return_value=(client, False, False))
+
+        with patch(
+            "kiro_crew.history.stream_and_collect_json",
+            new=AsyncMock(side_effect=RuntimeError(overflow)),
+        ):
+            outcome = await consolidator.consolidate_now(key)
+
+        assert outcome.status == "failed"
+        assert "too long" in outcome.detail
+        assert outcome.failed is True
+        # The offset must NOT have moved on a failure.
+        assert outcome.new_offset == outcome.old_offset
+        assert conv_log.get_metadata(key).get("last_consolidated", 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_success_reports_committed_offset(self, tmp_path):
+        """The reported offset is re-read from durable state, so a rotation
+        that reset it cannot be reported as a successful advance."""
+        conv_log, consolidator = self._consolidator(tmp_path)
+        key = "dashboard:chat-success"
+        for i in range(3):
+            conv_log.append(key, "user", f"m{i}")
+
+        async def _ok(prompt):
+            return {"history_entry": "a thing happened"}
+
+        with patch.object(consolidator, "_call_llm", side_effect=_ok), \
+                patch.object(consolidator, "_run_skill_detection", new_callable=AsyncMock):
+            outcome = await consolidator.consolidate_now(key)
+
+        assert outcome.status == "consolidated"
+        assert outcome.old_offset == 0
+        assert outcome.new_offset == 3
+        assert outcome.describe() == "consolidated 0 → 3"
+        assert conv_log.get_metadata(key).get("last_consolidated") == 3
