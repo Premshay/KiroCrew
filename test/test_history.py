@@ -2882,10 +2882,11 @@ class TestProcessAutoSkillsIntegration:
             return {"history_entry": "sensitive session"}
 
         with patch.object(consolidator, "_call_llm", side_effect=fake_llm):
-            await consolidator._consolidate("dashboard:chat-3", include_history=True)
+            outcome = await consolidator._consolidate("dashboard:chat-3", include_history=True)
 
-        assert llm_called  # consolidation still happened for memory
-        # But no auto skill written
+        assert outcome.status == "skipped"
+        assert outcome.detail == "sensitive"
+        assert not llm_called
         assert skills.list_auto_skills() == []
 
     @pytest.mark.asyncio
