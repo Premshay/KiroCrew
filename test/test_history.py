@@ -5,17 +5,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from windows_sim import builtin_open_sharing_violation
 
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.history import (
     _CONSOLIDATION_THRESHOLD,
     _SESSION_KEEP_LINES,
     _SESSION_MAX_BYTES,
     ConversationLog,
     HistoryConsolidator,
+    _cache_identity,
+    _safe_mtime,
 )
 
 
@@ -3847,3 +3851,79 @@ class TestLagTriggerRespectsSensitiveGuard:
         assert outcome.detail != "sensitive"
         assert "history not requested" in outcome.detail
         llm.assert_called_once()
+
+
+class TestCacheIdentitySurvivesMtimeRestore:
+    """A cache keyed on mtime alone is defeated by a writer that restores mtime.
+
+    ``mark_consolidated`` deliberately calls ``_restore_mtime`` so consolidation
+    does not float stale sessions to the top of ``list_sessions``. That makes the
+    file's mtime a lie about its content, and every mtime-keyed cache downstream
+    then serves the pre-write value. On 2026-08-13 a consolidation offset
+    committed by the CLI was read back stale by the gateway and written over,
+    which is how a 6,645-message backlog accumulated unnoticed.
+    """
+
+    def _log(self, tmp_path):
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        log.init()
+        return log
+
+    def test_metadata_reread_after_mtime_preserving_rewrite(self, tmp_path):
+        """The exact production shape: one reader warms its cache, another
+        process commits an offset and restores the mtime, and the first reader
+        must NOT keep serving the stale offset."""
+        writer = self._log(tmp_path)
+        key = "dashboard:chat-cache"
+        for i in range(3):
+            writer.append(key, "user", f"m{i}")
+
+        # A SEPARATE instance, standing in for the gateway: warm its cache.
+        reader = ConversationLog(base_dir=tmp_path / "sessions")
+        assert reader.get_metadata(key).get("last_consolidated", 0) == 0
+
+        # mark_consolidated writes the offset and restores the mtime.
+        writer.mark_consolidated(key, 3, generation=0)
+        path = writer._path(key)
+        assert path.stat().st_mtime == pytest.approx(
+            _safe_mtime(path)
+        )  # sanity: still stat-able
+
+        # The reader never invalidated anything and the mtime did not move.
+        assert reader.get_metadata(key).get("last_consolidated") == 3
+
+    def test_messages_reread_after_mtime_preserving_rewrite(self, tmp_path):
+        """The message cache shares the flaw, so it gets the same identity."""
+        writer = self._log(tmp_path)
+        key = "dashboard:chat-msgcache"
+        writer.append(key, "user", "first")
+
+        reader = ConversationLog(base_dir=tmp_path / "sessions")
+        assert len(reader._read_messages(key)) == 1
+
+        path = writer._path(key)
+        prev = path.stat().st_mtime
+        text = path.read_text(encoding="utf-8")
+        atomic_write(path, text + json.dumps({"role": "user", "content": "second"}) + "\n")
+        os.utime(path, (prev, prev))  # the lie: content grew, mtime did not
+
+        assert path.stat().st_mtime == prev
+        assert len(reader._read_messages(key)) == 2
+
+    def test_identity_moves_when_mtime_does_not(self, tmp_path):
+        """Names WHY the tuple works: ctime and inode both move through the
+        rewrite-then-restore that leaves mtime fixed."""
+        p = tmp_path / "f.jsonl"
+        p.write_text("v1\n")
+        before_stat = p.stat()
+        before = _cache_identity(before_stat)
+
+        atomic_write(p, "v2-changed\n")
+        os.utime(p, (before_stat.st_atime, before_stat.st_mtime))
+        after_stat = p.stat()
+        after = _cache_identity(after_stat)
+
+        assert after_stat.st_mtime == before_stat.st_mtime, "the lie must reproduce"
+        assert after != before, "identity must still detect the change"
+        assert after_stat.st_ctime != before_stat.st_ctime  # the structural tell
+        assert after_stat.st_ino != before_stat.st_ino  # survives a Windows ctime
