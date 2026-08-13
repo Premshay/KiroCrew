@@ -13,6 +13,7 @@ import pytest
 from windows_sim import builtin_open_sharing_violation
 
 from kiro_crew import history
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.history import (
     _HISTORY_LAG_THRESHOLD,
     _CONSOLIDATION_THRESHOLD,
@@ -88,6 +89,31 @@ class TestConversationLog:
         unconsolidated, total = log.get_unconsolidated("t1")
         assert len(unconsolidated) == 3
         assert total == 10
+
+    def test_cross_instance_caches_refresh_after_mtime_preserving_rewrite(self, tmp_path):
+        """A replacement can restore mtime, but cannot preserve file identity."""
+        writer = ConversationLog(base_dir=tmp_path)
+        writer.append("t1", "user", "first")
+        reader = ConversationLog(base_dir=tmp_path)
+        assert reader.get_metadata("t1").get("last_consolidated", 0) == 0
+        assert [m["content"] for m in reader._read_messages("t1")] == ["first"]
+        assert [m["content"] for m in reader.recent("t1")] == ["first"]
+
+        writer.mark_consolidated("t1", 1)
+        assert reader.get_metadata("t1")["last_consolidated"] == 1
+
+        path = writer._path("t1")
+        before = path.stat()
+        atomic_write(
+            path,
+            path.read_text(encoding="utf-8")
+            + json.dumps({"role": "user", "content": "second"})
+            + "\n",
+        )
+        os.utime(path, (before.st_atime, before.st_mtime))
+        assert path.stat().st_mtime == before.st_mtime
+        assert [m["content"] for m in reader._read_messages("t1")] == ["first", "second"]
+        assert [m["content"] for m in reader.recent("t1")] == ["first", "second"]
 
     def test_mark_consolidated_nonexistent(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
