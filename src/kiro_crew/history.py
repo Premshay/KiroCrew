@@ -1462,6 +1462,11 @@ def _safe_mtime(path: Path) -> float | None:
         return None
 
 
+def _cache_identity(stat: os.stat_result) -> tuple[float, float, int]:
+    """Return the file identity that survives an mtime-preserving rewrite."""
+    return (stat.st_mtime, stat.st_ctime, stat.st_ino)
+
+
 def _restore_mtime(path: Path, prev_mtime: float | None) -> None:
     """Restore a session file's mtime after a *housekeeping* rewrite.
 
@@ -2186,17 +2191,17 @@ class ConversationLog:
         cache_max: int = _TRANSCRIPT_CACHE_MAX,
     ):
         self._dir = base_dir or _sessions_dir()
-        # Bounded, mtime-keyed LRU caches (key → (mtime, payload)). Bounded so
+        # Bounded identity-keyed LRU caches. Bounded so
         # a long-lived gateway touching thousands of sessions cannot grow the
         # parsed-transcript working set without limit. Eviction is
         # least-recently-used and deterministic; writes invalidate per-key via
         # _invalidate_cache so a stale entry can never outlive a file change.
-        self._msg_cache: _LRUCache[tuple[float, int, list[dict]]] = _LRUCache(cache_max)
+        self._msg_cache: _LRUCache[tuple[tuple[float, float, int], int, list[dict]]] = _LRUCache(cache_max)
         #: ``(mtime, gen, meta)`` — like the search memos, entries record the
         #: invalidation generation and a warm hit requires both fields to
         #: match, so a preserved-mtime metadata edit through another
         #: instance (whose pops cannot reach this cache) still unhits.
-        self._meta_cache: _LRUCache[tuple[float, int, dict]] = _LRUCache(cache_max)
+        self._meta_cache: _LRUCache[tuple[tuple[float, float, int], int, dict]] = _LRUCache(cache_max)
         #: Bounded, mtime-keyed LRU of formatted ``recent()`` windows keyed by
         #: (key, max_messages, roles). The tail-read fast path intentionally
         #: never warms ``_msg_cache`` (it returns a partial view), so a session
@@ -2205,7 +2210,7 @@ class ConversationLog:
         #: call. This memoizes the formatted window; the stored mtime guards
         #: staleness (an append bumps the file mtime, so the entry is
         #: recomputed on the next call). Own ``_LRUCache`` → own internal lock.
-        self._recent_cache: _LRUCache[tuple[float, list[dict]]] = _LRUCache(cache_max)
+        self._recent_cache: _LRUCache[tuple[tuple[float, float, int], int, list[dict]]] = _LRUCache(cache_max)
         #: Bounded memo of ``(mtime, gen, doc_chars, casefolded_blob)`` per
         #: session, consumed only by :meth:`search_sessions`. ``gen`` is the
         #: invalidation generation (:meth:`_cache_gen`) the entry was folded
@@ -3588,7 +3593,7 @@ class ConversationLog:
             cached_meta = self._meta_cache.get(key)
             if (
                 cached_meta
-                and cached_meta[0] == stat.st_mtime
+                and cached_meta[0] == _cache_identity(stat)
                 and cached_meta[1] == self._cache_gen(key)
             ):
                 d = cached_meta[2]
@@ -3622,7 +3627,7 @@ class ConversationLog:
                             # invalidated this key inside the stat → read
                             # window (see the generation snapshot above).
                             self._publish_if_current(
-                                self._meta_cache, key, (stat.st_mtime, gen, d), key=key, gen=gen
+                                self._meta_cache, key, (_cache_identity(stat), gen, d), key=key, gen=gen
                             )
                 except Exception:
                     pass
@@ -3633,7 +3638,7 @@ class ConversationLog:
                 msg_cached = self._msg_cache.get(key)
                 if (
                     msg_cached
-                    and msg_cached[0] == stat.st_mtime
+                    and msg_cached[0] == _cache_identity(stat)
                     and msg_cached[1] == self._cache_gen(key)
                 ):
                     for m in msg_cached[2]:
@@ -3856,7 +3861,7 @@ class ConversationLog:
         """
         path = self._path(key)
         try:
-            mtime = path.stat().st_mtime
+            ident = _cache_identity(path.stat())
         except OSError:
             self._folded_cache.pop(key, None)
             self._snippet_cache.pop(key, None)
@@ -3906,7 +3911,7 @@ class ConversationLog:
                 self._snippet_cache.pop(key, None)
                 return (0, "")
             cached = self._folded_cache.get(key)
-            if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+            if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
                 return (cached[2], cached[3])
             built = self._build_folded(key, mtime, gen)
             if built is None:
@@ -4835,9 +4840,9 @@ class ConversationLog:
         # history-less tab on the same fault; retrying first recovers it.
         for attempt in range(_METADATA_READ_ATTEMPTS):
             try:
-                mtime = path.stat().st_mtime
+                ident = _cache_identity(path.stat())
                 cached = self._msg_cache.get(key)
-                if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+                if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
                     return cached[2]
                 with open(path, encoding="utf-8") as fh:
                     raw = fh.read()
@@ -4917,7 +4922,7 @@ class ConversationLog:
                 and flock_witness is not None
                 and flock_witness == self._flock_hold_witness(key)
             ):
-                self._msg_cache[key] = (mtime, entry_gen, messages)
+                self._msg_cache[key] = (ident, entry_gen, messages)
             return messages
         return []
 
@@ -4968,23 +4973,23 @@ class ConversationLog:
         # so only the generation can prove the window stayed write-free.
         gen = self._cache_gen(key)
         try:
-            mtime = path.stat().st_mtime
+            ident = _cache_identity(path.stat())
         except OSError:
             return None  # missing/unreadable → let the full path return []
         cached = self._msg_cache.get(key)
-        if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+        if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
             return None  # fresh full cache → full path is a cheap O(1) hit
         rc_key = self._recent_cache_key(key, max_messages, roles)
         rc = self._recent_cache.get(rc_key)
-        if rc is not None and rc[0] == mtime:
-            return [dict(m) for m in rc[1]]  # memo hit — no disk I/O
+        if rc is not None and rc[0] == ident and rc[1] == self._cache_gen(key):
+            return [dict(m) for m in rc[2]]  # memo hit — no disk I/O
         tail = self._read_tail_messages(path, max_messages, roles)
         formatted = [{"role": m["role"], "content": m["content"]} for m in tail]
         # Guarded publish: a rewrite that restored the mtime while we read the
         # tail would otherwise park this pre-rewrite window under an mtime the
         # file still has — and this memo feeds recent(), the per-turn model
         # context path, so the staleness would be served every turn.
-        self._publish_if_current(self._recent_cache, rc_key, (mtime, formatted), key=key, gen=gen)
+        self._publish_if_current(self._recent_cache, rc_key, (ident, gen, formatted), key=key, gen=gen)
         return [dict(m) for m in formatted]
 
     @staticmethod
@@ -5424,9 +5429,9 @@ class ConversationLog:
             # file still has.
             gen = self._cache_gen(key)
             try:
-                mtime = path.stat().st_mtime
+                ident = _cache_identity(path.stat())
                 cached = self._meta_cache.get(key)
-                if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+                if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
                     return cached[2], True
                 # Read ONLY the first line. The previous form slurped the entire
                 # file via read_text() and then threw all but the first line away
@@ -5475,7 +5480,7 @@ class ConversationLog:
             # key inside the stat → read window (see the generation snapshot
             # at the top of the loop). The metadata itself is still returned:
             # it was true at read time; only the memo must not outlive it.
-            self._publish_if_current(self._meta_cache, key, (mtime, gen, meta), key=key, gen=gen)
+            self._publish_if_current(self._meta_cache, key, (ident, gen, meta), key=key, gen=gen)
             return meta, True
         return {}, True
 
