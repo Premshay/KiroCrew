@@ -118,6 +118,18 @@ describe('ChatInput', () => {
       )
       expect(screen.getByTestId('tip-band')).toBeInTheDocument()
     })
+
+    it('makes the mobile + control open the native file picker directly', () => {
+      mobileEnv.mobile = true
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+
+      const input = screen.getAllByLabelText('Attach files').find((element) => element.tagName === 'INPUT')
+      const mobilePlus = screen.getByTitle('Attach files').closest('label')
+      expect(input).toBeDefined()
+      expect(mobilePlus).toHaveAttribute('for', input?.id)
+      expect(screen.queryByRole('button', { name: 'Add files & options' })).not.toBeInTheDocument()
+      expect(screen.queryByText('Upload file')).not.toBeInTheDocument()
+    })
   })
 
   describe('offline state', () => {
