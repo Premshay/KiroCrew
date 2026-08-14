@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, memo } from 'react'
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo } from 'react'
 import { ArrowUpFromLine, ArrowUp, Headset, Loader2, Play, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Globe, FolderOpen, FileText, ChevronDown, Check, Volume2 } from 'lucide-react'
 import { Toggle } from './ui'
 import CopyBranchButton from './CopyBranchButton'
@@ -53,8 +53,7 @@ import type { SendMode } from '../pages/chat/ChatSettings'
 
 // Upload picker accept hints. Client-side ONLY (UX) — the server validates type
 // (magic bytes), size, and runs malware scanning per input-validation guidance.
-const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/svg+xml'
-const FILE_ACCEPT = IMAGE_ACCEPT + ',.txt,.md,.json,.yaml,.yml,.xml,.csv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
+const FILE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/svg+xml,.txt,.md,.json,.yaml,.yml,.xml,.csv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 import ApprovalModePicker from './ApprovalModePicker'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
@@ -792,6 +791,7 @@ function ChatInput({
   // is kept in lockstep with the textarea (see syncMirrorScroll on the textarea).
   const mirrorRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const fileInputId = useId()
   // "+" drop-up menu (upload file / image + browse toggle).
   const [plusOpen, setPlusOpen] = useState(false)
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false)
@@ -906,15 +906,6 @@ function ChatInput({
   const togglePlus = () => {
     if (!plusOpen && plusBtnRef.current) setPlusRect(plusBtnRef.current.getBoundingClientRect())
     setPlusOpen(o => !o)
-  }
-  // Client-side `accept` is a UX hint only (input-validation guidance: server enforces type via
-  // magic bytes, size, and malware scanning — never trust the extension/MIME here).
-  const openPicker = (imageOnly: boolean) => {
-    const el = fileInputRef.current
-    if (!el) return
-    el.accept = imageOnly ? IMAGE_ACCEPT : FILE_ACCEPT
-    el.click()
-    setPlusOpen(false)
   }
   // Split send button (running turn): 'steer' (default) vs 'queue', chosen via
   // the chevron dropdown and persisted so the preference sticks across sessions.
@@ -2275,7 +2266,7 @@ function ChatInput({
         </div>
       )}
 
-      <input ref={fileInputRef} type="file" aria-label={i18nT('components.chatInput.attach_files')} multiple accept={FILE_ACCEPT} className="hidden" onChange={handleFileInputChange} />
+      <input id={fileInputId} ref={fileInputRef} type="file" aria-label={i18nT('components.chatInput.attach_files')} multiple accept={FILE_ACCEPT} className="sr-only" onChange={handleFileInputChange} />
 
       <SlashCommandMenu input={value} anchorRef={inputRef as React.RefObject<HTMLElement>} open={slashMenuOpen} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />
 
@@ -2464,14 +2455,14 @@ function ChatInput({
                     style={{ left: Math.max(8, Math.min(plusRect.left, window.innerWidth - 260 - 8)), bottom: window.innerHeight - plusRect.top + 8 }}
                   >
                     <div className="flex gap-2">
-                      <button
-                        type="button"
-                        onClick={() => openPicker(false)}
+                      <label
+                        htmlFor={fileInputId}
+                        onClick={() => setPlusOpen(false)}
                         className="flex-1 flex flex-col items-center gap-1.5 px-2 py-3 rounded-lg border border-border bg-transparent hover:bg-bg-hover hover:border-border-strong transition-all cursor-pointer"
                       >
                         <FileText size={18} className="text-muted" />
                         <span className="text-[12px] font-medium text-text">{i18nT('components.chatInput.upload_file')}</span>
-                      </button>
+                      </label>
                       {(isScreenSnipSupported() || isMac) && !isMobile && onScreenshot && (
                         <button
                           type="button"

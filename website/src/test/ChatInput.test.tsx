@@ -56,6 +56,16 @@ describe('ChatInput', () => {
       renderWithProviders(<ChatInput {...defaultProps} connected={false} />)
       expect(screen.getByPlaceholderText(/Gateway offline/)).toBeInTheDocument()
     })
+
+    it('uses a native file-input label so mobile browsers open the picker', () => {
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+      fireEvent.click(screen.getByRole('button', { name: 'Add files & options' }))
+
+      const input = screen.getByLabelText('Attach files')
+      const uploadLabel = screen.getByText('Upload file').closest('label')
+      expect(uploadLabel).toHaveAttribute('for', input.id)
+      expect(input).not.toHaveClass('hidden')
+    })
   })
 
   describe('offline state', () => {
@@ -281,13 +291,12 @@ describe('ChatInput', () => {
       expect(screen.getByText('Screenshot')).toBeInTheDocument()
     })
 
-    it('opening the menu and clicking "Upload file" triggers the hidden file input click', () => {
-      const clickSpy = vi.spyOn(HTMLInputElement.prototype, 'click')
+    it('opening the menu exposes a native label for the file input', () => {
       renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
       fireEvent.click(screen.getByTitle('Add files & options'))
-      fireEvent.click(screen.getByText('Upload file'))
-      expect(clickSpy).toHaveBeenCalled()
-      clickSpy.mockRestore()
+      const input = screen.getByLabelText('Attach files')
+      const uploadLabel = screen.getByText('Upload file').closest('label')
+      expect(uploadLabel).toHaveAttribute('for', input.id)
     })
 
     it('disables the + menu button when uploading', () => {
