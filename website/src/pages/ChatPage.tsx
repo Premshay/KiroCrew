@@ -221,6 +221,7 @@ import Clickable from '../components/Clickable'
 import StopEventCard from './chat/StopEventCard'
 import NudgeCard, { nudgeMatchesLoop } from './chat/NudgeCard'
 import RecoveryCard, { resolveInjectCard } from './chat/RecoveryCard'
+import PeerChannelRequestCard, { parsePeerChannelRequest } from './chat/PeerChannelRequestCard'
 import { ErrorCard } from './chat/ErrorCard'
 import WorkflowProgressBar from './chat/WorkflowProgressBar'
 import { tryQuickSend } from '../lib/quickSend'
@@ -6270,6 +6271,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // transcript for auditability, but as a one-line card that names the event
     // and the deny pattern rather than a full-width bubble of prompt prose.
     if (m.role === 'inject') {
+      const peerRequest = parsePeerChannelRequest(m.content)
+      if (peerRequest) {
+        return <PeerChannelRequestCard key={key} parsed={peerRequest} disclosureKey={key} />
+      }
       // One shared decision (resolveInjectCard) so this surface and the
       // transcript-renderer registry cannot disagree about the same row. It
       // returns null for a cron row, for a replay of the user's own words, and

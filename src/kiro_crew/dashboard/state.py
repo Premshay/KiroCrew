@@ -2473,10 +2473,26 @@ class _ChatSlot:
         for message in inbox:
             self.queue_peer_channel_message(message)
 
-    def drain_peer_channel_inbox(self) -> list[dict[str, Any]]:
-        """Return and clear pending peer deliveries after prompt framing."""
-        messages = [dict(message) for message in self._peer_channel_inbox]
-        self._peer_channel_inbox.clear()
+    def drain_peer_channel_inbox(
+        self, *, keep: set[tuple[str, str]] | None = None
+    ) -> list[dict[str, Any]]:
+        """Drain unreserved peer deliveries after prompt framing.
+
+        A named request carries its durable message identity in the structural
+        queue entry. Leave those inbox rows in place until that entry starts,
+        so an earlier peer turn cannot consume the body intended for a later
+        card.
+        """
+        keep = keep or set()
+        messages: list[dict[str, Any]] = []
+        retained: list[dict[str, Any]] = []
+        for message in self._peer_channel_inbox:
+            identity = (str(message.get("channel_id", "")), str(message.get("message_id", "")))
+            if identity in keep:
+                retained.append(message)
+            else:
+                messages.append(dict(message))
+        self._peer_channel_inbox = retained
         return messages
 
     def remove_peer_channel_message(self, channel_id: str, message_id: str) -> bool:
@@ -3128,7 +3144,15 @@ class _ChatSlot:
 
     # ── Queue helpers (dict-based queue items) ──
 
-    def queue_append(self, content: str, kind: str = "", meta: dict | None = None) -> str:
+    def queue_append(
+        self,
+        content: str,
+        kind: str = "",
+        meta: dict | None = None,
+        *,
+        peer_channel_id: str = "",
+        peer_message_id: str = "",
+    ) -> str:
         """Append a message to the queue. Returns the generated queue ID.
 
         ``kind`` is a structural origin tag (e.g. ``"synthetic_recovery"`` for
@@ -3148,6 +3172,9 @@ class _ChatSlot:
         item: dict[str, Any] = {"id": qid, "content": content, "kind": kind}
         if meta:
             item["meta"] = meta
+        if peer_channel_id and peer_message_id:
+            item["peer_channel_id"] = peer_channel_id
+            item["peer_message_id"] = peer_message_id
         self._queue.append(item)
         self._note_enqueue()
         return qid
@@ -3174,6 +3201,9 @@ class _ChatSlot:
         kind: str = "",
         payload: str = "",
         meta: dict | None = None,
+        *,
+        peer_channel_id: str = "",
+        peer_message_id: str = "",
     ) -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
 
@@ -3186,6 +3216,9 @@ class _ChatSlot:
         entry: dict[str, Any] = {"id": qid, "content": content, "kind": kind, "payload": payload}
         if meta:
             entry["meta"] = dict(meta)
+        if peer_channel_id and peer_message_id:
+            entry["peer_channel_id"] = peer_channel_id
+            entry["peer_message_id"] = peer_message_id
         self._queue.insert(index, entry)
         self._note_enqueue()
         return qid

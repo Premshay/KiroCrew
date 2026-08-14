@@ -22,6 +22,7 @@ import UserMessage from '../pages/chat/UserMessage'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
+import PeerChannelRequestCard, { parsePeerChannelRequest } from '../pages/chat/PeerChannelRequestCard'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
 import PastedChip from '../components/PastedChip'
@@ -293,6 +294,17 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     id: 'tool_lifecycle',
     roles: ['tool_call', 'tool_result'],
     render: (m, ctx) => toolRow(m, ctx),
+  },
+  {
+    id: 'peer_channel_request',
+    roles: ['inject'],
+    match: m => parsePeerChannelRequest(m.content) !== null,
+    render: (m, ctx) => {
+      const parsed = parsePeerChannelRequest(m.content)
+      return parsed
+        ? ctx.row(<PeerChannelRequestCard parsed={parsed} disclosureKey={ctx.key} />, true)
+        : null
+    },
   },
   {
     id: 'inject',
