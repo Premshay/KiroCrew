@@ -477,7 +477,9 @@ service installer such as `cloudflared service install`).
 
 In the Chat composer, tap `+` to open the device's native Files picker and
 attach an image or a regular file. This direct touch path does not open the
-desktop-style command menu first.
+desktop-style command menu first. When an agent replies with a confirmed local
+file link, tap it to open the file in the Chat side panel; a `:line` suffix
+opens at that line.
 
 ### Session duration
 
