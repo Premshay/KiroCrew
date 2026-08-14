@@ -169,6 +169,7 @@ import Clickable from '../components/Clickable'
 import StopEventCard from './chat/StopEventCard'
 import NudgeCard, { nudgeMatchesLoop } from './chat/NudgeCard'
 import RecoveryCard, { parseRecoveryMessage } from './chat/RecoveryCard'
+import PeerChannelRequestCard, { parsePeerChannelRequest } from './chat/PeerChannelRequestCard'
 import { ErrorCard } from './chat/ErrorCard'
 import WorkflowProgressBar from './chat/WorkflowProgressBar'
 import { tryQuickSend } from '../lib/quickSend'
@@ -4663,6 +4664,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (m.role === 'inject') {
       const recovery = parseRecoveryMessage(m.content)
       if (recovery) return <RecoveryCard key={key} parsed={recovery} disclosureKey={key} />
+      const peerRequest = parsePeerChannelRequest(m.content)
+      if (peerRequest) {
+        return <PeerChannelRequestCard key={key} parsed={peerRequest} disclosureKey={key} />
+      }
     }
     if (m.role === 'error') return (
       <ErrorCard

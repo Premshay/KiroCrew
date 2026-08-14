@@ -468,6 +468,8 @@ class TestAttachedSessionWake:
         assert outcome == "steered"
         slot._acp_client.steer.assert_awaited_once()
         assert "Delivery: interrupt" in slot._acp_client.steer.await_args.args[0]
+        assert slot.messages[-1]["role"] == "inject"
+        assert "From: Claude" in slot.messages[-1]["content"]
         assert slot.peer_channel_inbox_payload() == []
         assert slot._queue == []
 
@@ -564,6 +566,29 @@ class TestAttachedSessionWake:
         assert len(slot.peer_channel_inbox_payload()) == 20
         assert slot.peer_channel_inbox_payload()[0]["message_id"] == "message00"
 
+    def test_peer_inbox_keeps_later_named_request_for_its_queued_card(self, tmp_path) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        for message_id in ("first", "later"):
+            assert (
+                slot.queue_peer_channel_message(
+                    {
+                        "channel_id": "deadbeef",
+                        "message_id": message_id,
+                        "from_role": "Claude",
+                        "content": message_id,
+                        "msg_type": "mention",
+                        "delivery": "next_turn",
+                    }
+                )
+                == "queued"
+            )
+
+        drained = slot.drain_peer_channel_inbox(keep={("deadbeef", "later")})
+
+        assert [message["message_id"] for message in drained] == ["first"]
+        assert [message["message_id"] for message in slot.peer_channel_inbox_payload()] == ["later"]
+
     @pytest.mark.asyncio
     async def test_peer_request_drains_as_an_inject_message(self, monkeypatch, tmp_path) -> None:
         state = _state(tmp_path)
@@ -583,3 +608,32 @@ class TestAttachedSessionWake:
         assert await _start_next_queued_turn(state, slot) is True
         assert slot.task is task
         assert slot.messages[-1]["role"] == "inject"
+
+    @pytest.mark.asyncio
+    async def test_named_peer_request_keeps_its_message_identity(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        state = _state(tmp_path)
+        slot = state.get_or_create_slot("crew-codex")
+        member = SimpleNamespace(session_key="dashboard:crew-codex")
+        message = ChannelMessage(
+            id="request-card",
+            from_id="peer",
+            from_role="Claude",
+            mention=["codex"],
+            msg_type="mention",
+            content="Please review the cache patch.",
+        )
+        started = AsyncMock(return_value=True)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock())
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._start_next_queued_turn", started)
+
+        await deliver_attached_channel_message(
+            state, SimpleNamespace(id="deadbeef"), member, message
+        )
+
+        request = slot._queue[0]
+        assert request["peer_channel_id"] == "deadbeef"
+        assert request["peer_message_id"] == "request-card"
+        assert "From: Claude" in request["content"]
+        assert "Please review the cache patch." in request["content"]

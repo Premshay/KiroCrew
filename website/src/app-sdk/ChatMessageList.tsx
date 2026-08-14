@@ -16,6 +16,7 @@ import AssistantMessage, { type TurnStats } from '../pages/chat/AssistantMessage
 import UserMessage from '../pages/chat/UserMessage'
 import CollapsibleToolGroup from '../pages/chat/CollapsibleToolGroup'
 import TurnBlock from '../pages/chat/TurnBlock'
+import PeerChannelRequestCard, { parsePeerChannelRequest } from '../pages/chat/PeerChannelRequestCard'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
@@ -324,6 +325,8 @@ const ChatMessageList = memo(function ChatMessageList({
     }
 
     if (m.role === 'inject') {
+      const peerRequest = parsePeerChannelRequest(m.content)
+      if (peerRequest) return wrapper(<PeerChannelRequestCard parsed={peerRequest} disclosureKey={key} />)
       const cronLabel = (m.meta?.cronLabel as string) || ''
       const cleanContent = cronLabel
         ? m.content.replace(/^\[Cron notification from ".*"\]\n/, '').replace(/\n\[End of cron notification\]$/, '')

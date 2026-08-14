@@ -111,6 +111,7 @@ from kiro_crew.dashboard.state import (
     NATIVE_SUBAGENT_OUTPUT_TAIL,
     NATIVE_SUBAGENT_TERMINAL_KEEP,
     NATIVE_SUBAGENT_TERMINAL_TTL_SECS,
+    PEER_CHANNEL_REQUEST_KIND,
     POST_RESTART_CONTINUATION_KIND,
     POST_RESTART_CONTINUATION_PREFIX,
     REFUSAL_RECOVERY_PREFIX,
@@ -260,9 +261,9 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
     return "\n".join(ctx_parts) + "\n" if ctx_parts else ""
 
 
-def drain_peer_channel_inbox(slot: "_ChatSlot") -> str:
+def drain_peer_channel_inbox(slot: "_ChatSlot", *, keep: set[tuple[str, str]] | None = None) -> str:
     """Frame queued channel deliveries as peer messages, never user instructions."""
-    messages = slot.drain_peer_channel_inbox()
+    messages = slot.drain_peer_channel_inbox(keep=keep)
     if not messages:
         return ""
     blocks: list[str] = []
@@ -2399,6 +2400,13 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     is_cron = next_msg.startswith(CRON_NOTIFY_PREFIX)
     is_subagent = next_msg.startswith(SUBAGENT_COMPLETION_PREFIX)
     is_peer_channel_request = any(is_peer_channel_request_item(item) for item in consumed)
+    peer_channel_request_refs = tuple(
+        (item["peer_channel_id"], item["peer_message_id"])
+        for item in consumed
+        if is_peer_channel_request_item(item)
+        and item.get("peer_channel_id")
+        and item.get("peer_message_id")
+    )
     is_post_restart_continuation = any(
         is_post_restart_continuation_item(item) for item in consumed
     )
@@ -2420,21 +2428,24 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     cron_label = match.group(1) if match else "cron"
     cron_label, _ = redact_exfiltration_urls(cron_label)
     cron_label, _ = redact_credentials(cron_label)
-    slot.append(
+    inject_role = (
         "subagent"
         if is_subagent
-        else "inject"
-        if (is_cron or is_recovery or is_peer_channel_request or is_post_restart_continuation)
-        else "user",
-        next_msg,
-        (
-            json.dumps({"cronLabel": cron_label})
-            if is_cron
-            else "msg msg-inject"
-            if (is_recovery or is_peer_channel_request or is_post_restart_continuation)
-            else "msg msg-u"
-        ),
+        else (
+            "inject"
+            if (is_cron or is_recovery or is_peer_channel_request or is_post_restart_continuation)
+            else "user"
+        )
     )
+    if is_cron:
+        inject_cls = json.dumps({"cronLabel": cron_label})
+    elif is_peer_channel_request:
+        inject_cls = json.dumps({"kind": PEER_CHANNEL_REQUEST_KIND})
+    elif is_recovery or is_post_restart_continuation:
+        inject_cls = "msg msg-inject"
+    else:
+        inject_cls = "msg msg-u"
+    slot.append(inject_role, next_msg, inject_cls)
 
     task = spawn_guarded_turn(
         state,
@@ -2444,6 +2455,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
             slot,
             next_msg,
             _peer_channel_request=is_peer_channel_request,
+            _peer_channel_request_refs=peer_channel_request_refs,
             _post_restart_continuation=is_post_restart_continuation,
         ),
     )
@@ -2560,6 +2572,7 @@ async def _run_chat(
     _prompt_depth: int = 0,
     regenerate_hint: str = "",
     _peer_channel_request: bool = False,
+    _peer_channel_request_refs: tuple[tuple[str, str], ...] = (),
     _post_restart_continuation: bool = False,
 ) -> None:
     """Stream LLM response into *slot*.  Survives browser disconnect."""
@@ -3279,7 +3292,21 @@ async def _run_chat(
             _ctx_prefix = drain_pending_context(slot)
             if _ctx_prefix:
                 message = _ctx_prefix + message
-            _peer_prefix = drain_peer_channel_inbox(slot)
+            # The queued peer-request envelope already contains the exact
+            # delivery it represents and is persisted as the visible card.
+            # Remove only those records before draining passive peer updates;
+            # draining the whole inbox here would make a later request look
+            # like an empty generic notification.
+            for channel_id, message_id in _peer_channel_request_refs:
+                slot.remove_peer_channel_message(channel_id, message_id)
+            pending_peer_request_refs = {
+                (item["peer_channel_id"], item["peer_message_id"])
+                for item in slot._queue
+                if is_peer_channel_request_item(item)
+                and item.get("peer_channel_id")
+                and item.get("peer_message_id")
+            }
+            _peer_prefix = drain_peer_channel_inbox(slot, keep=pending_peer_request_refs)
             if _peer_prefix:
                 message = _peer_prefix + message
             # Use resolved kiro agent name (e.g. "kirocrew"), not the slot

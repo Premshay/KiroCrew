@@ -1440,10 +1440,20 @@ class _ChatSlot:
         for message in inbox:
             self.queue_peer_channel_message(message)
 
-    def drain_peer_channel_inbox(self) -> list[dict[str, Any]]:
-        """Return and clear pending peer deliveries after prompt framing."""
-        messages = [dict(message) for message in self._peer_channel_inbox]
-        self._peer_channel_inbox.clear()
+    def drain_peer_channel_inbox(
+        self, *, keep: set[tuple[str, str]] | None = None
+    ) -> list[dict[str, Any]]:
+        """Return peer deliveries except records owned by later queued requests."""
+        keep = keep or set()
+        messages: list[dict[str, Any]] = []
+        remaining: list[dict[str, Any]] = []
+        for message in self._peer_channel_inbox:
+            identity = (str(message.get("channel_id", "")), str(message.get("message_id", "")))
+            if identity in keep:
+                remaining.append(message)
+            else:
+                messages.append(dict(message))
+        self._peer_channel_inbox = remaining
         return messages
 
     def remove_peer_channel_message(self, channel_id: str, message_id: str) -> bool:
@@ -1742,7 +1752,14 @@ class _ChatSlot:
 
     # ── Queue helpers (dict-based queue items) ──
 
-    def queue_append(self, content: str, kind: str = "") -> str:
+    def queue_append(
+        self,
+        content: str,
+        kind: str = "",
+        *,
+        peer_channel_id: str = "",
+        peer_message_id: str = "",
+    ) -> str:
         """Append a message to the queue. Returns the generated queue ID.
 
         ``kind`` is a structural origin tag (e.g. ``"synthetic_recovery"`` for
@@ -1752,16 +1769,34 @@ class _ChatSlot:
         Empty string = plain user/system content (default).
         """
         qid = uuid.uuid4().hex[:12]
-        self._queue.append({"id": qid, "content": content, "kind": kind})
+        item: dict[str, str] = {"id": qid, "content": content, "kind": kind}
+        if peer_channel_id and peer_message_id:
+            # This durable identity lets the runner consume only the peer
+            # record rendered by this queued request, not the entire inbox.
+            item["peer_channel_id"] = peer_channel_id
+            item["peer_message_id"] = peer_message_id
+        self._queue.append(item)
         return qid
 
-    def queue_insert(self, index: int, content: str, kind: str = "") -> str:
+    def queue_insert(
+        self,
+        index: int,
+        content: str,
+        kind: str = "",
+        *,
+        peer_channel_id: str = "",
+        peer_message_id: str = "",
+    ) -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
 
         See :meth:`queue_append` for the ``kind`` structural origin tag.
         """
         qid = uuid.uuid4().hex[:12]
-        self._queue.insert(index, {"id": qid, "content": content, "kind": kind})
+        item: dict[str, str] = {"id": qid, "content": content, "kind": kind}
+        if peer_channel_id and peer_message_id:
+            item["peer_channel_id"] = peer_channel_id
+            item["peer_message_id"] = peer_message_id
+        self._queue.insert(index, item)
         return qid
 
     def queue_pop(self, index: int = 0) -> dict[str, str]:
