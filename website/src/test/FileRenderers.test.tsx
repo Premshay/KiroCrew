@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { fireEvent, render, screen } from '@testing-library/react'
-import { columnLetter, detectFileType, JsonlViewer, OfficeViewer, SheetViewer } from '../components/FileRenderers'
+import { columnLetter, detectFileType, ImageViewer, JsonlViewer, OfficeViewer, SheetViewer } from '../components/FileRenderers'
 
 describe('detectFileType', () => {
   it('returns jsonl for .jsonl files', () => {
@@ -62,6 +62,22 @@ describe('JsonlViewer', () => {
     const content = '{"a":1}\n\n\n{"b":2}\n'
     render(<JsonlViewer content={content} />)
     expect(screen.getByText('2 lines')).toBeInTheDocument()
+  })
+})
+
+describe('ImageViewer', () => {
+  it('offers direct open and download actions for a path-backed image', () => {
+    render(<ImageViewer filePath="/workspace/images/tour.svg" />)
+
+    expect(screen.getByText('Open in new tab')).toHaveAttribute(
+      'href',
+      '/api/file-raw?path=%2Fworkspace%2Fimages%2Ftour.svg',
+    )
+    expect(screen.getByText('Save')).toHaveAttribute(
+      'href',
+      '/api/file-download?path=%2Fworkspace%2Fimages%2Ftour.svg',
+    )
+    expect(screen.getByText('Save')).toHaveAttribute('download')
   })
 })
 
