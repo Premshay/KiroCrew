@@ -840,7 +840,7 @@ function McpAppTabBody({ tab, slot }: { tab: PanelTab; slot: string }) {
  * Rail visibility is a single app-wide preference; the rail only renders at
  * all when the chat has a project dir whose tree the backend serves.
  */
-function FileTabBody({ tab, projectDir, onContentChange, onDiffModeChange, onFileSave, onFileOpen, onClose, onSubmitComments, onRevealConsumed }: {
+function FileTabBody({ tab, projectDir, onContentChange, onDiffModeChange, onFileSave, onFileOpen, onClose, isTabActive, onSubmitComments, onRevealConsumed }: {
   tab: PanelTab
   projectDir?: string
   onContentChange: (c: string) => void
@@ -848,6 +848,7 @@ function FileTabBody({ tab, projectDir, onContentChange, onDiffModeChange, onFil
   onFileSave: (fp: string, c: string) => Promise<void>
   onFileOpen?: (p: string, opts?: { diffMode?: boolean; replaceId?: string; canReplace?: () => boolean }) => void
   onClose: () => void
+  isTabActive: boolean
   onSubmitComments?: (m: string) => void
   onRevealConsumed: () => void
 }) {
@@ -869,6 +870,7 @@ function FileTabBody({ tab, projectDir, onContentChange, onDiffModeChange, onFil
       onSave={onFileSave}
       onClose={onClose}
       liveWatch
+      isTabActive={isTabActive}
       onSubmitComments={onSubmitComments}
       revealLine={tab.revealLine}
       onRevealConsumed={onRevealConsumed}
@@ -928,6 +930,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
         onFileSave={onFileSave}
         onFileOpen={onFileOpen}
         onClose={onClose}
+        isTabActive={active}
         onSubmitComments={onSubmitComments}
         onRevealConsumed={onRevealConsumed}
       />
