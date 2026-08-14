@@ -178,6 +178,9 @@ interface Props {
   onSave: (filePath: string, content: string) => Promise<void>
   onClose: () => void
   liveWatch?: boolean
+  /** Whether this kept-mounted file tab is currently visible. Active tabs
+   *  re-read their file once so an earlier preview snapshot cannot linger. */
+  isTabActive?: boolean
   onSubmitComments?: (message: string) => void
   onRefresh?: (filePath: string) => Promise<void>
   reserveWidth?: number
@@ -736,7 +739,7 @@ const CommentOverlayBlock = memo(function CommentOverlayBlock({ popover, addComm
  *  control can't bypass the "Discard unsaved changes?" confirmation. */
 export interface MarkdownPanelHandle { requestClose: () => void }
 
-export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onSave, onClose, liveWatch, onSubmitComments, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, savedBaseline, revealLine, onRevealConsumed, onOpenFolder }: Props, ref) {
+export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onSave, onClose, liveWatch, isTabActive = true, onSubmitComments, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, savedBaseline, revealLine, onRevealConsumed, onOpenFolder }: Props, ref) {
   const qc = useQueryClient()
   // Code files (non-rich, non-markdown) have no meaningful preview — their
   // "preview" was just a read-only render of the same text. They open
@@ -1042,7 +1045,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   }, [content, lang, isMarkdown, editing, isRichType])
 
   useFileWatch(
-    liveWatch && !editing && !dirty ? filePath : null,
+    liveWatch && isTabActive && !editing && !dirty ? filePath : null,
     useCallback((c: string) => { onContentChange(c) }, [onContentChange]),
   )
 
@@ -1083,6 +1086,21 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       }
     } finally { setRefreshing(false) }
   }, [filePath, onContentChange, onRefresh, refreshing, dirty])
+
+  // SidePanel keeps document tabs mounted while merely hiding inactive ones.
+  // A file can therefore have changed after its initial read without an SSE
+  // event reaching this browser. Refresh exactly once per visible interval,
+  // but never replace an editor buffer containing unsaved work.
+  const refreshedOnActivationRef = useRef(false)
+  useEffect(() => {
+    if (!isTabActive) {
+      refreshedOnActivationRef.current = false
+      return
+    }
+    if (!liveWatch || dirty || refreshedOnActivationRef.current) return
+    refreshedOnActivationRef.current = true
+    void handleRefresh()
+  }, [isTabActive, liveWatch, dirty, handleRefresh])
 
   // Discard pending edits (matches the artifact detail page's Cancel button).
   // Re-reads the file from disk into the buffer, clearing dirty. Confirms first

@@ -722,6 +722,7 @@ function TabBody({ tab, active, slot, onClose, onContentChange, onDiffModeChange
         onSave={onFileSave}
         onClose={onClose}
         liveWatch
+        isTabActive={active}
         onSubmitComments={onSubmitComments}
         revealLine={tab.revealLine}
         onRevealConsumed={onRevealConsumed}
