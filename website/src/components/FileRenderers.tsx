@@ -67,14 +67,28 @@ function extOf(fp: string) { const i = fp.lastIndexOf('.'); return i >= 0 ? fp.s
 
 /* ── Image viewer ── */
 export const ImageViewer = memo(function ImageViewer({ filePath }: { filePath: string }) {
+  const rawUrl = '/api/file-raw?path=' + encodeURIComponent(filePath)
+  const downloadUrl = fileDownloadUrl(filePath)
   return (
-    <div className="flex items-center justify-center h-full overflow-auto p-4 bg-bg-elevated rounded-md border border-border">
-      <img
-        src={'/api/file-raw?path=' + encodeURIComponent(filePath)}
-        alt={filePath.split('/').pop()}
-        className="max-w-full max-h-full object-contain"
-        draggable={false}
-      />
+    <div className="flex flex-col h-full overflow-hidden bg-bg-elevated rounded-md border border-border">
+      <div className="flex-1 min-h-0 flex items-center justify-center overflow-auto p-4">
+        <a href={rawUrl} target="_blank" rel="noreferrer" className="max-w-full max-h-full">
+          <img
+            src={rawUrl}
+            alt={filePath.split('/').pop()}
+            className="max-w-full max-h-full object-contain cursor-pointer"
+            draggable={false}
+          />
+        </a>
+      </div>
+      <div className="flex items-center justify-end gap-3 border-t border-border px-3 py-2 text-[13px] font-medium">
+        <a href={rawUrl} target="_blank" rel="noreferrer" className="text-muted hover:text-text no-underline">
+          {i18nT('components.fileRenderers.open_in_new_tab')}
+        </a>
+        <a href={downloadUrl} download className="text-accent hover:text-accent/80 no-underline">
+          {i18nT('components.fileCard.save')}
+        </a>
+      </div>
     </div>
   )
 })

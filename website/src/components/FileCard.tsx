@@ -1,5 +1,5 @@
 import { memo } from 'react'
-import { Music, Video, Image, Paperclip, ArrowDown } from 'lucide-react'
+import { Music, Video, Image, Paperclip, ArrowDown, ExternalLink } from 'lucide-react'
 
 import { i18nT } from '../i18n/t'
 import { fmtBytes } from '../i18n/format'
@@ -53,7 +53,17 @@ export const FileCard = memo(function FileCard({ file }: { file: FileData }) {
           <span className="font-medium truncate">{file.filename}</span>
           {file.description && <span className="text-muted text-[12px] leading-5">— {file.description}</span>}
         </div>
-        <img src={url} alt={file.description || file.filename} className="max-w-full max-h-[400px] rounded object-contain" />
+        <a href={url} target="_blank" rel="noreferrer" className="self-center max-w-full">
+          <img src={url} alt={file.description || file.filename} className="max-w-full max-h-[400px] rounded object-contain cursor-pointer" />
+        </a>
+        <div className="flex items-center justify-end gap-3 text-[13px] font-medium">
+          <a href={url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-muted hover:text-text no-underline">
+            <ExternalLink className="lucide-inline" /> {i18nT('components.fileRenderers.open_in_new_tab')}
+          </a>
+          <a href={url} download className="inline-flex items-center gap-1 text-accent hover:text-accent/80 no-underline">
+            <ArrowDown className="lucide-inline" /> {i18nT('components.fileCard.save')}
+          </a>
+        </div>
       </div>
     )
   }

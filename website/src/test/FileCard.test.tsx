@@ -67,5 +67,7 @@ describe('FileCard', () => {
     expect(img).toBeInTheDocument()
     expect(img?.src).toContain('/api/outbox/screenshot.png')
     expect(img?.alt).toBe('A screenshot')
+    expect(screen.getByText('Open in new tab')).toHaveAttribute('href', '/api/outbox/screenshot.png')
+    expect(screen.getByText('Save')).toHaveAttribute('download')
   })
 })
