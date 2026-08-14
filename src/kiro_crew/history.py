@@ -5784,8 +5784,27 @@ def _session_touched_sensitive(messages: list[dict]) -> bool:
     - Legacy: substring match over each entry in ``msg["tools"]`` list.
     - Dashboard: substring match over ``content`` when ``role`` indicates a tool event.
 
-    Designed to be conservative — a false positive just means we skip
-    auto-creation for this session.
+    Designed to be conservative, but **a false positive is no longer cheap**.
+    This once gated only auto-skill creation, where over-triggering cost a
+    skill nobody missed. It now also gates history consolidation
+    (``consolidate_now``, ``consolidate_session`` and the backlog trigger via
+    ``_consolidate``), so a false positive means the session's history is
+    **never digested at all** — permanently, since the check re-fires on every
+    later attempt.
+
+    The match is a plain substring test against ``_SENSITIVE_TOOL_PATTERNS``, so
+    it does not distinguish *using* a credential from *reading* one:
+    ``ssh -i ~/.ssh/id_ed25519 host`` marks a session exactly as
+    ``cat ~/.ssh/id_rsa`` does. That is consistent with
+    :func:`~kiro_crew.security.is_sensitive_bash_command`, which flags both too,
+    so it is uniform policy rather than a matcher defect — but the blast radius
+    grew while the policy stayed put. Two consequences seen in practice
+    (2026-08-13): a benchmark session that merely SSH'd to a lab box lost its
+    entire history, and any session that *investigates* credential handling
+    marks itself by quoting the paths it is reasoning about.
+
+    Widening the callers again means re-examining that trade, not just adding a
+    call site.
     """
     for msg in messages:
         # Legacy schema: tools list on assistant messages
