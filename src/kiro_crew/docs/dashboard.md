@@ -28,7 +28,9 @@ If the dashboard doesn't load after setup:
 ### Chat (`/chat`)
 
 Multi-session parallel chat with full Markdown rendering, syntax-highlighted
-code blocks, Mermaid diagrams, and clickable file paths.
+code blocks, Mermaid diagrams, and clickable file paths. A confirmed local file
+link in an agent reply opens that file in the chat side panel; a `:line` suffix
+opens the file at that line instead of navigating the browser back to Chat.
 
 - **Multiple tabs**: each tab runs its own agent session in parallel
 - **Agent selection**: pick an agent before starting a chat, or switch mid-session
@@ -51,7 +53,10 @@ code blocks, Mermaid diagrams, and clickable file paths.
 - **Merge queued messages**: optionally merge queued messages into a single prompt
 - **Cooperative stop**: soft-stop sends cancel first, falls back to hard kill after budget (preserves session state)
 - **Tool input preview**: expandable tool input display in approval cards
-- **File upload**: drag-and-drop or paperclip upload for images and non-image files (.zip, .csv, .docx)
+- **File upload**: on desktop, use **Upload file** from the `+` menu or drop a
+  file into Chat. On a phone or other touch device, tap `+` to open the native
+  system Files picker directly. Both paths accept images and regular files such
+  as `.zip`, `.csv`, and `.docx`.
 - **Folder management**: create, rename, and organize sessions into sidebar folders with indent borders
 - **Session colors**: per-session color picker for visual organization
 
