@@ -947,6 +947,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
     return (
       <ArtifactPanel
         embedded
+        isTabActive={active}
         slug={tab.artifactSlug || ''}
         kind={tab.artifactKind || 'markdown'}
         content={tab.content || ''}
