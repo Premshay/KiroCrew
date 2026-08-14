@@ -329,6 +329,18 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     })
   })
 
+  it('opens a confirmed Markdown file link in the file viewer instead of navigating to the chat route', async () => {
+    stubKind('file')
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md:12)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
+
+    const anchor = container.querySelector('a[href="/home/user/a.md:12"]')
+    expect(anchor).not.toBeNull()
+    fireEvent.click(anchor!)
+    expect(onFileOpen).toHaveBeenCalledWith('/home/user/a.md', { line: 12 })
+  })
+
   it('leaves an inert chip glyph-free, so the affordance stays meaningful', async () => {
     stubKind(null, false)
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)

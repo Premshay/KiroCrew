@@ -375,6 +375,7 @@ function slugify(children: React.ReactNode): string | undefined {
  * schemes) keep in-place navigation; everything else opens in a new tab. */
 function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAnchorElement> & ExtraProps) {
   const override = useContext(LinkOverrideCtx)
+  const actions = useContext(PathActionCtx)
   // The override is resolved FIRST and wins outright — Issue Radar's in-app
   // issue/PR affordance must keep beating a link preview. Feeding `null` into
   // the unfurl gate for a claimed href also means a claimed link is never
@@ -382,6 +383,18 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   const claimed = href && override ? override({ href, children }) : null
   const target = useUnfurlHref(claimed ? null : href)
   const meta = useLinkMeta(target ?? undefined, target !== null)
+  let localHref: string | null = null
+  if (href?.startsWith('/')) {
+    try { localHref = decodeURIComponent(href) } catch { /* keep it a normal link */ }
+  }
+  const { path, line, endLine } = splitLineRef(localHref ?? '')
+  const pathCandidate = !claimed && !!localHref && !!(actions.onFileOpen || actions.onFolderOpen) && isPathCandidate(path)
+  const pathKind = usePathKind(pathCandidate ? path : null)
+  const onPathClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    if (!pathCandidate || e.button !== 0 || e.metaKey || e.ctrlKey || e.altKey) return
+    e.preventDefault()
+    if (pathKind === 'file' || pathKind === 'dir') activatePath(path, pathKind, e.shiftKey, actions, line, endLine)
+  }
   if (claimed) return <>{claimed}</>
   if (target && meta) return <LinkChip meta={meta} href={target}>{children}</LinkChip>
   let ext = false
@@ -390,6 +403,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
     <a
       {...sp(node)}
       href={href}
+      onClick={pathCandidate ? onPathClick : undefined}
       {...(ext ? {} : { target: '_blank', rel: 'noopener noreferrer' })}
       className="text-accent underline underline-offset-2 decoration-accent/40 hover:decoration-accent"
     >
