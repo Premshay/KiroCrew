@@ -177,7 +177,7 @@ export const ContentRenderer = memo(function ContentRenderer({
   const inner = (
     <>
       {isRichType && fileType === 'image' && filePath && <ImageViewer filePath={filePath} />}
-      {isRichType && fileType === 'svg' && <SvgViewer content={content} />}
+      {isRichType && fileType === 'svg' && <SvgViewer content={content} previewRef={previewRef as React.Ref<HTMLDivElement>} />}
       {isRichType && fileType === 'csv' && <CsvViewer content={content} filePath={filePath ?? ''} />}
       {isRichType && fileType === 'json' && <JsonViewer content={content} />}
       {isRichType && fileType === 'jsonl' && <JsonlViewer content={content} />}

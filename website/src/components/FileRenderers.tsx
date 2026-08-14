@@ -1,4 +1,4 @@
-import { memo, useState, useMemo, useCallback, useRef } from 'react'
+import { memo, useState, useMemo, useCallback, useRef, type Ref } from 'react'
 import DOMPurify from 'dompurify'
 
 import { i18nT } from '../i18n/t'
@@ -70,13 +70,18 @@ export const ImageViewer = memo(function ImageViewer({ filePath }: { filePath: s
  * Used for artifact `kind: svg` where the SVG XML lives in the artifact
  * content, not on disk. DOMPurify with the SVG profile strips dangerous
  * elements (script, foreignObject) while preserving normal SVG markup. */
-export const SvgViewer = memo(function SvgViewer({ content }: { content: string }) {
+export const SvgViewer = memo(function SvgViewer({ content, previewRef }: {
+  content: string
+  /** Lets the artifact comment layer prove and anchor a selection in SVG text. */
+  previewRef?: Ref<HTMLDivElement>
+}) {
   const safe = useMemo(
     () => DOMPurify.sanitize(content, { USE_PROFILES: { svg: true, svgFilters: true } }),
     [content],
   )
   return (
     <div
+      ref={previewRef}
       className="flex items-center justify-center h-full overflow-auto p-4 bg-bg-elevated rounded-md border border-border"
       dangerouslySetInnerHTML={{ __html: safe }}
     />

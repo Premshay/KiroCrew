@@ -842,22 +842,19 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
 
   // ── Inline-comment handlers ──────────────────────────────────────────────
   // Comments only make sense for kinds where text→source coords resolve
-  // cleanly: markdown (via data-sourcepos) and text (rendered === source).
-  // JSON / SVG selection produces noisy anchors; revisit when there's a real
-  // user demand.
+  // cleanly: markdown (via data-sourcepos), text (rendered === source), and
+  // SVG text (quoted text can be located directly in the SVG source).
   // Anchored (selection-driven) comment creation: select text in the rendered
   // body to pin a comment to that exact span. The anchor (quote + prefix/suffix
   // + rendered-text offsets + version) is persisted server-side and surfaced to
   // the agent via artifact_get_comments, so a comment is a durable, located
   // instruction rather than a free-floating note. Doc-level comments via the
   // CommentsSidebar remain available for all kinds.
-  // markdown AND text: both now render behind a `previewRef` (ContentRenderer
-  // attaches it to the markdown DOM and to the <pre> used for text), so a
-  // selection has a root to map back to source in either. Do not add a kind here
-  // without confirming its renderer attaches the ref, or the popover silently
-  // never opens.
+  // markdown, text, and SVG all render behind a `previewRef`, so a selection
+  // has a root to map back to source. Do not add a kind here without confirming
+  // its renderer attaches the ref, or the popover silently never opens.
   const commentable = !!artifact && !editing && isCurrent && (
-    artifact.kind === 'markdown' || artifact.kind === 'text'
+    artifact.kind === 'markdown' || artifact.kind === 'text' || artifact.kind === 'svg'
   )
   const isMarkdown = artifact?.kind === 'markdown'
   const sourceContent = artifact?.content ?? ''
@@ -2087,4 +2084,3 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
     </div>
   )
 }
-
