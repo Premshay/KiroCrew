@@ -16,8 +16,9 @@
  * jsdom has no real text selection, so `window.getSelection` is backed by a real
  * `Range` over the rendered body — the same object the production code reads.
  * The suite uses a MARKDOWN artifact because that is the kind that renders to a
- * DOM tree behind `previewRef`; text/json/svg render as a highlighted <pre> with
- * no preview ref, so a DOM selection there has nothing to map back to source.
+ * DOM tree behind `previewRef`; text/json render as a highlighted <pre>, while
+ * SVG uses its sanitized native viewer. Every commentable surface must attach
+ * that ref or selection creates a dead comment affordance.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, fireEvent } from '@testing-library/react'
@@ -171,6 +172,23 @@ describe('ArtifactDetailPage anchored comments', () => {
 
     expect(selectInBody('beta')).toBe(true)
     fireEvent.change(await screen.findByLabelText('Add a comment'), { target: { value: 'tighten this' } })
+    fireEvent.click(screen.getByLabelText('Add comment'))
+
+    await waitFor(() => expect(vi.mocked(api).postArtifactComment).toHaveBeenCalledTimes(1))
+    const anchor = vi.mocked(api).postArtifactComment.mock.calls[0][1].anchor as { quote: string }
+    expect(anchor.quote).toBe('beta')
+  })
+
+  it('anchors a comment on SVG text', async () => {
+    vi.mocked(api).artifact = vi.fn().mockResolvedValue(mkArtifact({
+      kind: 'svg',
+      content: '<svg viewBox="0 0 200 30"><text x="0" y="20">alpha beta gamma</text></svg>',
+    }))
+    renderPage()
+    await waitFor(() => expect(screen.getByLabelText('Toggle agent chat')).toBeInTheDocument())
+
+    expect(selectInBody('beta')).toBe(true)
+    fireEvent.change(await screen.findByLabelText('Add a comment'), { target: { value: 'clarify this step' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
 
     await waitFor(() => expect(vi.mocked(api).postArtifactComment).toHaveBeenCalledTimes(1))

@@ -236,7 +236,7 @@ export const ContentRenderer = memo(function ContentRenderer({
                   {i18nT('components.markdownPanel.preview')}
                 </div>
                 <div className="min-h-0 flex-1">
-                  <SvgViewer content={content} />
+                  <SvgViewer content={content} previewRef={previewRef as React.Ref<HTMLDivElement>} />
                 </div>
               </section>
               <section
@@ -261,7 +261,7 @@ export const ContentRenderer = memo(function ContentRenderer({
               </section>
             </div>
           </div>
-        ) : <SvgViewer content={content} />
+        ) : <SvgViewer content={content} previewRef={previewRef as React.Ref<HTMLDivElement>} />
       )}
       {isRichType && fileType === 'csv' && <CsvViewer content={content} filePath={filePath ?? ''} />}
       {isRichType && fileType === 'json' && <JsonViewer content={content} />}
