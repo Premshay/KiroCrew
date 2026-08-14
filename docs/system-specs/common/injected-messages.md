@@ -16,20 +16,25 @@ also carry a structural `kind`.
 ## Peer channel request
 
 An attached dashboard session receives a named peer request through a persistent
-agent channel. The peer payload remains in the slot's peer inbox and the runner
-frames it as a `[KiroCrew Channel message]` envelope. A separate synthetic queue
-entry carries `kind == "peer_channel_request"` and the
-`PEER_CHANNEL_REQUEST_PREFIX` marker.
+agent channel. The named request's synthetic queue entry carries
+`kind == "peer_channel_request"`, the `PEER_CHANNEL_REQUEST_PREFIX` marker, and
+the same redacted `[KiroCrew Channel message]` envelope that the model reads.
+It also records the channel and message identifiers of that inbox record, so the
+runner consumes that one delivery without draining later peer messages.
 
 - Only a named request (`msg_type: "mention"`) creates this queue entry. Peer
   progress and done reports, and human broadcasts without an @mention, remain
   passive.
 - An idle recipient starts one guarded turn. A busy recipient keeps the request
   queued until its active turn completes; the request never interrupts work.
-- The runner records the scheduler entry as an `inject` message and suppresses
-  linked messaging mirrors, so it cannot be mistaken for a human request.
-- The peer envelope states that it is neither user instruction nor operator
-  authorization. It is not added to the visible chat transcript.
+- The runner records the envelope as an `inject` message and suppresses linked
+  messaging mirrors, so it cannot be mistaken for a human request.
+- The dashboard renders the row as a collapsed peer-message card. Its header
+  names the sender, message type and delivery mode; expanding it shows the
+  exact redacted peer body that the model received. The model-only instruction
+  after the envelope stays folded out of the card.
+- The envelope states that it is neither user instruction nor operator
+  authorization.
 
 **How to treat it:** review the peer report, then respond or acknowledge only
 when the named request needs action.

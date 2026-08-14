@@ -2234,7 +2234,7 @@ class ConversationLog:
         #: order; :class:`_SearchTextCache` keeps that guarantee by refusing
         #: admission instead of evicting, so the sessions that fit stay cached
         #: and the bound is now a real memory ceiling rather than a proxy for one.
-        self._folded_cache: _SearchTextCache[tuple[float, int, int, str]] = _SearchTextCache(
+        self._folded_cache: _SearchTextCache[tuple[tuple[float, float, int], int, int, str]] = _SearchTextCache(
             _SEARCH_FOLD_BUDGET_BYTES, lambda v: v[3].__sizeof__(), "fold"
         )
         #: session key → (mtime, gen, raw message texts) for snippet extraction.
@@ -2254,7 +2254,7 @@ class ConversationLog:
         #: same generation field as ``_folded_cache`` above, for the same
         #: cross-instance reason: both memos are derived from the messages, so
         #: they go stale at exactly the same moment.
-        self._snippet_cache: _SearchTextCache[tuple[float, int, list[str]]] = _SearchTextCache(
+        self._snippet_cache: _SearchTextCache[tuple[tuple[float, float, int], int, list[str]]] = _SearchTextCache(
             _SEARCH_SNIPPET_BUDGET_BYTES,
             lambda v: v[2].__sizeof__() + sum(t.__sizeof__() for t in v[2]),
             "snippet",
@@ -3870,7 +3870,7 @@ class ConversationLog:
         # The hit wants the LATEST generation (a moved counter means a write
         # landed, so a miss is the correct answer), so it is read at check
         # time rather than snapshotted earlier — matching ``_snippet_texts``.
-        if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+        if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
             return (cached[2], cached[3])
         # Cold: serialize against this key's writers for the whole
         # stat -> read -> store sequence.
@@ -3905,7 +3905,7 @@ class ConversationLog:
             # current for this newer generation.
             gen = self._cache_gen(key)
             try:
-                mtime = path.stat().st_mtime
+                ident = _cache_identity(path.stat())
             except OSError:
                 self._folded_cache.pop(key, None)
                 self._snippet_cache.pop(key, None)
@@ -3913,7 +3913,7 @@ class ConversationLog:
             cached = self._folded_cache.get(key)
             if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
                 return (cached[2], cached[3])
-            built = self._build_folded(key, mtime, gen)
+            built = self._build_folded(key, ident, gen)
             if built is None:
                 # The read failed rather than finding no content. Caching that
                 # would be keyed by an mtime the file still has, so a session
@@ -3924,7 +3924,7 @@ class ConversationLog:
                 # report empty for this query and retry on the next one.
                 return (0, "")
             self._publish_if_current(
-                self._folded_cache, key, (mtime, gen, built[0], built[1]), key=key, gen=gen
+                self._folded_cache, key, (ident, gen, built[0], built[1]), key=key, gen=gen
             )
             return built
 
@@ -3948,7 +3948,9 @@ class ConversationLog:
             if cache.refused_since_prune():
                 cache.retain(live_keys)
 
-    def _build_folded(self, key: str, mtime: float, gen: int) -> tuple[int, str] | None:
+    def _build_folded(
+        self, key: str, identity: tuple[float, float, int], gen: int
+    ) -> tuple[int, str] | None:
         """Parse *key* and fold its content — the cache-miss half of
         :meth:`_folded_content`.
 
@@ -4006,7 +4008,9 @@ class ConversationLog:
         # in-process writers, so its job is refusing to stamp an entry with an
         # already-superseded generation — the recorded generation is what the
         # warm-hit checks compare against.
-        self._publish_if_current(self._snippet_cache, key, (mtime, gen, texts), key=key, gen=gen)
+        self._publish_if_current(
+            self._snippet_cache, key, (identity, gen, texts), key=key, gen=gen
+        )
         return (sum(len(t) for t in texts), "\x00".join(texts).casefold())
 
     def _iter_message_texts(self, key: str) -> Iterator[str]:
@@ -4072,8 +4076,8 @@ class ConversationLog:
         cached = self._snippet_cache.get(key)
         if cached is not None:
             try:
-                mtime_now = self._path(key).stat().st_mtime
-                if cached[0] == mtime_now and cached[1] == self._cache_gen(key):
+                ident_now = _cache_identity(self._path(key).stat())
+                if cached[0] == ident_now and cached[1] == self._cache_gen(key):
                     return iter(cached[2])
             except OSError:
                 # Let the fallback read raise the OSError the caller handles,
@@ -4685,12 +4689,12 @@ class ConversationLog:
         # be. The generation read is pure in-memory work (no I/O), so the hit
         # still never waits on a writer's file operations.
         try:
-            mtime = path.stat().st_mtime
+            ident = _cache_identity(path.stat())
         except OSError:
-            mtime = None
-        if mtime is not None:
+            ident = None
+        if ident is not None:
             cached = self._msg_cache.get(key)
-            if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+            if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
                 return cached[2]
         # ── Cold path: serialize the FILL against this key's writers ─────────
         # The mtime guard cannot protect the fill window, because housekeeping

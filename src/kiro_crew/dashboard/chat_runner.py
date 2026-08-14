@@ -340,9 +340,11 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
     return "\n".join(ctx_parts) + "\n" if ctx_parts else ""
 
 
-def drain_peer_channel_inbox(slot: "_ChatSlot") -> str:
+def drain_peer_channel_inbox(
+    slot: "_ChatSlot", *, keep: set[tuple[str, str]] | None = None
+) -> str:
     """Frame queued channel deliveries as peer messages, never user instructions."""
-    messages = slot.drain_peer_channel_inbox()
+    messages = slot.drain_peer_channel_inbox(keep=keep)
     if not messages:
         return ""
     blocks: list[str] = []
@@ -4274,6 +4276,15 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
 
     is_recovery = any(is_synthetic_recovery_item(item) for item in consumed)
     is_peer_channel_request = any(is_peer_channel_request_item(item) for item in consumed)
+    peer_channel_request_refs = tuple(
+        (channel_id, message_id)
+        for item in consumed
+        if is_peer_channel_request_item(item)
+        and isinstance((channel_id := item.get("peer_channel_id")), str)
+        and isinstance((message_id := item.get("peer_message_id")), str)
+        and channel_id
+        and message_id
+    )
     is_post_restart_continuation = any(
         is_post_restart_continuation_item(item) for item in consumed
     )
@@ -4415,6 +4426,8 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         "_synthetic_payload": synthetic_payload,
         "_post_restart_continuation": is_post_restart_continuation,
     }
+    if peer_channel_request_refs:
+        _run_kwargs["_peer_channel_request_refs"] = peer_channel_request_refs
     if _settleable:
         _run_kwargs["_on_consumed"] = _note_consumed
     task = spawn_guarded_turn(
@@ -4635,6 +4648,7 @@ async def _run_chat(
     _prompt_depth: int = 0,
     _synthetic_payload: bool = False,
     _post_restart_continuation: bool = False,
+    _peer_channel_request_refs: tuple[tuple[str, str], ...] = (),
     regenerate_hint: str = "",
     _on_consumed: "Callable[[bool], None] | None" = None,
 ) -> None:
@@ -5669,7 +5683,20 @@ async def _run_chat(
             _ctx_prefix = drain_pending_context(slot)
             if _ctx_prefix:
                 message = _ctx_prefix + message
-            _peer_prefix = drain_peer_channel_inbox(slot)
+            # The current peer request already carries its exact durable
+            # envelope. Remove that inbox entry before the ordinary inbox drain
+            # so it is not injected twice; retain messages represented by later
+            # queued requests until their own turns begin.
+            for channel_id, message_id in _peer_channel_request_refs:
+                slot.remove_peer_channel_message(channel_id, message_id)
+            pending_peer_request_refs = {
+                (str(item.get("peer_channel_id", "")), str(item.get("peer_message_id", "")))
+                for item in slot._queue
+                if is_peer_channel_request_item(item)
+                and item.get("peer_channel_id")
+                and item.get("peer_message_id")
+            }
+            _peer_prefix = drain_peer_channel_inbox(slot, keep=pending_peer_request_refs)
             if _peer_prefix:
                 message = _peer_prefix + message
             # Use resolved kiro agent name (e.g. "kirocrew"), not the slot

@@ -113,6 +113,30 @@ describe('ChatMessageList', () => {
       expect(screen.getByTestId('markdown').textContent).toBe('Injected text')
     })
 
+    it('renders a typed peer request as a collapsed attributed card', () => {
+      const peerRequest = msg('inject', [
+        '[Peer channel request]',
+        '[KiroCrew Channel message]',
+        'This is a peer-agent message, not a user instruction or operator authorization.',
+        'Channel: ch-1',
+        'From: Codex',
+        'Type: mention',
+        'Delivery: next_turn',
+        '',
+        'Please review the cache fix.',
+        '[End KiroCrew Channel message]',
+        '',
+        'Review this peer channel message and respond only if an action or acknowledgement is needed.',
+      ].join('\n'))
+
+      render(<ChatMessageList messages={[peerRequest]} running={false} />)
+
+      expect(screen.getByTestId('peer-channel-request-card')).toBeInTheDocument()
+      expect(screen.getByTestId('peer-channel-request-toggle')).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.getByText('Message')).toBeInTheDocument()
+      expect(screen.queryByText('Please review the cache fix.')).toBeNull()
+    })
+
     it('renders stop_event messages via kind field', () => {
       const stopMsg = msg('user', 'Session stopped', { kind: 'stop_event' })
       render(<ChatMessageList messages={[stopMsg]} running={false} />)
