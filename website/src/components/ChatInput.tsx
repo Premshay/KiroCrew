@@ -2436,19 +2436,31 @@ function ChatInput({
           <div className="flex items-center gap-0.5 min-w-0">
             {onUploadFiles && (
               <div className="relative shrink-0" ref={plusWrapRef}>
-                <button
-                  ref={plusBtnRef}
-                  className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? 'text-text bg-bg-hover' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
-                  onClick={togglePlus}
-                  disabled={uploading}
-                  aria-haspopup="menu"
-                  aria-expanded={plusOpen}
-                  aria-label={i18nT('components.chatInput.add_files_options')}
-                  title={i18nT('components.chatInput.add_files_options')}
-                >
-                  {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`} />}
-                </button>
-                {plusOpen && plusRect && createPortal(
+                {isMobile ? (
+                  <label
+                    htmlFor={uploading ? undefined : fileInputId}
+                    aria-disabled={uploading || undefined}
+                    className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all bg-transparent ${uploading ? 'opacity-30 cursor-default' : 'cursor-pointer text-muted hover:text-text hover:bg-bg-hover'}`}
+                    aria-label={i18nT('components.chatInput.attach_files')}
+                    title={i18nT('components.chatInput.attach_files')}
+                  >
+                    {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} />}
+                  </label>
+                ) : (
+                  <button
+                    ref={plusBtnRef}
+                    className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none ${plusOpen ? 'text-text bg-bg-hover' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
+                    onClick={togglePlus}
+                    disabled={uploading}
+                    aria-haspopup="menu"
+                    aria-expanded={plusOpen}
+                    aria-label={i18nT('components.chatInput.add_files_options')}
+                    title={i18nT('components.chatInput.add_files_options')}
+                  >
+                    {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`} />}
+                  </button>
+                )}
+                {!isMobile && plusOpen && plusRect && createPortal(
                   <div
                     ref={plusMenuRef}
                     className="fixed w-[260px] rounded-xl bg-bg-elevated border border-border shadow-xl p-2 animate-slide-up z-[60]"

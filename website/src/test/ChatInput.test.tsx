@@ -13,6 +13,9 @@ import type { PasteBlock } from '../utils/pasteTokens'
 const touchEnv = vi.hoisted(() => ({ touch: false }))
 vi.mock('../utils/isTouchDevice', () => ({ isTouchDevice: () => touchEnv.touch }))
 
+const mobileEnv = vi.hoisted(() => ({ mobile: false }))
+vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => mobileEnv.mobile }))
+
 const defaultProps = {
   value: '',
   onChange: vi.fn(),
@@ -23,6 +26,7 @@ beforeEach(() => {
   vi.restoreAllMocks()
   localStorage.clear()
   touchEnv.touch = false
+  mobileEnv.mobile = false
 })
 
 describe('ChatInput', () => {
@@ -65,6 +69,18 @@ describe('ChatInput', () => {
       const uploadLabel = screen.getByText('Upload file').closest('label')
       expect(uploadLabel).toHaveAttribute('for', input.id)
       expect(input).not.toHaveClass('hidden')
+    })
+
+    it('makes the mobile + control open the native file picker directly', () => {
+      mobileEnv.mobile = true
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+
+      const input = screen.getAllByLabelText('Attach files').find((element) => element.tagName === 'INPUT')
+      const mobilePlus = screen.getByTitle('Attach files').closest('label')
+      expect(input).toBeDefined()
+      expect(mobilePlus).toHaveAttribute('for', input?.id)
+      expect(screen.queryByRole('button', { name: 'Add files & options' })).not.toBeInTheDocument()
+      expect(screen.queryByText('Upload file')).not.toBeInTheDocument()
     })
   })
 
