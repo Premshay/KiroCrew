@@ -63,6 +63,7 @@ export default memo(function PeerChannelRequestCard({
   disclosureKey?: string
 }) {
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
+  const requestLabel = parsed.delivery === 'interrupt' ? 'Urgent' : 'Message'
 
   return (
     <div
@@ -84,7 +85,7 @@ export default memo(function PeerChannelRequestCard({
         <MessageCircle className="lucide-inline w-[13px] h-[13px] shrink-0 text-accent" aria-hidden="true" />
         <span className="font-medium text-fg truncate">{parsed.fromRole}</span>
         <span className="truncate text-[12px] opacity-75 min-w-0">
-          {parsed.msgType} · {parsed.delivery}
+          {requestLabel}
         </span>
       </button>
       {expanded && (

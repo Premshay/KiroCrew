@@ -41,8 +41,9 @@ describe('PeerChannelRequestCard', () => {
 
     const toggle = screen.getByTestId('peer-channel-request-toggle')
     expect(toggle).toHaveAccessibleName(/Claude knowledge llm/)
-    expect(toggle).toHaveTextContent('mention')
-    expect(toggle).toHaveTextContent('next_turn')
+    expect(toggle).toHaveTextContent('Message')
+    expect(toggle).not.toHaveTextContent('mention')
+    expect(toggle).not.toHaveTextContent('next_turn')
     expect(toggle).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByTestId('peer-channel-request-body')).toBeNull()
 
