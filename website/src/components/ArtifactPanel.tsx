@@ -28,6 +28,10 @@ interface Props {
   onSubmitComments?: (message: string) => void
   /** Render as a SidePanel tab body (fills parent, no resize handle/border). */
   embedded?: boolean
+  /** Document tabs stay mounted while hidden. Refresh current artifact content
+   * when this tab becomes visible so a missed WebSocket event cannot leave a
+   * stale chat snapshot on screen. */
+  isTabActive?: boolean
 }
 
 const BODY_HEIGHT_STYLE: React.CSSProperties = { height: '100%', minHeight: 0 }
@@ -100,7 +104,7 @@ function SubmitBar({ count, submitting, onSubmit, bleed = false }: {
  * `onSubmitComments` (the local-file user-message path) rather than the
  * full-page `iterateWithAgent` navigate — and only for human comments.
  */
-export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSubmitComments, embedded }: Props) {
+export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSubmitComments, embedded, isTabActive = true }: Props) {
   const navigate = useNavigate()
   const previewRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -117,6 +121,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSub
     staleTime: 10_000,
   })
   const artifact = detailQuery.data
+  const { refetch: refetchArtifact } = detailQuery
   const effectiveKind = artifact?.kind ?? kind
   const effectiveContent = artifact?.content ?? content
   const name = artifact?.name ?? slug
@@ -126,6 +131,21 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSub
   // query is still in flight) — otherwise the seed renders and never flashes.
   const isHydrating = detailQuery.isLoading && !artifact && !content
   const loadFailed = detailQuery.isError && !artifact && !content
+
+  // Document tabs are deliberately kept mounted while inactive (so opening a
+  // tab is instant), but a backgrounded mobile browser can miss the WebSocket
+  // invalidation that normally refreshes this query. Becoming visible is an
+  // explicit request for the authoritative current artifact, not the chat
+  // content captured when the tab was first opened.
+  useEffect(() => {
+    if (isTabActive) void refetchArtifact()
+  }, [isTabActive, refetchArtifact])
+
+  const liveVersion = artifact ? (
+    <span className="shrink-0" aria-live="polite">
+      {i18nT('pages.artifactDetailPage.live')} · {i18nT('pages.artifactDetailPage.v')}{artifact.version}
+    </span>
+  ) : null
 
   // Two instances (non-fullscreen body / fullscreen body) read the SAME durable
   // comments via the shared query cache; only local UI state (sidebar open,
@@ -302,13 +322,16 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSub
         </>
       }
       footer={
-        <Clickable
-          className="flex items-center gap-2 text-[11px] text-muted font-mono truncate cursor-pointer hover:text-text transition-colors"
-          title={i18nT('components.artifactPanel.click_to_copy_slug')}
-          onClick={() => copyToClipboard(slug)}
-        >
-          {i18nT('components.artifactPanel.artifacts')}{slug}
-        </Clickable>
+        <div className="flex items-center gap-2 text-[11px] text-muted font-mono min-w-0">
+          {liveVersion}
+          <Clickable
+            className="truncate cursor-pointer hover:text-text transition-colors"
+            title={i18nT('components.artifactPanel.click_to_copy_slug')}
+            onClick={() => copyToClipboard(slug)}
+          >
+            {i18nT('components.artifactPanel.artifacts')}{slug}
+          </Clickable>
+        </div>
       }
     >
       <div className="flex-1 overflow-hidden -mx-5 -my-4 py-4 flex flex-col pl-4 pr-0 min-h-0">
@@ -362,7 +385,10 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSub
             <SubmitBar count={humanComments.length} submitting={submitting} onSubmit={submitToChat} />
           </div>
         )}
-        <Clickable className="shrink-0 flex items-center px-16 h-6 text-[11px] text-muted font-mono truncate cursor-pointer hover:text-text transition-colors" title={i18nT('components.artifactPanel.click_to_copy_slug')} onClick={() => copyToClipboard(slug)}>{i18nT('components.artifactPanel.artifacts')}{slug}</Clickable>
+        <div className="shrink-0 flex items-center gap-2 px-16 h-6 text-[11px] text-muted font-mono min-w-0">
+          {liveVersion}
+          <Clickable className="truncate cursor-pointer hover:text-text transition-colors" title={i18nT('components.artifactPanel.click_to_copy_slug')} onClick={() => copyToClipboard(slug)}>{i18nT('components.artifactPanel.artifacts')}{slug}</Clickable>
+        </div>
       </div>,
       document.body
     )}

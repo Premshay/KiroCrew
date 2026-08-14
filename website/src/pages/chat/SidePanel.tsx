@@ -743,6 +743,7 @@ function TabBody({ tab, active, slot, onClose, onContentChange, onDiffModeChange
     return (
       <ArtifactPanel
         embedded
+        isTabActive={active}
         slug={tab.artifactSlug || ''}
         kind={tab.artifactKind || 'markdown'}
         content={tab.content || ''}
