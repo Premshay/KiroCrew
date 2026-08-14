@@ -978,6 +978,7 @@ function ChatInput({
   }, [disabled, onFollowUpSend])
   const { botName } = useBranding()
   const isMobile = useIsMobile()
+  const directFilePicker = isMobile || isTouchDevice()
   const ime = useImeGuard()
   const resolvedPlaceholder = placeholder || i18nT('components.chatInput.message_placeholder', { bot: botName })
   // An icon swap alone announces nothing, so the empty-state placeholder carries
@@ -2436,7 +2437,7 @@ function ChatInput({
           <div className="flex items-center gap-0.5 min-w-0">
             {onUploadFiles && (
               <div className="relative shrink-0" ref={plusWrapRef}>
-                {isMobile ? (
+                {directFilePicker ? (
                   <label
                     htmlFor={uploading ? undefined : fileInputId}
                     aria-disabled={uploading || undefined}
@@ -2460,7 +2461,7 @@ function ChatInput({
                     {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`} />}
                   </button>
                 )}
-                {!isMobile && plusOpen && plusRect && createPortal(
+                {!directFilePicker && plusOpen && plusRect && createPortal(
                   <div
                     ref={plusMenuRef}
                     className="fixed w-[260px] rounded-xl bg-bg-elevated border border-border shadow-xl p-2 animate-slide-up z-[60]"

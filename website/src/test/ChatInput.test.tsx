@@ -71,8 +71,8 @@ describe('ChatInput', () => {
       expect(input).not.toHaveClass('hidden')
     })
 
-    it('makes the mobile + control open the native file picker directly', () => {
-      mobileEnv.mobile = true
+    it('makes the touch-device + control open the native file picker directly in a wide viewport', () => {
+      touchEnv.touch = true
       renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
 
       const input = screen.getAllByLabelText('Attach files').find((element) => element.tagName === 'INPUT')
