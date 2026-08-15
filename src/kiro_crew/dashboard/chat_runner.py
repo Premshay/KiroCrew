@@ -6054,6 +6054,12 @@ async def _run_chat(
             logger.info("Aborting dispatch for %s — gateway is shutting down", session_key)
             return
         async for event in event_stream:
+            # A native ID is durable only inside a provider-defined namespace.
+            provider_session_id = client.session_id
+            provider_label = client.session_provider_label
+            if isinstance(provider_session_id, str) and isinstance(provider_label, str):
+                if provider_session_id and provider_label:
+                    await state.sessions.persist_provider_session(session_key, client)
             # Heartbeat every 5s during long operations
             if time.time() - last_heartbeat > 5:
                 state.broadcast_ws("heartbeat", {"slot": slot.key, "ts": time.time()})

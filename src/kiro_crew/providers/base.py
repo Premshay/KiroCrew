@@ -129,6 +129,29 @@ class LLMProvider(ABC):
         """
         return ""
 
+    @property
+    def session_provider_label(self) -> str:
+        """Persistent-session namespace, or empty when this provider has none.
+
+        A label opts a provider into KiroCrew's session map. The empty default
+        keeps providers without a documented native resume contract out of that
+        map instead of treating their identifiers as kiro-cli sessions.
+        """
+        return ""
+
+    def set_resume_session_id(self, session_id: str) -> None:
+        """Accept an exact provider-native conversation ID before ``start()``.
+
+        Providers without durable native conversations deliberately ignore this
+        request. A provider that exposes ``session_provider_label`` implements
+        its own exact resume operation rather than relying on global state.
+        """
+
+    @property
+    def session_resumed(self) -> bool:
+        """Whether startup restored the conversation requested for this provider."""
+        return False
+
     async def cleanup_session(self, session_id: str) -> None:
         """Delete on-disk session files for the given session ID.
 
