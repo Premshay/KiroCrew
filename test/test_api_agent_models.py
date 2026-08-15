@@ -49,9 +49,11 @@ def _app(policy, sessions):
 @pytest.mark.asyncio
 async def test_live_model_discovery_returns_advertised_subscription_models():
     provider = SimpleNamespace(
-        available_models=lambda: [
-            {"modelId": "gpt-5.6-sol", "name": "GPT-5.6", "description": "Subscription"}
-        ],
+        discover_models=AsyncMock(
+            return_value=[
+                {"modelId": "gpt-5.6-sol", "name": "GPT-5.6", "description": "Subscription"}
+            ]
+        ),
         get_valid_effort_levels=lambda: ["low", "high"],
     )
     sessions = _Sessions(provider)
@@ -73,6 +75,7 @@ async def test_live_model_discovery_returns_advertised_subscription_models():
             }
 
     assert sessions.agent == "codex"
+    provider.discover_models.assert_awaited_once()
     sessions.release.assert_called_once_with("dashboard:model-discovery:codex")
     sessions.destroy.assert_awaited_once_with("dashboard:model-discovery:codex")
 

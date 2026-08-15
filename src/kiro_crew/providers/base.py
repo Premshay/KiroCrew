@@ -121,6 +121,28 @@ class LLMProvider(ABC):
         return 0
 
     @property
+    def served_model(self) -> str:
+        """Return the selected native model, if the provider exposes one."""
+        return ""
+
+    @property
+    def agent_name(self) -> str:
+        """Return the selected native agent profile, if the provider exposes one."""
+        return ""
+
+    def available_models(self) -> list[dict[str, str]]:
+        """Return models already known to the provider without inventing a catalog."""
+        return []
+
+    async def discover_models(self) -> list[dict[str, str]]:
+        """Discover account-entitled models when the native transport supports it."""
+        return self.available_models()
+
+    def get_valid_effort_levels(self) -> list[str]:
+        """Return provider-defined reasoning effort values when selectable."""
+        return []
+
+    @property
     def session_id(self) -> str:
         """Provider-specific session identifier for file cleanup.
 
