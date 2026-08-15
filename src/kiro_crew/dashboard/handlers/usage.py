@@ -1113,6 +1113,8 @@ def _build_token_record(
         "output": getattr(u, "output_tokens", 0),
         "cache_create": getattr(u, "cache_creation_tokens", 0),
         "cache_read": getattr(u, "cache_read_tokens", 0),
+        "thinking": getattr(u, "thinking_tokens", 0),
+        "total": getattr(u, "total_tokens", 0),
         "cost": getattr(u, "cost_usd", 0.0),
         "credits": credits,
         "turns": getattr(u, "num_turns", 0),
