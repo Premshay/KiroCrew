@@ -50,7 +50,16 @@ class LLMProvider(ABC):
     async def cancel(*, wait_ack_timeout: float = 0.0) -> CancelOutcome
     def is_alive() -> bool
     def touch_activity() -> None
+    @property def session_provider_label() -> str
+    def set_resume_session_id(session_id: str) -> None
+    @property def session_resumed() -> bool
 ```
+
+`session_provider_label` opts a provider into a non-default session-map namespace; its safe
+default is empty. `set_resume_session_id()` is a safe no-op by default, while a resumable
+provider validates and retains its own opaque ID. `session_resumed` becomes true only when that
+provider accepted the exact prior ID. The session manager reads all three through the ABC, so
+an optional provider does not add a conditional to KiroCrew's ACP construction path.
 
 ### LLMEvent (`providers/base.py`)
 

@@ -209,7 +209,11 @@ class SessionMap:
         if not entry:
             return None
         sid = entry["sid"]
-        if entry.get("provider") == "claude_code":
+        # ACP owns a local kiro-cli session file. Every other named provider
+        # owns its native ID outside that directory, so requiring a kiro file
+        # would discard a valid resume mapping before its provider can use it.
+        provider = entry.get("provider")
+        if isinstance(provider, str) and provider not in {"", "acp"}:
             return sid
         sessions_dir = _kiro_sessions_dir()
         if sid and (sessions_dir / f"{sid}.json").exists():
@@ -290,7 +294,7 @@ class SessionMap:
         stale = [
             k
             for k, entry in self._data.items()
-            if entry.get("provider") != "claude_code"
+            if entry.get("provider") in {"", "acp"}
             and (
                 (entry.get("sid") and not (sessions_dir / f"{entry['sid']}.json").exists())
                 or (

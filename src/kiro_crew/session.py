@@ -165,6 +165,12 @@ def _is_claude_backend(provider: Any) -> bool:
     return backend == "claude"
 
 
+def _provider_label(provider: Any) -> str:
+    """Return the provider's session-map namespace, defaulting to ACP."""
+    label = provider.session_provider_label
+    return label if isinstance(label, str) and label else "acp"
+
+
 def _provider_effectively_alive(provider: Any) -> bool:
     """Whether a session's provider should be treated as live (NOT stale).
 
@@ -1941,6 +1947,26 @@ class SessionManager:
             )
         return result
 
+    def _store_provider_mapping(self, key: str, provider: LLMProvider) -> bool:
+        """Record a provider-native conversation when all resume fields exist."""
+        sid = provider.session_id
+        label = provider.session_provider_label
+        cwd = provider.cwd
+        if not all(isinstance(value, str) and value for value in (sid, label, cwd)):
+            return False
+        if (
+            self._session_map.get(key) == sid
+            and self._session_map.get_provider(key) == label
+            and self._session_map.get_cwd(key) == cwd
+        ):
+            return False
+        self._session_map.set(key, sid, provider=label, cwd=cwd)
+        return True
+
+    async def persist_provider_session(self, key: str, provider: LLMProvider) -> None:
+        """Persist a newly available provider-native conversation identifier."""
+        self._store_provider_mapping(key, provider)
+
     @staticmethod
     def _resolve_agent_model(agent: str) -> str:
         """Resolve model from agent config file. Cached at class level with
@@ -2170,21 +2196,11 @@ class SessionManager:
                         sess.last_used = time.monotonic()
                         was_new = sess.is_new
                         sess.is_new = False
-                        # Lazy-save CC session_id: init event fires after
-                        # registration, so the first get_or_create that finds
-                        # a live session with a populated session_id persists it.
-                        if (
-                            ClaudeCodeProvider is not None
-                            and isinstance(sess.provider, ClaudeCodeProvider)
-                            and sess.provider.session_id
-                            and not self._session_map.get(key)
+                        if key != BACKGROUND_KEY and (
+                            not any(key.startswith(p) for p in _STATELESS_PREFIXES)
+                            or self._is_continuable_key(key)
                         ):
-                            self._session_map.set(
-                                key,
-                                sess.provider.session_id,
-                                provider="claude_code",
-                                cwd=sess.provider.cwd,
-                            )
+                            self._store_provider_mapping(key, sess.provider)
                         # Claim this session, but DON'T acquire its semaphore
                         # while holding self._lock. The semaphore can be held a
                         # long time (a whole turn); a wedged turn (e.g. a dead
@@ -2415,10 +2431,7 @@ class SessionManager:
             # build_session_replay on the first prompt (provider_switch_replay flag).
             _provider_switched = False
             if resume_sid:
-                is_cc_now = (
-                    ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider)
-                ) or _is_claude_backend(provider)
-                current_provider = "claude_code" if is_cc_now else "acp"
+                current_provider = _provider_label(provider)
                 if detect_provider_switch(self._session_map, key, current_provider):
                     resume_sid = None
                     _provider_switched = True
@@ -2428,16 +2441,8 @@ class SessionManager:
 
             # Set resume ID before start() triggers _initialize_session
             if resume_sid:
-                from kiro_crew.providers.acp import (
-                    AcpProvider,  # circular import: providers -> session
-                )
-
-                if isinstance(provider, AcpProvider):
-                    provider.client.set_resume_session_id(resume_sid)
-                    logger.info("Attempting session/load for %s (sid=%s)", key, resume_sid)
-                elif ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider):
-                    provider.set_resume_session_id(resume_sid)
-                    logger.info("CC resume for %s (sid=%s)", key, resume_sid)
+                provider.set_resume_session_id(resume_sid)
+                logger.info("Attempting provider resume for %s (sid=%s)", key, resume_sid)
             async with self._start_sem:
                 try:
                     await provider.start()
@@ -2468,11 +2473,7 @@ class SessionManager:
         _dup_provider: "LLMProvider | None" = None
         try:
             # Check if session was resumed
-            resumed = False
-            from kiro_crew.providers.acp import AcpProvider  # circular import: providers -> session
-
-            if isinstance(provider, AcpProvider):
-                resumed = provider.client.resumed
+            resumed = provider.session_resumed is True
 
             async with self._lock:
                 # Re-check: another coroutine may have created this key while we
@@ -2529,21 +2530,8 @@ class SessionManager:
                         len(self._sessions),
                     )
 
-                    # Save session mapping for long-lived sessions
-                    _cwd_str = provider.cwd
-                    if not is_stateless and isinstance(provider, AcpProvider):
-                        sid = provider.client._session_id
-                        _prov_label = "claude_code" if _is_claude_backend(provider) else "acp"
-                        if sid:
-                            self._session_map.set(key, sid, provider=_prov_label, cwd=_cwd_str)
-                    elif (
-                        not is_stateless
-                        and ClaudeCodeProvider is not None
-                        and isinstance(provider, ClaudeCodeProvider)
-                    ):
-                        sid = provider.session_id
-                        if sid:
-                            self._session_map.set(key, sid, provider="claude_code", cwd=_cwd_str)
+                    if not is_stateless:
+                        self._store_provider_mapping(key, provider)
 
                     if self._cleanup_task is None or self._cleanup_task.done():
                         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -3255,39 +3243,12 @@ class SessionManager:
 
         async with self._lock:
             # Save session mappings before killing processes
-            from kiro_crew.providers.acp import AcpProvider  # circular import: providers -> session
-
             for key, sess in self._sessions.items():
-                _cwd_str = sess.provider.cwd
-                if isinstance(sess.provider, AcpProvider):
-                    sid = sess.provider.client._session_id
-                    if (
-                        sid
-                        and key != BACKGROUND_KEY
-                        and (
-                            not any(key.startswith(p) for p in _STATELESS_PREFIXES)
-                            or self._is_continuable_key(key)
-                        )
-                    ):
-                        # Persist the provider label so detect_provider_switch
-                        # on next startup doesn't see a missing entry, default
-                        # to "acp", and falsely fire a switch for users still
-                        # on claude_code.
-                        _prov_label = "claude_code" if _is_claude_backend(sess.provider) else "acp"
-                        self._session_map.set(key, sid, provider=_prov_label, cwd=_cwd_str)
-                elif ClaudeCodeProvider is not None and isinstance(
-                    sess.provider, ClaudeCodeProvider
+                if key != BACKGROUND_KEY and (
+                    not any(key.startswith(p) for p in _STATELESS_PREFIXES)
+                    or self._is_continuable_key(key)
                 ):
-                    sid = sess.provider.session_id
-                    if (
-                        sid
-                        and key != BACKGROUND_KEY
-                        and (
-                            not any(key.startswith(p) for p in _STATELESS_PREFIXES)
-                            or self._is_continuable_key(key)
-                        )
-                    ):
-                        self._session_map.set(key, sid, provider="claude_code", cwd=_cwd_str)
+                    self._store_provider_mapping(key, sess.provider)
 
             sessions = dict(self._sessions)
             self._sessions.clear()

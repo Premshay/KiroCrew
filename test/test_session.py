@@ -3055,6 +3055,8 @@ class TestCloseAllPersistence:
         mock_provider.client = MagicMock()
         mock_provider.client._session_id = "sid-persist-test"
         mock_provider.client.backend = ""  # kiro-cli backend
+        mock_provider.session_id = "sid-persist-test"
+        mock_provider.session_provider_label = "acp"
 
         mgr._sessions["dashboard:slot0"] = _Session(provider=mock_provider)
         with patch.object(mgr._session_map, "set") as mock_set:
@@ -3068,6 +3070,64 @@ class TestCloseAllPersistence:
             provider="acp",
             cwd="/tmp/test",
         )
+
+
+class TestProviderOwnedSessionMapping:
+    """Session-map persistence for companion-owned providers."""
+
+    @pytest.mark.asyncio
+    async def test_provider_label_maps_and_resumes_exact_native_id(self, cfg):
+        provider = AsyncMock()
+        provider.start = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.is_process_alive = lambda: True
+        provider.context_usage_pct = lambda: 0.0
+        provider.session_id = "conversation-1"
+        provider.session_provider_label = "external-test"
+        provider.session_resumed = True
+        provider.cwd = "/tmp/workspace"
+        provider.set_resume_session_id = MagicMock()
+
+        mgr = SessionManager(cfg, provider_factory=lambda *args, **kwargs: provider)
+        mgr._session_map.set(
+            "dashboard:slot0",
+            "conversation-1",
+            provider="external-test",
+            cwd="/tmp/workspace",
+        )
+
+        _, is_new, resumed = await mgr.get_or_create("dashboard:slot0")
+
+        assert is_new is True
+        assert resumed is True
+        provider.set_resume_session_id.assert_called_once_with("conversation-1")
+        assert mgr._session_map.get_provider("dashboard:slot0") == "external-test"
+        mgr.release("dashboard:slot0")
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_first_streamed_native_id_is_durably_mapped(self, cfg):
+        provider = AsyncMock()
+        provider.start = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.is_process_alive = lambda: True
+        provider.context_usage_pct = lambda: 0.0
+        provider.session_id = ""
+        provider.session_provider_label = "external-test"
+        provider.session_resumed = False
+        provider.cwd = "/tmp/workspace"
+
+        mgr = SessionManager(cfg, provider_factory=lambda *args, **kwargs: provider)
+        active, _, _ = await mgr.get_or_create("dashboard:slot0")
+        assert mgr._session_map.get("dashboard:slot0") is None
+
+        active.session_id = "conversation-created-during-stream"
+        await mgr.persist_provider_session("dashboard:slot0", active)
+
+        assert mgr._session_map.get("dashboard:slot0") == "conversation-created-during-stream"
+        assert mgr._session_map.get_provider("dashboard:slot0") == "external-test"
+        mgr.release("dashboard:slot0")
+        await mgr.close_all()
 
 
 class TestRemove:
