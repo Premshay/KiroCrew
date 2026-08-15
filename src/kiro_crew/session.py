@@ -1920,6 +1920,9 @@ class SessionManager:
                 if model == "auto" and agent and agent != "kirocrew":
                     model = self._resolve_agent_model(agent)
                 model = model or "auto"
+            else:
+                model = sess.provider.served_model or "auto"
+                agent = sess.provider.agent_name
             # Human-readable name
             if key == BACKGROUND_KEY:
                 name = "Background (titles, cron, heartbeat)"

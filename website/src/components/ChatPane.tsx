@@ -63,10 +63,7 @@ export default function ChatPane({
   const allMessages = useAppSelector((s) => selectSlotMessages(s, slotKey))
   const streamState = useAppSelector((s) => selectSlotStreamState(s, slotKey))
   const running = streamState !== 'idle'
-  // Per-slot context-window usage for the input-bar ring (mirrors ChatPage; the
-  // store keys these by slot). Default 0 so the ring always renders, exactly
-  // like single chat.
-  const contextPct = useAppSelector((s) => s.chat.slotContextPct[slotKey] ?? 0)
+  const contextPct = useAppSelector((s) => s.chat.slotContextPct[slotKey])
   const contextTokens = useAppSelector((s) => s.chat.slotContextTokens?.[slotKey])
   const paneSlot = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey))
   // Shared composer-busy rule (chatSlice.selectComposerBusy): main turn
@@ -114,13 +111,26 @@ export default function ChatPane({
       .catch(() => setDefaultAgentFailed(true))
   }, [dispatch])
   const agentDD = useFilteredDropdown(installedAgents)
+  const modelPickerAgent = paneSlot?.agent || defaultAgent || ''
+  const modelPickerPolicy = installedAgents.find((a) => a.name === modelPickerAgent)?.runtime_policy
   const { data: availableModels = [{ name: 'auto', description: 'Default' }] } = useQuery({
-    queryKey: ['available-models', provider.id],
+    queryKey: ['model-picker-options', modelPickerAgent, modelPickerPolicy?.model, provider.id],
     queryFn: async () => {
+      if (!modelPickerAgent || modelPickerPolicy?.model === 'managed' || modelPickerPolicy?.model === 'unsupported') {
+        return [{ name: 'auto', description: 'Default' }]
+      }
+      if (modelPickerPolicy?.model === 'selectable') {
+        const result = await api.crewModels(modelPickerAgent)
+        return [
+          { name: 'auto', description: 'Default' },
+          ...result.models.filter((m) => m.modelId !== 'auto').map((m) => ({ name: m.modelId, description: m.description })),
+        ]
+      }
       const models = await provider.fetchAvailableModels()
       return [{ name: 'auto', description: 'Default' }, ...models.filter((m) => m.name !== 'auto')]
     },
-    refetchInterval: modelListRefetchInterval,
+    refetchInterval: modelPickerAgent ? modelListRefetchInterval : false,
+    retry: false,
   })
   const modelDD = useFilteredDropdown(availableModels)
 
@@ -333,7 +343,7 @@ export default function ChatPane({
           modelName={paneSlot?.model || 'auto'}
           contextPct={contextPct}
           contextUsedTokens={contextTokens?.used}
-          contextWindowTokens={contextTokens?.window || provider.getContextWindow(paneSlot?.model || 'auto')}
+          contextWindowTokens={contextTokens?.window}
           onAgentClick={provider.capabilities.agentTemplates ? (rect) => { setAgentBtnRect(rect); agentDD.setOpen(!agentDD.open) } : undefined}
           onModelClick={(rect) => { setModelBtnRect(rect); modelDD.setOpen(!modelDD.open) }}
           approvalMode={displayMode}

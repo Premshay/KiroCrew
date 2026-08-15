@@ -1208,7 +1208,7 @@ async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
         provider, _is_new, _resumed = await asyncio.wait_for(
             state.sessions.get_or_create(key, agent=name), timeout=30
         )
-        available = getattr(provider, "available_models", lambda: [])()
+        available = await provider.discover_models()
         efforts = getattr(provider, "get_valid_effort_levels", lambda: [])()
         models = [
             {

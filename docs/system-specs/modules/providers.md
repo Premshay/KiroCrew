@@ -50,6 +50,11 @@ class LLMProvider(ABC):
     async def cancel(*, wait_ack_timeout: float = 0.0) -> CancelOutcome
     def is_alive() -> bool
     def touch_activity() -> None
+    @property def served_model() -> str
+    @property def agent_name() -> str
+    def available_models() -> list[dict[str, str]]
+    async def discover_models() -> list[dict[str, str]]
+    def get_valid_effort_levels() -> list[str]
     @property def session_provider_label() -> str
     def set_resume_session_id(session_id: str) -> None
     @property def session_resumed() -> bool
@@ -60,6 +65,13 @@ default is empty. `set_resume_session_id()` is a safe no-op by default, while a 
 provider validates and retains its own opaque ID. `session_resumed` becomes true only when that
 provider accepted the exact prior ID. The session manager reads all three through the ABC, so
 an optional provider does not add a conditional to KiroCrew's ACP construction path.
+
+`discover_models()` is the account-scoped discovery seam for a selectable runtime. The
+dashboard calls it only through its short-lived model-discovery session and renders the
+returned `modelId` values; a provider may cache the latest catalog behind
+`available_models()`. `served_model` and `agent_name` keep session and context views
+provider-neutral. Empty defaults mean the core neither invents a model nor displays a
+context window for a provider that did not report one.
 
 ### LLMEvent (`providers/base.py`)
 
