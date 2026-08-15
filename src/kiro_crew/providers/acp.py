@@ -1448,6 +1448,20 @@ class AcpProvider(LLMProvider):
         """Return the kiro-cli session UUID."""
         return self._client._session_id if self._client and self._client._session_id else ""
 
+    @property
+    def session_provider_label(self) -> str:
+        """Return the closed session-map label for this ACP backend."""
+        return provider_label(self)
+
+    def set_resume_session_id(self, session_id: str) -> None:
+        """Pass an exact persisted ID to the ACP startup path."""
+        self._client.set_resume_session_id(session_id)
+
+    @property
+    def session_resumed(self) -> bool:
+        """Expose whether ACP startup restored the requested native session."""
+        return bool(self._client.resumed)
+
     async def cleanup_session(self, session_id: str) -> None:
         """Delete kiro-cli session files (.json + .jsonl) at ~/.kiro/sessions/cli.
 

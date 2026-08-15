@@ -308,9 +308,10 @@ After a hard kill, `_eager_respawn(key)` calls `get_or_create(key)` in a backgro
 
 ## Session Resume (SessionMap)
 
-Persistent mapping of `session_key → kiro_session_id` stored at
-`~/.kiro/crew/session_map.json`. Enables `session/load` to restore full
-kiro-cli conversation history when a session is recycled.
+Persistent mapping of `session_key → provider_session_id` plus provider label stored at
+`~/.kiro/crew/session_map.json`. It enables a provider that owns exact resume semantics to
+restore its conversation when a session is recycled; the default ACP provider uses
+`session/load`.
 
 **Only long-lived conversational sessions are mapped.** Stateless sessions
 (cron, subagent, taskrunner, channel, secretary, side, heartbeat/background,
@@ -324,9 +325,10 @@ triggers `is_first_turn=True` in `build_side_message` which re-seeds the
 parent snapshot + accumulated side history.
 
 **Lifecycle:**
-- `get_or_create()`: looks up mapping → if found and `.json` file exists,
-  sets `resume_session_id` on the ACP client and skips warm pool. After
-  `ensure_ready()`, saves the new `session_key → session_id` mapping.
+- `get_or_create()`: looks up mapping → if found, passes its opaque ID to the matching provider
+  through `set_resume_session_id()` and skips warm pool. A resumed provider reports acceptance
+  through `session_resumed`; it never relies on an ID-shaped heuristic. Once a provider exposes
+  a stable ID, the manager persists `session_key → provider_session_id` with its label.
 - `reset()`: does NOT delete mapping — the kiro-cli session file persists
   on disk. Next `get_or_create` will try `session/load`.
 - `remove()`: deletes mapping — explicit tab delete, no resume expected.
