@@ -1138,7 +1138,10 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
         policy: dict[str, Any] | None = None
         if callable(policy_for):
             try:
-                candidate = policy_for(name)
+                # Providers key their policy on the engine identity, which for
+                # a workspace alias is its kiro_agent — the same resolution the
+                # session path applies before the provider factory runs.
+                candidate = policy_for(agent_cfg.kiro_agent or name)
                 if isinstance(candidate, dict):
                     policy = candidate
             except Exception:
@@ -1194,7 +1197,12 @@ async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
         if platform_context
         else None
     )
-    policy = policy_for(name) if callable(policy_for) else None
+    # Policy is keyed on the engine identity: a workspace alias resolves to its
+    # kiro_agent, matching the session path's resolution before the provider
+    # factory runs. Passing the alias verbatim returns no policy and the picker
+    # silently collapses to "auto".
+    engine_identity = cfg.agents[name].kiro_agent or name
+    policy = policy_for(engine_identity) if callable(policy_for) else None
     if not isinstance(policy, dict) or policy.get("model") != "selectable":
         return web.json_response({"models": [], "effort_levels": []})
     state: DashboardState | None = request.app.get("state")
