@@ -92,3 +92,43 @@ async def test_managed_runtime_does_not_start_a_discovery_session():
             assert await response.json() == {"models": [], "effort_levels": []}
 
     sessions.get_or_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workspace_alias_resolves_policy_by_kiro_agent():
+    """A workspace alias (name != kiro_agent) must look up policy on the
+    engine identity — the alias itself has no engine-map entry."""
+    provider = SimpleNamespace(
+        discover_models=AsyncMock(return_value=[{"modelId": "opus", "name": "Opus"}]),
+        get_valid_effort_levels=lambda: [],
+    )
+    sessions = _Sessions(provider)
+    config = SimpleNamespace(
+        agents={"codex-atlas": KiroCrewAgentConfig(kiro_agent="codex")},
+        default_agent="codex",
+    )
+    policy_calls = []
+
+    def policy_for(identity):
+        policy_calls.append(identity)
+        return {"model": "selectable", "effort": "selectable"}
+
+    app = web.Application()
+    app["state"] = SimpleNamespace(sessions=sessions)
+    app["platform_context"] = SimpleNamespace(
+        providers=SimpleNamespace(agent_runtime_policy=policy_for)
+    )
+    from kiro_crew.dashboard.handlers.agents import api_kirocrew_agent_models
+
+    app.router.add_get("/api/agents/{name}/models", api_kirocrew_agent_models)
+
+    with patch("kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load", return_value=config):
+        async with TestClient(TestServer(app)) as client:
+            response = await client.get("/api/agents/codex-atlas/models")
+            assert response.status == 200
+            body = await response.json()
+            assert body["models"] == [{"modelId": "opus", "name": "Opus", "description": ""}]
+
+    assert policy_calls == ["codex"]
+    # Discovery still binds the alias so its workspace and pins apply.
+    assert sessions.agent == "codex-atlas"

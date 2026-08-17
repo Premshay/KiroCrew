@@ -1535,7 +1535,7 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     agents = []
     for name, agent_cfg in cfg.agents.items():
         item = {"name": name, "scope": "global", **dataclasses.asdict(agent_cfg)}
-        policy = _agent_runtime_policy(request, name)
+        policy = _agent_runtime_policy(request, name, agent_cfg.kiro_agent or name)
         if policy is not None:
             item["runtime_policy"] = policy
         agents.append(item)
@@ -1590,7 +1590,9 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     )
 
 
-def _agent_runtime_policy(request: web.Request, name: str) -> dict[str, Any] | None:
+def _agent_runtime_policy(
+    request: web.Request, name: str, engine_identity: str | None = None
+) -> dict[str, Any] | None:
     """Return companion-owned UI policy without making it an enforcement boundary."""
     platform_context = request.app.get("platform_context")
     getter = (
@@ -1601,7 +1603,7 @@ def _agent_runtime_policy(request: web.Request, name: str) -> dict[str, Any] | N
     if not callable(getter):
         return None
     try:
-        policy = getter(name)
+        policy = getter(engine_identity or name)
     except Exception:
         logger.warning("Failed to read runtime policy for crew %s", name, exc_info=True)
         return None
@@ -1614,7 +1616,7 @@ async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
     if name not in cfg.agents:
         return web.json_response({"error": "agent not found", "code": "agent_not_found"}, status=404)
-    policy = _agent_runtime_policy(request, name)
+    policy = _agent_runtime_policy(request, name, cfg.agents[name].kiro_agent or name)
     if policy is None or policy.get("model") != "selectable":
         return web.json_response({"models": [], "effort_levels": []})
     state: DashboardState | None = request.app.get("state")
