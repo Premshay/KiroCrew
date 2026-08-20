@@ -100,6 +100,7 @@ from kiro_crew.dashboard.handlers.artifacts import (
 from kiro_crew.dashboard.handlers.auth_refresh import (
     api_auth_logout,
     api_auth_me,
+    api_auth_phone_link,
     api_auth_refresh,
 )
 from kiro_crew.dashboard.handlers.discover import (
@@ -2410,9 +2411,10 @@ async def start_dashboard(
 
     # OAuth-style refresh tokens for dashboard auth. POST /api/auth/refresh and
     # POST /api/auth/logout self-authenticate via the refresh cookie (the
-    # token_auth middleware exempts them); GET /api/auth/me is gated by the
-    # standard access-cookie auth.
+    # token_auth middleware exempts them); GET /api/auth/me and POST
+    # /api/auth/phone-link are gated by the standard access-cookie auth.
     app.router.add_get("/api/auth/me", api_auth_me)
+    app.router.add_post("/api/auth/phone-link", api_auth_phone_link)
     app.router.add_post("/api/auth/refresh", api_auth_refresh)
     app.router.add_post("/api/auth/logout", api_auth_logout)
 
