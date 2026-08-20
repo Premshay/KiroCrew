@@ -57,4 +57,21 @@ describe('PhoneLoginCard', () => {
       'Copy failed. Select the link and copy it manually.',
     )
   })
+
+  it('copies through the fallback when Clipboard API access is denied', async () => {
+    ;(api.phoneLoginLink as ReturnType<typeof vi.fn>).mockResolvedValue({
+      url: 'https://nexus.tailbfda76.ts.net/?token=abc.def',
+    })
+    vi.spyOn(navigator.clipboard, 'writeText').mockRejectedValue(new Error('denied'))
+    const execCommand = vi.fn().mockReturnValue(true)
+    Object.defineProperty(document, 'execCommand', { value: execCommand, configurable: true })
+
+    renderWithProviders(<PhoneLoginCard />)
+    fireEvent.click(screen.getByRole('button', { name: 'Create phone sign-in link' }))
+    await screen.findByLabelText('Phone sign-in link')
+    fireEvent.click(screen.getByRole('button', { name: 'Copy sign-in link' }))
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Link copied')
+    expect(execCommand).toHaveBeenCalledWith('copy')
+  })
 })
