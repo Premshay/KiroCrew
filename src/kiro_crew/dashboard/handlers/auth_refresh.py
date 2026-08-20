@@ -1,11 +1,11 @@
-"""Auth refresh endpoints: ``GET /api/auth/me`` and ``POST /api/auth/refresh``.
+"""Dashboard session endpoints, including refresh and phone-link recovery.
 
 Spec: ``docs/system-specs/features/dashboard-token-auth.md``.
 
-Both endpoints handle their own auth (the standard ``token_auth_middleware``
-exempts ``/api/auth/refresh`` so an expired access cookie does not block
-the refresh path). ``/api/auth/me`` requires a valid access cookie and is
-gated by the standard middleware.
+``POST /api/auth/refresh`` handles its own refresh-cookie authentication so an
+expired access cookie does not block recovery. ``GET /api/auth/me`` and
+``POST /api/auth/phone-link`` require the standard authenticated dashboard
+session; the latter never accepts an app-scoped token.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from kiro_crew.dashboard.refresh_tokens import (
 )
 from kiro_crew.dashboard.tailnet import TailnetTrust, peer_pin_key, resolve_forwarded_peer
 from kiro_crew.dashboard.token_auth import (
+    LINK_WINDOW_SECS,
     MAX_SESSION_TTL_SECS,
     _cookie_port_from_host,
     bind_token_peer,
@@ -364,6 +365,27 @@ async def api_auth_me(request: web.Request) -> web.Response:
             "session_exp": session_exp,
             "refresh_exp": refresh_exp,
         }
+    )
+
+
+async def api_auth_phone_link(request: web.Request) -> web.Response:
+    """Mint a short-lived dashboard link for a phone or another browser."""
+    if not check_origin(request, require=False):
+        _audit("", "phone_login_link", "bad_origin", request.headers.get("Origin", ""))
+        return web.json_response({"error": "bad_origin"}, status=403)
+
+    user_id = request.get("user", "")
+    if not user_id:
+        return web.json_response({"error": "unauthenticated"}, status=401)
+    if request.get("app", ""):
+        _audit(user_id, "phone_login_link", "app_token_denied")
+        return web.json_response({"error": "app_token_forbidden"}, status=403)
+
+    token = generate_token(user_id, ttl_seconds=MAX_SESSION_TTL_SECS)
+    _audit(user_id, "phone_login_link", "issued")
+    return web.json_response(
+        {"token": token, "expires_in": LINK_WINDOW_SECS},
+        headers={"Cache-Control": "no-store"},
     )
 
 
