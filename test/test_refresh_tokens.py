@@ -10,7 +10,6 @@ files that don't yet exist for this surface).
 
 from __future__ import annotations
 
-import asyncio
 import concurrent.futures
 import json
 import time
@@ -830,94 +829,6 @@ def test_tr_u_19_atomic_write_no_partial_state(tmp_path: Path):
 
 
 # -- Logout endpoint (TR-U-23..24) -------------------------------------------
-
-
-def test_phone_link_requires_dashboard_session_and_rejects_app_tokens():
-    """Only an interactive dashboard session may mint a phone-login link."""
-    from unittest.mock import MagicMock
-
-    from aiohttp import web
-
-    from kiro_crew.dashboard.handlers import auth_refresh as ar
-
-    request = MagicMock(spec=web.Request)
-    request.get.side_effect = {"user": "alice", "app": "calendar"}.get
-    request.headers = {"Origin": "https://dashboard.example"}
-
-    with patch("kiro_crew.dashboard.handlers.auth_refresh.check_origin", return_value=True):
-        response = asyncio.run(ar.api_auth_phone_link(request))
-
-    assert response.status == 403
-    assert json.loads(response.text) == {"error": "app_token_forbidden"}
-
-
-def test_phone_link_rejects_a_request_without_dashboard_identity():
-    """Missing middleware identity cannot mint a recovery credential."""
-    from unittest.mock import MagicMock
-
-    from aiohttp import web
-
-    from kiro_crew.dashboard.handlers import auth_refresh as ar
-
-    request = MagicMock(spec=web.Request)
-    request.get.side_effect = {"user": "", "app": ""}.get
-    request.headers = {"Origin": "https://dashboard.example"}
-
-    with patch("kiro_crew.dashboard.handlers.auth_refresh.check_origin", return_value=True):
-        response = asyncio.run(ar.api_auth_phone_link(request))
-
-    assert response.status == 401
-    assert json.loads(response.text) == {"error": "unauthenticated"}
-
-
-def test_phone_link_mints_configured_external_url_without_caching():
-    """The recovery endpoint returns a five-minute external dashboard link."""
-    from unittest.mock import MagicMock
-
-    from aiohttp import web
-
-    from kiro_crew.dashboard.handlers import auth_refresh as ar
-
-    request = MagicMock(spec=web.Request)
-    request.get.side_effect = {"user": "alice", "app": ""}.get
-    request.headers = {"Origin": "https://dashboard.example"}
-    request.app = {"dashboard_url": "https://nexus.tailbfda76.ts.net"}
-
-    with patch("kiro_crew.dashboard.handlers.auth_refresh.check_origin", return_value=True), patch(
-        "kiro_crew.dashboard.handlers.auth_refresh.generate_token", return_value="phone-link-token"
-    ) as generate:
-        response = asyncio.run(ar.api_auth_phone_link(request))
-
-    assert response.status == 200
-    assert response.headers["Cache-Control"] == "no-store"
-    assert json.loads(response.text) == {
-        "url": "https://nexus.tailbfda76.ts.net?token=phone-link-token",
-        "expires_in": ar.LINK_WINDOW_SECS,
-    }
-    generate.assert_called_once_with("alice", ttl_seconds=ar.MAX_SESSION_TTL_SECS)
-
-
-def test_phone_link_refuses_to_emit_a_localhost_fallback():
-    """A missing external dashboard URL must not create an unusable phone link."""
-    from unittest.mock import MagicMock
-
-    from aiohttp import web
-
-    from kiro_crew.dashboard.handlers import auth_refresh as ar
-
-    request = MagicMock(spec=web.Request)
-    request.get.side_effect = {"user": "alice", "app": ""}.get
-    request.headers = {"Origin": "https://dashboard.example"}
-    request.app = {"dashboard_url": ""}
-
-    with patch("kiro_crew.dashboard.handlers.auth_refresh.check_origin", return_value=True), patch(
-        "kiro_crew.dashboard.handlers.auth_refresh.generate_token"
-    ) as generate:
-        response = asyncio.run(ar.api_auth_phone_link(request))
-
-    assert response.status == 409
-    assert json.loads(response.text) == {"error": "external_origin_unavailable"}
-    generate.assert_not_called()
 
 
 def test_tr_u_23_logout_revokes_chain_and_clears_cookies(

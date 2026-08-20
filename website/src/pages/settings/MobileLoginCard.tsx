@@ -7,13 +7,13 @@ import { copyToClipboard } from '../../utils/clipboard'
 
 import { i18nT } from '../../i18n/t'
 
-export function PhoneLoginCard() {
+export function MobileLoginCard() {
   const [link, setLink] = useState('')
   const [copied, setCopied] = useState(false)
   const [copyFailed, setCopyFailed] = useState(false)
 
   const createLink = useMutation({
-    mutationFn: api.phoneLoginLink,
+    mutationFn: api.mobileLoginLink,
     onMutate: () => {
       setCopied(false)
       setCopyFailed(false)
@@ -39,23 +39,23 @@ export function PhoneLoginCard() {
     <Card>
       <CardTitle>
         <Smartphone className="lucide-inline" aria-hidden="true" />
-        {i18nT('pages.settings.phoneLoginCard.sign_in_on_phone')}
+        {i18nT('pages.settings.mobileLoginCard.sign_in_on_mobile')}
       </CardTitle>
       <p className="mt-2 text-sm leading-relaxed text-muted">
-        {i18nT('pages.settings.phoneLoginCard.create_a_one_time_link_for_a_phone_or_another_br')}
+        {i18nT('pages.settings.mobileLoginCard.create_a_one_time_link_for_mobile_or_another_browser')}
       </p>
       {!link ? (
         <Btn className="mt-4" type="button" disabled={createLink.isPending} onClick={() => createLink.mutate()}>
           <Smartphone className="lucide-inline" aria-hidden="true" />
           {createLink.isPending
-            ? i18nT('pages.settings.phoneLoginCard.creating_link')
-            : i18nT('pages.settings.phoneLoginCard.create_phone_sign_in_link')}
+            ? i18nT('pages.settings.mobileLoginCard.creating_link')
+            : i18nT('pages.settings.mobileLoginCard.create_mobile_sign_in_link')}
         </Btn>
       ) : (
         <div className="mt-4">
-          <label className="sr-only" htmlFor="phone-login-link">{i18nT('pages.settings.phoneLoginCard.phone_sign_in_link')}</label>
+          <label className="sr-only" htmlFor="mobile-login-link">{i18nT('pages.settings.mobileLoginCard.mobile_sign_in_link')}</label>
           <Input
-            id="phone-login-link"
+            id="mobile-login-link"
             className="w-full font-mono"
             readOnly
             value={link}
@@ -64,23 +64,23 @@ export function PhoneLoginCard() {
           <div className="mt-3 flex flex-wrap items-center gap-3">
             <Btn type="button" onClick={() => void copyLink()}>
               <Copy className="lucide-inline" aria-hidden="true" />
-              {i18nT('pages.settings.phoneLoginCard.copy_sign_in_link')}
+              {i18nT('pages.settings.mobileLoginCard.copy_sign_in_link')}
             </Btn>
-            {copied && <span className="text-sm text-ok" role="status">{i18nT('pages.settings.phoneLoginCard.link_copied')}</span>}
+            {copied && <span className="text-sm text-ok" role="status">{i18nT('pages.settings.mobileLoginCard.link_copied')}</span>}
           </div>
           <p className="mt-3 text-sm leading-relaxed text-muted">
-            {i18nT('pages.settings.phoneLoginCard.send_the_copied_link_to_your_phone_then_open_it')}
+            {i18nT('pages.settings.mobileLoginCard.send_the_copied_link_to_your_mobile_device_then_open_it')}
           </p>
         </div>
       )}
       {createLink.isError && (
         <p className="mt-3 text-sm text-danger" role="alert">
-          {i18nT('pages.settings.phoneLoginCard.could_not_create_a_sign_in_link_try_again')}
+          {i18nT('pages.settings.mobileLoginCard.could_not_create_a_sign_in_link_try_again')}
         </p>
       )}
       {copyFailed && (
         <p className="mt-3 text-sm text-danger" role="alert">
-          {i18nT('pages.settings.phoneLoginCard.copy_failed_select_the_link_and_copy_it_manually')}
+          {i18nT('pages.settings.mobileLoginCard.copy_failed_select_the_link_and_copy_it_manually')}
         </p>
       )}
     </Card>

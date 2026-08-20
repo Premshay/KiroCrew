@@ -971,7 +971,7 @@ export const api = {
   // means "temporarily unresolvable", never "zero".
   securityStats: () => get('/api/security/stats').then(j) as Promise<{ denied_commands: number | null; suspicious_patterns: number | null; tool_schemas: number | null; redaction_paths: number | null }>,
   securityPosture: () => get('/api/security/posture').then(j) as Promise<SecurityPostureData>,
-  phoneLoginLink: () => post('/api/auth/phone-link').then(j) as Promise<{
+  mobileLoginLink: () => post('/api/auth/mobile-link').then(j) as Promise<{
     url: string
     expires_in: number
   }>,

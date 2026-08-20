@@ -1,11 +1,11 @@
-"""Dashboard session endpoints, including refresh and phone-link recovery.
+"""Auth refresh endpoints: ``GET /api/auth/me`` and ``POST /api/auth/refresh``.
 
 Spec: ``docs/system-specs/features/dashboard-token-auth.md``.
 
-``POST /api/auth/refresh`` handles its own refresh-cookie authentication so an
-expired access cookie does not block recovery. ``GET /api/auth/me`` and
-``POST /api/auth/phone-link`` require the standard authenticated dashboard
-session; the latter never accepts an app-scoped token.
+Both endpoints handle their own auth (the standard ``token_auth_middleware``
+exempts ``/api/auth/refresh`` so an expired access cookie does not block
+the refresh path). ``/api/auth/me`` requires a valid access cookie and is
+gated by the standard middleware.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.dashboard.origin import check_origin, is_https_request
-from kiro_crew.dashboard.urls import build_dashboard_url, dashboard_origin
 from kiro_crew.dashboard.refresh_tokens import (
     MAX_REFRESH_TTL_SECS,
     REFRESH_COOKIE_PATH,
@@ -33,7 +32,6 @@ from kiro_crew.dashboard.refresh_tokens import (
     validate_refresh_token,
 )
 from kiro_crew.dashboard.token_auth import (
-    LINK_WINDOW_SECS,
     MAX_SESSION_TTL_SECS,
     _cookie_port_from_host,
     extract_numeric_claim,
@@ -364,35 +362,6 @@ async def api_auth_me(request: web.Request) -> web.Response:
             "session_exp": session_exp,
             "refresh_exp": refresh_exp,
         }
-    )
-
-
-async def api_auth_phone_link(request: web.Request) -> web.Response:
-    """Mint a short-lived link to the configured external dashboard origin."""
-    if not check_origin(request, require=False):
-        _audit("", "phone_login_link", "bad_origin", request.headers.get("Origin", ""))
-        return web.json_response({"error": "bad_origin"}, status=403)
-
-    user_id = request.get("user", "")
-    if not user_id:
-        return web.json_response({"error": "unauthenticated"}, status=401)
-    if request.get("app", ""):
-        _audit(user_id, "phone_login_link", "app_token_denied")
-        return web.json_response({"error": "app_token_forbidden"}, status=403)
-
-    external_origin = dashboard_origin(request.app.get("dashboard_url", ""))
-    if not external_origin:
-        _audit(user_id, "phone_login_link", "external_origin_unavailable")
-        return web.json_response({"error": "external_origin_unavailable"}, status=409)
-
-    token = generate_token(user_id, ttl_seconds=MAX_SESSION_TTL_SECS)
-    _audit(user_id, "phone_login_link", "issued")
-    return web.json_response(
-        {
-            "url": build_dashboard_url(external_origin, token, local_only=False),
-            "expires_in": LINK_WINDOW_SECS,
-        },
-        headers={"Cache-Control": "no-store"},
     )
 
 
