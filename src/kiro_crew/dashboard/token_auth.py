@@ -706,7 +706,7 @@ _403_HTML = (
     "<div class='logo'>👻</div>"
     "<h1>Sign in required</h1>"
     "<p>This browser does not have a dashboard session.</p>"
-    "<p>On a device already signed in, open <strong>Settings → Security → Sign in on phone</strong>, "
+    "<p>On a device already signed in, open <strong>Settings → Security → Sign in on mobile</strong>, "
     "then send the sign-in link to this device. Or paste a sign-in link below.</p>"
     "<input id='u' type='text' placeholder='Paste sign-in link or token…' autofocus>"
     "<button onclick='go()'>Connect</button>"

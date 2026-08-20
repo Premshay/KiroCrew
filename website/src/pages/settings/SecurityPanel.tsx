@@ -11,7 +11,7 @@ import Modal from '../../components/Modal'
 import InfoTip from '../../components/InfoTip'
 import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
 import { PostureDisclosureRow, CODE_BASE as POSTURE_CODE_BASE } from './PostureDisclosure'
-import { PhoneLoginCard } from './PhoneLoginCard'
+import { MobileLoginCard } from './MobileLoginCard'
 
 import { i18nT } from '../../i18n/t'
 import { fmtDateFields, fmtList, fmtTime, fmtTimeNumeric, toDate } from '../../i18n/format'
@@ -1254,7 +1254,7 @@ function PostureSection() {
 
   return (
     <SettingsSection title={i18nT('pages.settings.securityPanel.live_security_posture')}>
-      <PhoneLoginCard />
+      <MobileLoginCard />
       {/* data-setting-label: deep-link anchor for the manual registry entry
         * (settingsManual.ts `security.live-security-posture`) — the section is
         * raw markup the extractor cannot see, so without this the highlight
