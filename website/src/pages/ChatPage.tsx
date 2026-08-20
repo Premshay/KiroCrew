@@ -5394,8 +5394,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     requestAnimationFrame(() => trySeed())
   }, [dispatch])
 
-  const handleEditResend = useCallback((index: number, ts: string, newContent: string) => {
-    if (!activeSlot || slotRunning) return
+  const handleEditResend = useCallback((index: number, ts: string, newContent: string): boolean => {
+    // Reported, not swallowed: the editor keeps the draft when this refuses.
+    if (!activeSlot || slotRunning) return false
     const snapshot = [...messages]
     dispatch(truncateAfterIndex(index))
     dispatch(appendMessage({ role: 'user', content: newContent, cls: '', ts: new Date().toISOString() }))
@@ -5408,6 +5409,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       dispatch(replaceMessages(snapshot))
       setRegenerating(false)
     })
+    return true
   }, [activeSlot, slotRunning, messages, dispatch])
 
   const searchCtxValue = useMemo(() => ({

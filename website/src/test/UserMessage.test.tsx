@@ -64,6 +64,34 @@ describe('UserMessage', () => {
     expect(screen.getByText('Cancel')).toBeInTheDocument()
   })
 
+  it('keeps the draft open when the resend is refused', () => {
+    // The slot going busy between opening the editor and pressing Send made
+    // handleEditResend a silent no-op, while Send closed the editor anyway:
+    // nothing sent, edit gone. A refusal must not read as a cancel.
+    render(<UserMessage content="original" renderContent={renderContent} canEdit onEditResend={() => false} />)
+    fireEvent.click(screen.getByTitle('Edit & Resend'))
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'my careful rewrite' } })
+    fireEvent.click(screen.getByText('Send'))
+    // Still editing, and the text the user typed is still there.
+    expect(screen.getByRole('textbox')).toHaveValue('my careful rewrite')
+  })
+
+  it('closes the editor when the resend is accepted', () => {
+    render(<UserMessage content="original" renderContent={renderContent} canEdit onEditResend={() => true} />)
+    fireEvent.click(screen.getByTitle('Edit & Resend'))
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'sent text' } })
+    fireEvent.click(screen.getByText('Send'))
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+  })
+
+  it('closes the editor for a handler that returns nothing', () => {
+    // Back-compat: a void handler is treated as accepted, not refused.
+    render(<UserMessage content="original" renderContent={renderContent} canEdit onEditResend={() => {}} />)
+    fireEvent.click(screen.getByTitle('Edit & Resend'))
+    fireEvent.click(screen.getByText('Send'))
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+  })
+
   it('cancels edit on Cancel click', () => {
     render(<UserMessage content="original" renderContent={renderContent} canEdit onEditResend={() => {}} />)
     fireEvent.click(screen.getByTitle('Edit & Resend'))
