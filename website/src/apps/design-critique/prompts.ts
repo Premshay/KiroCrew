@@ -1,5 +1,5 @@
 import { KIND_LABEL } from './constants'
-import type { Report, Screen, DiscoveryScreen } from './types'
+import type { Report, ReviewBrief, Screen, DiscoveryScreen } from './types'
 
 /**
  * The critic persona and method, carried by the prompt rather than by an agent.
@@ -76,7 +76,28 @@ export const SCHEMA = (multi: boolean): string =>
   'Only include findings for what you actually saw. List anything you could not see under ' +
   '"couldNotSee" instead of guessing.'
 
-export const IMAGES_PROMPT = (paths: string[], brief?: string): string => {
+export const reviewBriefContext = (brief?: ReviewBrief): string => {
+  if (!brief) return ''
+  const values = [brief.projectName, brief.repository, brief.contextPaths, brief.notes, brief.targets]
+  if (!values.some(value => value.trim())) return ''
+  const intent = {
+    ground: 'Ground the critique in the current repository and its established product context. Do not invent a replacement direction.',
+    reference: 'Use the repository context as a reference to evaluate consistency, then make bounded improvement suggestions.',
+    invent: 'The repository context is background only. Explore a new direction where the evidence supports it.',
+  }[brief.intent]
+  return [
+    'Review brief — this narrows the run; it does not redefine the whole project:',
+    brief.projectName ? 'Project: ' + brief.projectName : '',
+    brief.repository ? 'Repository: ' + brief.repository : '',
+    brief.contextPaths ? 'Read these supporting files first when they exist (one per line):\n' + brief.contextPaths : '',
+    brief.notes ? 'Constraints and context: ' + brief.notes : '',
+    brief.targets ? 'Review target: ' + brief.targets : '',
+    intent,
+    'Do not infer requirements for unselected areas from the project context. State when the supplied target or evidence cannot support a conclusion.',
+  ].filter(Boolean).join('\n')
+}
+
+export const IMAGES_PROMPT = (paths: string[], brief?: ReviewBrief): string => {
   const multi = paths.length > 1
   return (
     CRITIC +
@@ -87,7 +108,7 @@ export const IMAGES_PROMPT = (paths: string[], brief?: string): string => {
         'screen and the next, where is the friction), then check the jumps between steps. ' +
         'Do not narrate what each screen contains.'
       : 'Please run a design critique on this screenshot.') +
-    (brief ? ' Context: ' + brief + '.' : '') + '\n\n' +
+    (reviewBriefContext(brief) ? '\n\n' + reviewBriefContext(brief) : '') + '\n\n' +
     SCHEMA(multi) + '\n\n' +
     'The screens, in order:\n' +
     paths.map((p, i) => (multi ? 'Step ' + (i + 1) + ':\n' : '') + '![screen](' + p + ')').join('\n\n') + '\n\n' +
@@ -101,7 +122,7 @@ export const IMAGES_PROMPT = (paths: string[], brief?: string): string => {
 // before judging them, using the skill's bundled scripts.
 // STEP 1 — find the candidate screens. No critique yet. The same chat slot is
 // reused for step 2, so a cloned repo stays on disk between the two calls.
-export const DISCOVER_PROMPT = (kind: string, value: string): string => {
+export const DISCOVER_PROMPT = (kind: string, value: string, brief?: ReviewBrief): string => {
   const how: Record<string, string> = {
     repo: 'Clone it shallow into a temp dir with credential prompts DISABLED so it can never ' +
       'hang: `GIT_TERMINAL_PROMPT=0 git clone --depth 1 <url> <dir>`. If the clone fails, do NOT ' +
@@ -137,7 +158,7 @@ export const DISCOVER_PROMPT = (kind: string, value: string): string => {
     (needsScripts ? RESOLVE_PATHS : '') +
     'Do NOT critique anything yet. I need to know what screens are IN this ' +
     (KIND_LABEL[kind] || 'design') + ' so the user can choose what to audit.\n\n' +
-    'Target: ' + value + '\n\n' + (how[kind] || '') + '\n\n' +
+    'Target: ' + value + '\n\n' + (reviewBriefContext(brief) ? reviewBriefContext(brief) + '\n\n' : '') + (how[kind] || '') + '\n\n' +
     'Then return ONLY JSON (no prose, no code fences):\n' +
     '{"framework":string,"note":string,' +
     '"blocked":{"reason":"no-access|not-found|figma-app-missing|figma-file-closed|figma-no-permission|other","detail":string}|null,' +
@@ -163,12 +184,12 @@ export const DISCOVER_PROMPT = (kind: string, value: string): string => {
 }
 
 // STEP 2 — critique only the screens the user picked, in their order.
-export const SCOPED_PROMPT = (picks: DiscoveryScreen[], brief?: string): string =>
+export const SCOPED_PROMPT = (picks: DiscoveryScreen[], brief?: ReviewBrief): string =>
   CRITIC +
   RESOLVE_PATHS +
   'Now critique exactly these screens, in this order' + (picks.length > 1 ? ' as one flow' : '') + ':\n' +
   picks.map((p, i) => (i + 1) + '. ' + p.label + ' — ' + (p.ref || p.id)).join('\n') + '\n\n' +
-  (brief ? 'Context from the user: ' + brief + '\n\n' : '') +
+  (reviewBriefContext(brief) ? reviewBriefContext(brief) + '\n\n' : '') +
   'Render each one to a PNG. For a built app use `node <SCRIPTS>/capture-build.mjs <dir> ' +
   '--routes=<comma-separated> --out=<UPLOADS>`; for a single file or URL use ' +
   '`node <SCRIPTS>/render.mjs <file-or-url> <out.png>`; for Figma export the frame. Save into ' +

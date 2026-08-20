@@ -1,4 +1,4 @@
-import type { ReviewRun, SlotData } from './types'
+import type { DesignRound, DesignRoundInput, ProjectContext, ReviewRun, SlotData } from './types'
 import type { KiroCrewAgent } from '../../components/AgentSelector'
 
 export interface AgentList {
@@ -17,6 +17,13 @@ export interface ReviewRunInput {
   stage: string
   source: Record<string, unknown>
   screens: unknown[]
+}
+
+export interface ProjectContextInput {
+  name: string
+  repository: string
+  context_paths: string[]
+  notes: string
 }
 
 // These hit the dashboard's own chat endpoints (NOT an app-scoped reverse proxy),
@@ -57,6 +64,37 @@ export const designCritiqueApi = {
 
   updateReviewRun: (runId: string, input: Partial<ReviewRun>) =>
     jsonFetch<{ run: ReviewRun }>('/api/apps/design-critique/runs/' + encodeURIComponent(runId), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }),
+
+  listProjectContexts: () =>
+    jsonFetch<{ contexts: ProjectContext[] }>('/api/apps/design-critique/contexts'),
+
+  createProjectContext: (input: ProjectContextInput) =>
+    postJson<{ context: ProjectContext }>('/api/apps/design-critique/contexts', input),
+
+  updateProjectContext: (contextId: string, input: Partial<ProjectContextInput>) =>
+    jsonFetch<{ context: ProjectContext }>('/api/apps/design-critique/contexts/' + encodeURIComponent(contextId), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }),
+
+  deleteProjectContext: (contextId: string) =>
+    jsonFetch<void>('/api/apps/design-critique/contexts/' + encodeURIComponent(contextId), {
+      method: 'DELETE',
+    }),
+
+  listDesignRounds: () =>
+    jsonFetch<{ rounds: DesignRound[] }>('/api/apps/design-critique/design-rounds'),
+
+  createDesignRound: (input: DesignRoundInput) =>
+    postJson<{ round: DesignRound }>('/api/apps/design-critique/design-rounds', input),
+
+  updateDesignRound: (roundId: string, input: Partial<DesignRound>) =>
+    jsonFetch<{ round: DesignRound }>('/api/apps/design-critique/design-rounds/' + encodeURIComponent(roundId), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),

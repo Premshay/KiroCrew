@@ -777,6 +777,39 @@
         "what_i_saw": "What I saw",
         "where": "Where"
       },
+      "scopingPicker": {
+        "drag_to_reorder": "Drag to reorder",
+        "move_earlier": "Move earlier",
+        "move_later": "Move later",
+        "optional_brief_who_is_it_for_and_what_is_the_mai": "Optional brief: who is it for, and what is the main task?",
+        "optional_who_is_it_for_and_what_s_the_main_task": "Optional: who is it for, and what’s the main task?",
+        "screens": "Screens",
+        "start_over": "Start over",
+        "suggested_flows": "Suggested flows",
+        "what_should_i_audit": "What should I audit?"
+      },
+      "scopeBuilder": {
+        "constraints_known_decisions_or_design_system_context": "Constraints, known decisions, or design-system context",
+        "delete_project_context": "Delete project context",
+        "explore_new_direction": "Explore a new direction",
+        "ground_existing_work": "Ground existing work",
+        "no_saved_project_context": "No saved project context",
+        "project_context_and_review_scope": "Project context and review scope",
+        "project_context_request_failed": "Couldn’t update the project context. Try again.",
+        "project_name": "Project name",
+        "reference_existing_system": "Reference the existing system",
+        "repository_or_local_path": "Repository or local path",
+        "review_intent": "Review intent",
+        "review_target": "Review target",
+        "review_target_placeholder": "Review target: a screen, flow, component, process, or area of the product",
+        "save_project_context": "Save project context",
+        "saved_project_context": "Saved project context",
+        "supporting_files_one_path_per_line": "Supporting files, one path per line"
+      },
+      "waitingScreen": {
+        "cancel_this_run": "Cancel this run",
+        "stop_this_run_and_discard_it": "Stop this run and discard it"
+      },
       "manifest": {
         "description": "A design critique you can run before you ask a colleague. Give it one screenshot, a whole multi-screen flow, a Figma file, a git repo, or a URL that is already serving, and it finds the candidate screens, lets you choose what to look at, then reports back the way an experienced designer would: an overall read, what is working, and the things worth tightening, each tied to a named heuristic. Multi-screen flows also get cross-screen findings that a single screen cannot show — inconsistent controls, missing progress, no way back, dead ends. It renders code and Figma before judging them, so it never critiques visuals it has not actually seen, and it says plainly which screens it could not get to instead of guessing.",
         "display_name": "Design Critique",

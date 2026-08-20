@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   PencilRuler, Image as ImageIcon, Upload, Plus, ChevronDown,
   Check, ChevronRight, Maximize2, X, Sparkle,
@@ -13,7 +13,7 @@ import { designCritiqueApi, fileUrl } from './api'
 import {
   detectKind, extractJson, lastAssistant, shortLabel, relTime, readableOn, normalizeReport, normalizeScope,
   loadHistory, saveHistory, beginPendingCritique, dropPendingCritique, loadJobs, saveJob, clearJob, loadSlots, saveSlots, trackSlot, untrackSlot,
-  loadLive, loadSelectedAgent, markLive, saveSelectedAgent, unmarkLive,
+  loadLive, loadReviewBrief, loadSelectedAgent, markLive, saveReviewBrief, saveSelectedAgent, unmarkLive,
 } from './utils'
 import { IMAGES_PROMPT, DISCOVER_PROMPT, SCOPED_PROMPT, ASK_CONTEXT, ASK_PROMPT } from './prompts'
 import { useReduceMotion, useNarrow, useToasts } from './hooks'
@@ -22,17 +22,20 @@ import WaitingScreen from './WaitingScreen'
 import Composer from './Composer'
 import ScopingPicker from './ScopingPicker'
 import AskLayer from './AskLayer'
+import DesignRoundPanel from './DesignRoundPanel'
 import type {
   Ask,
   Blocked,
   BlockedInfo,
   DiscoveryScreen,
+  DesignRound,
   Finding,
   Flow,
   HistoryEntry,
   Job,
   Phase,
   Report,
+  ReviewBrief,
   ReviewRun,
   Scope,
   Screen,
@@ -91,9 +94,13 @@ export default function DesignCritiquePage() {
   const [selectedAgent, setSelectedAgent] = useState(loadSelectedAgent)
   const [slotAgent, setSlotAgent] = useState(DEFAULT_AGENT)
   const [slotRunId, setSlotRunId] = useState('')
+  const [reviewBrief, setReviewBrief] = useState<ReviewBrief>(loadReviewBrief)
+  const [contextBusy, setContextBusy] = useState(false)
+  const [designRoundBusy, setDesignRoundBusy] = useState(false)
 
   const reduceMotion = useReduceMotion()
   const { toasts, notify } = useToasts()
+  const queryClient = useQueryClient()
   const { data: agentList } = useQuery({
     queryKey: ['design-critique-agents'],
     queryFn: designCritiqueApi.listAgents,
@@ -102,12 +109,127 @@ export default function DesignCritiquePage() {
     queryKey: ['design-critique-runs'],
     queryFn: designCritiqueApi.listReviewRuns,
   })
+  const { data: projectContextData } = useQuery({
+    queryKey: ['design-critique-project-contexts'],
+    queryFn: designCritiqueApi.listProjectContexts,
+  })
+  const { data: designRoundData } = useQuery({
+    queryKey: ['design-critique-design-rounds'],
+    queryFn: designCritiqueApi.listDesignRounds,
+  })
   const agents = agentList?.agents || []
+  const projectContexts = projectContextData?.contexts || []
   const activeAgent = agents.length && !agents.some(agent => agent.name === selectedAgent)
     ? DEFAULT_AGENT
     : selectedAgent
 
   useEffect(() => { saveSelectedAgent(activeAgent) }, [activeAgent])
+  useEffect(() => { saveReviewBrief(reviewBrief) }, [reviewBrief])
+
+  const updateReviewBrief = (patch: Partial<ReviewBrief>) => {
+    setReviewBrief((current) => ({ ...current, ...patch }))
+  }
+
+  const selectProjectContext = (contextId: string) => {
+    const context = projectContexts.find((entry) => entry.id === contextId)
+    if (!context) {
+      updateReviewBrief({ contextId: '' })
+      return
+    }
+    setReviewBrief((current) => ({
+      ...current,
+      contextId: context.id,
+      projectName: context.name,
+      repository: context.repository,
+      contextPaths: context.context_paths.join('\n'),
+      notes: context.notes,
+    }))
+  }
+
+  const saveProjectContext = async () => {
+    if (contextBusy) return
+    const input = {
+      name: reviewBrief.projectName.trim(),
+      repository: reviewBrief.repository.trim(),
+      context_paths: reviewBrief.contextPaths.split('\n').map((path) => path.trim()).filter(Boolean),
+      notes: reviewBrief.notes.trim(),
+    }
+    setContextBusy(true)
+    try {
+      const response = reviewBrief.contextId
+        ? await designCritiqueApi.updateProjectContext(reviewBrief.contextId, input)
+        : await designCritiqueApi.createProjectContext(input)
+      await queryClient.invalidateQueries({ queryKey: ['design-critique-project-contexts'] })
+      updateReviewBrief({ contextId: response.context.id })
+      setErr('')
+    } catch (error) {
+      setErr(error instanceof Error ? error.message : i18nT('apps.designCritique.scopeBuilder.project_context_request_failed'))
+    } finally {
+      setContextBusy(false)
+    }
+  }
+
+  const deleteProjectContext = async () => {
+    if (!reviewBrief.contextId || contextBusy) return
+    setContextBusy(true)
+    try {
+      await designCritiqueApi.deleteProjectContext(reviewBrief.contextId)
+      await queryClient.invalidateQueries({ queryKey: ['design-critique-project-contexts'] })
+      updateReviewBrief({ contextId: '' })
+      setErr('')
+    } catch (error) {
+      setErr(error instanceof Error ? error.message : i18nT('apps.designCritique.scopeBuilder.project_context_request_failed'))
+    } finally {
+      setContextBusy(false)
+    }
+  }
+
+  const briefForRun = (scopeNote = ''): ReviewBrief => ({
+    ...reviewBrief,
+    notes: [reviewBrief.notes, scopeNote].filter(Boolean).join('\n'),
+  })
+
+  const prepareDesignRound = async (input: {
+    mode: 'generate-design' | 'generate-prototype'
+    target: string
+    claude_design_url: string
+    handoff_path: string
+  }) => {
+    if (!current?.report || designRoundBusy) return
+    setDesignRoundBusy(true)
+    try {
+      await designCritiqueApi.createDesignRound({
+        ...input,
+        intent: reviewBrief.intent,
+        project_name: reviewBrief.projectName,
+        repository: reviewBrief.repository,
+        context_paths: reviewBrief.contextPaths,
+        notes: reviewBrief.notes,
+        review_run_id: slotRunId,
+        report: current.report,
+      })
+      await queryClient.invalidateQueries({ queryKey: ['design-critique-design-rounds'] })
+      setErr('')
+    } catch (error) {
+      setErr(error instanceof Error ? error.message : 'Could not prepare the Claude Design round.')
+    } finally {
+      setDesignRoundBusy(false)
+    }
+  }
+
+  const updateDesignRound = async (roundId: string, update: Partial<DesignRound>) => {
+    if (designRoundBusy) return
+    setDesignRoundBusy(true)
+    try {
+      await designCritiqueApi.updateDesignRound(roundId, update)
+      await queryClient.invalidateQueries({ queryKey: ['design-critique-design-rounds'] })
+      setErr('')
+    } catch (error) {
+      setErr(error instanceof Error ? error.message : 'Could not update the Claude Design round.')
+    } finally {
+      setDesignRoundBusy(false)
+    }
+  }
 
   useEffect(() => {
     const restored = (reviewRunData?.runs || []).filter(run => run.status === 'completed' && run.report)
@@ -119,7 +241,7 @@ export default function DesignCritiquePage() {
         !!screen && typeof screen.url === 'string' && typeof screen.label === 'string' && typeof screen.step === 'number') : []
       const report = normalizeReport(run.report) || run.report!
       return [{
-        id: run.created_at, ts: run.created_at, slotKey: run.slot_key, screens,
+        id: run.created_at, ts: run.created_at, slotKey: run.slot_key, runId: run.id, screens,
         thumbUrl: screens[0]?.url || '', read: report.overallRead || '', report,
       }, ...entries]
     }, current)
@@ -333,13 +455,13 @@ export default function DesignCritiquePage() {
     const thumbUrl = screens[0] ? screens[0].url : ''
     const read = rep.overallRead || ''
     if (at < 0) {
-      next = [{ id: Date.now(), ts: Date.now(), slotKey, screens, thumbUrl, read, report: rep }, ...cur]
+      next = [{ id: Date.now(), ts: Date.now(), slotKey, runId, screens, thumbUrl, read, report: rep }, ...cur]
       saveHistory(next)
     } else if (cur[at].pending) {
       // Backgrounded run finishing: fill the placeholder rather than adding a
       // second row, and keep its id and position so the list does not reshuffle.
       next = cur.slice()
-      next[at] = { ...cur[at], screens, thumbUrl, read, report: rep, pending: false }
+      next[at] = { ...cur[at], runId, screens, thumbUrl, read, report: rep, pending: false }
       saveHistory(next)
     }
     endRun(slotKey)
@@ -381,7 +503,7 @@ export default function DesignCritiquePage() {
     const agent = activeAgent
     try {
       slotKey = await openSlot(agent)
-      runId = await createReviewRun(slotKey, agent, 'analyzing', { kind: 'screenshots' }, uploaded)
+      runId = await createReviewRun(slotKey, agent, 'analyzing', { kind: 'screenshots', brief: briefForRun() }, uploaded)
       // Claiming activeSlotRef is what makes a run the foreground one, so a
       // superseded upload must not claim it — it would redirect every guard that
       // keys off the active slot to a run the user is no longer looking at.
@@ -409,7 +531,7 @@ export default function DesignCritiquePage() {
       // screen: keep critiquing in the background rather than stealing it back.
       const mine = runSeqRef.current === seq
       if (mine) { setCurrent({ report: null, screens: uploaded }); setScreenIdx(0); setPhase('analyzing') }
-      await ask(IMAGES_PROMPT(paths), uploaded, mine)
+      await ask(IMAGES_PROMPT(paths, briefForRun()), uploaded, mine)
     } catch (e) {
       // No slot exists yet at this point; ask() owns cleanup for the one it creates.
       if (runSeqRef.current === seq) { setErr(e instanceof Error ? e.message : i18nT('apps.designCritique.designCritiquePage.something_went_wrong')); setPhase('error') }
@@ -432,10 +554,10 @@ export default function DesignCritiquePage() {
     const agent = activeAgent
     try {
       slotKey = await openSlot(agent)
-      runId = await createReviewRun(slotKey, agent, 'scanning', { kind: det.kind, value: det.value }, [])
+      runId = await createReviewRun(slotKey, agent, 'scanning', { kind: det.kind, value: det.value, brief: briefForRun() }, [])
       activeSlotRef.current = slotKey; setSlot(slotKey); setSlotAgent(agent); setSlotRunId(runId)
       saveJob({ stage: 'scanning', slotKey, runId, agent, kind: det.kind, value: det.value, ts: Date.now() })
-      await send(slotKey, agent, DISCOVER_PROMPT(det.kind, det.value))
+      await send(slotKey, agent, DISCOVER_PROMPT(det.kind, det.value, briefForRun()))
       const info = await pollForReport<DiscoveryInfo>(slotKey)
       const list = Array.isArray(info.screens) ? info.screens.filter(s => s && s.id) : []
       if (info.blocked && info.blocked.reason) {
@@ -484,7 +606,7 @@ export default function DesignCritiquePage() {
     try {
       saveJob({ stage: 'analyzing', slotKey: slot, runId: slotRunId, agent: slotAgent, screens: [], ts: Date.now() })
       await updateReviewRun(slotRunId, { stage: 'analyzing' })
-      await send(slot, slotAgent, SCOPED_PROMPT(picks, refBrief))
+      await send(slot, slotAgent, SCOPED_PROMPT(picks, briefForRun(refBrief)))
       const rep = await pollForReport<Report>(slot)
       await finishReport(slot, [], rep, slotRunId)
       setSlot('')
@@ -844,6 +966,7 @@ export default function DesignCritiquePage() {
     if (e.pending) { watchRun(e); return }
     if (!e.report) return
     setMenuOpen(false)
+    setSlotRunId(e.runId || '')
     const scr = e.screens && e.screens.length ? e.screens : (e.thumbUrl ? [{ step: 1, label: 'Screen 1', url: e.thumbUrl }] : [])
     showReport(e.report, scr, e)
   }
@@ -876,6 +999,9 @@ export default function DesignCritiquePage() {
   const isFlowFinding = (f: Finding) => f.scope === 'flow' || (Array.isArray(f.steps) && f.steps.length > 1)
   const flowFindings = isFlow ? all.filter(isFlowFinding).sort(bySev) : []
   const screenFindings = all.filter(f => !isFlow || !isFlowFinding(f)).sort(bySev)
+  const designRounds = (designRoundData?.rounds || []).filter((designRound) =>
+    !!slotRunId && designRound.review_run_id === slotRunId,
+  )
 
   const idxOf = new Map<Finding, number>()
   flowFindings.forEach((f, i) => idxOf.set(f, i))
@@ -1069,6 +1195,16 @@ export default function DesignCritiquePage() {
           </div>
         ) : null}
         {tightenBlock}
+        <DesignRoundPanel
+          key="design-round"
+          brief={reviewBrief}
+          report={report}
+          reviewRunId={slotRunId}
+          rounds={designRounds}
+          busy={designRoundBusy}
+          onPrepare={prepareDesignRound}
+          onUpdate={updateDesignRound}
+        />
         {(Array.isArray(report.couldNotSee) && report.couldNotSee.length) ? (
           <div key="cns">
             <div style={S.sectionH}>{i18nT('apps.designCritique.designCritiquePage.couldn_t_see')}</div>
@@ -1204,8 +1340,10 @@ export default function DesignCritiquePage() {
     canvasInner = (
       <Composer
         staged={staged} refText={refText} dragging={dragging} blocked={blocked} showAuth={showAuth}
-        busy={busy} agents={agents} defaultAgent={agentList?.default_agent || DEFAULT_AGENT}
+        busy={busy || contextBusy} agents={agents} defaultAgent={agentList?.default_agent || DEFAULT_AGENT}
         selectedAgent={activeAgent} setSelectedAgent={setSelectedAgent} err={err} inputRef={inputRef}
+        contexts={projectContexts} brief={reviewBrief} setBrief={updateReviewBrief}
+        selectContext={selectProjectContext} saveContext={saveProjectContext} deleteContext={deleteProjectContext}
         onPick={onPick} onDrop={onDrop} onDragOver={onDragOver} onDragLeave={onDragLeave}
         pickFile={pickFile} dropStaged={dropStaged} moveStaged={moveStaged} clearStaged={clearStaged}
         start={start} setRefText={setRefText} setBlocked={setBlocked} setShowAuth={setShowAuth}
