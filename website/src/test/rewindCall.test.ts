@@ -56,3 +56,40 @@ describe('rewindWithRollback', () => {
     expect(warnSpy).toHaveBeenCalled()
   })
 })
+
+describe('rewindWithRollback — the reason reaches the caller', () => {
+  let fetchSpy: ReturnType<typeof vi.spyOn>
+  let warnSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    fetchSpy?.mockRestore()
+    warnSpy.mockRestore()
+  })
+
+  it('passes the server message to rollback instead of swallowing it', async () => {
+    // A signed-out install answers 503 with exactly what is wrong. Discarding
+    // it turned a five-second fix into a week of believing the edit button was
+    // broken: the edit reverted with nothing on screen.
+    fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: 'Kiro CLI setup or sign-in is required before starting a session.',
+          code: 'kiro_prerequisite_required',
+        }),
+        { status: 503, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+    const rollback = vi.fn()
+
+    await rewindWithRollback('slot-abc', 'ts-1', 'edited', rollback)
+
+    expect(rollback).toHaveBeenCalledTimes(1)
+    const reason = rollback.mock.calls[0][0]
+    expect(typeof reason).toBe('string')
+    expect(reason.length).toBeGreaterThan(0)
+  })
+})

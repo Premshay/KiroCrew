@@ -3066,6 +3066,12 @@
       "upload_failed_error": "Upload failed: {{error}}",
       "worktree_creation_returned_no_path": "Worktree creation returned no path",
       "loading_earlier_messages": "Loading earlier messages…",
+      "knowledge_item_one": "{{count}} knowledge item",
+      "knowledge_item_other": "{{count}} knowledge items",
+      "this_session_has_no_project_directory_to_branch": "This session has no project directory to branch from.",
+      "worktree_creation_returned_no_path": "Worktree creation returned no path",
+      "edit_resend_failed": "Could not resend the edited message: {{error}} Your original message was restored.",
+      "loading_earlier_messages": "Loading earlier messages…",
       "send_failed_with_error": "Send failed: {{error}}"
     },
     "chatSidebar": {

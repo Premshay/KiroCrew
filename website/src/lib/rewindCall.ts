@@ -14,15 +14,17 @@ export async function rewindWithRollback(
   slot: string,
   ts: string,
   content: string,
-  rollback: () => void,
+  rollback: (reason: string) => void,
 ): Promise<void> {
   try {
     await api.rewind(slot, ts, content)
   } catch (e) {
-    // Intentional diagnostic: a rewind failure is silent to the user (the
-    // optimistic edit is rolled back), so surface it in the console.
+    // The reason reaches the caller so it can reach the user. This path is how
+    // a signed-out install presented as "the edit button is broken": the server
+    // says exactly what is wrong (503 "Kiro CLI setup or sign-in is required"),
+    // and discarding it left the edit reverted with nothing on screen.
     // eslint-disable-next-line no-console
     console.warn('rewind failed', e)
-    rollback()
+    rollback(e instanceof Error && e.message ? e.message : String(e))
   }
 }
