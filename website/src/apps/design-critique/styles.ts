@@ -70,6 +70,11 @@ export const S: Record<string, CSSProperties> = {
   // so it sits on its own full-width line below both ways in.
   bigStart: { width: '100%', height: '46px', fontSize: '14px', fontWeight: 700, borderRadius: '10px', border: '1px solid var(--accent)', background: 'var(--accent)', color: 'var(--accent-fg)', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px', marginTop: '2px' },
   cardHint: { fontSize: '11.5px', color: 'var(--muted)', textAlign: 'center', lineHeight: 1.5, margin: 0 },
+  contextBuilder: { border: '1px solid var(--border)', borderRadius: '10px', background: 'var(--card)', padding: '10px 12px' },
+  contextSummary: { cursor: 'pointer', fontSize: '12.5px', fontWeight: 700, color: 'var(--text)' },
+  contextGrid: { display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '8px', marginTop: '10px' },
+  contextInput: { width: '100%', boxSizing: 'border-box', minHeight: '36px', padding: '8px 10px', fontSize: '12px', borderRadius: '7px', border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)', fontFamily: 'inherit' },
+  contextActions: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '9px' },
   stagedItem: { width: '168px', position: 'relative' },
   stagedThumb: { width: '168px', height: '112px', borderRadius: '9px', border: '1px solid var(--border)', overflow: 'hidden', background: 'var(--card)' },
   stagedImg: { width: '100%', height: '100%', objectFit: 'cover', objectPosition: 'top', display: 'block' },

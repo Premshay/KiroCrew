@@ -350,6 +350,24 @@
         "suggested_flows": "Suggested flows",
         "what_should_i_audit": "What should I audit?"
       },
+      "scopeBuilder": {
+        "constraints_known_decisions_or_design_system_context": "Constraints, known decisions, or design-system context",
+        "delete_project_context": "Delete project context",
+        "explore_new_direction": "Explore a new direction",
+        "ground_existing_work": "Ground existing work",
+        "no_saved_project_context": "No saved project context",
+        "project_context_and_review_scope": "Project context and review scope",
+        "project_context_request_failed": "Couldn’t update the project context. Try again.",
+        "project_name": "Project name",
+        "reference_existing_system": "Reference the existing system",
+        "repository_or_local_path": "Repository or local path",
+        "review_intent": "Review intent",
+        "review_target": "Review target",
+        "review_target_placeholder": "Review target: a screen, flow, component, process, or area of the product",
+        "save_project_context": "Save project context",
+        "saved_project_context": "Saved project context",
+        "supporting_files_one_path_per_line": "Supporting files, one path per line"
+      },
       "waitingScreen": {
         "cancel_this_run": "Cancel this run",
         "stop_this_run_and_discard_it": "Stop this run and discard it"

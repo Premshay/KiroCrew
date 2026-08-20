@@ -36,6 +36,7 @@ import { i18nT } from '../../i18n/t'
 // bundled app agent (see the CRITIC note in prompts.ts).
 export const DEFAULT_AGENT = 'kirocrew'
 export const AGENTKEY = 'dc-agent-v1'
+export const BRIEFKEY = 'dc-review-brief-v1'
 export const HKEY = 'dc-history-v1'
 export const JOBKEY = 'dc-current-job'
 // Every slot we create, until we've deleted it. Only ONE job record is kept, so
