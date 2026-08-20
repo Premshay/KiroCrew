@@ -3,8 +3,9 @@ import { Upload, Plus, X, ChevronLeft, ChevronRight, PencilRuler } from 'lucide-
 import { KIND_LABEL, kindLabel } from './constants'
 import { detectKind, recognise } from './utils'
 import { S } from './styles'
-import type { Blocked, StagedItem } from './types'
+import type { Blocked, ProjectContext, ReviewBrief, StagedItem } from './types'
 import AgentSelector, { type KiroCrewAgent } from '../../components/AgentSelector'
+import ScopeBuilder from './ScopeBuilder'
 
 import { i18nT } from '../../i18n/t'
 import { useImeGuard } from '../../hooks/useImeGuard'
@@ -19,6 +20,12 @@ interface Props {
   defaultAgent: string
   selectedAgent: string
   setSelectedAgent: (agent: string) => void
+  contexts: ProjectContext[]
+  brief: ReviewBrief
+  setBrief: (patch: Partial<ReviewBrief>) => void
+  selectContext: (contextId: string) => void
+  saveContext: () => void
+  deleteContext: () => void
   err: string
   inputRef: RefObject<HTMLInputElement>
   onPick: (e: React.ChangeEvent<HTMLInputElement>) => void
@@ -135,6 +142,15 @@ export default function Composer(p: Props) {
             />
           </div>
         ) : null}
+        <ScopeBuilder
+          contexts={p.contexts}
+          brief={p.brief}
+          busy={busy}
+          onChange={p.setBrief}
+          onSelectContext={p.selectContext}
+          onSaveContext={p.saveContext}
+          onDeleteContext={p.deleteContext}
+        />
         {err ? <div style={{ fontSize: '12.5px', color: 'var(--error, #e5484d)', textAlign: 'center' }}>{err}</div> : null}
         {middle}
         {/* Decorative separator between the drop zone and the link field. A lone
