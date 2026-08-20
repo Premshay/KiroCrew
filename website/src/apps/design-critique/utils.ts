@@ -1,4 +1,4 @@
-import { HKEY, JOBKEY, LIVEKEY, LIVE_TTL_MS, SLOTSKEY } from './constants'
+import { AGENTKEY, DEFAULT_AGENT, HKEY, JOBKEY, LIVEKEY, LIVE_TTL_MS, SLOTSKEY } from './constants'
 import { fmtRelative } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import type { Detected, DiscoveryScreen, Finding, Flow, HistoryEntry, Job, Report, ReportScreen, Scope, Screen, SlotData } from './types'
@@ -87,6 +87,15 @@ export function relTime(ts: number): string {
 }
 
 export const loadHistory = (): HistoryEntry[] => { try { return JSON.parse(localStorage.getItem(HKEY) || '[]') } catch { return [] } }
+export const loadSelectedAgent = (): string => {
+  try {
+    const value = localStorage.getItem(AGENTKEY)
+    return value && value.trim() ? value : DEFAULT_AGENT
+  } catch { return DEFAULT_AGENT }
+}
+export const saveSelectedAgent = (agent: string): void => {
+  try { localStorage.setItem(AGENTKEY, agent) } catch { /* quota */ }
+}
 /**
  * Show an in-flight run in the critique list. Called when `+ New` backgrounds a
  * running critique: the run keeps going, so it needs a visible home rather than
