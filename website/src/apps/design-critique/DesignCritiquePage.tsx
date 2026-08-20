@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   PencilRuler, Image as ImageIcon, Upload, Plus, ChevronDown,
   Check, ChevronRight, Maximize2, X, Sparkle,
 } from 'lucide-react'
 
-import { sevOf, KIND_LABEL, HARD_CAP_MS, MAX_SCREENS, BLOCKED, SAMPLE_REPORT, SAMPLE_SCREENS } from './constants'
+import { DEFAULT_AGENT, sevOf, KIND_LABEL, HARD_CAP_MS, MAX_SCREENS, BLOCKED, SAMPLE_REPORT, SAMPLE_SCREENS } from './constants'
 import Clickable from '../../components/Clickable'
 import { Spinner } from './Motion'
 import { S } from './styles'
@@ -12,7 +13,7 @@ import { designCritiqueApi, fileUrl } from './api'
 import {
   detectKind, extractJson, lastAssistant, shortLabel, relTime, readableOn, normalizeReport, normalizeScope,
   loadHistory, saveHistory, beginPendingCritique, dropPendingCritique, loadJobs, saveJob, clearJob, loadSlots, saveSlots, trackSlot, untrackSlot,
-  loadLive, markLive, unmarkLive,
+  loadLive, loadSelectedAgent, markLive, saveSelectedAgent, unmarkLive,
 } from './utils'
 import { IMAGES_PROMPT, DISCOVER_PROMPT, SCOPED_PROMPT, ASK_CONTEXT, ASK_PROMPT } from './prompts'
 import { useReduceMotion, useNarrow, useToasts } from './hooks'
@@ -32,6 +33,7 @@ import type {
   Job,
   Phase,
   Report,
+  ReviewRun,
   Scope,
   Screen,
   Sel,
@@ -86,9 +88,43 @@ export default function DesignCritiquePage() {
   const [elapsed, setElapsed] = useState(0)
   const [writing, setWriting] = useState(false)
   const [pendingKind, setPendingKind] = useState<string | null>(null)
+  const [selectedAgent, setSelectedAgent] = useState(loadSelectedAgent)
+  const [slotAgent, setSlotAgent] = useState(DEFAULT_AGENT)
+  const [slotRunId, setSlotRunId] = useState('')
 
   const reduceMotion = useReduceMotion()
   const { toasts, notify } = useToasts()
+  const { data: agentList } = useQuery({
+    queryKey: ['design-critique-agents'],
+    queryFn: designCritiqueApi.listAgents,
+  })
+  const { data: reviewRunData } = useQuery({
+    queryKey: ['design-critique-runs'],
+    queryFn: designCritiqueApi.listReviewRuns,
+  })
+  const agents = agentList?.agents || []
+  const activeAgent = agents.length && !agents.some(agent => agent.name === selectedAgent)
+    ? DEFAULT_AGENT
+    : selectedAgent
+
+  useEffect(() => { saveSelectedAgent(activeAgent) }, [activeAgent])
+
+  useEffect(() => {
+    const restored = (reviewRunData?.runs || []).filter(run => run.status === 'completed' && run.report)
+    if (!restored.length) return
+    const current = loadHistory()
+    const next = restored.reduce<HistoryEntry[]>((entries, run) => {
+      if (entries.some(entry => entry.slotKey === run.slot_key)) return entries
+      const screens = Array.isArray(run.screens) ? run.screens.filter((screen): screen is Screen =>
+        !!screen && typeof screen.url === 'string' && typeof screen.label === 'string' && typeof screen.step === 'number') : []
+      const report = normalizeReport(run.report) || run.report!
+      return [{
+        id: run.created_at, ts: run.created_at, slotKey: run.slot_key, screens,
+        thumbUrl: screens[0]?.url || '', read: report.overallRead || '', report,
+      }, ...entries]
+    }, current)
+    if (next.length !== current.length) { saveHistory(next); setCritiques(next) }
+  }, [reviewRunData])
 
   const inputRef = useRef<HTMLInputElement>(null)
   const rootRef = useRef<HTMLDivElement | null>(null)
@@ -115,6 +151,7 @@ export default function DesignCritiquePage() {
   const pollingRef = useRef<Set<string>>(new Set())
   const isCancelled = (slotKey: string): boolean => cancelledRef.current.has(slotKey)
   const askSlotRef = useRef('')
+  const askAgentRef = useRef(DEFAULT_AGENT)
   /**
    * Follow-ups deliberately share ONE chat slot so the thread keeps its context.
    * That makes them strictly sequential: `/api/chat` queues a second turn on the
@@ -175,7 +212,12 @@ export default function DesignCritiquePage() {
       if (!aliveRef.current || isCancelled(slotKey)) throw CANCELLED()
       const c = lastAssistant(d && d.messages)
       if (c && c.trim() && activeSlotRef.current === slotKey) setWriting(true)
-      if (d && !d.running && c) { const p = extractJson<T>(c); if (p) return p; throw new Error('The critic replied but not in a readable format.') }
+      if (d && !d.running) {
+        if (!c) throw new Error('slot_ended_without_result')
+        const p = extractJson<T>(c)
+        if (p) return p
+        throw new Error('critic_result_unreadable')
+      }
     }
     throw TIMEOUT()
   }
@@ -192,20 +234,36 @@ export default function DesignCritiquePage() {
       catch { if (++misses >= 8) throw new Error('lost contact'); continue }
       misses = 0
       const c = lastAssistant(d && d.messages)
-      if (d && !d.running && c && c.trim()) return c.trim()
+      if (d && !d.running) {
+        if (c && c.trim()) return c.trim()
+        throw new Error('slot_ended_without_result')
+      }
     }
     throw TIMEOUT()
   }
 
   const startClock = (fromMs?: number) => { startedAtRef.current = fromMs || Date.now(); setElapsed(0) }
 
-  const openSlot = async (): Promise<string> => {
-    const s = await designCritiqueApi.openSlot()
+  const openSlot = async (agent: string): Promise<string> => {
+    const s = await designCritiqueApi.openSlot(agent)
     trackSlot(s.key); markLive(s.key)
     return s.key
   }
-  const send = (slotKey: string, message: string) => designCritiqueApi.send(slotKey, message)
+  const send = (slotKey: string, agent: string, message: string) => designCritiqueApi.send(slotKey, agent, message)
   const dropSlot = (slotKey: string) => { if (!slotKey) return; untrackSlot(slotKey); unmarkLive(slotKey); designCritiqueApi.deleteSlot(slotKey) }
+
+  const createReviewRun = async (
+    slotKey: string, agent: string, stage: string, source: Record<string, unknown>, screens: Screen[],
+  ): Promise<string> => {
+    const model = await designCritiqueApi.resolveAgentModel(agent).then(result => result.model).catch(() => '')
+    const { run } = await designCritiqueApi.createReviewRun({
+      slot_key: slotKey, agent, model, stage, source, screens,
+    })
+    return run.id
+  }
+
+  const updateReviewRun = (runId: string | undefined, update: Partial<ReviewRun>): Promise<void> =>
+    runId ? designCritiqueApi.updateReviewRun(runId, update).then(() => undefined) : Promise.resolve()
 
   const showReport = (raw: Report, screens: Screen[], entry?: HistoryEntry) => {
     // Also normalise on the way IN, not just on the way out of a run: entries
@@ -218,7 +276,7 @@ export default function DesignCritiquePage() {
         a.turns ? a : { id: a.id, quote: a.quote, turns: [{ t: 0, q: a.q || '', a: a.a || '', pending: false, failed: !!a.failed }] })
     setAsks(saved)
     setOpenAskId(null); setSel(null); setAskDraft('')
-    if (askSlotRef.current) { dropSlot(askSlotRef.current); askSlotRef.current = '' }
+    if (askSlotRef.current) { dropSlot(askSlotRef.current); askSlotRef.current = ''; askAgentRef.current = DEFAULT_AGENT }
     setOpen(new Set([0])); setActive(null); setZoom(false); setScreenIdx(0); setPhase('report')
   }
 
@@ -263,12 +321,13 @@ export default function DesignCritiquePage() {
     activeSlotRef.current === slotKey &&
     (phaseRef.current === 'analyzing' || phaseRef.current === 'uploading' || phaseRef.current === 'scanning')
 
-  const finishReport = (slotKey: string, uploaded: Screen[], raw: Report) => {
+  const finishReport = async (slotKey: string, uploaded: Screen[], raw: Report, runId?: string) => {
     // Normalise the model's JSON once, here, before it reaches history or render.
     // Every caller funnels through this, so no render site can be handed a
     // non-array for keep / couldNotSee / findings / steps / rules.
     const rep = normalizeReport(raw) || raw
     const screens = resolveScreens(rep, uploaded)
+    await updateReviewRun(runId, { status: 'completed', stage: 'report', screens, report: rep, error: null })
     const cur = loadHistory(); let next = cur
     const at = cur.findIndex(e => e.slotKey === slotKey)
     const thumbUrl = screens[0] ? screens[0].url : ''
@@ -295,7 +354,7 @@ export default function DesignCritiquePage() {
     else setJustFinished({ slotKey, read: rep.overallRead || 'Critique ready', screens, report: rep })
   }
 
-  const failWith = (e: unknown, slotKey: string) => {
+  const failWith = async (e: unknown, slotKey: string, runId?: string) => {
     const flag = e as Flagged
     if (flag && flag.cancelled) return
     // Same rule as finishReport: only the run on screen may change the screen.
@@ -306,6 +365,10 @@ export default function DesignCritiquePage() {
       if (watching) { setErr('Still working on this one. It’s kept running — come back in a minute.'); setPhase('error') }
       return
     }
+    await updateReviewRun(runId, {
+      status: 'failed',
+      error: { code: e instanceof Error ? e.message : 'unknown_failure' },
+    }).catch(() => undefined)
     endRun(slotKey)
     setCritiques(dropPendingCritique(slotKey))
     if (watching) { setErr(e instanceof Error ? e.message : 'something went wrong'); setPhase('error') }
@@ -314,18 +377,21 @@ export default function DesignCritiquePage() {
 
   const ask = async (prompt: string, uploaded: Screen[], foreground = true) => {
     let slotKey = ''
+    let runId = ''
+    const agent = activeAgent
     try {
-      slotKey = await openSlot()
+      slotKey = await openSlot(agent)
+      runId = await createReviewRun(slotKey, agent, 'analyzing', { kind: 'screenshots' }, uploaded)
       // Claiming activeSlotRef is what makes a run the foreground one, so a
       // superseded upload must not claim it — it would redirect every guard that
       // keys off the active slot to a run the user is no longer looking at.
-      if (foreground) activeSlotRef.current = slotKey
+      if (foreground) { activeSlotRef.current = slotKey; setSlotRunId(runId) }
       else setCritiques(beginPendingCritique(slotKey, uploaded || []))
-      saveJob({ stage: 'analyzing', slotKey, screens: uploaded || [], ts: Date.now() })
-      await send(slotKey, prompt)
+      saveJob({ stage: 'analyzing', slotKey, runId, agent, screens: uploaded || [], ts: Date.now() })
+      await send(slotKey, agent, prompt)
       const rep = await pollForReport<Report>(slotKey)
-      finishReport(slotKey, uploaded, rep)
-    } catch (e) { failWith(e, slotKey) }
+      await finishReport(slotKey, uploaded, rep, runId)
+    } catch (e) { await failWith(e, slotKey, runId) }
   }
 
   // One or many screenshots. Order is the order you gave them.
@@ -362,14 +428,18 @@ export default function DesignCritiquePage() {
     setCurrent({ report: null, screens: [] }); setScreenIdx(0); setScope(null); setPicked([])
     setPhase('scanning')
     let slotKey = ''
+    let runId = ''
+    const agent = activeAgent
     try {
-      slotKey = await openSlot()
-      activeSlotRef.current = slotKey; setSlot(slotKey)
-      saveJob({ stage: 'scanning', slotKey, kind: det.kind, value: det.value, ts: Date.now() })
-      await send(slotKey, DISCOVER_PROMPT(det.kind, det.value))
+      slotKey = await openSlot(agent)
+      runId = await createReviewRun(slotKey, agent, 'scanning', { kind: det.kind, value: det.value }, [])
+      activeSlotRef.current = slotKey; setSlot(slotKey); setSlotAgent(agent); setSlotRunId(runId)
+      saveJob({ stage: 'scanning', slotKey, runId, agent, kind: det.kind, value: det.value, ts: Date.now() })
+      await send(slotKey, agent, DISCOVER_PROMPT(det.kind, det.value))
       const info = await pollForReport<DiscoveryInfo>(slotKey)
       const list = Array.isArray(info.screens) ? info.screens.filter(s => s && s.id) : []
       if (info.blocked && info.blocked.reason) {
+        await updateReviewRun(runId, { status: 'failed', stage: 'blocked', error: { code: info.blocked.reason } })
         endRun(slotKey); setSlot('')
         // `detail` comes from the model and is rendered as a React child, so an
         // object here would crash the route rather than show the blocked screen.
@@ -381,6 +451,7 @@ export default function DesignCritiquePage() {
         setPhase('error'); return
       }
       if (!list.length) {
+        await updateReviewRun(runId, { status: 'failed', stage: 'scanning', error: { code: 'no_renderable_screens' } })
         endRun(slotKey); setSlot('')
         setErr(discoveryNote(info) ||
           'I got in, but there’s nothing in there I can render. Drop screenshots instead.')
@@ -396,10 +467,11 @@ export default function DesignCritiquePage() {
         ? first.screenIds.filter(id => list.some(s => s.id === id))
         : list.filter(s => s.canSee !== false).map(s => s.id)
       setPicked(preset)
-      saveJob({ stage: 'scoping', slotKey, kind: det.kind, value: det.value, ts: Date.now(),
+      await updateReviewRun(runId, { stage: 'scoping', source: { kind: det.kind, value: det.value, scope: norm, picked: preset } })
+      saveJob({ stage: 'scoping', slotKey, runId, agent, kind: det.kind, value: det.value, ts: Date.now(),
         scope: norm, picked: preset })
       setPhase('scoping')
-    } catch (e) { setSlot(''); failWith(e, slotKey) }
+    } catch (e) { setSlot(''); await failWith(e, slotKey, runId) }
   }
 
   // Step 2: critique only what was picked, in the picked order, reusing the same slot.
@@ -410,12 +482,13 @@ export default function DesignCritiquePage() {
     startClock(); setWriting(false); setPhase('analyzing')
     activeSlotRef.current = slot
     try {
-      saveJob({ stage: 'analyzing', slotKey: slot, screens: [], ts: Date.now() })
-      await send(slot, SCOPED_PROMPT(picks, refBrief))
+      saveJob({ stage: 'analyzing', slotKey: slot, runId: slotRunId, agent: slotAgent, screens: [], ts: Date.now() })
+      await updateReviewRun(slotRunId, { stage: 'analyzing' })
+      await send(slot, slotAgent, SCOPED_PROMPT(picks, refBrief))
       const rep = await pollForReport<Report>(slot)
-      finishReport(slot, [], rep)
+      await finishReport(slot, [], rep, slotRunId)
       setSlot('')
-    } catch (e) { const k = slot; setSlot(''); failWith(e, k) }
+    } catch (e) { const k = slot; setSlot(''); await failWith(e, k, slotRunId) }
   }
 
   // Reap slots we created and never cleaned up. Runs before resume so the live job is spared.
@@ -445,6 +518,8 @@ export default function DesignCritiquePage() {
 
     if (job.stage === 'scoping' && job.scope) {
       setSlot(job.slotKey)
+      setSlotRunId(job.runId || '')
+      setSlotAgent(job.agent || DEFAULT_AGENT)
       // A job persisted by an earlier build can hold an un-normalised scope, so
       // repair on read rather than trusting what localStorage happens to contain.
       setScope(normalizeScope(job.scope) || job.scope)
@@ -457,13 +532,14 @@ export default function DesignCritiquePage() {
     }
 
     if (job.stage === 'scanning') {
-      setSlot(job.slotKey); setPendingKind(job.kind || null)
+      setSlot(job.slotKey); setSlotRunId(job.runId || ''); setSlotAgent(job.agent || DEFAULT_AGENT); setPendingKind(job.kind || null)
       setCurrent({ report: null, screens: [] }); startClock(job.ts); setPhase('scanning')
       ;(async () => {
         try {
           const info = await pollForReport<DiscoveryInfo>(job.slotKey)
           const list = Array.isArray(info.screens) ? info.screens.filter(s => s && s.id) : []
           if (!list.length) {
+            await updateReviewRun(job.runId, { status: 'failed', stage: 'scanning', error: { code: 'no_renderable_screens' } })
             endRun(job.slotKey); setSlot('')
             setErr(discoveryNote(info) ||
               'I couldn’t find any screens I can render in there. Drop screenshots instead.')
@@ -476,7 +552,8 @@ export default function DesignCritiquePage() {
             ? first.screenIds.filter(id => list.some(s => s.id === id))
             : list.filter(s => s.canSee !== false).map(s => s.id)
           setScope(sc); setPicked(preset)
-          saveJob({ stage: 'scoping', slotKey: job.slotKey, kind: job.kind, value: job.value, ts: job.ts, scope: sc, picked: preset })
+          await updateReviewRun(job.runId, { stage: 'scoping', source: { kind: job.kind, value: job.value, scope: sc, picked: preset } })
+          saveJob({ stage: 'scoping', slotKey: job.slotKey, runId: job.runId, agent: job.agent, kind: job.kind, value: job.value, ts: job.ts, scope: sc, picked: preset })
           setPhase('scoping')
         } catch (e) {
           const flag = e as Flagged
@@ -485,6 +562,7 @@ export default function DesignCritiquePage() {
             setErr('Still scanning. It’s kept running — come back to this page in a minute and it’ll pick up where it left off.')
             setPhase('error'); return
           }
+          await updateReviewRun(job.runId, { status: 'failed', error: { code: e instanceof Error ? e.message : 'unknown_failure' } }).catch(() => undefined)
           endRun(job.slotKey); setSlot('')
           setErr(e instanceof Error ? e.message : 'That scan didn’t finish.'); setPhase('error')
         }
@@ -498,9 +576,11 @@ export default function DesignCritiquePage() {
     // chip and the foreground sits on "analyzing" for ever.
     activeSlotRef.current = job.slotKey
     setSlot(job.slotKey)
+    setSlotRunId(job.runId || '')
+    setSlotAgent(job.agent || DEFAULT_AGENT)
     setCurrent({ report: null, screens: uploaded }); startClock(job.ts); setWriting(false); setPhase('analyzing')
     ;(async () => {
-      try { const rep = await pollForReport<Report>(job.slotKey); finishReport(job.slotKey, uploaded, rep) }
+      try { const rep = await pollForReport<Report>(job.slotKey); await finishReport(job.slotKey, uploaded, rep, job.runId) }
       catch (e) {
         pollingRef.current.delete(job.slotKey)
         const flag = e as Flagged
@@ -509,6 +589,7 @@ export default function DesignCritiquePage() {
           setErr('Still working on this one. It’s kept running — come back to this page in a minute and it’ll pick up where it left off.')
           setPhase('error'); return
         }
+        await updateReviewRun(job.runId, { status: 'failed', error: { code: e instanceof Error ? e.message : 'unknown_failure' } }).catch(() => undefined)
         endRun(job.slotKey)
         setErr(e instanceof Error ? e.message : 'That critique didn’t finish.'); setPhase('error')
       }
@@ -526,7 +607,7 @@ export default function DesignCritiquePage() {
   // Keep the persisted pick in sync while you're deciding, so a reorder isn't lost.
   useEffect(() => {
     if (phase !== 'scoping' || !scope || !slot) return
-    saveJob({ stage: 'scoping', slotKey: slot, kind: pendingKind, ts: Date.now(), scope, picked, refBrief })
+    saveJob({ stage: 'scoping', slotKey: slot, runId: slotRunId, agent: slotAgent, kind: pendingKind, ts: Date.now(), scope, picked, refBrief })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [picked, refBrief, phase])
 
@@ -573,9 +654,9 @@ export default function DesignCritiquePage() {
       const uploaded = Array.isArray(job.screens) ? job.screens : []
       try {
         const rep = await pollForReport<Report>(job.slotKey)
-        finishReport(job.slotKey, uploaded, rep)
+        await finishReport(job.slotKey, uploaded, rep, job.runId)
       } catch (e) {
-        failWith(e, job.slotKey)
+        await failWith(e, job.slotKey, job.runId)
       } finally {
         pollingRef.current.delete(job.slotKey)
       }
@@ -634,12 +715,14 @@ export default function DesignCritiquePage() {
       : a))
     try {
       if (!askSlotRef.current) {
-        const k = await openSlot()
+        const agent = activeAgent
+        const k = await openSlot(agent)
         askSlotRef.current = k
-        await send(k, ASK_CONTEXT(report as Report, screens))
+        askAgentRef.current = agent
+        await send(k, agent, ASK_CONTEXT(report as Report, screens))
         await pollForText(k).catch(() => {})
       }
-      await send(askSlotRef.current, seedWith
+      await send(askSlotRef.current, askAgentRef.current, seedWith
         ? ASK_PROMPT(seedWith, question)
         : 'Follow-up on the same highlighted text: ' + (question || 'Say more.') +
           '\n\nSame rules: 2-4 plain sentences, no bullets, no headings.')
@@ -691,13 +774,16 @@ export default function DesignCritiquePage() {
     setRefText('http://localhost:')
   }
 
-  const cancelRun = () => {
-    if (askSlotRef.current) { dropSlot(askSlotRef.current); askSlotRef.current = '' }
+  const cancelRun = async () => {
+    if (askSlotRef.current) { dropSlot(askSlotRef.current); askSlotRef.current = ''; askAgentRef.current = DEFAULT_AGENT }
     const k = activeSlotRef.current || slot
     // Cancel THIS run only, and clear only its job record: a bare clearJob()
     // removes every persisted run, which would discard a concurrent critique.
-    if (k) { cancelledRef.current.add(k); endRun(k) }
-    activeSlotRef.current = ''; setSlot(''); setScope(null); setPicked([]); setJustFinished(null)
+    if (k) {
+      await updateReviewRun(slotRunId, { status: 'interrupted', error: { code: 'cancelled' } }).catch(() => undefined)
+      cancelledRef.current.add(k); endRun(k)
+    }
+    activeSlotRef.current = ''; setSlot(''); setSlotRunId(''); setScope(null); setPicked([]); setJustFinished(null)
     setPhase('new'); setCurrent(null); setErr(''); setWriting(false); setPendingKind(null)
     startedAtRef.current = 0; setElapsed(0)
     // Release this slot's flag once its poller has certainly observed it. Keyed
@@ -1118,7 +1204,8 @@ export default function DesignCritiquePage() {
     canvasInner = (
       <Composer
         staged={staged} refText={refText} dragging={dragging} blocked={blocked} showAuth={showAuth}
-        busy={busy} err={err} inputRef={inputRef}
+        busy={busy} agents={agents} defaultAgent={agentList?.default_agent || DEFAULT_AGENT}
+        selectedAgent={activeAgent} setSelectedAgent={setSelectedAgent} err={err} inputRef={inputRef}
         onPick={onPick} onDrop={onDrop} onDragOver={onDragOver} onDragLeave={onDragLeave}
         pickFile={pickFile} dropStaged={dropStaged} moveStaged={moveStaged} clearStaged={clearStaged}
         start={start} setRefText={setRefText} setBlocked={setBlocked} setShowAuth={setShowAuth}

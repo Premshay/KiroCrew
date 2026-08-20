@@ -31,10 +31,11 @@ import { i18nT } from '../../i18n/t'
  * retried. See `blockedFor()` below for the one-line fix that closes it.
  */
 
-// The core agent, not a bundled one. A builtin's declared `agents` are never
-// registered (see the CRITIC note in prompts.ts), so naming `design-critic` here
-// would fail every request; the persona travels with the prompt instead.
-export const AGENT = 'kirocrew'
+// The core agent remains the fallback when a previously selected crew is no
+// longer installed. The critic persona travels with the prompt rather than a
+// bundled app agent (see the CRITIC note in prompts.ts).
+export const DEFAULT_AGENT = 'kirocrew'
+export const AGENTKEY = 'dc-agent-v1'
 export const HKEY = 'dc-history-v1'
 export const JOBKEY = 'dc-current-job'
 // Every slot we create, until we've deleted it. Only ONE job record is kept, so

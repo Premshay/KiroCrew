@@ -134,6 +134,8 @@ export interface HistoryEntry {
 export interface Job {
   stage: string
   slotKey: string
+  runId?: string
+  agent?: string
   screens?: Screen[]
   kind?: string | null
   value?: string
@@ -141,6 +143,23 @@ export interface Job {
   scope?: Scope
   picked?: string[]
   refBrief?: string
+}
+
+export type ReviewRunStatus = 'running' | 'completed' | 'failed' | 'interrupted'
+
+export interface ReviewRun {
+  id: string
+  status: ReviewRunStatus
+  slot_key: string
+  agent: string
+  model: string
+  stage: string
+  source: Record<string, unknown>
+  screens: Screen[]
+  created_at: number
+  updated_at: number
+  report: Report | null
+  error: Record<string, unknown> | null
 }
 
 // A screenshot staged in the composer, not sent yet.

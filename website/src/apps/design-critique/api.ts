@@ -1,5 +1,23 @@
-import { AGENT } from './constants'
-import type { SlotData } from './types'
+import type { ReviewRun, SlotData } from './types'
+import type { KiroCrewAgent } from '../../components/AgentSelector'
+
+export interface AgentList {
+  agents: KiroCrewAgent[]
+  default_agent: string
+}
+
+interface ResolvedAgentModel {
+  model: string
+}
+
+export interface ReviewRunInput {
+  slot_key: string
+  agent: string
+  model: string
+  stage: string
+  source: Record<string, unknown>
+  screens: unknown[]
+}
 
 // These hit the dashboard's own chat endpoints (NOT an app-scoped reverse proxy),
 // so they are plain same-origin fetches — the same convention file-explorer's
@@ -27,9 +45,26 @@ export const designCritiqueApi = {
   // Open a throwaway worker slot. memory_mode 'temporary' keeps it out of memory
   // snapshots; mode 'design-critique' keeps it OUT of the chat sidebar (the chat
   // list only renders '' and 'orchestrator').
-  openSlot: () =>
+  listAgents: () => jsonFetch<AgentList>('/api/agents'),
+
+  resolveAgentModel: (agent: string) =>
+    jsonFetch<ResolvedAgentModel>('/api/agents/resolved-model?agent=' + encodeURIComponent(agent)),
+
+  listReviewRuns: () => jsonFetch<{ runs: ReviewRun[] }>('/api/apps/design-critique/runs'),
+
+  createReviewRun: (input: ReviewRunInput) =>
+    postJson<{ run: ReviewRun }>('/api/apps/design-critique/runs', input),
+
+  updateReviewRun: (runId: string, input: Partial<ReviewRun>) =>
+    jsonFetch<{ run: ReviewRun }>('/api/apps/design-critique/runs/' + encodeURIComponent(runId), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }),
+
+  openSlot: (agent: string) =>
     postJson<{ key: string }>('/api/chat/slots', {
-      name: 'dc-' + Date.now(), agent: AGENT, memory_mode: 'temporary', mode: 'design-critique',
+      name: 'dc-' + Date.now(), agent, memory_mode: 'temporary', mode: 'design-critique',
     }),
 
   getSlot: (slotKey: string) =>
@@ -37,7 +72,7 @@ export const designCritiqueApi = {
 
   // Fire a message at a slot. The response body is not JSON we care about, so a
   // parse error is swallowed — only a real HTTP/network error propagates.
-  send: (slotKey: string, message: string): Promise<void> =>
+  send: (slotKey: string, agent: string, message: string): Promise<void> =>
     jsonFetch<void>('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -48,7 +83,7 @@ export const designCritiqueApi = {
       // recreate this critique slot with memory reads and writes ENABLED. Passing
       // it is also safe when the slot exists: get_or_create_slot only raises on a
       // mismatch, and this matches what openSlot() asked for.
-      body: JSON.stringify({ message, slot: slotKey, agent: AGENT, memory_mode: 'temporary' }),
+      body: JSON.stringify({ message, slot: slotKey, agent, memory_mode: 'temporary' }),
     }).catch((e: unknown) => {
       if (e instanceof SyntaxError) return
       throw e
