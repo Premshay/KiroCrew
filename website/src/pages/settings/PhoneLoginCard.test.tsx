@@ -14,8 +14,9 @@ describe('PhoneLoginCard', () => {
     vi.restoreAllMocks()
   })
 
-  it('creates a link on the current dashboard origin and copies it', async () => {
-    ;(api.phoneLoginLink as ReturnType<typeof vi.fn>).mockResolvedValue({ token: 'abc.def' })
+  it('creates and copies the configured external dashboard link', async () => {
+    const phoneLink = 'https://nexus.tailbfda76.ts.net/?token=abc.def'
+    ;(api.phoneLoginLink as ReturnType<typeof vi.fn>).mockResolvedValue({ url: phoneLink })
     const writeText = vi.fn().mockResolvedValue(undefined)
     vi.spyOn(navigator.clipboard, 'writeText').mockImplementation(writeText)
 
@@ -23,10 +24,10 @@ describe('PhoneLoginCard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Create phone sign-in link' }))
 
     const link = await screen.findByLabelText('Phone sign-in link')
-    expect(link).toHaveValue(`${window.location.origin}/?token=abc.def`)
+    expect(link).toHaveValue(phoneLink)
 
     fireEvent.click(screen.getByRole('button', { name: 'Copy sign-in link' }))
-    await waitFor(() => expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/?token=abc.def`))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(phoneLink))
     expect(await screen.findByRole('status')).toHaveTextContent('Link copied')
   })
 
@@ -42,7 +43,9 @@ describe('PhoneLoginCard', () => {
   })
 
   it('explains how to copy manually when clipboard access is unavailable', async () => {
-    ;(api.phoneLoginLink as ReturnType<typeof vi.fn>).mockResolvedValue({ token: 'abc.def' })
+    ;(api.phoneLoginLink as ReturnType<typeof vi.fn>).mockResolvedValue({
+      url: 'https://nexus.tailbfda76.ts.net/?token=abc.def',
+    })
     vi.spyOn(navigator.clipboard, 'writeText').mockRejectedValue(new Error('denied'))
 
     renderWithProviders(<PhoneLoginCard />)
