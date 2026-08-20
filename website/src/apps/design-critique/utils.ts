@@ -1,7 +1,7 @@
-import { HKEY, JOBKEY, LIVEKEY, LIVE_TTL_MS, SLOTSKEY } from './constants'
+import { AGENTKEY, BRIEFKEY, DEFAULT_AGENT, HKEY, JOBKEY, LIVEKEY, LIVE_TTL_MS, SLOTSKEY } from './constants'
 import { fmtRelative } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
-import type { Detected, DiscoveryScreen, Finding, Flow, HistoryEntry, Job, Report, ReportScreen, Scope, Screen, SlotData } from './types'
+import type { Detected, DiscoveryScreen, Finding, Flow, HistoryEntry, Job, Report, ReportScreen, ReviewBrief, ReviewIntent, Scope, Screen, SlotData } from './types'
 
 // What did the user hand us? Decide from the text they pasted.
 // Accepted: screenshots, a Figma link, a GitHub/GitLab/Bitbucket repo, a local path,
@@ -87,6 +87,40 @@ export function relTime(ts: number): string {
 }
 
 export const loadHistory = (): HistoryEntry[] => { try { return JSON.parse(localStorage.getItem(HKEY) || '[]') } catch { return [] } }
+export const loadSelectedAgent = (): string => {
+  try {
+    const value = localStorage.getItem(AGENTKEY)
+    return value && value.trim() ? value : DEFAULT_AGENT
+  } catch { return DEFAULT_AGENT }
+}
+export const saveSelectedAgent = (agent: string): void => {
+  try { localStorage.setItem(AGENTKEY, agent) } catch { /* quota */ }
+}
+export const EMPTY_REVIEW_BRIEF: ReviewBrief = {
+  contextId: '', projectName: '', repository: '', contextPaths: '', notes: '', targets: '', intent: 'ground',
+}
+const REVIEW_INTENTS = new Set<ReviewIntent>(['ground', 'reference', 'invent'])
+const reviewBriefText = (value: unknown): string => typeof value === 'string' ? value.slice(0, 16_000) : ''
+export const loadReviewBrief = (): ReviewBrief => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(BRIEFKEY) || '{}')
+    const raw = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown> : {}
+    const intent = raw.intent
+    return {
+      contextId: reviewBriefText(raw.contextId),
+      projectName: reviewBriefText(raw.projectName),
+      repository: reviewBriefText(raw.repository),
+      contextPaths: reviewBriefText(raw.contextPaths),
+      notes: reviewBriefText(raw.notes),
+      targets: reviewBriefText(raw.targets),
+      intent: typeof intent === 'string' && REVIEW_INTENTS.has(intent as ReviewIntent) ? intent as ReviewIntent : 'ground',
+    }
+  } catch { return EMPTY_REVIEW_BRIEF }
+}
+export const saveReviewBrief = (brief: ReviewBrief): void => {
+  try { localStorage.setItem(BRIEFKEY, JSON.stringify(brief)) } catch { /* quota */ }
+}
 /**
  * Show an in-flight run in the critique list. Called when `+ New` backgrounds a
  * running critique: the run keeps going, so it needs a visible home rather than

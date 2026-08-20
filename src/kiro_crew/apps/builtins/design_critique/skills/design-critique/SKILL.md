@@ -38,6 +38,16 @@ the artifact and list them as assumptions. Ask a concise clarifying question onl
 answers would materially change severity or the overall read. Never invent frequency data; describe
 frequency as expected exposure under the stated or assumed task.
 
+### Run-scoped project context
+
+The dashboard may provide a **Review brief** containing a project or repository, supporting files,
+constraints, and a review target. Treat it as reusable background for the current run, not as a
+request to evaluate the entire project. The target can be any bounded artifact — a screen, flow,
+component, state pair, process, service interaction, or product area — and it alone defines the
+critique's scope. Read named supporting files when available, use them to ground terminology and
+constraints, and do not infer requirements for unselected areas. State when the supplied evidence
+cannot support a conclusion.
+
 ---
 
 ## Step 0 — Detect input type and evaluability
@@ -441,6 +451,29 @@ The default critique stays conversational markdown — reach for the widget only
 per-category severity breakdown the designer explicitly asked for.
 
 ## Guardrails
+
+## Claude Design round handoff
+
+When a critique becomes design work, prepare one focused **Design Round**. This
+is a distinct durable record from the critique chat: it snapshots the selected
+target, intent, canonical paths, critique findings, Claude Design project URL,
+and intended repository handoff directory.
+
+1. Choose `generate-design` for a static hi-fi surface; choose
+   `generate-prototype` only for interaction, state, or flow behaviour.
+2. Treat **ground** as a demand to attach/read the real code and design-system
+   inputs. A written path is a pointer, not a substitute for a linked Codebase
+   or a live-source screenshot.
+3. Preparing the round creates a reviewable prompt but starts nothing.
+   Opening Claude Design and pressing Send are explicit owner actions because
+   they consume usage and create external work.
+4. While it builds, use DesignSync's file listing as progress evidence; a busy
+   or unresponsive canvas is not evidence of failure. Interrupted rounds retain
+   partial files and should resume in the same chat.
+5. A round is not harvested until the artifact,
+   `design-system-delta.md`, and `handoff-bundle-README.md` are all observed
+   and the import location is recorded. Tools propose system changes; canonical
+   code ratifies them before propagation.
 
 - Cite observable evidence; no generic "improve consistency" findings.
 - **Check that content the user must read is legible.** Flag illegibly small primary content or a
