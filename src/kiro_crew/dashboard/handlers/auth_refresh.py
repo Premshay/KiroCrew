@@ -21,6 +21,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.dashboard.origin import check_origin, is_https_request
+from kiro_crew.dashboard.urls import build_dashboard_url, dashboard_origin
 from kiro_crew.dashboard.refresh_tokens import (
     MAX_REFRESH_TTL_SECS,
     REFRESH_COOKIE_PATH,
@@ -367,7 +368,7 @@ async def api_auth_me(request: web.Request) -> web.Response:
 
 
 async def api_auth_phone_link(request: web.Request) -> web.Response:
-    """Mint a short-lived dashboard link for a phone or another browser."""
+    """Mint a short-lived link to the configured external dashboard origin."""
     if not check_origin(request, require=False):
         _audit("", "phone_login_link", "bad_origin", request.headers.get("Origin", ""))
         return web.json_response({"error": "bad_origin"}, status=403)
@@ -379,10 +380,18 @@ async def api_auth_phone_link(request: web.Request) -> web.Response:
         _audit(user_id, "phone_login_link", "app_token_denied")
         return web.json_response({"error": "app_token_forbidden"}, status=403)
 
+    external_origin = dashboard_origin(request.app.get("dashboard_url", ""))
+    if not external_origin:
+        _audit(user_id, "phone_login_link", "external_origin_unavailable")
+        return web.json_response({"error": "external_origin_unavailable"}, status=409)
+
     token = generate_token(user_id, ttl_seconds=MAX_SESSION_TTL_SECS)
     _audit(user_id, "phone_login_link", "issued")
     return web.json_response(
-        {"token": token, "expires_in": LINK_WINDOW_SECS},
+        {
+            "url": build_dashboard_url(external_origin, token, local_only=False),
+            "expires_in": LINK_WINDOW_SECS,
+        },
         headers={"Cache-Control": "no-store"},
     )
 
