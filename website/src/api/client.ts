@@ -1733,7 +1733,7 @@ export const api = {
   // setting IS a config value and the status endpoint only reports what the
   // running server resolved from it at startup.
   tailnetStatus: () => get('/api/tailnet/status').then(j) as Promise<TailnetStatusData>,
-  phoneLoginLink: () => post('/api/auth/phone-link').then(j) as Promise<{
+  mobileLoginLink: () => post('/api/auth/mobile-link').then(j) as Promise<{
     url: string
     expires_in: number
   }>,
