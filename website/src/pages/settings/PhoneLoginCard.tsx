@@ -18,7 +18,7 @@ export function PhoneLoginCard() {
       setCopyFailed(false)
     },
     onSuccess: result => {
-      setLink(`${window.location.origin}/?token=${encodeURIComponent(result.token)}`)
+      setLink(result.url)
     },
   })
 

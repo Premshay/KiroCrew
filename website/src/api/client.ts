@@ -1734,7 +1734,7 @@ export const api = {
   // running server resolved from it at startup.
   tailnetStatus: () => get('/api/tailnet/status').then(j) as Promise<TailnetStatusData>,
   phoneLoginLink: () => post('/api/auth/phone-link').then(j) as Promise<{
-    token: string
+    url: string
     expires_in: number
   }>,
   // Denied commands (Settings → Security). Every endpoint returns the full
