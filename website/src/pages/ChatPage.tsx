@@ -5405,9 +5405,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // truncated forward turns can't resurface on resume. Mirrors kiro-cli's
     // native /rewind slash command, but swaps the session under the same
     // slot identity so the UI stays in place (no new tab, no title change).
-    rewindWithRollback(activeSlot, ts, newContent, () => {
+    rewindWithRollback(activeSlot, ts, newContent, (reason) => {
       dispatch(replaceMessages(snapshot))
       setRegenerating(false)
+      // The rollback is invisible on its own — the edit simply reverts — so the
+      // reason is reported the same way a failed send is.
+      dispatch(appendMessage({
+        role: 'error',
+        content: i18nT('pages.chatPage.edit_resend_failed', { error: reason }),
+        cls: '',
+      }))
     })
     return true
   }, [activeSlot, slotRunning, messages, dispatch])
