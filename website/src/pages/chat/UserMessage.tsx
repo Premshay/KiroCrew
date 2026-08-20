@@ -23,7 +23,8 @@ interface UserMessageProps {
   canEdit?: boolean
   messageIndex?: number
   messageTs?: string
-  onEditResend?: (index: number, ts: string, newContent: string) => void
+  /** Returns false when the resend was refused, so the draft is kept. */
+  onEditResend?: (index: number, ts: string, newContent: string) => boolean | void
   slotKey?: string
   slotTitle?: string
   mode?: string
@@ -82,7 +83,11 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, render
   const submit = useCallback(() => {
     const trimmed = draft.trim()
     if (!trimmed) { setEditing(false); return }
-    onEditResend?.(messageIndex ?? 0, messageTs ?? '', trimmed)
+    const accepted = onEditResend?.(messageIndex ?? 0, messageTs ?? '', trimmed)
+    // A refused resend leaves the editor open with the draft intact. Closing it
+    // regardless discarded the edit while sending nothing, so the button read as
+    // a cancel — and the text was gone with no way to recover it.
+    if (accepted === false) return
     setEditing(false)
   }, [draft, onEditResend, messageIndex, messageTs])
 
