@@ -3,6 +3,7 @@ import { useMutation } from '@tanstack/react-query'
 import { Copy, Smartphone } from 'lucide-react'
 import { api } from '../../api/client'
 import { Btn, Card, CardTitle, Input } from '../../components/ui'
+import { copyToClipboard } from '../../utils/clipboard'
 
 import { i18nT } from '../../i18n/t'
 
@@ -25,7 +26,7 @@ export function PhoneLoginCard() {
   const copyLink = async () => {
     if (!link) return
     try {
-      await navigator.clipboard.writeText(link)
+      await copyToClipboard(link)
       setCopied(true)
       setCopyFailed(false)
     } catch {
