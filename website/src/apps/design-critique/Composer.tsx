@@ -4,6 +4,7 @@ import { KIND_LABEL, kindLabel } from './constants'
 import { detectKind, recognise } from './utils'
 import { S } from './styles'
 import type { Blocked, StagedItem } from './types'
+import AgentSelector, { type KiroCrewAgent } from '../../components/AgentSelector'
 
 import { i18nT } from '../../i18n/t'
 import { useImeGuard } from '../../hooks/useImeGuard'
@@ -14,6 +15,10 @@ interface Props {
   blocked: Blocked | null
   showAuth: boolean
   busy: boolean
+  agents: KiroCrewAgent[]
+  defaultAgent: string
+  selectedAgent: string
+  setSelectedAgent: (agent: string) => void
   err: string
   inputRef: RefObject<HTMLInputElement>
   onPick: (e: React.ChangeEvent<HTMLInputElement>) => void
@@ -120,6 +125,16 @@ export default function Composer(p: Props) {
           {subLine}
           {staged.length ? <button style={S.clearLink} onClick={p.clearStaged}>{i18nT('apps.designCritique.composer.clear_all')}</button> : null}
         </p>
+        {p.agents.length ? (
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '8px' }}>
+            <AgentSelector
+              agents={p.agents}
+              defaultAgent={p.defaultAgent}
+              value={p.selectedAgent}
+              onChange={p.setSelectedAgent}
+            />
+          </div>
+        ) : null}
         {err ? <div style={{ fontSize: '12.5px', color: 'var(--error, #e5484d)', textAlign: 'center' }}>{err}</div> : null}
         {middle}
         {/* Decorative separator between the drop zone and the link field. A lone
