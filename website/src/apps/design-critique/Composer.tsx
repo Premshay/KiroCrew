@@ -3,7 +3,9 @@ import { Upload, Plus, X, ChevronLeft, ChevronRight, PencilRuler } from 'lucide-
 import { KIND_LABEL } from './constants'
 import { detectKind, recognise } from './utils'
 import { S } from './styles'
-import type { Blocked, StagedItem } from './types'
+import type { Blocked, ProjectContext, ReviewBrief, StagedItem } from './types'
+import AgentSelector, { type KiroCrewAgent } from '../../components/AgentSelector'
+import ScopeBuilder from './ScopeBuilder'
 
 import { i18nT } from '../../i18n/t'
 interface Props {
@@ -13,6 +15,16 @@ interface Props {
   blocked: Blocked | null
   showAuth: boolean
   busy: boolean
+  agents: KiroCrewAgent[]
+  defaultAgent: string
+  selectedAgent: string
+  setSelectedAgent: (agent: string) => void
+  contexts: ProjectContext[]
+  brief: ReviewBrief
+  setBrief: (patch: Partial<ReviewBrief>) => void
+  selectContext: (contextId: string) => void
+  saveContext: () => void
+  deleteContext: () => void
   err: string
   inputRef: RefObject<HTMLInputElement>
   onPick: (e: React.ChangeEvent<HTMLInputElement>) => void
@@ -118,6 +130,25 @@ export default function Composer(p: Props) {
           {subLine}
           {staged.length ? <button style={S.clearLink} onClick={p.clearStaged}>{i18nT('apps.designCritique.composer.clear_all')}</button> : null}
         </p>
+        {p.agents.length ? (
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '8px' }}>
+            <AgentSelector
+              agents={p.agents}
+              defaultAgent={p.defaultAgent}
+              value={p.selectedAgent}
+              onChange={p.setSelectedAgent}
+            />
+          </div>
+        ) : null}
+        <ScopeBuilder
+          contexts={p.contexts}
+          brief={p.brief}
+          busy={busy}
+          onChange={p.setBrief}
+          onSelectContext={p.selectContext}
+          onSaveContext={p.saveContext}
+          onDeleteContext={p.deleteContext}
+        />
         {err ? <div style={{ fontSize: '12.5px', color: 'var(--error, #e5484d)', textAlign: 'center' }}>{err}</div> : null}
         {middle}
         {/* Decorative separator between the drop zone and the link field. A lone

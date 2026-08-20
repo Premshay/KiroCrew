@@ -117,6 +117,7 @@ export interface HistoryEntry {
   id: number
   ts: number
   slotKey: string
+  runId?: string
   screens: Screen[]
   thumbUrl: string
   read: string
@@ -134,6 +135,8 @@ export interface HistoryEntry {
 export interface Job {
   stage: string
   slotKey: string
+  runId?: string
+  agent?: string
   screens?: Screen[]
   kind?: string | null
   value?: string
@@ -141,6 +144,90 @@ export interface Job {
   scope?: Scope
   picked?: string[]
   refBrief?: string
+}
+
+export type ReviewRunStatus = 'running' | 'completed' | 'failed' | 'interrupted'
+
+export interface ReviewRun {
+  id: string
+  status: ReviewRunStatus
+  slot_key: string
+  agent: string
+  model: string
+  stage: string
+  source: Record<string, unknown>
+  screens: Screen[]
+  created_at: number
+  updated_at: number
+  report: Report | null
+  error: Record<string, unknown> | null
+}
+
+export interface ProjectContext {
+  id: string
+  name: string
+  repository: string
+  context_paths: string[]
+  notes: string
+  created_at: number
+  updated_at: number
+}
+
+export type ReviewIntent = 'ground' | 'reference' | 'invent'
+
+export interface ReviewBrief {
+  contextId: string
+  projectName: string
+  repository: string
+  contextPaths: string
+  notes: string
+  targets: string
+  intent: ReviewIntent
+}
+
+export type DesignRoundStatus =
+  | 'prepared'
+  | 'owner_send_confirmed'
+  | 'building'
+  | 'ready_to_harvest'
+  | 'harvested'
+  | 'interrupted'
+  | 'failed'
+
+export interface DesignRoundEvidence {
+  files: string[]
+  note: string
+}
+
+export interface DesignRound {
+  id: string
+  status: DesignRoundStatus
+  mode: 'generate-design' | 'generate-prototype'
+  intent: ReviewIntent
+  project_name: string
+  target: string
+  claude_design_url: string
+  handoff_path: string
+  review_run_id: string
+  prompt: string
+  evidence: DesignRoundEvidence
+  error: Record<string, unknown> | null
+  created_at: number
+  updated_at: number
+}
+
+export interface DesignRoundInput {
+  mode: 'generate-design' | 'generate-prototype'
+  intent: ReviewIntent
+  project_name: string
+  repository: string
+  context_paths: string
+  notes: string
+  target: string
+  claude_design_url: string
+  handoff_path: string
+  review_run_id: string
+  report: Report
 }
 
 // A screenshot staged in the composer, not sent yet.
