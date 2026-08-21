@@ -79,6 +79,14 @@ _CONSOLIDATION_THRESHOLD = 30  # preferences/projects update threshold (messages
 # ``_CONSOLIDATION_THRESHOLD`` so ordinary sessions still consolidate on idle
 # exactly as they do today; this is a safety net, not a replacement for it.
 _HISTORY_LAG_THRESHOLD = 300  # unconsolidated messages
+# Automatic consolidation is background maintenance. A failed attempt waits
+# before re-entering its provider so a transient fault cannot crowd out
+# foreground work with repeated self-contained prompts.
+_AUTO_CONSOLIDATION_RETRY_DELAY_S = 15 * 60
+# The consolidator cannot know a provider's tokenizer or hidden system prompt.
+# This conservative character window leaves room for provider-supplied context
+# while preserving message boundaries.
+_CONSOLIDATION_CHUNK_MAX_CHARS = 64 * 1024
 # Skill detection judges a wider window than the incremental history tail: a
 # reusable procedure usually spans the whole session, not just the slice since
 # the last consolidation, so a tail-only view systematically misses skills in
@@ -108,12 +116,16 @@ class ConsolidationOutcome:
         Attempted and did not complete; ``detail`` carries the reason.
     ``empty``
         Nothing unconsolidated to do.
+
+    ``complete`` is false when a successful history pass committed one bounded
+    transcript slice and work remains for a later background pass.
     """
 
     status: str
     detail: str = ""
     old_offset: int = 0
     new_offset: int = 0
+    complete: bool = True
 
     @property
     def failed(self) -> bool:
@@ -122,7 +134,8 @@ class ConsolidationOutcome:
     def describe(self) -> str:
         """One-line human summary, for the CLI and run logs."""
         if self.status == "consolidated":
-            return f"consolidated {self.old_offset} → {self.new_offset}"
+            suffix = "" if self.complete else " (partial)"
+            return f"consolidated {self.old_offset} → {self.new_offset}{suffix}"
         if self.status == "empty":
             return "nothing to consolidate"
         return f"{self.status}: {self.detail}" if self.detail else self.status
@@ -132,6 +145,21 @@ def _fmt_message(m: dict) -> str:
     """Render one transcript message for a consolidation / skill-detection prompt."""
     tools = f" [tools: {', '.join(m['tools'])}]" if m.get("tools") else ""
     return f"[{m.get('ts', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}"
+
+
+def _consolidation_chunk(messages: list[dict]) -> list[dict]:
+    """Return the longest message-aligned prefix that fits one background pass."""
+    chunk: list[dict] = []
+    size = 0
+    for message in messages:
+        rendered_size = len(_fmt_message(message))
+        if chunk and size + rendered_size > _CONSOLIDATION_CHUNK_MAX_CHARS:
+            break
+        if not chunk and rendered_size > _CONSOLIDATION_CHUNK_MAX_CHARS:
+            return []
+        chunk.append(message)
+        size += rendered_size
+    return chunk
 
 
 _SESSION_MAX_BYTES = 2 * 1024 * 1024  # 2MB
@@ -2956,6 +2984,7 @@ class HistoryConsolidator:
         # Track last activity per session for idle-based history consolidation
         self._last_activity: dict[str, float] = {}
         self._history_consolidated: dict[str, float] = {}  # key → last history consolidation time
+        self._auto_retry_after: dict[str, float] = {}
         # Separate offset for prefs-only consolidation (doesn't advance main offset)
         self._prefs_offset: dict[str, int] = {}
         # Reason the last LLM call failed, so _consolidate can report WHY rather
@@ -2979,6 +3008,8 @@ class HistoryConsolidator:
         """
         self._last_activity[key] = _time.time()
         if key in self._running:
+            return
+        if _time.time() < self._auto_retry_after.get(key, 0.0):
             return
         total = len(self._log._read_messages(key))
         prefs_off = self._prefs_offset.get(key, 0)
@@ -3008,9 +3039,21 @@ class HistoryConsolidator:
             wrote_history: bool = include_history,
         ) -> None:
             self._tasks.discard(fut)
-            if not fut.cancelled() and fut.exception() is None:
+            if fut.cancelled():
+                return
+            if exc := fut.exception():
+                self._defer_auto_consolidation(
+                    k, ConsolidationOutcome("failed", detail=str(exc) or exc.__class__.__name__)
+                )
+                return
+            outcome = fut.result()
+            if outcome.failed:
+                self._defer_auto_consolidation(k, outcome)
+                return
+            self._auto_retry_after.pop(k, None)
+            if outcome.status in {"consolidated", "skipped"}:
                 self._prefs_offset[k] = off
-                if wrote_history:
+                if wrote_history and outcome.status == "consolidated" and outcome.complete:
                     # Stamp the idle path's clock too, so a lag-triggered write
                     # is not immediately followed by an idle-triggered one over
                     # the few messages that arrived since.
@@ -3027,6 +3070,7 @@ class HistoryConsolidator:
                 or self._log.unconsolidated_count(key) < 1
                 or now - self._history_consolidated.get(key, 0) < self._history_idle_secs
                 or key in self._running
+                or now < self._auto_retry_after.get(key, 0.0)
             ):
                 continue
             self._running.add(key)
@@ -3040,7 +3084,19 @@ class HistoryConsolidator:
                 ts: float = captured_now,
             ) -> None:
                 self._tasks.discard(fut)
-                if not fut.cancelled() and fut.exception() is None:
+                if fut.cancelled():
+                    return
+                if exc := fut.exception():
+                    self._defer_auto_consolidation(
+                        k, ConsolidationOutcome("failed", detail=str(exc) or exc.__class__.__name__)
+                    )
+                    return
+                outcome = fut.result()
+                if outcome.failed:
+                    self._defer_auto_consolidation(k, outcome)
+                    return
+                self._auto_retry_after.pop(k, None)
+                if outcome.status == "consolidated" and outcome.complete:
                     self._history_consolidated[k] = ts
 
             t.add_done_callback(_on_idle_done)
@@ -3057,6 +3113,8 @@ class HistoryConsolidator:
         so sensitive sessions never produce skills regardless of entry point.
         """
         if key in self._running:
+            return
+        if _time.time() < self._auto_retry_after.get(key, 0.0):
             return
         if self._log.unconsolidated_count(key) < 1:
             return
@@ -3079,11 +3137,30 @@ class HistoryConsolidator:
                 return
             exc = fut.exception()
             if exc is None:
-                self._history_consolidated[k] = _time.time()
+                outcome = fut.result()
+                if outcome.failed:
+                    self._defer_auto_consolidation(k, outcome)
+                    return
+                self._auto_retry_after.pop(k, None)
+                if outcome.status == "consolidated" and outcome.complete:
+                    self._history_consolidated[k] = _time.time()
             else:
                 logger.warning("consolidate_session failed for %s: %s", k, exc)
+                self._defer_auto_consolidation(
+                    k, ConsolidationOutcome("failed", detail=str(exc) or exc.__class__.__name__)
+                )
 
         t.add_done_callback(_on_done)
+
+    def _defer_auto_consolidation(self, key: str, outcome: ConsolidationOutcome) -> None:
+        retry_at = _time.time() + _AUTO_CONSOLIDATION_RETRY_DELAY_S
+        self._auto_retry_after[key] = retry_at
+        logger.warning(
+            "History consolidation deferred for %s after %s; next automatic attempt in %ds",
+            key,
+            outcome.describe(),
+            _AUTO_CONSOLIDATION_RETRY_DELAY_S,
+        )
 
     async def consolidate_now(self, key: str) -> ConsolidationOutcome:
         """Consolidate a session synchronously (blocking), reporting the outcome.
@@ -3137,6 +3214,19 @@ class HistoryConsolidator:
             if not unconsolidated:
                 return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
 
+            if include_history:
+                chunk = _consolidation_chunk(unconsolidated)
+                if not chunk:
+                    return ConsolidationOutcome(
+                        "failed",
+                        detail="one transcript message exceeds the automatic consolidation window",
+                        old_offset=old_offset,
+                        new_offset=old_offset,
+                    )
+            else:
+                chunk = unconsolidated
+            complete = len(chunk) == len(unconsolidated)
+
             # The sensitive guard belongs HERE, not only on the entry points.
             # ``consolidate_now`` and ``consolidate_session`` each check before
             # calling, and ``consolidate_now``'s docstring already promised this
@@ -3168,7 +3258,7 @@ class HistoryConsolidator:
             else:
                 memory = self._memory
 
-            conversation = "\n".join(_fmt_message(m) for m in unconsolidated)
+            conversation = "\n".join(_fmt_message(m) for m in chunk)
 
             current_prefs = memory.read_preferences()
             current_projects = memory.read_projects()
@@ -3286,7 +3376,7 @@ class HistoryConsolidator:
                 # asyncio.create_task). Running it inline would let cross-process
                 # lock contention stall the whole gateway loop.
                 await run_in_embed_pool(memory.append_history, entry)
-                logger.info("Consolidated %d messages for %s", len(unconsolidated), key)
+                logger.info("Consolidated %d messages for %s", len(chunk), key)
 
             # Structured memory writes (Phase 2/3). Offloaded to a worker thread:
             # _write_structured_memory embeds each item via a blocking urllib call
@@ -3320,6 +3410,7 @@ class HistoryConsolidator:
             # are logged, never fatal.
             if (
                 include_history
+                and complete
                 and self._auto_skills_enabled
                 and self._skills_loader is not None
             ):
@@ -3357,10 +3448,11 @@ class HistoryConsolidator:
             # thread — otherwise a slow filesystem freezes the loop (heartbeats,
             # Slack, dashboard). Same rationale as the offloads above.
             if include_history:
+                processed_offset = old_offset + len(chunk)
                 await asyncio.to_thread(
                     self._log.mark_consolidated,
                     key,
-                    total,
+                    processed_offset,
                     generation_at_snapshot,
                 )
                 # Report the offset that was actually committed, not the one we
@@ -3370,7 +3462,10 @@ class HistoryConsolidator:
                 # this outcome type exists to prevent.
                 committed = self._log.get_metadata(key).get("last_consolidated", 0) or 0
                 return ConsolidationOutcome(
-                    "consolidated", old_offset=old_offset, new_offset=committed
+                    "consolidated",
+                    old_offset=old_offset,
+                    new_offset=committed,
+                    complete=complete and committed == total,
                 )
             return ConsolidationOutcome(
                 "skipped",
@@ -4256,7 +4351,10 @@ class HistoryConsolidator:
             # consolidation turn could fire side-effecting tools (send_message,
             # learn_add, spawn_run). REJECT_ALL keeps both providers tool-free.
             result = await stream_and_collect_json(
-                client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
+                client,
+                prompt,
+                approval_policy=ToolApprovalPolicy.REJECT_ALL,
+                retry_transient=False,
             )
             turn_s = _time.monotonic() - t_acquired
             logger.debug(

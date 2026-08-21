@@ -594,13 +594,21 @@ async def stream_and_collect_json(
     *,
     approval_policy: ToolApprovalPolicy = ToolApprovalPolicy.AUTO_APPROVE,
     hooks: HookManager | None = None,
+    retry_transient: bool = True,
 ) -> dict | None:
     """Stream a message and parse the response as JSON.
 
-    Combines ``stream_and_collect`` with ``parse_llm_json``.
+    Combines ``stream_and_collect`` with ``parse_llm_json``. ``retry_transient``
+    lets a caller with a durable deferral policy avoid an inner retry loop.
     Returns parsed dict or None on failure.
     """
-    text = await stream_and_collect(provider, message, approval_policy=approval_policy, hooks=hooks)
+    text = await stream_and_collect(
+        provider,
+        message,
+        approval_policy=approval_policy,
+        hooks=hooks,
+        retry_transient=retry_transient,
+    )
     return parse_llm_json(text)
 
 
