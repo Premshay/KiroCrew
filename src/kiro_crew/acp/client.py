@@ -149,6 +149,15 @@ PROTOCOL_VERSION = "2025-08-22"
 PROTOCOL_VERSION_CLAUDE = 1
 DEFAULT_MODEL = "auto"
 
+# Consolidation turns are JSON-only and enforce REJECT_ALL at dispatch.  The
+# Claude ACP adapter nevertheless receives its session capability MCP server
+# unless excluded here, which starts mcp-core and injects tool schemas that the
+# turn cannot use.  Keep this narrow: ordinary sessions need their capability
+# server for KiroCrew actions.
+_TOOL_FREE_CONSOLIDATION_AGENTS = frozenset(
+    {"kirocrew-consolidate", "kirocrew-consolidate-maintenance"}
+)
+
 KIRO_CLI_BIN = "kiro-cli"
 KIRO_CLI_SUBCMD = "acp"
 
@@ -2266,6 +2275,8 @@ class AcpClient:
 
     def _session_capability_mcp_servers(self) -> list[dict[str, Any]]:
         """Session-bound MCP capabilities available to every ACP backend."""
+        if self._agent in _TOOL_FREE_CONSOLIDATION_AGENTS:
+            return []
         return session_capability_servers(self._session_key)
 
     def _claude_session_mcp_servers(self) -> list:
