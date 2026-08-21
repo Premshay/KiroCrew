@@ -2960,6 +2960,7 @@ class HistoryConsolidator:
         archive_after_days: int = 90,
         generate_scripts: bool = True,
         judge_model: str = "",
+        consolidation_agent: str = "kirocrew-consolidate",
     ) -> None:
         self._log = log
         self._memory = memory
@@ -2979,6 +2980,7 @@ class HistoryConsolidator:
         self._archive_after_days = archive_after_days
         self._generate_scripts = generate_scripts
         self._judge_model = judge_model
+        self._consolidation_agent = consolidation_agent
         # Captured on the first _consolidate (the gateway loop) so the sync,
         # thread-offloaded _process_auto_skills can bridge the async dedupe
         # judge back onto the loop. Throttle guards the autonomous lifecycle.
@@ -4327,7 +4329,7 @@ class HistoryConsolidator:
             # titles succeeded). The dedicated identity lets the engine map
             # route consolidation to a large-context seat by itself.
             client, _is_new, _resumed = await self._sessions.get_or_create(
-                session_key, agent="kirocrew-consolidate"
+                session_key, agent=self._consolidation_agent
             )
             # Reset the conversation before every reused turn: each
             # consolidation is self-contained (the prompt carries the whole

@@ -109,6 +109,9 @@ class TestConsolidateCmd:
         # The real offset movement, not a bare "done" that meant nothing.
         assert "consolidated 0 \u2192 3" in captured.out
         assert mock_sel.return_value.log_api_access.call_count >= 1
+        assert mock_consolidator_cls.call_args.kwargs["consolidation_agent"] == (
+            "kirocrew-consolidate-maintenance"
+        )
 
     @patch("kiro_crew.cli.sel")
     @patch("kiro_crew.cli.SkillsLoader")
