@@ -2355,6 +2355,76 @@ class TestConsolidationToolPolicy:
         )
         assert captured["retry_transient"] is False
 
+    @pytest.mark.asyncio
+    async def test_call_llm_timeout_cancels_and_retires_dedicated_session(self, monkeypatch):
+        import kiro_crew.history as history_mod
+        from kiro_crew.history import _CONSOLIDATE_SESSION_KEY
+
+        provider = MagicMock()
+        sessions = MagicMock()
+        sessions.get_or_create = AsyncMock(return_value=(provider, False, False))
+        sessions.cancel_current = AsyncMock(return_value="timeout")
+        sessions.remove = AsyncMock()
+        sessions.release = MagicMock()
+        consolidator = HistoryConsolidator(log=MagicMock(), memory=MagicMock(), sessions=sessions)
+
+        cancelled = asyncio.Event()
+
+        async def _stalled_stream(*args, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        monkeypatch.setattr(history_mod, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S", 0.01)
+        with patch("kiro_crew.history.stream_and_collect_json", side_effect=_stalled_stream):
+            result = await consolidator._call_llm("some prompt")
+
+        assert result is None
+        assert await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+        sessions.cancel_current.assert_awaited_once_with(
+            _CONSOLIDATE_SESSION_KEY, wait_ack_timeout=0.01
+        )
+        sessions.remove.assert_awaited_once_with(_CONSOLIDATE_SESSION_KEY)
+        sessions.release.assert_called_once_with(_CONSOLIDATE_SESSION_KEY)
+        assert consolidator._last_llm_error == "consolidation turn timed out after 0s"
+
+
+    @pytest.mark.asyncio
+    async def test_call_llm_timeout_cancels_and_retires_dedicated_session(self, monkeypatch):
+        import kiro_crew.history as history_mod
+        from kiro_crew.history import _CONSOLIDATE_SESSION_KEY
+
+        provider = MagicMock()
+        sessions = MagicMock()
+        sessions.get_or_create = AsyncMock(return_value=(provider, False, False))
+        sessions.cancel_current = AsyncMock(return_value="timeout")
+        sessions.remove = AsyncMock()
+        sessions.release = MagicMock()
+        consolidator = HistoryConsolidator(log=MagicMock(), memory=MagicMock(), sessions=sessions)
+        cancelled = asyncio.Event()
+
+        async def stalled_stream(*args, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        monkeypatch.setattr(history_mod, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S", 0.01)
+        with patch("kiro_crew.history.stream_and_collect_json", side_effect=stalled_stream):
+            result = await consolidator._call_llm("some prompt")
+
+        assert result is None
+        assert await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+        sessions.cancel_current.assert_awaited_once_with(
+            _CONSOLIDATE_SESSION_KEY, wait_ack_timeout=0.01
+        )
+        sessions.remove.assert_awaited_once_with(_CONSOLIDATE_SESSION_KEY)
+        sessions.release.assert_called_once_with(_CONSOLIDATE_SESSION_KEY)
+        assert consolidator._last_llm_error == "consolidation turn timed out after 0s"
+
 
 class TestConsolidationOffset:
     """Verify _prefs_offset only advances when _consolidate succeeds."""

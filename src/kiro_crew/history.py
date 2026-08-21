@@ -79,6 +79,10 @@ _CONSOLIDATION_THRESHOLD = 30  # preferences/projects update threshold (messages
 # durable-offset threshold is its safety net; preferences can keep updating
 # without silently leaving the transcript unprocessed forever.
 _HISTORY_LAG_THRESHOLD = 300
+# A consolidation turn produces a compact structured record. Bound a stalled
+# provider so its dedicated background session cannot block later maintenance.
+_CONSOLIDATION_TURN_TIMEOUT_S = 3 * 60
+_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S = 5.0
 # The consolidator cannot know a provider's tokenizer or hidden system prompt.
 # This conservative character window leaves room for provider-supplied context
 # while preserving message boundaries.
@@ -5919,6 +5923,7 @@ class HistoryConsolidator:
         self._history_consolidated: dict[str, float] = {}  # key → last history consolidation time
         # Separate offset for prefs-only consolidation (doesn't advance main offset)
         self._prefs_offset: dict[str, int] = {}
+        self._last_llm_error = ""
         # Session length at the last skill-detection pass, so an unchanged
         # (rotation_generation, message_count) at the last skill-detection
         # pass, so an unchanged session isn't re-judged on every history
@@ -7574,14 +7579,52 @@ class HistoryConsolidator:
             # kirocrew-core/cron toolset — without REJECT_ALL a background
             # consolidation turn could fire side-effecting tools (send_message,
             # learn_add, spawn_run). REJECT_ALL keeps both providers tool-free.
-            try:
-                result = await stream_and_collect_json(
+            turn_task = asyncio.create_task(
+                stream_and_collect_json(
                     client,
                     prompt,
                     approval_policy=ToolApprovalPolicy.REJECT_ALL,
                     retry_transient=False,
                     model_fallback=True,
                 )
+            )
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(turn_task), timeout=_CONSOLIDATION_TURN_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                self._last_llm_error = (
+                    f"consolidation turn timed out after {_CONSOLIDATION_TURN_TIMEOUT_S:.0f}s"
+                )
+                logger.warning(
+                    "Consolidation LLM turn timed out after %.1fs; cancelling and retiring session",
+                    _CONSOLIDATION_TURN_TIMEOUT_S,
+                )
+                try:
+                    await self._sessions.cancel_current(
+                        _CONSOLIDATE_SESSION_KEY,
+                        wait_ack_timeout=_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S,
+                    )
+                except Exception:
+                    logger.warning("Consolidation turn cancel failed", exc_info=True)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(turn_task), timeout=_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S
+                    )
+                except asyncio.TimeoutError:
+                    turn_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await turn_task
+                except asyncio.CancelledError:
+                    if not turn_task.cancelled():
+                        raise
+                except Exception:
+                    pass
+                try:
+                    await self._sessions.remove(_CONSOLIDATE_SESSION_KEY)
+                except Exception:
+                    logger.warning("Consolidation session retirement failed", exc_info=True)
+                return None
             except Exception:
                 logger.warning(
                     "LLM consolidation turn failed after %.1fs",
