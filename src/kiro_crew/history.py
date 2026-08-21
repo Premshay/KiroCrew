@@ -5892,6 +5892,7 @@ class HistoryConsolidator:
         archive_after_days: int = 90,
         generate_scripts: bool = True,
         judge_model: str = "",
+        consolidation_agent: str = "kirocrew-consolidate",
     ) -> None:
         self._log = log
         self._memory = memory
@@ -5911,6 +5912,7 @@ class HistoryConsolidator:
         self._archive_after_days = archive_after_days
         self._generate_scripts = generate_scripts
         self._judge_model = judge_model
+        self._consolidation_agent = consolidation_agent
         # Captured on the first _consolidate (the gateway loop) so the sync,
         # thread-offloaded _process_auto_skills can bridge the async dedupe
         # judge back onto the loop. Throttle guards the autonomous lifecycle.
@@ -7556,7 +7558,7 @@ class HistoryConsolidator:
                     background_turn(
                         self._sessions,
                         task="consolidation",
-                        agent="kirocrew-consolidate",
+                        agent=self._consolidation_agent,
                         session_key=_CONSOLIDATE_SESSION_KEY,
                         reset_conversation=True,
                     )
