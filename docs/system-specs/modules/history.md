@@ -478,14 +478,21 @@ more. The discard warning logs only the rejected value's length, never its
 content, because raw model output can contain anything and the log ring feeds
 the dashboard.
 
-Non-blocking via `asyncio.create_task`. Requires `SessionManager` to be passed
-at construction time; consolidation is silently skipped if no session manager
-is available.
+Non-blocking via `asyncio.create_task`. The default transport requires a
+`SessionManager`; consolidation is skipped if no session manager is available.
+An operator-controlled local router can instead use
+`KIROCREW_CONSOLIDATION_ENDPOINT`, `KIROCREW_CONSOLIDATION_MODEL`, and, when
+needed, `KIROCREW_CONSOLIDATION_AUTH_TOKEN`. That trusted local transport sends
+one non-streaming Anthropic-compatible request and retains the selected model's
+normal output budget.
 
 **Manual maintenance:** automatic work uses the no-evict consolidation engine
 and defers when its long-context seat is not resident. The explicit
 `kirocrew consolidate` command instead uses a distinct maintenance engine,
 which may swap that seat because the operator requested a finite drain.
+When direct transport is configured, that CLI operation is history-only: it
+does not create an ACP session or run automatic skill extraction after the
+durable offset advances. The gateway path keeps its skill lifecycle.
 
 **Admission and durability:** automatic consolidation does not retry a
 transient provider failure in-place. The failed outcome sets a per-session
