@@ -489,6 +489,12 @@ durable `last_consolidated` offset. Automatic scheduling advances its
 preferences/history clocks only after a non-failed outcome; a full history pass
 must also commit its snapshot offset before it stamps the idle clock.
 
+**Turn deadline:** one consolidation generation has a three-minute wall-clock
+deadline. This bounds a stalled provider without limiting the response size:
+on expiry the consolidator requests an ACP cancellation, waits five seconds for
+the turn to settle, and retires its dedicated stateless session. The normal
+failure outcome and admission cooldown then govern a later retry.
+
 **Bounded history passes:** a history pass processes the longest
 message-aligned prefix no larger than 64 KiB of rendered transcript. Each
 successful prefix commits its own absolute message offset, and reports a
