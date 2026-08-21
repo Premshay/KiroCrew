@@ -446,9 +446,11 @@ Do not reintroduce a `memory_mode` condition here without first changing what
 
 ## HistoryConsolidator (`history.py`)
 
-Background task that fires when unconsolidated count ≥ 10 messages. Uses the
-persistent background ACP session (kiro-cli long-running session, same as
-cron/heartbeat/lesson extraction) to extract:
+Background task that starts a preferences/projects pass after 30 new messages,
+and a history pass after 300 unconsolidated messages, three hours of inactivity,
+or an explicit session-close request. It uses a dedicated consolidation ACP
+session, separate from the shared background session used by short maintenance
+work, to extract:
 - `history_entry` → appended to today's daily history file
 - `preferences_update` → overwrites `preferences.md` if changed
 - `projects_update` → overwrites `projects.md` if changed
@@ -479,6 +481,21 @@ the dashboard.
 Non-blocking via `asyncio.create_task`. Requires `SessionManager` to be passed
 at construction time; consolidation is silently skipped if no session manager
 is available.
+
+**Admission and durability:** automatic consolidation does not retry a
+transient provider failure in-place. The failed outcome sets a per-session
+15-minute cooldown, leaving foreground work available and preserving the
+durable `last_consolidated` offset. Automatic scheduling advances its
+preferences/history clocks only after a non-failed outcome; a full history pass
+must also commit its snapshot offset before it stamps the idle clock.
+
+**Bounded history passes:** a history pass processes the longest
+message-aligned prefix no larger than 64 KiB of rendered transcript. Each
+successful prefix commits its own absolute message offset, and reports a
+partial outcome until the snapshot is fully consumed. A single message larger
+than that window fails safely without advancing the offset. Preferences-only
+passes retain their existing whole-tail behavior because they do not advance
+the durable history offset.
 
 **Loop safety:** the task body runs on the event loop thread, so any blocking
 work inside it must be offloaded. `_write_structured_memory` and `_save_lessons`
