@@ -3111,6 +3111,7 @@ class HistoryConsolidator:
         self._last_activity: dict[str, float] = {}
         self._history_consolidated: dict[str, float] = {}  # key → last history consolidation time
         self._auto_retry_after: dict[str, float] = {}
+        self._direct_request_lock = asyncio.Lock()
         # Separate offset for prefs-only consolidation (doesn't advance main offset)
         self._prefs_offset: dict[str, int] = {}
         # Reason the last LLM call failed, so _consolidate can report WHY rather
@@ -4672,19 +4673,29 @@ class HistoryConsolidator:
             )
             logger.warning("%s", self._last_llm_error)
             return None
+        if self._direct_request_lock.locked():
+            deferred = _DirectConsolidationDeferred(
+                "another local consolidation is using the fleet lane",
+                _AUTO_CONSOLIDATION_BUSY_RETRY_DELAY_S,
+            )
+            _direct_consolidation_defer.set(deferred)
+            self._last_llm_error = str(deferred)
+            logger.info("Direct consolidation deferred: %s", deferred)
+            return None
         endpoint = f"{self._consolidation_endpoint}/v1/messages"
         try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _post_consolidation_request,
-                    endpoint,
-                    self._consolidation_model,
-                    self._consolidation_auth_token,
-                    prompt,
-                    _CONSOLIDATION_TURN_TIMEOUT_S,
-                ),
-                timeout=_CONSOLIDATION_TURN_TIMEOUT_S,
-            )
+            async with self._direct_request_lock:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _post_consolidation_request,
+                        endpoint,
+                        self._consolidation_model,
+                        self._consolidation_auth_token,
+                        prompt,
+                        _CONSOLIDATION_TURN_TIMEOUT_S,
+                    ),
+                    timeout=_CONSOLIDATION_TURN_TIMEOUT_S,
+                )
         except _DirectConsolidationDeferred as exc:
             _direct_consolidation_defer.set(exc)
             self._last_llm_error = str(exc)

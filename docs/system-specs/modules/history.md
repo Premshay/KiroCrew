@@ -4,6 +4,10 @@
 
 Persistent conversation history with provenance tracking and LLM-driven consolidation. Conversations survive session expiry and gateway restarts.
 
+Automatic direct-endpoint consolidation admits one request per `HistoryConsolidator` at a time.
+When another session is already using the local maintenance lane, the later session records its
+normal retry deadline without sending another prompt to the router.
+
 ## ConversationLog (`history.py`)
 
 Per-thread JSONL files at `~/.kiro/crew/sessions/{safe_key}.jsonl`. First line is metadata, subsequent lines are messages with `role`, `content`, `ts`, `tools`, `source_thread`, `source_user`.
