@@ -351,14 +351,24 @@ work, to extract:
 - `preferences_update` → overwrites `preferences.md` if changed
 - `projects_update` → overwrites `projects.md` if changed
 
-Non-blocking via `asyncio.create_task`. Requires `SessionManager` to be passed
-at construction time; consolidation is silently skipped if no session manager
-is available.
+Non-blocking via `asyncio.create_task`. The default transport requires a
+`SessionManager`; consolidation is silently skipped if no session manager is
+available. An operator-controlled local router can instead be configured with
+`KIROCREW_CONSOLIDATION_ENDPOINT`, `KIROCREW_CONSOLIDATION_MODEL`, and (when the
+router requires it) `KIROCREW_CONSOLIDATION_AUTH_TOKEN`. That transport sends one
+non-streaming Anthropic-compatible request directly to the trusted local router;
+it deliberately supplies no response-token cap, so the selected model retains
+its normal output budget.
 
 **Manual maintenance:** automatic work uses the no-evict consolidation engine
 and defers when its long-context seat is not resident. The explicit
 `kirocrew consolidate` command instead uses a distinct maintenance engine,
 which may swap that seat because the operator requested a finite drain.
+When that command uses the direct transport, it is a history-only drain: it
+does not construct an ACP session or run optional automatic skill extraction,
+which would otherwise create a second model turn after the durable offset has
+already advanced. The gateway's automatic path retains its configured skill
+lifecycle.
 
 **Admission and durability:** automatic consolidation does not retry a
 transient provider failure in-place. The failed outcome sets a per-session

@@ -17,6 +17,8 @@ import os
 import re
 import threading
 import time as _time
+import urllib.error
+import urllib.request
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -28,7 +30,12 @@ from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.executors import run_in_embed_pool
-from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect, stream_and_collect_json
+from kiro_crew.llm_helpers import (
+    ToolApprovalPolicy,
+    parse_llm_json,
+    stream_and_collect,
+    stream_and_collect_json,
+)
 from kiro_crew.messaging.link import legacy_key
 from kiro_crew.preview_text import strip_markdown_preview
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -98,6 +105,48 @@ _CONSOLIDATION_CHUNK_MAX_CHARS = 64 * 1024
 # any session consolidated more than once. Bound the window so pathologically
 # long sessions stay cost-safe.
 _SKILL_DETECTION_WINDOW = 200
+
+
+def _post_consolidation_request(
+    endpoint: str,
+    model: str,
+    auth_token: str,
+    prompt: str,
+    timeout: float,
+) -> dict:
+    """Submit one Anthropic-compatible, non-streaming consolidation request."""
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+    ).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+    }
+    if auth_token:
+        headers["x-api-key"] = auth_token
+    request = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # nosemgrep
+        decoded = json.loads(response.read().decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise ValueError("consolidation endpoint returned a non-object JSON response")
+    return decoded
+
+
+def _consolidation_response_text(response: dict) -> str:
+    """Extract text blocks from an Anthropic Messages response."""
+    content = response.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    )
 
 
 @dataclass(frozen=True)
@@ -2961,6 +3010,9 @@ class HistoryConsolidator:
         generate_scripts: bool = True,
         judge_model: str = "",
         consolidation_agent: str = "kirocrew-consolidate",
+        consolidation_endpoint: str | None = None,
+        consolidation_model: str | None = None,
+        consolidation_auth_token: str | None = None,
     ) -> None:
         self._log = log
         self._memory = memory
@@ -2981,6 +3033,21 @@ class HistoryConsolidator:
         self._generate_scripts = generate_scripts
         self._judge_model = judge_model
         self._consolidation_agent = consolidation_agent
+        self._consolidation_endpoint = (
+            os.environ.get("KIROCREW_CONSOLIDATION_ENDPOINT", "")
+            if consolidation_endpoint is None
+            else consolidation_endpoint
+        ).rstrip("/")
+        self._consolidation_model = (
+            os.environ.get("KIROCREW_CONSOLIDATION_MODEL", "")
+            if consolidation_model is None
+            else consolidation_model
+        ).strip()
+        self._consolidation_auth_token = (
+            os.environ.get("KIROCREW_CONSOLIDATION_AUTH_TOKEN", "")
+            if consolidation_auth_token is None
+            else consolidation_auth_token
+        )
         # Captured on the first _consolidate (the gateway loop) so the sync,
         # thread-offloaded _process_auto_skills can bridge the async dedupe
         # judge back onto the loop. Throttle guards the autonomous lifecycle.
@@ -4301,6 +4368,9 @@ class HistoryConsolidator:
 
         Returns parsed JSON dict or None on failure.
         """
+        if self._consolidation_endpoint:
+            return await self._call_direct_endpoint(prompt)
+
         if not self._sessions:
             logger.warning("LLM consolidation skipped — no session manager")
             return None
@@ -4440,3 +4510,43 @@ class HistoryConsolidator:
             # by the per-turn new_conversation() reset above plus its
             # stateless key (no session_map persistence).
             self._sessions.release(session_key)
+
+    async def _call_direct_endpoint(self, prompt: str) -> dict | None:
+        """Run one configured local-router request without a coding-agent session."""
+        if not self._consolidation_model:
+            self._last_llm_error = (
+                "direct consolidation endpoint requires "
+                "KIROCREW_CONSOLIDATION_MODEL"
+            )
+            logger.warning("%s", self._last_llm_error)
+            return None
+        endpoint = f"{self._consolidation_endpoint}/v1/messages"
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _post_consolidation_request,
+                    endpoint,
+                    self._consolidation_model,
+                    self._consolidation_auth_token,
+                    prompt,
+                    _CONSOLIDATION_TURN_TIMEOUT_S,
+                ),
+                timeout=_CONSOLIDATION_TURN_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            self._last_llm_error = (
+                f"consolidation endpoint timed out after {_CONSOLIDATION_TURN_TIMEOUT_S:.0f}s"
+            )
+            logger.warning("%s", self._last_llm_error)
+            return None
+        except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            self._last_llm_error = detail[:300]
+            logger.warning("Direct consolidation endpoint failed: %s", self._last_llm_error)
+            return None
+
+        result = parse_llm_json(_consolidation_response_text(response))
+        if result is None:
+            self._last_llm_error = "direct consolidation endpoint returned no usable JSON"
+            logger.warning("%s", self._last_llm_error)
+        return result
