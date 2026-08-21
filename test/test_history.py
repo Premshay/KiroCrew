@@ -1447,6 +1447,37 @@ class TestConsolidationToolPolicy:
         assert outcome.new_offset == 0
         assert log.get_metadata(key).get("last_consolidated", 0) == 0
 
+    @pytest.mark.asyncio
+    async def test_direct_endpoint_coalesces_while_one_request_is_in_flight(self):
+        import threading
+
+        consolidator = HistoryConsolidator(
+            log=MagicMock(),
+            memory=MagicMock(),
+            sessions=None,
+            consolidation_endpoint="http://router.example",
+            consolidation_model="consolidate",
+        )
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_request(*_args):
+            started.set()
+            assert release.wait(timeout=1)
+            return {"content": [{"type": "text", "text": '{"history_entry": "done"}'}]}
+
+        with patch(
+            "kiro_crew.history._post_consolidation_request", side_effect=blocked_request
+        ) as post:
+            first = asyncio.create_task(consolidator._call_direct_endpoint("first"))
+            await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
+            second = await consolidator._call_direct_endpoint("second")
+            release.set()
+            assert await first == {"history_entry": "done"}
+
+        assert second is None
+        assert post.call_count == 1
+
 
 class TestConsolidationOffset:
     """Verify _prefs_offset only advances when _consolidate succeeds."""
