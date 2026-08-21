@@ -4,6 +4,10 @@
 
 Persistent conversation history with provenance tracking and LLM-driven consolidation. Conversations survive session expiry and gateway restarts.
 
+Configured direct-endpoint consolidation admits one request per `HistoryConsolidator` at a time.
+When a request is already in flight, a later request does not send another prompt to the router;
+its normal durable environment-failure retry records the admission failure.
+
 ## ConversationLog (`history.py`)
 
 Per-thread JSONL files at `~/.kiro/crew/sessions/{safe_key}.jsonl`. First line is metadata, subsequent lines are messages with `role`, `content`, `ts`, `tools`, `source_thread`, `source_user`. A writer can also supply `cls` (presentation class) and `mid` — persisted as `meta.mid`, the same field shape the dashboard slot save writes, so a dual-write injector's durable copy carries the SAME delivery identity as its in-memory window copy and a bounded slot-detail read reconciles the two as one message instead of re-appending the injection. A row appended without an id carries no `meta` at all (the pre-id shape readers keep an id-less fallback for; existing transcripts are never migrated).

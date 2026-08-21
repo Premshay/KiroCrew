@@ -5976,6 +5976,7 @@ class HistoryConsolidator:
         # Track last activity per session for idle-based history consolidation
         self._last_activity: dict[str, float] = {}
         self._history_consolidated: dict[str, float] = {}  # key → last history consolidation time
+        self._direct_request_lock = asyncio.Lock()
         # Separate offset for prefs-only consolidation (doesn't advance main offset)
         self._prefs_offset: dict[str, int] = {}
         self._last_llm_error = ""
@@ -7714,19 +7715,24 @@ class HistoryConsolidator:
             )
             logger.warning("%s", self._last_llm_error)
             return None
+        if self._direct_request_lock.locked():
+            self._last_llm_error = "another direct consolidation request is already in progress"
+            logger.info("Direct consolidation not admitted: %s", self._last_llm_error)
+            return None
         endpoint = f"{self._consolidation_endpoint}/v1/messages"
         try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _post_consolidation_request,
-                    endpoint,
-                    self._consolidation_model,
-                    self._consolidation_auth_token,
-                    prompt,
-                    _CONSOLIDATION_TURN_TIMEOUT_S,
-                ),
-                timeout=_CONSOLIDATION_TURN_TIMEOUT_S,
-            )
+            async with self._direct_request_lock:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _post_consolidation_request,
+                        endpoint,
+                        self._consolidation_model,
+                        self._consolidation_auth_token,
+                        prompt,
+                        _CONSOLIDATION_TURN_TIMEOUT_S,
+                    ),
+                    timeout=_CONSOLIDATION_TURN_TIMEOUT_S,
+                )
         except asyncio.TimeoutError:
             self._last_llm_error = (
                 f"consolidation endpoint timed out after {_CONSOLIDATION_TURN_TIMEOUT_S:.0f}s"
