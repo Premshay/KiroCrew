@@ -424,7 +424,10 @@ class TestCanonicalKey:
         assert ConversationLog._canonical_key("dashboard_chat-1-100") == "dashboard_chat-1-100"
 
     def test_double_prefix_collapsed(self):
-        assert ConversationLog._canonical_key("dashboard_dashboard_chat-1-100") == "dashboard_chat-1-100"
+        assert (
+            ConversationLog._canonical_key("dashboard_dashboard_chat-1-100")
+            == "dashboard_chat-1-100"
+        )
 
     def test_triple_prefix_collapsed(self):
         assert ConversationLog._canonical_key("dashboard_dashboard_dashboard_x") == "dashboard_x"
@@ -684,6 +687,7 @@ class TestSearchSessions:
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "title-match.jsonl", (1000, 1000))
         os.utime(tmp_path / "content-only.jsonl", (2000, 2000))
         log = ConversationLog(base_dir=tmp_path)
@@ -708,6 +712,7 @@ class TestSearchSessions:
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "many.jsonl", (1000, 1000))
         os.utime(tmp_path / "few.jsonl", (2000, 2000))
         log = ConversationLog(base_dir=tmp_path)
@@ -731,6 +736,7 @@ class TestSearchSessions:
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "short.jsonl", (1000, 1000))
         os.utime(tmp_path / "long.jsonl", (2000, 2000))
         log = ConversationLog(base_dir=tmp_path)
@@ -753,21 +759,19 @@ class TestSearchSessions:
         newest-first-on-tie invariant isn't satisfied trivially.
         """
         (tmp_path / "older.jsonl").write_text(
-            '{"_type": "metadata", "title": "t"}\n'
-            '{"role": "user", "content": "apollo"}\n',
+            '{"_type": "metadata", "title": "t"}\n' '{"role": "user", "content": "apollo"}\n',
             encoding="utf-8",
         )
         (tmp_path / "middle-title.jsonl").write_text(
-            '{"_type": "metadata", "title": "apollo"}\n'
-            '{"role": "user", "content": "x"}\n',
+            '{"_type": "metadata", "title": "apollo"}\n' '{"role": "user", "content": "x"}\n',
             encoding="utf-8",
         )
         (tmp_path / "newer.jsonl").write_text(
-            '{"_type": "metadata", "title": "t"}\n'
-            '{"role": "user", "content": "apollo"}\n',
+            '{"_type": "metadata", "title": "t"}\n' '{"role": "user", "content": "apollo"}\n',
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "older.jsonl", (1000, 1000))
         os.utime(tmp_path / "middle-title.jsonl", (1500, 1500))
         os.utime(tmp_path / "newer.jsonl", (2000, 2000))
@@ -793,6 +797,7 @@ class TestSearchSessions:
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "strong.jsonl", (1000, 1000))
         os.utime(tmp_path / "weak.jsonl", (2000, 2000))
         log = ConversationLog(base_dir=tmp_path)
@@ -822,6 +827,7 @@ class TestSearchSessions:
             encoding="utf-8",
         )
         import os
+
         os.utime(tmp_path / "title-only.jsonl", (1000, 1000))
         os.utime(tmp_path / "heavy-content.jsonl", (2000, 2000))
         log = ConversationLog(base_dir=tmp_path)
@@ -849,6 +855,7 @@ class TestSearchSessions:
         # HFS+) can give all three files the same mtime, making the
         # list_sessions() order non-deterministic without this.
         import os
+
         os.utime(tmp_path / "old-strong.jsonl", (1000, 1000))
         os.utime(tmp_path / "new-weak-1.jsonl", (2000, 2000))
         os.utime(tmp_path / "new-weak-2.jsonl", (3000, 3000))
@@ -1024,9 +1031,7 @@ class TestArchive:
         removed = _cleanup_old_archives(base=tmp_path)
         assert removed == 0
 
-    def test_cleanup_throttled_explicit_negative_skips_config_load(
-        self, tmp_path, monkeypatch
-    ):
+    def test_cleanup_throttled_explicit_negative_skips_config_load(self, tmp_path, monkeypatch):
         """Explicit negative disables without touching config, even when throttled."""
         import time
 
@@ -1094,10 +1099,20 @@ class TestArchive:
         """First line of archive is a JSON metadata row; remaining lines are original message jsonl."""
         from kiro_crew.history import _archive_lines
 
-        p = _archive_lines("k", ['{"role":"user","content":"a"}\n', '{"role":"assistant","content":"b"}\n'], reason="rotate", base=tmp_path)
+        p = _archive_lines(
+            "k",
+            ['{"role":"user","content":"a"}\n', '{"role":"assistant","content":"b"}\n'],
+            reason="rotate",
+            base=tmp_path,
+        )
         lines = p.read_text(encoding="utf-8").splitlines()
         header = json.loads(lines[0])
-        assert header == {"_type": "archive", "reason": "rotate", "archived_at": header["archived_at"], "count": 2}
+        assert header == {
+            "_type": "archive",
+            "reason": "rotate",
+            "archived_at": header["archived_at"],
+            "count": 2,
+        }
         assert json.loads(lines[1])["role"] == "user"
         assert json.loads(lines[2])["role"] == "assistant"
 
@@ -1278,7 +1293,9 @@ class TestArchiveOnlyDropped:
         from kiro_crew.history import _safe_key
 
         path = tmp_path / f"{_safe_key('t1')}.jsonl"
-        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln and '"_type"' not in ln]
+        lines = [
+            ln for ln in path.read_text(encoding="utf-8").splitlines() if ln and '"_type"' not in ln
+        ]
         assert len(lines) == 3
         kept = [json.loads(lines[1]), json.loads(lines[2])]  # B, C
         log.rewrite_session("t1", kept)
@@ -1286,9 +1303,9 @@ class TestArchiveOnlyDropped:
         assert len(archives) == 1
         archived = archives[0].read_text(encoding="utf-8")
         # Only the dropped message A should be in the archive (not B or C).
-        assert "\"content\": \"A\"" in archived
-        assert "\"content\": \"B\"" not in archived
-        assert "\"content\": \"C\"" not in archived
+        assert '"content": "A"' in archived
+        assert '"content": "B"' not in archived
+        assert '"content": "C"' not in archived
         header = json.loads(archived.splitlines()[0])
         assert header["count"] == 1
 
@@ -1400,6 +1417,36 @@ class TestConsolidationToolPolicy:
             180,
         )
 
+    @pytest.mark.asyncio
+    async def test_direct_busy_lane_returns_deferred_without_advancing_offset(self, tmp_path):
+        from kiro_crew.history import _DirectConsolidationDeferred
+        from kiro_crew.memory import MemoryStore
+
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        memory = MemoryStore(workspace=tmp_path / "memory")
+        memory.init()
+        key = "dashboard:busy"
+        log.append(key, "user", "Summarize this once the local lane is free.")
+        consolidator = HistoryConsolidator(
+            log=log,
+            memory=memory,
+            sessions=None,
+            migrated=True,
+            consolidation_endpoint="http://router.example",
+            consolidation_model="consolidate",
+        )
+
+        with patch(
+            "kiro_crew.history._post_consolidation_request",
+            side_effect=_DirectConsolidationDeferred("fleet lane busy", 60),
+        ):
+            outcome = await consolidator._consolidate(key)
+
+        assert outcome.status == "deferred"
+        assert outcome.retry_after_s == 60
+        assert outcome.new_offset == 0
+        assert log.get_metadata(key).get("last_consolidated", 0) == 0
+
 
 class TestConsolidationOffset:
     """Verify _prefs_offset only advances when _consolidate succeeds."""
@@ -1495,8 +1542,8 @@ class TestConsolidationChunkAdmission:
 
     @pytest.mark.asyncio
     async def test_history_commits_one_message_aligned_chunk_at_a_time(self, tmp_path, monkeypatch):
-        from kiro_crew.memory import MemoryStore
         import kiro_crew.history as history_mod
+        from kiro_crew.memory import MemoryStore
 
         log = ConversationLog(base_dir=tmp_path / "sessions")
         log.init()
@@ -1528,14 +1575,67 @@ class TestConsolidationChunkAdmission:
         assert second.complete is True
         assert second.old_offset == 1
         assert second.new_offset == 2
+        assert "Previous History Entry For This Session" in prompts[1]
+        assert "bounded pass" in prompts[1]
         assert log.get_metadata(key)["last_consolidated"] == 2
+        assert log.get_metadata(key)["consolidation_last_history_entry"] == "bounded pass"
+
+    @pytest.mark.asyncio
+    async def test_closed_session_retry_is_durable_and_resumed_by_idle_sweep(self, tmp_path):
+        import time as wall_time
+
+        from kiro_crew.history import _DirectConsolidationDeferred
+        from kiro_crew.memory import MemoryStore
+
+        async def drain(consolidator):
+            while consolidator._tasks:
+                await asyncio.gather(*list(consolidator._tasks), return_exceptions=True)
+
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        memory = MemoryStore(workspace=tmp_path / "memory")
+        memory.init()
+        key = "dashboard:closed-retry"
+        log.append(key, "user", "Keep this durable after the gateway restarts.")
+        log.update_metadata(key, {"closed": True})
+        first = HistoryConsolidator(
+            log=log,
+            memory=memory,
+            sessions=None,
+            migrated=True,
+            consolidation_endpoint="http://router.example",
+            consolidation_model="consolidate",
+        )
+
+        with patch(
+            "kiro_crew.history._post_consolidation_request",
+            side_effect=_DirectConsolidationDeferred("fleet lane busy", 60),
+        ):
+            first.consolidate_session(key)
+            await drain(first)
+
+        retry_after = log.get_metadata(key)["consolidation_retry_after"]
+        assert retry_after > wall_time.time()
+        assert log.get_metadata(key)["consolidation_retry_attempts"] == 1
+
+        restarted = HistoryConsolidator(log=log, memory=memory, migrated=True)
+        with patch.object(restarted, "_consolidate", new_callable=AsyncMock) as consolidate:
+            restarted.consolidate_session(key)
+            consolidate.assert_not_awaited()
+
+            log.update_metadata(key, {"consolidation_retry_after": wall_time.time() - 1})
+            consolidate.return_value = ConsolidationOutcome("skipped")
+            restarted.check_idle_sessions()
+            await drain(restarted)
+
+        consolidate.assert_awaited_once_with(log._path(key).stem, include_history=True)
+        assert log.get_metadata(key)["consolidation_retry_after"] == 0.0
 
     @pytest.mark.asyncio
     async def test_oversized_single_message_defers_without_advancing_offset(
         self, tmp_path, monkeypatch
     ):
-        from kiro_crew.memory import MemoryStore
         import kiro_crew.history as history_mod
+        from kiro_crew.memory import MemoryStore
 
         log = ConversationLog(base_dir=tmp_path / "sessions")
         log.init()
@@ -1574,9 +1674,7 @@ class TestConsolidationDoesNotBlockLoop:
         write_thread_id: dict[str, int] = {}
 
         log = MagicMock()
-        log.snapshot_for_consolidation.return_value = (
-            [{"role": "user", "content": "hi"}], 1, 0
-        )
+        log.snapshot_for_consolidation.return_value = ([{"role": "user", "content": "hi"}], 1, 0)
         log.get_metadata.return_value = {}
 
         memory = MagicMock()
@@ -1587,16 +1685,21 @@ class TestConsolidationDoesNotBlockLoop:
         vector_store.get_all_semantic.return_value = []
 
         c = HistoryConsolidator(
-            log=log, memory=memory, sessions=None,
-            vector_store=vector_store, migrated=True,
+            log=log,
+            memory=memory,
+            sessions=None,
+            vector_store=vector_store,
+            migrated=True,
         )
 
         def _fake_write(result, key):
             # Simulate the blocking embed call; record the executing thread.
             write_thread_id["id"] = threading.get_ident()
 
-        with patch.object(c, "_call_llm", new_callable=AsyncMock) as llm, \
-                patch.object(c, "_write_structured_memory", side_effect=_fake_write):
+        with (
+            patch.object(c, "_call_llm", new_callable=AsyncMock) as llm,
+            patch.object(c, "_write_structured_memory", side_effect=_fake_write),
+        ):
             llm.return_value = {"episodic": [{"text": "x" * 20}]}
             await c._consolidate("k", include_history=False)
 
@@ -1621,9 +1724,7 @@ class TestConsolidationDoesNotBlockLoop:
         save_thread_id: dict[str, int] = {}
 
         log = MagicMock()
-        log.snapshot_for_consolidation.return_value = (
-            [{"role": "user", "content": "hi"}], 1, 0
-        )
+        log.snapshot_for_consolidation.return_value = ([{"role": "user", "content": "hi"}], 1, 0)
         log.get_metadata.return_value = {}
 
         memory = MagicMock()
@@ -1635,8 +1736,11 @@ class TestConsolidationDoesNotBlockLoop:
         vector_store.write_lesson.return_value = True
 
         c = HistoryConsolidator(
-            log=log, memory=memory, sessions=None,
-            vector_store=vector_store, migrated=True,
+            log=log,
+            memory=memory,
+            sessions=None,
+            vector_store=vector_store,
+            migrated=True,
         )
 
         original_save = c._save_lessons
@@ -1645,9 +1749,11 @@ class TestConsolidationDoesNotBlockLoop:
             save_thread_id["id"] = threading.get_ident()
             original_save(raw)
 
-        with patch.object(c, "_call_llm", new_callable=AsyncMock) as llm, \
-                patch.object(c, "_write_structured_memory"), \
-                patch.object(c, "_save_lessons", side_effect=_instrumented_save):
+        with (
+            patch.object(c, "_call_llm", new_callable=AsyncMock) as llm,
+            patch.object(c, "_write_structured_memory"),
+            patch.object(c, "_save_lessons", side_effect=_instrumented_save),
+        ):
             llm.return_value = {
                 "lessons": [{"rule": "always check return codes", "category": "tool"}],
             }
@@ -1670,8 +1776,11 @@ class TestConsolidationDoesNotBlockLoop:
         vector_store.write_lesson.return_value = True
 
         c = HistoryConsolidator(
-            log=MagicMock(), memory=MagicMock(), sessions=None,
-            vector_store=vector_store, migrated=True,
+            log=MagicMock(),
+            memory=MagicMock(),
+            sessions=None,
+            vector_store=vector_store,
+            migrated=True,
         )
         oversized = [
             {"rule": f"lesson number {i}", "category": "tool"}
@@ -1695,12 +1804,14 @@ class TestStopEventContextInjection:
         log.append("sess1", "user", "hello")
         log.append("sess1", "assistant", "hi")
         # Append a resolved stop_event as a system message
-        stop_data = json.dumps({
-            "kind": "stop_event",
-            "id": "stop-abc",
-            "state": "stopped",
-            "outcome": "soft",
-        })
+        stop_data = json.dumps(
+            {
+                "kind": "stop_event",
+                "id": "stop-abc",
+                "state": "stopped",
+                "outcome": "soft",
+            }
+        )
         log.append("sess1", "system", stop_data)
 
         result = _build_stop_event_notes(log, "sess1")
@@ -1714,18 +1825,18 @@ class TestStopEventContextInjection:
 
         log = ConversationLog(base_dir=tmp_path)
         for i in range(5):
-            stop_data = json.dumps({
-                "kind": "stop_event",
-                "id": f"stop-{i}",
-                "state": "stopped",
-                "outcome": "soft",
-            })
+            stop_data = json.dumps(
+                {
+                    "kind": "stop_event",
+                    "id": f"stop-{i}",
+                    "state": "stopped",
+                    "outcome": "soft",
+                }
+            )
             log.append("sess1", "system", stop_data)
 
         result = _build_stop_event_notes(log, "sess1")
-        count = result.count(
-            "[User stopped the previous turn mid-execution.]"
-        )
+        count = result.count("[User stopped the previous turn mid-execution.]")
         assert count == 3
 
     def test_context_injection_ignores_stopping_state(self, tmp_path):
@@ -1735,12 +1846,14 @@ class TestStopEventContextInjection:
         from kiro_crew.context import _build_stop_event_notes
 
         log = ConversationLog(base_dir=tmp_path)
-        stop_data = json.dumps({
-            "kind": "stop_event",
-            "id": "stop-abc",
-            "state": "stopping",
-            "outcome": None,
-        })
+        stop_data = json.dumps(
+            {
+                "kind": "stop_event",
+                "id": "stop-abc",
+                "state": "stopping",
+                "outcome": None,
+            }
+        )
         log.append("sess1", "system", stop_data)
 
         result = _build_stop_event_notes(log, "sess1")
@@ -2124,13 +2237,25 @@ class TestProcessAutoSkillsIntegration:
         # Seed with REAL dashboard-format messages (no "tools" field anywhere)
         conv_log.append("dashboard:chat-schema", "user", "find info on grading services")
         conv_log.append("dashboard:chat-schema", "assistant", "Let me look that up.")
-        conv_log.append("dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/ReadInternalWebsites")
-        conv_log.append("dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/ReadInternalWebsites")
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/ReadInternalWebsites"
+        )
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/ReadInternalWebsites"
+        )
         conv_log.append("dashboard:chat-schema", "assistant", "Now checking sub-pages.")
-        conv_log.append("dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/ReadInternalWebsites")
-        conv_log.append("dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/ReadInternalWebsites")
-        conv_log.append("dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/InternalCodeSearch")
-        conv_log.append("dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/InternalCodeSearch")
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/ReadInternalWebsites"
+        )
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/ReadInternalWebsites"
+        )
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "🔧 Running: @builder-mcp/InternalCodeSearch"
+        )
+        conv_log.append(
+            "dashboard:chat-schema", "tool", "✅ Running: @builder-mcp/InternalCodeSearch"
+        )
         conv_log.append("dashboard:chat-schema", "assistant", "Here's the full list.")
 
         async def fake_llm(_prompt):
@@ -2175,7 +2300,10 @@ class TestProcessAutoSkillsIntegration:
 
         for i in range(6):
             conv_log.append(
-                "dashboard:chat-stage", "assistant", f"step {i}", tools=["Running: grep foo bar.txt"]
+                "dashboard:chat-stage",
+                "assistant",
+                f"step {i}",
+                tools=["Running: grep foo bar.txt"],
             )
 
         async def fake_llm(_prompt):
@@ -2209,8 +2337,11 @@ class TestProcessAutoSkillsIntegration:
         mem.init()
         skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
         consolidator = HistoryConsolidator(
-            log=conv_log, memory=mem, skills_loader=skills,
-            auto_skills_enabled=True, auto_min_tool_calls=2,
+            log=conv_log,
+            memory=mem,
+            skills_loader=skills,
+            auto_skills_enabled=True,
+            auto_min_tool_calls=2,
             approval_required=False,  # auto-approve prose — but scripts still gate
             generate_scripts=True,
         )
@@ -2225,7 +2356,9 @@ class TestProcessAutoSkillsIntegration:
                     "description": "run a fixed sequence",
                     "triggers": "seq",
                     "procedure_md": "## Steps\n1. run\n",
-                    "scripts": [{"filename": "run.py", "language": "python", "content": "print('go')\n"}],
+                    "scripts": [
+                        {"filename": "run.py", "language": "python", "content": "print('go')\n"}
+                    ],
                 },
             }
 
@@ -2249,8 +2382,12 @@ class TestProcessAutoSkillsIntegration:
         mem.init()
         skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
         consolidator = HistoryConsolidator(
-            log=conv_log, memory=mem, skills_loader=skills,
-            auto_skills_enabled=True, auto_min_tool_calls=2, generate_scripts=True,
+            log=conv_log,
+            memory=mem,
+            skills_loader=skills,
+            auto_skills_enabled=True,
+            auto_min_tool_calls=2,
+            generate_scripts=True,
         )
         for i in range(3):
             conv_log.append("dashboard:chat-bad", "assistant", f"s{i}", tools=["fs_read"])
@@ -2263,8 +2400,13 @@ class TestProcessAutoSkillsIntegration:
                     "description": "does a thing",
                     "triggers": "thing",
                     "procedure_md": "## Steps\n1. run\n",
-                    "scripts": [{"filename": "wipe.py", "language": "python",
-                                 "content": "import os\nos.system('rm -rf /')\n"}],
+                    "scripts": [
+                        {
+                            "filename": "wipe.py",
+                            "language": "python",
+                            "content": "import os\nos.system('rm -rf /')\n",
+                        }
+                    ],
                 },
             }
 
@@ -2334,7 +2476,8 @@ class TestAutoSkillSELAudit:
 
         # Expect at least one audit entry with outcome=rejected and reason=not_auto_namespace
         namespace_rejections = [
-            r for r in recorded
+            r
+            for r in recorded
             if r.get("outcome") == "rejected"
             and r.get("metadata", {}).get("reason") == "not_auto_namespace"
         ]
@@ -2392,7 +2535,8 @@ class TestAutoSkillSELAudit:
                 await consolidator._consolidate("dashboard:chat-bad-slug", include_history=True)
 
         create_rejections = [
-            r for r in recorded
+            r
+            for r in recorded
             if r.get("tool_name") == "auto_skill_create"
             and r.get("outcome") == "rejected"
             and r.get("metadata", {}).get("reason") == "creation_failed"
@@ -2456,7 +2600,8 @@ class TestAutoSkillSELAuditCompleteness:
                 await consolidator._consolidate("dashboard:chat-empty", include_history=True)
 
         empty_rejections = [
-            r for r in recorded
+            r
+            for r in recorded
             if r.get("tool_name") == "auto_skill_create"
             and r.get("outcome") == "rejected"
             and r.get("metadata", {}).get("reason") == "empty_after_redaction"
@@ -2518,12 +2663,11 @@ class TestAutoSkillSELAuditCompleteness:
         with patch.object(consolidator, "_call_llm", side_effect=fake_llm):
             with patch("kiro_crew.history.sel") as mock_sel:
                 mock_sel.return_value.log_tool_invocation = fake_log
-                await consolidator._consolidate(
-                    "dashboard:chat-refine-empty", include_history=True
-                )
+                await consolidator._consolidate("dashboard:chat-refine-empty", include_history=True)
 
         empty_rejections = [
-            r for r in recorded
+            r
+            for r in recorded
             if r.get("tool_name") == "auto_skill_refine"
             and r.get("outcome") == "rejected"
             and r.get("metadata", {}).get("reason") == "empty_after_redaction"
@@ -2592,7 +2736,8 @@ class TestAutoSkillSELAuditCompleteness:
                 await consolidator._consolidate("dashboard:chat-oversize", include_history=True)
 
         update_rejections = [
-            r for r in recorded
+            r
+            for r in recorded
             if r.get("tool_name") == "auto_skill_refine"
             and r.get("outcome") == "rejected"
             and r.get("metadata", {}).get("reason") == "update_failed"
@@ -2872,7 +3017,12 @@ class TestConsolidateSession:
 
         consolidator = HistoryConsolidator(log=conv_log, memory=mem)
         # Seed a session with a sensitive tool call
-        conv_log.append("dashboard:chat-sensitive", "assistant", "reading secrets", tools=["cat .aws/credentials"])
+        conv_log.append(
+            "dashboard:chat-sensitive",
+            "assistant",
+            "reading secrets",
+            tools=["cat .aws/credentials"],
+        )
 
         consolidator.consolidate_session("dashboard:chat-sensitive")
         # No tasks created — sensitive session skipped
@@ -2892,7 +3042,9 @@ class TestConsolidateSession:
         consolidator = HistoryConsolidator(log=conv_log, memory=mem)
         conv_log.append("dashboard:chat-fail", "user", "hello")
 
-        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock, side_effect=RuntimeError("boom")):
+        with patch.object(
+            consolidator, "_consolidate", new_callable=AsyncMock, side_effect=RuntimeError("boom")
+        ):
             consolidator.consolidate_session("dashboard:chat-fail")
             await asyncio.sleep(0.1)
             for t in list(consolidator._tasks):
@@ -2916,7 +3068,9 @@ class TestConsolidateSession:
         mem.init()
 
         consolidator = HistoryConsolidator(log=conv_log, memory=mem)
-        conv_log.append("dashboard:chat-sens2", "assistant", "read .ssh/id_rsa", tools=["cat .ssh/id_rsa"])
+        conv_log.append(
+            "dashboard:chat-sens2", "assistant", "read .ssh/id_rsa", tools=["cat .ssh/id_rsa"]
+        )
 
         with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock_consolidate:
             await consolidator.consolidate_now("dashboard:chat-sens2")
@@ -3627,7 +3781,9 @@ async def test_dedupe_candidate_uses_judge_when_configured(tmp_path):
         provenance=AutoSkillProvenance(session_key="s", created_at="2026-01-01T00:00:00+00:00"),
     )
     c = HistoryConsolidator(
-        log=MagicMock(), memory=MagicMock(), skills_loader=skills,
+        log=MagicMock(),
+        memory=MagicMock(),
+        skills_loader=skills,
         judge_model="claude-haiku-4.5",
     )
     c._event_loop = asyncio.get_running_loop()
@@ -3656,8 +3812,12 @@ async def test_script_bearing_candidate_stages_even_when_all_scripts_invalid(tmp
     mem.init()
     skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
     consolidator = HistoryConsolidator(
-        log=conv_log, memory=mem, skills_loader=skills,
-        auto_skills_enabled=True, approval_required=False, auto_min_tool_calls=5,
+        log=conv_log,
+        memory=mem,
+        skills_loader=skills,
+        auto_skills_enabled=True,
+        approval_required=False,
+        auto_min_tool_calls=5,
         generate_scripts=True,
     )
     for i in range(6):
@@ -3671,7 +3831,9 @@ async def test_script_bearing_candidate_stages_even_when_all_scripts_invalid(tmp
                 "description": "does a scripted thing",
                 "triggers": "t1, t2",
                 "procedure_md": "## Steps\n\nrun it",
-                "scripts": [{"filename": "run.py", "content": "import os\nos.system('rm -rf /')\n"}],
+                "scripts": [
+                    {"filename": "run.py", "content": "import os\nos.system('rm -rf /')\n"}
+                ],
             },
         }
 
@@ -3705,9 +3867,9 @@ class TestMetadataReadSurvivesATransientSharingViolation:
             meta = log.get_metadata("s1")
 
         assert seen["n"] >= 1, "the simulator never intercepted the open"
-        assert meta.get("agent") == "my-agent", (
-            f"a single transient sharing violation was reported as absence: {meta!r}"
-        )
+        assert (
+            meta.get("agent") == "my-agent"
+        ), f"a single transient sharing violation was reported as absence: {meta!r}"
 
     def test_the_retry_never_sleeps_on_the_event_loop(self, tmp_path):
         """The retry delay must not run on the loop.
@@ -3755,9 +3917,7 @@ class TestMetadataReadSurvivesATransientSharingViolation:
         assert slept, "no retry pause off the event loop"
         assert meta.get("agent") == "my-agent"
 
-    def test_a_persistent_violation_still_reports_absence_but_warns(
-        self, tmp_path, caplog
-    ):
+    def test_a_persistent_violation_still_reports_absence_but_warns(self, tmp_path, caplog):
         """Fail closed after the retries, but leave a traceable warning rather
         than a confident empty dict."""
         log = ConversationLog(base_dir=tmp_path)
@@ -3965,8 +4125,10 @@ class TestConsolidationOutcomeReporting:
         async def _ok(prompt):
             return {"history_entry": "a thing happened"}
 
-        with patch.object(consolidator, "_call_llm", side_effect=_ok), \
-                patch.object(consolidator, "_run_skill_detection", new_callable=AsyncMock):
+        with (
+            patch.object(consolidator, "_call_llm", side_effect=_ok),
+            patch.object(consolidator, "_run_skill_detection", new_callable=AsyncMock),
+        ):
             outcome = await consolidator.consolidate_now(key)
 
         assert outcome.status == "consolidated"
@@ -4070,9 +4232,7 @@ class TestCacheIdentitySurvivesMtimeRestore:
         # mark_consolidated writes the offset and restores the mtime.
         writer.mark_consolidated(key, 3, generation=0)
         path = writer._path(key)
-        assert path.stat().st_mtime == pytest.approx(
-            _safe_mtime(path)
-        )  # sanity: still stat-able
+        assert path.stat().st_mtime == pytest.approx(_safe_mtime(path))  # sanity: still stat-able
 
         # The reader never invalidated anything and the mtime did not move.
         assert reader.get_metadata(key).get("last_consolidated") == 3
