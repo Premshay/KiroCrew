@@ -1376,6 +1376,30 @@ class TestConsolidationToolPolicy:
         sessions.release.assert_called_once_with(_CONSOLIDATE_SESSION_KEY)
         assert consolidator._last_llm_error == "consolidation turn timed out after 0s"
 
+    @pytest.mark.asyncio
+    async def test_direct_endpoint_bypasses_acp_and_parses_text_response(self):
+        consolidator = HistoryConsolidator(
+            log=MagicMock(),
+            memory=MagicMock(),
+            sessions=None,
+            consolidation_endpoint="http://router.example",
+            consolidation_model="consolidate-maintenance",
+            consolidation_auth_token="local",
+        )
+        response = {"content": [{"type": "text", "text": '{"history_entry": "done"}'}]}
+
+        with patch("kiro_crew.history._post_consolidation_request", return_value=response) as post:
+            result = await consolidator._call_llm("summarize this")
+
+        assert result == {"history_entry": "done"}
+        post.assert_called_once_with(
+            "http://router.example/v1/messages",
+            "consolidate-maintenance",
+            "local",
+            "summarize this",
+            180,
+        )
+
 
 class TestConsolidationOffset:
     """Verify _prefs_offset only advances when _consolidate succeeds."""

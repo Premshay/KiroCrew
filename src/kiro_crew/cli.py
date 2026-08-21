@@ -652,11 +652,21 @@ def _consolidate_cmd(args) -> None:
         print("\nRun with a session key or --all to consolidate.")
         return
 
+    # Direct maintenance uses a single router request and deliberately skips the
+    # ACP session plus optional second-pass skill extraction. The CLI remains an
+    # operator-requested history drain; autonomous skill discovery belongs to
+    # the normal gateway maintenance path.
+    direct_maintenance = bool(os.environ.get("KIROCREW_CONSOLIDATION_ENDPOINT", "").strip())
+
     # Heavy machinery only for actual consolidation
     mem = MemoryStore()
     mem.init()
-    skills = SkillsLoader()
-    sessions = SessionManager(cfg, provider_factory=build_provider_factory(cfg))
+    skills = None if direct_maintenance else SkillsLoader()
+    sessions = (
+        None
+        if direct_maintenance
+        else SessionManager(cfg, provider_factory=build_provider_factory(cfg))
+    )
 
     # vector_store omitted: skill dedup uses SkillsLoader.find_similar() (Jaccard),
     # not vector_store. vector_store is for episodic memory embeddings only.
@@ -664,9 +674,10 @@ def _consolidate_cmd(args) -> None:
         log=conv_log,
         memory=mem,
         sessions=sessions,
+        migrated=cfg.memory.migrated,
         skills_loader=skills,
-        auto_skills_enabled=cfg.skills.auto_create_from_sessions,
-        auto_refine_enabled=cfg.skills.auto_refine_on_deviation,
+        auto_skills_enabled=not direct_maintenance and cfg.skills.auto_create_from_sessions,
+        auto_refine_enabled=not direct_maintenance and cfg.skills.auto_refine_on_deviation,
         auto_min_tool_calls=cfg.skills.auto_min_tool_calls,
         auto_similarity_threshold=cfg.skills.auto_similarity_threshold,
         approval_required=cfg.skills.approval_required,
