@@ -482,6 +482,11 @@ Non-blocking via `asyncio.create_task`. Requires `SessionManager` to be passed
 at construction time; consolidation is silently skipped if no session manager
 is available.
 
+**Manual maintenance:** automatic work uses the no-evict consolidation engine
+and defers when its long-context seat is not resident. The explicit
+`kirocrew consolidate` command instead uses a distinct maintenance engine,
+which may swap that seat because the operator requested a finite drain.
+
 **Admission and durability:** automatic consolidation does not retry a
 transient provider failure in-place. The failed outcome sets a per-session
 15-minute cooldown, leaving foreground work available and preserving the
