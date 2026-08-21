@@ -202,6 +202,48 @@ class TestConsolidateCmd:
         captured = capsys.readouterr()
         assert "no unconsolidated messages, skipping" in captured.out
 
+    @patch("kiro_crew.cli.sel")
+    @patch("kiro_crew.cli.SkillsLoader")
+    @patch("kiro_crew.cli.SessionManager")
+    @patch("kiro_crew.cli.MemoryStore")
+    @patch("kiro_crew.cli.HistoryConsolidator")
+    @patch("kiro_crew.cli.ConversationLog")
+    @patch("kiro_crew.cli.KiroCrewConfig")
+    def test_direct_maintenance_skips_acp_and_auto_skill_pass(
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        monkeypatch,
+    ):
+        sessions_dir = self._make_session_file(tmp_path)
+        monkeypatch.setenv("KIROCREW_CONSOLIDATION_ENDPOINT", "http://router.example")
+        mock_cfg_cls.load.return_value = MagicMock()
+        mock_log = mock_log_cls.return_value
+        mock_log._dir = sessions_dir
+        mock_log.unconsolidated_count.return_value = 1
+        mock_consolidator_cls.return_value.consolidate_now = AsyncMock(
+            return_value=ConsolidationOutcome("consolidated", old_offset=0, new_offset=1)
+        )
+
+        from kiro_crew.cli import _consolidate_cmd
+
+        _consolidate_cmd(argparse.Namespace(session_key="test_session", consolidate_all=False))
+
+        mock_sess_cls.assert_not_called()
+        mock_skills_cls.assert_not_called()
+        kwargs = mock_consolidator_cls.call_args.kwargs
+        assert kwargs["sessions"] is None
+        assert kwargs["skills_loader"] is None
+        assert kwargs["migrated"] == mock_cfg_cls.load.return_value.memory.migrated
+        assert kwargs["auto_skills_enabled"] is False
+        assert kwargs["auto_refine_enabled"] is False
+
 
 class TestOnSessionExpire:
     """Cover on_session_expire callback via real SessionManager._expire_idle."""

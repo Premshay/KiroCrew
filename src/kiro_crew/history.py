@@ -17,6 +17,8 @@ import os
 import re
 import threading
 import time as _time
+import urllib.error
+import urllib.request
 from collections import OrderedDict
 from collections.abc import Callable, Container, Iterator
 from collections.abc import Set as AbstractSet
@@ -33,6 +35,7 @@ from kiro_crew.frontmatter import SKILL_UPDATE, frontmatter_value
 from kiro_crew.llm_helpers import (
     ToolApprovalPolicy,
     background_turn,
+    parse_llm_json,
     stream_and_collect,
     stream_and_collect_json,
 )
@@ -87,6 +90,38 @@ _CONSOLIDATION_CANCEL_ACK_TIMEOUT_S = 5.0
 # This conservative character window leaves room for provider-supplied context
 # while preserving message boundaries.
 _CONSOLIDATION_CHUNK_MAX_CHARS = 64 * 1024
+
+
+def _post_consolidation_request(
+    endpoint: str, model: str, auth_token: str, prompt: str, timeout: float
+) -> dict:
+    """Submit one Anthropic-compatible, non-streaming consolidation request."""
+    payload = json.dumps(
+        {"model": model, "messages": [{"role": "user", "content": prompt}]}
+    ).encode("utf-8")
+    headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+    if auth_token:
+        headers["x-api-key"] = auth_token
+    request = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # nosemgrep
+        decoded = json.loads(response.read().decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise ValueError("consolidation endpoint returned a non-object JSON response")
+    return decoded
+
+
+def _consolidation_response_text(response: dict) -> str:
+    """Extract text blocks from an Anthropic Messages response."""
+    content = response.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    )
 
 
 @dataclass(frozen=True)
@@ -5893,6 +5928,9 @@ class HistoryConsolidator:
         generate_scripts: bool = True,
         judge_model: str = "",
         consolidation_agent: str = "kirocrew-consolidate",
+        consolidation_endpoint: str | None = None,
+        consolidation_model: str | None = None,
+        consolidation_auth_token: str | None = None,
     ) -> None:
         self._log = log
         self._memory = memory
@@ -5913,6 +5951,21 @@ class HistoryConsolidator:
         self._generate_scripts = generate_scripts
         self._judge_model = judge_model
         self._consolidation_agent = consolidation_agent
+        self._consolidation_endpoint = (
+            os.environ.get("KIROCREW_CONSOLIDATION_ENDPOINT", "")
+            if consolidation_endpoint is None
+            else consolidation_endpoint
+        ).rstrip("/")
+        self._consolidation_model = (
+            os.environ.get("KIROCREW_CONSOLIDATION_MODEL", "")
+            if consolidation_model is None
+            else consolidation_model
+        ).strip()
+        self._consolidation_auth_token = (
+            os.environ.get("KIROCREW_CONSOLIDATION_AUTH_TOKEN", "")
+            if consolidation_auth_token is None
+            else consolidation_auth_token
+        )
         # Captured on the first _consolidate (the gateway loop) so the sync,
         # thread-offloaded _process_auto_skills can bridge the async dedupe
         # judge back onto the loop. Throttle guards the autonomous lifecycle.
@@ -6501,6 +6554,7 @@ class HistoryConsolidator:
                 )
             billed = True
             if not result:
+                failure_detail = self._last_llm_error or "empty LLM result"
                 # The turn reached the provider and produced nothing usable, so it
                 # was spent while the marker below stays unwritten. Returning
                 # silently would look like success to the done-callbacks, setting
@@ -6509,11 +6563,11 @@ class HistoryConsolidator:
                 # and immediately after every restart. Charge the attempt.
                 if include_history:
                     await self._note_failed_attempt(
-                        key, attempted, "empty LLM result"
+                        key, attempted, failure_detail
                     )
                 return ConsolidationOutcome(
                     "failed",
-                    detail="empty LLM result",
+                    detail=failure_detail,
                     old_offset=old_offset,
                     new_offset=old_offset,
                 )
@@ -7540,6 +7594,9 @@ class HistoryConsolidator:
         failure inside it may still have been billed, so it returns ``None`` and is
         charged rather than risk an unbounded retry loop over real spend.
         """
+        self._last_llm_error = ""
+        if self._consolidation_endpoint:
+            return await self._call_direct_endpoint(prompt)
         if not self._sessions:
             logger.warning("LLM consolidation skipped — no session manager")
             raise _ConsolidationNotDispatched("no session manager")
@@ -7648,3 +7705,43 @@ class HistoryConsolidator:
         # spent-but-unusable result rather than a non-dispatch, which would hand
         # the caller a free retry it has not earned.
         return None
+
+    async def _call_direct_endpoint(self, prompt: str) -> dict | None:
+        """Run one configured local-router request without an ACP session."""
+        if not self._consolidation_model:
+            self._last_llm_error = (
+                "direct consolidation endpoint requires KIROCREW_CONSOLIDATION_MODEL"
+            )
+            logger.warning("%s", self._last_llm_error)
+            return None
+        endpoint = f"{self._consolidation_endpoint}/v1/messages"
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _post_consolidation_request,
+                    endpoint,
+                    self._consolidation_model,
+                    self._consolidation_auth_token,
+                    prompt,
+                    _CONSOLIDATION_TURN_TIMEOUT_S,
+                ),
+                timeout=_CONSOLIDATION_TURN_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            self._last_llm_error = (
+                f"consolidation endpoint timed out after {_CONSOLIDATION_TURN_TIMEOUT_S:.0f}s"
+            )
+            logger.warning("%s", self._last_llm_error)
+            return None
+        except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
+            detail, _ = redact_credentials(str(exc).strip() or exc.__class__.__name__)
+            detail, _ = redact_exfiltration_urls(detail)
+            self._last_llm_error = detail[:300]
+            logger.warning("Direct consolidation endpoint failed: %s", self._last_llm_error)
+            return None
+
+        result = parse_llm_json(_consolidation_response_text(response))
+        if result is None:
+            self._last_llm_error = "direct consolidation endpoint returned no usable JSON"
+            logger.warning("%s", self._last_llm_error)
+        return result
