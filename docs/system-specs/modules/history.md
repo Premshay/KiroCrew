@@ -371,11 +371,23 @@ already advanced. The gateway's automatic path retains its configured skill
 lifecycle.
 
 **Admission and durability:** automatic consolidation does not retry a
-transient provider failure in-place. The failed outcome sets a per-session
-15-minute cooldown, leaving foreground work available and preserving the
-durable `last_consolidated` offset. Automatic scheduling advances its
-preferences/history clocks only after a non-failed outcome; a full history pass
-must also commit its snapshot offset before it stamps the idle clock.
+transient provider failure in-place. Direct local requests carry an
+idle-required marker: the fleet router rejects an occupied compatible lane
+before forwarding a prompt, returning a short busy retry instead of queueing
+behind foreground work. The retry deadline, attempt count, and reason live in
+the session metadata, so a gateway restart preserves the cooldown and its idle
+sweep resumes due retries for closed sessions. A timed-out turn keeps the
+15-minute cooldown; an unavailable lane uses five minutes. Every deferred or
+failed outcome leaves the durable `last_consolidated` offset unchanged.
+Automatic scheduling advances its preferences/history clocks only after a
+non-failed outcome; a full history pass must also commit its snapshot offset
+before it stamps the idle clock.
+
+**Adjacent-entry deduplication:** after a history entry is appended, its text is
+stored with the session metadata. The next bounded pass receives that one prior
+entry and must omit already-recorded facts unless the newer messages change an
+outcome. This limits overlap between adjacent chunks without imposing an output
+token cap or hiding a later status change.
 
 **Turn deadline:** one consolidation generation has a three-minute wall-clock
 deadline. This bounds a stalled provider without limiting the response size:

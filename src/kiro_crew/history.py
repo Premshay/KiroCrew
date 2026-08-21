@@ -90,6 +90,11 @@ _HISTORY_LAG_THRESHOLD = 300  # unconsolidated messages
 # before re-entering its provider so a transient fault cannot crowd out
 # foreground work with repeated self-contained prompts.
 _AUTO_CONSOLIDATION_RETRY_DELAY_S = 15 * 60
+_AUTO_CONSOLIDATION_BUSY_RETRY_DELAY_S = 60
+_AUTO_CONSOLIDATION_UNAVAILABLE_RETRY_DELAY_S = 5 * 60
+_AUTO_RETRY_AFTER_FIELD = "consolidation_retry_after"
+_AUTO_RETRY_ATTEMPTS_FIELD = "consolidation_retry_attempts"
+_AUTO_RETRY_REASON_FIELD = "consolidation_retry_reason"
 # Consolidation produces a short structured record. A healthy local large-context
 # seat completes that work well inside this deadline; retaining a stuck ACP turn
 # would otherwise hold the dedicated worker indefinitely and block the queue.
@@ -105,6 +110,19 @@ _CONSOLIDATION_CHUNK_MAX_CHARS = 64 * 1024
 # any session consolidated more than once. Bound the window so pathologically
 # long sessions stay cost-safe.
 _SKILL_DETECTION_WINDOW = 200
+
+
+class _DirectConsolidationDeferred(Exception):
+    """A local fleet refusal that should be retried without consuming a turn."""
+
+    def __init__(self, detail: str, retry_after_s: float) -> None:
+        super().__init__(detail)
+        self.retry_after_s = retry_after_s
+
+
+_direct_consolidation_defer: contextvars.ContextVar[_DirectConsolidationDeferred | None] = (
+    contextvars.ContextVar("direct_consolidation_defer", default=None)
+)
 
 
 def _post_consolidation_request(
@@ -124,12 +142,38 @@ def _post_consolidation_request(
     headers = {
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
+        "X-Fleet-Require-Idle": "true",
     }
     if auth_token:
         headers["x-api-key"] = auth_token
     request = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # nosemgrep
-        decoded = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosemgrep
+            decoded = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code != 503:
+            raise
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise
+        if not isinstance(payload, dict) or payload.get("code") not in {
+            "fleet_lane_busy",
+            "fleet_no_available_lane",
+        }:
+            raise
+        default_delay = (
+            _AUTO_CONSOLIDATION_BUSY_RETRY_DELAY_S
+            if payload["code"] == "fleet_lane_busy"
+            else _AUTO_CONSOLIDATION_UNAVAILABLE_RETRY_DELAY_S
+        )
+        try:
+            retry_after_s = float(exc.headers.get("Retry-After", default_delay))
+        except (TypeError, ValueError):
+            retry_after_s = default_delay
+        raise _DirectConsolidationDeferred(
+            str(payload.get("error") or payload["code"]), retry_after_s
+        ) from exc
     if not isinstance(decoded, dict):
         raise ValueError("consolidation endpoint returned a non-object JSON response")
     return decoded
@@ -168,6 +212,9 @@ class ConsolidationOutcome:
         Deliberately not consolidated — ``detail`` says why. Not an error.
     ``failed``
         Attempted and did not complete; ``detail`` carries the reason.
+    ``deferred``
+        The local fleet was unavailable or occupied before a model request was
+        sent. ``retry_after_s`` states when automatic maintenance may retry.
     ``empty``
         Nothing unconsolidated to do.
 
@@ -180,10 +227,15 @@ class ConsolidationOutcome:
     old_offset: int = 0
     new_offset: int = 0
     complete: bool = True
+    retry_after_s: float = 0.0
 
     @property
     def failed(self) -> bool:
         return self.status == "failed"
+
+    @property
+    def deferred(self) -> bool:
+        return self.status == "deferred"
 
     def describe(self) -> str:
         """One-line human summary, for the CLI and run logs."""
@@ -192,6 +244,8 @@ class ConsolidationOutcome:
             return f"consolidated {self.old_offset} → {self.new_offset}{suffix}"
         if self.status == "empty":
             return "nothing to consolidate"
+        if self.status == "deferred":
+            return f"deferred: {self.detail}" if self.detail else "deferred"
         return f"{self.status}: {self.detail}" if self.detail else self.status
 
 
@@ -1334,9 +1388,7 @@ class ConversationLog:
         any real append advances the mtime and invalidates it.
         """
         try:
-            data = json.loads(
-                self._summary_cache_path(key).read_text(encoding="utf-8")
-            )
+            data = json.loads(self._summary_cache_path(key).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
         summary = data.get("summary")
@@ -3072,6 +3124,53 @@ class HistoryConsolidator:
         # swaps the window's content) still forces a fresh pass.
         self._last_skillgen_marker: dict[str, tuple[int, int]] = {}
 
+    def _retry_after(self, key: str) -> float:
+        """Return the durable automatic-retry deadline for a session."""
+        cached = self._auto_retry_after.get(key, 0.0)
+        raw = self._log.get_metadata(key).get(_AUTO_RETRY_AFTER_FIELD, 0.0)
+        try:
+            persisted = float(raw or 0.0)
+        except (TypeError, ValueError):
+            persisted = 0.0
+        return max(cached, persisted)
+
+    def _is_running(self, key: str) -> bool:
+        """Treat a dashboard key and its JSONL-safe spelling as one session."""
+        safe_key = _safe_key(key)
+        return any(_safe_key(active_key) == safe_key for active_key in self._running)
+
+    def _persist_retry_state(self, key: str, fields: dict) -> None:
+        """Write retry bookkeeping off the event loop without delaying chat."""
+
+        async def _write() -> None:
+            try:
+                await asyncio.to_thread(self._log.update_metadata, key, fields)
+            except Exception:
+                logger.warning(
+                    "History consolidation retry state write failed for %s", key, exc_info=True
+                )
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._log.update_metadata(key, fields)
+            return
+        task = asyncio.create_task(_write())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _clear_auto_retry(self, key: str) -> None:
+        """Clear both the process cache and the restart-safe retry metadata."""
+        self._auto_retry_after.pop(key, None)
+        self._persist_retry_state(
+            key,
+            {
+                _AUTO_RETRY_AFTER_FIELD: 0.0,
+                _AUTO_RETRY_ATTEMPTS_FIELD: 0,
+                _AUTO_RETRY_REASON_FIELD: "",
+            },
+        )
+
     def maybe_consolidate(self, key: str) -> None:
         """Fire consolidation on message volume: preferences/projects always,
         history too once the unconsolidated backlog is large enough.
@@ -3081,9 +3180,9 @@ class HistoryConsolidator:
         written at all — the failure this method's lag trigger exists to prevent.
         """
         self._last_activity[key] = _time.time()
-        if key in self._running:
+        if self._is_running(key):
             return
-        if _time.time() < self._auto_retry_after.get(key, 0.0):
+        if _time.time() < self._retry_after(key):
             return
         total = len(self._log._read_messages(key))
         prefs_off = self._prefs_offset.get(key, 0)
@@ -3121,10 +3220,10 @@ class HistoryConsolidator:
                 )
                 return
             outcome = fut.result()
-            if outcome.failed:
+            if outcome.failed or outcome.deferred:
                 self._defer_auto_consolidation(k, outcome)
                 return
-            self._auto_retry_after.pop(k, None)
+            self._clear_auto_retry(k)
             if outcome.status in {"consolidated", "skipped"}:
                 self._prefs_offset[k] = off
                 if wrote_history and outcome.status == "consolidated" and outcome.complete:
@@ -3135,45 +3234,68 @@ class HistoryConsolidator:
 
         t.add_done_callback(_on_done)
 
+    def _schedule_auto_history_consolidation(self, key: str, started_at: float) -> None:
+        """Start one retryable history pass and persist its terminal retry state."""
+        self._running.add(key)
+        task = asyncio.create_task(self._consolidate(key, include_history=True))
+        self._tasks.add(task)
+
+        def _on_done(
+            future: asyncio.Task,  # type: ignore[type-arg]
+            session_key: str = key,
+            started: float = started_at,
+        ) -> None:
+            self._tasks.discard(future)
+            if future.cancelled():
+                return
+            if exc := future.exception():
+                self._defer_auto_consolidation(
+                    session_key,
+                    ConsolidationOutcome("failed", detail=str(exc) or exc.__class__.__name__),
+                )
+                return
+            outcome = future.result()
+            if outcome.failed or outcome.deferred:
+                self._defer_auto_consolidation(session_key, outcome)
+                return
+            self._clear_auto_retry(session_key)
+            if outcome.status == "consolidated" and outcome.complete:
+                self._history_consolidated[session_key] = started
+
+        task.add_done_callback(_on_done)
+
     def check_idle_sessions(self) -> None:
-        """Check all tracked sessions for idle-based history consolidation."""
+        """Check idle sessions and durable closed-session retries for history work."""
         now = _time.time()
+        scheduled: set[str] = set()
         for key, last in list(self._last_activity.items()):
             if (
                 now - last < self._history_idle_secs
                 or self._log.unconsolidated_count(key) < 1
                 or now - self._history_consolidated.get(key, 0) < self._history_idle_secs
-                or key in self._running
-                or now < self._auto_retry_after.get(key, 0.0)
+                or self._is_running(key)
+                or now < self._retry_after(key)
             ):
                 continue
-            self._running.add(key)
-            captured_now = now
-            t = asyncio.create_task(self._consolidate(key, include_history=True))
-            self._tasks.add(t)
+            self._schedule_auto_history_consolidation(key, now)
+            scheduled.add(_safe_key(key))
 
-            def _on_idle_done(
-                fut: asyncio.Task,  # type: ignore[type-arg]
-                k: str = key,
-                ts: float = captured_now,
-            ) -> None:
-                self._tasks.discard(fut)
-                if fut.cancelled():
-                    return
-                if exc := fut.exception():
-                    self._defer_auto_consolidation(
-                        k, ConsolidationOutcome("failed", detail=str(exc) or exc.__class__.__name__)
-                    )
-                    return
-                outcome = fut.result()
-                if outcome.failed:
-                    self._defer_auto_consolidation(k, outcome)
-                    return
-                self._auto_retry_after.pop(k, None)
-                if outcome.status == "consolidated" and outcome.complete:
-                    self._history_consolidated[k] = ts
-
-            t.add_done_callback(_on_idle_done)
+        # A gateway restart clears ``_last_activity``. Closed sessions retain
+        # their retry deadline in metadata so the regular idle sweep can resume
+        # deferred maintenance rather than forgetting it until another event.
+        for session in self._log.list_sessions():
+            key = session.get("key")
+            metadata = self._log.get_metadata(key) if isinstance(key, str) else {}
+            if (
+                not isinstance(key, str)
+                or _safe_key(key) in scheduled
+                or not metadata.get("closed")
+                or self._is_running(key)
+                or self._retry_after(key) > now
+                or self._log.unconsolidated_count(key) < 1
+            ):
+                continue
+            self._schedule_auto_history_consolidation(key, now)
 
     def consolidate_session(self, key: str) -> None:
         """Trigger history consolidation for *key* (fire-and-forget).
@@ -3186,9 +3308,9 @@ class HistoryConsolidator:
         _session_touched_sensitive() over its window before proposing anything,
         so sensitive sessions never produce skills regardless of entry point.
         """
-        if key in self._running:
+        if self._is_running(key):
             return
-        if _time.time() < self._auto_retry_after.get(key, 0.0):
+        if _time.time() < self._retry_after(key):
             return
         if self._log.unconsolidated_count(key) < 1:
             return
@@ -3212,10 +3334,10 @@ class HistoryConsolidator:
             exc = fut.exception()
             if exc is None:
                 outcome = fut.result()
-                if outcome.failed:
+                if outcome.failed or outcome.deferred:
                     self._defer_auto_consolidation(k, outcome)
                     return
-                self._auto_retry_after.pop(k, None)
+                self._clear_auto_retry(k)
                 if outcome.status == "consolidated" and outcome.complete:
                     self._history_consolidated[k] = _time.time()
             else:
@@ -3227,13 +3349,27 @@ class HistoryConsolidator:
         t.add_done_callback(_on_done)
 
     def _defer_auto_consolidation(self, key: str, outcome: ConsolidationOutcome) -> None:
-        retry_at = _time.time() + _AUTO_CONSOLIDATION_RETRY_DELAY_S
+        delay_s = outcome.retry_after_s or _AUTO_CONSOLIDATION_RETRY_DELAY_S
+        retry_at = _time.time() + delay_s
         self._auto_retry_after[key] = retry_at
+        metadata = self._log.get_metadata(key)
+        try:
+            attempts = int(metadata.get(_AUTO_RETRY_ATTEMPTS_FIELD, 0) or 0) + 1
+        except (TypeError, ValueError):
+            attempts = 1
+        self._persist_retry_state(
+            key,
+            {
+                _AUTO_RETRY_AFTER_FIELD: retry_at,
+                _AUTO_RETRY_ATTEMPTS_FIELD: attempts,
+                _AUTO_RETRY_REASON_FIELD: outcome.detail[:300],
+            },
+        )
         logger.warning(
             "History consolidation deferred for %s after %s; next automatic attempt in %ds",
             key,
             outcome.describe(),
-            _AUTO_CONSOLIDATION_RETRY_DELAY_S,
+            delay_s,
         )
 
     async def consolidate_now(self, key: str) -> ConsolidationOutcome:
@@ -3267,6 +3403,7 @@ class HistoryConsolidator:
         # Capture the gateway loop so the thread-offloaded _process_auto_skills
         # can schedule the async dedupe judge back onto it.
         self._event_loop = asyncio.get_running_loop()
+        defer_token = _direct_consolidation_defer.set(None)
         old_offset = self._log.get_metadata(key).get("last_consolidated", 0) or 0
         self._last_llm_error = ""
         try:
@@ -3425,6 +3562,14 @@ class HistoryConsolidator:
                 "You are a memory consolidation agent. Process this conversation "
                 f"and return a JSON object with these keys:\n\n{numbered}",
             ]
+            previous_entry = meta.get("consolidation_last_history_entry", "")
+            if include_history and isinstance(previous_entry, str) and previous_entry.strip():
+                prompt_parts.append(
+                    "\n\n## Previous History Entry For This Session\n"
+                    + previous_entry.strip()
+                    + "\n\nDo not repeat facts from that entry unless this conversation "
+                    "changes their outcome. Record only the new decision, result, or blocker."
+                )
             if has_vector:
                 prompt_parts.append(f"\n\n## Current Semantic Memory\n{semantic_json}")
             if not self._migrated:
@@ -3436,6 +3581,15 @@ class HistoryConsolidator:
 
             result = await self._call_llm(prompt)
             if not result:
+                deferred = _direct_consolidation_defer.get()
+                if deferred is not None:
+                    return ConsolidationOutcome(
+                        "deferred",
+                        detail=str(deferred),
+                        old_offset=old_offset,
+                        new_offset=old_offset,
+                        retry_after_s=deferred.retry_after_s,
+                    )
                 return ConsolidationOutcome(
                     "failed",
                     detail=self._last_llm_error or "LLM returned no usable result",
@@ -3450,6 +3604,11 @@ class HistoryConsolidator:
                 # asyncio.create_task). Running it inline would let cross-process
                 # lock contention stall the whole gateway loop.
                 await run_in_embed_pool(memory.append_history, entry)
+                await asyncio.to_thread(
+                    self._log.update_metadata,
+                    key,
+                    {"consolidation_last_history_entry": entry.strip()},
+                )
                 logger.info("Consolidated %d messages for %s", len(chunk), key)
 
             # Structured memory writes (Phase 2/3). Offloaded to a worker thread:
@@ -3498,10 +3657,7 @@ class HistoryConsolidator:
             # their own (create/approve were the only triggers). Consolidation is
             # the existing idle/periodic path; throttle to at most once/hour
             # across all sessions so frequent consolidations don't rescan the set.
-            if (
-                self._skills_loader is not None
-                and (_time.time() - self._last_lifecycle) > 3600
-            ):
+            if self._skills_loader is not None and (_time.time() - self._last_lifecycle) > 3600:
                 self._last_lifecycle = _time.time()
                 try:
                     await asyncio.to_thread(
@@ -3552,6 +3708,7 @@ class HistoryConsolidator:
             logger.exception("Consolidation failed for %s", key)
             raise
         finally:
+            _direct_consolidation_defer.reset(defer_token)
             self._running.discard(key)
 
     async def _run_skill_detection(self, key: str) -> None:
@@ -3627,7 +3784,7 @@ class HistoryConsolidator:
             '"procedure_md": "<concise markdown body with '
             "## When to use / ## Steps / ## Gotchas sections, "
             '<=8000 chars>"' + scripts_field + "}. "
-            'Return null if the session was trivial, a single-shot answer, '
+            "Return null if the session was trivial, a single-shot answer, "
             "a one-off failure with no reusable takeaway, or involved "
             "sensitive paths. When a session plausibly contains a procedure "
             "a future session could reuse, lean toward returning it — every "
@@ -3651,8 +3808,10 @@ class HistoryConsolidator:
         conversation = "\n".join(_fmt_message(m) for m in window)
         prompt = (
             "You are a skill-extraction agent. Review this session excerpt and "
-            "return a JSON object with these keys:\n\n" + numbered
-            + "\n\n## Session excerpt\n" + conversation
+            "return a JSON object with these keys:\n\n"
+            + numbered
+            + "\n\n## Session excerpt\n"
+            + conversation
             + "\n\nRespond with ONLY valid JSON, no markdown fences."
         )
         result = await self._call_llm(prompt)
@@ -3800,27 +3959,26 @@ class HistoryConsolidator:
         # only enumerates LIVE skills — .pending is pruned from discovery).
         try:
             for p in loader.list_pending_skills():
-                existing.append({
-                    "key": f"auto/{p.get('slug', '')}",
-                    "description": p.get("description", ""),
-                    "triggers": p.get("triggers", ""),
-                })
+                existing.append(
+                    {
+                        "key": f"auto/{p.get('slug', '')}",
+                        "description": p.get("description", ""),
+                        "triggers": p.get("triggers", ""),
+                    }
+                )
         except Exception:
             pass
         loop = self._event_loop
 
         def _lexical() -> "tuple[str, str | None]":
-            hit = loader.find_similar(
-                description, threshold=self._auto_similarity_threshold
-            )
+            hit = loader.find_similar(description, threshold=self._auto_similarity_threshold)
             return (VERDICT_DUP, hit) if hit else (VERDICT_NEW, None)
 
         if self._judge_model and existing and loop is not None:
+
             def _judge_fn(prompt: str) -> str:
                 try:
-                    fut = asyncio.run_coroutine_threadsafe(
-                        self._dedupe_judge(prompt), loop
-                    )
+                    fut = asyncio.run_coroutine_threadsafe(self._dedupe_judge(prompt), loop)
                     return fut.result(timeout=60) or ""
                 except Exception:
                     return ""
@@ -3967,9 +4125,7 @@ class HistoryConsolidator:
             # ``approve_pending_update`` requires a live target, so staging that
             # would queue a candidate the user can never approve. Drop it
             # instead, audited so the loss is visible.
-            logger.info(
-                "Skill update skipped: target '%s' is not a live auto skill", target_key
-            )
+            logger.info("Skill update skipped: target '%s' is not a live auto skill", target_key)
             sel().log_tool_invocation(
                 session_key=key,
                 tool_name="auto_skill_create",
@@ -3996,9 +4152,7 @@ class HistoryConsolidator:
         if live_prose and self._event_loop is not None:
             try:
                 fut = asyncio.run_coroutine_threadsafe(
-                    self._merge_skill_update(
-                        live_prose, description, triggers, procedure_md
-                    ),
+                    self._merge_skill_update(live_prose, description, triggers, procedure_md),
                     self._event_loop,
                 )
                 merged = fut.result(timeout=90)
@@ -4016,9 +4170,7 @@ class HistoryConsolidator:
                 body = red
                 used_merge = True
 
-        provenance = AutoSkillProvenance(
-            session_key=key, created_at=AutoSkillProvenance.now_iso()
-        )
+        provenance = AutoSkillProvenance(session_key=key, created_at=AutoSkillProvenance.now_iso())
         # The slug pattern caps at 64 chars, and our own generation prompt permits
         # up to 60, so `<target>-update` can overflow and be REJECTED by staging —
         # silently dropping the learning, because consolidation advances its
@@ -4048,8 +4200,7 @@ class HistoryConsolidator:
             base_version=base_version,
         )
         if name:
-            logger.info("Staged skill update %s (target %s) from session %s",
-                        name, target_key, key)
+            logger.info("Staged skill update %s (target %s) from session %s", name, target_key, key)
             sel().log_tool_invocation(
                 session_key=key,
                 tool_name="auto_skill_create",
@@ -4154,7 +4305,9 @@ class HistoryConsolidator:
                 # another *proposal*, which the human reviews side by side anyway.
                 if verdict == VERDICT_UPDATE and target:
                     try:
-                        _target_is_live = self._skills_loader.read_auto_skill_body(target) is not None
+                        _target_is_live = (
+                            self._skills_loader.read_auto_skill_body(target) is not None
+                        )
                     except Exception:
                         _target_is_live = False
                     if not _target_is_live:
@@ -4515,8 +4668,7 @@ class HistoryConsolidator:
         """Run one configured local-router request without a coding-agent session."""
         if not self._consolidation_model:
             self._last_llm_error = (
-                "direct consolidation endpoint requires "
-                "KIROCREW_CONSOLIDATION_MODEL"
+                "direct consolidation endpoint requires " "KIROCREW_CONSOLIDATION_MODEL"
             )
             logger.warning("%s", self._last_llm_error)
             return None
@@ -4533,6 +4685,11 @@ class HistoryConsolidator:
                 ),
                 timeout=_CONSOLIDATION_TURN_TIMEOUT_S,
             )
+        except _DirectConsolidationDeferred as exc:
+            _direct_consolidation_defer.set(exc)
+            self._last_llm_error = str(exc)
+            logger.info("Direct consolidation deferred: %s", exc)
+            return None
         except asyncio.TimeoutError:
             self._last_llm_error = (
                 f"consolidation endpoint timed out after {_CONSOLIDATION_TURN_TIMEOUT_S:.0f}s"
