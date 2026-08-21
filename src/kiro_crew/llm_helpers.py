@@ -1143,6 +1143,7 @@ async def stream_and_collect_json(
     *,
     approval_policy: ToolApprovalPolicy = ToolApprovalPolicy.AUTO_APPROVE,
     hooks: HookManager | None = None,
+    retry_transient: bool = True,
     model_fallback: bool = False,
 ) -> dict | None:
     """Stream a message and parse the response as JSON.
@@ -1155,6 +1156,7 @@ async def stream_and_collect_json(
         message,
         approval_policy=approval_policy,
         hooks=hooks,
+        retry_transient=retry_transient,
         model_fallback=model_fallback,
     )
     return parse_llm_json(text)
