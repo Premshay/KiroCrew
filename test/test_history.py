@@ -13,6 +13,7 @@ from windows_sim import builtin_open_sharing_violation
 
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.history import (
+    _CONSOLIDATE_SESSION_KEY,
     _CONSOLIDATION_THRESHOLD,
     _SESSION_KEEP_LINES,
     _SESSION_MAX_BYTES,
@@ -1336,6 +1337,9 @@ class TestConsolidationToolPolicy:
             "tool-free lite agent; CC injects the full toolset otherwise)"
         )
         assert captured["retry_transient"] is False
+        sessions.get_or_create.assert_awaited_once_with(
+            _CONSOLIDATE_SESSION_KEY, agent="kirocrew-consolidate"
+        )
 
     @pytest.mark.asyncio
     async def test_call_llm_timeout_cancels_and_retires_dedicated_session(self, monkeypatch):

@@ -71,6 +71,11 @@ from kiro_crew.skills import SkillsLoader
 
 logger = logging.getLogger(__name__)
 
+# Automatic consolidation must not evict foreground inference. An operator
+# invoking this command has requested a finite maintenance drain instead, so it
+# uses the companion's explicitly-swappable maintenance engine.
+_MANUAL_CONSOLIDATION_AGENT = "kirocrew-consolidate-maintenance"
+
 # Markers that uniquely identify the KiroCrew repo root for project-dir
 # auto-detection. ``skills/`` + ``src/kiro_crew/`` is the stable signature:
 # ``skills/`` is editable-at-root and ``src/kiro_crew/`` pins this to the
@@ -670,6 +675,7 @@ def _consolidate_cmd(args) -> None:
         archive_after_days=cfg.skills.archive_after_days,
         generate_scripts=cfg.skills.generate_scripts,
         judge_model=cfg.skills.judge_model,
+        consolidation_agent=_MANUAL_CONSOLIDATION_AGENT,
     )
 
     # Sessions whose consolidation did not complete. Printing "done" for these
