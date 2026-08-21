@@ -2341,6 +2341,7 @@ class TestConsolidationToolPolicy:
 
         async def _fake_scj(prov, prompt, *, approval_policy=None, **kw):
             captured["approval_policy"] = approval_policy
+            captured["retry_transient"] = kw["retry_transient"]
             return {"ok": True}
 
         # Patch where it is USED — history.py imports the symbol at module top.
@@ -2352,6 +2353,7 @@ class TestConsolidationToolPolicy:
             "background consolidation turn must reject tools (parity with kiro's "
             "tool-free lite agent; CC injects the full toolset otherwise)"
         )
+        assert captured["retry_transient"] is False
 
 
 class TestConsolidationOffset:
@@ -2431,6 +2433,71 @@ class TestConsolidationOffset:
             consolidate.assert_awaited_once_with("k", include_history=True)
 
         asyncio.run(run())
+
+
+class TestConsolidationChunkAdmission:
+    """Bounded history passes must preserve message boundaries and the offset."""
+
+    @pytest.mark.asyncio
+    async def test_history_commits_one_message_aligned_chunk_at_a_time(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.memory import MemoryStore
+        import kiro_crew.history as history_mod
+
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        log.init()
+        memory = MemoryStore(workspace=tmp_path / "memory")
+        memory.init()
+        key = "dashboard:chunked"
+        log.append(key, "user", "first " + "a" * 30)
+        log.append(key, "assistant", "second " + "b" * 30)
+        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 80)
+        consolidator = HistoryConsolidator(log=log, memory=memory)
+        prompts: list[str] = []
+
+        async def fake_llm(prompt: str):
+            prompts.append(prompt)
+            return {"history_entry": "bounded pass"}
+
+        with patch.object(consolidator, "_call_llm", side_effect=fake_llm):
+            first = await consolidator._consolidate(key, include_history=True)
+            second = await consolidator._consolidate(key, include_history=True)
+
+        assert first.status == "consolidated"
+        assert first.complete is False
+        assert first.old_offset == 0
+        assert first.new_offset == 1
+        assert "first " + "a" * 30 in prompts[0]
+        assert "second " + "b" * 30 not in prompts[0]
+        assert second.status == "consolidated"
+        assert second.complete is True
+        assert second.old_offset == 1
+        assert second.new_offset == 2
+        assert log.get_metadata(key)["last_consolidated"] == 2
+
+    @pytest.mark.asyncio
+    async def test_oversized_message_defers_without_advancing_offset(self, tmp_path, monkeypatch):
+        from kiro_crew.memory import MemoryStore
+        import kiro_crew.history as history_mod
+
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        log.init()
+        memory = MemoryStore(workspace=tmp_path / "memory")
+        memory.init()
+        key = "dashboard:too-large"
+        log.append(key, "user", "x" * 100)
+        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 50)
+        consolidator = HistoryConsolidator(log=log, memory=memory)
+
+        with patch.object(consolidator, "_call_llm", new_callable=AsyncMock) as llm:
+            outcome = await consolidator._consolidate(key, include_history=True)
+
+        llm.assert_not_awaited()
+        assert outcome.failed
+        assert outcome.old_offset == 0
+        assert outcome.new_offset == 0
+        assert log.get_metadata(key)["last_consolidated"] == 0
 
 
 class TestConsolidationDoesNotBlockLoop:

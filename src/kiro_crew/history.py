@@ -79,16 +79,25 @@ _CONSOLIDATION_THRESHOLD = 30  # preferences/projects update threshold (messages
 # durable-offset threshold is its safety net; preferences can keep updating
 # without silently leaving the transcript unprocessed forever.
 _HISTORY_LAG_THRESHOLD = 300
+# The consolidator cannot know a provider's tokenizer or hidden system prompt.
+# This conservative character window leaves room for provider-supplied context
+# while preserving message boundaries.
+_CONSOLIDATION_CHUNK_MAX_CHARS = 64 * 1024
 
 
 @dataclass(frozen=True)
 class ConsolidationOutcome:
-    """The observable result of one requested history consolidation."""
+    """The observable result of one requested history consolidation.
+
+    ``complete`` is false when a bounded history pass committed only the first
+    message-aligned chunk and leaves the durable offset ready for the next one.
+    """
 
     status: str
     detail: str = ""
     old_offset: int = 0
     new_offset: int = 0
+    complete: bool = True
 
     @property
     def failed(self) -> bool:
@@ -100,7 +109,8 @@ class ConsolidationOutcome:
 
     def describe(self) -> str:
         if self.status == "consolidated":
-            return f"consolidated {self.old_offset} → {self.new_offset}"
+            suffix = "" if self.complete else " (partial)"
+            return f"consolidated {self.old_offset} → {self.new_offset}{suffix}"
         if self.detail:
             return f"{self.status}: {self.detail}"
         return self.status
@@ -341,6 +351,21 @@ def _is_plausible_memory_file(content: str, header: str) -> bool:
     if normalized in _PLACEHOLDER_BODIES:
         return False
     return True
+
+
+def _consolidation_chunk(messages: list[dict]) -> list[dict]:
+    """Return the longest message-aligned prefix that fits one background pass."""
+    chunk: list[dict] = []
+    size = 0
+    for message in messages:
+        rendered_size = len(_fmt_message(message))
+        if chunk and size + rendered_size > _CONSOLIDATION_CHUNK_MAX_CHARS:
+            break
+        if not chunk and rendered_size > _CONSOLIDATION_CHUNK_MAX_CHARS:
+            return []
+        chunk.append(message)
+        size += rendered_size
+    return chunk
 
 
 _SESSION_MAX_BYTES = 2 * 1024 * 1024  # 2MB
@@ -6076,13 +6101,12 @@ class HistoryConsolidator:
             wrote_history: bool = include_history,
         ) -> None:
             self._tasks.discard(fut)
-            if (
-                not fut.cancelled()
-                and fut.exception() is None
-                and fut.result().completed
-            ):
+            if not fut.cancelled() and fut.exception() is None:
+                outcome = fut.result()
+                if not outcome.completed:
+                    return
                 self._prefs_offset[k] = off
-                if wrote_history:
+                if wrote_history and outcome.complete:
                     self._history_consolidated[k] = _time.time()
 
         t.add_done_callback(_on_done)
@@ -6118,11 +6142,9 @@ class HistoryConsolidator:
                 ts: float = captured_now,
             ) -> None:
                 self._tasks.discard(fut)
-                if (
-                    not fut.cancelled()
-                    and fut.exception() is None
-                    and fut.result().completed
-                ):
+            if not fut.cancelled() and fut.exception() is None:
+                outcome = fut.result()
+                if outcome.completed and outcome.complete:
                     self._history_consolidated[k] = ts
 
             t.add_done_callback(_on_idle_done)
@@ -6173,7 +6195,8 @@ class HistoryConsolidator:
                 return
             exc = fut.exception()
             if exc is None:
-                if fut.result().completed:
+                outcome = fut.result()
+                if outcome.completed and outcome.complete:
                     self._history_consolidated[k] = _time.time()
             else:
                 logger.warning("consolidate_session failed for %s: %s", k, exc)
@@ -6275,6 +6298,22 @@ class HistoryConsolidator:
                 generation=generation_at_snapshot,
                 offset=total - len(unconsolidated),
             )
+            old_offset = attempted.offset
+            if include_history:
+                chunk = _consolidation_chunk(unconsolidated)
+                if not chunk:
+                    await self._note_environment_failure(
+                        key, "one transcript message exceeds the automatic consolidation window"
+                    )
+                    return ConsolidationOutcome(
+                        "failed",
+                        detail="one transcript message exceeds the automatic consolidation window",
+                        old_offset=old_offset,
+                        new_offset=old_offset,
+                    )
+            else:
+                chunk = unconsolidated
+            complete = len(chunk) == len(unconsolidated)
 
             # The sensitive guard belongs HERE, not only on the entry points.
             # ``consolidate_now`` and ``consolidate_session`` each check before
@@ -6307,7 +6346,7 @@ class HistoryConsolidator:
             else:
                 memory = self._memory
 
-            conversation = "\n".join(_fmt_message(m) for m in unconsolidated)
+            conversation = "\n".join(_fmt_message(m) for m in chunk)
 
             current_prefs = memory.read_preferences()
             current_projects = memory.read_projects()
@@ -6479,7 +6518,7 @@ class HistoryConsolidator:
                 # asyncio.create_task). Running it inline would let cross-process
                 # lock contention stall the whole gateway loop.
                 await run_in_embed_pool(memory.append_history, entry)
-                logger.info("Consolidated %d messages for %s", len(unconsolidated), key)
+                logger.info("Consolidated %d messages for %s", len(chunk), key)
 
             # Structured memory writes (Phase 2/3). Offloaded to a worker thread:
             # _write_structured_memory embeds each item via a blocking urllib call
@@ -6556,7 +6595,12 @@ class HistoryConsolidator:
             # window (see _run_skill_detection), not the incremental tail. Runs
             # only on history consolidation, guarded by flag + loader; failures
             # are logged, never fatal.
-            if include_history and self._auto_skills_enabled and self._skills_loader is not None:
+            if (
+                include_history
+                and complete
+                and self._auto_skills_enabled
+                and self._skills_loader is not None
+            ):
                 try:
                     await self._run_skill_detection(key)
                 except Exception:
@@ -6588,10 +6632,11 @@ class HistoryConsolidator:
             # thread — otherwise a slow filesystem freezes the loop (heartbeats,
             # Slack, dashboard). Same rationale as the offloads above.
             if include_history:
+                processed_offset = old_offset + len(chunk)
                 await asyncio.to_thread(
                     self._log.mark_consolidated,
                     key,
-                    total,
+                    processed_offset,
                     generation_at_snapshot,
                 )
 
@@ -6611,7 +6656,10 @@ class HistoryConsolidator:
             self._running.discard(key)
         new_offset = int(self._log.get_metadata(key).get("last_consolidated", 0) or 0)
         return ConsolidationOutcome(
-            "consolidated", old_offset=old_offset, new_offset=new_offset
+            "consolidated",
+            old_offset=old_offset,
+            new_offset=new_offset,
+            complete=complete and new_offset == total,
         )
 
     async def _run_skill_detection(self, key: str) -> None:
@@ -7531,6 +7579,7 @@ class HistoryConsolidator:
                     client,
                     prompt,
                     approval_policy=ToolApprovalPolicy.REJECT_ALL,
+                    retry_transient=False,
                     model_fallback=True,
                 )
             except Exception:
