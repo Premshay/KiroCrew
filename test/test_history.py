@@ -16,6 +16,7 @@ from kiro_crew.history import (
     _CONSOLIDATION_THRESHOLD,
     _SESSION_KEEP_LINES,
     _SESSION_MAX_BYTES,
+    ConsolidationOutcome,
     ConversationLog,
     HistoryConsolidator,
     _cache_identity,
@@ -1322,6 +1323,7 @@ class TestConsolidationToolPolicy:
 
         async def _fake_scj(prov, prompt, *, approval_policy=None, **kw):
             captured["approval_policy"] = approval_policy
+            captured["retry_transient"] = kw["retry_transient"]
             return {"ok": True}
 
         # Patch where it is USED — history.py imports the symbol at module top.
@@ -1333,6 +1335,7 @@ class TestConsolidationToolPolicy:
             "background consolidation turn must reject tools (parity with kiro's "
             "tool-free lite agent; CC injects the full toolset otherwise)"
         )
+        assert captured["retry_transient"] is False
 
 
 class TestConsolidationOffset:
@@ -1353,7 +1356,12 @@ class TestConsolidationOffset:
         c = self._make_consolidator()
 
         async def run():
-            with patch.object(c, "_consolidate", new_callable=AsyncMock):
+            with patch.object(
+                c,
+                "_consolidate",
+                new_callable=AsyncMock,
+                return_value=ConsolidationOutcome("skipped"),
+            ):
                 c.maybe_consolidate("k")
                 await asyncio.gather(*c._tasks, return_exceptions=True)
 
@@ -1361,17 +1369,40 @@ class TestConsolidationOffset:
         assert c._prefs_offset.get("k") == _CONSOLIDATION_THRESHOLD
 
     def test_offset_does_not_advance_on_failure(self):
-        """When _consolidate raises, _prefs_offset must NOT advance."""
+        """A returned failed outcome must not advance the prefs schedule."""
         c = self._make_consolidator()
 
         async def run():
-            with patch.object(c, "_consolidate", new_callable=AsyncMock) as m:
-                m.side_effect = RuntimeError("LLM failed")
+            with patch.object(
+                c,
+                "_consolidate",
+                new_callable=AsyncMock,
+                return_value=ConsolidationOutcome("failed", detail="LLM failed"),
+            ):
                 c.maybe_consolidate("k")
                 await asyncio.gather(*c._tasks, return_exceptions=True)
 
         asyncio.run(run())
         assert c._prefs_offset.get("k", 0) == 0
+        assert "k" in c._auto_retry_after
+
+    def test_exception_also_defers_automatic_retry(self):
+        """An unexpected task exception is not a successful no-op."""
+        c = self._make_consolidator()
+
+        async def run():
+            with patch.object(
+                c,
+                "_consolidate",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("provider disconnected"),
+            ):
+                c.maybe_consolidate("k")
+                await asyncio.gather(*c._tasks, return_exceptions=True)
+
+        asyncio.run(run())
+        assert c._prefs_offset.get("k", 0) == 0
+        assert "k" in c._auto_retry_after
 
     def test_retry_after_failure(self):
         """After failure, next call retries (offset still 0)."""
@@ -1379,17 +1410,87 @@ class TestConsolidationOffset:
 
         async def run():
             with patch.object(c, "_consolidate", new_callable=AsyncMock) as m:
-                m.side_effect = RuntimeError("timeout")
+                m.return_value = ConsolidationOutcome("failed", detail="timeout")
                 c.maybe_consolidate("k")
                 await asyncio.gather(*c._tasks, return_exceptions=True)
+                assert m.await_count == 1
+                # The real _consolidate() releases this guard in its finally
+                # block; this test replaces that implementation with a mock.
                 c._running.discard("k")
 
-                m.side_effect = None
+                c._auto_retry_after["k"] = 0
+                m.return_value = ConsolidationOutcome("skipped")
                 c.maybe_consolidate("k")
                 await asyncio.gather(*c._tasks, return_exceptions=True)
 
         asyncio.run(run())
         assert c._prefs_offset["k"] == _CONSOLIDATION_THRESHOLD
+
+
+class TestConsolidationChunkAdmission:
+    """History passes must be bounded without losing the durable resume point."""
+
+    @pytest.mark.asyncio
+    async def test_history_commits_one_message_aligned_chunk_at_a_time(self, tmp_path, monkeypatch):
+        from kiro_crew.memory import MemoryStore
+        import kiro_crew.history as history_mod
+
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        log.init()
+        memory = MemoryStore(workspace=tmp_path / "memory")
+        memory.init()
+        key = "dashboard:chat-chunked"
+        log.append(key, "user", "first " + "a" * 30)
+        log.append(key, "assistant", "second " + "b" * 30)
+        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 80)
+
+        consolidator = HistoryConsolidator(log=log, memory=memory)
+        prompts: list[str] = []
+
+        async def fake_llm(prompt: str):
+            prompts.append(prompt)
+            return {"history_entry": "bounded pass"}
+
+        with patch.object(consolidator, "_call_llm", side_effect=fake_llm):
+            first = await consolidator._consolidate(key, include_history=True)
+            second = await consolidator._consolidate(key, include_history=True)
+
+        assert first.status == "consolidated"
+        assert first.complete is False
+        assert first.old_offset == 0
+        assert first.new_offset == 1
+        assert "first " + "a" * 30 in prompts[0]
+        assert "second " + "b" * 30 not in prompts[0]
+        assert second.status == "consolidated"
+        assert second.complete is True
+        assert second.old_offset == 1
+        assert second.new_offset == 2
+        assert log.get_metadata(key)["last_consolidated"] == 2
+
+    @pytest.mark.asyncio
+    async def test_oversized_single_message_defers_without_advancing_offset(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.memory import MemoryStore
+        import kiro_crew.history as history_mod
+
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        log.init()
+        memory = MemoryStore(workspace=tmp_path / "memory")
+        memory.init()
+        key = "dashboard:chat-too-large"
+        log.append(key, "user", "x" * 100)
+        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 50)
+        consolidator = HistoryConsolidator(log=log, memory=memory)
+
+        with patch.object(consolidator, "_call_llm", new_callable=AsyncMock) as llm:
+            outcome = await consolidator._consolidate(key, include_history=True)
+
+        llm.assert_not_awaited()
+        assert outcome.status == "failed"
+        assert outcome.old_offset == 0
+        assert outcome.new_offset == 0
+        assert log.get_metadata(key)["last_consolidated"] == 0
 
 
 class TestConsolidationDoesNotBlockLoop:
@@ -2739,6 +2840,7 @@ class TestConsolidateSession:
 
         # Key should be removed from _running after _on_done fires
         assert "dashboard:chat-fail" not in consolidator._running
+        assert "dashboard:chat-fail" in consolidator._auto_retry_after
 
     @pytest.mark.asyncio
     async def test_consolidate_now_skips_sensitive(self, tmp_path):
@@ -3639,7 +3741,12 @@ class TestHistoryLagSelfHeal:
         for i in range(_HISTORY_LAG_THRESHOLD):
             conv_log.append(key, "user", f"m{i}")
 
-        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock:
+        with patch.object(
+            consolidator,
+            "_consolidate",
+            new_callable=AsyncMock,
+            return_value=ConsolidationOutcome("consolidated"),
+        ) as mock:
             consolidator.maybe_consolidate(key)
             await asyncio.sleep(0)
         mock.assert_called_once_with(key, include_history=True)
@@ -3655,7 +3762,12 @@ class TestHistoryLagSelfHeal:
         for i in range(_CONSOLIDATION_THRESHOLD):
             conv_log.append(key, "user", f"m{i}")
 
-        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock:
+        with patch.object(
+            consolidator,
+            "_consolidate",
+            new_callable=AsyncMock,
+            return_value=ConsolidationOutcome("skipped"),
+        ) as mock:
             consolidator.maybe_consolidate(key)
             await asyncio.sleep(0)
         mock.assert_called_once_with(key, include_history=False)
@@ -3677,7 +3789,12 @@ class TestHistoryLagSelfHeal:
         # Prefs pass has seen everything; history has seen nothing.
         consolidator._prefs_offset[key] = _HISTORY_LAG_THRESHOLD
 
-        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as mock:
+        with patch.object(
+            consolidator,
+            "_consolidate",
+            new_callable=AsyncMock,
+            return_value=ConsolidationOutcome("consolidated"),
+        ) as mock:
             consolidator.maybe_consolidate(key)
             await asyncio.sleep(0)
         mock.assert_called_once_with(key, include_history=True)
@@ -3694,7 +3811,12 @@ class TestHistoryLagSelfHeal:
         for i in range(_HISTORY_LAG_THRESHOLD):
             conv_log.append(key, "user", f"m{i}")
 
-        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock):
+        with patch.object(
+            consolidator,
+            "_consolidate",
+            new_callable=AsyncMock,
+            return_value=ConsolidationOutcome("consolidated"),
+        ):
             consolidator.maybe_consolidate(key)
             for _ in range(5):
                 await asyncio.sleep(0)
