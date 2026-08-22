@@ -3062,6 +3062,7 @@ class HistoryConsolidator:
         generate_scripts: bool = True,
         judge_model: str = "",
         consolidation_agent: str = "kirocrew-consolidate",
+        auto_consolidation_enabled: bool | None = None,
         consolidation_endpoint: str | None = None,
         consolidation_model: str | None = None,
         consolidation_auth_token: str | None = None,
@@ -3085,6 +3086,12 @@ class HistoryConsolidator:
         self._generate_scripts = generate_scripts
         self._judge_model = judge_model
         self._consolidation_agent = consolidation_agent
+        if auto_consolidation_enabled is None:
+            auto_consolidation_enabled = (
+                os.environ.get("KIROCREW_AUTO_CONSOLIDATION_ENABLED", "true").strip().lower()
+                not in _ON_LOOP_FALSY
+            )
+        self._auto_consolidation_enabled = auto_consolidation_enabled
         self._consolidation_endpoint = (
             os.environ.get("KIROCREW_CONSOLIDATION_ENDPOINT", "")
             if consolidation_endpoint is None
@@ -3180,6 +3187,8 @@ class HistoryConsolidator:
         path, so a session that is continuously active never has its history
         written at all — the failure this method's lag trigger exists to prevent.
         """
+        if not self._auto_consolidation_enabled:
+            return
         self._last_activity[key] = _time.time()
         if self._is_running(key):
             return
@@ -3267,6 +3276,8 @@ class HistoryConsolidator:
 
     def check_idle_sessions(self) -> None:
         """Check idle sessions and durable closed-session retries for history work."""
+        if not self._auto_consolidation_enabled:
+            return
         now = _time.time()
         scheduled: set[str] = set()
         for key, last in list(self._last_activity.items()):
@@ -3309,6 +3320,8 @@ class HistoryConsolidator:
         _session_touched_sensitive() over its window before proposing anything,
         so sensitive sessions never produce skills regardless of entry point.
         """
+        if not self._auto_consolidation_enabled:
+            return
         if self._is_running(key):
             return
         if _time.time() < self._retry_after(key):

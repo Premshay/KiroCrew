@@ -25,6 +25,31 @@ from kiro_crew.history import (
 )
 
 
+class TestAutomaticConsolidationSwitch:
+    def test_disabled_switch_blocks_every_automatic_entrypoint(self, tmp_path) -> None:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("session", "user", "keep this out of the automatic queue")
+        log.update_metadata("session", {"closed": True})
+        consolidator = HistoryConsolidator(
+            log=log, memory=MagicMock(), auto_consolidation_enabled=False
+        )
+
+        consolidator.maybe_consolidate("session")
+        consolidator.check_idle_sessions()
+        consolidator.consolidate_session("session")
+
+        assert consolidator._tasks == set()
+        assert consolidator._last_activity == {}
+
+    def test_environment_can_disable_automatic_consolidation(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_AUTO_CONSOLIDATION_ENABLED", "false")
+        consolidator = HistoryConsolidator(
+            log=ConversationLog(base_dir=tmp_path), memory=MagicMock()
+        )
+
+        assert consolidator._auto_consolidation_enabled is False
+
+
 class TestConversationLog:
     def test_append_creates_file(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
