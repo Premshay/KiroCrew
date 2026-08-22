@@ -25,6 +25,44 @@ from kiro_crew.history import (
 )
 
 
+class TestAutomaticConsolidationSwitch:
+    def test_disabled_switch_blocks_every_automatic_entrypoint(self, tmp_path) -> None:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("session", "user", "keep this out of the automatic queue")
+        log.update_metadata("session", {"closed": True})
+        consolidator = HistoryConsolidator(
+            log=log, memory=MagicMock(), auto_consolidation_enabled=False
+        )
+
+        consolidator.maybe_consolidate("session")
+        consolidator.check_idle_sessions()
+        consolidator.consolidate_session("session")
+
+        assert consolidator._tasks == set()
+        assert consolidator._last_activity == {}
+
+    def test_environment_can_disable_automatic_consolidation(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_AUTO_CONSOLIDATION_ENABLED", "false")
+        consolidator = HistoryConsolidator(
+            log=ConversationLog(base_dir=tmp_path), memory=MagicMock()
+        )
+
+        assert consolidator._auto_consolidation_enabled is False
+
+    @pytest.mark.asyncio
+    async def test_disabled_switch_keeps_explicit_consolidation_available(self, tmp_path) -> None:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("session", "user", "run this only when explicitly requested")
+        consolidator = HistoryConsolidator(
+            log=log, memory=MagicMock(), auto_consolidation_enabled=False
+        )
+        expected = ConsolidationOutcome("consolidated", old_offset=0, new_offset=1)
+        consolidator._consolidate = AsyncMock(return_value=expected)
+
+        assert await consolidator.consolidate_now("session") is expected
+        consolidator._consolidate.assert_awaited_once_with("session", include_history=True)
+
+
 class TestConversationLog:
     def test_append_creates_file(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
@@ -2455,7 +2493,12 @@ class TestConsolidationOffset:
         log.unconsolidated_count.return_value = 0
         # A fresh span is eligible; maybe_consolidate's pre-check reads this.
         log.consolidation_retry_state.return_value = (0, 0.0)
-        return HistoryConsolidator(log=log, memory=MagicMock(), sessions=None)
+        return HistoryConsolidator(
+            log=log,
+            memory=MagicMock(),
+            sessions=None,
+            auto_consolidation_enabled=True,
+        )
 
     def test_offset_advances_on_success(self):
         """When _consolidate succeeds, _prefs_offset should advance."""
@@ -3947,6 +3990,7 @@ class TestConsolidateSession:
             memory=mem,
             skills_loader=skills,
             auto_skills_enabled=True,
+            auto_consolidation_enabled=True,
             approval_required=False,
             auto_min_tool_calls=2,
         )
