@@ -5599,6 +5599,7 @@ async def _run_chat(
         _user_span: list[int] = []
         _span_probe = ""
         _span_base_len = -1
+        rewound = slot._rewind_context_once
         if is_slash:
             full_message = message
             sel().log_tool_invocation(
@@ -5631,7 +5632,12 @@ async def _run_chat(
 
                 if isinstance(client, AcpProvider) and client.client.resumed:
                     _provider_has_history = True
-            if is_new and not _provider_has_history and state.context_builder.conversation_log:
+            if (
+                is_new
+                and not rewound
+                and not _provider_has_history
+                and state.context_builder.conversation_log
+            ):
                 from kiro_crew.context import (  # circular: context -> chat
                     build_session_replay,
                     window_for_provider_client,
@@ -5667,7 +5673,11 @@ async def _run_chat(
             # SessionManager.stop_turn), consumed one-shot here. Use getattr
             # for prev_turn_cancelled so test doubles don't raise on access.
             _session = getattr(state.sessions, "_sessions", {}).get(session_key)
-            if _session is not None and getattr(_session, "prev_turn_cancelled", False):
+            if (
+                not rewound
+                and _session is not None
+                and getattr(_session, "prev_turn_cancelled", False)
+            ):
                 _session.prev_turn_cancelled = False
                 if state.context_builder and state.context_builder.conversation_log:
                     from kiro_crew.context import (
@@ -5820,6 +5830,7 @@ async def _run_chat(
                 ),
                 user_span_out=_user_span,
                 needs_reinjection=_needs_reinjection,
+                include_session_history=not rewound,
             )
             # The reported span is valid for the message as build_message
             # returned it. Several later steps PREPEND to the finished prompt
@@ -5842,7 +5853,11 @@ async def _run_chat(
         # build_session_context already injects recent() from JSONL, so this
         # only adds value when in-memory messages are newer than disk.
         # Skip for soft stops — session is preserved, no re-injection needed.
-        if is_new and slot.messages:
+        if is_new and rewound and not is_slash:
+            history = _build_history_prefix(slot, slot.messages[:-1])
+            if history:
+                full_message = history + full_message
+        elif is_new and slot.messages:
             # Check if last stop was soft (session preserved, no re-injection).
             # cls is a JSON-encoded dict (see api_chat_slot_stop); parse it.
             _last_stop_soft = False
@@ -5869,6 +5884,8 @@ async def _run_chat(
                     history = _build_history_prefix(slot)
                     if history:
                         full_message = history + full_message
+
+        slot._rewind_context_once = False
 
         if is_new:
             spawn_injected = await _fire(HOOK_EVENT_AGENT_SPAWN, session_key)

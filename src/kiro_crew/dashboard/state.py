@@ -1641,6 +1641,7 @@ class _ChatSlot:
         "_disk_tail_ts",
         "_frozen_prefix_cache",
         "_pending_rewrite",
+        "_rewind_context_once",
         "_file_changes",
         "linked_session_key",
         "_active_turn_session_key",
@@ -2068,6 +2069,7 @@ class _ChatSlot:
         # overwriting (the default save skips archiving). Cleared on a
         # successful rewrite save.
         self._pending_rewrite: bool = False
+        self._rewind_context_once: bool = False
         self._file_changes: list[dict[str, str]] = (
             []
         )  # [{path, content}] before-snapshots accumulated per turn for file-chip diffs

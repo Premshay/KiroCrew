@@ -59,11 +59,86 @@ class TestRewindSlot:
         roles = [m["role"] for m in slot.messages]
         assert roles == ["user"]
         assert slot.messages[0]["content"] == "edited first question"
-        # ACP session was reset
-        state.sessions.remove.assert_called_once_with("dashboard:src")
+        assert slot._rewind_context_once is True
+        # The replacement must not resume the discarded native conversation.
+        state.sessions.discard_conversation.assert_awaited_once_with("dashboard:src")
+        state.sessions.remove.assert_not_awaited()
         # Cleanup runs
         if slot.task:
             slot.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_rewind_discards_queued_successors(self, tmp_path):
+        """Queued work from the discarded suffix must not run afterwards."""
+        state = _make_state(tmp_path)
+        slot = _populate_slot(state)
+        queue_id = slot.queue_append("discarded queued prompt")
+        slot.append("queued", "discarded queued prompt", json.dumps({"queue_id": queue_id}))
+        slot.drain()
+        state.sessions._session_map.get = MagicMock(return_value="")
+
+        with patch.object(state, "broadcast_ws") as broadcast:
+            app = _make_app(state)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/chat/slots/src/rewind",
+                    json={"at_message_index": 0, "content": "edited first question"},
+                )
+                assert resp.status == 200
+
+        assert slot.queue_depth == 0
+        assert all(message["role"] != "queued" for message in slot.messages)
+        broadcast.assert_any_call(
+            "queue_pop", {"slot": "src", "content": "", "queue_id": queue_id}
+        )
+        if slot.task:
+            slot.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_rewind_rejects_when_the_boundary_cannot_be_saved(self, tmp_path, monkeypatch):
+        """A failed rewrite must not start a replacement from stale disk state."""
+        state = _make_state(tmp_path)
+        slot = _populate_slot(state)
+        original_messages = list(slot.messages)
+        state.sessions._session_map.get = MagicMock(return_value="")
+
+        def _fail_save(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_rewind._save_slot_to_history", _fail_save)
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/chat/slots/src/rewind",
+                json={"at_message_index": 0, "content": "edited first question"},
+            )
+            assert resp.status == 503
+            assert (await resp.json())["code"] == "rewind_save_failed"
+
+        assert slot.messages == original_messages
+        assert slot._rewind_context_once is False
+        state.sessions.discard_conversation.assert_awaited_once_with("dashboard:src")
+
+    @pytest.mark.asyncio
+    async def test_rewind_rejects_when_the_native_boundary_cannot_be_saved(self, tmp_path):
+        """A failed resume-sid write must leave the old branch in place."""
+        state = _make_state(tmp_path)
+        slot = _populate_slot(state)
+        original_messages = list(slot.messages)
+        state.sessions._session_map.get = MagicMock(return_value="")
+        state.sessions.discard_conversation = AsyncMock(side_effect=OSError("map write failed"))
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/chat/slots/src/rewind",
+                json={"at_message_index": 0, "content": "edited first question"},
+            )
+            assert resp.status == 503
+            assert (await resp.json())["code"] == "rewind_prepare_failed"
+
+        assert slot.messages == original_messages
+        assert slot._rewind_context_once is False
 
     @pytest.mark.asyncio
     async def test_rewind_middle_user_message_keeps_prior_turns(self, tmp_path):
@@ -86,7 +161,7 @@ class TestRewindSlot:
         assert slot.messages[0]["content"] == "first question"
         assert slot.messages[1]["content"] == "first answer"
         assert slot.messages[2]["content"] == "edited second question"
-        state.sessions.remove.assert_called_once_with("dashboard:src")
+        state.sessions.discard_conversation.assert_awaited_once_with("dashboard:src")
         if slot.task:
             slot.task.cancel()
 
