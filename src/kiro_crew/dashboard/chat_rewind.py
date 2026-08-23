@@ -198,35 +198,64 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
             except Exception:
                 logger.debug("rewind: failed to read session_map", exc_info=True)
 
+        # Keep enough state to reject the edit unchanged if its destructive
+        # history rewrite cannot be made durable.
+        previous_messages = list(slot.messages)
+        previous_queue = list(slot._queue)
+        previous_pending = list(slot._pending)
+        previous_dirty = slot._dirty
+        previous_resumed_count = slot._resumed_count
+        previous_pending_rewrite = slot._pending_rewrite
+        previous_total_messages = slot.total_messages
+
+        def restore_slot() -> None:
+            slot.messages = previous_messages
+            slot._queue = previous_queue
+            slot._pending = previous_pending
+            slot._dirty = previous_dirty
+            slot._resumed_count = previous_resumed_count
+            slot._pending_rewrite = previous_pending_rewrite
+            slot.total_messages = previous_total_messages
+            slot._rewind_context_once = False
+            slot.invalidate_source_links()
+            if previous_pending:
+                slot.event.set()
+            else:
+                slot.event.clear()
+
         # Truncate slot messages to the snapshot — everything from the
         # edited message onward is discarded (intentional, by design).
         del slot.messages[index:]
+        # The backing queue belongs to that discarded suffix too.  Rewind is
+        # accepted only while this slot is idle, so nothing can race a clear.
+        discarded_queue = list(slot._queue)
+        slot._queue.clear()
         slot.invalidate_source_links()
         slot._dirty = True
         slot._resumed_count = 0
-        # Window was truncated → next save MUST be the archive-safe rewrite path.
-        # If the inline save below fails, the flag keeps the flush loop on the
-        # rewrite path so the dropped tail is still archived.
+        # Window was truncated → the explicit snapshot below uses the
+        # archive-safe rewrite path.
         slot._pending_rewrite = True
 
-        # Swap the ACP session: kill current process AND delete the
-        # session_map entry so the next get_or_create cold-starts a fresh
-        # kiro-cli session. ``remove`` (vs ``reset``) is the right call —
-        # we want a clean slate, not a session/load resume.
+        # Durably clear the native resume sid before committing the edited
+        # history. A failure leaves the original branch intact and dispatches
+        # no replacement turn.
         if state.sessions is not None:
             try:
-                await state.sessions.remove(session_key)
+                await state.sessions.discard_conversation(session_key)
             except Exception:
                 logger.warning(
-                    "rewind: failed to remove ACP session for %s",
-                    session_key,
-                    exc_info=True,
+                    "rewind: failed to discard ACP conversation for %s", session_key, exc_info=True
                 )
-
-        # Best-effort cleanup of the orphaned kiro-cli session JSONL so it
-        # does not show up in ``kiro-cli chat -l`` or the resume picker.
-        if orphan_kiro_session_id:
-            await _delete_orphan_kiro_session(orphan_kiro_session_id)
+                restore_slot()
+                state.push_slots_update()
+                return web.json_response(
+                    {
+                        "error": "could not prepare edited conversation; retry the edit",
+                        "code": "rewind_prepare_failed",
+                    },
+                    status=503,
+                )
 
         # Append the edited prompt to slot history so the truncated +
         # edited state is what gets persisted and what the freshly-spawned
@@ -234,12 +263,34 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
         redacted_content, _ = redact_exfiltration_urls(content)
         redacted_content, _ = redact_credentials(redacted_content)
         slot.append("user", redacted_content, "msg msg-u")
+        slot._rewind_context_once = True
 
         try:
             msgs_snapshot = list(slot.messages)
             await asyncio.to_thread(_save_slot_to_history, state, slot, msgs_snapshot)
         except Exception:
             logger.warning("rewind: failed to persist truncated history", exc_info=True)
+            restore_slot()
+            state.push_slots_update()
+            return web.json_response(
+                {
+                    "error": "could not save edited conversation; retry the edit",
+                    "code": "rewind_save_failed",
+                },
+                status=503,
+            )
+
+        # Best-effort cleanup of the orphaned kiro-cli session JSONL so it
+        # does not show up in ``kiro-cli chat -l`` or the resume picker.
+        if orphan_kiro_session_id:
+            await _delete_orphan_kiro_session(orphan_kiro_session_id)
+
+        # Other open clients render queue cards from WebSocket events rather
+        # than this slot's optimistic edit, so remove every discarded card.
+        for item in discarded_queue:
+            state.broadcast_ws(
+                "queue_pop", {"slot": slot.key, "content": "", "queue_id": item["id"]}
+            )
 
         sel().log_api_access(
             caller=request_app or "dashboard",
