@@ -3243,7 +3243,7 @@ class SessionManager:
         skip_if_busy: bool = False,
         clear_conversation: bool = False,
     ) -> bool:
-        """Kill and recreate a session (context overflow recovery).
+        """Kill a live session so the next turn can recreate it.
 
         Returns True if a session was actually torn down, False if an optional
         guard below made it a no-op.
@@ -3261,7 +3261,6 @@ class SessionManager:
             (semaphore held), so a live stream is never cut mid-turn. This is
             enforced here, atomically with the pop, rather than in a caller's
             separate lock acquisition (which reopens the window).
-
         ``clear_conversation`` additionally drops the session map's native
         resume sid (the entry itself — and the channel bindings it carries —
         survives, exactly as in ``_recycle_held``): used by the still-critical
