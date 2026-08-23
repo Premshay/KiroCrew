@@ -1980,6 +1980,7 @@ class ContextBuilder:
         context_groups: frozenset[str] | None = None,
         query_text: str = "",
         project: str | None = None,
+        include_session_history: bool = True,
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -2207,7 +2208,7 @@ class ContextBuilder:
         # Inject for CC too: a fresh dashboard/Slack session maps to a new CC
         # subprocess with no in-process history, so the thread transcript must
         # be supplied for parity with kiro (which gets it natively).
-        if session_key and self.conversation_log and not resumed:
+        if include_session_history and session_key and self.conversation_log and not resumed:
             _history_header = (
                 "[THREAD CONVERSATION HISTORY — this is the PRIMARY context.\n"
                 "When the user says 'just now', 'earlier', 'the task', 'try again', "
@@ -2286,7 +2287,7 @@ class ContextBuilder:
                         parts.append(
                             _history_header + history_block + "\n[End of thread history]\n\n"
                         )
-        elif session_key and resumed:
+        elif include_session_history and session_key and resumed:
             logger.info(
                 "🔍 build_session_context: session_key=%s RESUMED — "
                 "skipping thread history (kiro-cli has native history)",
@@ -2296,7 +2297,7 @@ class ContextBuilder:
 
         # Stop event context — inject notes for recent stop events so the
         # LLM knows prior turns were cancelled by the user.
-        if session_key and self.conversation_log:
+        if include_session_history and session_key and self.conversation_log:
             _stop_notes = _build_stop_event_notes(self.conversation_log, session_key)
             if _stop_notes:
                 parts.append(_stop_notes)
@@ -2433,6 +2434,8 @@ class ContextBuilder:
 
         # Provenance-tagged entries from recent sessions (skipped for temporary)
         if (
+            include_session_history
+            and
             session_key
             and self.conversation_log
             and not blocks_reads
@@ -2509,6 +2512,7 @@ class ContextBuilder:
         user_span_out: list[int] | None = None,
         needs_reinjection: bool = False,
         context_groups: frozenset[str] | None = None,
+        include_session_history: bool = True,
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -2595,6 +2599,7 @@ class ContextBuilder:
                 context_groups=context_groups,
                 query_text=text,
                 project=project,
+                include_session_history=include_session_history,
             )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in

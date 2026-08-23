@@ -4462,11 +4462,18 @@ class SessionManager:
             self._compact_pending_verdict.pop(key, None)
         try:
             if session:
-                await session.provider.shutdown()
+                try:
+                    await session.provider.shutdown()
+                except Exception:
+                    # A native provider can already be dead. The durable map
+                    # boundary below is what prevents a later session/load.
+                    logger.warning("Native shutdown failed while discarding %s", key, exc_info=True)
             # Reap any companion subagent runtime keyed by this parent (see remove()).
             await self.release_subagent_runtime(key)
         finally:
-            self._session_map.clear_sid(key)
+            await asyncio.to_thread(self._session_map.clear_sid, key)
+            # Rewind is destructive: do not return until the cleared resume
+            # sid is durable, or a restart could reattach the old conversation.
             logger.info("Discarded native conversation (sid cleared, map entry kept): %s", key)
 
     async def drain_active_turns(self, timeout: float | None = None) -> int:
