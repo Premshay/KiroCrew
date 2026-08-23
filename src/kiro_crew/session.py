@@ -3068,6 +3068,40 @@ class SessionManager:
             self._session_map.delete(key)
             logger.info("Destroyed session (map deleted): %s", key)
 
+    async def discard_conversation(self, key: str) -> None:
+        """Tear down the live session and drop ONLY its native conversation.
+
+        Like :meth:`destroy`, the provider is shut down and the resume sid is
+        removed — the next turn cold-starts a fresh native conversation
+        instead of ``session/load``-ing the old one. UNLIKE ``destroy``, the
+        session-map ENTRY survives via ``clear_sid``: the entry also carries
+        the Slack thread/channel linkage (and the reverse thread→session
+        index built from it), so a full ``delete`` would silently unlink a
+        mirrored session and fork later inbound replies into a new
+        conversation. Used by the poisoned-conversation escalation in
+        chat_runner, where the conversation is unusable but the session's
+        channel identity must persist.
+        """
+        key = self._fold_key(key)
+        async with self._lock:
+            session = self._sessions.pop(key, None)
+            self._compact_cooldown_until.pop(key, None)
+        try:
+            if session:
+                try:
+                    await session.provider.shutdown()
+                except Exception:
+                    # A native provider can already be dead. The durable map
+                    # boundary below is what prevents a later session/load.
+                    logger.warning("Native shutdown failed while discarding %s", key, exc_info=True)
+            # Reap any companion subagent runtime keyed by this parent (see remove()).
+            await self.release_subagent_runtime(key)
+        finally:
+            await asyncio.to_thread(self._session_map.clear_sid, key)
+            # Rewind is destructive: do not return until the cleared resume
+            # sid is durable, or a restart could reattach the old conversation.
+            logger.info("Discarded native conversation (sid cleared, map entry kept): %s", key)
+
     async def drain_active_turns(self, timeout: float | None = None) -> int:
         """Bring in-flight prompts to a safe boundary before teardown.
 

@@ -1716,9 +1716,7 @@ async def persist_post_restart_continuation(state: DashboardState, slot: _ChatSl
         effective_session_key(slot),
         {"post_restart_continuation": slot.post_restart_continuation()},
     )
-
-
-def _build_history_prefix(slot: _ChatSlot) -> str:
+def _build_history_prefix(slot: _ChatSlot, messages: list[dict] | None = None) -> str:
     """Build a condensed history prefix from slot messages for session re-injection.
 
     Redacts here as defence in depth. The returned prefix is prepended to the ACP
@@ -1729,7 +1727,7 @@ def _build_history_prefix(slot: _ChatSlot) -> str:
     """
     lines: list[str] = []
     total = 0
-    for m in slot.messages:
+    for m in messages if messages is not None else slot.messages:
         role = m.get("role", "")
         if role in ("chunk", "done", "streaming", "queued", "permission", "error", "tool"):
             continue

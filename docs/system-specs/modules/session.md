@@ -254,6 +254,13 @@ re-inject the cancelled user prompt and partial assistant output. This is
 necessary because kiro-cli discards cancelled turns from its own ACP
 conversation log, so the LLM has no memory of the interrupted request.
 
+### Edit rewind context boundary
+
+Dashboard Edit + Send replaces the ACP session and runs the edited message with
+only the retained prefix from the slot. The discarded suffix is excluded from
+session replay, stop recovery, and persisted-history context; stable memory,
+rules, skills, and project context remain available.
+
 ### Eager Respawn
 
 After a hard kill, `_eager_respawn(key)` calls `get_or_create(key)` in a background task so the next user message finds a warm session. On failure, logs at debug and does nothing — the next message triggers `get_or_create` again via the normal path.
