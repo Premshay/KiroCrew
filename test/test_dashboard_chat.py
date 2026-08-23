@@ -10420,6 +10420,74 @@ class TestRunChatTransientRetry:
         return [m["content"] for m in slot.messages if m.get("role") == "assistant"]
 
     @pytest.mark.asyncio
+    async def test_context_window_rebuilds_session_and_retries_once(
+        self, tmp_path, monkeypatch
+    ):
+        """A context admission rejection starts fresh and replays the request once.
+
+        A normal retry would resume the persisted native session and repeat the
+        same rejection. The reset must instead clear that native ID, allowing
+        KiroCrew's bounded replay to seed a fresh session.
+        """
+        from kiro_crew.acp.client import AcpContextWindowExceeded
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.dashboard.chat_runner import _CONTEXT_WINDOW_RECOVERY_PREFIX
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        attempts: list[str] = []
+
+        async def _stream(msg):
+            attempts.append(msg)
+            if len(attempts) == 1:
+                raise AcpContextWindowExceeded("context full", transient=False)
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="recovered")
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        state = self._make_state(tmp_path, monkeypatch)
+        client = self._client(_stream)
+        self._wire_sessions(state, client)
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+
+        await _run_chat(state, slot, "original request")
+        await self._drain_bg(state)
+
+        assert len(attempts) == 2
+        assert attempts[1].startswith(_CONTEXT_WINDOW_RECOVERY_PREFIX)
+        assert "original request" in attempts[1]
+        state.sessions.reset.assert_awaited_once_with("dashboard:s1", clear_resume=True)
+        assert any("Rebuilding the local-model context" in t for t in self._err_texts(slot))
+        assert any("recovered" in t for t in self._assistant_texts(slot))
+
+    @pytest.mark.asyncio
+    async def test_context_window_recovery_does_not_loop(self, tmp_path, monkeypatch):
+        """A rejected rebuilt request surfaces guidance instead of requeueing forever."""
+        from kiro_crew.acp.client import AcpContextWindowExceeded
+        from kiro_crew.dashboard.chat import _run_chat
+
+        attempts = 0
+
+        async def _stream(msg):
+            nonlocal attempts
+            attempts += 1
+            raise AcpContextWindowExceeded("context full", transient=False)
+            yield  # pragma: no cover -- keeps this an async generator
+
+        state = self._make_state(tmp_path, monkeypatch)
+        client = self._client(_stream)
+        self._wire_sessions(state, client)
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+
+        await _run_chat(state, slot, "still too large")
+        await self._drain_bg(state)
+
+        assert attempts == 2
+        assert not slot._queue
+        assert state.sessions.reset.await_count == 2
+        assert any("still does not fit" in t for t in self._err_texts(slot))
+
+    @pytest.mark.asyncio
     async def test_transient_pre_token_retries_then_recovers_no_reset(
         self, tmp_path, monkeypatch
     ):

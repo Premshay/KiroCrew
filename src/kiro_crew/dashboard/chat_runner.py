@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, urlparse
 from kiro_crew import mcp_apps_render, model_registry, session_directive
 from kiro_crew.acp.client import (
     AcpAuthRequired,
+    AcpContextWindowExceeded,
     AcpError,
     AcpProcessDied,
     AcpPromptBusy,
@@ -198,6 +199,11 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402
     SYNTHETIC_RECOVERY_KIND,
     is_synthetic_recovery_item,
 )
+
+# A fresh native session needs the original request again after a context-window
+# admission failure. The marker keeps that one automatic retry distinct from a
+# genuine user turn, so a single oversized request cannot requeue forever.
+_CONTEXT_WINDOW_RECOVERY_PREFIX = "[KiroCrew context-window recovery]"
 
 
 def _empty_auto_continue_enabled() -> bool:
@@ -2820,6 +2826,7 @@ async def _run_chat(
     slot._native_subagent_output = _native_card_output
     _native_card_output_len: dict[str, int] = {}
     needs_session_reset = False
+    clear_native_resume = False
     _auth_required = False
     saw_compaction = False
     _turn_tool_calls = 0  # tool dispatches this turn (refusal diagnostic)
@@ -2832,11 +2839,13 @@ async def _run_chat(
     # True when this turn IS an automatic refusal-recovery continuation. Used to
     # keep the synthetic prompt out of the linked-Slack user-message mirror.
     _is_recovery = message.startswith(REFUSAL_RECOVERY_PREFIX)
+    _context_window_recovery = message.startswith(_CONTEXT_WINDOW_RECOVERY_PREFIX)
     # The post-fan-out synthesis prompt is a synthetic continuation too: never
     # mirror it to linked surfaces (Slack/Telegram) as if the user typed it —
     # only its assistant reply is delivered.
     _is_synthetic = (
         _is_recovery
+        or _context_window_recovery
         or message.startswith(SUBAGENT_SYNTHESIS_PREFIX)
         or _peer_channel_request
         or _post_restart_continuation
@@ -5642,6 +5651,54 @@ async def _run_chat(
             # depth>0 with budget remaining: no re-queue (mirrors AcpProcessDied),
             # but still surface feedback so the nested turn doesn't fail silently.
             slot.append("error", "⟳ Session busy — please retry.", "msg msg-err")
+    except AcpContextWindowExceeded as exc:
+        # The router rejected this request before model execution because the
+        # persisted native conversation no longer fits its context window. A
+        # normal reset preserves the native ID and would resume that same
+        # oversized conversation, so clear it and let the next acquire use the
+        # bounded KiroCrew replay path instead. One marked retry preserves the
+        # original request without allowing an unbounded recovery loop.
+        logger.warning("Context window exceeded in slot %s: %s", slot.key, exc)
+        needs_session_reset = True
+        clear_native_resume = True
+        if assistant_text:
+            _safe, _ = redact_exfiltration_urls(assistant_text)
+            _safe, _ = redact_credentials(_safe)
+            slot.messages = [m for m in slot.messages if m.get("role") != "chunk"]
+            slot.append("assistant", _safe, "msg msg-a")
+        if _should_suppress_requeue(slot):
+            slot.append(
+                "error",
+                "The local model context is full. The session was rebuilt; please retry.",
+                "msg msg-err",
+            )
+        elif _prompt_depth != 0:
+            slot.append(
+                "error",
+                "The local model context is full. The session was rebuilt; please retry.",
+                "msg msg-err",
+            )
+        elif _context_window_recovery:
+            slot.append(
+                "error",
+                "The rebuilt local-model context still does not fit this request. "
+                "Shorten the request or reduce the tool output, then retry.",
+                "msg msg-err",
+            )
+        else:
+            slot.append(
+                "error",
+                "Rebuilding the local-model context and retrying…",
+                "msg msg-err",
+            )
+            slot.queue_insert(
+                0,
+                f"{_CONTEXT_WINDOW_RECOVERY_PREFIX}\n"
+                "The previous native session was discarded because it exceeded "
+                "the model context window. Treat the following as the user's "
+                f"original request and answer it normally:\n\n{message}",
+                kind=SYNTHETIC_RECOVERY_KIND,
+            )
     except AcpError as exc:
         # The exception CLASS is logged alongside the message because the
         # session-health scanner keys its prompt_stuck signal off this line, and
@@ -5954,9 +6011,11 @@ async def _run_chat(
                     logger.debug("Stream cleanup failed", exc_info=True)
             if _acquired and needs_session_reset:
                 try:
-                    await state.sessions.reset(session_key)
+                    await state.sessions.reset(
+                        session_key, clear_resume=clear_native_resume
+                    )
                 except Exception:
-                    logger.warning("Failed to reset session %s after agent switch", session_key)
+                    logger.warning("Failed to reset session %s after recovery", session_key)
         finally:
             if _acquired:
                 # A successful reset() above already popped the key under its
