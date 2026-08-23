@@ -743,6 +743,15 @@ class AcpPromptBusy(AcpError):  # noqa: N818
     """
 
 
+class AcpContextWindowExceeded(AcpError):  # noqa: N818
+    """The upstream model rejected a prompt that exceeds its context window.
+
+    Interactive callers must start a fresh native session before retrying: a
+    normal reset preserves the stored native session ID and would resume the
+    same oversized history.
+    """
+
+
 # kiro-cli emits a "not logged in" banner on stderr when the user's session
 # has expired. Detected during spawn/prompt so we can raise AcpAuthRequired
 # (non-retryable) instead of churning through the retry ladder.
@@ -1106,13 +1115,22 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
 
         req_id_match = re.search(r"request_id:\s*([0-9a-fA-F-]+)", data)
         req_id_suffix = f" (request_id: {req_id_match.group(1)})" if req_id_match else ""
+        unentitled = _model_is_unentitled(data, available_models)
 
+        # The fleet router admits requests before forwarding.  Its machine code
+        # tells interactive callers to rebuild from bounded KiroCrew history;
+        # do not leak the router's JSON error envelope to the user.
+        if _CONTEXT_WINDOW_EXCEEDED_RE.search(haystack):
+            formatted = (
+                "The local model context window is full. The conversation must "
+                "be rebuilt from a shorter history before this request can run."
+                f"{req_id_suffix}"
+            )
         # Entitlement failure: this account was never offered the model, so the
         # capacity/rollout advice below would be actively misleading (there is
-        # nothing to wait for). Checked FIRST because upstream uses the same
-        # string for both cases.
-        unentitled = _model_is_unentitled(data, available_models)
-        if unentitled:
+        # nothing to wait for). Checked before the generic model-unavailable
+        # branch because upstream uses the same string for both cases.
+        elif unentitled:
             usable = [m.strip() for m in (available_models or []) if m and m.strip()]
             # Cap the list: an account with many models would otherwise bury the
             # message, and the picker shows the full set anyway.
@@ -1289,6 +1307,7 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
 
 # ---------------------------------------------------------------------------
 _PROMPT_BUSY_RE = re.compile(r"already in progress", re.IGNORECASE)
+_CONTEXT_WINDOW_EXCEEDED_RE = re.compile(r"\bcontext_window_exceeded\b", re.IGNORECASE)
 
 
 def _rejected_model_from_error(error: object) -> str | None:
@@ -1311,9 +1330,9 @@ def _rejected_model_from_error(error: object) -> str | None:
 def _raise_acp_error(error: object, available_models: Sequence[str] | None = None) -> None:
     """Format and raise the appropriate AcpError subclass for *error*.
 
-    Delegates formatting to ``_format_acp_error`` and raises either
-    ``AcpPromptBusy`` (when the backend reports a concurrent in-flight prompt)
-    or the generic ``AcpError`` for all other cases.
+    Delegates formatting to ``_format_acp_error`` and raises a typed error for
+    known recovery paths, including ``AcpPromptBusy`` and a context-window
+    admission rejection. All other errors remain generic ``AcpError`` values.
 
     *available_models* is passed to BOTH the formatter and the transient
     classifier so a model-rejection's wording and its retry verdict are decided
@@ -1324,6 +1343,8 @@ def _raise_acp_error(error: object, available_models: Sequence[str] | None = Non
     raw_data = ""
     if isinstance(error, dict):
         raw_data = f"{error.get('data', '')} {error.get('message', '')}"
+    if _CONTEXT_WINDOW_EXCEEDED_RE.search(raw_data):
+        raise AcpContextWindowExceeded(formatted, transient=False)
     if _PROMPT_BUSY_RE.search(raw_data):
         raise AcpPromptBusy(formatted)
     err = AcpError(formatted, transient=_is_transient_raw_error(error, available_models))

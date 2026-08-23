@@ -2598,8 +2598,9 @@ class SessionManager:
         *,
         expect_session: _Session | None = None,
         skip_if_busy: bool = False,
+        clear_resume: bool = False,
     ) -> bool:
-        """Kill and recreate a session (context overflow recovery).
+        """Kill a live session so the next turn can recreate it.
 
         Returns True if a session was actually torn down, False if an optional
         guard below made it a no-op.
@@ -2617,6 +2618,10 @@ class SessionManager:
             (semaphore held), so a live stream is never cut mid-turn. This is
             enforced here, atomically with the pop, rather than in a caller's
             separate lock acquisition (which reopens the window).
+          * ``clear_resume`` — clear the persisted native session ID together
+            with the pop. Use only when that native conversation is itself
+            unusable (for example, an upstream context-window rejection);
+            ordinary resets deliberately preserve it for resume.
         """
         key = self._fold_key(key)
         async with self._lock:
@@ -2626,6 +2631,8 @@ class SessionManager:
             if skip_if_busy and current is not None and current.semaphore.locked():
                 return False
             session = self._sessions.pop(key, None)
+            if clear_resume:
+                self._session_map.clear_sid(key)
             # The new process is a fresh start — drop any stale failure
             # cooldown so it isn't inherited.
             self._compact_cooldown_until.pop(key, None)
