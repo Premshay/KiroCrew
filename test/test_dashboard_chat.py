@@ -14469,6 +14469,37 @@ class TestRunChatTransientRetry:
         assert slot._transient_5xx_retries == 0
 
     @pytest.mark.asyncio
+    async def test_context_window_discards_native_session_then_retries_once(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.acp.client import AcpContextWindowExceeded
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        call_count = 0
+
+        async def _stream(_msg):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise AcpContextWindowExceeded("context window is full", transient=False)
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="rebuilt-result")
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        state = self._make_state(tmp_path, monkeypatch)
+        self._wire_sessions(state, self._client(_stream))
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+
+        await _run_chat(state, slot, "hello")
+        await self._drain_bg(state)
+
+        assert call_count == 2
+        state.sessions.discard_conversation.assert_awaited_once_with("dashboard:s1")
+        state.sessions.reset.assert_not_awaited()
+        assert any("rebuilt-result" in text for text in self._assistant_texts(slot))
+
+    @pytest.mark.asyncio
     async def test_transient_post_token_textonly_retries_once(self, tmp_path, monkeypatch):
         """A transient 5xx AFTER text streamed (no tool call) is retried EXACTLY
         ONCE, APPEND-ONLY: the streamed partial is PRESERVED (finalized as a

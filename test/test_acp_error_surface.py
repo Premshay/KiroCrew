@@ -34,7 +34,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kiro_crew.acp.client import AcpError, AcpPromptBusy
+from kiro_crew.acp.client import AcpContextWindowExceeded, AcpError, AcpPromptBusy
 from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.types import JsonRpcMessage
 
@@ -54,6 +54,15 @@ _PROMPT_BUSY = {
     "code": -32603,
     "message": "Internal error",
     "data": "Prompt already in progress",
+}
+
+_CONTEXT_WINDOW_EXCEEDED = {
+    "code": -32603,
+    "message": "Internal error",
+    "data": (
+        'API Error: 413 {"code":"context_window_exceeded",'
+        '"input_tokens":131717,"context_size":131072}'
+    ),
 }
 
 # kiro-cli >= 2.16 rewording of the capacity rejection, which names NO model.
@@ -139,6 +148,14 @@ class TestNoRawDictInUserFacingError:
         exc = await driver(_PROMPT_BUSY)
         assert isinstance(exc, AcpPromptBusy)
         assert "still processing a previous request" in str(exc)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_context_window_admission_raises_subclass(self, driver):
+        exc = await driver(_CONTEXT_WINDOW_EXCEEDED)
+        assert isinstance(exc, AcpContextWindowExceeded)
+        assert exc.transient is False
+        assert "context window is full" in str(exc)
 
     @pytest.mark.asyncio
     async def test_unknown_shape_still_preserved(self):
