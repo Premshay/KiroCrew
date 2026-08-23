@@ -278,6 +278,19 @@ class TestSessionManager:
         provider.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_context_window_reset_discards_native_conversation(self, cfg):
+        """A recovery reset can opt out of resuming an unusable native session."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr.release("thread1")
+        mgr._session_map.set("thread1", "native-session", provider="external-test")
+
+        await mgr.reset("thread1", clear_conversation=True)
+
+        assert mgr._session_map.get("thread1") == ""
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
     async def test_held_session_does_not_block_other_sessions(self, cfg):
         """A SAME-KEY second acquirer parked on session A's held semaphore must
         NOT block get_or_create for a DIFFERENT session B. This is the actual
