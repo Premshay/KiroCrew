@@ -9,6 +9,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from kiro_crew.context import ContextBuilder, _neutralize_structural_markers
+from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import ContextRule, HookManager, HooksConfig
 from kiro_crew.learn import LessonStore
 from kiro_crew.memory import MemoryStore
@@ -75,6 +76,25 @@ class TestMemoryStoreOverrideProperty:
 
 
 class TestContextBuilder:
+    def test_session_history_can_be_omitted_without_losing_memory(self, tmp_path):
+        store = MemoryStore(workspace=tmp_path / "ws")
+        store.write("# Memory\n\nUser prefers concise replies.")
+        conversation_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conversation_log.init()
+        conversation_log.append("dashboard:tab-1", "user", "abandoned prompt")
+        conversation_log.append("dashboard:tab-1", "assistant", "abandoned answer")
+        builder = ContextBuilder(
+            memory=store,
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            conversation_log=conversation_log,
+        )
+
+        context = builder.build_session_context("dashboard:tab-1", include_session_history=False)
+
+        assert "abandoned prompt" not in context
+        assert "abandoned answer" not in context
+        assert "User prefers concise replies." in context
+
     def test_empty_context_has_critical_rules(self, tmp_path):
         builder = ContextBuilder(
             memory=MemoryStore(workspace=tmp_path / "ws"),
