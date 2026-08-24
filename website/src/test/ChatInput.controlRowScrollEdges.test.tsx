@@ -63,6 +63,16 @@ describe('ChatInput control-row scroll-edge cues', () => {
     expect(rightCue()).toBeNull()
   })
 
+  it('reserves the fixed voice and send controls before the row can scroll', () => {
+    // The row's overflow container is nested below this group. Without
+    // `flex-1`, that group grows to its content width and paints under the
+    // fixed action group instead of giving the scroller its remaining space.
+    renderWithProviders(<ChatInput {...defaultProps} />)
+    const leftControls = controlRow().parentElement?.parentElement
+    expect(leftControls).toHaveClass('flex-1')
+    expect(leftControls).toHaveClass('min-w-0')
+  })
+
   it('cues only the side hiding content when the row overflows', () => {
     stubGeometry({ hidden: 240 })
     renderWithProviders(<ChatInput {...defaultProps} />)
