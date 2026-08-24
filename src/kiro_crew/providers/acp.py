@@ -294,6 +294,7 @@ class AcpProvider(LLMProvider):
         mcp_gateway_settings_mcp_json: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
+        model_switch_method: str = "",
         crew_agent: str | None = None,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
@@ -319,10 +320,12 @@ class AcpProvider(LLMProvider):
             # kiro-cli path — fully inert; a companion-registered backend threads
             # it.
             "permission_mode": permission_mode,
+            "model_switch_method": model_switch_method,
         }
         if agent:
             kwargs["agent"] = agent
         self._client = AcpClient(**kwargs)
+        self.model_switch_method = model_switch_method
         # Consumer opt-in for the low-fidelity child permission downgrade
         # (see child_fidelity_aware property). Set by fidelity-aware
         # consumers (dashboard chat) BEFORE startup; re-applied when

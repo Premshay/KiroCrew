@@ -2080,6 +2080,7 @@ class AcpClient:
         mcp_gateway_settings_mcp_json: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
+        model_switch_method: str = "",
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -2097,6 +2098,9 @@ class AcpClient:
         self._agent = agent
         self._sandbox_mode = sandbox_mode
         self._acp_backend = acp_backend
+        # Codex ACP is launched through the Claude adapter seam but accepts model
+        # changes only through session/set_model, not the model config option.
+        self._model_switch_method = model_switch_method
         # Claude backend permission mode (Auto-mode / permission-UI parity).
         # Inert on the kiro-cli path and unused by the public core; a companion
         # that drives the _is_claude seam reads/writes it and wires the
@@ -2408,11 +2412,13 @@ class AcpClient:
         # instead of calling into here — otherwise the same stale setting that is
         # quietly withheld on a cold start would raise and kill a warm claim,
         # making the outcome depend on whether a pooled process happened to exist.
-        if self._is_kiro and self._model_is_unusable(model_id):
+        if (
+            self._is_kiro or self._model_switch_method == "session_set_model"
+        ) and self._model_is_unusable(model_id):
             _rejected_log, _ = redact_exfiltration_urls(str(model_id))
             _rejected_log, _ = redact_credentials(_rejected_log)
             raise AcpModelUnavailable(_rejected_log, self._advertised_model_ids())
-        if self._is_claude:
+        if self._is_claude and self._model_switch_method != "session_set_model":
             await self.set_config_option("model", model_id)
         else:
             await self._send_request(
@@ -2523,7 +2529,9 @@ class AcpClient:
         if not self._model or self._model == DEFAULT_MODEL:
             logger.info("ACP model: %s (from agent config)", self._model or "auto")
             return
-        if self._is_kiro and self._model_is_unusable(self._model):
+        if (
+            self._is_kiro or self._model_switch_method == "session_set_model"
+        ) and self._model_is_unusable(self._model):
             _withheld_log, _ = redact_exfiltration_urls(str(self._model))
             _withheld_log, _ = redact_credentials(_withheld_log)
             logger.warning(
@@ -2539,7 +2547,7 @@ class AcpClient:
             # unusable id here would re-offer it on every claim.
             self._model = DEFAULT_MODEL
             return
-        if self._is_claude:
+        if self._is_claude and self._model_switch_method != "session_set_model":
             await self.set_config_option("model", self._model)
         else:
             await self._send_request(

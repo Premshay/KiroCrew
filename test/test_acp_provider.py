@@ -43,6 +43,17 @@ def _async_iter(items):
     return _gen()
 
 
+def test_model_switch_method_reaches_client():
+    with patch("kiro_crew.providers.acp.AcpClient") as client_cls:
+        provider = AcpProvider(
+            acp_backend=ACP_BACKEND_CLAUDE,
+            model_switch_method="session_set_model",
+        )
+
+    assert client_cls.call_args.kwargs["model_switch_method"] == "session_set_model"
+    assert provider.model_switch_method == "session_set_model"
+
+
 class TestServedModel:
     """served_model is the PUBLIC accessor the poisoned-conversation canary
     probes (chat_runner never reaches into ``_client`` internals). These tests
