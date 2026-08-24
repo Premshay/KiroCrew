@@ -86,6 +86,8 @@ _HISTORY_LAG_THRESHOLD = 300
 # provider so its dedicated background session cannot block later maintenance.
 _CONSOLIDATION_TURN_TIMEOUT_S = 3 * 60
 _CONSOLIDATION_CANCEL_ACK_TIMEOUT_S = 5.0
+_CONSOLIDATION_LANE_BUSY_RETRY_S = 60.0
+_CONSOLIDATION_NO_LANE_RETRY_S = 5 * 60.0
 # The consolidator cannot know a provider's tokenizer or hidden system prompt.
 # This conservative character window leaves room for provider-supplied context
 # while preserving message boundaries.
@@ -99,12 +101,45 @@ def _post_consolidation_request(
     payload = json.dumps(
         {"model": model, "messages": [{"role": "user", "content": prompt}]}
     ).encode("utf-8")
-    headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+    headers = {
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        # Consolidation is maintenance on Nexus's shared local fleet. It may
+        # run only on an idle compatible lane, so it cannot queue behind or
+        # evict an interactive turn.
+        "X-Fleet-Require-Idle": "true",
+    }
     if auth_token:
         headers["x-api-key"] = auth_token
     request = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # nosemgrep
-        decoded = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosemgrep
+            decoded = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code != 503:
+            raise
+        try:
+            refusal = json.loads(exc.read().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise
+        if not isinstance(refusal, dict):
+            raise
+        code = refusal.get("code")
+        if code not in {"fleet_lane_busy", "fleet_no_available_lane"}:
+            raise
+        default_retry = (
+            _CONSOLIDATION_LANE_BUSY_RETRY_S
+            if code == "fleet_lane_busy"
+            else _CONSOLIDATION_NO_LANE_RETRY_S
+        )
+        try:
+            retry_after_s = float(exc.headers.get("Retry-After", default_retry))
+        except (TypeError, ValueError):
+            retry_after_s = default_retry
+        if not math.isfinite(retry_after_s) or retry_after_s <= 0:
+            retry_after_s = default_retry
+        detail = str(refusal.get("error") or code)
+        raise _ConsolidationLaneUnavailable(detail, retry_after_s) from exc
     if not isinstance(decoded, dict):
         raise ValueError("consolidation endpoint returned a non-object JSON response")
     return decoded
@@ -448,6 +483,14 @@ class _ConsolidationNotDispatched(Exception):
     rather than reported as a flag beside the result so a caller cannot silently
     drop the distinction.
     """
+
+
+class _ConsolidationLaneUnavailable(_ConsolidationNotDispatched):
+    """The local fleet declined maintenance before a model turn was sent."""
+
+    def __init__(self, detail: str, retry_after_s: float) -> None:
+        super().__init__(detail)
+        self.retry_after_s = retry_after_s
 
 
 class HistoryLockTimeout(TimeoutError):
@@ -6095,7 +6138,14 @@ class HistoryConsolidator:
                 "Could not mark abandoned consolidation for %s", key, exc_info=True
             )
 
-    async def _note_environment_failure(self, key: str, reason: str) -> None:
+    async def _note_environment_failure(
+        self,
+        key: str,
+        reason: str,
+        *,
+        base_secs: float = _CONSOLIDATION_BACKOFF_BASE_SECS,
+        max_secs: float = _CONSOLIDATION_BACKOFF_MAX_SECS,
+    ) -> None:
         """Arm the backoff for a consolidation that never reached the provider.
 
         Deliberately does NOT touch the attempt cap. A pre-dispatch failure spends
@@ -6109,8 +6159,8 @@ class HistoryConsolidator:
             failures, retry_at = await asyncio.to_thread(
                 self._log.record_consolidation_environment_failure,
                 key,
-                _CONSOLIDATION_BACKOFF_BASE_SECS,
-                _CONSOLIDATION_BACKOFF_MAX_SECS,
+                base_secs,
+                max_secs,
             )
         except Exception:
             logger.warning(
@@ -6562,7 +6612,15 @@ class HistoryConsolidator:
                 # exists to prevent. Arm the backoff only, so a broken host retries
                 # on a widening interval instead of on every 60s tick.
                 if include_history:
-                    await self._note_environment_failure(key, str(exc))
+                    if isinstance(exc, _ConsolidationLaneUnavailable):
+                        await self._note_environment_failure(
+                            key,
+                            str(exc),
+                            base_secs=exc.retry_after_s,
+                            max_secs=exc.retry_after_s,
+                        )
+                    else:
+                        await self._note_environment_failure(key, str(exc))
                 return ConsolidationOutcome(
                     "failed", detail=str(exc), old_offset=old_offset, new_offset=old_offset
                 )
@@ -7752,6 +7810,8 @@ class HistoryConsolidator:
             )
             logger.warning("%s", self._last_llm_error)
             return None
+        except _ConsolidationLaneUnavailable:
+            raise
         except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
             detail, _ = redact_credentials(str(exc).strip() or exc.__class__.__name__)
             detail, _ = redact_exfiltration_urls(detail)

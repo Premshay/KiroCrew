@@ -2452,6 +2452,48 @@ class TestConsolidationToolPolicy:
             180,
         )
 
+    def test_direct_request_requires_an_idle_local_fleet_lane(self) -> None:
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"content": []}'
+
+        with patch("kiro_crew.history.urllib.request.urlopen", return_value=_Response()) as open_url:
+            history._post_consolidation_request(
+                "http://router.example/v1/messages", "consolidate", "", "summarize", 30
+            )
+
+        request = open_url.call_args.args[0]
+        assert request.get_header("X-fleet-require-idle") == "true"
+
+    @pytest.mark.asyncio
+    async def test_direct_lane_refusal_is_unbilled_and_uses_router_retry(self, tmp_path) -> None:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("session", "user", "summarize this after the active turn")
+        consolidator = HistoryConsolidator(
+            log=log,
+            memory=MagicMock(),
+            sessions=None,
+            consolidation_endpoint="http://router.example",
+            consolidation_model="consolidate",
+        )
+        refusal = history._ConsolidationLaneUnavailable("fleet_lane_busy", 60.0)
+
+        with patch("kiro_crew.history._post_consolidation_request", side_effect=refusal):
+            outcome = await consolidator.consolidate_now("session")
+
+        meta = log.get_metadata("session")
+        assert outcome.status == "failed"
+        assert outcome.detail == "fleet_lane_busy"
+        assert meta.get("consolidation_attempts", 0) == 0
+        assert meta["consolidation_env_failures"] == 1
+        assert 50 <= meta["consolidation_retry_at"] - time.time() <= 70
+
     @pytest.mark.asyncio
     async def test_direct_endpoint_admits_one_inflight_request(self):
         import threading
