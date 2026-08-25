@@ -16,7 +16,11 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
-from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
+from kiro_crew.acp.client import (
+    acp_model_config_options,
+    advertised_model_ids,
+    model_is_unusable,
+)
 from kiro_crew.agent import (
     AGENT_FILENAME,
     clear_model_pin,
@@ -1631,6 +1635,11 @@ async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
         )
         available = await provider.discover_models()
         efforts = getattr(provider, "get_valid_effort_levels", lambda: [])()
+        configured_models = acp_model_config_options(
+            getattr(provider, "acp_config_options", [])
+        )
+        if configured_models:
+            available = configured_models
         models = [
             {
                 "modelId": str(model.get("modelId") or ""),

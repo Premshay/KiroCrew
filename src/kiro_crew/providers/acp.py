@@ -923,6 +923,11 @@ class AcpProvider(LLMProvider):
         """
         return self._client.available_models()
 
+    @property
+    def acp_config_options(self) -> list[dict[str, Any]]:
+        """Session config options advertised by the active ACP backend."""
+        return list(getattr(self._client, "acp_config_options", []))
+
     def get_valid_effort_levels(self) -> list[str]:
         """Effort levels the backend reported for the CURRENT model, in ACP order.
 
@@ -1018,21 +1023,22 @@ class AcpProvider(LLMProvider):
         the push entirely — there is nothing to set, and attempting it would
         spam errors and trigger a session reset on every turn.
         """
-        if not self._client.supports_config_option("effort"):
-            logger.debug("claude-agent-acp exposes no 'effort' config option; skipping effort push")
+        config_id = self._client.effort_config_option_id()
+        if not config_id:
+            logger.debug("ACP backend exposes no effort config option; skipping effort push")
             return
         # Descend from the requested level through lower levels (e.g.
         # max → xhigh → high). Never escalate above what was asked.
         try:
             start = EFFORT_LEVELS.index(level)
         except ValueError:
-            await self._client.set_config_option("effort", level)
+            await self._client.set_config_option(config_id, level)
             return
         ladder = [lvl for lvl in reversed(EFFORT_LEVELS[: start + 1])]
         last_exc: Exception | None = None
         for candidate in ladder:
             try:
-                await self._client.set_config_option("effort", candidate)
+                await self._client.set_config_option(config_id, candidate)
                 if candidate != level:
                     logger.info(
                         "CC effort %r unsupported by model %s — applied %r instead",
@@ -1048,7 +1054,7 @@ class AcpProvider(LLMProvider):
                     # nothing to set; skip silently rather than reset.
                     logger.debug("claude-agent-acp rejected 'effort' as unknown; skipping")
                     return
-                if "config option effort" not in msg:
+                if f"config option {config_id}" not in msg:
                     raise  # not a value-rejection — a real failure
                 last_exc = exc
                 continue
@@ -1072,8 +1078,8 @@ class AcpProvider(LLMProvider):
         # Older claude-agent-acp builds advertise no 'effort' config option;
         # attempting to push would fail with 'Unknown config option' and reset
         # the session. Report unsupported so the dashboard leaves the UI as-is.
-        if self.is_claude_backend and not self._client.supports_config_option("effort"):
-            logger.info("change_effort skipped — claude-agent-acp build exposes no 'effort' option")
+        if self.is_claude_backend and not self._client.effort_config_option_id():
+            logger.info("change_effort skipped — ACP backend exposes no effort option")
             return False
         # Accept any level the dynamic validation set knows about — ACP backends
         # can report levels beyond the canonical five (effort.py), and those are

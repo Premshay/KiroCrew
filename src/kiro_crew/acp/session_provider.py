@@ -28,6 +28,7 @@ from kiro_crew.acp.client import (
     AcpError,
     AcpModelUnavailable,
     AcpProcessDied,
+    acp_config_option_values,
     advertised_model_ids,
     model_is_unusable,
 )
@@ -572,7 +573,8 @@ class AcpSessionProvider(LLMProvider):
         error instead of recovering with a session reset — a reset here would
         destroy the live conversation and still land on a different model.
         """
-        advertised = advertised_model_ids(self._handle.available_models)
+        advertised = acp_config_option_values(self.acp_config_options, "model")
+        advertised.extend(advertised_model_ids(self._handle.available_models))
         if model_is_unusable(model_id, advertised):
             raise AcpModelUnavailable(model_id, advertised)
         await self._guarded(self._handle.set_model(model_id))
@@ -639,6 +641,10 @@ class AcpSessionProvider(LLMProvider):
     def get_valid_effort_levels(self) -> list[str]:
         """Valid effort levels from config options."""
         return self._handle.get_valid_effort_levels()
+
+    def effort_config_option_id(self) -> str | None:
+        """ACP id used to change reasoning effort on this backend."""
+        return self._handle.effort_config_option_id()
 
     def supports_config_option(self, config_id: str) -> bool:
         """Whether the session advertised a config option with this id."""

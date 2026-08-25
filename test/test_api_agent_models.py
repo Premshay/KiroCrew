@@ -81,6 +81,55 @@ async def test_live_model_discovery_returns_advertised_subscription_models():
 
 
 @pytest.mark.asyncio
+async def test_config_options_separate_codex_models_from_reasoning_effort():
+    provider = SimpleNamespace(
+        discover_models=AsyncMock(
+            return_value=[
+                {"modelId": "gpt-5.6-sol[low]", "name": "GPT-5.6 Sol (low)"},
+                {"modelId": "gpt-5.6-sol[high]", "name": "GPT-5.6 Sol (high)"},
+            ]
+        ),
+        acp_config_options=[
+            {
+                "id": "model",
+                "options": [
+                    {
+                        "value": "gpt-5.6-sol",
+                        "name": "GPT-5.6 Sol",
+                        "description": "Frontier coding model",
+                    }
+                ],
+            },
+            {
+                "id": "reasoning_effort",
+                "options": [{"value": "low"}, {"value": "high"}],
+            },
+        ],
+        get_valid_effort_levels=lambda: ["low", "high"],
+    )
+    sessions = _Sessions(provider)
+
+    with patch("kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load", return_value=_config()):
+        async with TestClient(
+            TestServer(_app({"model": "selectable", "effort": "selectable"}, sessions))
+        ) as client:
+            response = await client.get("/api/agents/codex/models")
+            assert response.status == 200
+            body = await response.json()
+
+    assert body == {
+        "models": [
+            {
+                "modelId": "gpt-5.6-sol",
+                "name": "GPT-5.6 Sol",
+                "description": "Frontier coding model",
+            }
+        ],
+        "effort_levels": ["low", "high"],
+    }
+
+
+@pytest.mark.asyncio
 async def test_managed_runtime_does_not_start_a_discovery_session():
     sessions = SimpleNamespace(get_or_create=AsyncMock())
     policy = {"model": "managed", "effort": "managed"}

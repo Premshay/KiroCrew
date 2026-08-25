@@ -458,6 +458,7 @@ class TestEffortControl:
         provider._client.set_config_option = AsyncMock()
         # Default: the session advertises an 'effort' option (modern adapter).
         provider._client.supports_config_option = MagicMock(return_value=True)
+        provider._client.effort_config_option_id = MagicMock(return_value="effort")
         return provider
 
     @pytest.mark.asyncio
@@ -482,6 +483,15 @@ class TestEffortControl:
         provider._client.set_config_option.assert_awaited_once_with("effort", "high")
         # claude does NOT use the kiro /effort slash command
         provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_codex_change_effort_uses_reasoning_effort_config_option(self):
+        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="gpt-5.6-sol")
+        provider._client.effort_config_option_id.return_value = "reasoning_effort"
+
+        assert await provider.change_effort("high") is True
+
+        provider._client.set_config_option.assert_awaited_once_with("reasoning_effort", "high")
 
     @pytest.mark.asyncio
     async def test_claude_change_effort_steps_down_when_max_unsupported(self):
@@ -562,7 +572,7 @@ class TestEffortControl:
         # no error) rather than spamming 'Unknown config option' every spawn.
         provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
         provider._effort_per_model = {"claude-opus-4.7": "max"}
-        provider._client.supports_config_option = MagicMock(return_value=False)
+        provider._client.effort_config_option_id.return_value = None
         await provider._apply_initial_effort()
         provider._client.set_config_option.assert_not_awaited()
 
@@ -571,7 +581,7 @@ class TestEffortControl:
         # change_effort must report unsupported (False) instead of attempting a
         # push that fails with 'Unknown config option' and resets the session.
         provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-        provider._client.supports_config_option = MagicMock(return_value=False)
+        provider._client.effort_config_option_id.return_value = None
         ok = await provider.change_effort("high")
         assert ok is False
         provider._client.set_config_option.assert_not_awaited()

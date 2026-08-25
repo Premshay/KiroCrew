@@ -1124,6 +1124,15 @@ class TestLivePathModelEntitlement:
         handle.set_model.assert_awaited_once_with("claude-opus-4.8")
 
     @pytest.mark.asyncio
+    async def test_config_option_base_model_is_admitted_over_combined_wire_models(self):
+        provider, handle = self._provider(["gpt-5.6-sol[low]", "gpt-5.6-sol[high]"])
+        handle.config_options = [{"id": "model", "options": [{"value": "gpt-5.6-sol"}]}]
+
+        await provider.set_model("gpt-5.6-sol")
+
+        handle.set_model.assert_awaited_once_with("gpt-5.6-sol")
+
+    @pytest.mark.asyncio
     async def test_unknown_advertised_set_still_applied(self):
         """A backend that advertises nothing must not have every switch refused."""
         provider, handle = self._provider([])

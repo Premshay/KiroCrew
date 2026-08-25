@@ -140,6 +140,59 @@ from kiro_crew.skill_usage import get_global_skill_read_observer
 
 logger = logging.getLogger(__name__)
 
+ACP_EFFORT_CONFIG_IDS: tuple[str, ...] = ("effort", "reasoning_effort")
+
+
+def acp_config_option(
+    config_options: object, *option_ids: str
+) -> dict[str, Any] | None:
+    """Return the first matching select option from an ACP configOptions payload."""
+    if not isinstance(config_options, (list, tuple)):
+        return None
+    wanted = set(option_ids)
+    for option in config_options:
+        if isinstance(option, dict) and option.get("id") in wanted:
+            return option
+    return None
+
+
+def acp_config_option_values(config_options: object, *option_ids: str) -> list[str]:
+    """Return non-empty string values from one ACP select option, in wire order."""
+    option = acp_config_option(config_options, *option_ids)
+    choices = option.get("options") if option else None
+    if not isinstance(choices, list):
+        return []
+    return [
+        choice["value"]
+        for choice in choices
+        if isinstance(choice, dict)
+        and isinstance(choice.get("value"), str)
+        and choice["value"]
+    ]
+
+
+def acp_model_config_options(config_options: object) -> list[dict[str, str]]:
+    """Normalize ACP's base-model selector to the dashboard model shape."""
+    option = acp_config_option(config_options, "model")
+    choices = option.get("options") if option else None
+    if not isinstance(choices, list):
+        return []
+    models: list[dict[str, str]] = []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        model_id = choice.get("value")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        models.append(
+            {
+                "modelId": model_id,
+                "name": str(choice.get("name") or model_id),
+                "description": str(choice.get("description") or ""),
+            }
+        )
+    return models
+
 CLIENT_NAME = "kirocrew"
 CLIENT_VERSION = "0.1.2"
 _T = TypeVar("_T")
@@ -2488,7 +2541,7 @@ class AcpClient:
         that omits ``models``), which the error path reads as "entitlement
         unknown" and leaves the existing transient/capacity handling alone.
         """
-        ids = []
+        ids = acp_config_option_values(self._acp_config_options, "model")
         for entry in self._available_models:
             model_id = entry.get("modelId") if isinstance(entry, dict) else None
             if isinstance(model_id, str) and model_id.strip():
@@ -2724,14 +2777,12 @@ class AcpClient:
         Parses configOptions for the entry with id="effort" and extracts its
         options[].value list in the order ACP reported them.
         """
-        for opt in self._acp_config_options:
-            if not isinstance(opt, dict):
-                continue
-            if opt.get("id") == "effort":
-                options = opt.get("options", [])
-                if isinstance(options, list):
-                    return [o["value"] for o in options if isinstance(o, dict) and "value" in o]
-        return []
+        return acp_config_option_values(self._acp_config_options, *ACP_EFFORT_CONFIG_IDS)
+
+    def effort_config_option_id(self) -> str | None:
+        """ACP id used to change reasoning effort on this backend."""
+        option = acp_config_option(self._acp_config_options, *ACP_EFFORT_CONFIG_IDS)
+        return str(option["id"]) if option else None
 
     def _next_req_id(self) -> int:
         rid = self._next_id

@@ -41,12 +41,15 @@ from kiro_crew.acp._dispatch import (
     set_model_params,
 )
 from kiro_crew.acp.client import (
+    ACP_EFFORT_CONFIG_IDS,
     AcpProcessDied,
     AcpTimeoutError,
     _effective_prompt_timeout_async,
     _is_safe_oauth_url,
     _is_tool_interrupted_marker,
     _raise_acp_error,
+    acp_config_option,
+    acp_config_option_values,
     prompt_timeout_for_ceiling,
     resolve_usable_model,
 )
@@ -1459,7 +1462,7 @@ class AcpSessionHandle:
         without it the entitlement discrimination in ``_model_is_unentitled``
         would only ever fire for direct-spawn ``AcpClient`` sessions.
         """
-        ids = []
+        ids = acp_config_option_values(self._config_options, "model")
         for entry in self._available_models:
             model_id = entry.get("modelId") if isinstance(entry, dict) else None
             if isinstance(model_id, str) and model_id.strip():
@@ -1480,18 +1483,12 @@ class AcpSessionHandle:
 
     def get_valid_effort_levels(self) -> list[str]:
         """Return valid effort levels from config options, preserving order."""
-        for opt in self._config_options:
-            if not isinstance(opt, dict):
-                continue
-            if opt.get("id") == "effort":
-                options = opt.get("options", [])
-                if isinstance(options, list):
-                    return [
-                        o.get("value", "")
-                        for o in options
-                        if isinstance(o, dict) and o.get("value")
-                    ]
-        return []
+        return acp_config_option_values(self._config_options, *ACP_EFFORT_CONFIG_IDS)
+
+    def effort_config_option_id(self) -> str | None:
+        """ACP id used to change reasoning effort on this backend."""
+        option = acp_config_option(self._config_options, *ACP_EFFORT_CONFIG_IDS)
+        return str(option["id"]) if option else None
 
     def rebind_watchdog(
         self, crew_agent: str, settings: WatchdogSettings | None = None
