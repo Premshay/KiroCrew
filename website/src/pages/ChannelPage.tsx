@@ -214,11 +214,15 @@ function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
   }, [menu])
 
   return (
-    <div className="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-bg-hover group">
-      <Badge variant={STATE_BADGE[agent.state]?.variant || 'warn'}>{STATE_BADGE[agent.state]?.label || agent.state}</Badge>
-      <div className="flex-1 min-w-0">
-        <div className="text-sm font-medium text-text truncate">{agent.role}</div>
-        {agent.agentName && <div className="text-[11px] text-muted font-mono truncate">{agent.agentName}</div>}
+    <div className="px-2 py-2 rounded-lg hover:bg-bg-hover group">
+      <div className="flex items-start gap-2 min-w-0">
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-medium text-text break-words" title={agent.role}>{agent.role}</div>
+          {agent.agentName && <div className="text-[11px] text-muted font-mono break-all" title={agent.agentName}>{agent.agentName}</div>}
+        </div>
+        <Badge variant={STATE_BADGE[agent.state]?.variant || 'warn'}>{STATE_BADGE[agent.state]?.label || agent.state}</Badge>
+      </div>
+      <div className="flex items-center justify-between gap-2 mt-1.5">
         <div className="relative inline-block" ref={menuRef}>
           <Btn onClick={() => setMenu(!menu)} className="!p-0 !border-none !rounded-none text-[13px] text-muted hover:text-text">
             <Badge variant={LISTEN_BADGE[agent.listenMode]?.variant || 'warn'}>{LISTEN_BADGE[agent.listenMode]?.label || agent.listenMode}</Badge>
@@ -232,9 +236,11 @@ function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
             ))}
           </div>}
         </div>
+        <div className="flex items-center gap-1 shrink-0">
+          {alive && <Btn onClick={onClearContext} aria-label={i18nT('pages.channelPage.clear_context')} title={i18nT('pages.channelPage.clear_context')}><RotateCcw className="lucide-inline" /></Btn>}
+          {alive && <Btn onClick={onDismiss} aria-label={i18nT('pages.channelPage.dismiss')} danger title={i18nT('pages.channelPage.dismiss')}><X className="lucide-inline" /></Btn>}
+        </div>
       </div>
-      {alive && <Btn onClick={onClearContext} aria-label={i18nT('pages.channelPage.clear_context')} title={i18nT('pages.channelPage.clear_context')}><RotateCcw className="lucide-inline" /></Btn>}
-      {alive && <Btn onClick={onDismiss} aria-label={i18nT('pages.channelPage.dismiss')} danger title={i18nT('pages.channelPage.dismiss')}><X className="lucide-inline" /></Btn>}
     </div>
   )
 }
@@ -785,12 +791,23 @@ export default function ChannelPage() {
             })()}
             </AnimatePresence>
 
+            <AnimatePresence>
             {showAgents && (
-              <div className={`flex flex-col bg-bg-elevated ${isMobile ? 'w-full' : 'w-64 shrink-0 border-l border-border'}`}>
-                <div className="px-3 py-2.5 border-b border-border flex items-center justify-between">
-                  <span className="text-sm font-semibold text-text-strong">{i18nT('pages.channelPage.agents')}</span>
-                  <Btn onClick={() => setShowAgents(false)} aria-label={i18nT('pages.channelPage.close_agents_panel')} className="!p-0 !border-none !rounded-none text-muted hover:text-text text-sm"><X className="lucide-inline" /></Btn>
-                </div>
+              <DetailPanel
+                key="channel-agents-panel"
+                title={i18nT('pages.channelPage.agents')}
+                onClose={() => setShowAgents(false)}
+                initialWidth={360}
+                minWidth={300}
+                storageKey="mc-channel-agents-width"
+                noPadding
+                customHeader={(
+                  <div className="px-3 py-2.5 border-b border-border flex items-center justify-between">
+                    <span className="text-sm font-semibold text-text-strong">{i18nT('pages.channelPage.agents')}</span>
+                    <Btn onClick={() => setShowAgents(false)} aria-label={i18nT('pages.channelPage.close_agents_panel')} className="!p-0 !border-none !rounded-none text-muted hover:text-text text-sm"><X className="lucide-inline" /></Btn>
+                  </div>
+                )}
+              >
                 <div className="flex-1 overflow-y-auto p-2 space-y-1">
                   {channel.agents.map((agent) => (
                     <AgentControlRow key={agent.id} agent={agent}
@@ -835,8 +852,9 @@ export default function ChannelPage() {
                     </div>
                   )}
                 </div>
-              </div>
+              </DetailPanel>
             )}
+            </AnimatePresence>
           </div>
 
           <div className={`border-t border-border px-4 py-3 ${isMobile && (threadId || showAgents) ? 'hidden' : ''}`}>

@@ -97,6 +97,7 @@ async function openAgentsPanel(name = '1 agent') {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  localStorage.clear()
   mockApi([channelOf()])
 })
 
@@ -309,6 +310,27 @@ describe('ChannelPage — composer', () => {
 })
 
 describe('ChannelPage — agents sidebar', () => {
+  it('uses the persisted resizable panel width and keeps long identities inspectable', async () => {
+    localStorage.setItem('mc-channel-agents-width', '420')
+    mockApi([channelOf({
+      members: {
+        a1: member({
+          role: 'Publication audit and release readiness coordinator',
+          agent_name: 'crew-codex-atlas-publication-audit',
+        }),
+      },
+    })])
+    await renderPage()
+    await openAgentsPanel()
+
+    const separator = screen.getByRole('separator', { name: 'Resize panel' })
+    expect(separator.parentElement).toHaveStyle({ width: '420px' })
+    expect(screen.getByTitle('Publication audit and release readiness coordinator'))
+      .toHaveClass('break-words')
+    expect(screen.getByTitle('crew-codex-atlas-publication-audit'))
+      .toHaveClass('break-all')
+  })
+
   it('renders each listen mode, including an unknown one verbatim', async () => {
     mockApi([channelOf({
       members: {
