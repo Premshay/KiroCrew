@@ -8372,6 +8372,23 @@ class KiroCrewConfig:
 
         return creds
 
+    def mcp_gateway_provider_kwargs(self) -> dict[str, str | None]:
+        """Return the config-owned MCP gateway values for an ACP provider."""
+        gateway = self.mcp_gateway
+        if not gateway.enabled:
+            return {
+                "mcp_gateway_overlay": None,
+                "mcp_gateway_settings_mcp_json": None,
+                "mcp_gateway_socket": None,
+            }
+
+        overlay = gateway.overlay_dir or str(default_overlay_dir())
+        return {
+            "mcp_gateway_overlay": overlay,
+            "mcp_gateway_settings_mcp_json": str(Path(overlay).parent / "settings" / "mcp.json"),
+            "mcp_gateway_socket": gateway.socket_path or str(default_socket_path()),
+        }
+
     def create_provider_factory(self) -> Callable:
         """Return a factory that creates LLMProvider instances from config.
 

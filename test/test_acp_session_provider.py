@@ -471,6 +471,15 @@ class TestAcpSessionProviderClientCompat:
         provider = AcpSessionProvider(handle, runtime)
         assert provider.backend == "kas"
 
+    def test_mcp_gateway_socket_is_mirrored_from_runtime(self):
+        handle = _make_handle()
+        runtime = _make_runtime()
+        runtime._mcp_gateway_socket = "/run/kiro/gateway.sock"
+
+        provider = AcpSessionProvider(handle, runtime)
+
+        assert provider._mcp_gateway_socket == "/run/kiro/gateway.sock"
+
     def test_has_active_turn(self):
         """has_active_turn is a METHOD (parity with AcpClient) delegating to
         handle.is_turn_active. Callers invoke it with () -- a @property here

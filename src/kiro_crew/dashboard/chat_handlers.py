@@ -2357,6 +2357,7 @@ async def stop_slot_turn(
     """
     name = slot.key
     cancel_key = cancel_key or _cancel_target(slot)
+    task_at_stop = slot.task
 
     # Escalation path: a second stop press while a cooperative cancel is
     # already pending hard-kills. We escalate on ANY second press — not only
@@ -2402,6 +2403,13 @@ async def stop_slot_turn(
         # reports success and cancels nothing. The SEL record below stays on the
         # slot-derived key, which identifies the tab the operator pressed.
         await state.sessions.stop_turn(cancel_key, force=True, on_hard=_on_hard_force)
+        if task_at_stop is not None and task_at_stop is not asyncio.current_task():
+            if not task_at_stop.done():
+                task_at_stop.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task_at_stop), timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
         sel().log_tool_invocation(
             session_key=_history_key_for(name),
             agent=getattr(slot, "agent", "") or "kirocrew",
@@ -2492,6 +2500,17 @@ async def stop_slot_turn(
         on_soft=_on_soft,
         on_hard=_on_hard,
     )
+    # A hard provider reset cannot make the runner's awaited stream return by
+    # itself. Cancel the task that owned the stopped turn so its finally block
+    # clears ``slot.running``; do not cancel a later task that may have claimed
+    # the slot while this request awaited the provider stop.
+    if outcome == "hard" and task_at_stop is not None and task_at_stop is not asyncio.current_task():
+        if not task_at_stop.done():
+            task_at_stop.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task_at_stop), timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
     # Resolve orphaned card when provider reports no active turn
     if outcome == "idle" and slot._stop_event_id:
         _resolve_stop_event(slot, "soft")
