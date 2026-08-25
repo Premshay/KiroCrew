@@ -607,6 +607,11 @@ class AcpSessionProvider(LLMProvider):
         return getattr(self._runtime, "_child_pids", {})
 
     @property
+    def _mcp_gateway_socket(self) -> str | None:
+        """Gateway control socket of the backing runtime."""
+        return getattr(self._runtime, "_mcp_gateway_socket", None)
+
+    @property
     def _start_time(self) -> int | None:
         """Process start time (for PID recycle detection)."""
         return getattr(self._runtime, "_start_time", None)

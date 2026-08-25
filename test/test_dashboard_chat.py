@@ -9335,7 +9335,7 @@ class TestStopTurnSlotState:
 
     @pytest.mark.asyncio
     async def test_stop_turn_slot_state_transitions_hard(self, tmp_path, monkeypatch):
-        """POST stop with hard outcome → idle→soft_pending→idle after on_hard."""
+        """Hard stop settles the card and cancels the turn that remained running."""
         state = self._make_state(tmp_path, monkeypatch)
         slot = state.get_or_create_slot("s1")
         slot.task = asyncio.ensure_future(asyncio.sleep(999))
@@ -9353,7 +9353,7 @@ class TestStopTurnSlotState:
             assert resp.status == 200
 
         assert slot._stop_state == "idle"
-        slot.task.cancel()
+        assert slot.task.cancelled()
 
     @pytest.mark.asyncio
     async def test_stop_turn_force_query_param(self, tmp_path, monkeypatch):
@@ -9380,7 +9380,7 @@ class TestStopTurnSlotState:
 
         assert force_called == [True]
         assert slot._stop_state == "idle"
-        slot.task.cancel()
+        assert slot.task.cancelled()
 
     @pytest.mark.asyncio
     async def test_stop_turn_second_press_escalates_without_force_flag(self, tmp_path, monkeypatch):
@@ -9413,7 +9413,7 @@ class TestStopTurnSlotState:
         # Backend escalated to a hard kill anyway.
         assert force_called == [True]
         assert slot._stop_state == "idle"
-        slot.task.cancel()
+        assert slot.task.cancelled()
 
     @pytest.mark.asyncio
     async def test_stop_turn_first_press_preserves_queue(self, tmp_path, monkeypatch):

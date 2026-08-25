@@ -5413,6 +5413,23 @@ class KiroCrewConfig:
 
         return creds
 
+    def mcp_gateway_provider_kwargs(self) -> dict[str, str | None]:
+        """Return the config-owned MCP gateway values for an ACP provider."""
+        gateway = self.mcp_gateway
+        if not gateway.enabled:
+            return {
+                "mcp_gateway_overlay": None,
+                "mcp_gateway_settings_mcp_json": None,
+                "mcp_gateway_socket": None,
+            }
+
+        overlay = gateway.overlay_dir or str(default_overlay_dir())
+        return {
+            "mcp_gateway_overlay": overlay,
+            "mcp_gateway_settings_mcp_json": str(Path(overlay).parent / "settings" / "mcp.json"),
+            "mcp_gateway_socket": gateway.socket_path or str(default_socket_path()),
+        }
+
     def create_provider_factory(self) -> Callable:
         """Return a factory that creates LLMProvider instances from config.
 
@@ -5436,17 +5453,7 @@ class KiroCrewConfig:
         # configured default instead of the provider/model default.
         default_effort = self.agent.reasoning_effort
 
-        # MCP gateway: resolve overlay + socket once when enabled. None when
-        # the feature flag is off -> AcpClient falls through to per-session MCP.
-        _gw = self.mcp_gateway
-        if _gw.enabled:
-            _gw_overlay = _gw.overlay_dir or str(default_overlay_dir())
-            _gw_socket = _gw.socket_path or str(default_socket_path())
-            _gw_settings = str(Path(_gw_overlay).parent / "settings" / "mcp.json")
-        else:
-            _gw_overlay = None
-            _gw_socket = None
-            _gw_settings = None
+        mcp_gateway_kwargs = self.mcp_gateway_provider_kwargs()
 
         def _acp(
             session_key: str | None = None,
@@ -5522,9 +5529,7 @@ class KiroCrewConfig:
                 extra_env=extra_env,
                 effort_per_model=_eff_per_model,
                 tool_search=tool_search,
-                mcp_gateway_overlay=_gw_overlay,
-                mcp_gateway_settings_mcp_json=_gw_settings,
-                mcp_gateway_socket=_gw_socket,
+                **mcp_gateway_kwargs,
             )
 
         return _acp

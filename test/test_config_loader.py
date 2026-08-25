@@ -3259,6 +3259,20 @@ class TestOrchestratorWatchdogThemeAreParsed:
         assert cfg.watchdog.tool_stall_hard_cap_secs == 61.0
         assert cfg.watchdog.check_after_secs == 5.0
 
+    def test_mcp_gateway_provider_kwargs_resolve_routed_gateway_paths(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ACP factories and companion mappings share gateway path resolution."""
+        monkeypatch.setattr(loader_module, "default_overlay_dir", lambda: Path("/run/kiro/overlay"))
+        monkeypatch.setattr(loader_module, "default_socket_path", lambda: Path("/run/kiro/gateway.sock"))
+        cfg = _load_from_dict({"mcp_gateway": {"enabled": True}})
+
+        assert cfg.mcp_gateway_provider_kwargs() == {
+            "mcp_gateway_overlay": "/run/kiro/overlay",
+            "mcp_gateway_settings_mcp_json": "/run/kiro/settings/mcp.json",
+            "mcp_gateway_socket": "/run/kiro/gateway.sock",
+        }
+
     def test_dashboard_theme_fields_are_parsed(self) -> None:
         cfg = _load_from_dict(
             {

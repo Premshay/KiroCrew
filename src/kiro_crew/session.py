@@ -3818,7 +3818,7 @@ class SessionManager:
         on_soft: Callable[[], Awaitable[None]] | None = None,
         on_hard: Callable[[], Awaitable[None]] | None = None,
     ) -> StopOutcome:
-        """Cooperative stop with kill fallback + eager respawn.
+        """Cooperative stop with kill fallback.
 
         Sequence:
           1. clear_queue(key) — skipped when preserve_queue=True (interrupt flow)
@@ -3827,7 +3827,7 @@ class SessionManager:
              - acked → call on_soft hook → return "soft"
              - timeout/error → fall through to hard kill
              - no_turn → return "idle"
-          4. hard kill: reset(key) → fire-and-forget respawn → on_hard → "hard"
+          4. hard kill: reset(key) → on_hard → "hard"
         """
         key = self._fold_key(key)
         session = self._sessions.get(key)
@@ -3882,11 +3882,6 @@ class SessionManager:
             key,
             elapsed,
         )
-        # Keep a strong reference — the event loop holds only a weak ref,
-        # and without this the task could be GC'd mid-respawn.
-        t = asyncio.create_task(self._eager_respawn(key))
-        self._background_tasks.add(t)
-        t.add_done_callback(self._background_tasks.discard)
         if on_hard:
             try:
                 await on_hard()
@@ -3941,18 +3936,6 @@ class SessionManager:
                 )
         except Exception:
             logger.debug("_send_abort_for_session failed for %s", key, exc_info=True)
-
-    async def _eager_respawn(self, key: str) -> None:
-        """Fire-and-forget respawn after hard kill.
-
-        ``get_or_create`` acquires the per-session semaphore on every return
-        path; release it here so the next real user message can run.
-        """
-        try:
-            await self.get_or_create(key)
-            self.release(key)
-        except Exception:
-            logger.debug("Eager respawn failed for %s", key, exc_info=True)
 
     @property
     def count(self) -> int:
