@@ -8,7 +8,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from kiro_crew.acp.client import (
     _NOT_LOGGED_IN_MESSAGE,
@@ -479,6 +479,16 @@ class AcpProvider(LLMProvider):
         not a member.
         """
         return self._client.backend in ACP_BACKENDS_ACP_RUNTIME
+
+    @property
+    def slash_commands(self) -> list[dict[str, str]]:
+        """Slash commands the live backend advertised, as {name, description}.
+
+        Names are bare words with no leading "/". Empty when the backend has
+        not advertised yet or does not advertise at all, which the dashboard
+        reads as "fall back to the static list" rather than "no commands".
+        """
+        return self._client.available_commands
 
     @property
     def is_session_sharing_eligible(self) -> bool:
@@ -1496,12 +1506,14 @@ class AcpProvider(LLMProvider):
                 logger.warning("cleanup_session: failed to delete %s", target, exc_info=True)
 
 
-def is_claude_backend(provider: Any) -> bool:
+def is_claude_backend(provider: Any) -> TypeGuard[AcpProvider]:
     """Check if a provider is a Claude backend via the ACP adapter.
 
     Free function for use from modules that hold the provider as the
     ``LLMProvider`` ABC and can't reach the ``AcpProvider.is_claude_backend``
-    property without an isinstance gate.
+    property without an isinstance gate. Being that gate is the point, so it
+    narrows: a caller past this check may read the ACP-only members it just
+    established are there.
     """
     return isinstance(provider, AcpProvider) and provider.is_claude_backend
 

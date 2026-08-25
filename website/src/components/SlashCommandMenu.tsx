@@ -152,7 +152,11 @@ export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, 
     return [...apiCommands, ...FRONTEND_COMMANDS.filter(c => !names.has(c.name))].sort((a, b) => a.name.localeCompare(b.name))
   }, [apiCommands])
 
-  const match = input.match(/^\/([a-z]*)$/)
+  // `-` and `:` are part of a command NAME, not the start of prose: the Claude
+  // backend advertises `design-sync` and `superpowers:brainstorming`, and a
+  // letters-only pattern closed the menu at the first hyphen or colon — hiding
+  // every command whose name needs one from the moment it became typeable.
+  const match = input.match(/^\/([a-z:-]*)$/)
   const visible = open && !!match
   const filter = match?.[1] ?? ''
 

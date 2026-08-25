@@ -99,6 +99,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_END_TURN,
     UPDATE_AGENT_MESSAGE_CHUNK,
     UPDATE_AGENT_THOUGHT_CHUNK,
+    UPDATE_AVAILABLE_COMMANDS,
     UPDATE_CONFIG_OPTION,
     UPDATE_TOOL_CALL,
     UPDATE_USAGE,
@@ -2253,6 +2254,14 @@ class AcpClient:
         # from "advertised zero/some modes, honor the list" (True) so an
         # explicitly-empty availableModes fails closed rather than attempting.
         self._modes_advertised: bool = False
+        # Slash commands the backend advertised via `available_commands_update`.
+        # claude-agent-acp pushes the Claude Code CLI's own registry here —
+        # built-ins (/design, /code-review, /simplify), skills and MCP prompts —
+        # so the dashboard menu can offer what this session can actually run
+        # rather than a hardcoded list no backend confirms. Each entry:
+        # {name, description}; `name` is the bare word with no leading "/".
+        # Empty until the backend sends its first update.
+        self._available_commands: list[dict[str, str]] = []
         # Model kiro-cli/claude-agent-acp actually resolved to (may differ
         # from self._model when that's the "auto" sentinel). Used to look up
         # the context window when usage_update isn't sent (see _track_metadata).
@@ -2362,6 +2371,15 @@ class AcpClient:
     def backend(self) -> str:
         """ACP backend identifier (e.g. ACP_BACKEND_CLAUDE for claude-agent-acp)."""
         return getattr(self, "_acp_backend", "")
+
+    @property
+    def available_commands(self) -> list[dict[str, str]]:
+        """Slash commands this session's backend advertised, newest push wins.
+
+        A copy: the caller must not be able to mutate the list a later
+        `commands_changed` push replaces wholesale.
+        """
+        return list(self._available_commands)
 
     @property
     def _is_claude(self) -> bool:
@@ -2766,6 +2784,76 @@ class AcpClient:
             self._acp_config_options = config_options
             logger.debug("ACP config options updated: %d entries", len(config_options))
             self._sync_effort_levels()
+
+    def _handle_available_commands_update(self, msg: JsonRpcMessage) -> None:
+        """Process an ``available_commands_update`` session notification.
+
+        The payload is the backend's WHOLE command registry and replaces the
+        previous one — claude-agent-acp re-sends it on every `commands_changed`
+        precisely so the client drops what is no longer runnable, so merging
+        would keep a retired command in the menu forever.
+
+        Every field arrives from the agent process, so each is validated before
+        it reaches the dashboard: a malformed entry is skipped rather than
+        raising inside notification dispatch, where it would break the turn.
+        """
+        params = msg.params or {}
+        update = params.get("update", {})
+        if not isinstance(update, dict):
+            return
+        commands = update.get("availableCommands")
+        if not isinstance(commands, list):
+            return
+        captured: list[dict[str, str]] = []
+        for entry in commands:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            description = entry.get("description")
+            captured.append(
+                {
+                    "name": name,
+                    "description": description if isinstance(description, str) else "",
+                }
+            )
+        self._available_commands = captured
+        logger.debug("ACP available commands updated: %d entries", len(captured))
+
+    def _capture_models_from_config_options(self, config_options: list[dict]) -> None:
+        """Capture a current ACP adapter's model selector as a model list.
+
+        Recent claude-agent-acp versions moved model selection from the legacy
+        top-level ``models.availableModels`` response to the ``model`` session
+        config option. Keep the top-level list when an adapter supplies it;
+        only Claude uses this fallback so Codex retains its effort-qualified
+        model ids from the standard ``models`` response.
+        """
+        if self._available_models and not self._is_claude:
+            return
+        for option in config_options:
+            if not isinstance(option, dict) or option.get("id") != "model":
+                continue
+            choices = option.get("options")
+            if not isinstance(choices, list):
+                return
+            captured = [
+                {
+                    "modelId": str(choice["value"]),
+                    "name": str(choice.get("name") or choice["value"]),
+                    "description": str(choice.get("description") or ""),
+                }
+                for choice in choices
+                if isinstance(choice, dict) and isinstance(choice.get("value"), str)
+                and choice["value"]
+            ]
+            if captured:
+                self._available_models = captured
+            current = option.get("currentValue")
+            if isinstance(current, str) and current:
+                self._resolved_model_id = current
+            return
 
     def _sync_effort_levels(self) -> None:
         """Push ACP-reported effort levels to the global validation set."""
@@ -4072,11 +4160,28 @@ class AcpClient:
             if isinstance(update, dict) and update.get("sessionUpdate") == UPDATE_CONFIG_OPTION:
                 self._handle_config_option_update(msg)
 
+        def _capture_available_commands(msg: JsonRpcMessage) -> None:
+            # claude-agent-acp fires this on a zero-delay timer immediately
+            # after session/new returns, so it lands in this drain rather than
+            # in any request wait. The prompt loop captures it too, for the
+            # mid-session `commands_changed` push and for the case where the
+            # backend's own supportedCommands() lookup outlasts the idle window.
+            if not msg.is_method(METHOD_SESSION_UPDATE):
+                return
+            params = msg.params or {}
+            update = params.get("update", {})
+            if (
+                isinstance(update, dict)
+                and update.get("sessionUpdate") == UPDATE_AVAILABLE_COMMANDS
+            ):
+                self._handle_available_commands_update(msg)
+
         # Process notifications buffered during _wait_for_response
         for msg in self._mcp_notifications:
             drained += 1
             _capture_oauth(msg)
             _capture_config_update(msg)
+            _capture_available_commands(msg)
             name = ""
             if isinstance(msg.params, dict):
                 name = msg.params.get("name") or msg.params.get("serverName") or ""
@@ -4108,6 +4213,7 @@ class AcpClient:
                 drained += 1
                 _capture_oauth(read_msg)
                 _capture_config_update(read_msg)
+                _capture_available_commands(read_msg)
                 if "mcp" in (read_msg.method or ""):
                     name = ""
                     if isinstance(read_msg.params, dict):
@@ -5169,6 +5275,8 @@ class AcpClient:
                 logger.debug("usage_update missing used/size: %s", update)
         elif kind == UPDATE_CONFIG_OPTION:
             self._handle_config_option_update(msg)
+        elif kind == UPDATE_AVAILABLE_COMMANDS:
+            self._handle_available_commands_update(msg)
         elif self._is_claude and kind and kind not in KNOWN_SESSION_UPDATES:
             logger.debug("Unhandled session update type: %s", kind)
 
