@@ -3530,13 +3530,16 @@ async def start_dashboard(
 
     # Relaunch agents in non-archived channels
     from kiro_crew.channel import ChannelManager, run_channel_agent
-    from kiro_crew.dashboard.handlers_channel import _spawn_agent_task
+    from kiro_crew.dashboard.handlers_channel import (
+        _spawn_agent_task,
+        deliver_attached_channel_message,
+    )
 
     mgr = ChannelManager(
         broadcast_fn=state.broadcast_ws,
         max_channels=cfg.agent.max_channels,
         max_agents=cfg.agent.max_channel_agents,
-        delivery_fn=lambda channel, member, message: handlers_channel.deliver_attached_channel_message(
+        delivery_fn=lambda channel, member, message: deliver_attached_channel_message(
             state, channel, member, message
         ),
     )

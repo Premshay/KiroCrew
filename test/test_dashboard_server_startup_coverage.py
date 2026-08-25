@@ -315,6 +315,25 @@ async def _cancel_stray_tasks() -> None:
 
 class TestStartDashboardWiring:
     @pytest.mark.asyncio
+    async def test_attached_channel_delivery_uses_the_wired_handler(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The channel manager's delivery callback must survive route extraction."""
+        import kiro_crew.dashboard.handlers_channel as handlers_channel
+
+        deliver = AsyncMock(return_value="delivered")
+        monkeypatch.setattr(handlers_channel, "deliver_attached_channel_message", deliver)
+
+        async with _dashboard(tmp_path, monkeypatch) as (_runner, state, _spies):
+            channel = MagicMock()
+            member = MagicMock()
+            message = MagicMock()
+            outcome = await state.channel_manager._delivery_fn(channel, member, message)
+
+        assert outcome == "delivered"
+        deliver.assert_awaited_once_with(state, channel, member, message)
+
+    @pytest.mark.asyncio
     async def test_the_app_is_wired_and_reports_ready(self, tmp_path, monkeypatch) -> None:
         """Readiness is published at the boot-to-ready boundary, last.
 
