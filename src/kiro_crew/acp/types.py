@@ -113,8 +113,8 @@ UPDATE_CONFIG_OPTION = "config_option_update"
 UPDATE_SESSION_INFO = "session_info_update"
 UPDATE_USAGE = "usage_update"
 
-# Updates we recognise but don't yet surface (plumbing-only). Listed here so the
-# "unhandled session update" log doesn't fire for them.
+# Updates the client recognises, whether or not it acts on each one. Listed here
+# so the "unhandled session update" log doesn't fire for them.
 KNOWN_SESSION_UPDATES = frozenset(
     {
         UPDATE_USER_MESSAGE_CHUNK,

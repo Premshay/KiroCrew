@@ -302,3 +302,71 @@ async def test_api_effort_levels_slot_without_live_provider_falls_back():
         assert json.loads(resp.body) == ["low", "medium", "high", "max"]
     finally:
         mod._reasoning_effort_ordered = orig_ordered
+
+
+class TestHandleAvailableCommandsUpdate:
+    """claude-agent-acp forwards the Claude Code CLI's command registry here."""
+
+    @staticmethod
+    def _msg(commands):
+        return JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": commands,
+                }
+            },
+        )
+
+    def test_captures_advertised_commands(self):
+        client = AcpClient()
+        client._handle_available_commands_update(
+            self._msg(
+                [
+                    {"name": "design", "description": "Grant or revoke Design access"},
+                    {"name": "code-review", "description": "Review the current diff"},
+                ]
+            )
+        )
+        assert client.available_commands == [
+            {"name": "design", "description": "Grant or revoke Design access"},
+            {"name": "code-review", "description": "Review the current diff"},
+        ]
+
+    def test_later_push_replaces_rather_than_merges(self):
+        """A retired command must leave the menu, so `commands_changed` wins whole."""
+        client = AcpClient()
+        client._handle_available_commands_update(self._msg([{"name": "design"}]))
+        client._handle_available_commands_update(self._msg([{"name": "simplify"}]))
+        assert [c["name"] for c in client.available_commands] == ["simplify"]
+
+    def test_skips_malformed_entries_without_raising(self):
+        client = AcpClient()
+        client._handle_available_commands_update(
+            self._msg(["design", {"description": "no name"}, {"name": ""}, {"name": "usage"}])
+        )
+        assert [c["name"] for c in client.available_commands] == ["usage"]
+
+    def test_missing_description_becomes_empty_string(self):
+        client = AcpClient()
+        client._handle_available_commands_update(self._msg([{"name": "design"}]))
+        assert client.available_commands[0]["description"] == ""
+
+    def test_non_list_payload_leaves_previous_list_intact(self):
+        client = AcpClient()
+        client._handle_available_commands_update(self._msg([{"name": "design"}]))
+        client._handle_available_commands_update(self._msg("nope"))
+        assert [c["name"] for c in client.available_commands] == ["design"]
+
+    def test_accessor_returns_a_copy(self):
+        client = AcpClient()
+        client._handle_available_commands_update(self._msg([{"name": "design"}]))
+        client.available_commands.clear()
+        assert client.available_commands
+
+    def test_routed_from_session_update_dispatch(self):
+        """The prompt loop's notification dispatch must reach the handler."""
+        client = AcpClient()
+        client._track_usage_update(self._msg([{"name": "design", "description": "d"}]))
+        assert [c["name"] for c in client.available_commands] == ["design"]

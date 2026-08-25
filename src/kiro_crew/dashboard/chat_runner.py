@@ -3118,6 +3118,21 @@ async def _run_chat(
         # X-Session-Key; one shared writer lives in messaging.identity.
         await publish_turn_identity(state.sessions, session_key)
 
+        # ── Claude-backend slash commands, resolved against the live session ──
+        # The early detection above can only consult `agent.provider`, which
+        # stays "acp" while an individual agent is routed to the Claude seam —
+        # so a Claude Code command typed into such a slot was classified as
+        # prose. That misclassification is what silently disarms it: prose gets
+        # the context builder's history and hook blocks PREPENDED, and the CLI
+        # only expands a command that STARTS the prompt.
+        #
+        # Membership in the advertised registry, not a leading "/": that is what
+        # separates `/design` from a message opening with an absolute path, and
+        # the backend has told us which is which.
+        if not is_slash and first_word.startswith("/") and is_claude_backend(client):
+            if first_word in {f"/{c['name']}" for c in client.slash_commands}:
+                is_slash = True
+
         # ── @prompt expansion: resolve @name to SOP/prompt content ──
         # Captured BEFORE any expansion: `@prompt` replaces `message` and
         # `$skill` appends to it, so len(message) at classification time no

@@ -33,15 +33,44 @@ def _make_app() -> web.Application:
     return app
 
 
-async def _get(provider: str):
-    with patch(
-        "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
-        return_value=_fake_config(provider),
+async def _get(provider: str, *, state=None, claude_providers=()):
+    """Fetch the menu, optionally against a fake live session.
+
+    *claude_providers* names which of ``state``'s providers the Claude-backend
+    check should accept, so a test can put a kiro session and a Claude session
+    in the same map and pin which one the handler reads.
+    """
+    app = _make_app()
+    if state is not None:
+        app["state"] = state
+    with (
+        patch(
+            "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
+            return_value=_fake_config(provider),
+        ),
+        patch(
+            "kiro_crew.providers.acp.is_claude_backend",
+            side_effect=lambda p: p in claude_providers,
+        ),
     ):
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/slash-commands")
             assert resp.status == 200
             return await resp.json()
+
+
+def _fake_provider(commands):
+    return SimpleNamespace(slash_commands=list(commands))
+
+
+def _fake_state(providers, by_key=None):
+    by_key = by_key or {}
+    return SimpleNamespace(
+        sessions=SimpleNamespace(
+            active_providers=lambda: list(providers),
+            get_provider=lambda key: by_key[key],
+        )
+    )
 
 
 def test_description_map_covers_slash_commands():
@@ -67,3 +96,91 @@ class TestApiSlashCommands:
             assert desc == SLASH_COMMAND_DESCRIPTIONS[name]
         # KiroCrew-local commands read meaningfully.
         assert "side" in by_name["/side"].lower()
+
+
+class TestAdvertisedCommands:
+    """The Claude backend forwards the CLI's own registry; the menu shows it.
+
+    Which backend a session runs is per-agent routing, so these all use the
+    ``acp`` provider — the global setting under which the routed Claude seam
+    actually runs, and under which the menu previously showed only kiro's set.
+    """
+
+    @pytest.mark.asyncio
+    async def test_live_claude_commands_replace_the_static_set(self):
+        provider = _fake_provider(
+            [
+                {"name": "design", "description": "Grant or revoke Design access"},
+                {"name": "code-review", "description": "Review the current diff"},
+            ]
+        )
+        payload = await _get("acp", state=_fake_state([provider]), claude_providers=(provider,))
+        by_name = {item["name"]: item["description"] for item in payload}
+        assert by_name["/design"] == "Grant or revoke Design access"
+        assert "/code-review" in by_name
+        # chat_runner intercepts these, so no backend advertises them and
+        # adopting the CLI registry must not drop them from the menu.
+        for dashboard_only in ("/side", "/goal", "/prompts"):
+            assert dashboard_only in by_name
+            assert by_name[dashboard_only] == SLASH_COMMAND_DESCRIPTIONS[dashboard_only]
+        # kiro-only commands are not runnable on this backend.
+        assert "/experiment" not in by_name
+
+    @pytest.mark.asyncio
+    async def test_kiro_backend_keeps_the_curated_set(self):
+        """kiro-cli advertises too, but its list would restore blocked commands."""
+        provider = _fake_provider([{"name": "design", "description": "d"}])
+        payload = await _get("acp", state=_fake_state([provider]), claude_providers=())
+        assert {item["name"] for item in payload} == set(_SLASH_COMMANDS)
+
+    @pytest.mark.asyncio
+    async def test_slot_query_picks_that_slots_backend(self):
+        kiro = _fake_provider([{"name": "wrong", "description": ""}])
+        claude = _fake_provider([{"name": "design", "description": "d"}])
+        state = _fake_state([kiro], by_key={"dashboard:slot-b": claude})
+        app = _make_app()
+        app["state"] = state
+        with (
+            patch(
+                "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
+                return_value=_fake_config("acp"),
+            ),
+            patch(
+                "kiro_crew.providers.acp.is_claude_backend",
+                side_effect=lambda p: p is claude,
+            ),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get("/api/slash-commands?slot=slot-b")
+                payload = await resp.json()
+        assert "/design" in {item["name"] for item in payload}
+
+    @pytest.mark.asyncio
+    async def test_multiline_description_collapses_to_one_row(self):
+        """A skill's body would otherwise ship kilobytes to render an ellipsis."""
+        provider = _fake_provider(
+            [{"name": "dataviz", "description": "First line.\n" + "x" * 5000}]
+        )
+        payload = await _get("acp", state=_fake_state([provider]), claude_providers=(provider,))
+        desc = next(i["description"] for i in payload if i["name"] == "/dataviz")
+        assert desc == "First line."
+
+    @pytest.mark.asyncio
+    async def test_overlong_single_line_is_capped(self):
+        provider = _fake_provider([{"name": "claude-api", "description": "y" * 5000}])
+        payload = await _get("acp", state=_fake_state([provider]), claude_providers=(provider,))
+        desc = next(i["description"] for i in payload if i["name"] == "/claude-api")
+        assert len(desc) == 200
+
+    @pytest.mark.asyncio
+    async def test_no_live_session_falls_back_to_the_static_set(self):
+        payload = await _get("acp", state=_fake_state([]), claude_providers=())
+        assert {item["name"] for item in payload} == set(_SLASH_COMMANDS)
+
+    @pytest.mark.asyncio
+    async def test_claude_code_provider_still_answers_before_any_handshake(self):
+        """Cold start: nothing advertised yet, so the SDK baseline stands in."""
+        payload = await _get("claude_code", state=_fake_state([]), claude_providers=())
+        names = {item["name"] for item in payload}
+        assert "/compact" in names and "/security-review" in names
+        assert {"/side", "/goal", "/prompts"} <= names
