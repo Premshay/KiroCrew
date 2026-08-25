@@ -195,6 +195,7 @@ ACP_BACKENDS_KIRO_IDENTITY_STORE = frozenset({ACP_BACKEND_KIRO})
 # An absent label means kiro-cli, which is the default backend.
 PROVIDER_LABEL_DEFAULT = "acp"
 PROVIDER_LABEL_CLAUDE = "claude_code"
+PROVIDER_LABEL_CODEX = "codex_acp"
 PROVIDER_LABEL_KAS = "kas"
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top

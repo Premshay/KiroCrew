@@ -29,6 +29,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_KNOWN,
     PROVIDER_LABEL_CLAUDE,
+    PROVIDER_LABEL_CODEX,
     PROVIDER_LABEL_DEFAULT,
     PROVIDER_LABEL_KAS,
 )
@@ -115,6 +116,14 @@ class TestProviderLabel:
         assert provider_label(_build_provider(ACP_BACKEND_KIRO)) == PROVIDER_LABEL_DEFAULT
         assert provider_label(_build_provider(ACP_BACKEND_CLAUDE)) == PROVIDER_LABEL_CLAUDE
         assert provider_label(_build_provider(ACP_BACKEND_KAS)) == PROVIDER_LABEL_KAS
+
+    def test_explicit_native_namespace_overrides_transport_backend(self):
+        provider = AcpProvider(
+            acp_backend=ACP_BACKEND_CLAUDE,
+            session_provider_label=PROVIDER_LABEL_CODEX,
+        )
+        assert provider.session_provider_label == PROVIDER_LABEL_CODEX
+        assert provider_label(provider) == PROVIDER_LABEL_CODEX
 
     def test_non_acp_provider_falls_back_to_the_default(self):
         assert provider_label(object()) == PROVIDER_LABEL_DEFAULT

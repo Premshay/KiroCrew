@@ -296,6 +296,7 @@ class AcpProvider(LLMProvider):
         permission_mode: str | None = None,
         model_switch_method: str = "",
         crew_agent: str | None = None,
+        session_provider_label: str = "",
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -326,6 +327,7 @@ class AcpProvider(LLMProvider):
             kwargs["agent"] = agent
         self._client = AcpClient(**kwargs)
         self.model_switch_method = model_switch_method
+        self._session_provider_label = session_provider_label
         # Consumer opt-in for the low-fidelity child permission downgrade
         # (see child_fidelity_aware property). Set by fidelity-aware
         # consumers (dashboard chat) BEFORE startup; re-applied when
@@ -1460,6 +1462,8 @@ class AcpProvider(LLMProvider):
     @property
     def session_provider_label(self) -> str:
         """Return the closed session-map label for this ACP backend."""
+        if self._session_provider_label:
+            return self._session_provider_label
         return provider_label(self)
 
     def set_resume_session_id(self, session_id: str) -> None:
@@ -1520,6 +1524,9 @@ def provider_label(provider: Any) -> str:
     the kiro label, and the map then prunes its id for want of a kiro
     transcript.
     """
+    override = getattr(provider, "_session_provider_label", "")
+    if isinstance(override, str) and override:
+        return override
     if isinstance(provider, AcpSessionProvider):
         backend = provider.backend
     elif isinstance(provider, AcpProvider):

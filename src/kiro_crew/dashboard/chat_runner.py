@@ -5676,7 +5676,6 @@ async def _run_chat(
                     _provider_has_history = True
             if (
                 is_new
-                and not rewound
                 and not _provider_has_history
                 and state.context_builder.conversation_log
             ):
@@ -5895,11 +5894,7 @@ async def _run_chat(
         # build_session_context already injects recent() from JSONL, so this
         # only adds value when in-memory messages are newer than disk.
         # Skip for soft stops — session is preserved, no re-injection needed.
-        if is_new and rewound and not is_slash:
-            history = _build_history_prefix(slot, slot.messages[:-1])
-            if history:
-                full_message = history + full_message
-        elif is_new and slot.messages:
+        if is_new and slot.messages and not rewound:
             # Check if last stop was soft (session preserved, no re-injection).
             # cls is a JSON-encoded dict (see api_chat_slot_stop); parse it.
             _last_stop_soft = False

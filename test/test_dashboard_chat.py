@@ -6982,14 +6982,44 @@ class TestRuntimeWiring:
         )
 
         state = _make_state(tmp_path, context_builder=ctx_builder)
+        ctx_builder.conversation_log = state.conversation_log
 
         # Create a slot with an agent
         slot = state.get_or_create_slot("mem-test", agent="oncall")
         slot._rewind_context_once = rewound
         if rewound:
+            # A rewind on a mature tab must rebuild from the recent surviving
+            # branch, not fill its budget from the oldest messages first.
+            for i in range(20):
+                content = f"old-{i}-" + ("x" * 500)
+                slot.append("assistant", content, "msg msg-a")
+                await asyncio.to_thread(
+                    state.conversation_log.append,
+                    "dashboard:mem-test",
+                    "assistant",
+                    content,
+                )
             slot.append("user", "retained question", "msg msg-u")
             slot.append("assistant", "retained answer", "msg msg-a")
             slot.append("user", "test message", "msg msg-u")
+            await asyncio.to_thread(
+                state.conversation_log.append,
+                "dashboard:mem-test",
+                "user",
+                "retained question",
+            )
+            await asyncio.to_thread(
+                state.conversation_log.append,
+                "dashboard:mem-test",
+                "assistant",
+                "retained answer",
+            )
+            await asyncio.to_thread(
+                state.conversation_log.append,
+                "dashboard:mem-test",
+                "user",
+                "test message",
+            )
 
         # Mock session manager to return a mock client
         mock_client = MagicMock()
@@ -7012,9 +7042,9 @@ class TestRuntimeWiring:
         )
         assert slot._rewind_context_once is False
         if rewound:
-            sent = mock_client.stream.call_args.args[0]
-            assert "retained question" in sent
-            assert "retained answer" in sent
+            replay = build_message_calls[0]["kwargs"].get("compressed_history") or ""
+            assert "retained question" in replay
+            assert "retained answer" in replay
 
     @pytest.mark.asyncio
     async def test_run_chat_clears_rewind_flag_for_slash_commands(self, tmp_path):
