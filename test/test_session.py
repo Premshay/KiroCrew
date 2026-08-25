@@ -1307,53 +1307,19 @@ class TestStopTurn:
         await mgr.close_all()
 
     @pytest.mark.asyncio
-    async def test_eager_respawn_called(self, cfg):
-        """Hard path schedules _eager_respawn via asyncio.create_task."""
+    async def test_stop_turn_hard_does_not_respawn_without_original_session_settings(self, cfg):
+        """Hard stop leaves the next real caller to recreate its own provider."""
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         provider, _, _ = await mgr.get_or_create("key1")
         mgr.release("key1")
 
         provider.cancel = AsyncMock(return_value="timeout")
 
-        with patch.object(mgr, "_eager_respawn", new_callable=AsyncMock) as mock_respawn:
-            await mgr.stop_turn("key1")
-            # Allow the created task to run
-            await asyncio.sleep(0)
-            mock_respawn.assert_awaited_once_with("key1")
+        await mgr.stop_turn("key1")
+        await asyncio.sleep(0)
 
-        await mgr.close_all()
-
-    @pytest.mark.asyncio
-    async def test_eager_respawn_failure_logged(self, cfg, caplog):
-        """_eager_respawn swallows exceptions and logs at debug."""
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-
-        with patch.object(
-            mgr, "get_or_create", new_callable=AsyncMock, side_effect=RuntimeError("boom")
-        ):
-            with caplog.at_level(logging.DEBUG, logger="kiro_crew.session"):
-                await mgr._eager_respawn("key1")
-
-        assert "Eager respawn failed" in caplog.text
-        await mgr.close_all()
-
-    @pytest.mark.asyncio
-    async def test_eager_respawn_releases_semaphore(self, cfg):
-        """_eager_respawn must release the semaphore acquired by get_or_create,
-        else the next user message deadlocks waiting on it."""
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        # Prime the session so get_or_create takes the fast path.
-        provider, _, _ = await mgr.get_or_create("key1")
-        mgr.release("key1")
-        sess = mgr._sessions["key1"]
-        # Sanity: semaphore is full (1 permit available) before respawn.
-        assert sess.semaphore.locked() is False
-
-        await mgr._eager_respawn("key1")
-
-        # After respawn the semaphore MUST be released, otherwise the next
-        # caller of get_or_create would hang on sess.semaphore.acquire().
-        assert sess.semaphore.locked() is False
+        assert not mgr.has_session("key1")
+        assert not mgr._background_tasks
         await mgr.close_all()
 
     @pytest.mark.asyncio
