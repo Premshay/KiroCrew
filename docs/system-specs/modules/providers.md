@@ -67,8 +67,9 @@ provider accepted the exact prior ID. The session manager reads all three throug
 an optional provider does not add a conditional to KiroCrew's ACP construction path.
 
 `discover_models()` is the account-scoped discovery seam for a selectable runtime. The
-dashboard calls it only through its short-lived model-discovery session and renders the
-returned `modelId` values; a provider may cache the latest catalog behind
+dashboard exposes it through `GET /api/agents/{name}/models`, using a short-lived
+model-discovery session bound to that named crew, and renders the returned `modelId`
+values; a provider may cache the latest catalog behind
 `available_models()`. `served_model` and `agent_name` keep session and context views
 provider-neutral. Empty defaults mean the core neither invents a model nor displays a
 context window for a provider that did not report one.

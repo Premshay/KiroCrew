@@ -132,3 +132,16 @@ async def test_workspace_alias_resolves_policy_by_kiro_agent():
     assert policy_calls == ["codex"]
     # Discovery still binds the alias so its workspace and pins apply.
     assert sessions.agent == "codex-atlas"
+
+
+def test_dashboard_routes_register_agent_model_discovery():
+    """The live handler is only reachable through the production registrar."""
+    from kiro_crew.dashboard.routes.agents import register
+
+    app = web.Application()
+    register(app)
+
+    assert any(
+        getattr(resource, "canonical", "") == "/api/agents/{name}/models"
+        for resource in app.router.resources()
+    )

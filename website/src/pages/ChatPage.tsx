@@ -1103,7 +1103,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [dispatch])
   const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(installedAgents)
   const filteredAgents = filteredAgentsByName
-  const availableModels = useAvailableModels()
+  const [pendingAgent, _setPendingAgent] = useState('')  // agent for next new slot
+  const pendingAgentRef = useRef('')
+  const setPendingAgent = useCallback((v: string) => { pendingAgentRef.current = v; _setPendingAgent(v) }, [])
+  const [pendingModel, _setPendingModel] = useState('')  // model for next new slot
+  const pendingModelRef = useRef('')
+  const setPendingModel = useCallback((v: string) => { pendingModelRef.current = v; _setPendingModel(v) }, [])
+  const pendingProjectRef = useRef('')
+  const setPendingProject = useCallback((v: string) => { pendingProjectRef.current = v }, [])
+  const modelPickerAgentName = slots.find(s => s.key === activeSlot)?.agent || pendingAgent || defaultAgent
+  const modelPickerAgent = installedAgents.find(agent => agent.name === modelPickerAgentName)
+  const availableModels = useAvailableModels({ agent: modelPickerAgent })
   const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(availableModels)
   // Roving-focus keyboard nav for the agent + model dropdowns (shared with StyledSelect/AgentSelector).
   const { onListKeyDown: onAgentListKeyDown } = useListboxKeyboard({
@@ -1127,15 +1137,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     onEnterSingleMatch: () => { switchModel(filteredModels[0].name); setModelDropdown(false) },
     closeToTrigger: () => setModelDropdown(false),
   })
-  const [pendingAgent, _setPendingAgent] = useState('')  // agent for next new slot
-  const pendingAgentRef = useRef('')
-  const setPendingAgent = useCallback((v: string) => { pendingAgentRef.current = v; _setPendingAgent(v) }, [])
-  const [pendingModel, _setPendingModel] = useState('')  // model for next new slot
-  const pendingModelRef = useRef('')
-  const setPendingModel = useCallback((v: string) => { pendingModelRef.current = v; _setPendingModel(v) }, [])
-  const pendingProjectRef = useRef('')
-  const setPendingProject = useCallback((v: string) => { pendingProjectRef.current = v }, [])
-
   // pendingModel is the model for the NEXT new slot, and it is deliberately
   // left EMPTY unless the user explicitly picks one (switchModel below).
   //

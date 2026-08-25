@@ -1977,6 +1977,12 @@ export const api = {
    *  `agent` resolves the configured default agent. */
   agentResolvedModel: (agent: string) =>
     fetch('/api/agents/resolved-model?agent=' + encodeURIComponent(agent)).then(j),
+  /** Models and effort levels advertised by this agent's own ACP runtime. */
+  kirocrewAgentModels: (agent: string) =>
+    fetch('/api/agents/' + encodeURIComponent(agent) + '/models').then(j) as Promise<{
+      models: { modelId: string; name: string; description: string }[]
+      effort_levels: string[]
+    }>,
   syncKirocrewAgents: () => post('/api/agents/sync', {}).then(j),
   createKirocrewAgent: (body: object) => post('/api/agents', body).then(j),
   updateKirocrewAgent: (name: string, body: object) =>

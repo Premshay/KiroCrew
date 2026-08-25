@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 
+import { api } from '../api/client'
 import { useProvider } from '../providers'
 import { modelListRefetchInterval } from '../providers/modelListHealth'
 import { withAutoFirst } from '../providers/modelList'
@@ -43,12 +44,40 @@ const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
  * kiro-cli. Other mounted observers still fetch normally — `enabled` gates who
  * *triggers* a fetch, not what lands in the cache.
  */
-export function useAvailableModels({ enabled }: { enabled?: boolean } = {}): ModelInfo[] {
+type ModelPickerAgent = {
+  name: string
+  runtime_policy?: { model?: 'selectable' | 'managed' | 'unsupported' } | null
+}
+
+/**
+ * Read one agent's account-scoped catalog when its companion explicitly owns
+ * model selection. Other callers retain the shared Kiro catalog and cache.
+ */
+export function useAvailableModels({
+  enabled,
+  agent,
+}: {
+  enabled?: boolean
+  agent?: ModelPickerAgent
+} = {}): ModelInfo[] {
   const provider = useProvider()
+  const selectableAgent = agent?.runtime_policy?.model === 'selectable' ? agent : undefined
   const { data } = useQuery({
-    queryKey: ['available-models', provider.id],
-    queryFn: async () => withAutoFirst(await provider.fetchAvailableModels()),
-    refetchInterval: modelListRefetchInterval,
+    queryKey: selectableAgent
+      ? ['available-models', provider.id, 'agent', selectableAgent.name]
+      : ['available-models', provider.id],
+    queryFn: async () => {
+      if (selectableAgent) {
+        const discovered = await api.kirocrewAgentModels(selectableAgent.name)
+        return withAutoFirst(discovered.models.map(model => ({
+          name: model.modelId,
+          description: model.description || model.name,
+          contextWindow: provider.getContextWindow(model.modelId),
+        })))
+      }
+      return withAutoFirst(await provider.fetchAvailableModels())
+    },
+    refetchInterval: selectableAgent ? false : modelListRefetchInterval,
     ...(enabled === undefined ? {} : { enabled }),
   })
   return data ?? PLACEHOLDER
