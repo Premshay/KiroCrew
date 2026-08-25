@@ -324,6 +324,7 @@ class TestStartDashboardWiring:
         async with _dashboard(tmp_path, monkeypatch) as (runner, state, _spies):
             assert state.ready is True
             assert runner.app["state"] is state
+            assert runner.app["platform_context"] is srv.current_context()
             assert runner.app["port"] == 0
 
     @pytest.mark.asyncio
