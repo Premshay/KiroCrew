@@ -19,6 +19,7 @@
         "model": "auto",
         "role_models": {},
         "role_efforts": {},
+        "fallback_model": "auto",
         "reasoning_effort": "",
         "provider": "acp",
         "mcp_registry_mode": false,
@@ -30,6 +31,8 @@
         "sandbox_allow_unsandboxed_exec": false,
         "apps_allow_third_party": false,
         "apps_trusted": [],
+        "apps_trusted_local": [],
+        "apps_trusted_repositories": {},
         "jail": "auto",
         "dangerously_skip_permissions": false,
         "yolo_duration": "6h",
@@ -174,6 +177,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null
+    },
+    {
+      "path": "agent.fallback_model",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Fallback model",
+      "help": "Model tried when the active model's transient-retry budget is exhausted (throttle/capacity). Default 'auto' defers to the backend's availability-aware routing; a concrete model id (as advertised by the provider, e.g. 'claude-opus-4.8') is tried first with 'auto' as the final fallthrough; empty ('') disables fallback entirely (fail loudly, pre-feature behavior). A fallback swap is announced in chat, sticks until the primary recovers, and the serving model is recorded in every turn's stats — never silent.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "auto"
     },
     {
       "path": "agent.reasoning_effort",
@@ -346,6 +363,62 @@
     },
     {
       "path": "agent.apps_trusted.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "agent.apps_trusted_local",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Trusted Local Apps",
+      "help": "App names whose per-app execution grant was explicitly reviewed as local, repository-less code. This internal grant-kind marker distinguishes current local consent from legacy name-only grants; it is effective only with the matching apps_trusted entry.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "agent.apps_trusted_local.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "agent.apps_trusted_repositories",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Trusted App Repositories",
+      "help": "Repository coordinates captured by the per-app trust endpoint. Each key is an app name from apps_trusted and each value is the normalized repository shown at consent. Registry installation refuses if that name later resolves to a different repository. Legacy repository-backed grants without an entry require one-time re-consent before code execution.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "agent.apps_trusted_repositories.*",
       "kind": "core",
       "type": "string",
       "required": false,
@@ -1940,7 +2013,8 @@
         "pending_ttl_days": 30,
         "generate_scripts": true,
         "judge_model": "auto",
-        "extra_paths": []
+        "extra_paths": [],
+        "project_skills_enabled": true
       }
     },
     {
@@ -2152,6 +2226,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null
+    },
+    {
+      "path": "skills.project_skills_enabled",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Project Skills",
+      "help": "Whether a chat session may load skills from its own project's <project>/.kiro/skills directory. Enabled by default, but a project's skills are still only loaded after the operator grants that specific directory trust, because a SKILL.md enters the agent's context and can instruct it to run anything. Set false to make project skills impossible regardless of any grant already recorded.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
     },
     {
       "path": "session_summary",
@@ -3896,8 +3984,11 @@
         "bot_token": "",
         "allowed_user_ids": [],
         "soft_threshold_pct": 80,
+        "show_thinking": false,
         "allow_forum": false,
         "allowed_forum_chat_ids": [],
+        "voice_replies": false,
+        "forum_activation": "always",
         "accounts": {},
         "session_folder": ""
       }
@@ -3981,6 +4072,22 @@
       "defaultValue": 80
     },
     {
+      "path": "telegram.show_thinking",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "telegram"
+      ],
+      "label": "Show Thinking",
+      "help": "Post the model's reasoning after each answer as a collapsed, expandable quote. Off by default: Telegram's rate limit is per chat and shared with the streaming edits the answer already spends, so reasoning costs an extra message per turn.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
       "path": "telegram.allow_forum",
       "kind": "core",
       "type": "boolean",
@@ -4025,6 +4132,38 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null
+    },
+    {
+      "path": "telegram.voice_replies",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "telegram"
+      ],
+      "label": "Voice Replies",
+      "help": "Speak each answer as a voice/audio message in addition to the text, using the global voice_reply provider settings. Off by default: it costs a second message per turn against Telegram's per-chat rate budget, and TTS may not be configured. Toggle per conversation with /voice on|off; this is the default for a new conversation.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "telegram.forum_activation",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "telegram"
+      ],
+      "label": "Forum Activation",
+      "help": "When the bot answers inside an allow-listed forum Topic: 'always' (every message), 'mention' (only when its @handle is used or one of its own messages is replied to), or 'off' (never). Slack's channel equivalent defaults to 'mention'; this defaults to 'always' so an existing forum keeps working after an upgrade instead of going quiet. Does not apply to a 1:1 DM, which is always served.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "always"
     },
     {
       "path": "telegram.accounts",
@@ -4939,6 +5078,10 @@
         "enabled": false,
         "bot_token": "",
         "allowed_emails": [],
+        "allow_group_rooms": false,
+        "allowed_room_ids": [],
+        "reply_in_thread": true,
+        "wdm_base": "",
         "soft_threshold_pct": 80,
         "hard_threshold_pct": 95,
         "session_folder": ""
@@ -5005,6 +5148,84 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null
+    },
+    {
+      "path": "webex.allow_group_rooms",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "webex"
+      ],
+      "label": "Allow Group Spaces",
+      "help": "Answer in group spaces as well as direct messages. Off by default: a reply in a space is visible to every member, including people who are not on the allow-list, so tool output would leave the DM. A Webex bot only ever sees messages that @mention it in a space.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "webex.allowed_room_ids",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "webex"
+      ],
+      "label": "Allowed Room IDs",
+      "help": "Webex space IDs the bot may answer in when group spaces are enabled. Empty = deny all (fail closed), so turning the switch on alone grants nothing; the sender must ALSO be on the email allow-list.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "webex.allowed_room_ids.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "webex.reply_in_thread",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "webex"
+      ],
+      "label": "Reply in Thread",
+      "help": "Reply under the message's own thread when it has one, keeping a space readable. Webex threads are flat, so a reply always attaches to the thread root.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
+      "path": "webex.wdm_base",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "webex"
+      ],
+      "label": "Device Manager Base URL",
+      "help": "Override the Webex Device Manager host used for the inbound WebSocket. Empty (the default) discovers the org's own regional host per token, which is what a non-US-resident org needs; set this only to pin a REGIONAL WEBEX host for a network that reaches it but not the service catalog. Must be an https Webex host (*.wbx2.com, *.webex.com, *.ciscospark.com) — the bot token rides device registration, so anything else is refused and discovery is used instead. An outbound proxy belongs in HTTPS_PROXY, not here.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
     },
     {
       "path": "webex.soft_threshold_pct",
@@ -5389,9 +5610,11 @@
           "enabled": false,
           "trust_identity": false,
           "allowed_logins": [],
-          "pin_scope": "node"
+          "pin_scope": "node",
+          "keep_awake": true
         },
         "restore_sessions": false,
+        "qr_session_until_restart": true,
         "restore_window_minutes": 30,
         "surface_channel_sessions": true,
         "bot_name": "",
@@ -5421,6 +5644,7 @@
         "theme_color": "",
         "language": "",
         "recent_tint_count": 0,
+        "update_nudge": {},
         "onboarded": false,
         "import_onboarded": false,
         "privacy_acked": false,
@@ -5469,7 +5693,8 @@
         "enabled": false,
         "trust_identity": false,
         "allowed_logins": [],
-        "pin_scope": "node"
+        "pin_scope": "node",
+        "keep_awake": true
       }
     },
     {
@@ -5543,6 +5768,20 @@
       "defaultValue": "node"
     },
     {
+      "path": "dashboard.tailscale.keep_awake",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Keep Awake While Published",
+      "help": "Keep this machine's SYSTEM awake while the dashboard is published on the tailnet, so a phone does not lose the dashboard when the laptop idles. The display is still allowed to sleep. Publishing is the opt-in — this exists to opt back OUT of the awake half without unpublishing. Independent of dashboard.prevent_sleep, which keeps the host awake only while a turn is in flight.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
       "path": "dashboard.restore_sessions",
       "kind": "core",
       "type": "boolean",
@@ -5555,6 +5794,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
+    },
+    {
+      "path": "dashboard.qr_session_until_restart",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Phone Sign-In Lasts Until Restart",
+      "help": "Keep a phone signed in for as long as this gateway process runs. The QR code still has to be scanned within its short window; after that the phone is not signed out for being idle in ordinary use, and a gateway restart signs it out. The one remaining idle limit is the refresh credential's own 30-day lifetime, which each visit renews, so a phone that goes untouched for 30 days re-scans. Turn this OFF to go back to a timed session that expires on a clock whether or not the gateway is still running. Either way `kirocrew logout` ends the session immediately, and the session stays pinned to the peer it was established from.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
     },
     {
       "path": "dashboard.restore_window_minutes",
@@ -5708,12 +5961,13 @@
       "sensitive": false,
       "tags": [],
       "label": "Response Verbosity",
-      "help": "Controls how terse the agent's prose is. 'default' is normal; 'concise' injects brevity guidelines (lead with the answer, cut filler, keep code/errors verbatim); 'ultra' writes for an ADHD reader — the answer lands in a 3-sentence opening, and any detail after it must be scannable bullets rather than prose. Both levels preserve full detail for security warnings, irreversible-action confirmations, and ordered multi-step instructions.",
+      "help": "Controls how terse the agent's prose is. 'default' is normal; 'concise' injects brevity guidelines (lead with the answer, cut filler, keep code/errors verbatim); 'ultra' writes for an ADHD reader — the answer lands in a 3-sentence opening, and any detail after it must be scannable bullets rather than prose; 'answer_only' drops explanation altogether — the answer or artifact alone, with at most one sentence of context, and detail only when the user asks for it, when the decision is consequential enough (security, exposure, data loss, spend, anything hard to undo) that they cannot choose correctly without the reasoning, or as the undo path that rides along with a destructive command. Every level preserves full detail for security warnings, irreversible-action confirmations, and ordered multi-step instructions.",
       "hasChildren": false,
       "enumValues": [
         "default",
         "concise",
-        "ultra"
+        "ultra",
+        "answer_only"
       ],
       "defaultValue": "default"
     },
@@ -5961,6 +6215,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0
+    },
+    {
+      "path": "dashboard.update_nudge",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Update Nudge",
+      "help": "Per-version state for the proactive update popup. Written by the dashboard when the user snoozes or skips a release; a record only suppresses the popup for the version it names. Validated as one atomic record by the PATCH allowlist (dashboard.update_nudge); no Settings control reads it, so it carries no schema properties.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
     },
     {
       "path": "dashboard.onboarded",

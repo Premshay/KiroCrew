@@ -18,7 +18,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Protocol
 
 from kiro_crew.acp.liveness import (
     VERDICT_DEAD,
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 from kiro_crew import platform_compat
 from kiro_crew.agent_discovery import cached_project_agent_names, list_agents
-from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig
 from kiro_crew.constants import SUBAGENT_COMPLETION_PREFIX
 from kiro_crew.context import (
     CONTEXT_GROUP_LESSONS,
@@ -64,8 +64,14 @@ from kiro_crew.hooks import (
     safe_read_file,
 )
 from kiro_crew.llm_helpers import (
+    FALLBACK_CANDIDATE_ATTEMPTS,
     TRANSIENT_RETRIES,
+    TURN_FALLBACK_ATTR,
+    FallbackState,
     acp_error_is_transient,
+    advance_fallback_candidate,
+    configured_fallback_chain,
+    provider_fallback_active,
     transient_retry_delay,
 )
 from kiro_crew.mcp_gateway import STUB_MODULE
@@ -79,7 +85,11 @@ from kiro_crew.providers.base import (
     LLMEvent,
 )
 from kiro_crew.resource_status import cached_admission_check
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    redact_and_truncate,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionManager
 from kiro_crew.session_surface import has_dashboard_surface
@@ -293,6 +303,16 @@ def _redact(text: str) -> str:
     return text
 
 
+def _redact_and_truncate(text: str, max_chars: int) -> str:
+    """Redact over the FULL text, then truncate (never ``_redact(x[:n])``).
+
+    Truncating first can cut a credential in half at the boundary, leaving a
+    fragment the redaction regexes no longer match — the raw remainder would
+    then leak into the surface this feeds. Delegates to the canonical helper.
+    """
+    return redact_and_truncate(text, max_chars)
+
+
 # Bounds for a rendered exception chain. The rendering reaches a WS frame, a
 # tombstone and the Subagents panel, so it is capped rather than trusted.
 _MAX_ERROR_DETAIL_LEN = 2_000
@@ -441,6 +461,31 @@ def _resolve_injection_timeout() -> float:
 INJECTION_TIMEOUT = _resolve_injection_timeout()
 
 
+def _resolved_model_of(client: object) -> str:
+    """The model id *client*'s live session actually resolved to serve, or ``""``.
+
+    Reads the provider's PUBLIC ``served_model`` accessor (never private
+    ``_client`` internals, which are free to move) — the same contract the
+    poisoned-conversation canary and ``AcpProvider.served_model`` use. Both
+    provider shapes are covered: ``AcpSessionProvider.served_model`` prefers the
+    explicit ``set_model`` and falls back to the ``session/new|load`` response's
+    ``currentModelId`` (so a session on the backend-selected DEFAULT is still
+    readable at spawn), while the raw ``AcpClient`` reports ``_resolved_model_id``
+    once the backend has answered (known after the first turn on the CC path).
+
+    The ``DEFAULT_MODEL`` (``"auto"``) sentinel — "let the backend pick", not yet
+    resolved — is filtered to ``""`` (unknown/inconclusive) so a caller never
+    renders it as if it were a real model, and callers must treat ``""`` as
+    "don't show", never as a wildcard. Never raises — an unreadable or
+    duck-typed client (test doubles) yields ``""``.
+    """
+    try:
+        model = str(getattr(client, "served_model", "") or "").strip()
+    except Exception:
+        return ""
+    return "" if model == DEFAULT_MODEL else model
+
+
 def _subagent_default_model() -> str:
     """Explicit sub-agent model pin (``agent.role_models['subagent']``), or ``""``.
 
@@ -536,7 +581,9 @@ def _digest_hold_secs() -> float:
 DIGEST_HOLD_SECS = _digest_hold_secs()
 
 
-def _timeout_context(info: "SubagentInfo", *, include_elapsed: bool = True, turn_limit: int = 0) -> str:
+def _timeout_context(
+    info: "SubagentInfo", *, include_elapsed: bool = True, turn_limit: int = 0
+) -> str:
     """Build a human-readable context string for timeout errors.
 
     ``turn_limit`` is the resolved effective turn cap (per-spawn override →
@@ -580,10 +627,13 @@ def check_memory_available(min_gb: float = 4.0, path: str = "/proc/meminfo") -> 
     return (True, -1.0)
 
 
-# Process-subtree RSS readers (relocated from the upstream mcp_gateway pool,
+# Process-subtree readers (relocated from the upstream mcp_gateway pool,
 # which is absent in this fork). Pure-stdlib /proc walkers: on non-Linux hosts
 # every /proc access raises OSError and these degrade to -1 / [] gracefully.
-_RSS_SUBTREE_MAX_PROCS = 256
+# ONE ceiling for every reading. RSS, CPU and the two counts used to be three
+# walks carrying two copies of the same 256, which is how they could have
+# drifted apart.
+_SUBTREE_MAX_PROCS = 256
 
 
 def _single_proc_rss_kb(pid: int) -> int:
@@ -619,85 +669,126 @@ def _proc_children(pid: int) -> list[int]:
     return kids
 
 
-def _proc_rss_kb(pid: Optional[int]) -> int:
-    """Resident set size (KiB) for ``pid`` **and all its descendants**.
+def _parse_cpu_jiffies(stat: bytes) -> int:
+    """Sum utime+stime (clock ticks) from raw ``/proc/<pid>/stat`` bytes.
+
+    Splits after the final ``)`` so a ``comm`` containing spaces/parens is
+    handled. utime/stime are fields 14/15 (1-indexed) → indices 11/12 of the
+    post-comm tokens. Returns 0 on any parse error.
+    """
+    try:
+        rparen = stat.rindex(b")")
+        fields = stat[rparen + 2 :].split()
+        return int(fields[11]) + int(fields[12])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _proc_cpu_jiffies(pid: int) -> int:
+    """utime+stime (clock ticks) for a single pid, 0 on error."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            return _parse_cpu_jiffies(fh.read())
+    except OSError:
+        return 0
+
+
+class _SubtreeSample(NamedTuple):
+    """Every subtree reading the cost sweep needs, from ONE walk.
+
+    Each field keeps the sentinel its own reader had, because the four readings
+    are unmeasurable in different ways and collapsing any of them into zero is
+    the bug class the count columns were added to fix:
+
+    * ``rss_kb`` — summed KiB, or ``-1`` when the root pid's own status is
+      unreadable (it is gone, or the host has no ``/proc``).
+    * ``jiffies`` — summed utime+stime clock ticks; an unreadable pid
+      contributes 0, since a *delta* of jiffies is what the caller consumes.
+    * ``procs`` / ``stubs`` — how many processes a runtime carries, and how many
+      of them are MCP stubs, matched on ``STUB_MODULE``, the module path the
+      rewriter itself puts on the stub launch line. ``None`` means UNMEASURABLE,
+      never zero. Rendering "0 processes" for a live runtime would be a lie; the
+      surface renders ``None`` as an em dash instead.
+    """
+
+    rss_kb: int
+    jiffies: int
+    procs: Optional[int]
+    stubs: Optional[int]
+
+
+def _proc_subtree_sample(
+    pid: Optional[int],
+    *,
+    rss: bool = True,
+    counts: bool = True,
+) -> _SubtreeSample:
+    """Walk ``pid``'s process subtree ONCE and return every reading from it.
 
     A subagent's kiro-cli process is frequently a thin launcher whose real
-    memory lives in a child process. Counting only ``pid``'s own ``VmRSS``
-    under-reports the true footprint, so we sum the whole subtree.
+    memory lives in a child process, so all four readings describe the whole
+    subtree rather than the root pid alone.
 
-    Returns -1 if ``pid`` is falsy or its own status cannot be read; otherwise
-    the summed KiB (descendants that vanish mid-walk are simply skipped, so the
-    result degrades gracefully to parent-only when ``children`` is unreadable).
+    The point of one pass is not only the ~3x fewer ``/proc`` reads: the three
+    readers this replaced ran at three different instants, so a process that
+    exited between them was counted by one and missed by another. Reading every
+    metric off a single frontier is what makes "the same set of processes" true
+    of the *result* and not merely of the walk rules.
+
+    ``rss`` / ``counts`` let a caller that only needs the CPU total skip those
+    per-process reads, so it costs what it cost before this walk was shared.
+    Skipped metrics come back as their own unmeasurable sentinel.
+
+    Blocking: reads a handful of ``/proc`` entries per process in the subtree,
+    so it belongs on an executor thread, never on the event loop (see
+    ``_reaper_loop`` -> ``_sample_live_costs``).
     """
     if not pid:
-        return -1
-    own = _single_proc_rss_kb(pid)
-    if own < 0:
-        return -1
-    total = own
-    seen = {pid}
-    frontier = [pid]
-    while frontier and len(seen) < _RSS_SUBTREE_MAX_PROCS:
-        nxt: list[int] = []
-        for parent in frontier:
-            for child in _proc_children(parent):
-                if child in seen:
-                    continue
-                seen.add(child)
-                kb = _single_proc_rss_kb(child)
-                if kb > 0:
-                    total += kb
-                nxt.append(child)
-        frontier = nxt
-    return total
-
-
-def _proc_subtree_counts(pid: Optional[int]) -> tuple[Optional[int], Optional[int]]:
-    """``(processes, mcp_stubs)`` in ``pid``'s subtree, or ``(None, None)``.
-
-    The companion to :func:`_proc_rss_kb` for the two count columns of the
-    Sessions surface: how many processes a runtime carries, and how many of them
-    are MCP stubs — matched on ``STUB_MODULE``, the module path the rewriter
-    itself puts on the stub launch line.
-
-    ``None`` means UNMEASURABLE, never zero. A host without ``/proc`` cannot walk
-    a subtree at all, and rendering that as "0 processes" for a live runtime
-    would be a lie — the surface renders ``None`` as an em dash instead.
-
-    Walk order, depth and the ``_RSS_SUBTREE_MAX_PROCS`` ceiling mirror
-    ``_proc_rss_kb`` so both readings describe the same set of processes.
-
-    Blocking: reads one ``/proc`` entry per process in the subtree, so it belongs
-    on an executor thread, never on the event loop (see ``_reaper_loop``).
-    """
-    if not pid or not platform_compat.IS_LINUX:
-        return (None, None)
-    if _single_proc_rss_kb(pid) < 0:
-        return (None, None)  # pid gone or /proc unreadable: nothing to attribute
+        return _SubtreeSample(-1, 0, None, None)
+    # The counts share RSS's liveness probe: a root pid whose own status cannot
+    # be read has nothing to attribute, so there is nothing to count either.
+    own_rss = _single_proc_rss_kb(pid) if (rss or counts) else -1
+    countable = counts and platform_compat.IS_LINUX and own_rss >= 0
+    rss_total = own_rss if (rss and own_rss >= 0) else -1
     needles = (STUB_MODULE,)
+    jiffies = _proc_cpu_jiffies(pid)
     procs = 1
-    stubs = 1 if platform_compat.process_matches(pid, needles) else 0
+    stubs = 1 if countable and platform_compat.process_matches(pid, needles) else 0
     seen = {pid}
     frontier = [pid]
-    while frontier and len(seen) < _RSS_SUBTREE_MAX_PROCS:
+    while frontier and len(seen) < _SUBTREE_MAX_PROCS:
         nxt: list[int] = []
         for parent in frontier:
             for child in _proc_children(parent):
                 if child in seen:
                     continue
                 seen.add(child)
-                procs += 1
-                if platform_compat.process_matches(child, needles):
-                    stubs += 1
+                if rss_total >= 0:
+                    kb = _single_proc_rss_kb(child)
+                    if kb > 0:
+                        rss_total += kb
+                jiffies += _proc_cpu_jiffies(child)
+                if countable:
+                    procs += 1
+                    if platform_compat.process_matches(child, needles):
+                        stubs += 1
                 nxt.append(child)
         frontier = nxt
-    return (procs, stubs)
+    if not countable:
+        return _SubtreeSample(rss_total, jiffies, None, None)
+    return _SubtreeSample(rss_total, jiffies, procs, stubs)
 
 
-def _attributed_count(
-    total: Optional[int], sharers: int, previous: Optional[int]
-) -> Optional[int]:
+def _subtree_cpu_jiffies(pid: int) -> int:
+    """Sum utime+stime across ``pid`` and its descendants (clock ticks).
+
+    Thin wrapper over :func:`_proc_subtree_sample`, so the CPU subtree the
+    Sessions session rows read is the same subtree the task rows describe.
+    """
+    return _proc_subtree_sample(pid, rss=False, counts=False).jiffies
+
+
+def _attributed_count(total: Optional[int], sharers: int, previous: Optional[int]) -> Optional[int]:
     """One co-tenant's share of a subtree *total*, or *previous* if unmeasured.
 
     Counts follow the same per-sharer split as the RSS/CPU attribution (see
@@ -953,53 +1044,6 @@ def resolve_max_subagents(cfg: KiroCrewConfig) -> int:
 
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-_CPU_SUBTREE_MAX_PROCS = 256
-
-
-def _parse_cpu_jiffies(stat: bytes) -> int:
-    """Sum utime+stime (clock ticks) from raw ``/proc/<pid>/stat`` bytes.
-
-    Splits after the final ``)`` so a ``comm`` containing spaces/parens is
-    handled. utime/stime are fields 14/15 (1-indexed) → indices 11/12 of the
-    post-comm tokens. Returns 0 on any parse error.
-    """
-    try:
-        rparen = stat.rindex(b")")
-        fields = stat[rparen + 2 :].split()
-        return int(fields[11]) + int(fields[12])
-    except (ValueError, IndexError):
-        return 0
-
-
-def _proc_cpu_jiffies(pid: int) -> int:
-    """utime+stime (clock ticks) for a single pid, 0 on error."""
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as fh:
-            return _parse_cpu_jiffies(fh.read())
-    except OSError:
-        return 0
-
-
-def _subtree_cpu_jiffies(pid: int) -> int:
-    """Sum utime+stime across ``pid`` and its descendants (clock ticks).
-
-    Walks the same kernel children list as ``pool._proc_rss_kb`` so the CPU
-    subtree matches the RSS subtree.
-    """
-    total = _proc_cpu_jiffies(pid)
-    seen = {pid}
-    frontier = [pid]
-    while frontier and len(seen) < _CPU_SUBTREE_MAX_PROCS:
-        nxt: list[int] = []
-        for parent in frontier:
-            for child in _proc_children(parent):
-                if child in seen:
-                    continue
-                seen.add(child)
-                total += _proc_cpu_jiffies(child)
-                nxt.append(child)
-        frontier = nxt
-    return total
 
 
 def validate_cwd(cwd: str, allowed_roots: list[str]) -> tuple[str, str]:
@@ -1186,6 +1230,24 @@ class SubagentInfo:
     _raw_task: str = ""  # unredacted task for kiro-cli execution prompt
     # CC-specific overrides (ignored for ACP)
     model: str = ""
+    # The model id the live session ACTUALLY resolved to serve, read back from
+    # the provider's public ``served_model`` accessor. Distinct from ``model``,
+    # which is only the REQUESTED pin (often "" ⇒ provider default): the ACP
+    # backend reports the served id even on the default, and a routing/config/
+    # availability downgrade makes the two differ. "" means unknown/inconclusive
+    # (never a wildcard) — the ACP session/new response fills it at spawn, while
+    # the CC/raw path only knows it after the first turn, so it is refreshed at
+    # completion too. Surfaced on the subagent WS frames and completion meta so a
+    # model-pinned review's actual model is auditable (issue #3582).
+    resolved_model: str = ""
+    # The EFFECTIVE requested model — the per-spawn pin (``model``) OR, when that
+    # is empty, the ``agent.role_models['subagent']`` config pin (AGENTS.md names
+    # the config pin as *the* way to pin a subagent model). This is the side the
+    # downgrade comparison must use: a config-pinned run served a different model
+    # is exactly the "unverifiable pin" this feature exists to catch, and keying
+    # off the bare per-spawn ``model`` would miss it (Design review on #3582).
+    # "" ⇒ no pin (the provider default). Resolved once at spawn.
+    requested_model: str = ""
     # Per-call reasoning-effort override (spawn_run ``reasoning_effort``).
     # Wins over the ``role_efforts['subagent']`` pin; ``""`` defers to it.
     # Like ``model``, a non-empty value forces the dedicated-process path.
@@ -1301,6 +1363,36 @@ class SubagentInfo:
 
 # Callback: (subagent_info) -> None
 AnnounceCallback = Callable[[SubagentInfo], Awaitable[None]]
+
+
+def _injection_notice_outcome(info: "SubagentInfo") -> str:
+    """One-sentence outcome line for the injection-failure fallback notice.
+
+    ``notify_injection_failed`` fires whenever a terminal report could not be
+    injected into the parent — for EVERY terminal state, not just successful
+    completion. Asserting "finished" for a run that was stopped or rejected
+    before it executed misdescribes the outcome, so the line branches on the
+    record's canonical :attr:`SubagentInfo.outcome` with one before-start
+    refinement per branch: ``_exec_started`` — the marker ``_run_inner`` sets
+    when execution actually begins — is ``None`` exactly when the run never
+    executed, which covers every spawn-rejection site (all of them construct
+    their record without it) with no wording contract between ``error``
+    strings and this notice. The "no result to deliver" phrasings are guarded
+    on the absence of any output so they can never contradict the result-path
+    recovery hint. Pure function of the record, unit-tested per branch.
+    """
+    never_ran = info._exec_started is None and not info.result and not info.result_path
+    outcome = info.outcome
+    if outcome == "stopped":
+        if never_ran:
+            return "The run was stopped before it started, so there is no result to deliver."
+        return "The run was stopped before it completed."
+    if outcome == "failed":
+        if never_ran:
+            return "The run failed before it started, so there is no result to deliver."
+        return "The agent failed before a result could be delivered."
+    return "The agent finished but result delivery timed out."
+
 
 # Event callback: (event_type, info, extra_data) -> None
 SubagentEventCallback = Callable[[str, "SubagentInfo", dict], Awaitable[None]]
@@ -1748,6 +1840,8 @@ class SubagentManager:
                 outcome=OUTCOME_INTERRUPTED,
                 task=task_preview,
                 note="orphaned by gateway restart",
+                requested_model=str(state.get("requested_model") or ""),
+                resolved_model=str(state.get("resolved_model") or ""),
             )
         else:
             msg = (
@@ -1761,6 +1855,8 @@ class SubagentManager:
                 outcome=OUTCOME_FAILED,
                 task=task_preview,
                 note="lost to gateway restart",
+                requested_model=str(state.get("requested_model") or ""),
+                resolved_model=str(state.get("resolved_model") or ""),
             )
 
         # Redact before any delivery path (injection or Slack DM)
@@ -1841,24 +1937,22 @@ class SubagentManager:
                 logger.debug("on_orphan_dm raised", exc_info=True)
         logger.warning("Orphan notification (no delivery channel wired): %s", msg[:200])
 
-    def _live_shared_count(
-        self, pid: int | None, agents: "list[SubagentInfo] | None" = None
-    ) -> int:
+    def _live_shared_count(self, pid: int | None, agents: "list[SubagentInfo]") -> int:
         """Count live session-shared subagents sharing runtime *pid* (>= 1).
 
         Used to average the shared AcpRuntime's measured RSS/CPU across the
         sessions currently running inside it, so each shared subagent is charged
         an empirical per-session share rather than the whole process.
 
-        *agents* lets an off-loop caller pass the snapshot it already took, so the
-        count never iterates the live registry from a worker thread (see
-        ``_sample_live_costs``). Omitted, it reads the registry directly, which is
-        correct on the event loop.
+        *agents* is the registry snapshot the caller already took, and is
+        required: the sole caller runs on a worker thread (see
+        ``_sample_live_costs``), where iterating the live registry would raise
+        ``RuntimeError`` the moment the event loop registered or evicted an
+        agent. An on-loop caller passes ``list(self._agents.values())``.
         """
         if not pid:
             return 1
-        pool = agents if agents is not None else list(self._agents.values())
-        n = sum(1 for a in pool if not a.done and a._session_sharing and a._pid == pid)
+        n = sum(1 for a in agents if not a.done and a._session_sharing and a._pid == pid)
         return n if n > 0 else 1
 
     def _sample_live_costs(self) -> None:
@@ -1870,9 +1964,10 @@ class SubagentManager:
         seeds the CPU baseline (no delta yet). Best-effort: a dead/unreadable
         pid is simply skipped.
 
-        BLOCKING, and therefore off-loop: every live agent costs several ``/proc``
-        walks (RSS subtree, CPU jiffies, process+stub counts), so the caller
-        hands this to :func:`maintenance_executor` and the body must stay
+        BLOCKING, and therefore off-loop: every live agent costs ONE ``/proc``
+        subtree walk (:func:`_proc_subtree_sample`, which returns RSS, CPU
+        jiffies and the process/stub counts from a single frontier), so the
+        caller hands this to :func:`maintenance_executor` and the body must stay
         thread-safe. Concretely that means it takes ONE snapshot of the agent
         registry up front and derives everything, sharer counts included, from
         that list: iterating the live dict from a worker thread would raise
@@ -1892,44 +1987,23 @@ class SubagentManager:
             # by the number of concurrently-live shared sessions on that PID — an
             # empirical per-session average, not a guessed constant
             # (dynamic-subagent-sizing.md §session-sharing cost model).
-            if info._session_sharing:
-                shared_n = self._live_shared_count(pid_owner := info._pid, agents=agents)
-                rss_kb = _proc_rss_kb(pid_owner)
-                if rss_kb > 0 and shared_n > 0:
-                    gb = (rss_kb / (1024 * 1024)) / shared_n
-                    info.last_rss_gb = gb
-                    if gb > info.peak_rss_gb:
-                        info.peak_rss_gb = gb
-                procs, stubs = _proc_subtree_counts(pid_owner)
-                info.last_procs = _attributed_count(procs, shared_n, info.last_procs)
-                info.last_stubs = _attributed_count(stubs, shared_n, info.last_stubs)
-                jiffies = _subtree_cpu_jiffies(pid_owner)
-                if info._cpu_sample_ts > 0.0 and jiffies >= info._cpu_jiffies_prev and shared_n > 0:
-                    dt = now - info._cpu_sample_ts
-                    if dt > 0:
-                        cores = ((jiffies - info._cpu_jiffies_prev) / (_CLK_TCK * dt)) / shared_n
-                        info.last_cpu_cores = cores
-                        if cores > info.peak_cpu_cores:
-                            info.peak_cpu_cores = cores
-                info._cpu_jiffies_prev = jiffies
-                info._cpu_sample_ts = now
-                continue
-            pid = info._pid
-            rss_kb = _proc_rss_kb(pid)
-            if rss_kb > 0:
-                gb = rss_kb / (1024 * 1024)
+            #
+            # Sole tenant of its own process: the subtree reading IS this run's,
+            # which is a share of one.
+            shared_n = self._live_shared_count(info._pid, agents) if info._session_sharing else 1
+            sample = _proc_subtree_sample(info._pid)
+            if sample.rss_kb > 0 and shared_n > 0:
+                gb = (sample.rss_kb / (1024 * 1024)) / shared_n
                 info.last_rss_gb = gb
                 if gb > info.peak_rss_gb:
                     info.peak_rss_gb = gb
-            procs, stubs = _proc_subtree_counts(pid)
-            # Sole tenant of its own process: the subtree reading IS this run's.
-            info.last_procs = _attributed_count(procs, 1, info.last_procs)
-            info.last_stubs = _attributed_count(stubs, 1, info.last_stubs)
-            jiffies = _subtree_cpu_jiffies(pid)
-            if info._cpu_sample_ts > 0.0 and jiffies >= info._cpu_jiffies_prev:
+            info.last_procs = _attributed_count(sample.procs, shared_n, info.last_procs)
+            info.last_stubs = _attributed_count(sample.stubs, shared_n, info.last_stubs)
+            jiffies = sample.jiffies
+            if info._cpu_sample_ts > 0.0 and jiffies >= info._cpu_jiffies_prev and shared_n > 0:
                 dt = now - info._cpu_sample_ts
                 if dt > 0:
-                    cores = (jiffies - info._cpu_jiffies_prev) / (_CLK_TCK * dt)
+                    cores = ((jiffies - info._cpu_jiffies_prev) / (_CLK_TCK * dt)) / shared_n
                     info.last_cpu_cores = cores
                     if cores > info.peak_cpu_cores:
                         info.peak_cpu_cores = cores
@@ -2446,6 +2520,11 @@ class SubagentManager:
                 "outcome": info.outcome,
                 "task": _redact(info.task),
                 "agent": _redact(info.agent),
+                # The model actually served (issue #3582). By the terminal
+                # report this is the authoritative value on every provider — the
+                # CC/raw path has completed at least one turn, so its
+                # ``_resolved_model_id`` is populated (refreshed in ``_run``).
+                "model": info.resolved_model,
                 "result": _done_result(info.result),
             },
         )
@@ -2912,7 +2991,11 @@ class SubagentManager:
         Appends a synthetic error to the dashboard slot (UI) and queues a
         failure message into ``slot._pending_subagent_failures`` so the LLM
         learns about the failure on the next ``_run_chat`` turn and can read
-        the result from disk if needed.
+        the result from disk if needed. The notice's outcome line is derived
+        from the record (:func:`_injection_notice_outcome`) rather than
+        asserting completion: this path fires for every terminal state whose
+        report could not be injected, including runs cancelled or rejected
+        before they ever executed.
         """
         try:
             # Lazy: the dashboard layer must not be imported by a core module at
@@ -2945,7 +3028,7 @@ class SubagentManager:
                 f"{SUBAGENT_COMPLETION_PREFIX}\n"
                 f"Agent `{info.id}` ❌ {reason}\n"
                 f"Task: {task_preview}\n"
-                f"The agent finished but result delivery timed out.{result_hint}"
+                f"{_injection_notice_outcome(info)}{result_hint}"
             )
 
             # Queue for LLM context drain on next _run_chat
@@ -3018,7 +3101,7 @@ class SubagentManager:
         return [
             {
                 "id": a.id,
-                "task": _redact(a.task[:80]),
+                "task": _redact_and_truncate(a.task, 80),
                 "agent": _redact(a.agent),
                 "parent": a.parent_session_key,
                 "rss_mb": round(a.last_rss_gb * 1024, 1),
@@ -3633,14 +3716,16 @@ class SubagentManager:
         """
         if not key.startswith("subagent:"):
             return False
-        conv_id = key[len("subagent:"):]
+        conv_id = key[len("subagent:") :]
         try:
             state = read_state(conv_id) or {}
         except Exception:
             return False
         return bool(state.get("keep"))
 
-    def _promote_conversation(self, conv_id: str, conv_key: str, last_used: float | None = None) -> None:
+    def _promote_conversation(
+        self, conv_id: str, conv_key: str, last_used: float | None = None
+    ) -> None:
         """Single choke point for promoting a conversation's retention (#1115).
 
         Writes all three retention surfaces together so they cannot drift:
@@ -3676,15 +3761,19 @@ class SubagentManager:
                 if not state.get("keep"):
                     continue
                 conv_key = str(state.get("conversation_key") or "") or f"subagent:{d.name}"
-                conv_id = conv_key[len("subagent:"):]
+                conv_id = conv_key[len("subagent:") :]
                 sid = str(state.get("session_id") or "")
                 last_used = float(state.get("updated_at") or state.get("started") or 0.0)
-                out.append((
-                    conv_id, conv_key, sid,
-                    str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
-                    str(state.get("cwd") or ""),
-                    last_used,
-                ))
+                out.append(
+                    (
+                        conv_id,
+                        conv_key,
+                        sid,
+                        str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
+                        str(state.get("cwd") or ""),
+                        last_used,
+                    )
+                )
             except Exception:
                 logger.debug("registry rebuild: skipping %s", d, exc_info=True)
         return out
@@ -4046,15 +4135,11 @@ class SubagentManager:
         task = asyncio.create_task(self._deliver_followups(info))
         self._followup_watchers[run_id] = task
 
-        def _done(
-            t: "asyncio.Task", _id: str = run_id, _info: SubagentInfo = run_info
-        ) -> None:
+        def _done(t: "asyncio.Task", _id: str = run_id, _info: SubagentInfo = run_info) -> None:
             self._followup_watchers.pop(_id, None)
             _info._followup_watcher = False
             if not t.cancelled() and t.exception() is not None:
-                logger.warning(
-                    "follow_up watcher for %s failed", _id, exc_info=t.exception()
-                )
+                logger.warning("follow_up watcher for %s failed", _id, exc_info=t.exception())
                 return
             if (
                 not t.cancelled()
@@ -4122,7 +4207,7 @@ class SubagentManager:
             # sweep, so the messages vanished with no event. The slice keeps
             # anything queued while we were announcing (the done-callback
             # re-arms for it).
-            info.pending_followups = info.pending_followups[len(dropped):]
+            info.pending_followups = info.pending_followups[len(dropped) :]
             return
         # SNAPSHOT, do not drain: messages stay in ``pending_followups`` until
         # their outcome is SETTLED (dispatched, or their failure announced).
@@ -4137,12 +4222,10 @@ class SubagentManager:
             return
 
         def _settle() -> None:
-            info.pending_followups = info.pending_followups[len(messages):]
+            info.pending_followups = info.pending_followups[len(messages) :]
 
         if info.user_stopped:
-            logger.info(
-                "follow_up for %s suppressed — the user stopped the run", info.id
-            )
+            logger.info("follow_up for %s suppressed — the user stopped the run", info.id)
             self._audit_followup(info, "followup_suppressed")
             _settle()
             await self._announce_followup_failure(
@@ -4171,9 +4254,7 @@ class SubagentManager:
                 break
             await asyncio.sleep(self._FOLLOWUP_BUSY_RETRY_SECS)
         if err:
-            logger.warning(
-                "follow_up delivery for %s failed: %s", info.id, err.split(":", 1)[0]
-            )
+            logger.warning("follow_up delivery for %s failed: %s", info.id, err.split(":", 1)[0])
             self._audit_followup(info, "followup_failed")
             _settle()
             # continue_conversation's typed failures are already done
@@ -4181,9 +4262,7 @@ class SubagentManager:
             if child is not None:
                 await self._announce_followup_failure(info, "", failure_info=child)
             else:
-                await self._announce_followup_failure(
-                    info, f"follow_up dispatch failed: {err}"
-                )
+                await self._announce_followup_failure(info, f"follow_up dispatch failed: {err}")
         else:
             self._audit_followup(info, "followup_dispatched")
             _settle()
@@ -4211,9 +4290,8 @@ class SubagentManager:
         label_msgs = messages if messages is not None else info.pending_followups
         synthetic = failure_info or SubagentInfo(
             id=uuid.uuid4().hex[:8],
-            task=f"[follow_up of run {info.id}] " + _redact(
-                "; ".join(m[:120] for m in label_msgs) or "queued follow-up"
-            ),
+            task=f"[follow_up of run {info.id}] "
+            + _redact("; ".join(m[:120] for m in label_msgs) or "queued follow-up"),
             done=True,
             parent_session_key=info.parent_session_key,
             error=reason,
@@ -4221,9 +4299,7 @@ class SubagentManager:
         try:
             await self._on_done(synthetic)
         except Exception:
-            logger.warning(
-                "follow_up failure announce for %s failed", info.id, exc_info=True
-            )
+            logger.warning("follow_up failure announce for %s failed", info.id, exc_info=True)
 
     def _audit_followup(self, info: SubagentInfo, outcome: str) -> None:
         try:
@@ -4247,9 +4323,7 @@ class SubagentManager:
         busy = self._conversation_busy(conv_key)
         if busy is not None:
             return False, f"conversation_busy: run {busy.id} is in flight"
-        provider_label = (
-            self._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT
-        )
+        provider_label = self._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT
         sid = self._sessions.forget_conversation(conv_key)
         self._conversations.pop(conv_key, None)
         # Demote the persisted source of truth too (#1115): with the disk
@@ -4757,21 +4831,35 @@ class SubagentManager:
             try:
                 await asyncio.to_thread(mark_delivered, agent_id)
             except Exception:
-                logger.debug("Failed to mark drained subagent %s delivered", agent_id, exc_info=True)
+                logger.debug(
+                    "Failed to mark drained subagent %s delivered", agent_id, exc_info=True
+                )
 
     def _settle_digest_holds(self, info: SubagentInfo) -> None:
         """Settle delivery tombstones for wave members whose injection was
         held for this member's digest. Called ONLY after ``_on_done`` returned
-        without raising — the digest has been handed off, so marking the held
-        members delivered no longer risks the restart-loss window
-        (settling at digest composition, before routing, would).
+        without raising — and it is a real settle only for the routes where
+        that return IS the confirmation. Both dashboard routes hand off
+        asynchronously, so they detach the ids before ``_on_done`` returns and
+        owe them to the parent's consumption instead (the queue branch via
+        ``_defer_queued_delivery``, the direct-injection branch via the same
+        slot ledger), leaving this a no-op there. Marking the held members
+        delivered no longer risks the restart-loss window here (settling at
+        digest composition, before routing, would).
+
+        The ids are taken off ``info`` BEFORE settling, so a re-entry cannot
+        write a second tombstone and a route that detached them first leaves
+        this a no-op.
+
+        A failing tombstone write is logged and skipped, never raised: one
+        unwritable run folder must not strand the rest of the chunk.
         """
-        for _hid in info._digest_settle_ids:
+        ids, info._digest_settle_ids = info._digest_settle_ids, []
+        for _hid in ids:
             try:
                 mark_delivered(_hid)
             except Exception:
                 logger.debug("Failed to settle held subagent %s", _hid, exc_info=True)
-        info._digest_settle_ids = []
 
     def get(self, agent_id: str) -> SubagentInfo | None:
         """Get agent info by ID."""
@@ -5345,6 +5433,11 @@ class SubagentManager:
         # that role is unpinned the helper returns "" so we omit the kwarg and
         # keep deferring to the provider's configured default, exactly as before.
         eff_model = info.model or _subagent_default_model()
+        # Record the EFFECTIVE pin (per-spawn OR the role_models['subagent']
+        # config pin) as the requested side of the downgrade comparison — keying
+        # off the bare per-spawn ``model`` would miss a config-pinned run served a
+        # different model (Design review on #3582).
+        info.requested_model = eff_model
         if eff_model:
             extra_kwargs["model"] = eff_model
         # Sub-agent reasoning effort (per-call override -> role_efforts['subagent']
@@ -5494,8 +5587,51 @@ class SubagentManager:
         child_escalation_limit = max(turn_limit * 3, 60)
         # Reports inherited agent (not just info.agent) so telemetry shows
         # the actual agent used for this subagent session.
+        #
+        # Read back the model the live session actually resolved to serve, so
+        # the panel shows what ran rather than only what was requested (issue
+        # #3582). Best-effort at spawn: the ACP session/new response already
+        # carries the served id (readable now, even on the backend default),
+        # while the raw CC path only knows it after the first turn — so this is
+        # refreshed authoritatively at completion below. Only overwrite a prior
+        # non-empty value with another non-empty one, so a spawn-time read that
+        # succeeded is never clobbered back to "" by a transient later miss.
+        _spawn_model = _resolved_model_of(client)
+        if _spawn_model:
+            info.resolved_model = _spawn_model
+        # Persist provenance to disk BEFORE the spawn event so a gateway restart
+        # in the window between the event and the later session_id state write
+        # cannot lose it — orphan recovery reads these from disk (GPT review on
+        # #3582). Off-loop (to_thread): update_state does a synchronous fsync, so
+        # a slow FS must not freeze the gateway/heartbeat. Best-effort with ONE
+        # bounded retry: this write is the SINGLE owner of these two fields on
+        # the spawn path (#5394) — the later session_id write no longer doubles
+        # as a fallback, so a transient failure gets its second chance HERE
+        # rather than from a second writer downstream. update_state reports a
+        # silently-skipped merge (unreadable state) as False, which counts as a
+        # failure for the retry — only a REPORTED write ends the loop. A
+        # persistence hiccup must still never block the spawn.
+        for _provenance_attempt in range(2):
+            try:
+                _wrote = await asyncio.to_thread(
+                    update_state,
+                    info.id,
+                    requested_model=info.requested_model,
+                    resolved_model=info.resolved_model,
+                )
+                if _wrote:
+                    break
+                logger.debug("Provenance write skipped (unreadable state) for %s", info.id)
+            except Exception:
+                logger.debug("Failed to persist model provenance for %s", info.id, exc_info=True)
         await self._fire_event(
-            "subagent_spawn", info, {"task": _redact(info.task), "agent": agent or ""}
+            "subagent_spawn",
+            info,
+            {
+                "task": _redact(info.task),
+                "agent": agent or "",
+                "model": info.resolved_model,
+            },
         )
         # Stream results to disk for orchestrated chat.
 
@@ -5516,6 +5652,15 @@ class SubagentManager:
             state_update: dict[str, object] = {
                 "session_id": session_id,
                 "provider": provider_type,
+                # Model provenance (requested_model/resolved_model) is NOT
+                # re-written here: the crash-safe write BEFORE the
+                # subagent_spawn event above is the single owner of those two
+                # fields on the spawn path, and a transient failure there is
+                # handled by that write's own bounded retry (#5394). This write
+                # still performs the same read-merge-rewrite either way, so the
+                # point is one authoritative writer, not saved I/O. The CC-path
+                # refinement below still updates resolved_model when it first
+                # becomes known.
                 # keep marks this run's session files as resume material: the
                 # orphan reconciler and tombstone pruner skip file deletion
                 # for keep runs (restart-safe — read from disk, not memory).
@@ -5572,6 +5717,13 @@ class SubagentManager:
             # intentionally identical semantics — a fix to either's activity
             # predicate or budget rules must be mirrored in the other.
             post_activity_attempts = 0
+            # Throttle-exhaustion fallback chain (agent.fallback_model):
+            # engaged only once the zero-activity budget above is spent, same
+            # trigger as stream_and_collect's Case 2.75 and the dashboard's
+            # fallback branch. State is per-run (this closure), matching
+            # "a slot/session-scoped equivalent" — the sticky marker for the
+            # session lives on the provider via TURN_FALLBACK_ATTR.
+            _fb_state = FallbackState(configured_fallback_chain())
             msg = full_message
             while True:
                 try:
@@ -5595,7 +5747,74 @@ class SubagentManager:
                             raise
                         post_activity_attempts += 1
                     elif attempts >= TRANSIENT_RETRIES:
-                        raise
+                        # ── Throttle-exhaustion fallback chain ──
+                        # Zero-activity budget spent: walk agent.fallback_model
+                        # before surfacing (empty chain ⇒ raise exactly as
+                        # before this feature). Two attempts per candidate
+                        # (FALLBACK_CANDIDATE_ATTEMPTS), ~2s backoff each —
+                        # NOT the exponential same-model curve; see
+                        # llm_helpers Case 2.75 for the rationale.
+                        if not _fb_state.chain:
+                            raise
+                        if (
+                            _fb_state.active is not None
+                            and _fb_state.attempts < FALLBACK_CANDIDATE_ATTEMPTS
+                        ):
+                            _fb_state.attempts += 1
+                        else:
+                            _cand = await advance_fallback_candidate(
+                                client,
+                                _fb_state,
+                                surface="subagent",
+                                log_suffix=f", id={info.id}",
+                            )
+                            if _cand is None:
+                                if _fb_state.walked:
+                                    _story = (
+                                        f"{_fb_state.primary or 'the selected model'} "
+                                        f"throttled; fallbacks "
+                                        f"{', '.join(_fb_state.walked)} also unavailable"
+                                    )
+                                    logger.warning(
+                                        "model fallback: chain exhausted (%s) for "
+                                        "subagent %s; surfacing original error",
+                                        _story,
+                                        info.id,
+                                    )
+                                    try:
+                                        exc._kc_fallback_story = _story  # type: ignore[attr-defined]
+                                    except Exception:
+                                        pass
+                                raise
+                        _fb_delay = transient_retry_delay(1)
+                        await self._fire_event(
+                            "subagent_retrying",
+                            info,
+                            {
+                                "attempt": _fb_state.attempts,
+                                "max": FALLBACK_CANDIDATE_ATTEMPTS,
+                                "fallback_model": _fb_state.active or "",
+                            },
+                        )
+                        try:
+                            sel().log_api_access(
+                                caller=info.parent_session_key or f"subagent:{info.id}",
+                                operation="subagent.model_fallback_retry",
+                                outcome="retrying",
+                                source="subagent",
+                                resources=(
+                                    f"subagent_id={info.id},"
+                                    f"model={_fb_state.active or ''},"
+                                    f"attempt={_fb_state.attempts}"
+                                ),
+                            )
+                        except Exception:
+                            logger.debug("SEL audit for fallback retry failed", exc_info=True)
+                        await asyncio.sleep(_fb_delay)
+                        # Zero activity by construction on this arm — replay
+                        # the original prompt, never a continuation.
+                        msg = full_message
+                        continue
                     attempts += 1
                     delay = transient_retry_delay(attempts)
                     logger.warning(
@@ -5669,6 +5888,29 @@ class SubagentManager:
             if not event.runtime_global:
                 await self._touch_activity(info)
             if event.kind == EVENT_TEXT_CHUNK:
+                # The CC/raw provider only learns its served model once the
+                # backend answers the first turn — by the first text chunk that
+                # has happened, so refresh here. Runs once (guarded on a still-
+                # empty value) and stays cheap: covers every downstream exit
+                # path (normal, turn_limit, child-escalation, cancel) without
+                # threading the live client through each. Never overwrites a good
+                # spawn-time read with "".
+                if not info.resolved_model:
+                    _live_model = _resolved_model_of(client)
+                    if _live_model:
+                        info.resolved_model = _live_model
+                        # Persist the CC-path refinement so a restart after the
+                        # first turn still recovers the served model. Off-loop
+                        # (to_thread): synchronous fsync must not block the loop
+                        # (GPT review on #3582).
+                        try:
+                            await asyncio.to_thread(
+                                update_state, info.id, resolved_model=_live_model
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist refined model for %s", info.id, exc_info=True
+                            )
                 result_text += event.text
                 write_result_chunk(info.id, event.text)
                 redacted = _redact(event.text)
@@ -5721,9 +5963,7 @@ class SubagentManager:
                                 error="child_escalation_limit",
                             )
                         except Exception:
-                            logger.exception(
-                                "failed to reject escalation-limit trigger request"
-                            )
+                            logger.exception("failed to reject escalation-limit trigger request")
                         info.result = result_text or "_Partial output._"
                         info.error = f"child_escalation_limit:{child_escalation_limit}"
                         info.done = True
@@ -5826,9 +6066,7 @@ class SubagentManager:
                                 approved = bool(await approve_cb(event))
                             elif _child_fallback is not None:
                                 approved = bool(
-                                    await _child_fallback(
-                                        event, info.parent_session_key
-                                    )
+                                    await _child_fallback(event, info.parent_session_key)
                                 )
                         except Exception:
                             logger.exception("child approval callback failed")
@@ -6021,6 +6259,24 @@ class SubagentManager:
 
             cleaned, _ = redact_exfiltration_urls(cleaned)
             cleaned, _ = redact_credentials(cleaned)
+        # Model-fallback visibility (agent.fallback_model): a run served by a
+        # fallback model must say so in the delivered result — same contract as
+        # the cron/heartbeat annotation and the dashboard notice card. Model
+        # ids come from config (LLM-reachable via MCP), so they pass the same
+        # redaction as the result body.
+        _fb_marker = getattr(client, TURN_FALLBACK_ATTR, None)
+        if _fb_marker:
+            try:
+                _fb_primary, _fb_candidate = _fb_marker
+                _fb_line = (
+                    f"⚠️ Model '{_fb_primary}' throttled; this run was served by "
+                    f"fallback '{_fb_candidate}'."
+                )
+                _fb_line, _ = redact_exfiltration_urls(_fb_line)
+                _fb_line, _ = redact_credentials(_fb_line)
+                cleaned = f"{_fb_line}\n\n{cleaned}" if cleaned else _fb_line
+            except Exception:
+                logger.debug("fallback annotation failed", exc_info=True)
         info.result = cleaned or "_No response._"
         # Cap disk file and trim memory — gateway decides how much to show based on mode.
         if info.result_path:
@@ -6061,10 +6317,17 @@ class SubagentManager:
             _used, _window = read_context_tokens(client)
             await persist_token_record_async(
                 session_key,
-                info.model or "",
+                # Blank while a fallback serves this run: the explicit pin
+                # would bill the fallback's spend to a model that never
+                # executed; model_source reports what actually ran.
+                ("" if provider_fallback_active(client) else (info.model or "")),
                 _complete_event,
                 provider="claude_code" if is_cc else "acp",
                 surface="subagent",
+                # Ownership stamp (see _build_token_record): an app-dispatched
+                # subagent's spend must be readable by that app's audit — the
+                # illustrator lane of an app is exactly this path.
+                app=info.app or "",
                 # Explicit/inherited `agent` FIRST here — unlike every other
                 # surface. Under session sharing this subagent reuses the
                 # PARENT's runtime, so read_effective_agent() would report the

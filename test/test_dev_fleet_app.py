@@ -2139,6 +2139,11 @@ async def test_run_cmd_cancel_with_reaped_child_propagates_cancellation(monkeypa
     )
     monkeypatch.setattr(mod, "create_subprocess_limited", fake_spawn)
     monkeypatch.setattr(mod, "_kill_tree", AsyncMock())
+    # The shared reap helper also signals the tree; intercept it so the fake
+    # pid never reaches a real killpg, and shrink its bound so the reap of a
+    # still-blocking communicate() cannot stall this test.
+    monkeypatch.setattr(mod.platform_compat, "kill_process_tree_async", AsyncMock())
+    monkeypatch.setattr(mod.platform_compat, "REAP_TIMEOUT_SECS", 0.01)
 
     task = asyncio.ensure_future(mod._run_cmd(["/bin/true"]))
     # Bounded so a future early-return in _run_cmd fails fast, not a hang.
@@ -2166,11 +2171,19 @@ async def test_start_run_readline_overrun_kills_process_tree(monkeypatch):
         pid = 424242
         returncode: int | None = None
         stdout = FakeStdout()
+        wait_calls = 0
+        communicate_calls = 0
 
         def kill(self):
             FakeProc.returncode = -9
 
+        async def communicate(self):
+            FakeProc.communicate_calls += 1
+            FakeProc.returncode = FakeProc.returncode or -9
+            return b"", b""
+
         async def wait(self):
+            FakeProc.wait_calls += 1
             FakeProc.returncode = FakeProc.returncode or -9
             return FakeProc.returncode
 
@@ -2182,6 +2195,9 @@ async def test_start_run_readline_overrun_kills_process_tree(monkeypatch):
 
     monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(mod, "_kill_tree", fake_kill_tree)
+    # The shared reap helper also signals the tree; intercept it so the fake
+    # pid never reaches a real killpg on the host.
+    monkeypatch.setattr(mod.platform_compat, "kill_process_tree_async", AsyncMock())
     FakeProc.returncode = None
 
     # Absolute: the spawn shim execs without a PATH search, so only a bare name
@@ -2198,7 +2214,11 @@ async def test_start_run_readline_overrun_kills_process_tree(monkeypatch):
     assert rec["status"] == "done" and rec["exit_code"] == -1
     assert any("chunk is longer than limit" in line for line in rec["output"])
     assert killed == [424242]  # tree reaped exactly once
-    assert FakeProc.returncode is not None  # proc.kill()/wait() completed
+    assert FakeProc.returncode is not None  # proc.kill() ran
+    # The reap drains pipes via communicate(), never a bare wait() that a
+    # full pipe could hang (#5989).
+    assert FakeProc.communicate_calls == 1
+    assert FakeProc.wait_calls == 0
 
 
 # --- Codex R35 regressions ---
@@ -3388,6 +3408,20 @@ def _reset_make_live_committed_latch():
     mod._MAKE_LIVE_COMMITTED = False
     yield
     mod._MAKE_LIVE_COMMITTED = False
+
+
+@pytest.fixture(autouse=True)
+def _reset_shutdown_admission_state():
+    """``_SHUTDOWN_IN_PROGRESS`` is set by ``dev_fleet_cleanup`` and never cleared
+    in production (the process exits).  In-process pytest leaks the latched True
+    state into later tests that call ``_start_run`` directly, causing them to
+    raise RuntimeError instead of running normally.  Reset both the flag and the
+    lock around every test to mirror a fresh gateway process."""
+    mod._SHUTDOWN_IN_PROGRESS = False
+    mod._SHUTDOWN_ADMISSION_LOCK = asyncio.Lock()
+    yield
+    mod._SHUTDOWN_IN_PROGRESS = False
+    mod._SHUTDOWN_ADMISSION_LOCK = asyncio.Lock()
 
 
 def _mk_make_live_wt(tmp_path, *, venv: bool = False, dist: bool = False,

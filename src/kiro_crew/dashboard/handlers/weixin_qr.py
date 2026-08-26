@@ -23,10 +23,9 @@ take — so a QR confirmation can never interleave with another config save.
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -34,6 +33,7 @@ from typing import Any, Dict, Optional
 
 from aiohttp import web
 
+from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import CRED_WEIXIN_TOKEN, KiroCrewConfig, config_path, env_path
 from kiro_crew.dashboard.channel_folders import (
@@ -58,18 +58,13 @@ def _render_qr_data_uri(scan_data: str) -> str:
     """Encode ``scan_data`` (the iLink login URL) into a PNG data URI.
 
     Runs in a worker thread: PNG encoding is CPU-bound and must not stall the
-    gateway event loop. Import is function-local deliberately — qrcode pulls
-    Pillow, and this is the only feature needing it at handler-module import.
+    gateway event loop. Delegates to :mod:`kiro_crew.qr`, the single owner of QR
+    encoding, so this surface and tailnet mobile access cannot drift into two
+    different encoders.
     """
-    import qrcode as _qrcode  # noqa: PLC0415 — heavy optional import, QR path only
+    from kiro_crew.qr import render_qr_data_uri  # noqa: PLC0415 - heavy import, QR path only
 
-    qr = _qrcode.QRCode(border=2, box_size=8)
-    qr.add_data(scan_data)
-    qr.make(fit=True)
-    image = qr.make_image(fill_color="black", back_color="white")
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    return render_qr_data_uri(scan_data)
 
 
 def _prune_sessions() -> None:
@@ -181,26 +176,54 @@ def _commit_credential_and_config(cp: Path, serialized: str, token: str) -> None
     paired with stale account metadata — the channel would authenticate against
     the wrong account — and the previously working credential would be gone, with
     no way to recover it from the dashboard.
+
+    Acquires the shared ``.env.lock`` cross-process advisory lock (same sidecar
+    file used by ``secrets import --apply``) before any read or write of ``.env``,
+    so the importer and this handler cannot interleave their read-modify-write
+    cycles.  If the lock is already held by another process the function raises
+    ``OSError`` with a descriptive message; the caller (``_persist``) propagates
+    it as a 500 response, which is the same outcome as any other I/O failure here.
+    The existing in-process ``_get_config_lock()`` (held by the caller one level
+    up) continues to serialise same-process concurrent callers; the file lock adds
+    the cross-process exclusion layer on top.
     """
-    prior = _read_env_value(CRED_WEIXIN_TOKEN)
-    _write_env_secret(CRED_WEIXIN_TOKEN, token)
+    ep = env_path()
+    # Lazy import: the migration importer is an optional CLI subsystem, so keep it
+    # off the gateway boot-import path (weixin_qr is imported at server startup).
+    # Only load it when a credential write actually happens.
+    from kiro_crew.secrets.migrate import _env_lock_path
+
+    lock_path = _env_lock_path(ep)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        _atomic_write(cp, serialized)
-    except BaseException:
-        try:
-            if prior is None:
-                _delete_env_key(CRED_WEIXIN_TOKEN)
-            else:
-                _write_env_secret(CRED_WEIXIN_TOKEN, prior)
-        except Exception:
-            # Surfacing the rollback failure would mask the original cause, so
-            # log it and let the real error propagate.
-            logger.error(
-                "weixin: config commit failed AND credential rollback failed; "
-                "the stored credential may not match config.json",
-                exc_info=True,
+        if not platform_compat.try_acquire_lock(lock_fd, exclusive=True):
+            raise OSError(
+                f"{ep} is locked by another process (secrets import in progress); "
+                "the WeChat credential was not written.  Retry the QR sign-in "
+                "once the other operation finishes."
             )
-        raise
+        prior = _read_env_value(CRED_WEIXIN_TOKEN)
+        _write_env_secret(CRED_WEIXIN_TOKEN, token)
+        try:
+            _atomic_write(cp, serialized)
+        except BaseException:
+            try:
+                if prior is None:
+                    _delete_env_key(CRED_WEIXIN_TOKEN)
+                else:
+                    _write_env_secret(CRED_WEIXIN_TOKEN, prior)
+            except Exception:
+                # Surfacing the rollback failure would mask the original cause, so
+                # log it and let the real error propagate.
+                logger.error(
+                    "weixin: config commit failed AND credential rollback failed; "
+                    "the stored credential may not match config.json",
+                    exc_info=True,
+                )
+            raise
+    finally:
+        platform_compat.release_lock(lock_fd)
+        os.close(lock_fd)
 
 
 def _stage_weixin_config(*, account_id: str, base_url: str) -> tuple[Path, str]:

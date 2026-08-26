@@ -456,7 +456,9 @@ below), which is substituted instead. `extends` is monotonic narrowing
 **Configurable fallback (policy-only).** By default the substitute for an unusable
 profile is the most-restrictive deny-all. A policy MAY declare a top-level
 `fallback` object — parsed as a narrow-only profile (same scope validation; an
-unknown scope in it fails closed at boot) — which the loader substitutes at all
+unknown scope in it fails closed at boot, on both sides of the key-open asymmetry
+described below, because it is part of the policy document rather than a profile
+file) — which the loader substitutes at all
 three unusable-file sites instead of deny-all. Intersected with the ceiling like
 any profile, it can only narrow it: it lets an operator keep the basic operational
 planes available (subagent/cron/heartbeat/taskrunner) while still denying the
@@ -466,6 +468,52 @@ profile may NOT declare `fallback` (policy-only, rejected at parse). The chosen
 fallback is resolved against the composed ceiling, and the profile-store freshness
 key folds in whether a fallback is declared, so a store first-touched before the
 ceiling composed reloads once it does rather than baking deny-all permanently.
+
+**Unknown `capabilities.*` child in a PROFILE — tolerated ONLY when `enabled: true`.**
+An unknown governed key normally fails closed. The one exception is a child of a
+*key-open* namespace (`capabilities`) inside a **profile file**, and it is
+deliberately **asymmetric**:
+
+- **A payload of exactly `{"enabled": true}` (that one key, boolean identity) →
+  tolerated.** `parse_profile` skips it, logs a warning naming the profile and the
+  key, and records it on `Profile.unknown_scopes`. Known siblings in the same block
+  still parse and still enforce.
+- **Anything else → fails closed** exactly as before the tolerance existed
+  (`enabled: false`, `enabled` absent, a non-dict value, a non-boolean `enabled`,
+  or **any extra key beyond `enabled`** — capability payloads carry inner
+  narrowing rulesets like `spawn.agents`, so `{"enabled": true, "agents": {...}}`
+  is an enable-plus-narrowing whose narrowing must not be dropped), so the loader
+  substitutes the bind-preserving deny-all fallback.
+
+The tolerated side exists because cross-edition data-home sharing is supported: an
+edition that `register_scope`s extra capability rows seeds them into `host.json`
+with `enabled: true`, and a build without those rows used to reject the whole
+profile and degrade the surface to deny-all (every governance row reading "deny
+all"). It is safe because a profile is narrow-only and the intersection is applied
+by `resolve` (rule-2 intersect of ceiling ∘ profile) — declining to narrow an
+unregistered scope cannot change any decision in any build.
+
+The fail-closed side exists because an unknown **narrowing** is indistinguishable
+from a typo'd narrowing of a core capability: `{"spwan": {"enabled": false}}` reads
+exactly like a failed attempt to disable `spawn`. Tolerating it would silently grant
+what the operator tried to deny, so the loud deny-all fallback is the correct
+outcome — it surfaces the typo.
+
+**Accepted design consequence.** One residual class is knowingly not caught: a
+typo'd capability name that carries `enabled: true` (for example
+`{"spwan": {"enabled": true}}`) is tolerated rather than surfaced as an error. This
+is inert by the argument above — the declaration could not have changed a decision
+whether it was honored or skipped — so the cost is a missed diagnostic, not a
+permission change. `Profile.unknown_scopes`, surfaced in the Security page's
+governance payload as `unknown_profile_scopes`, is what makes that class visible.
+
+Three things are deliberately unchanged: a **policy** naming an unknown key still
+raises regardless of `enabled` (tamper-evidence, Rule 8); the policy's top-level
+`fallback` object — parsed as a profile body but not through `parse_profile` — still
+fails closed at boot; and an unknown **top-level** governed family in a profile
+still fails closed. The tolerance assumes `SCOPE_CATALOG` is **append-only** (a
+scope is added or retired, never renamed in place), else a renamed row declared
+`enabled: true` would be silently tolerated instead of surfacing as a migration.
 
 **Present-but-unrecoverable profile — governed fleet fails closed, standalone is
 lenient.** The reload reads each file's bytes SEPARATELY from parsing and handles
@@ -627,7 +675,37 @@ read-your-writes should add it deliberately, with its own tests.
   profile, title)` (governance, incl. the `commands` scope, and MCP titles
   `mcp__server__tool` converted to `@server/tool`) → first-party app-own MCP
   server auto-approve → read-only auto-approve →
-  user `auto_approve_tools` loop**. A governance deny wins over a user
+  user `auto_approve_tools` loop**. **Canonical MCP identity.** For a call
+  carrying BOTH trusted `_meta.kiro` fields, the gate reconstructs
+  `mcp__<mcp_server_name>__<mcp_tool_name>` once on the common path and runs the
+  deny-floor and `gate_decision` against it **in addition to** the display title
+  and raw command — never instead of them. `select_tool_title` prefers the
+  model's prose `description`, so an ordinary MCP call whose per-tool rule names
+  the real tool would otherwise miss the ceiling and reach interactive approval,
+  where a human "allow" runs a policy-denied tool. The two are not competing
+  spellings of one fact: the canonical name is the trusted, non-model-authored
+  statement of WHICH tool is invoked and is what a per-tool rule matches, while
+  the title and raw command carry the path/command/content signals that a tool
+  identity does not express. Each covers a security dimension the other cannot,
+  so a deny on EITHER denies the call: a `~/.aws/credentials` title still denies
+  behind a harmless canonical name, and a denied canonical name still denies
+  behind benign prose. **Server-only identity.** When the backend proves the
+  server but not the tool (no `_meta.kiro.toolName`, or an uncached permission
+  event), `gate_decision` is asked about `mcp__<mcp_server_name>` instead. That
+  is a complete question for this plane and only this plane: `mcp_title_to_ref`
+  maps it to `@server`, and an `@server` rule is defined to cover every tool
+  under that server, so a `deny @github` ceiling binds on a call whose tool
+  cannot be named — without it, governance sees only the model-authored title
+  and the call reaches a human who can approve a server the policy forbids. It
+  is deliberately NOT added to the deny-floor targets: that plane matches raw
+  text and operator regexes, where `mcp__<server>` is a different string from
+  the canonical identity a rule is written against rather than a broader form of
+  it. A server-only identity never satisfies auto-approval. Because this
+  enforcement is
+  on the common path, the first-party app-own auto-approve below does **not**
+  repeat it; what remains load-bearing there is the identity requirement itself
+  (an absent `mcp_tool_name` leaves the canonical name empty, so the tool cannot
+  be identified and is not auto-approved). A governance deny wins over a user
   auto-approve, and the read-only auto-approve fast-path runs strictly AFTER
   both the deny-floor and `gate_decision`, so a read-only classification can
   never re-admit a denied/governed call. **First-party app-own MCP server

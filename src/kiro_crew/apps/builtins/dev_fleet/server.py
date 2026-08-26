@@ -1158,25 +1158,17 @@ async def _run_cmd(
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             await _kill_tree(proc.pid)
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.wait()
+            await platform_compat.kill_and_reap(proc)
             return -1, "", f"timeout ({timeout}s)"
         except asyncio.CancelledError:
             # Backend shutdown/restart cancels in-flight handlers: the child
             # runs in its own process group and would outlive us (a canceled
             # rebase never reaches its --abort path, wedging the worktree).
+            # kill_and_reap is best-effort throughout, so an already-reaped
+            # child cannot REPLACE the in-flight CancelledError with
+            # ProcessLookupError and swallow the cancellation.
             await _kill_tree(proc.pid)
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                # Already reaped: an unguarded kill here would REPLACE the
-                # in-flight CancelledError with ProcessLookupError, swallowing
-                # the cancellation (#2096).
-                pass
-            await proc.wait()
+            await platform_compat.kill_and_reap(proc)
             raise
         return proc.returncode or 0, (stdout or b"").decode(errors="replace"), (stderr or b"").decode(errors="replace")
     finally:
@@ -1229,6 +1221,18 @@ async def _kill_tree(pid: int) -> None:
 # Active background runs: rid -> (worker task, subprocess). Tracked so
 # gateway cleanup can kill process trees instead of orphaning pip/npm.
 _ACTIVE_RUNS: dict[str, tuple[asyncio.Task, Any]] = {}
+
+# Shutdown admission control: once dev_fleet_cleanup starts, no new run may
+# register in _ACTIVE_RUNS.  The lock is held only for the two fast dict
+# operations that constitute the critical section (read flag + register, or
+# set flag + snapshot) — it is never held across slow kill/await calls, so
+# there is no risk of asyncio lock contention or done-callback deadlocks.
+# LoopBoundLock (not a bare asyncio.Lock) because a module-global primitive
+# binds to the import-time loop and raises RuntimeError from any other loop
+# (Python 3.10+, see #4800) — this module is imported once but serves
+# whichever loop the gateway runs.
+_SHUTDOWN_ADMISSION_LOCK = LoopBoundLock()
+_SHUTDOWN_IN_PROGRESS = False
 
 
 _RUNS_MAX_COMPLETED = 50
@@ -1359,11 +1363,7 @@ async def _start_run(
             # so a worktree-controlled build can't outlive its run record.
             if proc is not None and proc.returncode is None:
                 await _kill_tree(proc.pid)
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
+                await platform_compat.kill_and_reap(proc)
             async with _RUNS_LOCK:
                 _RUNS[rid]["status"] = "done"
                 _RUNS[rid]["exit_code"] = -1
@@ -1392,7 +1392,18 @@ async def _start_run(
                     pass
 
     task = asyncio.create_task(worker())
-    _ACTIVE_RUNS[rid] = (task, None)
+    # Register under the admission lock so this insertion is atomic with
+    # respect to dev_fleet_cleanup's flag-set + snapshot.  The lock is held
+    # only for these two dict writes (< 1 µs) — never across slow I/O — so
+    # it cannot stall cleanup or introduce done-callback deadlocks.
+    async with _SHUTDOWN_ADMISSION_LOCK:
+        if _SHUTDOWN_IN_PROGRESS:
+            # Cleanup has already snapshotted _ACTIVE_RUNS; cancelling the
+            # task here keeps the worker from running to completion after the
+            # gateway exits and mutating shared checkout state.
+            task.cancel()
+            raise RuntimeError("dev-fleet shutdown in progress: run refused")
+        _ACTIVE_RUNS[rid] = (task, None)
     task.add_done_callback(lambda _t: _ACTIVE_RUNS.pop(rid, None))
     return rid
 
@@ -4682,10 +4693,20 @@ async def dev_fleet_startup(app: web.Application) -> None:
 
 async def dev_fleet_cleanup(app: web.Application) -> None:
     """Cancel and await background tasks so a stopped runner leaves nothing behind."""
-    global _refresher_task, _warm_task, _reaper_task
+    global _refresher_task, _warm_task, _reaper_task, _SHUTDOWN_IN_PROGRESS
+    # Close the admission window first: set the flag and snapshot _ACTIVE_RUNS
+    # atomically under the admission lock.  The lock is held only for these two
+    # fast dict operations — no I/O, no awaits — so it cannot stall any in-
+    # flight handler or create done-callback deadlocks.  Once we drop the lock,
+    # _SHUTDOWN_IN_PROGRESS is True and _start_run will refuse new registrations,
+    # so the snapshot is complete: every run that could ever be in _ACTIVE_RUNS
+    # is either already in `active_snapshot` or will be refused by _start_run.
+    async with _SHUTDOWN_ADMISSION_LOCK:
+        _SHUTDOWN_IN_PROGRESS = True
+        active_snapshot = list(_ACTIVE_RUNS.items())
     # Kill active sync/provision subprocess trees first, then cancel workers —
     # otherwise a gateway restart leaves pip/npm mutating shared checkouts.
-    for rid, (task, proc) in list(_ACTIVE_RUNS.items()):
+    for rid, (task, proc) in active_snapshot:
         if proc is not None and proc.returncode is None:
             await _kill_tree(proc.pid)
             try:

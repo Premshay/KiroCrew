@@ -21,6 +21,7 @@ import AssistantMessage, { type TurnStats } from '../pages/chat/AssistantMessage
 import UserMessage from '../pages/chat/UserMessage'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
+import NudgeCard from '../pages/chat/NudgeCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import PeerChannelRequestCard, { parsePeerChannelRequest } from '../pages/chat/PeerChannelRequestCard'
 import MarkdownRenderer from '../components/MarkdownRenderer'
@@ -30,6 +31,7 @@ import { type PasteBlock, findTokenRanges, recollapsePastes } from '../utils/pas
 import type { ChatMessage } from '../types'
 import { fmtMessageTime, fmtMessageTimeFull } from '../pages/chat/messageTime'
 import { turnHadPolicyBlock } from './turnPolicyBlock'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
 /** Everything a renderer may read. Passed per row so entries stay pure functions. */
 export interface MessageRenderContext {
@@ -115,6 +117,7 @@ function formatTs(ts?: string): string | undefined {
 
 /** Prop-driven tool row. The store-connected variant is a host entry. */
 export const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen, autoDenied }: { message: ChatMessage; running: boolean; onFileOpen?: (path: string) => void; autoDenied?: boolean }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = React.useState(false)
   const isDone = message.role === 'tool_result'
   const isRejected = message.meta?.resolved === 'rejected'
@@ -317,7 +320,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
       return ctx.wrapper(
         <>
           {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
-          <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warning-subtle text-fg ring-1 ring-inset forced-colors:border ring-warning/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+          <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
             <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} /></MessageErrorBoundary>
           </div>
         </>,
@@ -364,6 +367,14 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
       if (!banner) return null
       return ctx.row(banner)
     },
+  },
+  {
+    // Auto-nudge cycle marker. `onOpenLoop` (jump to the loop popover) is
+    // ChatPage chrome and is deliberately absent here: the card renders its
+    // full content without it, only the affordance is page-specific.
+    id: 'nudge',
+    roles: ['nudge'],
+    render: (m, ctx) => ctx.row(<NudgeCard message={m} disclosureKey={ctx.key} />),
   },
 ]
 

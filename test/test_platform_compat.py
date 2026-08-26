@@ -60,6 +60,86 @@ class TestPlatformFlags:
         assert isinstance(pc.SIGTERM, int) and pc.SIGTERM > 0
 
 
+class TestReexecPythonModule:
+    def test_windows_uses_space_free_argv0(self, monkeypatch):
+        executable = (
+            r"C:\Users\alice\AppData\Local\Programs\KiroCrew Nightly"
+            r"\resources\backend-dist\kirocrew-backend\python.exe"
+        )
+        calls = []
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc.sys, "executable", executable)
+        monkeypatch.setattr(pc.os, "execv", lambda path, argv: calls.append((path, argv)))
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+
+        pc.reexec_python_module("kiro_crew", ["gateway", "--port", "5476"])
+
+        assert calls == [
+            (
+                executable,
+                ["python.exe", "-m", "kiro_crew", "gateway", "--port", "5476"],
+            )
+        ]
+        assert os.environ["PYTHONUTF8"] == "1"
+        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
+
+    def test_posix_preserves_full_argv0_and_pins_utf8(self, monkeypatch):
+        executable = "/opt/Kiro Crew/bin/python3"
+        calls = []
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(pc.sys, "executable", executable)
+        monkeypatch.setattr(pc.os, "execv", lambda path, argv: calls.append((path, argv)))
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        monkeypatch.setenv("PYTHONIOENCODING", "latin-1")
+
+        pc.reexec_python_module("kiro_crew", ["gateway"])
+
+        assert calls == [(executable, [executable, "-m", "kiro_crew", "gateway"])]
+        assert os.environ["PYTHONUTF8"] == "1"
+        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
+
+    def test_reexec_successor_survives_hostile_parent_encoding(self, tmp_path):
+        """Exercise the real failure shape behind desktop in-app restarts.
+
+        The first interpreter intentionally starts with cp1252 streams on every
+        OS.  It re-execs without calling ensure_utf8_console, so only the
+        environment published by reexec_python_module can make the successor's
+        first emoji print safe.
+        """
+        probe = tmp_path / "utf8_reexec_probe.py"
+        probe.write_text(
+            "import os\n"
+            "from kiro_crew.platform_compat import reexec_python_module\n"
+            "if os.environ.get('_KIROCREW_UTF8_REEXEC_PROBE') == '1':\n"
+            "    print('👻 restarted')\n"
+            "else:\n"
+            "    os.environ['_KIROCREW_UTF8_REEXEC_PROBE'] = '1'\n"
+            "    reexec_python_module('utf8_reexec_probe', [])\n",
+            encoding="utf-8",
+        )
+        source_root = str(Path(__file__).resolve().parents[1] / "src")
+        inherited_path = os.environ.get("PYTHONPATH", "")
+        env = {
+            **os.environ,
+            "PYTHONUTF8": "0",
+            "PYTHONIOENCODING": "cp1252",
+            "PYTHONPATH": os.pathsep.join(p for p in (source_root, inherited_path) if p),
+        }
+
+        result = subprocess.run(
+            [sys.executable, "-m", "utf8_reexec_probe"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+        assert "👻 restarted".encode() in result.stdout
+
+
 class TestFileLock:
     def test_exclusive_lock_round_trips(self, tmp_path):
         # The lock must acquire + release cleanly and run the body, on whatever
@@ -108,6 +188,45 @@ class TestFileLock:
             os.close(fd)
 
 
+class TestRenameNoReplace:
+    @pytest.mark.skipif(
+        not pc.RENAME_NOREPLACE_AVAILABLE,
+        reason="native atomic no-replace rename is unavailable",
+    )
+    def test_rename_is_atomic_and_preserves_an_existing_destination(self, tmp_path):
+        first = tmp_path / "first"
+        first.mkdir()
+        (first / "payload").write_text("published")
+        parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            pc.rename_noreplace("first", "published", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            assert not first.exists()
+            assert (tmp_path / "published" / "payload").read_text() == "published"
+
+            losing = tmp_path / "losing"
+            losing.mkdir()
+            destination = tmp_path / "occupied"
+            destination.mkdir(mode=0o700)
+            before = destination.stat()
+            with pytest.raises(FileExistsError):
+                pc.rename_noreplace(
+                    "losing",
+                    "occupied",
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            after = destination.stat()
+            assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+            assert losing.is_dir()
+        finally:
+            os.close(parent_fd)
+
+    def test_unavailable_native_contract_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(pc, "_RENAME_NOREPLACE_FN", None)
+        with pytest.raises(NotImplementedError):
+            pc.rename_noreplace("source", "target", src_dir_fd=-1, dst_dir_fd=-1)
+
+
 class TestProcessHelpers:
     def test_pid_exists_true_for_self(self):
         # The current process obviously exists — on POSIX via os.kill(0), on
@@ -124,9 +243,7 @@ class TestProcessHelpers:
         # still report False via GetExitCodeProcess, or every session recycle
         # logs a false "PID survived kill" and leaks a dead PID into the tracker.
         # On POSIX this reaps normally and is equally False.
-        child = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"]
-        )
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
             assert pc.pid_exists(child.pid) is True
             child.kill()
@@ -200,7 +317,9 @@ class TestProcessCwd:
 
     def test_darwin_reads_the_path_at_the_cwd_offset(self, monkeypatch):
         monkeypatch.setattr(
-            pc, "_darwin_libproc_handle", lambda: self._fake_libproc(b"/Users/u/proj"),
+            pc,
+            "_darwin_libproc_handle",
+            lambda: self._fake_libproc(b"/Users/u/proj"),
         )
         assert pc._darwin_process_cwd(4242) == "/Users/u/proj"
 
@@ -217,7 +336,9 @@ class TestProcessCwd:
 
     def test_darwin_refuses_an_error_return(self, monkeypatch):
         monkeypatch.setattr(
-            pc, "_darwin_libproc_handle", lambda: self._fake_libproc(b"/x", filled=-1),
+            pc,
+            "_darwin_libproc_handle",
+            lambda: self._fake_libproc(b"/x", filled=-1),
         )
         assert pc._darwin_process_cwd(4242) is None
 
@@ -319,7 +440,7 @@ class TestStrftime:
         if pc.IS_WINDOWS:
             assert dt.fmt == "%#I:%M %p"
         else:
-            assert dt.fmt == "%-I:%M %p"   # untouched on POSIX
+            assert dt.fmt == "%-I:%M %p"  # untouched on POSIX
 
     def test_real_datetime_formats_without_error(self):
         # End-to-end against a real datetime: must not raise ValueError on
@@ -339,11 +460,11 @@ class TestIsExecutableFile:
         f.write_text("#!/bin/sh\nexit 0\n")
         os.chmod(f, 0o644)  # no x-bit
         if pc.IS_WINDOWS:
-            assert pc.is_executable_file(f) is True   # .sh extension → runnable
+            assert pc.is_executable_file(f) is True  # .sh extension → runnable
         else:
             assert pc.is_executable_file(f) is False  # no x-bit → not runnable
         os.chmod(f, 0o755)  # +x
-        assert pc.is_executable_file(f) is True       # runnable on both now
+        assert pc.is_executable_file(f) is True  # runnable on both now
 
     def test_missing_file_is_not_executable(self, tmp_path):
         assert pc.is_executable_file(tmp_path / "nope.sh") is False
@@ -400,9 +521,7 @@ class TestFindPythonInterpreter:
             return stub if name in ("python", "python3") else real
 
         monkeypatch.setattr("shutil.which", fake_which)
-        monkeypatch.setattr(
-            pc.subprocess, "check_output", lambda *a, **k: "3.12\n"
-        )
+        monkeypatch.setattr(pc.subprocess, "check_output", lambda *a, **k: "3.12\n")
         got = pc.find_python_interpreter()
         assert got == real
         assert pc._is_windows_store_python_stub(got) is False
@@ -420,10 +539,24 @@ class TestFindPythonInterpreter:
 
 
 class TestUtf8Console:
+    @pytest.mark.parametrize("is_windows", [False, True])
+    def test_call_publishes_utf8_for_children(self, monkeypatch, is_windows):
+        monkeypatch.setattr(pc, "IS_WINDOWS", is_windows)
+        monkeypatch.setattr(pc.sys, "stdout", None)
+        monkeypatch.setattr(pc.sys, "stderr", None)
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+
+        pc.ensure_utf8_console()
+
+        assert os.environ["PYTHONUTF8"] == "1"
+        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
+
     def test_ensure_utf8_console_is_safe_to_call(self):
-        # No-op on POSIX; reconfigures stdout/stderr on Windows. Either way it
-        # must never raise (it swallows non-reconfigurable streams), and must be
-        # idempotent (safe to call from both __main__ and cli.main).
+        # Publishes the child environment on every OS and reconfigures the
+        # current stdout/stderr only on Windows. Either way it must never raise
+        # (it swallows non-reconfigurable streams), and must be idempotent (safe
+        # to call from both __main__ and cli.main).
         pc.ensure_utf8_console()
         pc.ensure_utf8_console()
 
@@ -443,11 +576,10 @@ class TestUtf8Console:
         # crashed on the first non-ASCII log record. ensure_utf8_console() must
         # re-wrap the underlying buffer so the record emits cleanly.
         #
-        # This is a WINDOWS-only behavior: ensure_utf8_console() is a deliberate
-        # no-op on POSIX (which already defaults to UTF-8), so forcing a cp1252
-        # stderr here and asserting emoji survives only makes sense on Windows —
-        # on POSIX the function intentionally leaves the forced cp1252 stream
-        # alone, so the emoji would (correctly) fail to encode. Gate accordingly.
+        # This stream repair is WINDOWS-only behavior: on POSIX the function
+        # publishes the environment for children but leaves current streams
+        # alone. Forcing a cp1252 stderr and asserting emoji survives therefore
+        # only makes sense on Windows. Gate accordingly.
         if not pc.IS_WINDOWS:
             pytest.skip("ensure_utf8_console re-wrap is Windows-only (no-op on POSIX)")
 
@@ -611,7 +743,7 @@ class TestChmodShims:
         f.write_text("x")
         fd = os.open(str(f), os.O_RDONLY)
         try:
-            pc.fchmod_safe(fd, 0o600)   # applies on POSIX, no-op on Windows
+            pc.fchmod_safe(fd, 0o600)  # applies on POSIX, no-op on Windows
         finally:
             os.close(fd)
 
@@ -970,7 +1102,8 @@ class TestProcessIdentityPosix:
         # never race /proc/<pid>/cmdline population on a loaded runner.
         child = subprocess.Popen(
             [
-                sys.executable, "-c",
+                sys.executable,
+                "-c",
                 f"import sys, time; sys.stdout.write('R'); sys.stdout.flush(); "
                 f"time.sleep(30)  # {token}",
             ],
@@ -1047,9 +1180,7 @@ class TestProcessArgvMatchesExact:
             # targets — ssh and the aws v2 binary do not re-exec).
             sleep_bin = shutil.which("sleep") or "/bin/sleep"
             argv = [sleep_bin, "300"]
-            child = subprocess.Popen(
-                argv, start_new_session=True, stderr=subprocess.DEVNULL
-            )
+            child = subprocess.Popen(argv, start_new_session=True, stderr=subprocess.DEVNULL)
         else:
             child, argv = self._spawn("kirocrew-argvexact-probe")
         try:
@@ -1089,9 +1220,7 @@ class TestProcessArgvMatchesExact:
         assert pc.process_argv_matches_exact(os.getpid(), ()) is False
 
     def test_own_process_with_wrong_argv_is_false(self):
-        result = pc.process_argv_matches_exact(
-            os.getpid(), ("zzz-not-this-interpreter", "--nope")
-        )
+        result = pc.process_argv_matches_exact(os.getpid(), ("zzz-not-this-interpreter", "--nope"))
         assert result is False
 
 
@@ -1190,9 +1319,7 @@ class TestProcessStartTime:
         monkeypatch.setattr(pc.sys, "platform", "darwin")
         monkeypatch.setattr(pc, "IS_WINDOWS", False)
         monkeypatch.setattr(pc, "trusted_system_bin", lambda _n: "/usr/bin/ps")
-        monkeypatch.setattr(
-            pc.subprocess, "check_output", lambda *_a, **_k: b"\xff\xfe not utf-8"
-        )
+        monkeypatch.setattr(pc.subprocess, "check_output", lambda *_a, **_k: b"\xff\xfe not utf-8")
         assert pc.process_start_time(4242) is None
 
     def test_empty_ps_output_fails_safe(self, monkeypatch):
@@ -1218,6 +1345,149 @@ class TestProcessStartTime:
 
         monkeypatch.setattr(pc, "_open_process_termination_handle", _refuse)
         assert pc.process_start_time(os.getpid())
+
+
+class TestOwnProcessStartTime:
+    """The module-cached self identity the metrics exporter stamps on shards.
+
+    The cache IS the contract: every reader in one process must observe the
+    same token for the process lifetime, so metric records written before and
+    after an in-process provider rebuild stitch into one stream.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cold_cache(self, monkeypatch):
+        """Start every test on a cold cache and restore the global after.
+
+        Without this, whichever test runs first fills the module global for
+        the rest of the worker session, making the first-read assertions
+        order-dependent.
+        """
+        monkeypatch.setattr(pc, "_OWN_START_TIME", None)
+
+    def test_matches_the_identity_token_and_is_stable(self):
+        token = pc.own_process_start_time()
+        if token is None:
+            pytest.skip("process start time unavailable on this platform")
+        assert token == pc._own_identity_token(os.getpid())
+        assert pc.own_process_start_time() == token
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="Linux boot-scope contract")
+    def test_linux_token_is_boot_scoped(self):
+        """The durable token carries the boot UUID, not bare start ticks.
+
+        ``/proc`` start ticks count from boot, and metric shards outlive
+        boots: a post-reboot process repeating an earlier boot's (PID, ticks)
+        pair must still read as a different process.
+        """
+        ticks = pc.process_start_time(os.getpid())
+        boot = pc._linux_boot_id()
+        assert ticks
+        token = pc.own_process_start_time()
+        if boot is None:
+            assert token is None
+        else:
+            assert token == f"{ticks}:{boot}"
+
+    def test_same_ticks_across_boots_yield_distinct_tokens(self, monkeypatch):
+        """A repeated (PID, ticks) pair after a reboot is a NEW identity."""
+        monkeypatch.setattr(pc.sys, "platform", "linux")
+        monkeypatch.setattr(pc, "process_start_time", lambda _pid: "12345")
+        monkeypatch.setattr(pc, "_linux_boot_id", lambda: "boot-aaaa")
+        first_boot = pc._own_identity_token(os.getpid())
+        monkeypatch.setattr(pc, "_linux_boot_id", lambda: "boot-bbbb")
+        second_boot = pc._own_identity_token(os.getpid())
+        assert first_boot == "12345:boot-aaaa"
+        assert second_boot == "12345:boot-bbbb"
+        assert first_boot != second_boot
+
+    def test_a_degraded_read_yields_no_identity_at_all(self, monkeypatch):
+        """A token that cannot honor one-token-one-process is refused.
+
+        The aggregator MUTES its value-drop reset heuristic for any stream
+        carrying a token, so an aliasable coarse token (bare boot-relative
+        ticks, 1s ``lstart``) would merge two lifetimes AND disable the
+        detector that catches the merge — strictly worse than no token, which
+        routes the stream onto the legacy heuristic.
+        """
+        monkeypatch.setattr(pc.sys, "platform", "linux")
+        monkeypatch.setattr(pc, "process_start_time", lambda _pid: "12345")
+        monkeypatch.setattr(pc, "_linux_boot_id", lambda: None)
+        assert pc._own_identity_token(os.getpid()) is None
+
+        monkeypatch.setattr(pc.sys, "platform", "darwin")
+        monkeypatch.setattr(pc, "_darwin_libproc_handle", lambda: None)
+        assert pc._own_identity_token(os.getpid()) is None
+
+        # Platforms with only the 1s ``ps`` probe are outside the closed list.
+        monkeypatch.setattr(pc.sys, "platform", "freebsd14")
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        assert pc._own_identity_token(os.getpid()) is None
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS libproc contract")
+    def test_darwin_microtime_is_used_when_available(self):
+        """The microsecond ``proc_pidinfo`` instant outranks 1s ``ps`` output.
+
+        A PID recycled within one second aliases under ``lstart``; the
+        microsecond instant cannot.
+        """
+        micro = pc._darwin_process_start_microtime(os.getpid())
+        if micro is None:
+            pytest.skip("libproc unavailable in this environment")
+        assert re.fullmatch(r"[1-9]\d*\.\d{6}", micro)
+        assert pc.own_process_start_time() == micro
+
+    def test_darwin_microtime_parses_the_bsdinfo_layout(self, monkeypatch):
+        """The sec/usec pair is sliced from the pinned struct offsets."""
+
+        class _FakeLib:
+            @staticmethod
+            def proc_pidinfo(_pid, _flavor, _arg, buf, size):
+                raw = bytearray(size)
+                raw[pc._DARWIN_PBI_START_TVSEC_OFFSET : pc._DARWIN_PBI_START_TVSEC_OFFSET + 8] = (
+                    1724500000
+                ).to_bytes(8, "little")
+                raw[pc._DARWIN_PBI_START_TVUSEC_OFFSET : pc._DARWIN_PBI_START_TVUSEC_OFFSET + 8] = (
+                    42
+                ).to_bytes(8, "little")
+                buf.raw = bytes(raw)
+                return size
+
+        monkeypatch.setattr(pc, "_darwin_libproc_handle", lambda: _FakeLib())
+        assert pc._darwin_process_start_microtime(4242) == "1724500000.000042"
+
+    def test_darwin_microtime_refuses_a_mismatched_struct_size(self, monkeypatch):
+        """A partial fill means the assumed layout is wrong: answer None."""
+
+        class _ShortLib:
+            @staticmethod
+            def proc_pidinfo(_pid, _flavor, _arg, _buf, _size):
+                return 64
+
+        monkeypatch.setattr(pc, "_darwin_libproc_handle", lambda: _ShortLib())
+        assert pc._darwin_process_start_microtime(4242) is None
+
+    def test_reads_the_platform_once_then_serves_the_cache(self, monkeypatch):
+        first = pc.own_process_start_time()  # populate the cache for THIS pid
+
+        def _boom(_pid):
+            raise AssertionError("cached identity was re-read from the platform")
+
+        monkeypatch.setattr(pc, "_own_identity_token", _boom)
+        assert pc.own_process_start_time() == first
+
+    def test_cache_is_pid_keyed_so_a_forked_child_rereads(self, monkeypatch):
+        """A stale inherited cache entry must be recomputed, not served.
+
+        The OTEL SDK re-installs exporters in fork children, so a child that
+        served the parent's token would share (PID, identity) with any later
+        sibling reusing its PID — the exact merge the identity exists to
+        prevent. Simulate the inherited state directly rather than patching
+        ``os.getpid`` (other threads read it during the patch window).
+        """
+        real = pc.own_process_start_time()
+        monkeypatch.setattr(pc, "_OWN_START_TIME", (os.getpid() + 1, "inherited-stale"))
+        assert pc.own_process_start_time() == real
 
 
 class TestPidLivenessPosix:
@@ -1624,14 +1894,14 @@ class TestTaskkillErrorMapping:
         def _run(*_a, **_kw):
             r = types.SimpleNamespace(returncode=rc, stdout=b"", stderr=stderr)
             return r
+
         return _run
 
     def test_taskkill_rc128_maps_to_process_lookup(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "run",
-                            self._fake_run(128, b"process not found"))
+        monkeypatch.setattr(pc.subprocess, "run", self._fake_run(128, b"process not found"))
         with pytest.raises(ProcessLookupError):
             pc.kill_pid(99999, pc.SIGKILL)
         with pytest.raises(ProcessLookupError):
@@ -1641,8 +1911,7 @@ class TestTaskkillErrorMapping:
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "run",
-                            self._fake_run(5, b"access denied"))
+        monkeypatch.setattr(pc.subprocess, "run", self._fake_run(5, b"access denied"))
         with pytest.raises(PermissionError):
             pc.kill_pid(99999, pc.SIGKILL)
         with pytest.raises(PermissionError):
@@ -1652,8 +1921,7 @@ class TestTaskkillErrorMapping:
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         _fake_windows_bins(monkeypatch)
-        monkeypatch.setattr(pc.subprocess, "run",
-                            self._fake_run(42, b"weird error"))
+        monkeypatch.setattr(pc.subprocess, "run", self._fake_run(42, b"weird error"))
         with pytest.raises(OSError) as ei:
             pc.kill_pid(99999, pc.SIGKILL)
         # not one of the more specific subclasses
@@ -1674,6 +1942,7 @@ class TestTaskkillErrorMapping:
 
         def _boom(*_a, **_kw):
             raise FileNotFoundError(2, "taskkill.exe not found")
+
         monkeypatch.setattr(pc.subprocess, "run", _boom)
         with pytest.raises(OSError):
             pc.kill_pid(99999, pc.SIGKILL)
@@ -1698,8 +1967,7 @@ class TestRestrictToOwnerArgvOnLinux:
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         # Reset the success-only SID memo so the monkeypatched stub wins
         monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid",
-                            lambda: "*S-1-5-21-1-2-3-1000")
+        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-1-2-3-1000")
         captured: dict = {}
 
         def fake_run(argv, **_kw):
@@ -1727,11 +1995,12 @@ class TestRestrictToOwnerArgvOnLinux:
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid",
-                            lambda: "*S-1-5-21-9-9-9-9")
-        monkeypatch.setattr(pc.subprocess, "run",
-                            lambda *a, **k: types.SimpleNamespace(
-                                returncode=1, stdout=b"", stderr=b"denied"))
+        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-9-9-9-9")
+        monkeypatch.setattr(
+            pc.subprocess,
+            "run",
+            lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"denied"),
+        )
         f = tmp_path / "secret.key"
         f.write_bytes(b"s" * 32)
         with pytest.raises(OSError):
@@ -1816,9 +2085,7 @@ class TestRestrictToOwnerArgvOnLinux:
         f.write_bytes(b"s" * 32)
         pc.restrict_to_owner(f)
         grants = [
-            captured["argv"][i + 1]
-            for i, a in enumerate(captured["argv"][:-1])
-            if a == "/grant:r"
+            captured["argv"][i + 1] for i, a in enumerate(captured["argv"][:-1]) if a == "/grant:r"
         ]
         assert grants, captured["argv"]
         for g in grants:
@@ -1895,10 +2162,11 @@ class TestRestrictToOwnerArgvOnLinux:
             if len(attempts) == 1:
                 return types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
             return types.SimpleNamespace(
-                returncode=0, stdout=b'"ANT\\user","S-1-5-21-1-2-3-500"', stderr=b"")
+                returncode=0, stdout=b'"ANT\\user","S-1-5-21-1-2-3-500"', stderr=b""
+            )
 
         monkeypatch.setattr(pc.subprocess, "run", flaky_run)
-        assert pc._current_user_sid() is None          # first call fails...
+        assert pc._current_user_sid() is None  # first call fails...
         assert pc._current_user_sid() == "*S-1-5-21-1-2-3-500"  # ...retry succeeds
         assert pc._current_user_sid() == "*S-1-5-21-1-2-3-500"  # ...and is cached
         assert len(attempts) == 2, "success must be memoized (no third spawn)"
@@ -2084,7 +2352,8 @@ class TestRestrictToOwner:
         f.write_bytes(b"s" * 32)
         pc.restrict_to_owner(f)
         out = subprocess.check_output(
-            ["icacls", str(f)], stderr=subprocess.DEVNULL,
+            ["icacls", str(f)],
+            stderr=subprocess.DEVNULL,
         ).decode("utf-8", "replace")
         assert _owner_only_dacl_violations(out) == [], out
 
@@ -2211,6 +2480,29 @@ class TestFindPythonInterpreterReal:
         monkeypatch.setattr(pc.subprocess, "check_output", boom)
         assert pc.find_python_interpreter() is None
 
+    def test_version_gate_ignores_a_sitecustomize_decoy_on_pythonpath(self, tmp_path, monkeypatch):
+        # The selection-side twin of test_origin_probe_ignores_pythonpath: at
+        # child startup the ``site`` module imports any ``sitecustomize.py``
+        # found on the caller's PYTHONPATH, and that module can monkeypatch
+        # ``sys.version_info`` — here forcing this real >= 3.10 interpreter to
+        # report 3.4, which would make the version gate reject it and steer
+        # selection. The gate runs the probe isolated (-I), so the decoy is
+        # never imported and the candidate is judged by its REAL version.
+        # This spawns a real child; the probe is a read-only version query
+        # that creates nothing, so no cwd pin is needed.
+        decoy = tmp_path / "decoy-pythonpath"
+        decoy.mkdir()
+        (decoy / "sitecustomize.py").write_text(
+            "import sys\nsys.version_info = (3, 4, 0, 'final', 0)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        # Every candidate name resolves to this suite's own interpreter — a
+        # real, runnable >= 3.10 CPython on every platform CI runs.
+        monkeypatch.setattr("shutil.which", lambda name: sys.executable)
+
+        assert pc.find_python_interpreter() == sys.executable
+
 
 class TestFindListeningPidsErrors:
     def test_returns_empty_when_lsof_missing(self, monkeypatch):
@@ -2285,8 +2577,10 @@ class TestFindListeningPidsErrors:
 
     def _fake_netstat(self, blob: str):
         """Return a fake subprocess.check_output that returns *blob*."""
+
         def _run(*_a, **_kw):
             return blob
+
         return _run
 
     def test_windows_finds_ipv6_listener_via_netstat(self, monkeypatch):
@@ -2328,9 +2622,7 @@ class TestFindListeningPidsErrors:
         # future-proof against a hypothetical Windows build that switches to
         # "TCP6" (the netstat -p flag already accepts "tcpv6"). Guard the
         # defensive path so a future relabel doesn't silently re-break this.
-        blob = (
-            "  TCP6   [::1]:7777             [::]:0                 LISTENING       77\n"
-        )
+        blob = "  TCP6   [::1]:7777             [::]:0                 LISTENING       77\n"
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         _fake_windows_bins(monkeypatch)
@@ -2397,6 +2689,7 @@ class TestFindListeningPidsErrors:
         # canned-blob tests above by exercising the real netstat parse against
         # whatever this Windows build actually prints.
         import socket as _socket
+
         s = _socket.socket(_socket.AF_INET6, _socket.SOCK_STREAM)
         try:
             s.bind(("::1", 0))
@@ -2509,9 +2802,7 @@ class TestKillAsyncVariants:
         monkeypatch.setattr(pc, "kill_pid", fake_kill_pid)
         import asyncio as _asyncio
 
-        result = _asyncio.new_event_loop().run_until_complete(
-            pc.kill_pid_async(4242, pc.SIGKILL)
-        )
+        result = _asyncio.new_event_loop().run_until_complete(pc.kill_pid_async(4242, pc.SIGKILL))
         assert result is True
         assert seen == [(4242, pc.SIGKILL)]
 
@@ -2606,13 +2897,11 @@ class TestKillAsyncVariants:
 
         result = real_loop.run_until_complete(_driver())
         assert result is True
-        assert seen_executors == [sentinel], (
-            f"expected the subprocess_executor sentinel, got {seen_executors!r}"
-        )
+        assert seen_executors == [
+            sentinel
+        ], f"expected the subprocess_executor sentinel, got {seen_executors!r}"
 
-    def test_windows_kill_process_tree_async_offloads_via_subprocess_executor(
-        self, monkeypatch
-    ):
+    def test_windows_kill_process_tree_async_offloads_via_subprocess_executor(self, monkeypatch):
         """Same offload contract as kill_pid_async but for the /T variant."""
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
@@ -2624,9 +2913,7 @@ class TestKillAsyncVariants:
         monkeypatch.setattr(
             pc.subprocess,
             "run",
-            lambda *_a, **_kw: types.SimpleNamespace(
-                returncode=0, stdout=b"", stderr=b""
-            ),
+            lambda *_a, **_kw: types.SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
         )
         monkeypatch.setattr(pc, "subprocess_executor", lambda: sentinel)
 
@@ -2843,9 +3130,7 @@ class TestLocalUserId:
         monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-9-8-7-1002")
         assert pc.local_user_id() != first  # and distinct per user
 
-    def test_windows_without_a_sid_collapses_to_zero(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_windows_without_a_sid_collapses_to_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A partition collapse, not a privilege change: the endpoint is already
         per-user, so two users cannot reach the same pool regardless."""
         monkeypatch.setattr(pc, "IS_POSIX", False)
@@ -2929,13 +3214,9 @@ class TestCurrentUserSidNeverSpawns:
 
     @staticmethod
     def _forbid_spawn(*_a, **_kw):
-        raise AssertionError(
-            "current_user_sid must not spawn -- it runs on the event loop"
-        )
+        raise AssertionError("current_user_sid must not spawn -- it runs on the event loop")
 
-    def test_returns_none_without_spawning_when_the_token_read_fails(
-        self, monkeypatch
-    ):
+    def test_returns_none_without_spawning_when_the_token_read_fails(self, monkeypatch):
         monkeypatch.setattr(pc, "_TOKEN_SID_CACHE", [])
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
@@ -3028,7 +3309,9 @@ def test_process_descendants_is_best_effort_on_unreadable_table(monkeypatch):
         lambda: (_ for _ in ()).throw(OSError("boom")),
     )
     monkeypatch.setattr(
-        platform_compat, "_windows_process_parent_map", lambda: (_ for _ in ()).throw(OSError("boom"))
+        platform_compat,
+        "_windows_process_parent_map",
+        lambda: (_ for _ in ()).throw(OSError("boom")),
     )
     assert platform_compat.process_descendants(os.getpid()) == []
 
@@ -3570,9 +3853,7 @@ class TestKillProcessTreePinned:
 
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_open_process_query_handle", lambda pid: self.HANDLE)
-        monkeypatch.setattr(
-            pc, "_windows_process_handle_identity", lambda h: (4321, 777, None)
-        )
+        monkeypatch.setattr(pc, "_windows_process_handle_identity", lambda h: (4321, 777, None))
         monkeypatch.setattr(pc, "_close_process_handle", closed.append)
 
         def _gated_kill(pid, sig):
@@ -3612,9 +3893,7 @@ class TestKillProcessTreePinned:
         closed: list[int] = []
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_open_process_query_handle", lambda pid: self.HANDLE)
-        monkeypatch.setattr(
-            pc, "_windows_process_handle_identity", lambda h: (4321, 777, None)
-        )
+        monkeypatch.setattr(pc, "_windows_process_handle_identity", lambda h: (4321, 777, None))
         monkeypatch.setattr(pc, "_close_process_handle", closed.append)
 
         def _raising_kill(pid, sig):
@@ -3648,9 +3927,7 @@ class TestKillProcessTreePinned:
         assert killed == [(4321, pc.SIGTERM)]
         assert opened == [], "no handle work on POSIX"
 
-    def test_the_pinned_identity_is_the_same_half_process_start_time_returns(
-        self, monkeypatch
-    ):
+    def test_the_pinned_identity_is_the_same_half_process_start_time_returns(self, monkeypatch):
         """Both sides must read the CREATION half, or the comparison is nonsense.
 
         ``process_start_time`` records ``str(identity[1])``; if the pin compared
@@ -3667,9 +3944,7 @@ class TestKillProcessTreePinned:
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_open_process_query_handle", lambda pid: self.HANDLE)
         monkeypatch.setattr(pc, "_close_process_handle", lambda h: None)
-        monkeypatch.setattr(
-            pc, "_windows_process_handle_identity", lambda h: (4321, 777, 888)
-        )
+        monkeypatch.setattr(pc, "_windows_process_handle_identity", lambda h: (4321, 777, 888))
         monkeypatch.setattr(pc, "kill_process_tree", lambda pid, sig: True)
 
         recorded = pc.process_start_time(4321)
@@ -3756,3 +4031,169 @@ class TestKillPidPinned:
 
         assert pc.kill_pid_pinned(4321, "777", pc.SIGTERM) is True
         assert killed == [(4321, pc.SIGTERM)]
+
+
+class TestTrustedGitBin:
+    """`git` resolution for privileged/unattended callers.
+
+    Moved here from `test_cli_doctor` with the logic: the doctor and the update
+    seam are two callers of one resolver, so the resolution rules belong beside
+    the resolver rather than in either caller's tests.
+    """
+
+    def test_uses_the_trusted_system_resolver(self, monkeypatch) -> None:
+        monkeypatch.setattr(pc, "trusted_system_bin", lambda _n: "/usr/bin/git")
+        assert pc.trusted_git_bin() == "/usr/bin/git"
+
+    def test_windows_falls_back_to_the_git_for_windows_roots(self, monkeypatch, tmp_path) -> None:
+        """Git for Windows installs under Program Files, never System32.
+
+        Without the fallback every supported Windows source install resolves to
+        None, which would silently disable the callers that depend on it.
+        """
+        monkeypatch.setattr(pc, "trusted_system_bin", lambda _n: None)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+
+        gfw = tmp_path / "Git" / "cmd"
+        gfw.mkdir(parents=True)
+        exe = gfw / "git.exe"
+        exe.write_text("")
+        exe.chmod(0o755)
+        monkeypatch.setattr(pc, "_WINDOWS_GIT_DIRS", (str(gfw),))
+        assert pc.trusted_git_bin() == str(exe)
+
+    def test_windows_returns_none_when_the_roots_are_empty(self, monkeypatch) -> None:
+        """Fixed roots only -- a miss returns None without consulting PATH.
+
+        Reading `%ProgramFiles%` instead would let a poisoned variable redirect
+        the lookup to an agent-writable directory, which is the hole the pin
+        exists to close.
+        """
+        monkeypatch.setattr(pc, "trusted_system_bin", lambda _n: None)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_WINDOWS_GIT_DIRS", (r"Z:\nonexistent\Git\cmd",))
+        assert pc.trusted_git_bin() is None
+
+    def test_posix_never_probes_the_windows_roots(self, monkeypatch) -> None:
+        """On POSIX the trusted-dirs decision is final."""
+        monkeypatch.setattr(pc, "trusted_system_bin", lambda _n: None)
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(
+            pc,
+            "_WINDOWS_GIT_DIRS",
+            property(lambda _s: (_ for _ in ()).throw(AssertionError("probed on POSIX"))),
+        )
+        assert pc.trusted_git_bin() is None
+
+
+class TestKillAndReap:
+    """The shared kill-the-tree + bounded-pipe-draining-reap helper (#5989)."""
+
+    @staticmethod
+    def _proc(pid: int = 4242):
+        from unittest import mock
+
+        proc = mock.MagicMock()
+        proc.pid = pid
+        proc.kill = mock.MagicMock()
+        proc.communicate = mock.AsyncMock(return_value=(b"", b""))
+        proc.wait = mock.AsyncMock()
+        return proc
+
+    @pytest.mark.asyncio
+    async def test_kills_the_whole_tree_then_the_pid(self) -> None:
+        """A spawned command is often a shell line, so the whole group must be
+        signalled; the pid-scoped kill backs up a group signal that missed."""
+        from unittest import mock
+
+        proc = self._proc(pid=4242)
+        with mock.patch.object(pc, "kill_process_tree_async", mock.AsyncMock()) as tree:
+            await pc.kill_and_reap(proc)
+        tree.assert_awaited_once()
+        assert tree.await_args.args == (4242, pc.SIGKILL)
+        proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reaps_via_communicate_never_wait(self) -> None:
+        """The reap must drain the pipes: a killed child blocked writing into
+        a full pipe makes a bare ``wait()`` hang the calling task forever."""
+        from unittest import mock
+
+        proc = self._proc()
+        with mock.patch.object(pc, "kill_process_tree_async", mock.AsyncMock()):
+            await pc.kill_and_reap(proc)
+        proc.communicate.assert_awaited_once()
+        proc.wait.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bounds_the_reap(self) -> None:
+        """A descendant that ignores SIGKILL's effects on the pipe (e.g. an
+        inherited fd held open) must not turn cleanup into a hang."""
+        import asyncio
+        from unittest import mock
+
+        assert 0 < pc.REAP_TIMEOUT_SECS <= 30
+        proc = self._proc(pid=1)
+
+        async def _never_returns():
+            await asyncio.sleep(3600)
+
+        proc.communicate = _never_returns
+        with mock.patch.object(pc, "kill_process_tree_async", mock.AsyncMock()):
+            # Outer bound is a hang detector only; the helper's own bound
+            # (passed explicitly) is what must return first.
+            await asyncio.wait_for(pc.kill_and_reap(proc, timeout=0.01), timeout=30)
+
+    @pytest.mark.asyncio
+    async def test_tolerates_dead_child_and_mock_pids(self) -> None:
+        """Best-effort throughout: an already-exited child (or a non-int test
+        pid refused by the broadcast guard) must not mask the caller's own
+        timeout or cancellation handling."""
+        from unittest import mock
+
+        proc = mock.MagicMock()  # pid is a MagicMock -> tree kill refuses it
+        proc.kill = mock.MagicMock(side_effect=ProcessLookupError())
+        proc.communicate = mock.AsyncMock(side_effect=RuntimeError("already reaped"))
+        await pc.kill_and_reap(proc)
+
+    @pytest.mark.asyncio
+    async def test_repeat_cancellation_does_not_abandon_cleanup(self) -> None:
+        """A second Task.cancel() landing mid-cleanup is a BaseException that
+        escapes ``suppress(Exception)``: without the shield it aborts the
+        cleanup before the reap, leaving the killed child un-drained. The
+        helper must finish the kill + reap, then re-deliver the cancellation
+        exactly once."""
+        import asyncio
+        from unittest import mock
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        events: list[str] = []
+
+        class Proc:
+            pid = 4242
+
+            def kill(self):
+                events.append("killed")
+
+            async def communicate(self):
+                events.append("reap-started")
+                started.set()
+                await release.wait()
+                events.append("reaped")
+                return b"", b""
+
+        async def _caller():
+            with mock.patch.object(pc, "kill_process_tree_async", mock.AsyncMock()):
+                await pc.kill_and_reap(Proc())
+
+        task = asyncio.ensure_future(_caller())
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()  # the repeat cancellation that used to abort the reap
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert events == ["killed", "reap-started", "reaped"]

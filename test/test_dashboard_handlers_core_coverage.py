@@ -19,6 +19,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -130,9 +131,7 @@ class TestPageAndAssets:
             "kiro_crew.dashboard.handlers.KiroCrewConfig",
             SimpleNamespace(load=lambda: cfg),
         )
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.handlers.is_sensitive_path", lambda _p: True
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_sensitive_path", lambda _p: True)
         resp = await core_mod.logo(_req())
         assert resp.status == 404
 
@@ -145,9 +144,7 @@ class TestPageAndAssets:
             "kiro_crew.dashboard.handlers.KiroCrewConfig",
             SimpleNamespace(load=lambda: cfg),
         )
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.handlers.is_sensitive_path", lambda _p: False
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_sensitive_path", lambda _p: False)
         monkeypatch.setattr(
             "kiro_crew.hooks.validate_file_path", lambda p: str(avatar) if p else None
         )
@@ -323,9 +320,7 @@ class TestSttPrereqCommands:
         monkeypatch.setattr(core_mod, "_voice_extra_importable", lambda: False)
         monkeypatch.setattr(core_mod.shutil, "which", lambda _n: "C:\\ffmpeg\\ffmpeg.exe")
         monkeypatch.setattr(core_mod.os, "name", "nt")
-        monkeypatch.setattr(
-            core_mod.sys, "executable", "C:\\Program Files\\Python312\\python.exe"
-        )
+        monkeypatch.setattr(core_mod.sys, "executable", "C:\\Program Files\\Python312\\python.exe")
         cmds = core_mod._stt_prereq_commands("transcribe")
         assert cmds == [
             "& 'C:\\Program Files\\Python312\\python.exe' -m pip install kirocrew[voice]"
@@ -443,17 +438,13 @@ class TestPipInstallChannel:
     @pytest.fixture(autouse=True)
     def _not_bundled(self, monkeypatch):
         """Pin the desktop-bundle probe; the bundled case has its own test."""
-        monkeypatch.setattr(
-            core_mod.platform_compat, "is_bundled_interpreter", lambda: False
-        )
+        monkeypatch.setattr(core_mod.platform_compat, "is_bundled_interpreter", lambda: False)
 
     def test_bundled_desktop_interpreter_has_no_channel(self, monkeypatch) -> None:
         """A pip install into the desktop app's code-signed bundle breaks
         launches/updates and is discarded on every app update — the command
         must not be offered there even though pip itself may exist."""
-        monkeypatch.setattr(
-            core_mod.platform_compat, "is_bundled_interpreter", lambda: True
-        )
+        monkeypatch.setattr(core_mod.platform_compat, "is_bundled_interpreter", lambda: True)
         assert core_mod._pip_install_channel_available() is False
 
     def test_pipless_interpreter_has_no_channel(self, monkeypatch) -> None:
@@ -510,7 +501,14 @@ class TestAl2023Detection:
 
 
 class TestFindSuitablePython:
-    """The reject predicate must SKIP an unusable interpreter, never abort."""
+    """The reject predicate must SKIP an unusable interpreter, never abort.
+
+    Since #5535 both probes run through ``dep_sync._probe_interpreter`` so the
+    verdict describes the CANDIDATE interpreter, never the gateway's
+    environment. The decoy tests run a real child against ``sys.executable``
+    to prove the two attack routes (an inherited ``PYTHONPATH``, and ``-m``'s
+    import-and-execute of a planted ``pip``) stay closed.
+    """
 
     @staticmethod
     def _capture(monkeypatch):
@@ -520,35 +518,42 @@ class TestFindSuitablePython:
             captured["reject"] = reject
             return "/usr/bin/python3"
 
-        monkeypatch.setattr(
-            "kiro_crew.platform_compat.find_python_interpreter", _fake
-        )
+        monkeypatch.setattr("kiro_crew.platform_compat.find_python_interpreter", _fake)
         assert core_mod._find_suitable_python() == "/usr/bin/python3"
         return captured["reject"]
 
+    @staticmethod
+    def _fake_probe(monkeypatch, version_rc=0, version_out="3.12.1 (main)", pip_rc=0):
+        """Stub ``dep_sync._probe_interpreter``: find_spec code = pip probe."""
+
+        def _fake(_py, code, timeout=None):
+            assert timeout == 5, "each probe must keep the 5s bound"
+            if "find_spec" in code:
+                return SimpleNamespace(returncode=pip_rc, stdout="", stderr="")
+            return SimpleNamespace(returncode=version_rc, stdout=version_out, stderr="")
+
+        monkeypatch.setattr(core_mod.dep_sync, "_probe_interpreter", _fake)
+
     def test_free_threaded_build_is_rejected(self, monkeypatch) -> None:
         reject = self._capture(monkeypatch)
-        monkeypatch.setattr(
-            subprocess,
-            "check_output",
-            lambda *a, **k: "3.14.0 free-threading build",
-        )
+        self._fake_probe(monkeypatch, version_out="3.14.0 free-threading build")
         assert reject("/usr/bin/python3.14t") is True
 
     def test_interpreter_with_pip_is_accepted(self, monkeypatch) -> None:
         reject = self._capture(monkeypatch)
-        monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "3.12.1 (main)")
+        self._fake_probe(monkeypatch)
         assert reject("/usr/bin/python3.12") is False
 
     def test_missing_pip_is_rejected(self, monkeypatch) -> None:
         reject = self._capture(monkeypatch)
+        self._fake_probe(monkeypatch, pip_rc=1)
+        assert reject("/usr/bin/python3.12") is True
 
-        def _fake(args, **_k):
-            if "pip" in args:
-                raise subprocess.CalledProcessError(1, args)
-            return "3.12.1 (main)"
-
-        monkeypatch.setattr(subprocess, "check_output", _fake)
+    def test_failed_version_probe_is_rejected(self, monkeypatch) -> None:
+        """_probe_interpreter reports failure via returncode, not an exception:
+        an implicit fall-through would hand the installer a broken target."""
+        reject = self._capture(monkeypatch)
+        self._fake_probe(monkeypatch, version_rc=1, version_out="")
         assert reject("/usr/bin/python3.12") is True
 
     def test_unspawnable_interpreter_is_rejected(self, monkeypatch) -> None:
@@ -556,8 +561,88 @@ class TestFindSuitablePython:
             raise OSError("exec format error")
 
         reject = self._capture(monkeypatch)
-        monkeypatch.setattr(subprocess, "check_output", _boom)
+        monkeypatch.setattr(core_mod.dep_sync, "_probe_interpreter", _boom)
         assert reject("/usr/bin/broken") is True
+
+    def test_hung_probe_is_rejected(self, monkeypatch) -> None:
+        def _hang(*_a, **_k):
+            raise subprocess.TimeoutExpired(cmd="python", timeout=5)
+
+        reject = self._capture(monkeypatch)
+        monkeypatch.setattr(core_mod.dep_sync, "_probe_interpreter", _hang)
+        assert reject("/usr/bin/python3.12") is True
+
+    def test_both_probes_run_isolated_bounded_and_without_dash_m(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Structural pin on the child argv: ``-I`` (no PYTHONPATH / user-site /
+        CWD entry), the 5s bound, a neutral cwd — and never ``-m``, whose
+        import-and-execute is the half of #5535 that runs planted code."""
+        target = tmp_path / "bin" / "python3"
+        target.parent.mkdir(parents=True)
+        seen = []
+
+        def _fake_run(cmd, **kwargs):
+            seen.append((cmd, kwargs))
+            return SimpleNamespace(returncode=0, stdout="3.12.1 (main)", stderr="")
+
+        reject = self._capture(monkeypatch)
+        monkeypatch.setattr(core_mod.dep_sync.subprocess, "run", _fake_run)
+        assert reject(str(target)) is False
+        assert len(seen) == 2, "version probe + pip probe"
+        for cmd, kwargs in seen:
+            assert cmd[0] == str(target)
+            assert cmd[1] == "-I", "probe must run the interpreter isolated"
+            assert "-m" not in cmd, "-m imports and executes; probes must use -c"
+            assert kwargs.get("timeout") == 5, "the per-probe 5s bound must survive"
+            assert kwargs.get("cwd") == target.parent, "probe needs a neutral cwd"
+            assert "env" not in kwargs, "-I owns isolation; no env forwarding"
+
+    def test_a_sitecustomize_decoy_on_pythonpath_cannot_forge_free_threading(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A ``sitecustomize.py`` on the caller's PYTHONPATH edits ``sys.version``
+        in every unisolated child — vetoing all candidates (Whisper reported
+        unavailable) or waving a genuinely free-threaded build through as the
+        install target. ``-I`` drops PYTHONPATH, so the verdict must not move."""
+        decoy = tmp_path / "decoy-path"
+        decoy.mkdir()
+        (decoy / "sitecustomize.py").write_text(
+            "import sys; sys.version += ' free-threading build'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        reject = self._capture(monkeypatch)
+
+        # sys.executable (this test venv) has pip and is not free-threaded:
+        # the decoy must not flip its verdict to "unusable".
+        assert reject(sys.executable) is False
+
+    def test_a_decoy_pip_package_neither_executes_nor_forges_the_verdict(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """``-m pip`` IMPORTS AND EXECUTES the ``pip`` the child resolves, so a
+        decoy package on the caller's PYTHONPATH both runs planted code in the
+        probe child and answers "pip present/absent" regardless of reality.
+        The fixed probe asks ``find_spec`` under ``-I``: the decoy must never
+        run (no canary file) and must not flip the verdict (this interpreter's
+        real pip still wins)."""
+        decoy = tmp_path / "decoy-path"
+        canary = tmp_path / "canary"
+        pkg = decoy / "pip"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(
+            f"import pathlib, sys\n"
+            f"pathlib.Path({str(canary)!r}).write_text('ran', encoding='utf-8')\n"
+            f"sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        (pkg / "__main__.py").write_text("", encoding="utf-8")
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        reject = self._capture(monkeypatch)
+
+        assert reject(sys.executable) is False
+        assert not canary.exists(), "decoy pip must never be imported or executed"
 
 
 class TestInstallScript:
@@ -779,9 +864,7 @@ class TestSttInstall:
         assert fake_sel.log_api_access.call_args.kwargs["outcome"] == "failed"
 
     @pytest.mark.asyncio
-    async def test_install_timeout_kills_the_child(
-        self, monkeypatch, fake_sel, stt_status
-    ) -> None:
+    async def test_install_timeout_kills_the_child(self, monkeypatch, fake_sel, stt_status) -> None:
         core_mod._stt_install_status = {"step": "idle", "detail": "", "error": ""}
         proc = MagicMock()
         proc.stdout = SimpleNamespace(readline=AsyncMock(side_effect=asyncio.TimeoutError))
@@ -1015,9 +1098,7 @@ class TestAgentSettingsPut:
             assert (await resp.json())["error"] == "agent must be an object"
 
     @pytest.mark.asyncio
-    async def test_corrupt_config_is_500_not_a_silent_reset(
-        self, seeded_config, fake_sel
-    ) -> None:
+    async def test_corrupt_config_is_500_not_a_silent_reset(self, seeded_config, fake_sel) -> None:
         seeded_config.write_text("<<not json>>", encoding="utf-8", newline="\n")
         async with TestClient(TestServer(_agent_cfg_app())) as client:
             resp = await _put_agent(client, {"subagent_max_turns": 5})
@@ -1028,9 +1109,7 @@ class TestAgentSettingsPut:
     @pytest.mark.asyncio
     async def test_out_of_range_turns_is_denied(self, seeded_config, fake_sel) -> None:
         async with TestClient(TestServer(_agent_cfg_app())) as client:
-            resp = await _put_agent(
-                client, {"subagent_max_turns": SUBAGENT_MAX_TURNS_CEILING + 1}
-            )
+            resp = await _put_agent(client, {"subagent_max_turns": SUBAGENT_MAX_TURNS_CEILING + 1})
             assert resp.status == 400
             assert "between 1 and" in (await resp.json())["error"]
 
@@ -1045,9 +1124,7 @@ class TestAgentSettingsPut:
     @pytest.mark.asyncio
     async def test_auto_max_above_ceiling_is_denied(self, seeded_config, fake_sel) -> None:
         async with TestClient(TestServer(_agent_cfg_app())) as client:
-            resp = await _put_agent(
-                client, {"subagent_auto_max": SUBAGENT_AUTO_MAX_CEILING + 1}
-            )
+            resp = await _put_agent(client, {"subagent_auto_max": SUBAGENT_AUTO_MAX_CEILING + 1})
             assert resp.status == 400
             assert "subagent_auto_max must be an integer" in (await resp.json())["error"]
 
@@ -1094,9 +1171,7 @@ class TestAgentSettingsPut:
             resp = await _put_agent(client, {"max_subagents": 0})
             assert resp.status == 200
             assert (await resp.json())["restart_required"] is True
-        assert json.loads(seeded_config.read_text(encoding="utf-8"))["agent"][
-            "max_subagents"
-        ] == 0
+        assert json.loads(seeded_config.read_text(encoding="utf-8"))["agent"]["max_subagents"] == 0
 
     @pytest.mark.asyncio
     async def test_non_boolean_toggle_is_denied(self, seeded_config, fake_sel) -> None:
@@ -1182,9 +1257,7 @@ class TestAgentSettingsPutLockOffload:
     """
 
     @pytest.mark.asyncio
-    async def test_concurrent_puts_serialize_not_clobber(
-        self, seeded_config, fake_sel
-    ) -> None:
+    async def test_concurrent_puts_serialize_not_clobber(self, seeded_config, fake_sel) -> None:
         """Two concurrent PUTs must both land — neither write clobbers the other.
 
         We fire two coroutines simultaneously: one sets ``subagent_max_turns=3``
@@ -1224,12 +1297,13 @@ class TestAgentSettingsPutLockOffload:
         async with TestClient(TestServer(_agent_cfg_app())) as client:
             resp = await _put_agent(client, {"subagent_max_turns": 5})
         assert resp.status == 200
-        assert calls == ["update_config_locked"], (
-            "PUT did not route through update_config_locked — lost-write race still present"
+        assert calls == [
+            "update_config_locked"
+        ], "PUT did not route through update_config_locked — lost-write race still present"
+        assert (
+            json.loads(seeded_config.read_text(encoding="utf-8"))["agent"]["subagent_max_turns"]
+            == 5
         )
-        assert json.loads(seeded_config.read_text(encoding="utf-8"))["agent"][
-            "subagent_max_turns"
-        ] == 5
 
 
 # ── PATCH validators not reachable through the editable-field table ─────
@@ -1264,6 +1338,66 @@ class TestPatchGuards:
             assert (await resp.json())["error"] == "field not editable: agent.nope"
 
 
+class TestFallbackModelPatch:
+    """agent.fallback_model — single-value str spec with role-model validation."""
+
+    def _app(self) -> web.Application:
+        app = web.Application()
+        app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_accepts_a_model_id(self, seeded_config, fake_sel) -> None:
+        async with TestClient(TestServer(self._app())) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": "claude-opus-4.8"},
+            )
+            assert resp.status == 200
+        assert (
+            json.loads(seeded_config.read_text(encoding="utf-8"))["agent"]["fallback_model"]
+            == "claude-opus-4.8"
+        )
+
+    @pytest.mark.asyncio
+    async def test_accepts_auto(self, seeded_config, fake_sel) -> None:
+        # "auto" always allows — _validate_role_model's defer-to-default case.
+        async with TestClient(TestServer(self._app())) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": "auto"},
+            )
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_accepts_empty_feature_off(self, seeded_config, fake_sel) -> None:
+        async with TestClient(TestServer(self._app())) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": ""},
+            )
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_string(self, seeded_config, fake_sel) -> None:
+        async with TestClient(TestServer(self._app())) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": ["claude-opus-5"]},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_rejects_bad_grammar(self, seeded_config, fake_sel) -> None:
+        async with TestClient(TestServer(self._app())) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": "model; rm -rf /"},
+            )
+            assert resp.status == 400
+            assert "invalid value" in (await resp.json())["error"]
+
+
 class TestAdvertisedModelGuards:
     def test_unknown_when_no_session_has_initialised(self) -> None:
         assert core_mod._active_advertised_ids(_req(app={})) is None
@@ -1290,9 +1424,7 @@ class TestAdvertisedModelGuards:
             sessions=SimpleNamespace(
                 active_providers=lambda: [
                     SimpleNamespace(available_models=lambda: []),
-                    SimpleNamespace(
-                        available_models=lambda: [{"modelId": "claude-sonnet-4.6"}]
-                    ),
+                    SimpleNamespace(available_models=lambda: [{"modelId": "claude-sonnet-4.6"}]),
                 ]
             )
         )
@@ -1482,9 +1614,7 @@ class TestAppSecretExchange:
 
     @pytest.mark.asyncio
     async def test_invalid_secret_is_refused(self, app_sel, monkeypatch) -> None:
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.token_auth.validate_app_secret", lambda *_a: False
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.token_auth.validate_app_secret", lambda *_a: False)
         resp = await core_mod.api_app_token(
             _req(match_info={"name": "meetings"}, headers={"X-App-Secret": "nope"})
         )
@@ -1492,12 +1622,8 @@ class TestAppSecretExchange:
         assert json.loads(resp.body)["error"] == "invalid secret"
 
     @pytest.mark.asyncio
-    async def test_valid_secret_mints_an_app_scoped_credential(
-        self, app_sel, monkeypatch
-    ) -> None:
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.token_auth.validate_app_secret", lambda *_a: True
-        )
+    async def test_valid_secret_mints_an_app_scoped_credential(self, app_sel, monkeypatch) -> None:
+        monkeypatch.setattr("kiro_crew.dashboard.token_auth.validate_app_secret", lambda *_a: True)
         seen: dict = {}
 
         def _generate(name, app=None):
@@ -1573,9 +1699,7 @@ class TestSessionAgentRoutes:
         assert "event: done" in text
 
     @pytest.mark.asyncio
-    async def test_stream_stops_when_the_client_disconnects(
-        self, monkeypatch, fake_sel
-    ) -> None:
+    async def test_stream_stops_when_the_client_disconnects(self, monkeypatch, fake_sel) -> None:
         """A reset peer must end the loop, not spin for the full 20 minutes."""
 
         def _reset(**_k):

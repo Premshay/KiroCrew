@@ -60,8 +60,6 @@ from kiro_crew.acp.kas_agents import (
 from kiro_crew.acp.kas_assets import (
     KasAssetsMissing,
     build_kas_argv,
-    build_kas_cli_argv,
-    kas_override_active,
     resolve_kas_entry,
 )
 from kiro_crew.acp.kas_auth import (
@@ -117,7 +115,7 @@ from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
     cgroup_scope_argv,
     create_subprocess_limited,
-    scrub_agent_denied_env,
+    scrub_agent_subprocess_env,
     wrap_argv,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -954,19 +952,10 @@ class AcpRuntime:
             return claude_argv
 
         if self._acp_backend == ACP_BACKEND_KAS:
-            if kas_override_active():
-                # Escape hatch (airgap/debug): launch the operator's pinned
-                # local build directly. No --agent: KAS takes custom agents
-                # over the wire in session/new (_meta.kiro.customAgents).
-                node, script = await asyncio.to_thread(resolve_kas_entry)
-                return build_kas_argv(node, script)
-            # Default: front KAS with kiro-cli's own ACP surface. kiro-cli
-            # extracts the bundle on demand and supervises the Node process;
-            # the auth callback is still forwarded to this client (kas_auth).
-            kas_kiro_bin = await _resolve_kiro_bin_for_spawn()
-            if not kas_kiro_bin:
-                raise AcpRuntimeError(f"{KIRO_CLI_BIN} not found in PATH")
-            return build_kas_cli_argv(kas_kiro_bin)
+            node, script = await asyncio.to_thread(resolve_kas_entry)
+            # No --agent: KAS takes custom agents over the wire in session/new
+            # (_meta.kiro.customAgents), not from a CLI flag.
+            return build_kas_argv(node, script)
 
         kiro_bin = await _resolve_kiro_bin_for_spawn()
         if not kiro_bin:
@@ -1014,9 +1003,10 @@ class AcpRuntime:
         # needs no bind-mount and works with sandbox mode "off". strip_python_env
         # IS applied to keep the host PYTHONPATH/PYTHONHOME out of kiro-cli's
         # foreign MCP subprocesses (which bundle their own interpreter + deps).
-        # is_kiro_cli drives a macOS-only delegation: when kiro's internal
-        # sandbox is enabled, wrap_argv skips its own seatbelt because the two
-        # cannot nest (kernel EPERM). Granted by membership in
+        # is_kiro_cli drives the reviewed Kiro internal-sandbox delegation: on
+        # macOS wrap_argv skips its seatbelt because the two cannot nest; on
+        # Windows the official Kiro backend delegates by default because Crew
+        # has no native OS sandbox there. Granted by membership in
         # ACP_BACKENDS_INTERNAL_SANDBOX (harness-parity H7), never as "not KAS":
         # this test fails OPEN, so a harness that inherited a negative test would
         # have Crew's seatbelt skipped in favour of an internal sandbox that never
@@ -1026,13 +1016,7 @@ class AcpRuntime:
             argv,
             mode=self._sandbox_mode,
             strip_python_env=True,
-            # Positive grants only (harness-parity H7): membership grants the
-            # kiro backend directly; every other backend defers to wrap_argv's
-            # own argv-basename detection (None), which is a positive Kiro test
-            # that follows the spawned BINARY — the cli-fronted KAS shape
-            # launches kiro-cli itself (internal sandbox, cannot nest inside
-            # Crew's seatbelt), while the direct Node shape keeps the seatbelt.
-            is_kiro_cli=(True if self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX else None),
+            is_kiro_cli=self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX,
         )
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
@@ -1056,15 +1040,6 @@ class AcpRuntime:
                     "%s not found on PATH; set CLAUDE_CODE_EXECUTABLE for the adapter.",
                     CLAUDE_CODE_BIN,
                 )
-
-        # Parent-level scrub of gateway-owned channel credentials. The default
-        # auto/standard sandbox launcher strips _AGENT_DENIED_ENV_KEYS only for
-        # cc/strict, and this path copies a raw os.environ + wrap_argv (not
-        # sandboxed_spawn_argv), so without this the Slack/WeCom/Telegram tokens
-        # seeded into os.environ by load_credentials() would be inherited by the
-        # agent subprocess on the default tier. Leaves the AWS/SSH env the
-        # standard sandbox intentionally exposes untouched.
-        env = scrub_agent_denied_env(env)
 
         env["PATH"] = augmented_path(env.get("PATH", ""))
 
@@ -1092,6 +1067,12 @@ class AcpRuntime:
                 strip_kiro_cli_api_key(env)
 
         await self._to_thread_guarding_sandbox(_resolve_env_off_loop)
+        # Parent-side equivalent of the launcher scrub. This is required on
+        # Windows where the positively classified Kiro backend delegates to the
+        # CLI's internal sandbox without a POSIX `env -u` wrapper. Do it after
+        # credential-pointer/API-key resolution so no resolver can reintroduce a
+        # denied variable; KIRO_API_KEY itself is intentionally not denied.
+        env = scrub_agent_subprocess_env(env)
         # Positive-identity marker for the orphan sweep: kiro-cli and every MCP
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
@@ -1147,30 +1128,59 @@ class AcpRuntime:
             profile=RLIMIT_PROFILE_SESSION_HOST,
         )
         self._pid = self._process.pid
-        # Windows resource ceiling, applied while the child is still SUSPENDED,
-        # then resumed. No-op on POSIX (CREATE_SUSPENDED is 0 there). This shared
-        # runtime multiplexes many session handles, so an unbounded fork/memory
-        # blowup here takes down every session on it, not just one. Offloaded for
-        # the same reason as in `AcpClient._spawn`: the Windows path reads config
-        # and walks the process and thread tables, and this runtime's event loop
-        # is serving every other session while it spawns.
-        await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(),
-            functools.partial(
-                finish_suspended_spawn, self._process, self._pid, label=f"{KIRO_CLI_BIN} acp"
-            ),
-        )
-        self._start_time = _get_start_time(self._pid)
-        self._spawn_monotonic = time.monotonic()
-        self._last_activity = time.monotonic()
-        if self._scratch_dir is not None:
-            # Liveness anchor for the scratch sweeps: a dir whose recorded
-            # owner is dead is reclaimable. Off-loop (file write), fail-open
-            # (an unowned dir falls under the grace-window rule instead).
+        # The subprocess is LIVE from here on but nothing has recorded it yet, so
+        # this window needs the same guard AcpClient._spawn has. finish_suspended_spawn
+        # documents its own resume failure as FATAL, and _get_start_time can raise;
+        # all four runtime.spawn() callers (providers/acp.py:726, :825 catch
+        # AcpRuntimeError; session.py:1416, :1490 catch AcpRuntimeDead) let anything
+        # else through, so a raise here left a live process absent from both PID
+        # files -- unreachable by every agent-runtime reaper and leaking until the
+        # host reboots. kill() reaps it before we re-raise.
+        #
+        # BaseException so a cancellation mid-window cleans up too. This is the same
+        # guard as the reader/handshake one below; they stay separate blocks because
+        # only the later one has reader/stderr tasks to tear down.
+        try:
+            # Windows resource ceiling, applied while the child is still SUSPENDED,
+            # then resumed. No-op on POSIX (CREATE_SUSPENDED is 0 there). This shared
+            # runtime multiplexes many session handles, so an unbounded fork/memory
+            # blowup here takes down every session on it, not just one. Offloaded for
+            # the same reason as in `AcpClient._spawn`: the Windows path reads config
+            # and walks the process and thread tables, and this runtime's event loop
+            # is serving every other session while it spawns.
             await asyncio.get_running_loop().run_in_executor(
                 subprocess_executor(),
-                functools.partial(agent_scratch.record_owner, self._scratch_dir, self._pid),
+                functools.partial(
+                    finish_suspended_spawn, self._process, self._pid, label=f"{KIRO_CLI_BIN} acp"
+                ),
             )
+            self._start_time = _get_start_time(self._pid)
+            self._spawn_monotonic = time.monotonic()
+            self._last_activity = time.monotonic()
+            if self._scratch_dir is not None:
+                # Liveness anchor for the scratch sweeps: a dir whose recorded
+                # owner is dead is reclaimable. Off-loop (file write), fail-open
+                # (an unowned dir falls under the grace-window rule instead).
+                await asyncio.get_running_loop().run_in_executor(
+                    subprocess_executor(),
+                    functools.partial(agent_scratch.record_owner, self._scratch_dir, self._pid),
+                )
+        except BaseException:
+            logger.error(
+                "AcpRuntime: spawn failed after the process was live (PID %s); reaping it "
+                "so it cannot leak untracked",
+                self._pid,
+                exc_info=True,
+            )
+            try:
+                await self.kill()
+            except Exception:
+                logger.warning(
+                    "AcpRuntime: cleanup reap after a failed spawn did not complete for PID %s",
+                    self._pid,
+                    exc_info=True,
+                )
+            raise
         logger.info(
             "AcpRuntime spawned backend=%s agent=%s (PID %d)",
             self._acp_backend,
@@ -1184,17 +1194,42 @@ class AcpRuntime:
         # A LIVE runtime is already protected during the periodic sweep because
         # AcpSessionProvider._pid feeds _collect_active_pids — this only closes
         # the cross-restart leak.
+        # Shield this shared runtime's PID from the periodic orphan sweep.
+        # _bg_runtime and companion subagent runtimes are held only in
+        # SessionManager instance attributes (not registered sessions /
+        # warm-pool providers), so _collect_active_pids would otherwise
+        # classify them as orphans and SIGKILL them mid-use.
+        #
+        # Ordered BEFORE the two file appends, which is the only ordering that
+        # is safe: register_protected_pid is an in-memory set insert under a
+        # threading lock with no IO, so it cannot fail for the reasons an append
+        # can (ENOSPC, a wedged file lock). Behind the appends it was reachable
+        # only if they both succeeded, so one failed append escalated into a
+        # LIVE runtime losing its shield and being SIGKILLed mid-use by the very
+        # sweep this call exists to hide it from.
+        register_protected_pid(self._pid)
         try:
             _track_pid(self._pid)
             _track_session_pid(self._pid)
-            # Shield this shared runtime's PID from the periodic orphan sweep.
-            # _bg_runtime and companion subagent runtimes are held only in
-            # SessionManager instance attributes (not registered sessions /
-            # warm-pool providers), so _collect_active_pids would otherwise
-            # classify them as orphans and SIGKILL them mid-use.
-            register_protected_pid(self._pid)
         except Exception:
-            logger.debug("AcpRuntime: PID tracking failed for %s", self._pid, exc_info=True)
+            # A runtime that is not in the PID files is unreachable by every
+            # agent-runtime reaper: cleanup_orphaned_sessions,
+            # _periodic_pid_sweep and cleanup_orphaned_session_roots all read
+            # those files, and the /proc orphan scan declines managed agent
+            # runtimes on purpose (session_pid._MANAGED_AGENT_MARKERS is a
+            # negative gate) precisely because this lifecycle is meant to own
+            # them. So the process keeps working, holds hundreds of MB, and
+            # leaks for the rest of the host's uptime.
+            #
+            # ERROR, not debug: this log line is the only signal that will ever
+            # be emitted for that leak. #2985 made a failed PID-file REWRITE
+            # loud for the same reason; this is the append half.
+            logger.error(
+                "AcpRuntime: PID tracking failed for %s — this runtime is now "
+                "invisible to every reaper and will leak until the host reboots",
+                self._pid,
+                exc_info=True,
+            )
 
         # Everything after the subprocess exists must be guarded: if reader
         # startup or the initialize handshake fails (kiro-cli hang / auth stall),

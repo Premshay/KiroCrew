@@ -195,10 +195,10 @@ _PYTHON_ENV_PREFIXES: list[str] = [
 
 # Gateway-owned credentials must never reach agent-influenced subprocesses.
 # This list feeds the cc/strict launcher scrub, the always-on ``scrub_env``
-# parent scrub, and ``scrub_agent_denied_env`` — the parent-level scrub the ACP
-# spawn paths apply on EVERY tier (incl. the default auto/standard tier, whose
-# launcher does not strip these keys). Loader coverage is pinned by regression
-# test.
+# parent scrub, and the narrower ``scrub_agent_denied_env`` compatibility helper.
+# ACP spawn paths use ``scrub_agent_subprocess_env`` so Windows Kiro delegation
+# has the same parent-side scrub as the POSIX sandbox launchers. Loader coverage
+# is pinned by regression test.
 _AGENT_DENIED_ENV_KEYS: list[str] = [
     "SLACK_BOT_TOKEN",
     "SLACK_APP_TOKEN",
@@ -1730,6 +1730,25 @@ def main():
                 "{strict_host_key_opt}"
             )
 
+        # Gradle would otherwise leave a daemon running after this sandboxed
+        # command exits, holding our mount namespace open with the credential
+        # paths still masked, plus the inherited seccomp filter and emptied
+        # capability bounding set. Nothing here changes what Gradle keys its
+        # daemon context on, so a later build OUTSIDE the sandbox matches and
+        # adopts that daemon, silently running under restrictions and a
+        # credential view it never asked for. Keyed on the EFFECTIVE LAST
+        # -Dorg.gradle.daemon= directive rather than on mere presence, because
+        # duplicate -D resolves last-wins: a trailing =true would otherwise
+        # survive, while appending when ours is already last just duplicates.
+        if [
+            _t
+            for _t in os.environ.get("GRADLE_OPTS", "").split()
+            if _t.startswith("-Dorg.gradle.daemon=")
+        ][-1:] != ["-Dorg.gradle.daemon=false"]:
+            os.environ["GRADLE_OPTS"] = (
+                os.environ.get("GRADLE_OPTS", "") + " -Dorg.gradle.daemon=false"
+            ).strip()
+
         # ── Step 5: Drop capabilities + set NO_NEW_PRIVS ──
         # Inside the user namespace, the child has CAP_SYS_ADMIN (owner of the
         # NS) which lets it umount the credential bind-mounts. Drop ALL
@@ -2197,22 +2216,28 @@ def _delegate_to_kiro_internal_sandbox(
     sandbox_level: str,
     *,
     strip_python_env: bool = False,
-) -> tuple[list[str], str | None]:
-    """macOS sandbox mutual exclusion: kiro-cli's internal sandbox owns
-    isolation for this spawn; KiroCrew's seatbelt is skipped.
+) -> tuple[list[str], str | None] | None:
+    """Delegate an explicitly trusted kiro-cli spawn to its internal sandbox.
 
     This is NOT the forbidden silent unsandboxed fallback: the child still
-    runs under an OS sandbox (kiro's own), the delegation is config-driven and
-    deterministic (never a reaction to a wrap failure), it is logged loudly
-    once per process, and every delegated spawn is SEL-audited on an
-    audit-or-deny basis — if the audit event cannot be written, the delegation
-    is refused and the spawn falls back to KiroCrew's own seatbelt. The env
-    scrub is applied exactly as the seatbelt wrap would have applied it.
+    runs under kiro-cli's own sandbox. On macOS the delegation is config-driven
+    mutual exclusion with Kiro Crew's seatbelt; on Windows it is restricted to a
+    positive first-party Kiro backend classification because Kiro Crew has no
+    native OS wrapper there. The decision is deterministic (never a reaction to
+    a wrap failure), logged loudly once per process, and every delegated spawn
+    is SEL-audited on an audit-or-deny basis. If the audit event cannot be
+    written, ``None`` tells the caller to continue through the normal sandbox
+    policy, which fail-closes on Windows.
+
+    The POSIX env scrub is applied inline. Windows has no ``env -u`` launcher,
+    so every production caller must pass :func:`scrub_agent_subprocess_env`'s
+    result as the child environment; regression tests pin those call sites.
 
     Deliberately does NOT resolve the real kiro binary: the launcher shim is
     part of kiro's own sandbox mechanism on this path, so bypassing it here
     would defeat the delegated layer.
     """
+
     global _kiro_delegation_warned
     try:
         # circular import (pre-emptive, layering): sandbox.py is a low-level
@@ -2226,11 +2251,14 @@ def _delegate_to_kiro_internal_sandbox(
             session_key="sandbox",
             agent="system",
             source="sandbox.wrap_argv",
-            tool_name=argv[0] if argv else "unknown",
+            tool_name=_command_log_label(argv),
             tool_kind="subprocess",
             outcome="delegated",
             resources=(
-                "macOS sandbox mutual exclusion: kiro internal sandbox on -> "
+                "Windows Kiro backend delegation: kiro internal sandbox owns "
+                "this spawn; Kiro Crew has no native Windows sandbox backend"
+                if sys.platform == "win32"
+                else "macOS sandbox mutual exclusion: kiro internal sandbox on -> "
                 "KiroCrew seatbelt off for this kiro-cli spawn"
             ),
             # audit-or-deny: written synchronously; a filesystem failure
@@ -2239,30 +2267,28 @@ def _delegate_to_kiro_internal_sandbox(
         )
     except Exception:
         # Fail closed (security-controls): a security delegation that cannot
-        # be audited does not happen. Fall back to KiroCrew's own seatbelt —
-        # the always-safe, audited-by-default layer. If kiro's internal
-        # sandbox is enabled this spawn will then fail with the nested-
-        # sandbox EPERM rather than run unaudited: safety over availability
-        # while SEL is broken.
+        # be audited does not happen. The caller continues through Kiro Crew's
+        # normal policy: macOS gets its seatbelt; Windows, which has no native
+        # backend, raises SandboxUnavailableError rather than run unaudited.
         logger.warning(
             "SEL audit failed for sandbox delegation — refusing unaudited "
-            "delegation; falling back to KiroCrew's seatbelt",
+            "delegation; falling back to Kiro Crew's sandbox policy",
             exc_info=True,
         )
-        return sandbox_exec_argv(argv, sandbox_level, strip_python_env=strip_python_env)
+        return None
     # SEL audit succeeded — delegation is actually proceeding. Only now
     # consume the warn-once flag (a SEL-failed attempt above fell back to
     # seatbelt and must not burn the warning for the first real delegation).
     if not _kiro_delegation_warned:
         _kiro_delegation_warned = True
         logger.warning(
-            "SECURITY: kiro-cli's internal sandbox is enabled (%s) — delegating "
-            "agent isolation to it and skipping KiroCrew's seatbelt for kiro-cli "
-            "spawns (nested seatbelt is impossible on macOS; exactly one layer "
-            "can be active). To use KiroCrew's sandbox instead, set "
-            '{"sandbox": false} in that file. Env scrubbing still applies.',
-            _KIRO_INTERNAL_SETTINGS_PATH,
+            "SECURITY: delegating this %s kiro-cli spawn to kiro-cli's internal "
+            "sandbox and skipping Kiro Crew's OS wrapper. Env scrubbing still "
+            "applies.",
+            "Windows" if sys.platform == "win32" else "macOS",
         )
+    if sys.platform == "win32":
+        return list(argv), None
     unset_args = _sandbox_env_unset_args(sandbox_level, strip_python_env)
     if unset_args:
         return ["env", *unset_args, *argv], None
@@ -2523,10 +2549,10 @@ def configured_sandbox_mode() -> str:
     actually configured. Where ``agent.sandbox`` is an explicit ``"off"`` —
     isolation deferred to kiro-cli's own internal sandbox, which cannot nest
     inside Kiro Crew's (macOS Seatbelt returns EPERM) — a spawn that takes the
-    parameter default asks for a STRICTER tier than the operator configured, and
-    on a host with no backend at all (any Windows host, macOS >= 26)
-    ``wrap_argv`` fail-closes on that request while the main chat path — which
-    passes this value — runs fine.
+    parameter default asks for a STRICTER tier than the operator configured. On
+    a backend-less host an unclassified spawn then fail-closes while a delegated
+    Kiro chat path can run; the reviewed Windows Kiro sites carry explicit
+    classification, but keeping the configured tier remains the cross-platform rule.
 
     Passing the configured value is what keeps a one-shot read from being
     stricter than the long-lived session it accompanies; it can never make it
@@ -2903,6 +2929,37 @@ def _warn_no_isolation(mode: str) -> None:
     )
 
 
+def _command_log_label(argv: list[str]) -> str:
+    """Return a fixed, non-sensitive executable class for diagnostics.
+
+    ``wrap_argv`` is a generic boundary: later argv elements routinely contain
+    user-controlled paths, URLs, and occasionally transport capabilities. Static
+    analysis also correctly treats a list element as able to reach any other
+    element. Never send a value taken from that container to a log or SEL event,
+    even when the runtime expression selects ``argv[0]``. The fixed labels retain
+    enough operational signal without exposing executable paths or arguments.
+    """
+
+    if not argv:
+        return "unknown"
+    name = argv[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    if name == "git":
+        return "git"
+    if name in {"python", "python3", "pythonw", "pythonw3"}:
+        return "python"
+    if name in {"node", "npm", "npx"}:
+        return "node"
+    if name in {"kiro", "kiro-cli", "kirocrew"}:
+        return "kiro"
+    if name in {"bash", "sh", "zsh", "cmd", "powershell", "pwsh"}:
+        return "shell"
+    if name in {"env", "bwrap", "sandbox-exec", "systemd-run"}:
+        return "sandbox-helper"
+    return "other"
+
+
 def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
     """Emit a once-per-process SECURITY warning when mode='off' results in
     no OS-level isolation and no verified delegation.
@@ -2918,7 +2975,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             logger.info(
                 "agent.sandbox='off' with no active delegation; operator opted "
                 "in via sandbox_allow_no_isolation. Command: %s",
-                argv[0] if argv else "unknown",
+                _command_log_label(argv),
             )
         return
 
@@ -2937,7 +2994,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "security.py checks remain. Set agent.sandbox='auto' or enable "
             "kiro-cli's internal sandbox to restore OS-level confinement. "
             "Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     elif sys.platform.startswith("linux"):
         if "linux" in _warned_set:
@@ -2950,7 +3007,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "secrets are readable by it and only the bypassable app-level "
             "security.py checks remain. Set agent.sandbox='auto' to engage "
             "namespace isolation. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     elif sys.platform == "win32":
         if "win32" in _warned_set:
@@ -2960,7 +3017,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "SECURITY: agent.sandbox='off' on Windows — no OS-level sandbox "
             "backend exists on this platform. The agent subprocess runs with "
             "full filesystem access. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     else:
         if "other" in _warned_set:
@@ -2970,7 +3027,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "SECURITY: agent.sandbox='off' for a non-kiro-cli subprocess — "
             "running without OS-level confinement. Set agent.sandbox='auto' "
             "to engage seatbelt isolation. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
 
     _warn_mode_off_unconfined._warned_set = _warned_set  # type: ignore[attr-defined]
@@ -2994,7 +3051,7 @@ def _warn_first_party_unconfined_once(argv: list[str]) -> None:
         "Hostile-input spawn paths are unaffected: they keep failing closed "
         "and still require agent.sandbox_allow_unsandboxed_exec=true. "
         "Command: %s",
-        argv[0] if argv else "unknown",
+        _command_log_label(argv),
     )
 
 
@@ -3031,7 +3088,7 @@ def _first_party_no_backend_passthrough(
             session_key="sandbox",
             agent="system",
             source="sandbox.wrap_argv",
-            tool_name=argv[0] if argv else "unknown",
+            tool_name=_command_log_label(argv),
             tool_kind="subprocess",
             outcome="unconfined",
             resources="first-party fixed argv, no sandbox backend (issue #1563 carve-out)",
@@ -3042,7 +3099,7 @@ def _first_party_no_backend_passthrough(
             "unaudited: the argv is package-derived and denying the spawn "
             "would brick built-in tooling whenever SEL hiccups (matches the "
             "mode=off delegation posture). Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
             exc_info=True,
         )
     # Same env scrub as the seatbelt / delegation paths, via the trusted
@@ -3267,6 +3324,8 @@ def wrap_argv(
         is_kiro_cli: Explicit executable classification for descriptor-backed
             Kiro snapshots whose launch path no longer has a ``kiro-cli``
             basename. ``None`` retains basename detection for other callers.
+            Windows internal-sandbox delegation requires this to be exactly
+            ``True``; basename inference can never grant that exception.
         first_party_fixed_argv: True ONLY for spawns whose full argv is derived
             inside this package with zero agent/repo/user-config influence;
             every passing site must be allowlisted in
@@ -3287,7 +3346,8 @@ def wrap_argv(
     Raises:
         RuntimeError: When no sandbox backend is available, mode is not "off",
             ``agent.sandbox_allow_unsandboxed_exec`` is False (default), and
-            the first-party carve-out above does not apply.
+            neither the first-party carve-out nor the explicitly classified
+            Windows Kiro internal-sandbox delegation applies.
             This is the fail-closed behavior — the agent subprocess is NOT
             allowed to run without OS-level isolation unless explicitly opted in.
     """
@@ -3326,7 +3386,7 @@ def wrap_argv(
                     session_key="sandbox",
                     agent="system",
                     source="sandbox.wrap_argv",
-                    tool_name=argv[0] if argv else "unknown",
+                    tool_name=_command_log_label(argv),
                     tool_kind="subprocess",
                     outcome="delegated",
                     resources=(
@@ -3343,7 +3403,7 @@ def wrap_argv(
                 logger.warning(
                     "SECURITY: SEL audit failed for mode=off delegation; "
                     "proceeding with env scrub but no seatbelt. Command: %s",
-                    argv[0] if argv else "unknown",
+                    _command_log_label(argv),
                     exc_info=True,
                 )
             unset_args = _sandbox_env_unset_args("standard", strip_python_env)
@@ -3402,7 +3462,7 @@ def wrap_argv(
                 "Applying the stricter tier's env scrub to the passthrough.",
                 requested_level,
                 active_level,
-                argv[0] if argv else "unknown",
+                _command_log_label(argv),
             )
         # Emit an SEL audit event for this security-relevant passthrough so the
         # decision to spawn without a *fresh* wrap is tamper-evidently recorded,
@@ -3433,7 +3493,7 @@ def wrap_argv(
                 session_key="sandbox",
                 agent="system",
                 source="sandbox.wrap_argv",
-                tool_name=argv[0] if argv else "unknown",
+                tool_name=_command_log_label(argv),
                 tool_kind="subprocess",
                 outcome="allowed",
                 metadata={
@@ -3506,24 +3566,40 @@ def wrap_argv(
     # allow-all outer profile), so exactly one layer can own isolation. When
     # kiro's internal sandbox is enabled, it is that layer for kiro-cli spawns;
     # KiroCrew's sandbox stays on for everything else and whenever kiro's is off.
-    # Checked before backend detection so delegation also applies where our own
-    # probe found no backend. macOS only — Linux namespace isolation is
-    # unaffected.
+    # Windows has no Kiro Crew OS sandbox backend. Official Kiro ACP spawns are
+    # positively classified by their reviewed callers and delegate to Kiro's
+    # built-in sandbox by default; basename inference is deliberately
+    # insufficient to grant this exception. All other Windows spawns retain the
+    # no-backend fail-closed path. Checked before backend detection so this is a
+    # deterministic capability decision, never a fallback after a probe failure.
+    # Linux namespace isolation is unaffected.
     kiro_spawn = _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
-    if sys.platform == "darwin" and kiro_spawn and kiro_internal_sandbox_enabled():
+    delegate_to_kiro = (
+        sys.platform == "darwin" and kiro_spawn and kiro_internal_sandbox_enabled()
+    ) or (sys.platform == "win32" and is_kiro_cli is True)
+    if delegate_to_kiro:
         if extra_hidden_dirs or extra_visible_dirs:
             # A delegated sandbox cannot enforce KiroCrew-specific path hides.
-            # Keep the outer seatbelt for callers that require extra isolation.
-            return sandbox_exec_argv(
-                argv,
-                sandbox_level,
-                strip_python_env=strip_python_env,
-                extra_hidden_dirs=extra_hidden_dirs,
-                extra_visible_dirs=extra_visible_dirs,
+            # macOS keeps the outer seatbelt. Windows falls through to its
+            # no-backend policy and fail-closes unless explicitly opted in.
+            if sys.platform == "darwin":
+                return sandbox_exec_argv(
+                    argv,
+                    sandbox_level,
+                    strip_python_env=strip_python_env,
+                    extra_hidden_dirs=extra_hidden_dirs,
+                    extra_visible_dirs=extra_visible_dirs,
+                )
+        else:
+            delegated = _delegate_to_kiro_internal_sandbox(
+                argv, sandbox_level, strip_python_env=strip_python_env
             )
-        return _delegate_to_kiro_internal_sandbox(
-            argv, sandbox_level, strip_python_env=strip_python_env
-        )
+            if delegated is not None:
+                return delegated
+            if sys.platform == "darwin":
+                # Preserve macOS's audit-failure fallback: once delegation is
+                # refused, Kiro Crew's own seatbelt remains the safe owner.
+                return sandbox_exec_argv(argv, sandbox_level, strip_python_env=strip_python_env)
 
     backend = detect_backend(config_mode=mode)
 
@@ -3724,7 +3800,7 @@ def wrap_argv(
                     session_key="sandbox",
                     agent="system",
                     source="sandbox.wrap_argv",
-                    tool_name=argv[0] if argv else "unknown",
+                    tool_name=_command_log_label(argv),
                     tool_kind="subprocess",
                     outcome="denied",
                     error=(f"{sel_reason} (probe: {probe_reason})"),
@@ -3813,6 +3889,18 @@ def scrub_agent_denied_env(env: dict[str, str]) -> dict[str, str]:
     return {
         k: v for k, v in env.items() if not any(k.startswith(p) for p in _AGENT_DENIED_ENV_KEYS)
     }
+
+
+def scrub_agent_subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return the full environment scrub required for a Kiro/ACP child.
+
+    This is the parent-side equivalent of the OS launchers' sensitive-variable
+    removal plus ``strip_python_env=True``. It is mandatory for Windows Kiro
+    delegation because Windows cannot express the POSIX ``env -u`` prefix, and
+    keeping it on every platform makes delegated and wrapped ACP spawns inherit
+    the same environment policy.
+    """
+    return scrub_env(env, extra_prefixes=_PYTHON_ENV_PREFIXES)
 
 
 def sandboxed_spawn_argv(

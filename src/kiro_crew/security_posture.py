@@ -627,6 +627,51 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "paths) at this egress before the renderer posts it.",
     ),
     (
+        "Telegram rendered-form seal",
+        "telegram/renderer.py",
+        "Every text this channel posts, scanned against the form Telegram RENDERS "
+        "rather than the bytes sent. The TurnDriver's stream scan runs before this "
+        "renderer introduces any markup, so it cannot see a credential the markup "
+        "then reassembles: `AKIA**...**` matches nothing at the byte level, and "
+        "`_md_to_telegram_html` turns it into `AKIA<b>...</b>`, which the client "
+        "displays as an intact key. A link and a zero-width character between the "
+        "halves do the same. Both live-frame and seal run "
+        "`display_safety.redact_for_display` ahead of any tag being introduced, "
+        "covering the HTML, Rich-Message and plaintext branches at once; the "
+        "reasoning blockquote and the restored upload markup run it too.",
+    ),
+    (
+        "Recent-sessions read audit",
+        "messaging/sessions_view.py",
+        "The exception text recorded when the collector fails to read the sessions "
+        "directory, which goes into a SEL audit record every surface's session list "
+        "shares. The message is filesystem error text and can quote a path or an "
+        "environment value, so it is redacted before truncation — truncating first "
+        "would let a cut split a credential pattern out of the matcher's reach.",
+    ),
+    (
+        "LLM-generated session title",
+        "messaging/auto_title.py",
+        "The 3-6 word title a background turn proposes for a session. The model "
+        "writes it FROM the conversation, so it can quote a credential or a beacon "
+        "URL the user pasted, and the title then lands in three places at once — "
+        "the conversation log, the channel's own thread/chat title, and the "
+        "dashboard sidebar. Redacted here, before the cap, because the cap is what "
+        "would otherwise split a credential pattern out of the matcher's reach; and "
+        "here rather than at each caller, because a title reaching one surface "
+        "unredacted is the whole failure.",
+    ),
+    (
+        "Channel keyword-command replies",
+        "messaging/commands.py",
+        "The reply text of the path-independent chat commands — a cron job's name, "
+        "schedule and message, a subagent's task, a task-runner spec path and a "
+        "start failure. Each is free-form text a user typed or the agent proposed, "
+        "and every reply is posted to a channel AND persisted to the conversation "
+        "log, so the credential + exfiltration-URL pair runs before the string "
+        "leaves the module rather than at each channel's own boundary.",
+    ),
+    (
         "Discord session-resume replay",
         "discord/session_resume.py",
         "Session titles in the `!sessions` picker and the transcript replayed when a "
@@ -693,6 +738,23 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "ZWSP insertion is itself a post-scan transformation. Enforced at this sink "
         "rather than per renderer for the same reason the max_buttons cap lives in "
         "shared code: a channel cannot forget what it does not call.",
+    ),
+    (
+        "Webex delivery",
+        "webex/renderer.py",
+        "The Webex DELIVERY boundary. Webex renders markdown, so it reassembles a "
+        "credential the driver's literal-byte scan of the provider stream could "
+        "not match contiguously (`AKIA**IOSF**ODNN7EXAMPLE`, a link target broken "
+        "by emphasis) -- and this channel adds two egress paths of its own that "
+        "carry the same text: the numbered `[OPTIONS:]` fallback posted when an "
+        "Adaptive Card send fails, and the local-path references restored when an "
+        "upload fails. The final answer is therefore re-scanned through "
+        "redact_for_display (messaging/display_safety.py) on the DISPLAYED form, "
+        "with the same redactor pair TurnDriver streams through. Deliberately "
+        "without the mention defang the shared `display_safe` adds: that "
+        "neutralizes `@everyone`-style broadcast grammars, Webex has none, and "
+        "this channel's allow-list is email addresses -- so defanging would mangle "
+        "every address the agent legitimately prints.",
     ),
     (
         "iMessage delivery",
@@ -954,6 +1016,18 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "written into the archive.",
     ),
     (
+        "Connections L1 smoke report",
+        "connections/l1_smoke.py",
+        "The authorized-grant sweep's JSON verdict report: written to disk by "
+        "`_persist_report`, echoed to stdout by `_echo`, and uploaded by the "
+        "nightly lane as a build artifact — so it reaches CI logs and every "
+        "reader of the repository, not just the operator who ran it. The "
+        "credential-bearing part is the provider's own error text, scrubbed by "
+        "`redact_mcp_error` as it enters a verdict row (both site-wide scanners "
+        "plus the configured header-value pass), at the write rather than at a "
+        "read, because the report outlives the process that made it.",
+    ),
+    (
         "Tag definitions (HTTP + auto-tag)",
         "dashboard/chat_tags.py",
         "Tag names supplied by both the POST /api/chat/tags HTTP handler and the "
@@ -983,6 +1057,21 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "`pii: True` marker is a separate Aperture disclosure flag, not a "
         "substitute for redaction. `rating` (a fixed frontend enum) is not run "
         "through this pass.",
+    ),
+    (
+        "Auto Triage Pipeline dashboard strings",
+        "apps/builtins/auto_triage_pipeline/backend/pipeline_fold.py",
+        "Every string this read-only fold hands to its routes -- issue titles, "
+        "assignee and author logins, labels, event names, slot keys -- funnels "
+        "through one `_printable` helper before serialization, and the routes render "
+        "it in the dashboard. The titles and labels are NOT our text: they come from "
+        "the forge, where any user can open an issue and write anything in the "
+        "title, so this is a dashboard-bound sink for attacker-controlled text. "
+        "`_printable` runs the shared credential + exfiltration-URL chain FIRST, "
+        "then neutralizes control and bidirectional-override characters, and "
+        "truncates LAST -- redaction has to precede truncation, because cutting "
+        "first can split a credential so only its tail is left to match and the head "
+        "survives into the output.",
     ),
 )
 
@@ -1041,6 +1130,15 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "imessage/client.py",
         "imessage/transport.py",
         "imessage/transport_dispatch.py",
+        # The tool-permission prompt and its SEL record. Neither crosses a
+        # machine boundary: the prompt is written to the operator's OWN terminal
+        # in their own process, and the audit line goes to the local SEL log. The
+        # scrubbing there is targeted hygiene — a credential the model echoed
+        # into a tool title must not be copied into the audit record, and
+        # `log_tool_invocation` does not redact for its callers — not an egress
+        # pass. Local paths are deliberately NOT redacted in the prompt, because
+        # seeing the real path is part of what the operator is consenting to.
+        "cli_chat.py",
         "acp/_dispatch.py",
         "acp/client.py",
         # Redacts the tool title in the auto-rejected-permission WARNING (a

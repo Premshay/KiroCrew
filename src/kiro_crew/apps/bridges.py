@@ -1337,6 +1337,8 @@ def _cron_defs_from_manifest(
                 "persistent_session": cron.persistent_session,
                 "silent": cron.silent,
                 "enabled": cron.enabled,
+                "timezone": cron.timezone,
+                "skip_dates": cron.skip_dates,
             }
         )
         registered.append(namespaced)
@@ -1374,14 +1376,51 @@ def _deregister_crons(app_name: str) -> int:
 
 
 def load_app_cron_defs(app_name: str) -> list[dict[str, Any]]:
-    """Load persisted cron definitions for an app (used by CronService bridge)."""
+    """Load persisted cron definitions for an app (used by CronService bridge).
+
+    The return type is a promise to the caller, so it is enforced rather than
+    assumed. ``app-crons.json`` lives in the app's INSTALL directory, which is
+    ordinary user-writable state -- a hand-edit, a partial restore, or an app
+    that writes its own file can leave valid JSON that is not a list of
+    objects. That parses cleanly, so catching ``JSONDecodeError`` does not see
+    it, and the value flows into ``register_app_crons_with_service``'s
+    ``for d in defs: d.get("name", "")`` -- which raises ``AttributeError`` on
+    a string (iterating a JSON object yields its keys) and ``TypeError`` on a
+    scalar, from OUTSIDE the per-job ``try`` that makes one bad cron skippable.
+
+    Two levels, because they fail differently:
+
+    - a non-list top level is the whole file being wrong, and is treated
+      exactly like the unreadable case above -- no definitions, app enables
+      without crons.
+    - a non-object ENTRY is one bad row among good ones, and is skipped the
+      way an entry whose registration raises already is, so the remaining
+      crons still register.
+    """
     path = _app_crons_path(app_name)
     if not path.is_file():
         return []
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return []
+    if not isinstance(data, list):
+        logger.warning(
+            "App %s: cron manifest %s is not a JSON array (%s); ignoring it",
+            app_name,
+            path,
+            type(data).__name__,
+        )
+        return []
+    defs = [entry for entry in data if isinstance(entry, dict)]
+    if len(defs) != len(data):
+        logger.warning(
+            "App %s: cron manifest %s has %d entry/entries that are not JSON objects; skipping them",
+            app_name,
+            path,
+            len(data) - len(defs),
+        )
+    return defs
 
 
 async def register_app_crons_with_service(app_name: str, cron_service: Any) -> list[str]:
@@ -1500,6 +1539,12 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
                 persistent_session=d.get("persistent_session", False),
                 silent=bool(d.get("silent", False)),
                 enabled=bool(d.get("enabled", True)),
+                # An empty timezone resolves to the config zone and then to UTC
+                # at fire time, so a manifest that pins an hour meaningful only
+                # in one zone must have it threaded here, not corrected by a
+                # second write after the job already exists.
+                timezone=d.get("timezone") or "",
+                skip_dates=d.get("skip_dates") or None,
             )
             if job is None:
                 # Lost the race (or already present): another registrar

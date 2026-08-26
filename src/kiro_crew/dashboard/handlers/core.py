@@ -23,7 +23,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
-from kiro_crew import beacon, platform_compat
+from kiro_crew import beacon, dep_sync, platform_compat
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES_LIMIT
 from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREENSHOT_MAX_PX
@@ -46,7 +46,6 @@ from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.executors import discovery_executor
 from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
-from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.transcribe import BREW_PATH_DIRS, ensure_ffmpeg_in_path, find_brew, is_available
 
 logger = logging.getLogger(__name__)
@@ -54,6 +53,17 @@ logger = logging.getLogger(__name__)
 _STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 _DIST_DIR = _STATIC_DIR / "dist"
 _DIST_INDEX = _DIST_DIR / "index.html"
+# mtime-keyed cache of the SPA shell HTML.  Each request stat()s _DIST_INDEX
+# (cheap) and re-reads the file only when its mtime_ns differs from the cached
+# key, so a Vite rebuild that rewrites index.html (new hashed asset refs) is
+# picked up on the very next request WITHOUT a gateway restart — the cache
+# never pins a pre-rebuild shell.  A missing-then-present bundle also self-heals
+# because a FileNotFoundError is never cached.  The stat replaces a full
+# read_text of the bundle on the hot path, which is the win.
+# SECURITY CONTRACT: the cached value must stay ``None`` or equal the static,
+# secret-free bundle — never inject per-request/dynamic data.  Pinned by
+# test_served_shell_is_auth_independent.
+_INDEX_HTML_CACHE: tuple[int, str] | None = None
 _SSE_INTERVAL_SECS = 5
 
 # Sentinel returned in place of sensitive config values in API responses. Kept
@@ -147,6 +157,29 @@ def _sel():
 # ── Page ──
 
 
+def _resolve_index_html() -> str:
+    """Return the SPA shell HTML, using the mtime-keyed cache.
+
+    Runs entirely in a worker thread (see ``index``): performs the blocking
+    ``stat()`` and, only on first load or after a rebuild changed the mtime, the
+    blocking ``read_text()``. A ``FileNotFoundError`` returns the static fallback
+    and is never cached, so a transiently-absent dist self-heals on the next
+    request (e.g. after a dev build). SECURITY CONTRACT: the cached value is
+    solely the on-disk bundle — never per-request/dynamic data.
+    """
+    global _INDEX_HTML_CACHE
+    try:
+        mtime = _DIST_INDEX.stat().st_mtime_ns
+        cached = _INDEX_HTML_CACHE
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        html = _DIST_INDEX.read_text(encoding="utf-8")
+        _INDEX_HTML_CACHE = (mtime, html)
+        return html
+    except FileNotFoundError:
+        return _DASHBOARD_HTML_NOT_FOUND
+
+
 async def index(request: web.Request) -> web.Response:
     """Serve the React dashboard SPA shell (``static/dist/index.html``).
 
@@ -165,10 +198,16 @@ async def index(request: web.Request) -> web.Response:
     would leak it across the auth boundary. Keep dynamic data behind gated
     ``/api/*`` routes. Pinned by test_served_shell_is_auth_independent.
     """
-    try:
-        html = _DIST_INDEX.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        html = _DASHBOARD_HTML_NOT_FOUND
+    # Resolve the shell entirely off the event loop: the stat() + conditional
+    # read_text() are the only blocking calls, and even a bare stat() can stall
+    # the loop on slow/network-backed storage. Route through the dedicated
+    # discovery_executor rather than the shared default thread pool: index() is
+    # served UNAUTHENTICATED on the cold-start path, so a remote SPA GET flood on
+    # slow storage must not be able to saturate the pool other gateway work
+    # (DNS, etc.) depends on. The mtime cache still serves repeat requests
+    # without a read.
+    loop = asyncio.get_running_loop()
+    html = await loop.run_in_executor(discovery_executor(), _resolve_index_html)
     return web.Response(text=html, content_type="text/html")
 
 
@@ -882,32 +921,35 @@ def _find_suitable_python() -> str | None:
     passed as the ``reject`` predicate so the resolver FALLS THROUGH to the next
     candidate when one fails them, rather than giving up: a free-threaded/pip-less
     interpreter winning the name race must not mask a usable later one.
+
+    Both probes run through :func:`dep_sync._probe_interpreter` (``-I``, neutral
+    cwd) because this predicate picks the INSTALL TARGET: each answer must
+    describe the candidate interpreter itself, never the process asking.
+    Unisolated children inherit ``PYTHONPATH`` and take the caller's CWD as
+    ``sys.path[0]``, so a ``sitecustomize.py`` on either route can edit
+    ``sys.version`` — vetoing every candidate or waving a genuinely
+    free-threaded build through — and probing pip with ``-m pip`` would IMPORT
+    AND EXECUTE whatever ``pip`` those routes resolve, running planted code and
+    forging the verdict at once. ``find_spec`` under ``-I`` answers "does this
+    interpreter's own site-packages have pip" without executing it.
     """
 
     def _unusable(p: str) -> bool:
         # True => skip this interpreter and keep searching. A probe failure
-        # (can't even run it) also counts as unusable.
+        # (non-zero exit, timeout, unrunnable interpreter) also counts as
+        # unusable: _probe_interpreter reports a failed child via returncode
+        # rather than raising, so translate that explicitly — falling through
+        # would hand the STT installer a pip-less interpreter.
         try:
-            # PYTHONIOENCODING pins the CHILD's emit side: piped stdout on
-            # Windows otherwise re-encodes with the ANSI code page, which the
-            # UTF-8 decode below cannot undo.
-            child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-            ver = subprocess.check_output(
-                [p, "-c", "import sys; print(sys.version)"],
-                timeout=5,
-                env=child_env,
-                **UTF8_TEXT,
-            )
-            if "free-threading" in ver:
+            ver = dep_sync._probe_interpreter(Path(p), "import sys; print(sys.version)", timeout=5)
+            if ver.returncode != 0 or "free-threading" in ver.stdout:
                 return True
-            subprocess.check_output(
-                [p, "-m", "pip", "--version"],
+            pip = dep_sync._probe_interpreter(
+                Path(p),
+                "import importlib.util as u; raise SystemExit(0 if u.find_spec('pip') else 1)",
                 timeout=5,
-                stderr=subprocess.DEVNULL,
-                env=child_env,
-                **UTF8_TEXT,
             )
-            return False
+            return pip.returncode != 0
         except Exception:
             return True
 
@@ -1201,7 +1243,9 @@ echo "Done. whisper=$(command -v whisper 2>/dev/null || echo 'check PATH') ffmpe
 async def api_stt_transcribe(request: web.Request) -> web.Response:
     """POST /api/stt/transcribe — transcribe uploaded audio via whisper."""
     import tempfile  # noqa: F811
+    import uuid
 
+    from kiro_crew.dashboard import part_stream
     from kiro_crew.transcribe import is_available, transcribe_audio  # noqa: F811
 
     if not is_available():
@@ -1215,19 +1259,19 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
     # Use uploaded filename extension (recording.webm / .mp4 / .ogg)
     fname = getattr(field, "filename", None) or "recording.webm"
     ext = os.path.splitext(fname)[1] or ".webm"
-    fd, tmp = tempfile.mkstemp(suffix=ext)
+    # A fresh unpublished path: stream_part_to_file writes to a sibling temp
+    # off the event loop and publishes here atomically, so no exit path (413,
+    # backend failure, cancellation) can leave a partial file at this name.
+    tmp = os.path.join(tempfile.gettempdir(), f"kc_stt_{uuid.uuid4().hex}{ext}")
     try:
-        os.close(fd)
-        size = 0
-        with open(tmp, "wb") as f:
-            while True:
-                chunk = await field.read_chunk(8192)  # type: ignore[union-attr]
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > 25 * 1024 * 1024:  # 25 MB cap
-                    return web.json_response({"error": "audio too large"}, status=413)
-                f.write(chunk)
+        try:
+            await part_stream.stream_part_to_file(
+                field,  # type: ignore[arg-type]
+                Path(tmp),
+                max_bytes=25 * 1024 * 1024,
+            )
+        except part_stream.PartTooLarge:
+            return web.json_response({"error": "audio too large"}, status=413)
 
         text = await transcribe_audio(tmp)
         if text:
@@ -1715,6 +1759,17 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
         "validate_fn": _validate_role_model,
     },
+    # Throttle-exhaustion fallback model. Single value: "auto" (default) defers
+    # to the backend's availability-aware routing; a concrete id is tried first
+    # with "auto" as the final fallthrough; "" disables the feature. Same
+    # grammar + entitlement validation as the role-model pins ("" / "auto"
+    # always allow), so the dropdown and the wire cannot disagree.
+    "agent.fallback_model": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "validate_fn": _validate_role_model,
+    },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
     # Per-role reasoning effort, paired with role_models. Same enum as the chat
     # default; "" = inherit. Applies only on reasoning-capable models.
@@ -1755,6 +1810,21 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "auto_update": {"type": "bool"},
     "dashboard.mcp_probe_timeout_secs": {"type": "int", "min": 5, "max": 120},
     "dashboard.recent_tint_count": {"type": "int", "min": 0, "max": 10},
+    # Per-version snooze/skip verdict for the proactive update popup, written
+    # as ONE atomic record: the three fields only mean anything together, so
+    # per-field writes would open both a crash window (old verdict paired
+    # with a new version) and a two-client interleave that reassembles a
+    # verdict nobody expressed. Persisted in gateway config (not browser
+    # storage) so the decision holds across browsers and the desktop app's
+    # embedded dashboard.
+    "dashboard.update_nudge": {
+        "type": "dict",
+        "keys": {
+            "version": {"type": "str", "max_len": 128},
+            "snoozed_until": {"type": "float", "min": 0.0, "max": 4102444800.0},
+            "skipped": {"type": "bool"},
+        },
+    },
     # Default shell for the built-in terminal panel (Settings → Display →
     # Terminal). "" = unset, use $SHELL / the platform default. The executable
     # check lives as an off-loop special case in the PATCH handler (a PATH
@@ -2002,6 +2072,54 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             reason = validate_fn(value, request)
             if reason:
                 return _deny(reason, f"{path_key}={value}")
+    elif spec["type"] == "dict":
+        # One-level record written ATOMICALLY as a single value, for settings
+        # where multiple scalar fields form one verdict and a partial write is
+        # itself the bug (e.g. the update popup's version+snooze+skip record).
+        # Strict by design: every declared key present, no undeclared keys,
+        # each value validated against its scalar subspec — so this cannot
+        # become a generic JSON passthrough.
+        if not isinstance(value, dict):
+            return _deny("must be an object", f"{path_key}={value}")
+        keys_spec = spec["keys"]
+        unknown = set(value) - set(keys_spec)
+        if unknown:
+            return _deny(f"unknown key(s): {sorted(unknown)}", f"{path_key}={value}")
+        missing = set(keys_spec) - set(value)
+        if missing:
+            return _deny(f"missing key(s): {sorted(missing)}", f"{path_key}={value}")
+        validated: dict = {}
+        for sub_key, sub_spec in keys_spec.items():
+            sub_val = value[sub_key]
+            if sub_spec["type"] == "str":
+                if not isinstance(sub_val, str):
+                    return _deny(f"{sub_key} must be a string", f"{path_key}={value}")
+                if len(sub_val) > sub_spec.get("max_len", 256):
+                    return _deny(
+                        f"{sub_key} must be at most {sub_spec.get('max_len', 256)} characters",
+                        f"{path_key}={value}",
+                    )
+            elif sub_spec["type"] == "bool":
+                if not isinstance(sub_val, bool):
+                    return _deny(f"{sub_key} must be a boolean", f"{path_key}={value}")
+            elif sub_spec["type"] == "float":
+                # bool is an int subclass; refuse it before coercion so
+                # `true` cannot silently store 1.0.
+                if isinstance(sub_val, bool):
+                    return _deny(f"{sub_key} must be a number", f"{path_key}={value}")
+                try:
+                    sub_val = float(sub_val)
+                except (TypeError, ValueError):
+                    return _deny(f"{sub_key} must be a number", f"{path_key}={value}")
+                if not math.isfinite(sub_val):
+                    return _deny(f"{sub_key} must be a finite number", f"{path_key}={value}")
+                lo, hi = sub_spec.get("min", 0.0), sub_spec.get("max", 999999.0)
+                if sub_val < lo or sub_val > hi:
+                    return _deny(f"{sub_key} must be between {lo} and {hi}", f"{path_key}={value}")
+            else:
+                return _deny("unsupported config type", f"{path_key}={value}", 500)
+            validated[sub_key] = sub_val
+        value = validated
     else:
         return _deny("unsupported config type", f"{path_key}={value}", 500)
 
@@ -2160,6 +2278,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         for slot in state._slots.values():
             if slot.model:
                 slot.model = ""
+                # Deliberate model change: bump the pick generation so the
+                # fallback restore probe drops any sticky state instead of
+                # restoring a model id from the previous provider.
+                slot._model_pick_gen += 1
         state.push_slots_update()
         logger.info(
             "Provider switched to %s — config rebuilt, factory reloaded, slot models cleared", value

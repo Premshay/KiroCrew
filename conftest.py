@@ -13,7 +13,7 @@ test collected from any testpath, because what they protect is the
 developer's machine rather than the correctness of one suite. Everything that is
 merely suite-specific isolation stays in ``test/conftest.py``.
 
-The floor has five parts, and each one exists because the "remember to isolate
+The floor has six parts, and each one exists because the "remember to isolate
 this" contract failed at least once:
 
 * **Services.** ``$XDG_CONFIG_HOME`` is redirected and the stdlib spawn funnels
@@ -25,6 +25,10 @@ this" contract failed at least once:
   under ``src/kiro_crew/apps/builtins/*/tests/`` -- which see this conftest and no
   other -- write the operator's live ``~/.kiro/crew`` the moment they touch
   ``config_dir()``.
+* **Credential environment.** Recognised fixed credentials and validated
+  ``JIRA_TOKEN_<HEX>`` keys are restored after every test, so a fabricated
+  ``.env`` cannot silently override the next test's credentials in the same
+  worker.
 * **The agent-spec home.** ``kiro_agents_dir()`` is a LAZY resolver, so neither of
   the two above reaches it, and a test that reaches the spec write path rewrites
   the machine-wide ``<kiro home>/agents/kirocrew.json`` -- the file that decides
@@ -97,6 +101,32 @@ import threading
 import warnings
 
 import pytest
+
+
+def _root_can_create_real_symlink() -> bool:
+    """Probe real-link capability for tests collected outside ``test/`` too.
+
+    Ordinary Windows shells commonly lack ``SeCreateSymbolicLinkPrivilege``.
+    This is a capability probe, not an OS guess: Developer Mode/elevated Windows
+    runners retain the security coverage, while only the exact tests inventoried
+    in ``test/requires-real-symlinks.txt`` skip on an incapable host.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "target")
+        os.mkdir(target)
+        try:
+            os.symlink(
+                target,
+                os.path.join(tmp, "link"),
+                target_is_directory=True,
+            )
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+        return True
+
+
+_ROOT_HAS_REAL_SYMLINKS = _root_can_create_real_symlink()
+
 
 #: Service managers whose *mutating* subcommands reconfigure, start, or stop a
 #: real service. Matched on BASENAME against every token of the argv, not just
@@ -384,20 +414,27 @@ def _no_credential_env_residue():
     token from one file's temp ``.env`` silently satisfied the other's assertion,
     and only when both landed in the same worker.
 
-    Bounded to the recognised credential keys, so this is two dict passes over
-    ~20 names per test and cannot mask an unrelated environment change.
+    Bounded to the recognised fixed keys and the validated ``JIRA_TOKEN_<HEX>``
+    shape. Two linear environment scans per test also catch a dynamic key that
+    did not exist at setup, without masking an unrelated environment change.
     """
-    from kiro_crew.config.loader import _CREDENTIAL_KEYS
+    from kiro_crew.config.loader import _CREDENTIAL_KEYS, _JIRA_TOKEN_RE
 
-    before = {key: os.environ.get(key) for key in _CREDENTIAL_KEYS}
+    fixed = frozenset(_CREDENTIAL_KEYS)
+
+    def _is_credential(key: str) -> bool:
+        return key in fixed or _JIRA_TOKEN_RE.match(key) is not None
+
+    before = {key: value for key, value in os.environ.items() if _is_credential(key)}
     try:
         yield
     finally:
-        for key, value in before.items():
-            if value is None:
+        current = {key for key in os.environ if _is_credential(key)}
+        for key in current | before.keys():
+            if key not in before:
                 os.environ.pop(key, None)
             else:
-                os.environ[key] = value
+                os.environ[key] = before[key]
 
 
 @pytest.fixture(autouse=True)
@@ -922,6 +959,92 @@ def _restore_log_record_factory():
         logging.setLogRecordFactory(before)
 
 
+# ── logger levels go back after every test ──────────────────────────
+
+
+#: What a logger nobody has configured looks like. ``logging.getLogger(name)`` builds
+#: exactly this, so a name MISSING from the "before" snapshot restores to it rather than
+#: being passed over -- otherwise a test that creates a logger and configures it leaks
+#: through the one gap a snapshot cannot see.
+_PRISTINE_LOGGER: tuple[int, bool] = (logging.NOTSET, False)
+
+
+def _logger_levels() -> dict[str, tuple[int, bool]]:
+    """``(level, disabled)`` for the root logger and every logger by name.
+
+    ``loggerDict`` also holds ``PlaceHolder`` entries for the un-instantiated middle of a
+    dotted name; those carry no level and are skipped. The root logger is not in it at
+    all, so it is added under ``""`` -- the name ``logging.getLogger`` maps back to it.
+    """
+    snapshot: dict[str, tuple[int, bool]] = {
+        name: (obj.level, obj.disabled)
+        for name, obj in list(logging.Logger.manager.loggerDict.items())
+        if isinstance(obj, logging.Logger)
+    }
+    root = logging.getLogger()
+    snapshot[""] = (root.level, root.disabled)
+    return snapshot
+
+
+@pytest.fixture(autouse=True)
+def _restore_logger_levels():
+    """Put every logger's level and ``disabled`` flag back after each test.
+
+    A level is PROCESS-GLOBAL and HIERARCHICAL, which together are what make a leak here
+    so hard to attribute: ``Logger.debug`` checks the EFFECTIVE level, so an explicit
+    level left on ``kiro_crew`` decides what every ``kiro_crew.*`` logger in the worker
+    may emit, and it outranks the root level ``caplog.at_level()`` sets. The victim then
+    sees ``caplog.text == ""`` -- not the wrong text, NOTHING -- from a test that passes
+    alone, in a file that has nothing to do with the cause.
+
+    Measured: ``test_slack_gateway_more_coverage.py::TestDeliverCronResponse::
+    test_options_post_failure_still_delivers_text`` asserts on a ``logger.debug`` line and
+    reds whenever ``test_cli.py::TestCronCli::test_cli_argparse_cron_add_agent_flag``
+    shares its worker -- an ARGPARSE test, in a file with no connection to Slack. It
+    drives the real ``cli.main()``, whose ``_setup_cli_logging`` pins ``kiro_crew`` at
+    WARNING, exactly as production does once per process and never undoes. Test modules
+    across the suite drive ``main()`` that way.
+
+    Restoring rather than blaming, for the same reason as ``_restore_log_record_factory``
+    above: configuring logging is what the entry point under test is FOR, so demanding
+    per-module bookkeeping from every test that reaches it buys no coverage and is one
+    forgotten fixture away from reappearing. The damage is to OTHER tests, so stopping it
+    propagating is the whole job.
+
+    **HANDLERS are deliberately not restored, and the boundary is not squeamishness.** A
+    handler is routinely paired with a module-global that records it as installed --
+    ``dashboard.handlers.updates._log_ring_handler_installed`` is the live example -- and
+    a floor can detach the handler but cannot know to clear the flag. That leaves the
+    module in a state neither a test nor production can otherwise reach: the singleton
+    reports installed while nothing is attached, so the next caller is handed a handler
+    that receives nothing. Restoring the ROOT logger's handler list is unsafe for a
+    second, independent reason: pytest's ``catching_logs`` adds one per test PHASE and
+    removes it at the phase boundary, so a list snapshotted during setup would be written
+    back during teardown, re-attaching the setup phase's handler and dropping the one the
+    teardown phase is capturing through.
+
+    The handlers ``_setup_cli_logging`` leaves on ``kiro_crew`` do accumulate -- each open
+    on a ``gateway.log`` under a ``tmp_path`` the next test deletes -- but that is a
+    separate defect from this one, and it is not what empties ``caplog``.
+    ``test_cli_logging.py``'s own ``_pristine_logging`` fixture is what absorbs it today,
+    by clearing both handler lists at setup rather than by trusting its inheritance.
+
+    Measured cost: ~30us per snapshot at ~450 live loggers, so ~60us per test.
+    """
+    before_disable = logging.Logger.manager.disable
+    before = _logger_levels()
+    yield
+    for name, after in _logger_levels().items():
+        level, disabled = before.get(name, _PRISTINE_LOGGER)
+        if after == (level, disabled):
+            continue
+        logger = logging.getLogger(name)
+        logger.setLevel(level)
+        logger.disabled = disabled
+    if logging.Logger.manager.disable != before_disable:
+        logging.disable(before_disable)
+
+
 # ── the sandbox probe cache is warm for every test, in every testpath ──
 
 
@@ -987,7 +1110,13 @@ def pytest_runtest_setup(item):
 
 
 def pytest_collection_modifyitems(config, items):
-    """On Windows, skip the tracked known-gap tests (all parametrizations).
+    """Apply exact capability skips, then Windows' tracked known-gap skips.
+
+    Real-symlink tests are listed individually rather than intercepting
+    ``os.symlink`` globally.  A global interception also catches production
+    compatibility helpers before they can handle WinError 1314 and fall back to
+    a junction, silently dropping the Windows behavior those tests exist to
+    cover.  Exact collection markers leave every non-link path untouched.
 
     The list lives in ``test/windows-expected-failures.txt`` -- one unparametrized node
     id per line, captured from the first Windows CI runs. It is a burn-down backlog:
@@ -1005,6 +1134,24 @@ def pytest_collection_modifyitems(config, items):
     always spelled with ``/`` even on Windows, so the in-package entries need no
     translation.
     """
+    if not _ROOT_HAS_REAL_SYMLINKS:
+        listfile = _REPO_ROOT / "test" / "requires-real-symlinks.txt"
+        try:
+            text = listfile.read_text(encoding="utf-8")
+        except OSError:  # pragma: no cover - list file absent in a partial checkout
+            text = ""
+        requires_real_symlink = {
+            _base_nodeid(ln.strip())
+            for ln in text.splitlines()
+            if ln.strip() and not ln.startswith("#")
+        }
+        marker = pytest.mark.skip(
+            reason="test requires real symlink creation; host lacks that capability"
+        )
+        for item in items:
+            if _base_nodeid(item.nodeid) in requires_real_symlink:
+                item.add_marker(marker)
+
     if not platform_compat_or_none() or not platform_compat_or_none().IS_WINDOWS:
         return
     listfile = _REPO_ROOT / "test" / "windows-expected-failures.txt"
@@ -1960,10 +2107,7 @@ def _drain_windows_proactor_finalizers() -> None:
     def _suppress_closed_loop(unraisable: sys.UnraisableHookArgs) -> None:
         """Suppress 'Event loop is closed' from transport __del__."""
         exc = unraisable.exc_value
-        if (
-            isinstance(exc, RuntimeError)
-            and str(exc) == "Event loop is closed"
-        ):
+        if isinstance(exc, RuntimeError) and str(exc) == "Event loop is closed":
             # Silently swallow — the transport is being finalized after its loop
             # closed, which is harmless (the I/O is already done).
             return

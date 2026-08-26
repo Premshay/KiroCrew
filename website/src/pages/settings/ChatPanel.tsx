@@ -63,8 +63,8 @@ const SOFT_STOP_DEFAULT = 10.0
 type CompletionKeepMode = 'head' | 'tail' | 'both'
 const COMPLETION_KEEP_OPTIONS: CompletionKeepMode[] = ['head', 'tail', 'both']
 
-type VerbosityLevel = 'default' | 'concise' | 'ultra'
-const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'ultra']
+type VerbosityLevel = 'default' | 'concise' | 'ultra' | 'answer_only'
+const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'ultra', 'answer_only']
 
 /**
  * Narrow a persisted `dashboard.verbosity` to a level this Select can render.
@@ -160,6 +160,7 @@ export function ChatPanel() {
       soft_stop_budget_secs?: number
       completion_keep?: CompletionKeepMode
       completion_keep_chars?: number
+      fallback_model?: string
     }
     dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string; prevent_sleep?: boolean }
   }>({
@@ -238,6 +239,36 @@ export function ChatPanel() {
       setLocalBudget(String(mcCfg?.agent?.soft_stop_budget_secs ?? SOFT_STOP_DEFAULT))
     },
   })
+
+  // ── Throttle-fallback model (agent.fallback_model) ──
+  // Single-select dropdown fed by the same advertised-model list as the
+  // role-model rows (no free text — a typo'd id can't exist). "" = disabled,
+  // "auto" (default) = backend availability-aware routing, concrete id =
+  // tried first with "auto" as the final fallthrough.
+  const fallbackModel = mcCfg?.agent?.fallback_model ?? 'auto'
+  const fallbackMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.fallback_model', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: (err: unknown) => {
+      // Surface the backend's actual deny reason (e.g. an unentitled id)
+      // next to the generic failure line.
+      const reason = err instanceof Error && err.message ? `: ${err.message}` : ''
+      setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_fallback_model') + reason)
+    },
+  })
+  const fallbackModelOptions = (current: string): string[] => {
+    const opts = ['', 'auto', ...availableModels.map(m => m.name).filter(m => m !== 'auto')]
+    if (current && !opts.includes(current)) opts.splice(2, 0, current)
+    return opts
+  }
+  const fallbackModelLabels = (opts: string[]): string[] =>
+    opts.map(m =>
+      m === ''
+        ? i18nT('pages.settings.chatPanel.fallback_disabled')
+        : m === 'auto'
+          ? i18nT('pages.settings.chatPanel.fallback_auto')
+          : m,
+    )
 
   const [localKeepChars, setLocalKeepChars] = useState('')
   const keepCharsInitRef = useRef(false)
@@ -460,6 +491,21 @@ export function ChatPanel() {
             disabled={!mcQ.isSuccess || !subEffortSupported}
           />
         </SettingsCard>
+
+        <SettingsCard>
+          <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.chatPanel.throttle_fallback')}</div>
+          <div className="text-[12px] text-muted -mt-0.5">{i18nT('pages.settings.chatPanel.model_tried_when_your_current_model_stays_rate_li')}</div>
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.fallback_model')}
+            hint={i18nT('pages.settings.chatPanel.fallback_auto_hint')}
+            value={fallbackModel}
+            options={fallbackModelOptions(fallbackModel)}
+            optionLabels={fallbackModelLabels(fallbackModelOptions(fallbackModel))}
+            onChange={v => fallbackMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+            configKey="agent.fallback_model"
+          />
+        </SettingsCard>
       </SettingsSection>
 
       <SettingsSection title={i18nT('pages.settings.chatPanel.about_you')}>
@@ -562,7 +608,7 @@ export function ChatPanel() {
           <SettingsSelect label={i18nT('pages.settings.chatPanel.widget_density')} description={i18nT('pages.settings.chatPanel.how_aggressively_the_agent_uses_inline_widgets_f')} value={dashCfg.widget_density ?? 'more'} options={['more', 'less']} optionLabels={[i18nT('pages.settings.chatPanel.more_encourage_widgets'), i18nT('pages.settings.chatPanel.less_only_when_needed')]} onChange={v => setDash({ widget_density: v as 'more' | 'less' })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.mcp_apps_in_side_panel')} description={i18nT('pages.settings.chatPanel.render_interactive_mcp_apps_in_the_right_side_pa')} checked={dashCfg.mcp_app_panel} onChange={v => setDash({ mcp_app_panel: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.auto_open_git_panel')} description={i18nT('pages.settings.chatPanel.expand_the_side_panel_to_the_git_tab_each_time_yo')} checked={dashCfg.auto_open_git_panel} onChange={v => setDash({ auto_open_git_panel: v })} disabled={dashDisabled} />
-          <SettingsSelect label={i18nT('pages.settings.chatPanel.response_verbosity')} description={i18nT('pages.settings.chatPanel.how_terse_the_agent_s_prose_is_ultra_concise_cap')} value={asVerbosity(dashCfg.verbosity)} options={VERBOSITY_OPTIONS} optionLabels={[i18nT('pages.settings.chatPanel.default_normal_length'), i18nT('pages.settings.chatPanel.concise_trim_filler'), i18nT('pages.settings.chatPanel.ultra_concise_3_sentences')]} onChange={v => setDash({ verbosity: v as VerbosityLevel })} disabled={dashDisabled} />
+          <SettingsSelect label={i18nT('pages.settings.chatPanel.response_verbosity')} description={i18nT('pages.settings.chatPanel.how_terse_the_agent_s_prose_is_ultra_concise_cap')} value={asVerbosity(dashCfg.verbosity)} options={VERBOSITY_OPTIONS} optionLabels={[i18nT('pages.settings.chatPanel.default_normal_length'), i18nT('pages.settings.chatPanel.concise_trim_filler'), i18nT('pages.settings.chatPanel.ultra_concise_3_sentences'), i18nT('pages.settings.chatPanel.answer_only_details_on_request')]} onChange={v => setDash({ verbosity: v as VerbosityLevel })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_context_percentage')} description={i18nT('pages.settings.chatPanel.display_usage_percentage_next_to_the_context_pro')} checked={chatCfg.showContextPct} onChange={v => setChat('showContextPct', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_token_usage')} description={i18nT('pages.settings.chatPanel.display_used_and_total_tokens_next_to_the_contex')} checked={chatCfg.showContextTokens} onChange={v => setChat('showContextTokens', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.feature_tips')} description={tipsConfigOff ? i18nT('pages.settings.chatPanel.disabled_by_instance_config_tips_enabled_false') : i18nT('pages.settings.chatPanel.show_occasional_feature_discovery_tips_above_the')} checked={!!tipsQ.data && tipsQ.data.enabled_config && !tipsQ.data.opted_out} onChange={v => tipsMut.mutate(v)} disabled={tipsConfigOff || tipsQ.isLoading || tipsQ.isError} />

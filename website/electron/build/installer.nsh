@@ -4,10 +4,11 @@
 ; generated script; nothing here runs unless the macro name matches a hook the
 ; template inserts.
 ;
-; Keep the assisted flow on electron-builder's native MUI pages. In particular,
-; do not add custom page animations, timer-driven bitmap swaps, or Sleep calls:
-; they block the NSIS UI thread and made extraction appear stalled. The native
-; finish page also owns the automatic transition away from 100% completion.
+; Keep the assisted flow on electron-builder's native MUI pages. Page boundaries
+; use one short top-level Win32 cross-fade, but extraction stays on the native
+; progress page: no timer-driven bitmap swaps or Sleep calls can stall its UI
+; thread. Fresh installs retain the native finish page. Updates skip every
+; decision page, keep that progress page visible, then relaunch and close.
 ;
 ; SCOPE: exactly one directory -- the electron-updater cache under $LOCALAPPDATA,
 ; which the generated uninstaller cannot reach (it only ever clears $APPDATA).
@@ -32,6 +33,44 @@
 !define KIRO_RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
 !define KIRO_FILE_ATTRIBUTE_DIRECTORY 0x10
 !define KIRO_INVALID_FILE_ATTRIBUTES -1
+!define KIRO_SPI_GETCLIENTAREAANIMATION 0x1042
+!define KIRO_WM_SETTEXT 0x000C
+!define KIRO_SW_HIDE 0
+!define KIRO_SW_SHOW 5
+!define KIRO_AW_HIDE 0x00010000
+!define KIRO_AW_ACTIVATE 0x00020000
+!define KIRO_AW_BLEND 0x00080000
+!define KIRO_FADE_IN_MS 180
+!define KIRO_FADE_OUT_MS 120
+
+; electron-builder ships these 26 installer languages by default. Keep the
+; update-only progress contract in the same language as the native MUI chrome.
+LangString KiroUpdateProgress 1033 "This can take several minutes. ${PRODUCT_NAME} will reopen automatically."
+LangString KiroUpdateProgress 1031 "Dies kann mehrere Minuten dauern. ${PRODUCT_NAME} wird automatisch wieder geöffnet."
+LangString KiroUpdateProgress 1036 "Cela peut prendre plusieurs minutes. ${PRODUCT_NAME} se rouvrira automatiquement."
+LangString KiroUpdateProgress 3082 "Esto puede tardar varios minutos. ${PRODUCT_NAME} se volverá a abrir automáticamente."
+LangString KiroUpdateProgress 2052 "这可能需要几分钟。${PRODUCT_NAME} 将自动重新打开。"
+LangString KiroUpdateProgress 1028 "這可能需要幾分鐘。${PRODUCT_NAME} 將自動重新開啟。"
+LangString KiroUpdateProgress 1041 "数分かかる場合があります。${PRODUCT_NAME} は自動的に再び開きます。"
+LangString KiroUpdateProgress 1042 "몇 분이 걸릴 수 있습니다. ${PRODUCT_NAME}이(가) 자동으로 다시 열립니다."
+LangString KiroUpdateProgress 1040 "L'operazione può richiedere alcuni minuti. ${PRODUCT_NAME} si riaprirà automaticamente."
+LangString KiroUpdateProgress 1043 "Dit kan enkele minuten duren. ${PRODUCT_NAME} wordt automatisch opnieuw geopend."
+LangString KiroUpdateProgress 1030 "Dette kan tage flere minutter. ${PRODUCT_NAME} åbner automatisk igen."
+LangString KiroUpdateProgress 1053 "Det här kan ta flera minuter. ${PRODUCT_NAME} öppnas automatiskt igen."
+LangString KiroUpdateProgress 1044 "Dette kan ta flere minutter. ${PRODUCT_NAME} åpnes automatisk igjen."
+LangString KiroUpdateProgress 1035 "Tämä voi kestää useita minuutteja. ${PRODUCT_NAME} avautuu automaattisesti uudelleen."
+LangString KiroUpdateProgress 1049 "Это может занять несколько минут. ${PRODUCT_NAME} откроется снова автоматически."
+LangString KiroUpdateProgress 2070 "Isto pode demorar vários minutos. ${PRODUCT_NAME} será reaberto automaticamente."
+LangString KiroUpdateProgress 1046 "Isto pode demorar vários minutos. ${PRODUCT_NAME} será reaberto automaticamente."
+LangString KiroUpdateProgress 1045 "Może to potrwać kilka minut. ${PRODUCT_NAME} otworzy się ponownie automatycznie."
+LangString KiroUpdateProgress 1058 "Це може тривати кілька хвилин. ${PRODUCT_NAME} автоматично відкриється знову."
+LangString KiroUpdateProgress 1029 "Může to trvat několik minut. ${PRODUCT_NAME} se automaticky znovu otevře."
+LangString KiroUpdateProgress 1051 "Môže to trvať niekoľko minút. ${PRODUCT_NAME} sa automaticky znova otvorí."
+LangString KiroUpdateProgress 1038 "Ez több percet is igénybe vehet. A(z) ${PRODUCT_NAME} automatikusan újra megnyílik."
+LangString KiroUpdateProgress 1025 "قد يستغرق هذا عدة دقائق. سيُعاد فتح ${PRODUCT_NAME} تلقائيًا."
+LangString KiroUpdateProgress 1055 "Bu işlem birkaç dakika sürebilir. ${PRODUCT_NAME} otomatik olarak yeniden açılacaktır."
+LangString KiroUpdateProgress 1054 "อาจใช้เวลาหลายนาที ${PRODUCT_NAME} จะเปิดขึ้นอีกครั้งโดยอัตโนมัติ"
+LangString KiroUpdateProgress 1066 "Quá trình này có thể mất vài phút. ${PRODUCT_NAME} sẽ tự động mở lại."
 
 !ifndef BUILD_UNINSTALLER
 
@@ -41,6 +80,75 @@ Var KiroPerMachineDefault
 Var KiroHasPerUserInstallation
 Var KiroHasPerMachineInstallation
 Var KiroScope
+Var KiroAnimationsEnabled
+Var KiroWindowVisible
+Var KiroVisibleUpdate
+
+; The fade operates on the top-level dialog, the only window type for which
+; AW_BLEND is supported. It runs once per page boundary and leaves the native
+; extraction page untouched while files are being installed.
+Function KiroDetectAnimations
+  Push $0
+  Push $1
+  StrCpy $KiroAnimationsEnabled 1
+  System::Call "user32::SystemParametersInfoW(i ${KIRO_SPI_GETCLIENTAREAANIMATION}, i 0, *i .r0, i 0)i.r1"
+  ${If} $1 != 0
+    StrCpy $KiroAnimationsEnabled $0
+  ${EndIf}
+  Pop $1
+  Pop $0
+FunctionEnd
+
+Function KiroFadeInPage
+  ${If} ${Silent}
+    Return
+  ${EndIf}
+  ${If} $KiroAnimationsEnabled == 0
+    ShowWindow $HWNDPARENT ${KIRO_SW_SHOW}
+    StrCpy $KiroWindowVisible 1
+    Return
+  ${EndIf}
+
+  Push $0
+  IntOp $0 ${KIRO_AW_ACTIVATE} | ${KIRO_AW_BLEND}
+  ShowWindow $HWNDPARENT ${KIRO_SW_HIDE}
+  System::Call "user32::AnimateWindow(p $HWNDPARENT, i ${KIRO_FADE_IN_MS}, i $0)i.r0"
+  ${If} $0 == 0
+    ShowWindow $HWNDPARENT ${KIRO_SW_SHOW}
+  ${EndIf}
+  StrCpy $KiroWindowVisible 1
+  Pop $0
+FunctionEnd
+
+Function KiroFadeOutPage
+  ${If} ${Silent}
+    Return
+  ${EndIf}
+  ${If} $KiroAnimationsEnabled == 0
+    Return
+  ${EndIf}
+  ${If} $KiroWindowVisible != 1
+    Return
+  ${EndIf}
+
+  Push $0
+  Push $1
+  IntOp $0 ${KIRO_AW_HIDE} | ${KIRO_AW_BLEND}
+  System::Call "user32::AnimateWindow(p $HWNDPARENT, i ${KIRO_FADE_OUT_MS}, i $0)i.r1"
+  ${If} $1 == 0
+    ShowWindow $HWNDPARENT ${KIRO_SW_HIDE}
+  ${EndIf}
+  StrCpy $KiroWindowVisible 0
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; Cancel closes the wizard without leaving a page, so the normal page callback
+; cannot observe it. The GUI lifecycle hook gives that path the same fade-out;
+; the visibility guard makes it a no-op after a finish-page leave already hid it.
+Function .onGUIEnd
+  Call KiroFadeOutPage
+FunctionEnd
 
 ; electron-builder's generated uninstaller removes $INSTDIR recursively. A
 ; fresh install must therefore own a directory that did not exist beforehand.
@@ -93,6 +201,51 @@ Function KiroEnsureAppInstallDir
   KiroFreshInstallDirReady:
 FunctionEnd
 
+; Updates need progress, not another decision: skip the welcome page while
+; preserving the native assisted flow for a first install.
+Function KiroWelcomePre
+  ${If} $KiroVisibleUpdate == 1
+    Abort
+  ${EndIf}
+FunctionEnd
+
+; A visible update must stay non-interactive while files are being replaced.
+; Hide the native Cancel button and reject window-close/Alt+F4 aborts; cancelling
+; midway can leave the installed app only partially replaced.
+Function KiroInstFilesShow
+  Call KiroFadeInPage
+  ${If} $KiroVisibleUpdate == 1
+    ; The native progress page is the only surface that is guaranteed to remain
+    ; visible throughout the handoff. Put the timing/relaunch contract on that
+    ; page itself instead of relying on a toast that Focus Assist may suppress.
+    GetDlgItem $0 $HWNDPARENT 1038
+    SendMessage $0 ${KIRO_WM_SETTEXT} 0 "STR:$(KiroUpdateProgress)"
+    GetDlgItem $0 $HWNDPARENT 2
+    EnableWindow $0 0
+    ShowWindow $0 ${KIRO_SW_HIDE}
+  ${EndIf}
+FunctionEnd
+
+; MUI owns .onUserAbort, so use its pre-warning hook instead of replacing the
+; generated callback. Returning preserves the normal confirmation on a fresh
+; install; Abort suppresses both the warning and the close during an update.
+Function KiroAbortPre
+  ${If} $KiroVisibleUpdate == 1
+    Abort
+  ${EndIf}
+FunctionEnd
+!define MUI_PAGE_FUNCTION_ABORTWARNING KiroAbortPre
+
+; electron-builder exposes the welcome-page macro hook directly. Reinsert the
+; same native MUI page with show/leave callbacks so startup and the first Next
+; transition do not blink before the rest of the fade sequence begins.
+!macro customWelcomePage
+  !define MUI_PAGE_CUSTOMFUNCTION_PRE KiroWelcomePre
+  !define MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage
+  !define MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage
+  !insertmacro MUI_PAGE_WELCOME
+!macroend
+
 !macro customPageAfterChangeDir
   ; The native install-mode page calls electron-builder's setInstallMode
   ; macros, which can replace $INSTDIR after .onInit/customInit has run.
@@ -115,6 +268,15 @@ FunctionEnd
     ${EndIf}
     StrCpy $INSTDIR $KiroInstallDir
   FunctionEnd
+
+  Function KiroInstallModeLeave
+    Call KiroValidateInstallDirAfterMode
+    Call KiroFadeOutPage
+  FunctionEnd
+
+  ; These hooks apply to the immediately following native instfiles page.
+  !define MUI_PAGE_CUSTOMFUNCTION_SHOW KiroInstFilesShow
+  !define MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage
 !macroend
 
 ; Attach the validator to the native install-mode page's own leave callback.
@@ -122,13 +284,98 @@ FunctionEnd
 ; or changing the native Install button into a misleading Next button.
 !macro customInstallMode
   !ifndef BUILD_UNINSTALLER
-    !define MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroValidateInstallDirAfterMode
+    ; Preserve the registered install scope without asking the user to choose it
+    ; again. multiUserUi consumes these flags in its page-pre callback, performs
+    ; elevation when needed, and Abort-skips the page.
+    ${If} $KiroVisibleUpdate == 1
+      ${If} $installMode == "all"
+        StrCpy $isForceMachineInstall 1
+      ${Else}
+        StrCpy $isForceCurrentInstall 1
+      ${EndIf}
+    ${EndIf}
+    !define MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage
+    !define MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroInstallModeLeave
   !endif
+!macroend
+
+; Add callbacks around the stock MUI finish page without replacing its controls,
+; localization, run-after-finish behavior, or automatic progress handoff. The
+; packaging contract compares this copied StartApp block with electron-builder's
+; locked template so a dependency upgrade cannot silently drift from upstream.
+!macro customFinishPage
+  !ifndef HIDE_RUN_AFTER_FINISH
+    Function StartApp
+      ${if} ${isUpdated}
+        StrCpy $1 "--updated"
+      ${else}
+        StrCpy $1 ""
+      ${endif}
+      ${StdUtils.ExecShellAsUser} $0 "$launchLink" "open" "$1"
+    FunctionEnd
+
+    !define MUI_FINISHPAGE_RUN
+    !define MUI_FINISHPAGE_RUN_FUNCTION "StartApp"
+
+    ; The extraction page is the entire update UI. Once it reaches 100%, start
+    ; the updated app through electron-builder's locked launch contract and
+    ; close successfully instead of waiting on a redundant Finish click.
+    Function KiroFinishPagePre
+      ${If} $KiroVisibleUpdate == 1
+        ${If} ${isForceRun}
+          Call StartApp
+        ${EndIf}
+        !insertmacro quitSuccess
+      ${EndIf}
+    FunctionEnd
+
+    !define MUI_PAGE_CUSTOMFUNCTION_PRE KiroFinishPagePre
+  !endif
+  !define MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage
+  !define MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage
+  !insertmacro MUI_PAGE_FINISH
+!macroend
+
+; app-builder-lib stages the complete differential-aware 7z under $PLUGINSDIR,
+; then normally copies every file into $INSTDIR. The bundled Python runtime is
+; almost entirely under resources, so on the normal same-volume install path a
+; directory rename publishes those thousands of files in one filesystem
+; operation. Rename is attempted only for the two stable Electron directories
+; in per-user installs. Per-machine installs deliberately use CopyFiles so the
+; payload inherits the Program Files ACL instead of retaining the staging
+; user's temporary-directory ACL. CopyFiles also handles root files, future
+; directories, cross-volume TEMP layouts, occupied destinations and retries
+; exactly as upstream does.
+!macro customPublishAppPackage SOURCE DESTINATION
+  ${If} $installMode != "all"
+    ClearErrors
+    Rename "${SOURCE}\resources" "${DESTINATION}\resources"
+    ${If} ${Errors}
+      ClearErrors
+    ${EndIf}
+    Rename "${SOURCE}\locales" "${DESTINATION}\locales"
+    ${If} ${Errors}
+      ClearErrors
+    ${EndIf}
+  ${EndIf}
+  CopyFiles /SILENT "${SOURCE}\*" "${DESTINATION}"
 !macroend
 
 ; Preserve only the install-root ownership guard from the former custom UI.
 ; This runs for silent installs too and does not replace or restyle any page.
 !macro customInit
+  StrCpy $KiroWindowVisible 0
+  StrCpy $KiroVisibleUpdate 0
+  ${If} ${isUpdated}
+    StrCpy $KiroVisibleUpdate 1
+    ; Older Kiro Crew clients launch every NSIS update with /S. Convert that
+    ; legacy handoff to the visible, non-interactive update path so users see
+    ; progress on the very first upgrade that contains this fix.
+    ${If} ${Silent}
+      SetSilent normal
+    ${EndIf}
+  ${EndIf}
+  Call KiroDetectAnimations
   StrCpy $KiroScope "current"
   ${If} $installMode == "all"
     StrCpy $KiroScope "all"

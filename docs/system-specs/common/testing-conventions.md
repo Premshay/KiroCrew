@@ -125,7 +125,7 @@ It also pins the other real host paths a test must not reach: the subagent regis
 running gateway sweeps stray entries there as orphans), the 610MB embedding-model
 download, and the agent-state sidecar.
 
-Three members are there for a different reason — a **process-global** that any testpath
+Five members are there for a different reason — a **process-global** that any testpath
 can poison for every test after it, which is the same failure shape as host mutation
 one scope down:
 
@@ -151,6 +151,21 @@ one scope down:
   undoes it, so a test driving that code cannot avoid it.
   `log_redaction.uninstall_log_redaction()` exists for a test that wants to assert on
   the uninstalled state itself.
+* `_restore_logger_levels` puts every logger's level and `disabled` flag back. A level is
+  process-global AND hierarchical, so an explicit one left on `kiro_crew` decides what
+  every `kiro_crew.*` logger in the worker may emit and it outranks the root level
+  `caplog.at_level()` sets — the victim's `caplog.text` comes back **empty**, not wrong,
+  which reads as "the code stopped logging" rather than as pollution.
+  `cli._setup_cli_logging` pins `kiro_crew` at WARNING, and test modules across the suite
+  run it for real by driving `cli.main()` in process. Restored rather than blamed, for the
+  same reason the CWD restore is. **Handlers are deliberately not restored**: one is
+  routinely paired with a module-global recording it as installed
+  (`dashboard.handlers.updates._log_ring_handler_installed`), and a floor can detach the
+  handler but cannot know to clear the flag, which leaves the singleton reporting
+  installed with nothing attached. The root logger's handler list is doubly excluded —
+  pytest's own `catching_logs` adds one per test phase and removes it at the phase
+  boundary, so writing back a setup-phase snapshot during teardown would drop the handler
+  the teardown phase is capturing through.
 * `_restore_autonudge_singleton` puts `autonudge._INSTANCE` back to whatever the test
   inherited. `AutoNudgeService.start()` publishes itself there and `stop()` clears it, so
   a test that starts the service — or drives a dashboard handler that does — leaves a live
@@ -684,6 +699,38 @@ body = os.urandom(20_000)
 # RIGHT: same entropy, same code path, one outcome
 body = random.Random(20260803).randbytes(20_000)
 ```
+
+**Host MEMORY is the other one, and it fails with a misleading exception.**
+`SubagentManager.spawn` refuses — returning before it registers anything in
+`_tasks` — while the machine looks short of memory, and it does so twice: an
+absolute floor (`check_memory_available` against `agent.spawn_min_memory_gb`) and
+the posture tier (`cached_admission_check`, refusing while the cgroup-clamped
+reading is CRITICAL). What makes it expensive to diagnose is that a refusal IS a
+`SubagentInfo` — a done one carrying `error` — so `assert info is not None` still
+passes and the test dies on the NEXT line, at `await mgr._tasks[info.id]`, with a
+bare `KeyError` naming an id nothing else mentions. Measured on a CI runner with
+~0.5 GB free.
+
+Fix: pin the reading with `healthy_host_memory` (`test/conftest.py`), which any
+file driving `spawn` opts into at module scope:
+
+```python
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+```
+
+It pins only the HOST reading — a caller that names its own `path` is feeding the
+`/proc/meminfo` parser a fixture file rather than asking about this machine, so
+those tests still run the real function and a parser regression still goes red. A
+test that is actually ABOUT either guard patches it in its own body, which lands on
+top of the fixture and reverts to it.
+
+Opt-in rather than autouse, because the pin is not free of consequence: the tests
+that drive the probe with no `path` and stub `safe_read_file` underneath it —
+`test_subagent_coverage.py::TestCheckMemoryAvailable` — never reach their own stub
+once the reading is pinned. `test_subagent_spawn_host_pin.py` is what keeps opt-in
+from decaying into "whoever remembered": a module that names `SubagentManager` and
+calls `.spawn(` must be pinned or excluded with a reason, so the next spawning test
+file cannot land unpinned.
 
 ### 2. Wall-clock races
 

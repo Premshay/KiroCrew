@@ -219,8 +219,10 @@ of the AUTOSDE rules; the semantic half is delegated to the line reviewers.
   closed on **high or critical production** vulnerabilities. Time-boxed exceptions
   live in `.vulnerability-exceptions.json`.
 - **`pr-hygiene`** enforces a Conventional-Commits PR title (it becomes the
-  squash-merge message) and exactly one commit (`git rev-list --count == 1`). Both
-  blocking.
+  squash-merge message) and at most two commits (`git rev-list --count <= 2`).
+  One commit stays the norm; the second is there so a mechanical follow-up (a
+  regenerated artifact, a formatting sweep) can stay separable from the change
+  it accompanies. Both blocking.
 
 Separately, **`dependency-review.yml`** fails a PR that adds or changes a
 dependency whose license is off the curated allowlist in
@@ -356,7 +358,18 @@ the network and cannot fetch it itself.
 
 Both line reviewers run the same review contract, and severity encodes exactly one
 thing: *does this block the merge*, **never confidence**. There is no
-"possible issue" tier. A finding must state a concrete input or condition that
+"possible issue" tier. The blocks of that contract shared by the two GPT
+workflows — the diff-is-not-evidence clause, the coverage/finding/fix bars, the
+output contract, and the falsification-pass mandate and verdict framing — live in
+shared `.github/review-prompts/gpt-*.md` files rather than as two inline copies,
+so the lanes cannot drift apart on them (#5852). The same-repo lane stages them
+from the PR's **base** commit like the Opus lanes; unlike those lanes it falls
+back to the checked-out copy (with a warning) when a block is absent on the base,
+because a hard gate cannot afford a no-verdict pass and, on a same-repo PR, the
+workflow file itself is already editable by the PR — the fallback adds no attack
+surface the lane did not have. The fork lane's checkout *is* the trusted base
+(the diff is never applied), so it reads the files straight from the tree and
+fails closed if one is missing. A finding must state a concrete input or condition that
 occurs in practice, the call path to the changed line, and an observable wrong
 outcome; anything phrased as "could", "might" or "if a caller were to" is **not a
 finding**, and silence is the correct output. Only two labels exist: **BLOCKING**
@@ -379,7 +392,7 @@ observable outcome itself from code it opened in that pass. Pass 2 may also *add
 defect discovery missed, in both lanes, but only under that same three-part
 grounding and the same confidence floor — killing a candidate stays its primary
 job, and a self-found finding gets no second opinion, so it earns no cheaper path
-in. In the Opus lane such a finding is tagged `(origin: validation)` in the posted
+in. In both lanes such a finding is tagged `(origin: validation)` in the posted
 review, because it is un-falsified by construction: the tag is what lets a reader
 weight it accordingly, and what lets the precision of self-added findings be
 compared against survivors' rather than assumed equal. Pass 2 is the only
@@ -479,7 +492,15 @@ characters, then posts a **bot-authored** marker comment that the reviewer workf
 trust. Raw PR comments can never turn a gate green directly; only that marker can.
 The scope is **this commit only**, so a new push needs a new judgment. The workflow
 then re-runs the affected reviewer, cancelling an in-flight run first so its stale
-verdict cannot race the human decision.
+verdict cannot race the human decision. On a fork PR the affected reviewer is the
+`workflow_run`-triggered Stage-2 lane, whose run objects are keyed to the default
+branch — the handler locates the lane run through the run URL the lane stamps into
+the `details_url` of the check-run it posts on the PR head, verifies the resolved
+run belongs to the expected fork workflow, and re-runs it. The fork lanes consume
+no override marker, so that re-run is a fresh review roll rather than a forced
+pass. A rerun failure after the judgment has recorded is reported as a warning
+annotation plus a PR notice naming the lane to re-run manually — never as a failed
+run, which would make a recorded judgment look rejected.
 
 ## `pr-readiness.yml`: the aggregator
 

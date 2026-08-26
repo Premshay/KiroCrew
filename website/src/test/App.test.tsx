@@ -143,6 +143,25 @@ describe('App routing', () => {
       onboarded: false,
       import_onboarded: false,
     } as never)
+    // Keep the import chapter open after its scan. An empty scan deliberately
+    // auto-completes the chapter, so asserting on the transient dialog races
+    // that completion under a loaded test shard.
+    vi.mocked(api.onboardingImportScan).mockResolvedValueOnce({
+      sources: [{
+        id: 'codex',
+        name: 'Codex',
+        detected: true,
+        detail: '~/.codex',
+        categories: [{
+          id: 'instructions',
+          label: 'Instructions',
+          count: 1,
+          description: 'Agent instructions',
+        }],
+      }],
+      skipped: [],
+      merge_only: true,
+    } as never)
 
     renderWithProviders(<App />, { route: '/chat' })
 
@@ -1177,13 +1196,19 @@ describe('mobile nav drawer insets', () => {
   })
 
   it('spans the viewport height so both margins resolve', () => {
-    // `top-0 bottom-0` with a margin on each end resolves the height to
+    // An anchor on BOTH ends plus a margin on each resolves the height to
     // viewport-16px. Dropping either anchor would make the margins inert (auto
     // height) and re-open the flush-top defect from the other direction.
+    //
+    // The safe-area variants satisfy this the same way the plain ones do: they
+    // set top/bottom to env(safe-area-inset-*), a definite length that is 0 on
+    // hardware without a notch. So accept either form per end, but keep
+    // requiring that BOTH ends are anchored -- that is the actual invariant,
+    // and the literal class name is not.
     const classes = mobileDrawerClasses()
     expect(classes).toContain('fixed')
-    expect(classes).toContain('top-0')
-    expect(classes).toContain('bottom-0')
+    expect(classes.some(c => c === 'top-0' || c === 'top-safe'), `expected a top anchor, got: ${classes.join(' ')}`).toBe(true)
+    expect(classes.some(c => c === 'bottom-0' || c === 'bottom-safe'), `expected a bottom anchor, got: ${classes.join(' ')}`).toBe(true)
   })
 })
 

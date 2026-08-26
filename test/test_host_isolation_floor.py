@@ -761,6 +761,30 @@ class TestTheWorkingDirectoryIsRestored:
         )
 
 
+_DYNAMIC_CREDENTIAL_ORDER: dict[str, bool] = {}
+
+
+@pytest.mark.xdist_group(name="dynamic_credential_env_floor")
+class TestDynamicCredentialEnvironmentIsRestored:
+    """A dynamic per-host Jira token must not leak to the next test.
+
+    ``load_credentials`` propagates ``JIRA_TOKEN_<HEX>`` keys even though they
+    are not members of the fixed ``_CREDENTIAL_KEYS`` tuple. Keep these tests
+    adjacent on one worker so the second observes the first test's teardown.
+    """
+
+    def test_a_test_can_inject_a_dynamic_jira_token(self) -> None:
+        os.environ["JIRA_TOKEN_AABBCC"] = "token-from-previous-test"
+        _DYNAMIC_CREDENTIAL_ORDER["injected"] = True
+
+    def test_the_next_test_does_not_inherit_the_dynamic_token(self) -> None:
+        assert _DYNAMIC_CREDENTIAL_ORDER.get("injected"), (
+            "the injecting test did not run on this worker, so this assertion "
+            "would prove nothing"
+        )
+        assert "JIRA_TOKEN_AABBCC" not in os.environ
+
+
 # ── the logging record factory ─────────────────────────────────────────────
 
 
@@ -809,6 +833,72 @@ class TestTheLogRecordFactoryIsRestored:
         )
 
 
+# ── logger levels ──────────────────────────────────────────────────────────
+
+
+#: Written by the leaking test and read by the one after it, for the same reason as
+#: ``_FACTORY_ORDER``: the restore this pins runs in teardown, after every finalizer the
+#: leaking test itself could own.
+_LOGGER_ORDER: dict[str, object] = {}
+
+
+@pytest.mark.xdist_group(name="logger_level_floor")
+class TestLoggerLevelsAreRestored:
+    """A logger's level is PROCESS-GLOBAL, per worker, and HIERARCHICAL.
+
+    Together those are what make this leak class so hard to attribute. ``Logger.debug``
+    gates on the EFFECTIVE level, so an explicit level left on ``kiro_crew`` decides what
+    every ``kiro_crew.*`` logger in the worker may emit, and it outranks the root level
+    ``caplog.at_level()`` sets -- the victim gets ``caplog.text == ""``, nothing at all
+    rather than the wrong text, from a test that passes alone. The suite reaches this
+    through ``cli._setup_cli_logging``, which pins ``kiro_crew`` at WARNING, and which
+    test modules across the suite run for real by driving ``cli.main()`` in process.
+
+    ``conftest._restore_logger_levels`` is what removes the class; without a test, an edit
+    to it reverts silently and the failures reappear in files that have nothing to do with
+    the cause.
+
+    Grouped with ``xdist_group`` so the leaker and the observer stay on ONE worker:
+    ``--dist loadgroup`` honours that, and without it the two are distributed
+    independently and the observation passes vacuously.
+    """
+
+    def test_this_test_starts_with_an_unconfigured_kiro_crew_logger(self) -> None:
+        """Which is only true if no earlier test on this worker left a level on it."""
+        assert logging.getLogger("kiro_crew").level == logging.NOTSET
+
+    def test_a_leaked_level_does_not_reach_the_next_test(self) -> None:
+        """Leaks one and deliberately restores nothing -- the floor's job, not ours."""
+        logging.getLogger("kiro_crew").setLevel(logging.WARNING)
+        _LOGGER_ORDER["leaked"] = True
+        assert logging.getLogger("kiro_crew").level == logging.WARNING
+
+    def test_the_next_test_sees_the_level_gone(self) -> None:
+        """Reads what the previous test recorded. Ordered by definition order in the file."""
+        assert _LOGGER_ORDER.get("leaked"), (
+            "the leaking test did not run on this worker, so this assertion proves "
+            "nothing -- the xdist_group mark on the class is what keeps them together"
+        )
+        level = logging.getLogger("kiro_crew").level
+        assert level == logging.NOTSET, (
+            f"kiro_crew is still pinned at {logging.getLevelName(level)} -- every "
+            "kiro_crew.* record below that level is now dropped before it reaches the "
+            "root handler caplog captures through"
+        )
+
+    def test_a_debug_record_from_a_kiro_crew_logger_still_reaches_caplog(self, caplog) -> None:
+        """The capability the level restore exists to protect, asserted directly.
+
+        The level assertion above pins the mechanism; this pins the OUTCOME, in the exact
+        shape the victim test uses -- ``at_level`` on the root logger, a ``debug`` call on
+        a ``kiro_crew.*`` child -- so a future floor that restores something subtly
+        different still has to keep this working.
+        """
+        with caplog.at_level("DEBUG"):
+            logging.getLogger("kiro_crew.slack.gateway").debug("floor canary")
+        assert "floor canary" in caplog.text
+
+
 # ── the worker budget ─────────────────────────────────────────────────────
 
 
@@ -839,8 +929,8 @@ class TestTheWorkerBudgetIsMemoryBounded:
         invoked: a test that inspected only the live plugin manager would pass from
         ``test/`` even after a regression put the hook back in the wrong file.
         """
-        root_conftest = (_REPO_ROOT / "conftest.py").read_text()
-        suite_conftest = (_REPO_ROOT / "test" / "conftest.py").read_text()
+        root_conftest = (_REPO_ROOT / "conftest.py").read_text(encoding="utf-8")
+        suite_conftest = (_REPO_ROOT / "test" / "conftest.py").read_text(encoding="utf-8")
         hook = "def pytest_xdist_auto_num_workers"
 
         assert hook in root_conftest, (

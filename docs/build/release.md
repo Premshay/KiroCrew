@@ -559,10 +559,18 @@ Two Windows details do not generalise from the other platforms:
   Windows arch is a second entry inside that one file, never a second feed, and
   it also has to contend with `Provider.findFile()` disambiguating entries by
   matching `process.arch` against the URL path.
-- **`quitAndInstall` passes `isSilent` on win32 only.** `NsisUpdater` adds `/S`
-  only when silent, and the installer is assisted (`nsis.oneClick: false`), so
-  without it the app would quit and then wait for the user to click through a
-  setup wizard rather than swapping silently the way macOS and Linux do.
+- **Windows updates are visible but non-interactive.** `quitAndInstall` passes
+  `isSilent=false` and `isForceRunAfter=true`. The assisted installer
+  (`nsis.oneClick: false`) uses update-only hooks in `installer.nsh` to skip the
+  Welcome, install-mode, and Finish decisions, leaving only the native
+  extraction page and its real progress visible. At completion it runs the
+  locked electron-builder `StartApp` contract and exits successfully. The same
+  hooks call `SetSilent normal` for `/S --updated`, so a client released before
+  this behavior change also gets visible progress on its first upgrade into it.
+  The downloaded installer owns this UI contract: a downgrade or channel
+  switch-back to an installer that predates these hooks shows that release's
+  legacy assisted wizard instead, so operators and users must retain the
+  install scope detected by that wizard.
 
 `SUPPORTED_PLATFORMS` is necessary but not sufficient: a channel can lack a
 desktop publish lane entirely, which is what `KNOWN_CHANNELS` and
@@ -621,7 +629,10 @@ those installs permanently with a manual DMG re-download as the only escape.
 safe to remove once no pre-migration installs remain.
 
 Four updater policy flags each differ from the library default on purpose:
-`autoDownload=false` (consent-first: discovery must never pull megabytes),
+`autoDownload=false` (the library must never fetch from inside
+`checkForUpdates`; whether a discovered update downloads without a click is a
+separate preference read per discovery, and keeping the flag false is what
+routes the automatic and the consented download through one guarded function),
 `autoInstallOnAppQuit=false` (the default would swap the bundle on quit without
 stopping the embedded Python gateway), `allowDowngrade=true` (the gate is
 difference-based, so a feed pointed at an older version is offered, which is
@@ -629,6 +640,24 @@ what makes a channel switch-back work), and `allowPrerelease=true` (every
 nightly and insider stamp is a semver prerelease and would otherwise be
 invisible to its own channel). The library still refuses an equal version before
 the `allowDowngrade` branch, which is what prevents a self-reinstall loop.
+
+**Desktop updates download automatically by default, and install on the next
+quit.** The `autoDownloadUpdates` preference (electron-store, default `true`,
+opt out in Settings → About) decides whether the `update-available` handler
+calls `startDownload()` itself. The INSTALL is not made automatic by this: the
+existing `update-downloaded` handler arms a `before-quit` install that stops the
+gateway first, so a downloaded update lands on the user's own next quit rather
+than interrupting a live session. `autoInstallOnAppQuit` stays false on every
+platform — on macOS that flag stages eagerly, which arms ShipIt to swap the
+bundle on ANY exit (including exits that skip the gateway teardown) and cannot
+be un-armed, so it would also defeat release retraction.
+
+Turning the preference off keeps bytes already fetched but **disarms the
+install-on-quit for a stage that was downloaded automatically**, so the update a
+user just declined does not land on their next quit; a stage they explicitly
+downloaded stays armed, because the preference is not what put it there. The
+stage itself is never discarded, so an explicit Install still applies it with
+nothing to re-download.
 
 **Which channel a build follows is a default plus an opt-in, not a property of
 the bytes.** `channelForVersion()` classifies the version stamp and `nightly`

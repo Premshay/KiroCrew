@@ -4,6 +4,7 @@ import { ChevronRight, Info, Layers, RotateCcw, TriangleAlert } from 'lucide-rea
 import { i18nT } from '../../i18n/t'
 import { DENY_REASON_MARKER } from '../../utils/denyReason'
 import { useRowDisclosure } from './rowDisclosure'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 
 /**
  * The synthetic-continuation prefixes the gateway prepends when it recovers a
@@ -97,6 +98,22 @@ const PREFIXES: ReadonlyArray<[RecoveryKind, string]> = [
  * copy would let one half drift while the other kept matching.
  */
 const POLICY_RE = new RegExp(`${DENY_REASON_MARKER.source}\\s*(.+?)\\s*$`, 'gm')
+
+/**
+ * Deny cause → the card's always-visible detail line.
+ *
+ * Wire values, matched byte-for-byte against `DENY_CAUSE_*` in
+ * `dashboard/state.py`; never translate the KEYS of this map. The reason the map
+ * exists at all is the same one the notice's own wording is cause-specific for: an
+ * invalid tool name and a faulted hook are not policy verdicts, so a single
+ * "safety policy blocked the call" summary asserts a cause the system knows is
+ * false and points the reader at a security rule that does not exist.
+ */
+const TOOL_BLOCKED_DETAIL: Record<string, string> = {
+  policy: 'pages.chat.recoveryCard.safety_policy_told_in_turn',
+  invalid_name: 'pages.chat.recoveryCard.invalid_name_told_in_turn',
+  hook_error: 'pages.chat.recoveryCard.hook_fault_told_in_turn',
+}
 /** A blocked-item bullet in the refusal body (`  - <tool>: <reason>`). */
 const BULLET_RE = /^\s*-\s+\S/
 
@@ -250,6 +267,13 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
   // Refusal: count the blocked-item bullets and collect the distinct deny
   // patterns. A turn can refuse several calls, and they need not share a cause.
   const blocked = body.split('\n').filter(line => BULLET_RE.test(line)).length
+  // `tool_blocked` carries its DENY CAUSE on the marker line, the way
+  // `hook_halted` carries `#<depth>`. Read here rather than in that branch so the
+  // generic marker slice stays the single place the first line is parsed.
+  const markerCause = raw
+    .slice(prefix.length)
+    .split('\n', 1)[0]
+    .trim()
   const patterns = new Set<string>()
   for (const m of body.matchAll(POLICY_RE)) patterns.add(m[1])
   const distinct = [...patterns]
@@ -263,7 +287,7 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
     blocked > 1
       ? i18nT('pages.chat.recoveryCard.n_tool_calls_blocked', { count: blocked })
       : i18nT('pages.chat.recoveryCard.tool_call_blocked')
-  // Same EVENT as `refusal` — a policy blocked a call — so it shares the title
+  // Same EVENT as `refusal` — the host blocked a call — so it shares the title
   // and the pattern chip. Only the second half differs: nothing was interrupted
   // and no continuation was sent, because the reason went to the agent inside
   // the turn that was already running. Saying "continuation sent" here would
@@ -272,7 +296,14 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
     return {
       kind,
       title,
-      detail: i18nT('pages.chat.recoveryCard.safety_policy_told_in_turn'),
+      // Keyed on the cause the marker line carries. A single "safety policy
+      // blocked the call" summary would assert a cause the system knows is false
+      // for two of the three — an invalid tool name and a faulted hook are not
+      // policy verdicts — and send the reader to audit a security rule that does
+      // not exist. The expandable body names the real cause either way; this is
+      // the line they see WITHOUT expanding. Unknown/absent cause falls back to
+      // the policy wording, matching the backend's own cause default.
+      detail: i18nT(TOOL_BLOCKED_DETAIL[markerCause] ?? TOOL_BLOCKED_DETAIL.policy),
       chip,
       body,
     }
@@ -359,6 +390,7 @@ export function resolveInjectCard(m: { content: string; meta?: Record<string, un
  * NudgeCard.
  */
 export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: ParsedRecovery; disclosureKey?: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
   const { kind, title, detail, chip, body } = parsed
   // Severity split: a refusal or a stall means something was blocked or died and
@@ -400,7 +432,7 @@ export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: P
         // one thing a screen-reader user would otherwise have to expand the raw
         // machine prose to learn. The inner text names the button (matching what
         // sighted users read) and aria-expanded carries the toggle state.
-        className="w-full flex items-center gap-2 px-3 py-2 min-w-0 text-left text-[13px] leading-5 hover:text-fg transition-colors"
+        className="w-full flex items-center gap-2 px-3 py-2 min-w-0 text-left text-[13px] leading-5 hover:text-text transition-colors"
         data-testid="recovery-card-toggle"
       >
         <ChevronRight
@@ -410,10 +442,10 @@ export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: P
         />
         <Icon
           size={13}
-          className={`lucide-inline shrink-0 ${routine ? 'text-muted' : 'text-warning'}`}
+          className={`lucide-inline shrink-0 ${routine ? 'text-muted' : 'text-warn'}`}
           aria-hidden="true"
         />
-        <span className="font-medium text-fg shrink-0">{title}</span>
+        <span className="font-medium text-text shrink-0">{title}</span>
         <span className="truncate text-[12px] leading-5 opacity-75 min-w-0">{detail}</span>
         {chip && (
           <code

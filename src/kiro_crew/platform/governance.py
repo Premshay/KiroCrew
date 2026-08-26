@@ -41,11 +41,12 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (
     Callable,
     Dict,
+    List,
     Mapping,
     MutableMapping,
     Optional,
@@ -439,6 +440,24 @@ _KIND_READ = "read"
 _KIND_EDIT = "edit"
 _KIND_FETCH = "fetch"
 
+_PATH_ARG_KEYS = ("path", "file_path", "filePath")
+
+
+def _tool_arg_paths(raw_params: Mapping[str, object]) -> Tuple[str, ...]:
+    """Return every distinct, non-empty path carried under a supported alias.
+
+    Tool backends use all three spellings, sometimes in the same payload.  Every
+    value must be governed: choosing the first truthy alias would let a benign
+    ``path`` mask a sensitive ``filePath`` (and a truthy non-string value could
+    mask every later alias entirely).
+    """
+    paths: list[str] = []
+    for key in _PATH_ARG_KEYS:
+        value = raw_params.get(key)
+        if isinstance(value, str) and value.strip() and value not in paths:
+            paths.append(value)
+    return tuple(paths)
+
 
 def classify_tool_args(
     tool_kind: str, raw_params: Optional[Mapping[str, object]]
@@ -451,8 +470,10 @@ def classify_tool_args(
     authoritative signal.  Used by the gate to enforce the path/host scopes that a
     title cannot carry:
 
-    * ``kind == "edit"`` with a ``path`` → ``("filesystem.write", "<path>")``.
-    * ``kind == "read"`` with a ``path`` → ``("filesystem.read", "<path>")``
+    * ``kind == "edit"`` with a path argument →
+      ``("filesystem.write", "<path>")``.
+    * ``kind == "read"`` with a path argument →
+      ``("filesystem.read", "<path>")``
       (redundant with the ``Reading`` title path, harmless — both must permit).
     * ``kind == "fetch"`` with a ``url`` → ``("network.egress", "<host>")`` —
       the host is extracted from the URL so the ``host`` matcher applies.
@@ -461,7 +482,7 @@ def classify_tool_args(
     ACP backends omit it, so it arrives ``""``).**  When the kind is not one of
     the known fs/fetch kinds, we infer from the param SHAPE so an edit/fetch is
     still governed: a ``url``/``uri`` (and no shell ``command``) → egress; a
-    ``path``/``file_path`` (and no shell ``command``) → BOTH read and write
+    ``path``/``file_path``/``filePath`` (and no shell ``command``) → BOTH read and write
     (we cannot tell read from write without the kind, so we apply both ceilings —
     an ungoverned one permits, so this only tightens and never misroutes a shell
     command, which carries ``command`` and is governed by the ``commands`` scope).
@@ -472,14 +493,14 @@ def classify_tool_args(
     if not raw_params or not isinstance(raw_params, Mapping):
         return ()
     pairs: list = []
-    path = raw_params.get("path") or raw_params.get("file_path")
+    paths = _tool_arg_paths(raw_params)
     url = raw_params.get("url") or raw_params.get("uri")
     has_command = bool(raw_params.get("command"))  # a shell tool → commands scope
     if tool_kind == _KIND_EDIT:
-        if isinstance(path, str) and path:
+        for path in paths:
             pairs.append(("filesystem.write", path))
     elif tool_kind == _KIND_READ:
-        if isinstance(path, str) and path:
+        for path in paths:
             pairs.append(("filesystem.read", path))
     elif tool_kind == _KIND_FETCH:
         if isinstance(url, str) and url:
@@ -493,7 +514,7 @@ def classify_tool_args(
             host = _url_host(url)
             if host:
                 pairs.append(("network.egress", host))
-        if isinstance(path, str) and path:
+        for path in paths:
             # Can't distinguish read from write without the kind → apply both
             # ceilings (tightest-wins; an ungoverned scope permits).
             pairs.append(("filesystem.read", path))
@@ -624,6 +645,12 @@ class Decision:
     reason: str
     rule: str = ""  # rule1-allow | rule1-deny | rule2-intersect | ordinal | gate | default
     layer: str = ""  # policy | profile | both | default
+    # The governed item this outcome is ABOUT. One gate query can carry several
+    # identities for a single call (a prose title plus a trusted tool name plus an
+    # MCP reference), so a denial has to say WHICH one it denied or the audit
+    # record names the wrong subject. Empty when the caller asked about one item
+    # and already knows it.
+    item: str = ""
 
 
 # A control that can answer "is this item permitted?" for ONE level.  Both
@@ -969,6 +996,16 @@ class ScopeSpec:
 # previously described the absent-key case and were wrong.
 
 # Built-in catalog.
+#
+# APPEND-ONLY CONTRACT: add a row, or retire one — never RENAME a scope in place.
+# Two things depend on it. A policy naming a retired scope fails closed at boot, so
+# a rename is a visible migration on the ceiling; and a PROFILE naming an
+# unregistered ``capabilities.*`` child that declares ``enabled: true`` is
+# deliberately TOLERATED (skipped + recorded on ``Profile.unknown_scopes``, see
+# ``_parse_controls``) so a data home shared with an edition that registers extra
+# rows still loads. A rename would land in that tolerant path and silently stop
+# governing, instead of surfacing. (A renamed row declared ``enabled: false`` still
+# fails closed — the asymmetry is documented on ``_parse_controls``.)
 SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     "tools": ScopeSpec(RULESET, matcher="identifier"),
     "mcp": ScopeSpec(RULESET, matcher="mcp"),
@@ -1388,6 +1425,12 @@ class Profile:
     bind: Optional[Bind] = None
     extends: str = ""
     controls: Mapping[str, object] = field(default_factory=dict)
+    #: Capability-family keys this profile declared that THIS build does not know
+    #: (see the key-open tolerance note in ``_parse_controls``). Diagnostic only —
+    #: an unknown key governs nothing here, so it is recorded rather than enforced.
+    #: Defaults to ``()`` so every existing constructor and ``replace()`` call keeps
+    #: working unchanged.
+    unknown_scopes: Tuple[str, ...] = ()
 
     def get(self, scope: str) -> Optional[object]:
         return self.controls.get(scope)
@@ -1509,7 +1552,13 @@ _SCOPE_ALIASES: Dict[str, str] = {
 }
 
 
-def _parse_controls(data: Mapping[str, object], *, is_policy: bool) -> Dict[str, object]:
+def _parse_controls(
+    data: Mapping[str, object],
+    *,
+    is_policy: bool,
+    unknown_out: Optional[List[str]] = None,
+    profile_name: str = "",
+) -> Dict[str, object]:
     """Flatten a policy/profile JSON body into the catalog's dotted-scope map.
 
     Data-driven against ``SCOPE_CATALOG`` so a newly ``register_scope``'d family
@@ -1522,7 +1571,58 @@ def _parse_controls(data: Mapping[str, object], *, is_policy: bool) -> Dict[str,
     * ``capabilities`` (and any registered key-open namespace) maps each child to
       ``<key>.<child>``, deferring the known/unknown decision to the catalog.
 
-    An unknown governed key fails closed (tamper-evidence / Rule 8).
+    An unknown governed key fails closed (tamper-evidence / Rule 8), with ONE
+    narrow exception: see ``unknown_out``.
+
+    ``unknown_out`` opts into KEY-OPEN TOLERANCE and is passed ONLY by
+    :func:`parse_profile`. When present, an unknown child of a key-open namespace
+    (``capabilities.*``) does not invalidate the profile — but ONLY in the
+    ASYMMETRIC case where the child is a dict whose ``enabled`` is exactly
+    ``True``. Such a child is skipped, warned about, and appended here for the
+    caller to record on ``Profile.unknown_scopes``. Every KNOWN sibling in the same
+    block still parses and is still enforced.
+
+    Every OTHER unknown child — ``enabled: false``, ``enabled`` absent, a non-dict
+    value, anything malformed — RAISES exactly as it did before the tolerance
+    existed, so the loader degrades the whole profile to its bind-preserving
+    deny-all fallback.
+
+    Why the rule is asymmetric, and why it is profile-only:
+
+    * a profile is **narrow-only**, and the intersection is performed by
+      :func:`resolve` (rule-2 intersect of ceiling ∘ profile), so an unknown
+      ``enabled: true`` cannot change ANY decision in ANY build: if the scope is
+      unregistered there is nothing to decide, and if a later build registers it
+      the profile merely declines to narrow it. Skipping it therefore loses
+      nothing, and that holds even when the key is a typo;
+    * an unknown NARROWING (``enabled: false``, or a malformed child whose intent
+      cannot be read) is indistinguishable from a typo'd narrowing of a CORE
+      capability — ``{"spwan": {"enabled": false}}`` reads exactly like a failed
+      attempt to disable ``spawn``. Honoring the operator's intent requires
+      failing closed there: the loud deny-all fallback surfaces the typo, whereas
+      tolerating it would silently grant what the operator tried to deny;
+    * the POLICY/ceiling path keeps raising (``unknown_out`` stays ``None``), so
+      tamper-evidence on the ceiling is unchanged (Rule 8). The policy's optional
+      top-level ``fallback`` object parses with ``is_policy=False`` but no
+      ``unknown_out``, so it fails closed at boot;
+    * unknown **top-level** governed families still fail closed either way — only
+      children inside an already-known key-open family are eligible.
+
+    The concrete defect this fixes: the internal edition ``register_scope``s extra
+    ``capabilities.*`` rows and seeds a profile naming them with ``enabled: true``;
+    a public edition reading the SAME data home rejects that whole profile and
+    degrades the surface to deny-all. Cross-edition data-home sharing is supported,
+    so an inert declaration must not be fatal.
+
+    Accepted residual: a typo'd capability name carrying ``enabled: true`` is
+    tolerated rather than surfaced. That is inert by the first bullet above (it
+    could not have changed a decision), so the cost is a missed diagnostic, not a
+    permission change. ``Profile.unknown_scopes`` is what surfaces it.
+
+    This relies on ``SCOPE_CATALOG`` being APPEND-ONLY (a scope is added or
+    retired, never renamed in place) — otherwise a renamed key declared
+    ``enabled: true`` would be silently tolerated instead of surfacing as the
+    migration it is.
     """
     controls: Dict[str, object] = {}
     # Precompute, per top-level key, the set of dotted children in the catalog.
@@ -1532,13 +1632,49 @@ def _parse_controls(data: Mapping[str, object], *, is_policy: bool) -> Dict[str,
         if sep and not tail.startswith("_"):
             nested_children.setdefault(head, set()).add(tail)
 
-    def take(scope: str, raw: object) -> None:
+    def take(scope: str, raw: object, *, tolerate_unknown: bool = False) -> None:
         # Normalize an alias (folders.* → filesystem.*) so it lands in the SAME
         # control key the gate queries, and a profile's folders.* actually narrows
         # the policy's filesystem.* ceiling.
         scope = _SCOPE_ALIASES.get(scope, scope)
         spec = SCOPE_CATALOG.get(scope)
         if spec is None:
+            # ASYMMETRIC TOLERANCE (profiles only, key-open families only): an
+            # unknown child whose payload is EXACTLY ``{"enabled": true}`` is
+            # inert — the intersection lives in resolve() and a profile is
+            # narrow-only, so declining to narrow an unregistered scope cannot
+            # change any decision in any build. The payload must be the exact
+            # one-key dict: a capability payload can carry inner narrowing
+            # rulesets (``spawn`` has ``agents``, ``publish`` has
+            # ``destinations``), so ``{"enabled": true, "agents": {...}}`` is
+            # an ENABLE-plus-NARROWING and skipping it would drop the inner
+            # narrowing — that shape, any other extra key, ``enabled: false``,
+            # a truthy-but-not-True enabled (``1``, ``"true"``), or a non-dict
+            # is indistinguishable from a typo'd narrowing of a core
+            # capability, so it must fail closed: honoring the operator's
+            # intent means the loud deny-all fallback rather than silently
+            # granting what they tried to deny. Key-set equality plus an ``is
+            # True`` identity check (never ``==``, which admits ``1``) is what
+            # makes the inertness proof airtight.
+            if (
+                tolerate_unknown
+                and unknown_out is not None
+                and isinstance(raw, dict)
+                and set(raw.keys()) == {"enabled"}
+                and raw["enabled"] is True
+            ):
+                logger.warning(
+                    "profile %r declares capability scope %r which this build does not "
+                    "register; skipping it because it is declared enabled=true, which "
+                    "cannot change any decision (a profile only narrows, and the "
+                    "intersection is applied in resolve). Known capabilities in this "
+                    "profile are still enforced. If this name is a typo, correct it — "
+                    "the same key with enabled=false would instead fail closed.",
+                    profile_name or "<unnamed>",
+                    scope,
+                )
+                unknown_out.append(scope)
+                return
             raise PlatformCompositionError(f"unknown governed scope {scope!r} (fail-closed)")
         if scope in controls:
             # Both folders.* and filesystem.* present (or a dup) → intersect so
@@ -1556,9 +1692,11 @@ def _parse_controls(data: Mapping[str, object], *, is_policy: bool) -> Dict[str,
             # A flat top-level scope (e.g. tools, mcp, commands, channels).
             take(key, raw)
         elif key in _KEY_OPEN_NAMESPACES and isinstance(raw, dict):
-            # Every child is a catalog scope; unknown child fails closed in take().
+            # Every child is a catalog scope; an unknown child fails closed in
+            # take() for a POLICY, and is tolerated + recorded for a PROFILE.
+            tolerate = not is_policy and unknown_out is not None
             for child, child_raw in raw.items():
-                take(f"{key}.{child}", child_raw)
+                take(f"{key}.{child}", child_raw, tolerate_unknown=tolerate)
         elif key in nested_children and isinstance(raw, dict):
             # A fixed-child namespace (filesystem, folders, network, sandbox, …).
             for sub, sub_raw in raw.items():
@@ -1614,10 +1752,13 @@ def parse_policy(
     if raw_updates is not None and not isinstance(raw_updates, dict):
         raise PlatformCompositionError("security policy 'updates' must be an object")
     # Optional operator-declared fallback profile (see GovernanceCeiling.fallback_profile).
-    # Parsed as a narrow-only PROFILE (is_policy=False): it is intersected with this
-    # ceiling like any per-surface profile when a profile FILE is unusable, so it can
-    # only narrow the ceiling, and an unknown scope inside it fails closed at boot
-    # exactly like a real profile would.
+    # Parsed as a narrow-only PROFILE (is_policy=False): resolve() intersects it with
+    # this ceiling like any per-surface profile when a profile FILE is unusable, so it
+    # can only narrow the ceiling. Unknown scopes inside it fail closed at boot, on
+    # BOTH sides of the key-open asymmetry: this call passes no ``unknown_out``, so a
+    # ``capabilities.*`` child this build does not register raises here even when it
+    # declares ``enabled: true`` — the case a real profile FILE tolerates. The policy
+    # document is the tamper-evidence surface (Rule 8), so it gets no tolerance.
     raw_fallback = data.get("fallback")
     fallback_profile: "Optional[Profile]" = None
     if raw_fallback is not None:
@@ -1696,12 +1837,18 @@ def parse_profile(data: Mapping[str, object]) -> Profile:
                 f"profile bind.type must be surface|app|task, got {btype!r}"
             )
         bind = Bind(type=btype, id=str(raw_bind.get("id", "")))
-    controls = _parse_controls(data, is_policy=False)
+    # Key-open tolerance is opted into HERE and nowhere else (by passing
+    # ``unknown_out``): an unknown ``capabilities.*`` child declared
+    # ``enabled: true`` is inert, so it does not cost a cross-edition data home its
+    # whole profile. Any other unknown child still raises. See _parse_controls.
+    unknown: List[str] = []
+    controls = _parse_controls(data, is_policy=False, unknown_out=unknown, profile_name=name)
     return Profile(
         name=name,
         bind=bind,
         extends=str(data.get("extends", "")),
         controls=controls,
+        unknown_scopes=tuple(unknown),
     )
 
 
@@ -2158,6 +2305,8 @@ def gate_decision(
     *,
     tool_kind: str = "",
     raw_params: Optional[Mapping[str, object]] = None,
+    mcp_ref: str = "",
+    extra_titles: Tuple[str, ...] = (),
 ) -> Decision:
     """Resolve a PreToolUse gate title against the governance ceiling ∩ profile.
 
@@ -2170,9 +2319,43 @@ def gate_decision(
     permitted here — an ungoverned scope permits.  When BOTH levels are
     ungoverned the result permits (the standalone default), so a host with no
     policy + no profile behaves exactly as today.
+
+    ``mcp_ref`` supplies an ALREADY-canonical ``@server`` / ``@server/tool``
+    reference for a caller that holds the server and tool as separate trusted
+    fields; it is checked in the ``mcp`` scope alongside anything the title maps
+    to.  Taking the reference directly is what makes such a call exact: the
+    ``mcp__<server>__<tool>`` title form is read by splitting on the LAST ``__``,
+    so it cannot represent a tool name containing ``__``, and a caller holding
+    the untangled fields must not be made to encode them into a form that loses
+    the distinction.
+
+    ``extra_titles`` carries any further NON-model-authored names the caller holds
+    for the SAME call (the trusted ``_meta.kiro.toolName`` beside a prose display
+    title). They belong in this one call rather than a second one: a separate call
+    re-resolves the active profile, so a hot reload between the two could answer
+    each question from a different snapshot and permit a tool that both complete
+    profiles deny. Empty entries are ignored.
     """
     pairs = list(classify_tool_title(tool_title))
+    # Additional NON-model-authored titles the caller holds for the same call --
+    # e.g. the trusted ``_meta.kiro.toolName`` beside an LLM-authored display
+    # title. They are classified here, in ONE decision, rather than asked as
+    # separate calls: each separate call would resolve the active profile again,
+    # so a profile hot-reloaded mid-call could serve a DIFFERENT snapshot to each
+    # question and a tool denied by both complete profiles could be permitted by
+    # every individual lookup. One snapshot, every target, deny if any denies.
+    # Empty entries are skipped: an empty title classifies to the unprefixed
+    # scopes as a real queryable item (``('tools', '')``), not a no-op, so it
+    # could match a rule it has nothing to do with.
+    for extra in extra_titles:
+        if extra:
+            pairs.extend(classify_tool_title(extra))
     pairs.extend(classify_tool_args(tool_kind, raw_params))
+    if mcp_ref:
+        pairs.append(("mcp", mcp_ref))
+    # Order-preserving dedupe -- a caller whose title already equals its trusted
+    # identity must not pay the same resolve twice.
+    pairs = list(dict.fromkeys(pairs))
     if not pairs:
         return Decision(True, "title not name-gate-governed", rule="default")
     # Deny if ANY governed scope the title/args map to denies it (the unprefixed
@@ -2181,7 +2364,10 @@ def gate_decision(
     for scope, item in pairs:
         decision = resolve(ceiling, profile, scope, item)
         if not decision.permitted:
-            return decision
+            # Name the identity that actually denied: with several targets in one
+            # query the caller cannot infer it, and an audit naming the prose
+            # title instead of the trusted tool name is a misleading record.
+            return replace(decision, item=item)
     return Decision(True, "permitted by all mapped scopes", rule="rule2-intersect")
 
 
@@ -2657,7 +2843,15 @@ def compose_profiles(parent: Profile, child: Profile) -> Profile:
             merged[scope] = c_control
             continue
         merged[scope] = _compose_controls(p_control, c_control)
-    return Profile(name=child.name, bind=child.bind or parent.bind, extends="", controls=merged)
+    # Union the diagnostic records so an ``extends`` chain does not lose the fact
+    # that a link in it named a capability this build cannot govern.
+    return Profile(
+        name=child.name,
+        bind=child.bind or parent.bind,
+        extends="",
+        controls=merged,
+        unknown_scopes=_dedup(parent.unknown_scopes + child.unknown_scopes),
+    )
 
 
 def _compose_controls(ceiling: object, narrower: object) -> object:

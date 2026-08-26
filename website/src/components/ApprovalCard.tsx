@@ -15,7 +15,10 @@ export default function ApprovalCard({ title, toolInput, showButtons, showTrust 
   // Passed through to TrustDropdown: a surface whose `trust` decision grants
   // more than the session (e.g. channel-wide, persisted) labels the real grant.
   trustAllLabelKey?: string
-  onApprove: (decision: string, pattern?: string) => void
+  /** MUST return the request's promise: it feeds the optimistic-state rollback
+   *  below (rejection restores the buttons). No `void` arm, so a fire-and-forget
+   *  handler — the shape behind #5524 — cannot compile here. */
+  onApprove: (decision: string, pattern?: string) => Promise<unknown>
 }) {
   const [decided, setDecided] = useState<string | null>(null)
   // null = no failure. `terminal` marks a refusal that retrying can never
@@ -71,7 +74,9 @@ export default function ApprovalCard({ title, toolInput, showButtons, showTrust 
 
   const isShell = title.startsWith('Running: ')
   const normalized = title.replace(/^(Running: |Reading )/, '')
-  const baseCmd = normalized.split(/\s+/)[0] || normalized
+  // Channel approvals pass ``hasCommand=false`` and grant only channel-wide
+  // trust.  Do not derive dead command/base authority from their display title.
+  const baseCmd = hasCommand ? (normalized.split(/\s+/)[0] || normalized) : ''
   // The showButtons branch renders its own i18n "Running:" label, so a shell
   // title (which carries the "Running: " prefix) must be de-prefixed there to
   // avoid "Running: Running: …". The wrench branch renders no label, so the
@@ -89,7 +94,7 @@ export default function ApprovalCard({ title, toolInput, showButtons, showTrust 
       {showButtons && !decided && !failure?.terminal && (
         <div ref={buttonsRef} className="mt-1.5 flex gap-1.5 flex-wrap">
           <button className={btnClass} onClick={() => handle('approved')}><CheckCircle className="lucide-inline" /> {i18nT('components.approvalCard.approve')}</button>
-          {showTrust && <TrustDropdown fullCommand={normalized} baseCommand={baseCmd} isShell={isShell} hasCommand={hasCommand} trustAllLabelKey={trustAllLabelKey} className={btnClass} onAction={(action, pattern) => handle(action, pattern)} />}
+          {showTrust && <TrustDropdown fullCommand={hasCommand ? normalized : ''} baseCommand={baseCmd} isShell={hasCommand && isShell} hasCommand={hasCommand} trustAllLabelKey={trustAllLabelKey} className={btnClass} onAction={(action, pattern) => handle(action, pattern)} />}
           <button className={btnClass + ' hover:!text-danger hover:!border-danger'} onClick={() => handle('rejected')}><Ban className="lucide-inline" /> {i18nT('components.approvalCard.reject')}</button>
         </div>
       )}
