@@ -34,15 +34,15 @@ describe('copyCode', () => {
     writeText.mockRejectedValueOnce(new Error('denied'))
     const execCommand = mockExecCommand(true)
 
-    await copyToClipboard('phone link')
+    await copyToClipboard('mobile link')
 
     expect(execCommand).toHaveBeenCalledWith('copy')
   })
 
-  it('rejects when neither clipboard path succeeds', async () => {
+  it('resolves false when neither clipboard path succeeds', async () => {
     writeText.mockRejectedValueOnce(new Error('denied'))
     mockExecCommand(false)
 
-    await expect(copyToClipboard('phone link')).rejects.toThrow('Copy failed')
+    await expect(copyToClipboard('mobile link')).resolves.toBe(false)
   })
 })

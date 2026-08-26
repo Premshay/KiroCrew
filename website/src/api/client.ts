@@ -13,6 +13,7 @@ import type {
   SessionInventoryList,
   SessionLaneKey,
   SessionStorageCleanup,
+  SessionStorageEmptyJob,
   SessionStorageReport,
   SessionTrashResult,
   UpdateCheckResult,
@@ -382,9 +383,12 @@ export interface TelegramConfigData {
   enabled: boolean
   allowed_user_ids: string[]
   soft_threshold_pct: number
+  show_thinking?: boolean
+  voice_replies?: boolean
   // Forum per-topic config. chat_ids are negative supergroup ids as strings.
   allow_forum?: boolean
   allowed_forum_chat_ids?: string[]
+  forum_activation?: string
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -412,8 +416,11 @@ export interface TelegramConfigSave {
   enabled: boolean
   allowed_user_ids: string[]
   soft_threshold_pct: number
+  show_thinking?: boolean
+  voice_replies?: boolean
   allow_forum?: boolean
   allowed_forum_chat_ids?: string[]
+  forum_activation?: string
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -463,6 +470,11 @@ export interface WebexConfigData {
   bot_token_preview: string
   enabled: boolean
   allowed_emails: string[]
+  allow_group_rooms: boolean
+  allowed_room_ids: string[]
+  reply_in_thread: boolean
+  soft_threshold_pct: number
+  hard_threshold_pct: number
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -473,6 +485,11 @@ export interface WebexConfigSave {
   bot_token_clear: boolean
   enabled: boolean
   allowed_emails: string[]
+  allow_group_rooms: boolean
+  allowed_room_ids: string[]
+  reply_in_thread: boolean
+  soft_threshold_pct: number
+  hard_threshold_pct: number
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -746,6 +763,7 @@ export interface GovernancePolicyData {
    *  could not be read or parsed — enforcement is correct (fail-closed) but the
    *  operator should know the ceiling is synthetic, not intentional. */
   fallback_profiles?: string[]
+  unknown_profile_scopes?: Record<string, string[]>
   /** True when governance resolution failed — the viewer shows a soft notice. */
   unavailable: boolean
   scopes: GovernanceScope[]
@@ -815,6 +833,54 @@ export interface TailnetStatusData {
   /** Epoch seconds of that startup resolution; `0` when it never resolved. */
   resolved_at: number
   state: 'pinned' | 'off' | 'unresolved' | 'active'
+}
+
+export type TailnetMobileStep =
+  | 'pinned'
+  | 'install'
+  | 'start_daemon'
+  | 'sign_in'
+  | 'enable_magicdns'
+  | 'enable_https'
+  | 'trust_off'
+  | 'restart_gateway'
+  | 'occupied'
+  | 'publish'
+  | 'ready'
+
+export interface TailnetMobileData {
+  step: TailnetMobileStep
+  host: string
+  origin: string
+  installed: boolean
+  reachable: boolean
+  logged_in: boolean
+  peer_count: number
+  peers_online: number
+  trusted: boolean
+  startup_trusted: boolean
+  published: boolean | null
+  keep_awake: boolean
+  governance_pinned: boolean
+  detail: string
+  download_url: string
+  qr_ttl_secs: number
+  serve_port: number
+  dashboard_port: number
+}
+
+export interface TailnetMobileMutation {
+  ok: boolean
+  code: string
+  detail: string
+}
+
+export interface TailnetMobileQr {
+  url: string
+  image: string
+  ttl_secs: number
+  link_window_secs: number
+  host: string
 }
 
 /**
@@ -1225,7 +1291,8 @@ function trackArtifactWrite(url: string, res: Promise<Response>): Promise<Respon
 const projectHeader = (projectKey?: string): HeadersInit | undefined =>
   projectKey ? { 'X-Steering-Project': projectKey } : undefined
 
-const get = (url: string) => fetch(url, { headers: { ..._sk } })
+const get = (url: string, sessionKey?: string) =>
+  fetch(url, { headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) } })
 const post = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
   trackArtifactWrite(url, fetch(url, {
     method: 'POST',
@@ -1491,6 +1558,7 @@ export interface KiroBonusCreditGrantPayload {
 
 export interface KiroUsagePayload {
   available?: boolean
+  reason?: string
   credits_used?: number
   credits_covered?: number
   credits_overage?: number
@@ -1703,7 +1771,9 @@ export const api = {
     post('/api/system/session-storage/restore', uids ? { batch_id: batchId, uids } : { batch_id: batchId })
       .then(j) as Promise<{ restored: number }>,
   sessionStorageEmpty: (batchIds: string[]) =>
-    post('/api/system/session-storage/empty', { batch_ids: batchIds }).then(j) as Promise<{ freed_bytes: number }>,
+    post('/api/system/session-storage/empty', { batch_ids: batchIds }).then(j) as Promise<SessionStorageEmptyJob>,
+  sessionStorageEmptyStatus: () =>
+    get('/api/system/session-storage/empty').then(j) as Promise<{ job: SessionStorageEmptyJob | null }>,
   /** Session inventory — the flat list contract (§1). */
   sessionInventory: () =>
     get('/api/system/session-storage/sessions').then(j) as Promise<SessionInventoryList>,
@@ -1718,6 +1788,8 @@ export const api = {
   // telemetry main switch: the usage rows it reads are always written.
   telemetryContextTrace: (slot: string) =>
     fetch('/api/telemetry/context-trace?slot=' + encodeURIComponent(slot)).then(j),
+  usageTurns: (slot: string) =>
+    fetch('/api/usage/turns?slot=' + encodeURIComponent(slot)).then(j),
   /** Intent summary for the chat summary panel.
    *
    *  Read-only: it never triggers generation. Summaries are produced at turn end
@@ -1782,7 +1854,14 @@ export const api = {
   // setting IS a config value and the status endpoint only reports what the
   // running server resolved from it at startup.
   tailnetStatus: () => get('/api/tailnet/status').then(j) as Promise<TailnetStatusData>,
-  mobileLoginLink: () => post('/api/auth/mobile-link').then(j) as Promise<{
+  tailnetMobile: () => get('/api/tailnet/mobile').then(j) as Promise<TailnetMobileData>,
+  tailnetMobilePublish: () =>
+    post('/api/tailnet/mobile/publish', {}).then(j) as Promise<TailnetMobileMutation>,
+  tailnetMobileUnpublish: () =>
+    post('/api/tailnet/mobile/unpublish', {}).then(j) as Promise<TailnetMobileMutation>,
+  tailnetMobileQr: (ttl?: string) =>
+    post('/api/tailnet/mobile/qr', ttl ? { ttl } : {}).then(j) as Promise<TailnetMobileQr>,
+  mobileLoginLink: (sessionKey?: string) => post('/api/auth/mobile-link', undefined, sessionKey).then(j) as Promise<{
     url: string
     expires_in: number
   }>,
@@ -1803,8 +1882,8 @@ export const api = {
   // endpoint returns the full refreshed snapshot so callers can seed the query
   // cache from the mutation response instead of re-fetching.
   listTrustedApps: () => get('/api/security/trusted-apps').then(j) as Promise<TrustedAppsData>,
-  trustApp: (name: string) =>
-    post('/api/security/trusted-apps/' + encodeURIComponent(name)).then(j) as Promise<TrustedAppsData>,
+  trustApp: (name: string, repository?: string) =>
+    post('/api/security/trusted-apps/' + encodeURIComponent(name), repository ? { repository } : undefined).then(j) as Promise<TrustedAppsData>,
   // Returns the snapshot PLUS `disabled` — revoking trust also disables an app
   // that is currently enabled, so its code stops running immediately.
   untrustApp: (name: string) =>
@@ -2109,7 +2188,12 @@ export const api = {
   prompts: () => fetch('/api/prompts').then(j),
   promptDetail: (name: string) => fetch('/api/prompts/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
   // Skills
-  skills: () => fetch('/api/skills').then(j),
+  skills: (sessionKey?: string) => get('/api/skills', sessionKey).then(j),
+  skillTrust: (sessionKey?: string) => get('/api/skills/-/trust', sessionKey).then(j),
+  grantSkillTrust: (sessionKey: string | undefined, expectedKey: string) =>
+    post('/api/skills/-/trust', { expected_key: expectedKey }, sessionKey).then(j),
+  revokeSkillTrust: (path?: string, sessionKey?: string) =>
+    del('/api/skills/-/trust' + (path ? '?path=' + encodeURIComponent(path) : ''), undefined, sessionKey).then(j),
   skill: (name: string) => fetch('/api/skills/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
   /** List the file tree under a skill's directory.  The ``/-/`` separator
    *  disambiguates from a nested skill whose last segment is ``tree``. */
@@ -2593,10 +2677,11 @@ export const api = {
    *  Filtering server-side rather than dropping unwanted hits here matters because the
    *  backend caps results BEFORE the response, so a client-side filter would silently
    *  shrink an already-capped list. */
-  fileSearch: (q: string, project?: string, signal?: AbortSignal, kinds?: 'files' | 'dirs') => {
+  fileSearch: (q: string, project?: string, signal?: AbortSignal, kinds?: 'files' | 'dirs', limit?: number) => {
     const p = new URLSearchParams({ q })
     if (project) p.set('project', project)
     if (kinds) p.set('kinds', kinds)
+    if (limit) p.set('limit', String(limit))
     return fetch(`/api/file-search?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string }>
   },
   /** Upload files via browser File API (cross-platform) */

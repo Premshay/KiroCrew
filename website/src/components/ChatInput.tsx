@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo } from 'react'
-import { ArrowUpFromLine, ArrowUp, Headset, Loader2, RotateCw, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, Check, Volume2 } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Keyboard, Square, BookOpen, X, ClipboardList, CheckCircle, Check, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, Headset, Volume2 } from 'lucide-react'
 import CopyBranchButton from './CopyBranchButton'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import { useScrollEdges } from '../hooks/useScrollEdges'
@@ -15,7 +15,7 @@ import { useSlotId } from '../providers/SlotContext'
 import { useToolPillVisible } from '../store/toolPillRegistry'
 import { ToolDetails } from '../pages/chat/ToolDetails'
 import { api, ApiError } from '../api/client'
-import { safeSetItem } from '../utils/safeStorage'
+import { safeSetItem, safeGetItem } from '../utils/safeStorage'
 import { offlineProps } from '../utils/offline'
 import { shallowEqual } from 'react-redux'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -27,6 +27,9 @@ import TrustDropdown from './TrustDropdown'
 import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { isTouchDevice } from '../utils/isTouchDevice'
+import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
+import { Btn } from './ui'
+import { useTouchPushToTalk } from '../hooks/useTouchPushToTalk'
 import { consumeComposerRelease } from '../pages/chat/composerFocus'
 import BusySendButton, { useBusySendMode } from './BusySendButton'
 import { isScreenSnipSupported } from '../hooks/useScreenSnip'
@@ -52,11 +55,21 @@ import {
   findTokenRanges,
 } from '../utils/pasteTokens'
 import type { SendMode } from '../pages/chat/ChatSettings'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
 // Upload picker accept hints. Client-side ONLY (UX) — the server validates type
 // (magic bytes), size, and runs malware scanning per input-validation guidance.
 const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/svg+xml'
-const FILE_ACCEPT = IMAGE_ACCEPT + ',.txt,.md,.json,.har,.yaml,.yml,.xml,.csv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
+// Video containers the server accepts (see `_ALLOWED_VIDEO_EXT`). MIME form, not
+// extensions, because this string is also what the MOBILE photo picker filters
+// the library by: iOS shows videos only when a video/* type is listed, so an
+// extension-only hint is what made a phone able to attach photos and nothing else.
+// One MIME per accepted extension — `video/x-m4v` is NOT covered by `video/mp4`
+// in a picker's filter, so omitting it hides a file the server would accept.
+// test_accept_list_covers_every_accepted_extension pins this set against the
+// server's, from the Python side, since a vitest cannot read the Python constant.
+const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
+const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.md,.json,.har,.yaml,.yml,.xml,.csv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 // Extension per image MIME type, mirroring IMAGE_ACCEPT. Used to synthesize a
 // filename for clipboard-pasted images (see nameClipboardImage).
@@ -96,7 +109,7 @@ function nameClipboardImage(f: File, batchIndex: number): File {
   return new File([f], `pasted-image-${stamp}${suffix}.${ext}`, { type: f.type, lastModified: f.lastModified })
 }
 
-import ApprovalModePicker from './ApprovalModePicker'
+import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
 // Re-exported here for back-compat with existing `from './ChatInput'` imports.
 export {
@@ -113,8 +126,11 @@ import SlashCommandMenu from './SlashCommandMenu'
 import FilePickerMenu from './FilePickerMenu'
 import type { FileKind } from './FilePickerMenu'
 import SkillPickerMenu from './SkillPickerMenu'
+import { skillsCacheStaleTime } from '../lib/skillsCache'
+import ProjectSkillsTrustDialog from './ProjectSkillsTrustDialog'
 import { matchFileToken, matchSkillToken, replaceTokenAtCaret } from './composerTokens'
 import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
+import { useMeasuredHeight } from '../hooks/useMeasuredHeight'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateFields, fmtPercent } from '../i18n/format'
@@ -124,16 +140,15 @@ const INPUT_MIN_H = 44
 const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
 const INPUT_DRAG_MIN_H = 93
-const FILE_PREVIEW_H = 81 // h-16 (64px) + py-2 (16px) + border-t (1px)
-/** Same strip once any staged image carries a resize pill: the pill sits in flow
- *  under its thumbnail, so the tallest chip grows by gap-0.5 (2px) + the pill's
- *  own 18px. Keep in sync with ResizeBadge and FilePreviewStrip. */
-const FILE_PREVIEW_H_RESIZED = 101
-/** Height of the staged-session-reference strip: one chip row (py-1 + 12px text
- *  ≈ 26px) + py-2 (16px) + border-t (1px). Keep in sync with SessionRefStrip. */
-const SESSION_REF_STRIP_H = 43
 const INPUT_DRAG_MAX_RATIO = 0.5
 const INPUT_HEIGHT_LS_KEY = 'mc-input-height'
+/**
+ * Whether the composer is in hold-to-talk mode (`'1'`) — the WeChat-style swap
+ * where the textarea is replaced by a hold target. Persisted because using voice
+ * is a habit rather than a per-message choice: someone who dictates does it all
+ * day, and resetting to the keyboard on every mount taxes exactly them.
+ */
+const VOICE_MODE_LS_KEY = 'mc-voice-mode'
 
 // Prompt undo/redo tuning. The chat textarea is a controlled component, so any
 // programmatic value reset (send-clear, ↑/↓ history recall, prompt optimize)
@@ -171,6 +186,11 @@ function toApiDecision(d: string): 'approve' | 'reject' {
  *  `_BACKGROUND_APPROVAL_SOURCES` minus `autonudge`, which does run in-session. */
 export const UNATTENDED_APPROVAL_SOURCES = new Set(['cron', 'heartbeat', 'taskrunner'])
 
+/** B2 nudge: after this many manual one-shot approvals in one slot while the
+ *  mode is still `normal`, offer the approval-mode picker once. Three is the
+ *  point where repeated prompting reads as friction rather than safety. */
+const APPROVAL_NUDGE_THRESHOLD = 3
+
 // Pending-approval selection is slot-aware — see selectSlotPendingApproval
 // in chatSlice: each grid pane's approval bar reflects ITS slot.
 
@@ -201,12 +221,24 @@ function stripTrailingBlankLines(s: string): string {
 /** Auto-size textarea to fit content (only when not manually sized).
  *  Sets overflow:hidden during measurement so the parent flex container
  *  never sees the collapsed (height:0) intermediate state — prevents the
- *  Virtuoso message list above from reflowing and causing visible vibration. */
+ *  Virtuoso message list above from reflowing and causing visible vibration.
+ *
+ *  `parked` is a hard precondition, not an optimisation. Voice hold mode and the
+ *  dictation panel both keep the textarea mounted inside an `sr-only` box (value,
+ *  caret and IME state have to survive the swap), and `sr-only` is a 1px clip — a
+ *  textarea one pixel wide reports a `scrollHeight` of the better part of a
+ *  viewport, which this function would then clamp to `cap` and WRITE BACK as an
+ *  inline height. That height outlives the parking (nothing re-measures until
+ *  `value` changes again), so a single voice round-trip left the composer stuck
+ *  at the 140px ceiling with an empty box, on a surface whose only way to shrink
+ *  it — the drag handle's double-click — does not exist under a finger. */
 function applyHeight(
   el: HTMLTextAreaElement,
   manualHeight: number | null,
   prefillHint?: boolean,
+  parked?: boolean,
 ) {
+  if (parked) return // clipped out of layout — there is nothing valid to measure
   if (manualHeight !== null) return // manual height — wrapper controls size
   const cap = prefillHint ? INPUT_PREFILL_MAX_H : INPUT_DEFAULT_MAX_H
   const prev = el.style.height
@@ -226,6 +258,9 @@ function applyHeight(
     el.scrollTop = el.scrollHeight
   }
 }
+
+/** Stable empty result for suppressed spawn-approval reads — a fresh [] per render would churn every dependent memo. */
+const EMPTY_SPAWN_APPROVALS: ReturnType<typeof selectSlotPendingSpawnApprovals> = []
 
 interface ChatInputProps {
   value: string
@@ -291,11 +326,49 @@ interface ChatInputProps {
   /** True when a device switch applies to the live capture, not the next one. */
   voiceDeviceSwitchIsLive?: boolean
   voiceTranscribing?: boolean
+  /**
+   * "Is a transcription in flight ANYWHERE" — ungated by session ownership, the
+   * same distinction `voiceCaptureActive` draws for capture.
+   *
+   * `voiceTranscribing` is gated (`owned && transcribing`), but the refusal it
+   * has to predict is global: `startVoice` returns early on `voice.transcribing`
+   * outright, because the mic is one shared device. Gating it meant that while
+   * another session's transcript was still landing, THIS composer's voice
+   * controls looked live, invited a press, and captured nothing.
+   *
+   * Only the voice affordances read this. The composer's own text behaviour
+   * (focus, Enter-to-send) stays on the gated flag — another slot transcribing
+   * is no reason to stop this one from typing and sending.
+   */
+  voiceTranscribeActive?: boolean
   onVoiceToggle?: () => void
   /** Cancel (discard) an in-progress dictation without transcribing — Esc. */
   onVoiceCancel?: () => void
   /** Pre-warm the mic on pointer-down so recording starts instantly on click. */
   onVoicePrewarm?: () => void
+  /** Begin capture. Distinct from `onVoiceToggle` because the hold-to-talk
+   *  gesture must open and close a session on separate edges of one press —
+   *  a toggle cannot express "the finger went down" on its own. */
+  onVoiceStart?: () => Promise<void> | void
+  /** End capture AND transcribe — the commit half of the hold gesture. */
+  onVoiceStop?: () => void
+  /**
+   * Is capture in flight AT ALL — ungated by session ownership, unlike
+   * `voiceRecording`.
+   *
+   * The two are not interchangeable and the difference loses speech. Streaming
+   * STT flips its own `recording` true the moment the worklet is wired and PCM is
+   * buffering, but `useVoiceInput` assigns `sessionOwner` only AFTER the server
+   * handshake resolves — so for the length of that handshake real audio exists
+   * while `voiceRecording` (which is `owned && recording`) still reads false. The
+   * gesture's commit veto asks "did capture begin?", and answering it with the
+   * ownership-gated flag made a release inside that window take the discard
+   * branch and drop what the user had just said.
+   *
+   * Use this ONLY for that question. Anything presentational keeps
+   * `voiceRecording`, so one slot never renders another slot's capture.
+   */
+  voiceCaptureActive?: boolean
   /** Mic error (null = none), live input level [0,1], active device label, and error-dismiss. */
   voiceError?: string | null
   voiceLevel?: number
@@ -412,6 +485,36 @@ interface ChatInputProps {
    *  composerFocus one-shot (consumeComposerRelease) or macOS keyboard
    *  switches will autofocus through the release — see composerFocus.ts. */
   autoFocusKey?: string | null
+  /**
+   * Accessible name for the textarea. Defaults to the main chat's "Message
+   * input". A host mounting a SECOND composer on the same screen (the side
+   * panel) must pass a distinct name, or a screen-reader user tabbing between
+   * the two hears the same announcement for both.
+   */
+  inputAriaLabel?: string
+  /**
+   * The typed '/' command and '$' skill triggers, their pickers, and their
+   * rows in the plus menu. Defaults on. A host whose sends bypass command
+   * handling (the side panel's isolated Q&A turns treat text literally)
+   * turns this off so the menus cannot offer commands that would be sent as
+   * plain text.
+   */
+  typedCommandMenus?: boolean
+  /**
+   * The slot's approval chrome (tool-approval bar, spawn-approval banner).
+   * Defaults on. These are store-driven for the composer's slot, so a second
+   * composer on the SAME slot (the side panel) must opt out or the main
+   * turn's approvals render twice on one screen.
+   */
+  slotApprovalChrome?: boolean
+  /**
+   * The prompt-optimizer button. Defaults on. Its slot-mismatch completion
+   * path routes a late result through `onOptimizeResult`; a host whose
+   * displayed slot can change mid-optimize and that supplies no such route
+   * (the side panel) must opt out, or an optimize finished after a session
+   * switch silently discards the draft it produced.
+   */
+  promptOptimizer?: boolean
   /** Gateway WebSocket connection state. When false, send is blocked and a
    *  warning banner appears above the input. Defaults to true so callers that
    *  don't track connectivity (e.g. tests, embedded previews) keep working. */
@@ -430,7 +533,7 @@ interface ChatInputProps {
  *  the strip's overflow-x-auto can't clip it. */
 function ResizeBadge({ resize }: { resize: ResizeInfo }) {
   const [tip, setTip] = useState<{ top: number; left: number } | null>(null)
-  const ref = useRef<HTMLSpanElement>(null)
+  const ref = useRef<HTMLButtonElement>(null)
   const show = () => {
     const r = ref.current?.getBoundingClientRect()
     if (r) setTip({ top: r.top - 8, left: r.left })
@@ -448,13 +551,13 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
           wider of image and pill, so each locale pays only its own width and the
           thumbnail is never covered in any of them. `whitespace-nowrap` is what
           makes the chip grow instead of the pill wrapping. */}
-      <span
+      <button
+        type="button"
         ref={ref}
-        tabIndex={0}
         aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', { fromW: resize.fromW, fromH: resize.fromH, toW: resize.toW, toH: resize.toH })}
-        className="px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default whitespace-nowrap"
+        className="px-1.5 py-[1px] rounded-full border-0 text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default whitespace-nowrap"
         onMouseEnter={show} onMouseLeave={hide} onFocus={show} onBlur={hide}
-      >{i18nT('components.chatInput.resized')}</span>
+      >{i18nT('components.chatInput.resized')}</button>
       {tip && createPortal(
         <div
           role="tooltip"
@@ -474,7 +577,7 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
  *  effect on every render (a fresh [] literal changes deps each time). */
 const NO_DIRS: string[] = []
 
-function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemoveDir }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void }) {
+function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemoveDir, rootRef }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void; rootRef?: (node: HTMLDivElement | null) => void }) {
   const [attachScroller, edges, remeasure] = useScrollEdges<HTMLDivElement>()
   // Chips are added and removed while the strip stays mounted (a paste, a
   // remove), and the scroller keeps its own box through those changes, so the
@@ -488,10 +591,8 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
     // The wrapper exists for the edge cues: absolutely-positioned children of
     // the scroller itself would travel with the scrolled content, so the fades
     // anchor to a non-scrolling parent, same shape as the sibling strips.
-    <div className="relative">
-      {/* NOTE: rendered height must match FILE_PREVIEW_H / FILE_PREVIEW_H_RESIZED,
-          update them together.
-          items-start, not items-end: a chip carrying a resize pill is taller than a
+    <div className="relative" ref={rootRef}>
+      {/* items-start, not items-end: a chip carrying a resize pill is taller than a
           plain one, and bottom-alignment would spend that difference staggering the
           THUMBNAILS (the thing being compared) instead of letting the pills hang. */}
       <div ref={attachScroller} data-testid="preview-strip" className="flex gap-2 px-4 py-2 border-t border-border bg-chrome/50 overflow-x-auto items-start" data-image-scope="">
@@ -523,6 +624,9 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
                   every image chip, including transparent PNGs. No ceiling: a
                   panorama makes a wide chip and scrolls its siblings out of view
                   in this overflow-x-auto strip, but nobody has reported that. */}
+              {/* The listener measures intrinsic layout; the image is inside the
+                  actual preview button and is not itself interactive. */}
+              {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
               <img src={src} alt={path} className="h-16 min-w-12 rounded border border-border object-contain bg-bg-hover hover:opacity-80 transition-opacity"
                 data-lightbox-image=""
                 // A thumbnail widens when its bytes arrive (h-16 + intrinsic
@@ -596,6 +700,9 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
 
 /** Stable no-op so an unwired embedder does not remount the picker each render. */
 const noopSelectDevice = () => {}
+/** Zero-arg stand-in for an absent voice control. Separate from
+ *  `noopSelectDevice`, whose one parameter makes it unassignable to `() => void`. */
+const noopVoiceControl = () => {}
 
 function ChatInput({
   aboveComposer,
@@ -625,9 +732,13 @@ function ChatInput({
   onSelectVoiceDevice,
   voiceDeviceSwitchIsLive = false,
   voiceTranscribing = false,
+  voiceTranscribeActive,
   onVoiceToggle,
   onVoiceCancel,
   onVoicePrewarm,
+  onVoiceStart,
+  onVoiceStop,
+  voiceCaptureActive,
   voiceError = null,
   voiceLevel = 0,
   voiceDeviceLabel = '',
@@ -689,15 +800,50 @@ function ChatInput({
   onPasteBlocksChange,
   knowledgeChip,
   autoFocusKey,
+  inputAriaLabel,
+  typedCommandMenus = true,
+  slotApprovalChrome = true,
+  promptOptimizer = true,
   connected = true,
   onOptimizeResult,
 }: ChatInputProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const disabled = disabledProp
   const dispatch = useAppDispatch()
   const slotId = useSlotId()
-  const pendingApproval = useAppSelector(s => selectSlotPendingApproval(s, slotId), shallowEqual)
+  const pendingApprovalRaw = useAppSelector(s => selectSlotPendingApproval(s, slotId), shallowEqual)
+  // Suppressed at the READ so every consumer (bar, ghost, pill, rounded-corner
+  // class) follows one judgment instead of each render site re-deciding.
+  const pendingApproval = slotApprovalChrome ? pendingApprovalRaw : null
   const hasApproval = !!pendingApproval
   const [approvalSubmitting, setApprovalSubmitting] = useState(false)
+  // A2: bumping this opens the footer ApprovalModePicker with a spotlight
+  // ring, so the approval bar's hint lands the user on the real control.
+  const [approvalPickerSignal, setApprovalPickerSignal] = useState(0)
+  // A1: the hint retires once the user has ever adjusted the mode themselves.
+  // Read per approval arrival (cheap), not once per mount, so adjusting the
+  // mode hides the hint on the very next approval without a reload.
+  const approvalModeAdjusted = !!pendingApproval && !!safeGetItem(APPROVAL_MODE_ADJUSTED_LS_KEY)
+  // B2: per-slot manual one-shot approval tally for this dashboard session.
+  // In-memory by design — "3 approvals in one sitting" is the annoyance
+  // signal; persisting it would fire the nudge on stale history.
+  const approvalCountsRef = useRef<Record<string, number>>({})
+  const [approvalNudgeSlot, setApprovalNudgeSlot] = useState<string | null>(null)
+  const approvalNudgeActive = !!approvalNudgeSlot && approvalNudgeSlot === slotId
+  // Permanent dismissal (buttons / menu open): the callout has delivered its
+  // lesson, so the A1 hint retires with it — otherwise a "Got it" user keeps
+  // seeing "Tired of confirming every step?" on every later approval.
+  const dismissApprovalNudge = useCallback(() => {
+    setApprovalNudgeSlot(null)
+    // One flag carries both retirements: the adjusted/discovery flag already
+    // suppresses the hint AND gates the nudge, so a separate dismissed flag
+    // would only ever be written alongside it — dead state.
+    safeSetItem(APPROVAL_MODE_ADJUSTED_LS_KEY, '1')
+  }, [])
+  // Session-scoped hide (Escape): a reflexive Escape aimed at the composer
+  // must not spend the one-time callout unseen; it may re-fire on a later
+  // approval in this sitting.
+  const hideApprovalNudge = useCallback(() => setApprovalNudgeSlot(null), [])
   // Non-null while the last approval decision failed. Rendered as a one-line
   // strip under the composer; auto-clears so it cannot become permanent chrome.
   const [approvalNotice, setApprovalNotice] = useState<string | null>(null)
@@ -709,8 +855,12 @@ function ChatInput({
   const approvalIsReadOnly = !!(approvalMeta?.is_read_only)
   const approvalFullCommand = (approvalMeta?.full_command as string) || ''
   const approvalBaseCommand = (approvalMeta?.base_command as string) || ''
-  const approvalToolTitle = (approvalMeta?.tool_title as string) || ''
-  const approvalIsShell = approvalToolTitle.startsWith('Running: ')
+  const approvalIsShell = approvalMeta?.is_shell === '1'
+  // Command-scoped trust is offered only when the gateway proved a canonical,
+  // unredacted scope.  The title/input preview are presentation data and must
+  // never be promoted into grant authority by a frontend fallback.
+  const approvalTrustCommandGrantable = approvalMeta?.trust_command_grantable === '1'
+  const approvalTrustBaseGrantable = approvalMeta?.trust_base_grantable === '1'
   /** Sources that run with no human attached to THIS conversation. Session
    *  trust means "auto-approve tools for this chat session", which is
    *  incoherent for an unattended job: the job is not this session, so the
@@ -784,6 +934,21 @@ function ChatInput({
     const finish = () => {
       dispatch(resolveByApprovalId({ id: approvalId, decision }))
       setApprovalSubmitting(false)
+      // B2: tally manual one-shot approvals per slot. Only 'approved' counts —
+      // a trust grant already reduces future prompts, and a rejection is not
+      // approval fatigue. Fires once per dashboard install (localStorage
+      // guard) and only while the slot still asks about everything (normal).
+      if (decision === 'approved' && activeSlot && !approvalIsUnattended) {
+        const n = (approvalCountsRef.current[activeSlot] || 0) + 1
+        approvalCountsRef.current[activeSlot] = n
+        if (
+          n >= APPROVAL_NUDGE_THRESHOLD &&
+          approvalMode === 'normal' &&
+          !safeGetItem(APPROVAL_MODE_ADJUSTED_LS_KEY)
+        ) {
+          setApprovalNudgeSlot(activeSlot)
+        }
+      }
     }
     const fail = (err: unknown) => {
       setApprovalSubmitting(false)
@@ -824,7 +989,7 @@ function ChatInput({
     } else {
       api.resolveApproval(approvalId, toApiDecision(decision)).then(finish).catch(fail)
     }
-  }, [approvalId, activeSlot, approvalIsUnattended, approvalSource, dispatch])
+  }, [approvalId, activeSlot, approvalIsUnattended, approvalSource, approvalMode, dispatch])
 
   // Pending sub-agent SPAWN approvals for this slot (blocked on user approval).
   // Surfaced as a top-level banner with inline Approve/Reject so the user can
@@ -835,7 +1000,8 @@ function ChatInput({
   // Subagents tab for the fuller per-agent view (task + streaming output).
   // Resolution goes through the same api.resolveApproval + markSubagentApproving
   // path the panel uses, so the two surfaces stay consistent for a given id.
-  const pendingSpawnApprovals = useAppSelector(s => selectSlotPendingSpawnApprovals(s, slotId), shallowEqual)
+  const pendingSpawnApprovalsRaw = useAppSelector(s => selectSlotPendingSpawnApprovals(s, slotId), shallowEqual)
+  const pendingSpawnApprovals = slotApprovalChrome ? pendingSpawnApprovalsRaw : EMPTY_SPAWN_APPROVALS
   const reviewSpawnApprovals = useCallback(() => { dispatch(openActivityToTab('subagents')) }, [dispatch])
   // True once every pending spawn is mid-resolution — swaps the header buttons
   // for a "Resolving…" note. Cards stay in the pending list (status is still
@@ -1120,6 +1286,17 @@ function ChatInput({
   const [fileQuery, setFileQuery] = useState('')
   const [skillPickerOpen, setSkillPickerOpen] = useState(false)
   const [skillQuery, setSkillQuery] = useState('')
+  // Project skill awaiting consent, together with the exact chat/project/request
+  // that initiated it. A grant can outlive this dialog, so completion must not
+  // write into a different draft or supersede a newer consent request.
+  const nextTrustRequestIdRef = useRef(0)
+  const activeTrustRequestIdRef = useRef<number | null>(null)
+  const [trustPrompt, setTrustPrompt] = useState<{
+    requestId: number
+    leaf: string
+    slotKey?: string
+    project?: string
+  } | null>(null)
   // Open an in-input trigger picker from the + menu (mirrors typing the sigil):
   //  '/' slash commands (whole-input), '@' file mention, '$' skill. Inserts the
   //  sigil at a word boundary, opens the matching picker, then refocuses the box.
@@ -1140,18 +1317,25 @@ function ChatInput({
       if (el) { el.focus(); const n = el.value.length; el.setSelectionRange(n, n) }
     })
   }
-  // Warm the shared ['skills'] cache when the input gains focus so the first
+  // Warm the per-slot-and-project skills cache when the input gains focus so the first
   // `$` trigger renders the picker instantly (the fetch is the only latency).
   // prefetchQuery is a no-op if the cache is already fresh (staleTime), so it's
-  // cheap to call on every focus. Shares the key with SkillPickerMenu + SkillsTab.
+  // cheap to call on every focus. The key and the session key must match
+  // SkillPickerMenu's exactly, or the prefetch warms a different entry and the
+  // menu still pays the fetch on open.
   const queryClient = useQueryClient()
+  const skillSlotKey = slotId ? `dashboard:${slotId}` : undefined
+  const skillSlotKeyRef = useRef(skillSlotKey)
+  skillSlotKeyRef.current = skillSlotKey
+  const skillProjectRef = useRef(project)
+  skillProjectRef.current = project
   const prefetchSkills = useCallback(() => {
     queryClient.prefetchQuery({
-      queryKey: ['skills'],
-      queryFn: () => api.skills(),
-      staleTime: 5 * 60 * 1000,
+      queryKey: ['skills', skillSlotKey ?? null, project ?? null],
+      queryFn: () => api.skills(skillSlotKey),
+      staleTime: skillsCacheStaleTime(project),
     })
-  }, [queryClient])
+  }, [queryClient, skillSlotKey, project])
   // Shared caret-relative token insertion for the @/$ pickers: replace the
   // sigil-token ending at the caret with `token`, commit, and restore the caret
   // just after it. One copy keeps the two onSelect handlers duplication-free.
@@ -1162,11 +1346,33 @@ function ChatInput({
     requestAnimationFrame(() => { const e2 = inputRef.current; if (e2) { e2.focus(); e2.setSelectionRange(next.caret, next.caret) } })
   }, [value, onChange])
   const chatMessages = useAppSelector(s => s.chat.messages)
-  const [manualHeight, setManualHeight] = useState<number | null>(() => {
+  /** The persisted drag-to-resize preference. Read `manualHeight` below instead —
+   *  this is the raw stored value and is not what the composer renders at. */
+  const [manualHeightPref, setManualHeight] = useState<number | null>(() => {
     const saved = localStorage.getItem(INPUT_HEIGHT_LS_KEY)
     const n = saved ? parseInt(saved, 10) : NaN
     return !isNaN(n) && n >= INPUT_MIN_H ? n : null
   })
+  /**
+   * Drag-to-resize is pointer-only, so on a touch device the composer always
+   * auto-sizes and the persisted preference is ignored outright.
+   *
+   * Nobody drags a phone's message box, and the affordance is not merely unused
+   * there — it is a trap. The handle is a 6px strip with `touch-action:none` and a
+   * zero-px drag threshold sitting directly above the input, so a thumb that lands
+   * short pins the height on the spot; and the only way back out is a
+   * double-click, which no finger can produce. One stray tap and the box was that
+   * size for good, across reloads.
+   *
+   * Derived rather than baked into the state's seed so a pointer-class change
+   * mid-session (a tablet gaining a trackpad) is honoured in both directions:
+   * the preference is never destroyed, only disregarded while there is no pointer
+   * to have set it. Every consumer below — the wrapper's height, the textarea's
+   * `flex-1`, the manual-resize floor, `applyHeight`'s bail — reads this and so
+   * follows automatically.
+   */
+  const isTouch = useIsTouchDevice()
+  const manualHeight = isTouch ? null : manualHeightPref
 
   // Drag-to-resize refs — resize wrapper div via direct DOM writes, commit on mouseup.
   // Resizing the wrapper (not the textarea) avoids layout thrashing: the textarea
@@ -1175,6 +1381,11 @@ function ChatInput({
   const dragging = useRef(false)
   const dragStartY = useRef(0)
   const dragStartH = useRef(0)
+  /** Mirrors `textareaParked` (defined with the voice-mode derivations, far below)
+   *  for the handlers declared above it. Assigned during render, like the other
+   *  prop/state mirrors in this file, so it is already current by the time any
+   *  effect or event handler reads it. */
+  const parkedRef = useRef(false)
 
   // Prompt history navigation: -1 = draft (not in history), else index into sentMessages.
   // Refs keep the handler stable across re-renders while preserving state between keystrokes.
@@ -1274,8 +1485,12 @@ function ChatInput({
     inputRef.current?.focus()
   }, [autoFocusKey, disabled, isMobile])
 
-  // Global "/" shortcut to focus chat input (like GitHub, YouTube, Slack)
+  // Global "/" shortcut to focus chat input (like GitHub, YouTube, Slack).
+  // Only the primary command composer claims it: with a second instance
+  // mounted (the side panel), two document-level listeners would contend and
+  // the last-registered one would silently win the focus.
   useEffect(() => {
+    if (!typedCommandMenus) return
     const onSlashFocus = (e: KeyboardEvent) => {
       if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
       const tag = (e.target as HTMLElement)?.tagName
@@ -1285,7 +1500,7 @@ function ChatInput({
     }
     document.addEventListener('keydown', onSlashFocus)
     return () => document.removeEventListener('keydown', onSlashFocus)
-  }, [])
+  }, [typedCommandMenus])
 
   const inputResize = usePointerDrag({
     threshold: 0,
@@ -1357,20 +1572,11 @@ function ChatInput({
     }
   }, [manualHeight, pendingFiles.length, pendingSessions.length])
 
-  // Auto-resize textarea to fit content
-  useEffect(() => {
-    if (inputRef.current && !dragging.current) applyHeight(inputRef.current, manualHeight, prefillHint)
-  }, [value, prefillHint, manualHeight])
-
-  // Keep the paste-highlight mirror's scroll aligned with the textarea after
-  // value/height changes (applyHeight mutates scrollTop programmatically, which
-  // doesn't fire the textarea's onScroll). rAF lets layout settle first.
-  useEffect(() => {
-    const id = requestAnimationFrame(() => {
-      if (mirrorRef.current && inputRef.current) mirrorRef.current.scrollTop = inputRef.current.scrollTop
-    })
-    return () => cancelAnimationFrame(id)
-  }, [value, prefillHint, manualHeight])
+  // The two effects that MEASURE the textarea (auto-size, and the paste-mirror
+  // scroll sync that reads the scrollTop auto-size just wrote) are declared much
+  // further down, immediately below `textareaParked` — they must not run while the
+  // textarea is clipped out of layout, and a dep can only name a variable already
+  // in scope. Do not move them back up here.
 
   // Reset manual height when input is cleared (new message sent)
   const prevValueRef = useRef(value)
@@ -1472,7 +1678,7 @@ function ChatInput({
   }, [value, autoFocusKey])
 
   const handleInput = useCallback((e: React.FormEvent<HTMLTextAreaElement>) => {
-    if (!dragging.current) applyHeight(e.target as HTMLTextAreaElement, manualHeight, prefillHint)
+    if (!dragging.current) applyHeight(e.target as HTMLTextAreaElement, manualHeight, prefillHint, parkedRef.current)
   }, [manualHeight, prefillHint])
 
   const setTextUndoable = useCallback((text: string) => {
@@ -1820,11 +2026,15 @@ function ChatInput({
     }
 
     // Cmd+Shift+Enter (or Ctrl+Shift+Enter) → optimize prompt.
+    // Gated on `promptOptimizer` like the Optimize button and plus-menu row:
+    // a host that opted out (e.g. the side panel) has no optimize affordance,
+    // so the combo falls through to ordinary Enter/Shift+Enter handling there
+    // instead of rewriting a draft the surface meant to treat literally.
     // preventDefault always fires when the combo is detected so the browser's
     // default Enter behavior (newline insert) doesn't leak through when the
     // gateway is offline. The action itself is gated on `connected` to match
     // the disabled-state on the Optimize button (line ~1734).
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && e.shiftKey) {
+    if (promptOptimizer && e.key === 'Enter' && (e.metaKey || e.ctrlKey) && e.shiftKey) {
       e.preventDefault()
       if (connected) optimizePrompt()
       return
@@ -2158,21 +2368,283 @@ function ChatInput({
     e.target.value = '' // reset so same file can be re-selected
   }, [onUploadFiles])
 
-  // The preview strip renders for folder references too, so height
-  // compensation must key off both staged families — otherwise a dirs-only
-  // strip appears with no wrapper expansion and eats into the textarea.
-  const hasFiles = pendingFiles.length > 0 || pendingDirs.length > 0
-  // A resize pill makes the strip taller, so the compensation has to know about
-  // it — otherwise the extra row eats into the textarea.
-  const hasResizedFile = pendingFiles.some(p => IMG_EXT.test(p) && !!resizedInfo?.[p])
   const hasSessionRefs = pendingSessions.length > 0
-  /** Combined height of every strip currently stacked above the textarea. The
+  const [fileStripRef, fileStripH] = useMeasuredHeight<HTMLDivElement>()
+  const [sessionStripRef, sessionStripH] = useMeasuredHeight<HTMLDivElement>()
+  /** True when the composer holds something a send would carry.
+   *
+   *  Hoisted because the hold-to-talk gate has to agree with the send button, and
+   *  an inline fifth copy is how that agreement rots. It replaces exactly ONE
+   *  inline spelling (the mid-turn split-send branch); the resume and idle-send
+   *  branches keep theirs, because they ask a DIFFERENT question — they include
+   *  `hasSessionRefs` and this deliberately does not.
+   *
+   *  That exclusion is the point, not an oversight: a session ref is an
+   *  attachment, not text to read back and edit, so dictating while one is
+   *  pending is a normal thing to want and hold mode stays available for it. A
+   *  refs-only composer therefore keeps the hold bar while the send button is
+   *  live, which is correct for both. */
+  const composerHasDraft = !!value.trim() || pendingFiles.length > 0
+  /**
+   * Hold-to-talk mode: the textarea is swapped for a press-and-hold target and
+   * the mic button becomes the switch between the two.
+   *
+   * TOUCH ONLY, and that means the POINTER CLASS — not the width. Desktop already
+   * has keyboard push-to-talk (`usePushToTalk`), so a pointer-hold mode there
+   * would be a second way to do one thing, and this gesture exists precisely
+   * because a thumb has no Esc key to discard with. A narrowed desktop window is
+   * still a mouse: including `isMobile` here handed it the mode switch and took
+   * away click-to-record, which is the opposite of an addition. `directFilePicker`
+   * above pairs the two predicates because a native file dialog genuinely is a
+   * width call; this one is not, so it gates on the pointer alone.
+   *
+   * Resolved inline rather than through a second coarse-pointer subscription: the
+   * pointer class does not change under a mounted composer.
+   */
+  const voiceModeAvailable = !!onVoiceStart && !!onVoiceStop && !!onVoiceCancel && isTouchDevice()
+  const [voiceModePref, setVoiceModePref] = useState(() => localStorage.getItem(VOICE_MODE_LS_KEY) === '1')
+  /**
+   * A draft SUSPENDS hold mode instead of exiting it, so the preference survives.
+   *
+   * This is the state every finished dictation lands in: the transcript arrives
+   * in `value`, and reading, fixing and sending it are all things a hold target
+   * cannot do. Suspending hands the textarea back for exactly as long as there is
+   * something in it, then returns the hold bar without the user re-choosing it.
+   *
+   * When a capture the touch gesture OWNS is in flight, the draft check is
+   * overridden — the mechanics and the reason live with `voiceHoldMode` below.
+   */
+  /** "Is capture in flight at all" — see the `voiceCaptureActive` prop doc. Falls
+   *  back to the gated flag so the prop stays optional for other callers. */
+  const captureInFlight = voiceCaptureActive ?? voiceRecording
+  /** "Is a transcription in flight at all" — see the `voiceTranscribeActive` prop
+   *  doc. Falls back to the gated flag so the prop stays optional. */
+  const transcribeInFlight = voiceTranscribeActive ?? voiceTranscribing
+  /** State, not a ref: the hold target mounts only once hold mode is on, and the
+   *  gesture hook can only bind its listeners when that arrival is observable.
+   *  Declared above `touchPtt` because the hook binds to it. */
+  const [holdTarget, setHoldTarget] = useState<HTMLButtonElement | null>(null)
+  const touchVoice = useMemo(
+    () => ({
+      recording: captureInFlight,
+      start: onVoiceStart ?? noopVoiceControl,
+      stop: onVoiceStop ?? noopVoiceControl,
+      cancel: onVoiceCancel ?? noopVoiceControl,
+    }),
+    [captureInFlight, onVoiceStart, onVoiceStop, onVoiceCancel],
+  )
+  /*
+   * `disabled` deliberately omits `!voiceHoldMode`, and that omission is what
+   * lets `voiceHoldMode` read the hook's ownership below without a cycle. The
+   * term is implied rather than lost: the hook binds only to `holdTarget`, the
+   * only writer of `holdTarget` is the hold bar's ref, and the bar renders under
+   * `voiceHoldMode &&` — so outside hold mode the hook has no element, no
+   * listeners, and nothing left to disable. Leaving hold mode unmounts the bar,
+   * which clears the target and runs the hook's own abandon path.
+   */
+  const touchPtt = useTouchPushToTalk(touchVoice, {
+    target: holdTarget,
+    disabled: disabled || transcribeInFlight || optimizing,
+  })
+  /*
+   * A draft suspends hold mode, EXCEPT while the touch gesture's own capture is
+   * still running — otherwise a transcript landing in the composer would unmount
+   * the bar from under the finger that is still holding it.
+   *
+   * `touchPtt.owns` is what distinguishes the gesture's capture from any other,
+   * and it has to be asked: `captureInFlight` alone also matches capture opened
+   * elsewhere — the mic-as-record-button, or the keyboard push-to-talk binding
+   * on a coarse-pointer device that also has a hardware keyboard. The previous
+   * proxy, `holdTarget !== null`, could not tell those apart either: the bar is
+   * mounted for EVERY capture that happens while hold mode is on, so a keyboard
+   * dictation whose streaming partial landed in the composer kept hold mode
+   * alive and rendered a disabled `settling` bar beside a disabled mode switch —
+   * two dead touch controls describing a capture neither of them owned (#5753).
+   * Ownership comes from the hook's own state machine instead, recorded at the
+   * pointerdown that opens capture and relinquished when the gesture resolves.
+   *
+   * Relinquished AT THE RELEASE, deliberately: a draft the gesture itself
+   * streamed in drops hold mode the moment the finger lifts, and the mic — a
+   * record toggle again once hold mode drops — is the live stop control for
+   * whatever drain remains. The old proxy instead held the surface as a
+   * disabled `settling` bar until capture fully ended: a window where nothing
+   * on screen was pressable. (What is VISIBLE through that drain depends on the
+   * dictation panel: its own gate reads `voiceRecording`, so when enabled — the
+   * default — it stays up and the textarea returns when capture ends; the
+   * panel's `gestureDriven` carries the settling term for the same window, see
+   * the render site.)
+   */
+  const voiceHoldMode = voiceModeAvailable && voiceModePref
+    && (!composerHasDraft || (captureInFlight && touchPtt.owns))
+  /**
+   * True when the mic press changes MODE rather than starting a recording.
+   *
+   * ONE predicate for the label, the icon, the action and the disabled state. It
+   * is written as a single value because deriving them separately is how a control
+   * comes to say one thing and do another: with `!composerHasDraft` alone, a
+   * streaming partial landing mid-capture made the label read "Switch to keyboard"
+   * (which keys off `voiceHoldMode`, still true because capture overrides the
+   * draft) while the click ran `onVoiceToggle` and stopped the recording.
+   *
+   * `voiceHoldMode ||` is the fix and it is not redundant: hold mode being ON is
+   * itself proof there is a mode to switch out of, draft or no draft. The
+   * `!composerHasDraft` half covers the other direction — an empty composer with
+   * the preference off, where the switch is how voice gets turned on.
+   */
+  const micIsModeSwitch = voiceModeAvailable && (voiceHoldMode || !composerHasDraft)
+  /**
+   * Capture is winding DOWN: the gesture is over but the transport has not let go.
+   *
+   * Streaming `stop()` keeps `recording` true until its socket is cleaned up, and
+   * `transcribeInFlight` is still false through that drain — so the bar fell back to
+   * "Hold to talk" while enabled, and the next press hit the hook's
+   * existing-recording branch and STOPPED the phantom session instead of opening a
+   * new one. The user's next utterance was simply not captured.
+   *
+   * Derived from `touchPtt.bar` and used only for the label and the button's
+   * `disabled` — deliberately NOT fed back into the hook's own `disabled`, which
+   * would be circular. It does not need to be: a disabled <button> dispatches no
+   * pointer events, so the gesture cannot start from a bar that is switched off.
+   */
+  const voiceSettling = voiceHoldMode && touchPtt.bar === 'settling'
+  /**
+   * The textarea is PARKED: still mounted, but clipped out of layout by the
+   * `sr-only` box the hold bar and the dictation panel both put it in.
+   *
+   * Anything that measures the textarea has to ask this first — see `applyHeight`
+   * for what a 1px-wide measurement did to the composer's height. It also has to
+   * be a dep of those effects, so the height is recomputed on the way BACK: the
+   * value that was streamed in while parked is exactly the value whose height was
+   * never measurable.
+   */
+  const textareaParked = !!showDictation || voiceHoldMode
+  parkedRef.current = textareaParked
+
+  // Auto-resize textarea to fit content. Moved down here from the other composer
+  // effects so it can name `textareaParked` — see the note at that site.
+  useEffect(() => {
+    if (inputRef.current && !dragging.current) applyHeight(inputRef.current, manualHeight, prefillHint, textareaParked)
+  }, [value, prefillHint, manualHeight, textareaParked])
+
+  // Keep the paste-highlight mirror's scroll aligned with the textarea after
+  // value/height changes (applyHeight mutates scrollTop programmatically, which
+  // doesn't fire the textarea's onScroll). rAF lets layout settle first.
+  useEffect(() => {
+    const id = requestAnimationFrame(() => {
+      if (mirrorRef.current && inputRef.current) mirrorRef.current.scrollTop = inputRef.current.scrollTop
+    })
+    return () => cancelAnimationFrame(id)
+  }, [value, prefillHint, manualHeight, textareaParked])
+  const toggleVoiceMode = useCallback(() => {
+    setVoiceModePref(prev => {
+      const next = !prev
+      safeSetItem(VOICE_MODE_LS_KEY, next ? '1' : '0')
+      return next
+    })
+  }, [])
+  /**
+   * One label for the mic button, which is two different controls depending on
+   * the device: a mode SWITCH on touch, the record toggle everywhere else.
+   *
+   * The draft case is spelled out rather than left as a bare greyed button —
+   * "why can I not press this" is otherwise unanswerable, and the answer (there
+   * is unsent text in the composer) is something the user can act on.
+   */
+  // Branches on `micIsModeSwitch` FIRST, so the label can only ever describe the
+  // job the click actually performs. Reading `voiceHoldMode` first was what let the
+  // two diverge — and a transcription elsewhere must not relabel a control whose
+  // only job here is handing the keyboard back.
+  const micLabel = handsFreePhase
+    ? handsFreePhase === 'speaking'
+      ? i18nT('components.chatInput.handsfree_interrupt_hint')
+      : i18nT('components.chatInput.handsfree_stop')
+    : micIsModeSwitch
+      ? voiceHoldMode
+        ? i18nT('components.chatInput.switch_to_keyboard')
+        : i18nT('components.chatInput.switch_to_voice')
+      : transcribeInFlight
+        ? i18nT('components.chatInput.transcribing')
+        // Not a switch: it records. Same two labels the desktop mic has always had.
+        : voiceRecording
+          ? i18nT('components.chatInput.stop_recording')
+          : i18nT('components.chatInput.voice_input')
+  /**
+   * What the hold bar says, which must describe what the NEXT press or release
+   * ACTUALLY does. Two of these were wrong for the same reason — the WeChat
+   * gesture this copies sends on release, and the labels borrowed its promises
+   * without borrowing its behaviour:
+   *
+   * - Releasing does NOT send. `stopVoice` sets `sttEndpointDisarmedRef` on
+   *   purpose, so a manual stop cannot become an unrequested send; the transcript
+   *   arrives as a composer draft. A user trusting "Release to send" would release,
+   *   pocket the phone, and never notice the message was still sitting there — a
+   *   silent failure on a chat surface's core action. It says `Release to
+   *   transcribe`, which is what release does.
+   * - While transcribing, the bar is disabled and used to still read "Hold to
+   *   talk", so the dead control explained nothing.
+   */
+  const holdBarLabel = transcribeInFlight
+    ? i18nT('components.chatInput.transcribing')
+    : touchPtt.bar === 'settling'
+      // NOT "Transcribing": the drain has not handed anything to the transcriber
+      // yet. Saying so would claim work that has not started — the same overclaim
+      // this bar has already been corrected for twice.
+      ? i18nT('components.chatInput.finishing')
+      : touchPtt.bar === 'armed-cancel'
+        ? i18nT('components.chatInput.release_to_cancel')
+        : touchPtt.bar === 'holding'
+          ? i18nT('components.chatInput.release_to_transcribe')
+          : touchPtt.bar === 'tap-too-short'
+            ? i18nT('components.chatInput.keep_holding_to_record')
+            : i18nT('components.chatInput.hold_to_talk')
+  /**
+   * Discovery hint for the mic switch, shown only where the switch exists and
+   * only while it is reachable.
+   *
+   * Deliberately ranked BELOW `continuePlaceholder` and below a caller-supplied
+   * `placeholder`: the resume hint is about a broken turn and outranks a feature
+   * tour, and a caller that named its own placeholder means it.
+   *
+   * It names where the mic LEADS, not an action to perform. Two earlier wordings
+   * were both wrong for the same reason — a two-step affordance does not fit in one
+   * line, and compressing it produced a promise the tap does not keep:
+   *
+   * - "hold to talk" named a gesture with no target in keyboard mode (the textarea
+   *   cannot be one, since a long press there opens the iOS selection loupe).
+   * - "tap the mic to talk" was worse: the tap runs `toggleVoiceMode` and starts no
+   *   capture, so anyone who tapped and spoke was not recorded at all.
+   *
+   * So it promises only what the tap delivers — voice becomes available — and the
+   * hold bar that appears teaches the gesture where the gesture actually exists.
+   */
+  const voiceModePlaceholder = voiceModeAvailable && !voiceHoldMode && !composerHasDraft && !placeholder
+    ? i18nT('components.chatInput.send_a_message_or_tap_the_mic_for_voice')
+    : ''
+  /** Combined height of every strip currently stacked above the textarea,
+   *  MEASURED rather than predicted from the strips' Tailwind classes. The
    *  manual-resize floor and the transient height adjustment below both work off
    *  this total, so adding a strip can never leave one of them counting only
-   *  attachments. */
-  const stripH = (hasFiles ? (hasResizedFile ? FILE_PREVIEW_H_RESIZED : FILE_PREVIEW_H) : 0)
-    + (hasSessionRefs ? SESSION_REF_STRIP_H : 0)
-  const prevStripH = useRef(stripH)
+   *  attachments.
+   *
+   *  Each strip reports 0 while unmounted, so the sum needs no per-strip
+   *  booleans: an absent strip reserves nothing by construction. That also
+   *  retires the `hasResizedFile` special case — a chip carrying a resize pill
+   *  is simply taller when measured, instead of needing a second predicted
+   *  height, which is how the third constant came to exist in the first place.
+   */
+  const stripH = fileStripH + sessionStripH
+  /** Whether `stripH` describes what is actually on screen right now.
+   *
+   *  A measured height arrives one commit AFTER the strip mounts: the ref
+   *  callback cannot read a box that has not been laid out yet. Without this
+   *  gate the settling 0 -> 81 reads as "a strip appeared" and the transient
+   *  adjustment below inflates a persisted manual height by the strip's height
+   *  on every mount that already had something staged. Waiting for a mounted
+   *  strip to report a non-zero box makes the first value a BASELINE rather
+   *  than a change. */
+  const stripsMounted = pendingFiles.length > 0 || pendingDirs.length > 0 || hasSessionRefs
+  const stripHSettled = stripsMounted ? stripH > 0 : stripH === 0
+  const prevStripH = useRef<number | null>(null)
   const dragMinH = INPUT_DRAG_MIN_H + stripH
   const dragMinHRef = useRef(dragMinH)
   dragMinHRef.current = dragMinH
@@ -2181,11 +2653,14 @@ function ChatInput({
   // rather than a per-strip boolean keeps the arithmetic correct when both
   // strips change in the same commit (e.g. send clears files and refs at once).
   useLayoutEffect(() => {
+    if (!stripHSettled) return
     const prev = prevStripH.current
     prevStripH.current = stripH
-    if (prev === stripH) return
+    // `null` is the first settled reading: there is no previous state to have
+    // moved from, so it establishes the baseline instead of adjusting.
+    if (prev === null || prev === stripH) return
     setManualHeight(h => h !== null ? Math.max(INPUT_DRAG_MIN_H, h + (stripH - prev)) : h)
-  }, [stripH])
+  }, [stripH, stripHSettled])
 
   return (
     // 'input-area' is a stable theming hook — see website/docs/theming-contract.md
@@ -2207,13 +2682,19 @@ function ChatInput({
           push it away from the box. */}
       {aboveComposer}
 
-      {/* Drag handle — always visible, sits above approval bar or input */}
+      {/* Drag handle — sits above approval bar or input, on pointer devices only */}
       {/* Pointer-drag resize handle for the message input (double-click resets).
           Resize is a pure visual enhancement — the textarea already auto-sizes to
           its content and there is no per-pixel keyboard resize gesture — so the
-          handle is aria-hidden and carries no interactive semantics. */}
-      {!showGhost && <div
+          handle is aria-hidden and carries no interactive semantics.
+
+          Absent under a finger, and its absence is the feature: the reset is a
+          double-click, so on touch the gesture could only ever pin the height, never
+          undo it. See `manualHeight` for why the persisted value is disregarded
+          there too. */}
+      {!showGhost && !isTouch && <div
         aria-hidden="true"
+        data-testid="composer-resize-handle"
         className="flex items-center justify-center h-[6px] cursor-row-resize group/drag"
         style={{ touchAction: 'none' }}
         {...inputResize}
@@ -2396,11 +2877,12 @@ function ChatInput({
                   <div className="flex gap-1.5 flex-wrap items-center">
                       <button disabled={approvalSubmitting} className={approvalBtnClass} onClick={() => handleApprovalAction('approved')}><CheckCircle size={12} className="shrink-0" />{i18nT('components.chatInput.allow_once')}</button>
                       {approvalIsReadOnly && !approvalIsUnattended && <button disabled={approvalSubmitting} className={approvalBtnClass} onClick={() => handleApprovalAction('trust_reads')}><BookOpen size={12} className="shrink-0" />{i18nT('components.chatInput.trust_reads')}</button>}
-                      {!approvalIsUnattended && (
+                      {!approvalIsUnattended && approvalTrustCommandGrantable && (
                         <TrustDropdown
-                            fullCommand={approvalFullCommand || approvalLabelRaw}
-                            baseCommand={approvalBaseCommand || approvalLabelRaw.split(/\s+/)[0] || ''}
-                            isShell={approvalIsShell}
+                            fullCommand={approvalFullCommand}
+                            baseCommand={approvalBaseCommand}
+                            isShell={approvalIsShell && approvalTrustBaseGrantable}
+                            hasCommand={approvalTrustCommandGrantable}
                             disabled={approvalSubmitting}
                             className={approvalBtnClass}
                             onAction={(action, pattern) => { handleApprovalAction(action, pattern) }}
@@ -2409,6 +2891,31 @@ function ChatInput({
                       <button disabled={approvalSubmitting} className={`${approvalBtnClass} hover:!text-danger hover:!bg-[color-mix(in_srgb,var(--danger)_10%,transparent)]`} onClick={() => handleApprovalAction('rejected')}><Ban size={12} className="shrink-0" />{i18nT('components.chatInput.reject')}</button>
                   </div>
               </div>
+              {/* A1 discoverability hint: points at the footer mode picker so a
+                  new user learns approval prompting is adjustable. Withheld for
+                  unattended sources (the mode picker governs THIS slot, not the
+                  job that raised the card), in the ghost state (the collapsed
+                  composer unmounts the picker, so the link would have nothing
+                  to open), while the B2 nudge is up (two pointers at one
+                  control), and retired forever once the user has found the
+                  picker — via this link or by adjusting the mode. */}
+              {!showGhost && !approvalIsUnattended && !approvalModeAdjusted && !approvalNudgeActive && approvalMode && (
+                <div className="flex items-center gap-1.5 flex-wrap px-3.5 pb-2 -mt-1 text-[12px] text-muted select-none">
+                  <span>{i18nT('components.chatInput.approval_hint_question')}</span>
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-0.5 p-0 bg-transparent border-none text-accent text-[12px] cursor-pointer hover:underline"
+                    onClick={() => {
+                      // Discovery achieved: the picker is about to open under a
+                      // spotlight, so the hint has done its job for good.
+                      safeSetItem(APPROVAL_MODE_ADJUSTED_LS_KEY, '1')
+                      setApprovalPickerSignal(n => n + 1)
+                    }}
+                  >
+                    {i18nT('components.chatInput.approval_hint_adjust')}
+                  </button>
+                </div>
+              )}
             </div>
           </motion.div>
         )}
@@ -2432,7 +2939,7 @@ function ChatInput({
 
       <input id={fileInputId} ref={fileInputRef} type="file" aria-label={i18nT('components.chatInput.attach_files')} multiple accept={FILE_ACCEPT} className="sr-only" onChange={handleFileInputChange} />
 
-      <SlashCommandMenu input={value} anchorRef={inputRef as React.RefObject<HTMLElement>} open={slashMenuOpen} sendOnEnter={sendOnEnter} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />
+      {typedCommandMenus && <SlashCommandMenu input={value} anchorRef={inputRef as React.RefObject<HTMLElement>} open={slashMenuOpen} sendOnEnter={sendOnEnter} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />}
 
       {onFileSelect && (
         <FilePickerMenu
@@ -2454,18 +2961,63 @@ function ChatInput({
         />
       )}
 
-      <SkillPickerMenu
+      {typedCommandMenus && <SkillPickerMenu
         query={skillQuery}
         anchorRef={inputRef as React.RefObject<HTMLElement>}
         open={skillPickerOpen}
         sendOnEnter={sendOnEnter}
+        slotKey={skillSlotKey}
+        project={project}
         onSelect={({ leaf }) => {
           // Token left literal — backend appends the skill body; the user still
           // sees their $token marker. Caret-relative replace via shared helper.
           applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${leaf} `)
           setSkillPickerOpen(false); setSkillQuery('')
         }}
+        onTrustRequest={({ leaf }) => {
+          // An unconsented project skill: close the menu and ask, rather than
+          // inserting a token that would resolve to nothing.
+          setSkillPickerOpen(false); setSkillQuery('')
+          const requestId = nextTrustRequestIdRef.current + 1
+          nextTrustRequestIdRef.current = requestId
+          activeTrustRequestIdRef.current = requestId
+          setTrustPrompt({ requestId, leaf, slotKey: skillSlotKey, project })
+        }}
         onClose={() => { setSkillPickerOpen(false); setSkillQuery('') }}
+      />}
+      <ProjectSkillsTrustDialog
+        key={trustPrompt?.requestId ?? 0}
+        open={trustPrompt !== null}
+        skillLeaf={trustPrompt?.leaf ?? ''}
+        slotKey={trustPrompt?.slotKey}
+        onClose={() => {
+          activeTrustRequestIdRef.current = null
+          setTrustPrompt(null)
+        }}
+        onTrusted={leaf => {
+          const completedPrompt = trustPrompt
+          if (
+            !completedPrompt
+            || completedPrompt.requestId !== activeTrustRequestIdRef.current
+          ) return
+          if (
+            completedPrompt.slotKey !== skillSlotKeyRef.current
+            || completedPrompt.project !== skillProjectRef.current
+            || completedPrompt.leaf !== leaf
+          ) {
+            // Retire this prompt only if it is still current. A superseding
+            // request has a different id and must remain open.
+            activeTrustRequestIdRef.current = null
+            setTrustPrompt(current =>
+              current?.requestId === completedPrompt.requestId ? null : current)
+            return
+          }
+          activeTrustRequestIdRef.current = null
+          setTrustPrompt(null)
+          // The grant makes the token resolvable, so insert it now — the user
+          // asked for this skill and has just consented to its directory.
+          applyPickedToken(/(^|[\s])\$[a-z0-9/_-]*$/, `$${completedPrompt.leaf} `)
+        }}
       />
 
       {/* Unified input container — drag-to-resize targets the inner div. */}
@@ -2501,69 +3053,71 @@ function ChatInput({
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
-        <SessionRefStrip refs={pendingSessions} onRemove={onRemoveSessionRef} />
-        <FilePreviewStrip files={pendingFiles} dirs={pendingDirs} resizedInfo={resizedInfo} onRemove={onRemoveFile} onRemoveDir={onRemoveDir} />
+        <SessionRefStrip refs={pendingSessions} onRemove={onRemoveSessionRef} rootRef={sessionStripRef} />
+        <FilePreviewStrip files={pendingFiles} dirs={pendingDirs} resizedInfo={resizedInfo} onRemove={onRemoveFile} onRemoveDir={onRemoveDir} rootRef={fileStripRef} />
 
-        {/* Hands-free loop status. Always mounted while the loop is armed —
-            including the between-captures gaps the phase deliberately papers
-            over — so a driver gets one steady surface answering "is it safe to
-            talk". Taller touch row via hover-none, matching the 40px floor the
-            message-action footers use. */}
         {handsFreePhase && (
           <div
             data-testid="handsfree-status"
             aria-live="polite"
             className="flex items-center gap-2 px-3 py-1.5 [@media(hover:none)]:min-h-[44px] text-[12px] border-b border-border bg-accent-subtle text-accent"
           >
-            {handsFreePhase === 'listening' && (
-              <>
-                <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
-                  <span className="absolute inline-flex h-full w-full rounded-full bg-danger opacity-60 animate-ping" />
-                  <span className="relative inline-flex h-2 w-2 rounded-full bg-danger" />
-                </span>
-                <span className="font-medium">{i18nT('components.chatInput.handsfree_listening')}</span>
-              </>
-            )}
-            {handsFreePhase === 'processing' && (
-              <>
-                <Loader2 className="lucide-inline animate-spin shrink-0" />
-                <span className="font-medium">{i18nT('components.chatInput.transcribing')}</span>
-              </>
-            )}
-            {handsFreePhase === 'sent' && (
-              <>
-                <Check className="lucide-inline shrink-0" />
-                <span className="font-medium">{i18nT('components.chatInput.handsfree_sent')}</span>
-              </>
-            )}
-            {handsFreePhase === 'speaking' && (
-              <>
-                <Volume2 className="lucide-inline shrink-0" />
-                <span className="font-medium">{i18nT('components.chatInput.handsfree_speaking')}</span>
-              </>
-            )}
+            {handsFreePhase === 'listening' && <><span className="relative flex h-2 w-2 shrink-0" aria-hidden="true"><span className="absolute inline-flex h-full w-full rounded-full bg-danger opacity-60 animate-ping" /><span className="relative inline-flex h-2 w-2 rounded-full bg-danger" /></span><span className="font-medium">{i18nT('components.chatInput.handsfree_listening')}</span></>}
+            {handsFreePhase === 'processing' && <><Loader2 className="lucide-inline animate-spin shrink-0" /><span className="font-medium">{i18nT('components.chatInput.transcribing')}</span></>}
+            {handsFreePhase === 'sent' && <><Check className="lucide-inline shrink-0" /><span className="font-medium">{i18nT('components.chatInput.handsfree_sent')}</span></>}
+            {handsFreePhase === 'speaking' && <><Volume2 className="lucide-inline shrink-0" /><span className="font-medium">{i18nT('components.chatInput.handsfree_speaking')}</span></>}
             <span className="ml-auto text-muted font-normal">{i18nT(handsFreePhase === 'speaking' ? 'components.chatInput.handsfree_interrupt_hint' : 'components.chatInput.handsfree_stop_hint')}</span>
           </div>
         )}
 
+        {/* Cancel cue for the hold gesture. Rendered above the dictation panel so
+            the drop zone is genuinely UP from the thumb, and only while a press is
+            live — a permanent hint would be noise in a composer used mostly for
+            typing. `aria-live` announces the arm/disarm flip, which is the only
+            feedback a screen-reader user gets for a gesture with no focus change. */}
+        {voiceHoldMode && touchPtt.phase !== 'idle' && (
+          <div
+            data-testid="hold-cancel-cue"
+            aria-live="polite"
+            className={`flex items-center justify-center gap-1.5 py-1.5 text-[11.5px] font-medium transition-colors ${
+              touchPtt.armedCancel ? 'bg-danger text-danger-fg' : 'text-muted border-b border-dashed border-border-strong'
+            }`}
+          >
+            {touchPtt.armedCancel ? (
+              <><X size={12} className="shrink-0" />{i18nT('components.chatInput.release_to_cancel')}</>
+            ) : (
+              <><ArrowUp size={12} className="shrink-0" />{i18nT('components.chatInput.slide_up_to_cancel')}</>
+            )}
+          </div>
+        )}
+
+
         {showDictation ? (
-          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} />
+          /* `gestureDriven` carries the settling term because ownership ends at
+             the release while this panel outlives it: `showDictation` is gated
+             on `voiceRecording`, which stays true through the streaming drain.
+             `bar === 'settling'` can only name the gesture's OWN drain (the
+             hook records `draining` solely on its own commit path), so the
+             keyboard hint stays suppressed for exactly the drain the finger
+             just committed — and stays SHOWN for a keyboard-binding capture,
+             where Esc/Enter genuinely work. */
+          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} gestureDriven={voiceHoldMode || touchPtt.bar === 'settling'} />
         ) : (
           <VoiceStatusBar recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} />
         )}
 
         {optimizing && <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl"><Sparkles size={14} className="inline mr-1 text-yellow-400" /> {i18nT('components.chatInput.optimizing_prompt')}</span>}
-        <div className={`relative ${showDictation ? 'sr-only' : ''} ${manualHeight !== null ? 'flex-1 min-h-0 flex flex-col' : ''}`}>
+        <div className={`relative ${showDictation || voiceHoldMode ? 'sr-only' : ''} ${manualHeight !== null ? 'flex-1 min-h-0 flex flex-col' : ''}`}>
         <PasteHighlightLayer ref={mirrorRef} value={value} blocks={pasteBlocks} />
         <textarea
           ref={inputRef}
-          aria-label={i18nT('components.chatInput.message_input')}
+          aria-label={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
           data-composer-input=""
           aria-describedby={pastePreviewPanelId ?? undefined}
           data-composer-typo
-          className={`relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
+          className={/* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
           style={manualHeight !== null ? { height: '100%' } : undefined}
-          placeholder={!connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : voiceTranscribing ? i18nT('components.chatInput.transcribing_please_wait') : continuePlaceholder || resolvedPlaceholder}
+          placeholder={!connected ? i18nT('components.chatInput.gateway_offline_message_will_not_send') : disabledProp ? i18nT('components.chatInput.stopping') : voiceRecording ? i18nT('components.chatInput.recording_click_mic_to_stop') : voiceTranscribing ? i18nT('components.chatInput.transcribing_please_wait') : continuePlaceholder || voiceModePlaceholder || resolvedPlaceholder}
           readOnly={optimizing}
           rows={1}
           value={value}
@@ -2572,7 +3126,7 @@ function ChatInput({
           onDrop={e => { e.preventDefault(); onDrop?.(e); e.stopPropagation() }}
           onChange={e => {
             valueFromUserRef.current = true // real DOM edit, not a parent-driven draft restore
-            const val = e.target.value; onChange(val); setSlashMenuOpen(val.startsWith('/'))
+            const val = e.target.value; onChange(val); setSlashMenuOpen(typedCommandMenus && val.startsWith('/'))
             // Anchor @/$ detection to the token being edited AT THE CARET, not the
             // end of the whole input. `before` ends at the caret, so a match means
             // "the token ends where my cursor is" — which makes both pickers fire
@@ -2584,7 +3138,7 @@ function ChatInput({
             else { setFilePickerOpen(false); setFileQuery('') }
             // $ and @ are mutually exclusive (a token starts with one sigil); @ wins.
             const skillQ = fileQ === null ? matchSkillToken(before) : null
-            if (skillQ !== null) { setSkillPickerOpen(true); setSkillQuery(skillQ) }
+            if (typedCommandMenus && skillQ !== null) { setSkillPickerOpen(true); setSkillQuery(skillQ) }
             else { setSkillPickerOpen(false); setSkillQuery('') }
             recordCaret()
           }}
@@ -2609,12 +3163,48 @@ function ChatInput({
         {pasteBlocks.length > 0 && <PasteHoverLayer ref={hoverRef} value={value} blocks={pasteBlocks} mirrorRef={mirrorRef} onActivePanelChange={setPastePreviewPanelId} />}
         </div>
 
+        {/* The hold target. A real <button>, not the textarea: a long press on a
+            text field opens iOS's selection loupe and swallows the pointermoves the
+            cancel gesture is measured from, so "hold the input box" cannot be built
+            on the input box. `touch-action:none` stops the page claiming the drag as
+            a scroll, and the two -webkit rules stop the long-press callout.
+            `flex-1` mirrors the textarea so a manually-resized composer does not
+            fight the persisted height. */}
+        {voiceHoldMode && (
+          <div className={`flex px-2.5 pt-2 pb-0.5 ${manualHeight !== null ? 'flex-1 min-h-0' : ''}`}>
+            <Btn
+              type="button"
+              ref={setHoldTarget}
+              data-testid="hold-to-talk"
+              style={{ touchAction: 'none', WebkitUserSelect: 'none', WebkitTouchCallout: 'none' }}
+              // `flex-1` inside a flex row, NOT `flex` on its own: a <button> sizes
+              // to fit-content even as a block-level flex container (UA form-control
+              // sizing), so a bare display swap leaves a small pill where the whole
+              // point is a target a thumb can hit without aiming.
+              className={`flex-1 min-h-[44px] justify-center rounded-xl font-semibold select-none ${
+                touchPtt.bar === 'armed-cancel'
+                  ? 'border-dashed border-danger bg-danger-subtle text-danger'
+                  : touchPtt.bar === 'holding'
+                    ? 'border-accent bg-accent text-accent-fg'
+                    : 'border-border-strong bg-card text-text-strong'
+              }`}
+              disabled={disabled || transcribeInFlight || optimizing || voiceSettling}
+              aria-label={holdBarLabel}
+            >
+              <Mic size={15} className="shrink-0" />
+              {holdBarLabel}
+            </Btn>
+          </div>
+        )}
+
         {/* Bottom icon row */}
         <div className="flex items-center justify-between px-2.5 pb-2 pt-0.5">
-          <div className="flex flex-1 items-center gap-0.5 min-w-0">
+          <div className="flex items-center gap-0.5 min-w-0">
             {onUploadFiles && (
               <div className="relative shrink-0" ref={plusWrapRef}>
                 {directFilePicker ? (
+                  /* Association is intentionally absent while uploads disable the control. */
+                  // eslint-disable-next-line jsx-a11y/label-has-for
                   <label
                     htmlFor={uploading ? undefined : fileInputId}
                     aria-disabled={uploading || undefined}
@@ -2667,7 +3257,7 @@ function ChatInput({
                     {/* In-input trigger shortcuts: clicking inserts the sigil
                      *  and opens the matching picker (same as typing /, @, $). */}
                     <div className="mt-2 pt-2 border-t border-border flex flex-col gap-0.5">
-                      <button
+                      {typedCommandMenus && <button
                         type="button"
                         onClick={() => openTrigger('/')}
                         title={i18nT('components.chatInput.slash_commands')}
@@ -2678,7 +3268,7 @@ function ChatInput({
                           <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.command')}</div>
                           <div className="text-[11px] text-muted leading-snug">{i18nT('components.chatInput.quick_actions_like_clearing_the_chat_or_checking')}</div>
                         </div>
-                      </button>
+                      </button>}
                       {onFileSelect && (
                         <button
                           type="button"
@@ -2693,7 +3283,7 @@ function ChatInput({
                           </div>
                         </button>
                       )}
-                      <button
+                      {typedCommandMenus && <button
                         type="button"
                         onClick={() => openTrigger('$')}
                         title={i18nT('components.chatInput.use_a_skill')}
@@ -2704,7 +3294,7 @@ function ChatInput({
                           <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.skill')}</div>
                           <div className="text-[11px] text-muted leading-snug">{i18nT('components.chatInput.apply_a_ready_made_set_of_instructions')}</div>
                         </div>
-                      </button>
+                      </button>}
                     </div>
                   </div>,
                   document.body
@@ -2733,7 +3323,7 @@ function ChatInput({
                 />
               )}
               {!isMobile && approvalMode && (
-                <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} />
+                <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
               )}
               </div>
               {/* Edge cues, same treatment as the sibling strips that already
@@ -2754,19 +3344,14 @@ function ChatInput({
               )}
             </div>
             {isMobile && approvalMode && (
-              <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact />
+              <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
             )}
           </div>
           <div className="flex items-center gap-1 shrink-0">
             {onHandsFreeToggle && handsFreeAvailable && (
-              /* Hands-free mode toggle. Three visual tiers: loop armed (solid
-                 accent), preference on but idle (subtle accent), off (muted).
-                 Grows to the 40px touch floor where the pointer cannot hover;
-                 the icon tracks the button's font size via lucide-inline. */
               <button
-                className={`w-8 h-8 [@media(hover:none)]:w-10 [@media(hover:none)]:h-10 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none text-[18px] ${
-                  handsFreePhase ? 'bg-accent text-accent-fg' : handsFreeOn ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'
-                } disabled:opacity-30`}
+                type="button"
+                className={`w-8 h-8 [@media(hover:none)]:w-10 [@media(hover:none)]:h-10 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none text-[18px] ${handsFreePhase ? 'bg-accent text-accent-fg' : handsFreeOn ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'} disabled:opacity-30`}
                 onClick={onHandsFreeToggle}
                 disabled={disabled || optimizing}
                 aria-pressed={handsFreeOn}
@@ -2779,22 +3364,46 @@ function ChatInput({
             )}
             {onVoiceToggle && (
               <button
-                className={`w-8 h-8 ${handsFreeAvailable ? '[@media(hover:none)]:w-10 [@media(hover:none)]:h-10 ' : ''}rounded-lg flex items-center justify-center cursor-pointer transition-all border-none ${
-                  voiceRecording ? 'bg-danger-subtle text-danger animate-pulse' : voiceTranscribing ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'
+                type="button"
+                className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all border-none ${
+                  voiceRecording ? 'bg-danger-subtle text-danger animate-pulse' : (!micIsModeSwitch && transcribeInFlight) ? 'bg-accent-subtle text-accent' : voiceHoldMode ? 'bg-accent-subtle text-accent' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'
                 } disabled:opacity-30`}
-                onClick={onVoiceToggle}
-                onPointerDown={onVoicePrewarm}
-                // While the hands-free loop is armed the mic is its stop
-                // control, so it stays enabled through the transcribing phase
-                // (a driver must be able to halt the loop at any moment).
-                disabled={disabled || (voiceTranscribing && !handsFreePhase) || optimizing}
-                aria-label={handsFreePhase === 'speaking' ? i18nT('components.chatInput.handsfree_interrupt_hint') : handsFreePhase ? i18nT('components.chatInput.handsfree_stop') : voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
-                title={handsFreePhase === 'speaking' ? i18nT('components.chatInput.handsfree_interrupt_hint') : handsFreePhase ? i18nT('components.chatInput.handsfree_stop') : voiceRecording ? i18nT('components.chatInput.stop_recording') : voiceTranscribing ? i18nT('components.chatInput.transcribing') : i18nT('components.chatInput.voice_input')}
+                // The mic does whichever voice thing is AVAILABLE right now, which is
+                // what keeps it from becoming a dead control. On an empty composer
+                // that is the mode switch. With a draft, hold mode is suspended
+                // anyway (a hold bar cannot show text you need to read and edit),
+                // so the mic reverts to the job it had before this feature: tap to
+                // dictate, transcript spliced in at the caret.
+                //
+                // Without that second branch the switch was disabled on every draft,
+                // on every coarse-pointer device — including for someone who never
+                // opened hold mode — and since the mic is the only voice entry point
+                // on touch, dictating onto existing text became impossible. Speak,
+                // glance, speak again is how a long message actually gets composed
+                // on a phone, so losing it is not a cost of the new mode; it would
+                // have been an unconditional regression in the old one.
+                onClick={micIsModeSwitch ? toggleVoiceMode : onVoiceToggle}
+                // Prewarm only when the press will actually record. On the switch it
+                // would acquire the mic for a press that changes layout, and in hold
+                // mode the gesture's own pointerdown opens capture earlier anyway.
+                onPointerDown={micIsModeSwitch ? undefined : onVoicePrewarm}
+                /* A foreign transcription blocks STARTING a capture, so it gates the
+                   mic only while the mic is the record button. As a MODE SWITCH the
+                   click starts nothing — it hands the keyboard back — and disabling
+                   it there strands the user in voice mode, unable to type or send
+                   until unrelated work in another session finishes. */
+                disabled={disabled || optimizing || (!handsFreePhase && (micIsModeSwitch ? captureInFlight : transcribeInFlight))}
+                aria-label={micLabel}
+                title={micLabel}
               >
-                {voiceTranscribing && !handsFreePhase ? <Loader2 size={18} className="animate-spin" /> : <Mic size={18} />}
+                {!handsFreePhase && !micIsModeSwitch && transcribeInFlight ? <Loader2 size={18} className="animate-spin" /> : voiceHoldMode ? <Keyboard size={18} /> : <Mic size={18} />}
               </button>
             )}
-            {(isRunning || stopState === 'soft_pending' || stopState === 'killing') && onStop ? (
+            {/* The busy branch is reachable with EITHER a stop affordance or a
+                steer path: a host without onStop (the side panel — stopping the
+                main turn from there would be misdirected) still needs the
+                split steer/queue button while a turn runs. */}
+            {(isRunning || stopState === 'soft_pending' || stopState === 'killing') && (onStop || (canSteer && onSteer)) ? (
               stopState === 'killing' ? (
                 killingEscaped ? (
                   <div className="flex items-center gap-1.5">
@@ -2843,7 +3452,7 @@ function ChatInput({
               // unreachable before session refs existed, since an empty composer
               // mid-turn rendered the stop button instead. A bare ref therefore
               // waits for the turn to end and rides the idle send button.
-              value.trim() || pendingFiles.length ? (
+              composerHasDraft ? (
                 canSteer && onSteer ? (
                   <BusySendButton
                     mode={busySendMode}
@@ -2856,13 +3465,23 @@ function ChatInput({
                     <ArrowUpFromLine size={18} />
                   </button>
                 )
-              ) : (
+              ) : onStop ? (
                 <button className="w-8 h-8 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all" onClick={onStop} title={i18nT('components.chatInput.stop_generation')} aria-label={i18nT('components.chatInput.stop_generation')} data-testid="stop-button-armed">
                   <Square size={18} fill="currentColor" />
                 </button>
+              ) : (
+                // No stop affordance and nothing typed: keep the split button
+                // in place (disabled) so the composer's shape does not jump
+                // when the first character lands.
+                <BusySendButton
+                  mode={busySendMode}
+                  onModeChange={setBusySendMode}
+                  onFire={fireComposer}
+                  disabled
+                />
               )
             ) : (<>
-              <button
+              {promptOptimizer && <button
                 className={`w-8 h-8 rounded-lg border-none flex items-center justify-center cursor-pointer transition-all disabled:cursor-not-allowed ${optimizing ? 'bg-accent/20 text-accent animate-pulse' : 'bg-transparent text-muted hover:text-accent hover:bg-accent/10 disabled:opacity-40 disabled:hover:text-muted disabled:hover:bg-transparent'}`}
                 onClick={(e) => { e.stopPropagation(); e.preventDefault(); optimizePrompt() }}
                 // A single mutation backs this instance, so only one optimize can
@@ -2878,7 +3497,7 @@ function ChatInput({
                 {...offlineProps(connected, 'optimize', 'Optimize')}
               >
                 {optimizing ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
-              </button>
+              </button>}
               {/* 'primary' is a stable theming hook (button.primary) — see website/docs/theming-contract.md */}
               {/*
                 Sixth state of this button. The first five are send / stop /

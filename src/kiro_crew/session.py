@@ -85,6 +85,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -719,6 +720,22 @@ def _provider_has_unfinished_turn(provider: LLMProvider) -> bool:
 StopOutcome = Literal["soft", "hard", "idle"]
 
 
+class FirstTurnState(Enum):
+    """Atomic observation consumed by the first real claimant of a session."""
+
+    NOTHING_ARMED = auto()
+    FRESH = auto()
+    RESUMED = auto()
+
+    @property
+    def is_new(self) -> bool:
+        return self is not FirstTurnState.NOTHING_ARMED
+
+    @property
+    def resumed(self) -> bool:
+        return self is FirstTurnState.RESUMED
+
+
 @dataclass
 class _Session:
     provider: LLMProvider
@@ -727,17 +744,7 @@ class _Session:
     # ``last_used`` is monotonic (correct for idle math, but it has no epoch), so
     # it cannot answer "how long has this session been alive".
     created_at: float = field(default_factory=time.time)
-    is_new: bool = True
-    # One-shot companion to ``is_new``, armed only by a SPECULATIVE creator
-    # whose provider start restored the persisted transcript via ACP
-    # session/load. The existing-session fast path and the won-race path
-    # otherwise report ``resumed=False``, which would make the real first turn
-    # inject Kiro Crew history on top of the natively-replayed transcript. Set
-    # atomically at registration (never on its own — only ever alongside an
-    # armed ``is_new``) and consumed together with ``is_new`` by the first
-    # real claimant under the per-session semaphore; a speculative claimant
-    # reads without consuming.
-    resumed_armed: bool = False
+    first_turn: FirstTurnState = FirstTurnState.FRESH
     # Set when an identity sweep found this session BUSY and therefore left its
     # in-flight turn alone. The child is authenticated as an account that is no
     # longer signed in, so the NEXT turn on this key must not reuse it: the
@@ -788,10 +795,8 @@ class _Session:
         """
         self.provider = provider
         self.provider_switch_replay = False
-        # The replacement provider is a fresh native session, not a resumed
-        # one — a stale armed observation would make the next first turn skip
-        # history injection it actually needs.
-        self.resumed_armed = False
+        if self.first_turn is FirstTurnState.RESUMED:
+            self.first_turn = FirstTurnState.FRESH
         self.prompt_count = 0
         self.consecutive_failures = 0
         self.prev_turn_cancelled = False
@@ -1030,6 +1035,10 @@ class SessionManager:
         # cold-start).
         self._recycling: dict[str, "_Session"] = {}
         self._compact_cooldown_until: dict[str, float] = {}
+        # A deliberate fresh start suppresses history replay only for its next
+        # cold start. This lives on the manager because discard removes the
+        # session object that would otherwise carry the one-shot decision.
+        self._suppress_replay: set[str] = set()
         # Compactions whose effect could not be measured at completion time
         # (post-compaction stats reset to unknown, or telemetry not refreshed
         # yet): key -> the pct that triggered the attempt. Settled by the
@@ -1284,7 +1293,11 @@ class SessionManager:
             return
         async with self._lock:
             if BACKGROUND_KEY not in self._sessions:
-                sess = _Session(provider=provider, is_new=False, agent=BACKGROUND_AGENT)
+                sess = _Session(
+                    provider=provider,
+                    first_turn=FirstTurnState.NOTHING_ARMED,
+                    agent=BACKGROUND_AGENT,
+                )
                 self._sessions[BACKGROUND_KEY] = sess
                 logger.info("Background session created")
             else:
@@ -1733,7 +1746,7 @@ class SessionManager:
             else:
                 sess = _Session(
                     provider=provider,
-                    is_new=True,
+                    first_turn=FirstTurnState.FRESH,
                     approval_policy=approval_policy,
                     agent=agent or "",
                 )
@@ -2772,11 +2785,11 @@ class SessionManager:
                 # together at registration and consumed together here, so the
                 # real first turn observes resumed=True exactly when a resume
                 # prefetch restored the transcript.
-                was_new = sess.is_new
-                was_resumed = sess.resumed_armed
+                first_turn = sess.first_turn
                 if not speculative:
-                    sess.is_new = False
-                    sess.resumed_armed = False
+                    sess.first_turn = FirstTurnState.NOTHING_ARMED
+                was_new = first_turn.is_new
+                was_resumed = first_turn.resumed
                 return sess.provider, was_new, was_resumed
             # Stale between claim and acquire — the semaphore has already been
             # released by the re-validate. If the entry is still ours but the
@@ -3135,22 +3148,14 @@ class SessionManager:
                     _won_race_sess = sess
                     _dup_provider = provider
                 else:
+                    first_turn = (
+                        FirstTurnState.NOTHING_ARMED
+                        if not speculative
+                        else FirstTurnState.RESUMED if resumed else FirstTurnState.FRESH
+                    )
                     sess = _Session(
                         provider=provider,
-                        # A real creator consumes the first-turn flag itself
-                        # (is_new=True goes back to it in `result`); a
-                        # speculative creator leaves it ARMED for the first
-                        # real turn, which claims it via the fast path or the
-                        # won-race path. Set atomically at registration, under
-                        # self._lock — this is what replaces the racy
-                        # rearm-after-release design.
-                        is_new=bool(speculative),
-                        # Armed only alongside is_new: a speculative resume
-                        # creator whose session/load actually restored the
-                        # transcript owes the resumed=True observation to the
-                        # first real claimant. A real creator receives
-                        # ``resumed`` directly in its own return tuple.
-                        resumed_armed=bool(speculative and resumed),
+                        first_turn=first_turn,
                         approval_policy=approval_policy,
                         agent=agent or "",
                     )
@@ -3227,11 +3232,11 @@ class SessionManager:
                 # later message). Both-real races are unchanged: the real
                 # winner consumed its own flag at registration, so was_new
                 # reads False exactly as before.
-                was_new = _won_race_sess.is_new
-                was_resumed = _won_race_sess.resumed_armed
+                first_turn = _won_race_sess.first_turn
                 if not speculative:
-                    _won_race_sess.is_new = False
-                    _won_race_sess.resumed_armed = False
+                    _won_race_sess.first_turn = FirstTurnState.NOTHING_ARMED
+                was_new = first_turn.is_new
+                was_resumed = first_turn.resumed
                 return _won_race_sess.provider, was_new, was_resumed
             # Stale winner: the semaphore has already been released by the
             # re-validate; retry from the top (cold-starts cleanly). Bounded so
@@ -3514,6 +3519,17 @@ class SessionManager:
             return False
         sess.needs_context_reinjection = False
         return True
+
+    def consume_replay_suppression(self, key: str) -> bool:
+        """Read and clear whether *key*'s next cold start skips replay once."""
+        if key in self._suppress_replay:
+            self._suppress_replay.discard(key)
+            return True
+        folded = self._fold_key(key)
+        if folded in self._suppress_replay:
+            self._suppress_replay.discard(folded)
+            return True
+        return False
 
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register a callback fired when the watchdog recycles a session.
@@ -4123,6 +4139,7 @@ class SessionManager:
         async with self._lock:
             session = self._sessions.pop(key, None)
             self._compact_cooldown_until.pop(key, None)
+            self._suppress_replay.discard(key)
             self._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
         if session:
@@ -4438,7 +4455,11 @@ class SessionManager:
         key = self._fold_key(key)
         async with self._lock:
             session = self._sessions.get(key)
-            if session is None or not session.is_new or session.semaphore.locked():
+            if (
+                session is None
+                or session.first_turn is FirstTurnState.NOTHING_ARMED
+                or session.semaphore.locked()
+            ):
                 return False
             del self._sessions[key]
             self._compact_cooldown_until.pop(key, None)
@@ -4471,7 +4492,7 @@ class SessionManager:
             self._session_map.delete(key, reason=UNBIND_REASON_SESSION_DESTROYED)
             logger.info("Destroyed session (map deleted): %s", key)
 
-    async def discard_conversation(self, key: str) -> None:
+    async def discard_conversation(self, key: str, *, replay: bool = True) -> None:
         """Tear down the live session and drop ONLY its native conversation.
 
         Like :meth:`destroy`, the provider is shut down and the resume sid is
@@ -4490,6 +4511,10 @@ class SessionManager:
             session = self._sessions.pop(key, None)
             self._compact_cooldown_until.pop(key, None)
             self._compact_pending_verdict.pop(key, None)
+            if replay:
+                self._suppress_replay.discard(key)
+            else:
+                self._suppress_replay.add(key)
         try:
             if session:
                 await asyncio.to_thread(_unlink_session_queue, session)
@@ -4708,6 +4733,7 @@ class SessionManager:
             sessions = dict(self._sessions)
             self._sessions.clear()
             self._compact_cooldown_until.clear()
+            self._suppress_replay.clear()
             self._compact_pending_verdict.clear()
 
         # Bound concurrent shutdowns: each provider.shutdown() -> _kill_process()
