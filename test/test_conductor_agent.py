@@ -2,9 +2,9 @@
 
 The installer test mirrors the research-agent installer test's shape: stub the
 agents dir and ``build_agent_config``, run the installer, assert on the JSON it
-wrote. The evaluator tests run the real script over stdin/stdout — it is the
-deterministic half of the conductor's patrol, so its verdict vocabulary is
-pinned here.
+wrote. The evaluator tests pin the product module's JSON interface and run the
+real generic-Python skill adapter end to end. It is the deterministic half of
+the conductor's patrol, so its verdict vocabulary is pinned here.
 
 The ``cmd`` fixtures deliberately use ``git`` rather than ``sys.executable``:
 bare interpreters are NOT on the evaluator's allowlist (a spec could otherwise
@@ -12,13 +12,17 @@ name ``python -c <payload>``), and pinning that is one of the tests below.
 """
 
 import json
+import os
 import subprocess
 import sys
+from io import StringIO
 from pathlib import Path
+
+import pytest
 
 from skill_script_helpers import load_skill_script
 
-from kiro_crew import agent
+from kiro_crew import agent, work_acceptance
 from kiro_crew.agent_files import CONDUCTOR_AGENT_FILENAME, OWNED_KIRO_AGENT_FILES
 from kiro_crew.skills import _BUILTIN_SKILLS_DIR
 
@@ -26,6 +30,8 @@ SKILL_DIR = (
     Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "builtin_skills" / "goal-conductor"
 )
 SCRIPT = SKILL_DIR / "scripts" / "accept_eval.py"
+PRODUCT_SOURCE = Path(work_acceptance.__file__).resolve()
+PRODUCT_SRC_ROOT = PRODUCT_SOURCE.parents[1]
 
 #: An allowlisted command that always exits 0 — the "pass" fixture.
 
@@ -277,8 +283,8 @@ class TestConductorInstaller:
         assert "name: goal-conductor" in (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
 
 
-def _load_evaluator():
-    """Load accept_eval.py by file location, via the shared no-bytecode helper.
+def _load_adapter():
+    """Load the stdlib-only adapter without leaving bytecode in the skill tree.
 
     The script lives inside the checked-in skill dir (no package import path);
     loading it by file location is what lets a test assert on its internals.
@@ -286,7 +292,7 @@ def _load_evaluator():
     ``exec_module`` here would drop ``__pycache__`` beside the checked-in
     script, the exact side effect ``no-test-side-effects`` forbids.
     """
-    return load_skill_script("_accept_eval_under_test", SCRIPT)
+    return load_skill_script("_accept_eval_adapter_under_test", SCRIPT)
 
 
 class TestAcceptEvaluatorInvariant:
@@ -299,12 +305,14 @@ class TestAcceptEvaluatorInvariant:
     to stop accepting one at all.
     """
 
-    def test_pr_checks_builds_its_own_argv(self):
+    def test_pr_checks_builds_its_own_argv(self, monkeypatch):
         """The only exec path constructs argv from narrowly-typed fields."""
-        mod = _load_evaluator()
+        mod = work_acceptance
         seen = []
-        mod._run = lambda argv, cwd=None: (seen.append((argv, cwd)), ("pass", "ok"))[1]
-        verdict, _ = mod._evaluate(
+        monkeypatch.setattr(
+            mod, "_run", lambda argv, cwd=None: (seen.append((argv, cwd)), ("pass", "ok"))[1]
+        )
+        verdict, _ = mod.evaluate(
             {"accept": {"kind": "pr_checks", "pr": 123, "repo": "owner/name"}}
         )
         assert verdict == "pass"
@@ -312,7 +320,7 @@ class TestAcceptEvaluatorInvariant:
 
     def test_run_refuses_a_command_it_did_not_build(self):
         """The internal guard fails closed if a handler ever leaks spec input."""
-        mod = _load_evaluator()
+        mod = work_acceptance
         verdict, evidence = mod._run(["git", "--version"])
         assert verdict == "refused"
         assert "not a command this script builds" in evidence
@@ -325,31 +333,24 @@ class TestAcceptEvaluatorInvariant:
         if a future kind re-introduces the shape, which is the actual regression
         to prevent.
         """
-        src = SCRIPT.read_text(encoding="utf-8")
+        src = PRODUCT_SOURCE.read_text(encoding="utf-8")
         for banned in ('accept.get("argv")', 'accept.get("command")', 'accept.get("shell")'):
             assert banned not in src, f"a spec field must never name a command: {banned}"
 
     def test_pr_checks_rejects_a_non_integer_pr(self):
         """Including bool, which is an int subclass and would render as 'True'."""
-        mod = _load_evaluator()
+        mod = work_acceptance
         for bad in ("123", True, None, 12.5):
-            verdict, evidence = mod._evaluate({"accept": {"kind": "pr_checks", "pr": bad}})
+            verdict, evidence = mod.evaluate({"accept": {"kind": "pr_checks", "pr": bad}})
             assert verdict == "error", bad
             assert "integer pr" in evidence
 
 
 class TestAcceptEvaluator:
     def _run(self, items):
-        proc = subprocess.run(
-            [sys.executable, str(SCRIPT)],
-            input=json.dumps({"items": items}),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=60,
-        )
-        assert proc.returncode == 0, proc.stderr
-        return {r["id"]: r for r in json.loads(proc.stdout)["results"]}
+        stdout = StringIO()
+        assert work_acceptance.main(StringIO(json.dumps({"items": items})), stdout) == 0
+        return {r["id"]: r for r in json.loads(stdout.getvalue())["results"]}
 
     def test_verdict_vocabulary_across_kinds(self, tmp_path):
         exists = tmp_path / "made"
@@ -399,12 +400,74 @@ class TestAcceptEvaluator:
         assert "JSON object" in out["#0"]["evidence"]
 
     def test_malformed_stdin_is_a_clean_exit_2(self):
+        stdout = StringIO()
+        assert work_acceptance.main(StringIO("not json"), stdout) == 2
+        assert json.loads(stdout.getvalue())["error"].startswith("stdin must be JSON")
+
+    def test_internal_evaluator_defect_is_not_misreported_as_bad_stdin(self, monkeypatch):
+        def _boom(_payload):
+            raise RuntimeError("sentinel evaluator defect")
+
+        monkeypatch.setattr(work_acceptance, "evaluate_payload", _boom)
+        with pytest.raises(RuntimeError, match="sentinel evaluator defect"):
+            work_acceptance.main(StringIO('{"items": []}'), StringIO())
+
+
+class TestAcceptEvaluatorAdapter:
+    def test_adapter_invokes_only_the_fixed_product_command(self, monkeypatch):
+        adapter = _load_adapter()
+        seen = {}
+
+        class _Result:
+            returncode = 23
+
+        def _run(argv, **kwargs):
+            seen["argv"] = argv
+            seen["kwargs"] = kwargs
+            return _Result()
+
+        monkeypatch.setattr(adapter.subprocess, "run", _run)
+        assert adapter.main() == 23
+        assert seen["argv"] == ("kirocrew", "_acceptance-evaluate")
+        assert seen["kwargs"]["stdin"] is sys.stdin
+        assert seen["kwargs"]["stdout"] is sys.stdout
+        assert seen["kwargs"]["stderr"] is sys.stderr
+        assert seen["kwargs"]["shell"] is False
+        assert seen["kwargs"]["check"] is False
+
+    def test_generic_python_adapter_reaches_the_product_cli(self, tmp_path):
+        """The installed skill cannot import the package, so exercise its real seam."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        launcher = bin_dir / "kirocrew"
+        launcher.write_text(
+            "#!" + sys.executable + "\n"
+            "import os, sys\n"
+            "os.execv(sys.executable, [sys.executable, '-m', 'kiro_crew', "
+            "'_acceptance-evaluate'])\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        env = {
+            **os.environ,
+            "PATH": str(bin_dir),
+            "PYTHONPATH": str(PRODUCT_SRC_ROOT),
+            "KIROCREW_HOME": str(tmp_path / "home"),
+        }
         proc = subprocess.run(
             [sys.executable, str(SCRIPT)],
-            input="not json",
+            input=json.dumps({"items": [{"id": "human", "accept": {"kind": "human_approval"}}]}),
             capture_output=True,
             text=True,
             encoding="utf-8",
+            env=env,
             timeout=30,
         )
-        assert proc.returncode == 2
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout)["results"] == [
+            {
+                "id": "human",
+                "verdict": "pending",
+                "evidence": "awaiting human approval - not machine-checkable",
+            }
+        ]

@@ -1943,6 +1943,11 @@ Examples:
     # a session nothing: kiro-cli loads a server only when `tools` names it.
     sub.add_parser("mcp-dashboard")
 
+    # Stable product endpoint for the bundled goal-conductor skill.  Its
+    # underscore name keeps it out of the public CLI taxonomy: the supported
+    # user surface is the typed work-item feature, not an arbitrary evaluator.
+    sub.add_parser("_acceptance-evaluate")
+
     # Builtin app MCP servers (spawned by the agent backend, not user-facing).
     # Only builtins that actually ship an ``mcp_server`` module get a verb —
     # ``_BUILTIN_NAMES`` is load-bearing for HTTP route registration and lists
@@ -2478,6 +2483,12 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # below: `kirocrew gateway` boots through this module, and a default-off
         # optional subsystem must not be imported to start it.
         importlib.import_module("kiro_crew.mcp_dashboard").run_mcp_server()
+    elif args.command == "_acceptance-evaluate":
+        from kiro_crew.work_acceptance import main as work_acceptance_main
+
+        rc = work_acceptance_main()
+        if rc:
+            raise SystemExit(rc)
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
         # Registration gates this verb on _builtin_mcp_server_available, and
         # _run_app_mcp_server is the ONE dispatch-time spelling of "import the

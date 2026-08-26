@@ -196,10 +196,11 @@ def render_epilog(width: int = 13) -> str:
 def visible_commands(choices: Iterable[str]) -> list[str]:
     """The registered command names that belong in the top-level listing.
 
-    ``mcp-*`` entries are MCP servers the agent backend spawns; they are not
-    commands a person runs, so they are excluded here and carry no ``help``.
+    ``mcp-*`` entries are MCP servers the agent backend spawns.  Underscore
+    entries are fixed internal adapters used by packaged features.  Neither is
+    a command a person runs, so both stay out of help and typo messages.
     """
-    return [name for name in choices if not name.startswith("mcp-")]
+    return [name for name in choices if not name.startswith(("mcp-", "_"))]
 
 
 class _VisibleCommandChoices(Mapping[str, Any]):
@@ -242,7 +243,7 @@ class _VisibleCommandChoices(Mapping[str, Any]):
 
 
 def hide_internal_commands(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
-    """Keep ``mcp-*`` out of argparse's invalid-choice error message."""
+    """Keep internal adapters out of argparse's invalid-choice error message."""
     # typeshed annotates ``choices`` as a concrete dict, but argparse only ever
     # iterates it (to build that message) and tests membership (to validate the
     # command), both of which a Mapping serves; dispatch reads the action's own
