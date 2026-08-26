@@ -631,6 +631,13 @@ answers `tools/list` from):
 - **Crew routing:** `select_crew`
 - **Sessions and history:** `list_sessions`, `get_chat_session`,
   `search_chat_history`
+- **Coordinator work items:** `work_cycle_open`, `work_item_create`,
+  `work_item_list`, `work_item_read`, `work_item_update`,
+  `work_item_transition`, `work_item_evaluate`, `work_cycle_close`,
+  `work_cycle_archive_list`, `work_cycle_archive_read`. These are strictly
+  coordinator-scoped durable outcome records, not worker assignment, delivery,
+  or liveness tools; their lifecycle is in
+  [coordinator-work-items](../system-specs/features/coordinator-work-items.md).
 - **Artifacts:** `artifact_list`, `artifact_get`, `artifact_save`,
   `artifact_update`, `artifact_delete`, `artifact_move`, `artifact_versions`,
   `artifact_revert`, `artifact_folder_list`, `artifact_folder_create`,
@@ -915,6 +922,13 @@ where the lenient walk would have recorded a forgeable one.
 the session, then `POST` to a gateway HTTP endpoint that owns the state (usually
 in `DashboardState`), addressed by session key plus a per-request id, blocking on
 that round-trip if it needs a result.
+
+Coordinator work items are the on-disk durable variant of this rule. Their MCP
+handlers use `_resolve_session_key_strict()`, then pass that exact checked key to
+the strict-internal gateway route; the route repeats recognized-session and
+restricted-mode checks before deriving the coordinator store. The shared MCP
+process retains no cycle, item, or archive state, and a subagent whose strict
+identity is unavailable is refused rather than inheriting its parent's store.
 
 ### Reference implementations
 

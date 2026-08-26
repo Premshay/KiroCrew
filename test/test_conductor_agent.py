@@ -69,19 +69,18 @@ class TestConductorInstaller:
         assert data["name"] == "kirocrew-conductor"
         assert "work item" in data["prompt"]
 
-    def test_no_write_tool_and_dashboard_not_preapproved(self, tmp_path, monkeypatch):
+    def test_no_write_or_shell_tool_and_dashboard_not_preapproved(self, tmp_path, monkeypatch):
         """The two deliberate security properties of the spec.
 
         No ``fs_write``: the conductor cannot do a work item's work itself.
-        ``@kirocrew-dashboard`` and ``execute_bash`` reachable but NOT in
-        ``allowedTools``: their calls must keep passing through the tool-call
-        hook where the deny floor and governance ceiling apply.
+        ``@kirocrew-dashboard`` remains approval-gated. The new product
+        work-item evaluator removes shell from the conductor entirely.
         """
         data = self._install(tmp_path, monkeypatch)
         assert "fs_write" not in data["tools"]
         assert "@kirocrew-dashboard" in data["tools"]
         assert "@kirocrew-dashboard" not in data["allowedTools"]
-        assert "execute_bash" in data["tools"]
+        assert "execute_bash" not in data["tools"]
         assert "execute_bash" not in data["allowedTools"]
 
     def test_mounts_no_tool_the_charter_never_names(self, tmp_path, monkeypatch):
@@ -233,31 +232,20 @@ class TestConductorInstaller:
         )
         assert data["allowedTools"] == ["session", "report"]
 
-    def test_skill_documents_artifacts_as_a_string_map(self):
-        """The ledger's ``artifacts`` values MUST be JSON-serialized strings.
-
-        ``session_ledger`` handler validation rejects a non-string value with
-        ``artifacts_not_string_map`` (HTTP 400), so a skill that told the
-        conductor to send a nested object would lose every dispatched item's
-        state — the exact durability this entry exists to provide. Pinned as a
-        doc ratchet because the instruction, not the code, is what would drift.
-
-        The format is owned by ``scripts/ledger_entry.py`` (issue #5912), so
-        the skill must route encoding through the codec rather than carrying a
-        hand-written byte-format example for models to re-derive — the worked
-        example was the specification once, and produced real defects on
-        PR #5652.
-        """
+    def test_skill_uses_product_work_items_and_labels_the_codec_legacy_only(self):
+        """New coordination state cannot regress into a string-artifact codec."""
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
-        assert "artifacts_not_string_map" in text
-        assert "map of string to STRING" in text
-        # The codec is the format's one code owner: the skill must direct the
-        # conductor to it for encode/decode/validate/rotate...
+        for tool in (
+            "work_cycle_open",
+            "work_item_create",
+            "work_item_list",
+            "work_item_evaluate",
+            "work_cycle_close",
+        ):
+            assert tool in text
         assert "scripts/ledger_entry.py" in text
-        assert "ledger_entry.py encode" in text
-        # ...and must never show a bare `item-1 -> {` object literal, which is
-        # exactly the value shape the ledger rejects.
-        assert "item-1 -> {" not in text
+        assert "Do not use either for new work" in text
+        assert "ledger_entry.py encode" not in text
 
     def test_spec_is_registered_as_kirocrew_owned(self):
         """Every managed spec registers in ``OWNED_KIRO_AGENT_FILES``.

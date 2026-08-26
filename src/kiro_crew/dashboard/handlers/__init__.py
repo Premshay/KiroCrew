@@ -328,6 +328,20 @@ from kiro_crew.dashboard.handlers.session_ledger import (  # noqa: E402, F401
     api_session_ledger_record,
 )
 
+# ── Coordinator work items (handlers/work_items.py) ──
+from kiro_crew.dashboard.handlers.work_items import (  # noqa: E402, F401
+    api_work_cycle_archive_list,
+    api_work_cycle_archive_read,
+    api_work_cycle_close,
+    api_work_cycle_open,
+    api_work_item_create,
+    api_work_item_evaluate,
+    api_work_item_read,
+    api_work_item_transition,
+    api_work_item_update,
+    api_work_items_list,
+)
+
 # ── Sessions (extracted to handlers/sessions.py) ──
 from kiro_crew.dashboard.handlers.session_storage import (  # noqa: E402, F401
     api_session_inventory,

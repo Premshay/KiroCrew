@@ -49,6 +49,12 @@ The context window becomes a cache; the ledger is the authority. A loop cycle
 needs the snapshot plus its check instructions — its cost no longer grows with
 the number of cycles that came before it.
 
+Structured coordinator outcomes are deliberately not ledger artifacts. See
+[coordinator-work-items.md](coordinator-work-items.md) for the sibling store:
+it owns immutable typed acceptance, per-item bounded evidence, closed-cycle
+archives, and the one-time Goal Conductor `item-N` migration. The ledger remains
+the coordinator's small high-level resume record.
+
 ## 3. On-disk layout and lifecycle
 
 ```

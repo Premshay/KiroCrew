@@ -24,7 +24,7 @@ from aiohttp import web
 # binds via sys.modules and defers attribute access to call time, which also
 # keeps tests' monkeypatching of handlers.redact_* effective (late binding).
 import kiro_crew.dashboard.handlers as _h
-from kiro_crew import session_ledger
+from kiro_crew import session_ledger, work_items
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.chat_utils import effective_session_key
@@ -1390,15 +1390,13 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
             await state.sessions.destroy(effective_session_key(slot))
         except Exception:
             pass
-    # The work ledger persists independently of the transcript too, and its
-    # content is disposable intermediate state (nothing reconstructs from it),
-    # so a permanent delete reaps it unconditionally. Runs LAST — after the
-    # slot's turn is cancelled and its session destroyed — so an in-flight
-    # ledger write from the dying turn cannot land after the purge; a write
-    # racing in from another process can at worst recreate an orphan directory
-    # the next delete sweeps (see session_ledger.purge). Tab close
-    # (api_chat_slot_delete) deliberately does NOT reach here: the ledger is
-    # part of a session's resumable state.
+    # Coordinator work items and the per-session work ledger both persist
+    # independently of the transcript, so a permanent delete reaps them only
+    # AFTER the slot's turn is cancelled and its provider session destroyed.
+    # Tab close (api_chat_slot_delete) deliberately does NOT reach here: both
+    # stores are resumable state. A racing cross-process write can at worst
+    # recreate an orphan directory; the exact-key plus breadcrumb sweeps make
+    # the next permanent delete reclaim it.
     ledger_candidates = set(pin_slot_keys)
     if slot is not None:
         # The AUTHORITATIVE session key: a channel-born slot runs the
@@ -1416,6 +1414,12 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
             await asyncio.to_thread(session_ledger.purge, candidate)
         except Exception:
             logger.warning("History delete: ledger purge failed for %s", candidate, exc_info=True)
+        try:
+            await asyncio.to_thread(work_items.purge, candidate)
+        except (OSError, work_items.WorkItemError):
+            logger.warning(
+                "History delete: work-item purge failed for %s", candidate, exc_info=True
+            )
     # Breadcrumb sweep: a channel session's ledger is keyed by its EXACT
     # session key, but a slotless delete only holds the folded transcript
     # spelling — match each ledger's breadcrumb under the same fold so the
@@ -1427,6 +1431,12 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
         )
     except Exception:
         logger.warning("History delete: ledger sweep failed for %s", key, exc_info=True)
+    try:
+        await asyncio.to_thread(
+            work_items.purge_matching, exact_keys, folded_keys, _normalize_slot_key
+        )
+    except (OSError, work_items.WorkItemError):
+        logger.warning("History delete: work-item sweep failed for %s", key, exc_info=True)
 
 
 async def api_sessions_clear(request: web.Request) -> web.Response:

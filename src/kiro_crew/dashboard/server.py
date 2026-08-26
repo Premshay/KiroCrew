@@ -386,6 +386,9 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # cookie auth and are refused before the handler's own session
         # recognition can run.
         "/api/session-ledger",
+        # MCP-only coordinator work-item operations.  The prefix covers every
+        # cycle/item/archive sub-route; no browser route consumes this API.
+        "/api/work-items",
         # MCP-only (knowledge_add_document tool); no browser caller — the
         # dashboard ingests via its own cookie-authed knowledge routes. Same
         # wiring class as "/api/notifications/agent" above.
@@ -1157,6 +1160,20 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_delete("/api/lessons", handlers.api_lessons_delete)
     app.router.add_get("/api/session-ledger", handlers.api_session_ledger_get)
     app.router.add_post("/api/session-ledger/record", handlers.api_session_ledger_record)
+    app.router.add_get("/api/work-items", handlers.api_work_items_list)
+    app.router.add_post("/api/work-items/cycle/open", handlers.api_work_cycle_open)
+    app.router.add_post("/api/work-items/cycle/close", handlers.api_work_cycle_close)
+    app.router.add_post("/api/work-items/items", handlers.api_work_item_create)
+    app.router.add_post("/api/work-items/items/evaluate", handlers.api_work_item_evaluate)
+    app.router.add_get("/api/work-items/items/{item_id}", handlers.api_work_item_read)
+    app.router.add_post("/api/work-items/items/{item_id}/update", handlers.api_work_item_update)
+    app.router.add_post(
+        "/api/work-items/items/{item_id}/transition", handlers.api_work_item_transition
+    )
+    app.router.add_get("/api/work-items/archive", handlers.api_work_cycle_archive_list)
+    app.router.add_get(
+        "/api/work-items/archive/{cycle_id}", handlers.api_work_cycle_archive_read
+    )
     app.router.add_get("/api/crons", handlers.api_crons)
     app.router.add_post("/api/crons", handlers.api_crons_create)
     app.router.add_delete("/api/crons", handlers.api_cron_batch_delete)

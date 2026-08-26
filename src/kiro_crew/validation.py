@@ -1103,6 +1103,100 @@ SESSION_LEDGER_RECORD_SCHEMA = ToolSchema(
 # arguments; the schema's job is to enforce exactly that.
 SESSION_LEDGER_READ_SCHEMA = ToolSchema(tool_name="session_ledger_read")
 
+# Coordinator work items (work_items.py).  These schemas own the outer request
+# shape; the storage module validates the closed, typed acceptance object and
+# refuses every unsupported kind before it reaches a durable record.
+WORK_CYCLE_OPEN_SCHEMA = ToolSchema(
+    tool_name="work_cycle_open",
+    fields=[
+        FieldSpec("goal", str, required=True, max_len=2000),
+        FieldSpec("next_action", str, required=True, max_len=2000),
+    ],
+)
+
+WORK_ITEM_CREATE_SCHEMA = ToolSchema(
+    tool_name="work_item_create",
+    fields=[
+        FieldSpec("title", str, required=True, max_len=240),
+        FieldSpec("acceptance", dict, required=True),
+        FieldSpec("canonical_ref", str, max_len=2000),
+        FieldSpec("declared_resources", list, max_items=32, item_type=str, item_max_len=512),
+        FieldSpec("next_action", str, required=True, max_len=2000),
+    ],
+)
+
+
+def _work_item_update_fields(cleaned: dict[str, Any]) -> None:
+    if not any(
+        name in cleaned for name in ("canonical_ref", "declared_resources", "next_action", "event")
+    ):
+        raise ValidationError("args", "supply at least one mutable work-item field")
+    if "event_kind" in cleaned and "event" not in cleaned:
+        raise ValidationError("event_kind", "requires event")
+
+
+_WORK_ITEM_UPDATE_FIELDS = [
+    FieldSpec("canonical_ref", str, max_len=2000),
+    FieldSpec("declared_resources", list, max_items=32, item_type=str, item_max_len=512),
+    FieldSpec("next_action", str, max_len=2000),
+    FieldSpec("event", str, max_len=2000),
+    FieldSpec("event_kind", str, allowed=frozenset({"progress", "blocker"})),
+]
+
+WORK_ITEM_UPDATE_SCHEMA = ToolSchema(
+    tool_name="work_item_update",
+    fields=[
+        FieldSpec("item_id", str, required=True, max_len=64),
+        *_WORK_ITEM_UPDATE_FIELDS,
+    ],
+    custom_validator=_work_item_update_fields,
+)
+WORK_ITEM_UPDATE_ROUTE_SCHEMA = ToolSchema(
+    tool_name="work_item_update_route",
+    fields=_WORK_ITEM_UPDATE_FIELDS,
+    custom_validator=_work_item_update_fields,
+)
+
+_WORK_ITEM_TRANSITION_FIELDS = [
+    FieldSpec(
+        "state",
+        str,
+        required=True,
+        allowed=frozenset({"proposed", "waiting", "rejected", "cancelled"}),
+    ),
+    FieldSpec("event", str, required=True, max_len=2000),
+    FieldSpec("next_action", str, max_len=2000),
+]
+WORK_ITEM_TRANSITION_SCHEMA = ToolSchema(
+    tool_name="work_item_transition",
+    fields=[FieldSpec("item_id", str, required=True, max_len=64), *_WORK_ITEM_TRANSITION_FIELDS],
+)
+WORK_ITEM_TRANSITION_ROUTE_SCHEMA = ToolSchema(
+    tool_name="work_item_transition_route", fields=_WORK_ITEM_TRANSITION_FIELDS
+)
+
+WORK_ITEM_EVALUATE_SCHEMA = ToolSchema(
+    tool_name="work_item_evaluate",
+    fields=[
+        FieldSpec("item_ids", list, required=True, max_items=64, item_type=str, item_max_len=64)
+    ],
+)
+
+WORK_CYCLE_CLOSE_SCHEMA = ToolSchema(
+    tool_name="work_cycle_close",
+    fields=[FieldSpec("summary", str, required=True, max_len=2000)],
+)
+
+WORK_ITEM_LIST_SCHEMA = ToolSchema(tool_name="work_item_list")
+WORK_ITEM_READ_SCHEMA = ToolSchema(
+    tool_name="work_item_read", fields=[FieldSpec("item_id", str, required=True, max_len=64)]
+)
+WORK_CYCLE_ARCHIVE_LIST_SCHEMA = ToolSchema(tool_name="work_cycle_archive_list")
+WORK_CYCLE_ARCHIVE_READ_SCHEMA = ToolSchema(
+    tool_name="work_cycle_archive_read",
+    fields=[FieldSpec("cycle_id", str, required=True, max_len=64)],
+)
+
 SPAWN_STATUS_SCHEMA = ToolSchema(
     tool_name="spawn_status",
     fields=[
@@ -2797,6 +2891,16 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "learn_remove": LEARN_REMOVE_SCHEMA,
     "session_ledger_read": SESSION_LEDGER_READ_SCHEMA,
     "session_ledger_record": SESSION_LEDGER_RECORD_SCHEMA,
+    "work_cycle_open": WORK_CYCLE_OPEN_SCHEMA,
+    "work_item_create": WORK_ITEM_CREATE_SCHEMA,
+    "work_item_list": WORK_ITEM_LIST_SCHEMA,
+    "work_item_read": WORK_ITEM_READ_SCHEMA,
+    "work_item_update": WORK_ITEM_UPDATE_SCHEMA,
+    "work_item_transition": WORK_ITEM_TRANSITION_SCHEMA,
+    "work_item_evaluate": WORK_ITEM_EVALUATE_SCHEMA,
+    "work_cycle_close": WORK_CYCLE_CLOSE_SCHEMA,
+    "work_cycle_archive_list": WORK_CYCLE_ARCHIVE_LIST_SCHEMA,
+    "work_cycle_archive_read": WORK_CYCLE_ARCHIVE_READ_SCHEMA,
     "skill_search": SKILL_SEARCH_SCHEMA,
     "skill_discover": SKILL_DISCOVER_SCHEMA,
     "skill_fetch": SKILL_FETCH_SCHEMA,
