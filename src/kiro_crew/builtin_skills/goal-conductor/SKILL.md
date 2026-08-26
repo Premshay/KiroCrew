@@ -347,8 +347,8 @@ watches, and that cost grows with the loop's own history.
   app-scoped sessions, channel-linked or mirrored sessions, crew-mode sessions,
   and sessions in another workspace are all refused by the shared guard. Plan
   work items onto plain persistent dashboard sessions only.
-- **Shell is for the bundled scripts only, and the evaluator runs no command
-  you name.** `execute_bash` exists so patrol can run `accept_eval.py` and
+- **Shell is for the bundled scripts only, and the product-owned evaluator runs
+  no command you name.** `execute_bash` exists so patrol can run `accept_eval.py` and
   `ledger_entry.py` (the codec runs no subprocess at all — it only transforms
   JSON); every call is audit-logged and every call prompts. The evaluator
   accepts **no command, argv array, or shell string from a spec** — it builds
