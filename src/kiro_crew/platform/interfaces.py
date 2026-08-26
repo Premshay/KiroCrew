@@ -248,6 +248,15 @@ class SlackEnterpriseGate(Protocol):
     Signatures mirror ``slack/enterprise.py``: ``validate_enterprise`` is called
     once at startup with the bot token; ``check_message_origin`` is the per-
     message in-memory check.
+
+    ``extra_ids`` is advisory, and an implementation MAY ignore it. The public
+    default gate DOES ignore it: its callers derive the value from the same
+    ``slack.allowed_enterprise_ids`` key that gate re-reads itself, so the value
+    can only be an older copy of what the gate already has, and honouring it
+    would re-admit ids the operator removed. Do not rely on this parameter to
+    add ids the config does not list -- against the default gate they are
+    dropped. It stays in the signature because an edition whose allowlist comes
+    from somewhere other than that config key can still use it.
     """
 
     def validate_enterprise(
@@ -535,6 +544,75 @@ class PromptSourceProvider(Protocol):
 
 
 @dataclass(frozen=True)
+class ImportSource:
+    """One foreign agent installation the onboarding importer can read from.
+
+    A descriptor says WHERE an install is. It does not supply reader code, and it
+    does not choose a reader: the engine does all reading with its own gated
+    helpers, which is what keeps credential redaction, prompt-injection screening,
+    sensitive-path refusal, size caps and symlink rejection applying to a
+    registered source exactly as they do to a built-in one. A seam that accepted a
+    scanner callable would hand an edition the engine's internal accumulator and
+    depend on it to re-implement every one of those invariants correctly.
+
+    The engine reads a registered source as an install of **this product's own
+    on-disk layout** — a predecessor, a rename, or a fork, which is the case an
+    edition actually has. A genuinely novel foreign format needs a reader in the
+    core, because only the core can read it through the content gates; when a
+    second layout exists, naming one becomes an additive default-valued field
+    here rather than a reason to accept arbitrary reader code now.
+
+    ``env_vars`` are consulted in order and the first non-empty one wins;
+    ``home_dir`` is the fallback directory name under the user's home. A source
+    declaring only ``env_vars``, with none of them set, is left unresolved rather
+    than defaulting to the home root.
+    """
+
+    id: str
+    display_name: str
+    env_vars: tuple[str, ...] = ()
+    home_dir: str = ""
+    #: MCP server names this agent manages itself. Importing one would hand the
+    #: user a server pointing at a foreign runtime, so they are always skipped.
+    managed_mcp_names: tuple[str, ...] = ()
+    #: Whether this product REPLACES the agent — a predecessor or a rename, not
+    #: a peer the user may still be running. Only a superseded agent's leftovers
+    #: are reclaimed from the user's global provider config: doing that to a live
+    #: foreign agent would delete servers it is still using.
+    superseded: bool = False
+    #: Basenames of this agent's own launcher, used with ``superseded``. An MCP
+    #: entry whose command is one of these was written by that agent and is
+    #: purgeable once it is gone. Matched on the command, never on the server
+    #: name, so an entry the user created themselves is left alone. A shared
+    #: runtime (``node``, ``python``, a Windows shell, any versioned spelling of
+    #: one) is refused: it would reclaim every server that happens to run on it.
+    stale_mcp_binaries: tuple[str, ...] = ()
+
+
+class ImportSourceProvider(Protocol):
+    """Edition-contributed onboarding-import sources.
+
+    The public edition ships the foreign agents any user may plausibly have
+    installed. An edition whose users are migrating from a predecessor of its
+    own registers that predecessor here instead of the core naming it, which is
+    what keeps an edition-specific product name out of the public tree.
+    """
+
+    def import_sources(self) -> List[ImportSource]:
+        """Return extra import sources (Default: ``[]``).
+
+        WIRED: ``onboarding_import._sources()`` unions these over the core
+        builtins for every scan, apply, and id-validation path, so a registered
+        source appears in ``/api/onboarding/import/scan`` and is accepted by
+        ``/api/onboarding/import/apply`` with no core branching. Read
+        fail-closed through ``safe_context_call`` (fallback: builtins only), and
+        a duplicate or malformed descriptor is dropped rather than shadowing a
+        builtin.
+        """
+        ...
+
+
+@dataclass(frozen=True)
 class CapabilityResult:
     """Outcome of a ``CapabilityManager`` mutation.
 
@@ -696,6 +774,55 @@ class CapabilityManager(Protocol):
 # ── install / structural extension points ──
 
 
+class ExternalAccessPolicy(Protocol):
+    """Which external services this deployment may reach, beyond the deny floor.
+
+    The core offers three things unconditionally that a managed deployment may
+    have to withhold, and none of them had a composition point:
+
+    * **Installable-content registries.** Skill discovery (``skill_providers/``,
+      skills.sh) and MCP server discovery (``mcp_providers/``, the official MCP
+      registry) fetch from the public internet and then offer to INSTALL what
+      they return. Both hardcoded their public provider at registration time.
+    * **Cloud deployment.** ``kiro_crew/deploy/`` provisions real infrastructure
+      (S3, CloudFront, IAM roles, a reaper Lambda) in the operator's own cloud
+      account and hands back a public URL. It carries no capability gate at all,
+      so ``capabilities.publish`` — which bounds publish-provider destinations —
+      does not reach it.
+
+    One policy object rather than three, because they answer the same question
+    ("may this deployment use an external service the core offers by default?")
+    and because a single object gives ONE audited admission chokepoint and one
+    thing for an operator to implement, instead of a decision that is logged in
+    some places and not others.
+
+    Both decisions take the concrete target as well as a label. A name is
+    something a provider chooses for itself; the URL or target is what determines
+    where bytes go. An allowlist pinned to the target stops admitting a provider
+    that later repoints at a different host, rather than letting it inherit trust
+    from its name.
+
+    The public default admits everything, so open-source behaviour is unchanged.
+    """
+
+    def admits_registry(self, kind: str, name: str, api_base: str) -> bool:
+        """Whether the *kind* registry *name* serving ``api_base`` may be queried.
+
+        *kind* is the catalog the provider belongs to — ``"skill"`` or ``"mcp"``.
+        Returning ``False`` means the provider is never registered.
+        """
+        ...
+
+    def admits_cloud_deployment(self, target: str) -> bool:
+        """Whether this deployment may provision infrastructure in a cloud account.
+
+        *target* names the deployment backend (``"aws"`` today). Returning
+        ``False`` makes the deploy surface report itself disabled and refuse every
+        mutating request.
+        """
+        ...
+
+
 class AppRegistryPolicy(Protocol):
     """Trusted git hosts + clone-sandbox-mode decision for the app registry.
 
@@ -731,6 +858,35 @@ class AppsLoader(Protocol):
         pointing at internal git hosts — which its ``AppRegistryPolicy`` already
         trusts. Each row is the same dict shape as an ``app-registry.json`` entry.
         v1 method addition (no ``CONTRACT_VERSION`` bump).
+        """
+        ...
+
+    def default_registries(self) -> List[Dict[str, Any]]:
+        """External app registries the edition ships as defaults (ADD-only merge).
+
+        WIRED: ``apps/registry.py::_effective_registries`` merges these with the
+        operator's ``config.registries`` for EVERY consumer of the registry list —
+        index fetch/refresh, the trusted-host allowlist, row lookup, install, and
+        the blob-proxy allowlist. Merging at the consumption sites rather than
+        inside ``KiroCrewConfig`` is deliberate: an edition default must never be
+        written back into the operator's ``config.json`` by a config save, and must
+        never be shadowed by a stale copy that a past save persisted.
+
+        Each row is the field shape of ``config.loader.ExternalRegistryConfig``
+        (``{"name", "repo", "branch", "trust"}``); dicts, not dataclass instances,
+        so a companion need not import the config module. Missing keys take the
+        dataclass default.
+
+        An edition default WINS on a ``name`` collision with an operator entry.
+        That direction is the fail-closed one: a registry the edition pins carries
+        a ``trust`` tier, and letting a same-named operator entry replace it would
+        let a hand-edited ``config.json`` inherit that tier while repointing
+        ``repo`` somewhere else. An operator can still add registries freely — just
+        not silently repoint one the edition pinned.
+
+        The public Default returns ``[]``, so standalone behaviour is byte-identical
+        to reading ``config.registries`` alone. v1 method addition (no
+        ``CONTRACT_VERSION`` bump).
         """
         ...
 

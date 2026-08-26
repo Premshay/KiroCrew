@@ -20,7 +20,9 @@ import type { MeetingsConfig } from './api'
 import AgentPanel from './components/AgentPanel'
 import AgentPillBar from './components/AgentPillBar'
 import BroadcastBar from './components/BroadcastBar'
+import MeetingWorkspace from './components/MeetingWorkspace'
 import TaskSidebar from './components/TaskSidebar'
+import TranscriptPanel from './components/TranscriptPanel'
 import TaskReviewView from './TaskReviewView'
 import { useMeetingSession } from './hooks/useMeetingSession'
 
@@ -54,6 +56,9 @@ export default function MeetingView({
     mutedAgents,
     outputs,
     tasks,
+    transcript,
+    partialTranscript,
+    transcriptFull,
     caption,
     chatViewAgents,
     selectedPreset,
@@ -81,6 +86,9 @@ export default function MeetingView({
     return (
       <TaskReviewView
         tasks={tasks}
+        transcript={transcript}
+        partialTranscript={partialTranscript}
+        transcriptFull={transcriptFull}
         provider={config?.task_provider ?? ''}
         filing={pending.filing}
         onBack={actions.backToMeeting}
@@ -112,9 +120,14 @@ export default function MeetingView({
   }
 
   return (
-    <div className="flex h-full overflow-hidden">
-      <div className="flex-1 flex flex-col h-full overflow-hidden">
-        <div className="flex-none px-6 py-4 border-b border-border flex items-center justify-between gap-3">
+    // Stacks below `lg`, the same shape MeetingWorkspace and TaskReviewView
+    // already use in this app: a 340px task sidebar beside the meeting left the
+    // content 49px at 390px. `min-w-0`/`min-h-0` on the content column is what
+    // lets it actually shrink -- without it the row overflowed sideways instead,
+    // pushing the meeting off-screen rather than narrowing it.
+    <div className="flex flex-col lg:flex-row h-full overflow-hidden">
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
+        <div className="flex-none px-4 md:px-6 py-4 border-b border-border flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
             <Btn onClick={onBack} aria-label={i18nT('apps.meetings.meeting.back')}>
               <ArrowLeft className="lucide-inline" />
@@ -229,15 +242,10 @@ export default function MeetingView({
           )}
         </AnimatePresence>
 
-        <div className="flex-1 overflow-y-auto min-h-0">
-          {enabledAgents.length === 0 ? (
-            <EmptyState
-              icon={<ListChecks className="lucide-inline" />}
-              title={i18nT('apps.meetings.meeting.noAgents')}
-              subtitle={i18nT('apps.meetings.meeting.noAgentsHint')}
-            />
-          ) : (
-            <div className="grid grid-cols-2 gap-3 p-6">
+        <MeetingWorkspace
+          hasAgentPanels={enabledAgents.length > 0}
+          agentPanels={(
+            <div className="grid grid-cols-1 2xl:grid-cols-2 gap-3">
               {enabledAgents.map(agent => (
                 <AgentPanel
                   key={agent.id}
@@ -254,10 +262,23 @@ export default function MeetingView({
               ))}
             </div>
           )}
-        </div>
+          transcript={(
+            <TranscriptPanel
+              segments={transcript}
+              partial={partialTranscript}
+              primary={enabledAgents.length === 0}
+              status={status}
+              full={transcriptFull}
+            />
+          )}
+        />
 
         {(status === 'active' || status === 'paused') && (
-          <BroadcastBar onSend={actions.broadcast} caption={caption} />
+          <BroadcastBar
+            onSend={actions.broadcast}
+            caption={caption}
+            disabled={transcriptFull}
+          />
         )}
       </div>
 

@@ -3,13 +3,14 @@
 ## Overview
 
 `src/kiro_crew/cloud/` runs KiroCrew on the user's **own** AWS EC2 instance with a
-single command. It provisions a CloudFormation stack, ships the local source,
-signs `kiro-cli` in over SSM, and opens the dashboard through an SSM
-port-forward. Command surface (wired in `cli_cloud.py`, invoked via
+single command. It provisions a CloudFormation stack, ships an available local
+checkout (or clones the public repo from packaged installs), signs `kiro-cli` in
+over SSM, and opens the dashboard through an SSM port-forward. Command surface
+(wired in `cli_cloud.py`, invoked via
 `kirocrew cloud <action>`):
 
 ```
-launch | list | status | connect | tunnel | login | stop | start | destroy | iam-policy | iam-boundary | doctor
+launch | list | status | connect | tunnel | login | logout | stop | start | destroy | iam-policy | iam-boundary | doctor
 ```
 
 (`iam-boundary` is the one-time admin step that pre-creates the immutable
@@ -24,7 +25,7 @@ single hard boundary in the default posture**:
 - (2) the shell `deniedCommands` in `config/defaults.json` (kiro-cli
   `execute_bash`/`shell`) block both the raw AWS CLI verbs (`aws ec2
   terminate-instances` / `delete-*`, `aws cloudformation delete-stack`) **and**
-  the `kirocrew cloud destroy|stop|start|launch|connect|tunnel|login` wrappers
+  the `kirocrew cloud destroy|stop|start|launch|connect|tunnel|login|logout` wrappers
   (the latter mint/print tokens); read-only `list`/`status` stay allowed. The
   AWS patterns tolerate global options in BOTH positions — before the service
   AND between the service and the operation
@@ -67,12 +68,12 @@ claim that a hostile in-process agent is fully contained.
 | Module | Role |
 |--------|------|
 | `aws.py` | The single `run_aws` chokepoint — fixed argv, no shell, sandbox-wrapped, `--profile` only (never boto3, never a raw key). `checked`/`checked_json`; `AccessDenied → exact IAM action` mapping; `env_credentials_hint()`. |
-| `ec2.py` | `deploy`/`status`/`stop`/`start`/`destroy` via `aws cloudformation` + `ec2`; AZ- **and egress-**aware `discover_network`; tag-based stateless discovery; `_validate_cidr`. `find_stack` verifies BOTH `kirocrew:managed=true` AND `kirocrew:instance==<tag>` before status/stop/start/destroy touch a stack — so a same-prefix managed stack with a different instance tag can't be acted on by the wrong `--tag`. |
+| `ec2.py` | `deploy`/`status`/`stop`/`start`/`destroy` via `aws cloudformation` + `ec2`; AZ- **and egress-**aware `discover_network` + `resolve_explicit_subnet` (`--subnet` pin, same guarantees); tag-based stateless discovery; `_validate_cidr`. `find_stack` verifies BOTH `kirocrew:managed=true` AND `kirocrew:instance==<tag>` before status/stop/start/destroy touch a stack — so a same-prefix managed stack with a different instance tag can't be acted on by the wrong `--tag`. |
 | `iam.py` | Least-privilege launcher policy generator (applied by the user, never by KiroCrew) + read-only reachability check + the **content-fixed instance permissions-boundary document** (`boundary_policy_document`/`boundary_arn`) and its constants (`BOUNDARY_NAME`). |
 | `ssm.py` | SSM `send-command` run-and-poll (base64-wrapped remote scripts) + `start-session` port-forward; `port_is_free` / `wait_for_local_port`. |
-| `login.py` | `kiro-cli` device-code / social sign-in on the box over SSM. |
+| `login.py` | `kiro-cli` device-code / social sign-in on the box over SSM, plus `logout` — the account switch. `login` short-circuits on an existing session, so `logout` is what makes a different Kiro account reachable without a hand-run SSM command. It kills any still-polling background `kiro-cli login` **and** any live `kiro-cli acp` runtime **before** signing out (otherwise the login re-authenticates the old account, and an ACP runtime keeps serving the old account's in-memory credential until its next 401), removes the login log/PID/FIFO (they hold the previous device-code URL + code, which must never be re-shown as a fresh prompt), and confirms the result with `is_logged_in` rather than the exit code — `kiro-cli logout` exits non-zero when there was no session to drop, which is still the requested state. That confirmation fails CLOSED: it requires a positive signed-out sentinel (`__NOAUTH__`), so an SSM timeout or transport error — where the session may still be active — reports failure rather than a false "signed out". The same fail-closed applies to the cleanup command itself: if that SSM invocation doesn't return `Success`, the kills it was meant to do can't be trusted and logout reports failure without probing. The CLI warns the operator that in-flight chats/cron sessions are stopped (their runtimes are killed). |
 | `connect.py` | SSM port-forward + token mint + open browser; Instances-registry integration; `redact_token`. |
-| `source.py` | Package the local checkout (`git archive`, tarfile fallback) and upload to a per-account S3 bucket; secret-excluding filter shared by both paths. Also **`ensure_instance_boundary`** — creates the shared, immutable `kirocrew-ec2-boundary` managed policy once (create-if-not-exists, never re-versioned) and returns its ARN; `delete_instance_boundary` for admin cleanup. |
+| `source.py` | Detect and package an editable local checkout (`git archive`, tarfile fallback) and upload it to a per-account S3 bucket; packaged installs instead use the template's public-repo clone fallback. The secret-excluding filter is shared by both packaging paths. Also **`ensure_instance_boundary`** — creates the shared, immutable `kirocrew-ec2-boundary` managed policy once (create-if-not-exists, never re-versioned) and returns its ARN; `delete_instance_boundary` for admin cleanup. |
 | `config.py` | Persisted profile / region / tag (**never credentials**); `load()` tolerates a hand-edited/corrupt `cloud.json` — bad JSON *or* a non-object shape falls back to defaults rather than crashing every cloud command. |
 | `sizes.py` | arm64/Graviton size tiers (16 GB default `t4g.xlarge`). |
 | `ui.py` / `wizard.py` | Terminal UI + the interactive launch flow. `_deploy_with_progress` runs the blocking deploy on a daemon thread and captures the `aws cloudformation deploy` child via a `proc_sink`, so a Ctrl+C on the main (poll) thread terminates it instead of orphaning it (~1800s). An unknown `--size`/`size_key` on the public `launch()` entrypoint yields a clean rc=1 + message, not an uncaught `KeyError`. Resuming a saved stack (`launch` after `stop`) first calls `_ensure_running_and_ssm_ready` — starts a `stopped` instance and waits for SSM `Online` before sign-in/tunnel (which are SSM-only and would otherwise fail); a `terminated` instance fails clean pointing at `--new`. `last_tag` is persisted (`cfg.save()`) **only after** a deploy confirms healthy — a failed first launch leaves no saved pointer, so the next `launch` retries clean instead of resuming a rolled-back/instance-less stack; `_saved_launch_is_usable` additionally ignores a stale saved tag (from an older build) whose stack is in a `_FAILED_STATES` status or has no instance. |
@@ -87,25 +88,50 @@ rollback, one-command `delete-stack` teardown. AMI resolves from the public
 failed bootstrap folds the on-box setup-log tail into the signal reason so the
 cause survives the rollback.
 
-Because the public repo is private, the box can't `git clone` it: the launcher
-packages the local checkout and uploads it to a launcher-owned bucket
+The instance bootstrap runs `install.sh --voice` on both its initial attempt and
+retry. This installs the existing `voice` extra (`boto3` and
+`amazon-transcribe`) before the gateway first imports its Transcribe provider;
+installing those SDKs after startup would otherwise require a gateway restart.
+
+When the installed module belongs to a valid source checkout, the launcher
+packages that checkout and uploads it to a launcher-owned bucket
 (`kirocrew-src-<account>-<region>`); the instance downloads it with its own IAM
-role (`s3:GetObject` scoped to the single object). A public `git clone` remains
-a fallback when no `SourceBucket` is passed.
+role (`s3:GetObject` scoped to the single object). Wheel and desktop installs
+have no checkout to package, so `ec2.deploy` omits `SourceBucket` by default and
+the template clones the public repository/ref instead. An explicit
+`ship_source=True` remains fail-closed rather than packaging an unrelated
+`site-packages` ancestor.
 
 `discover_network` is **egress-kind-aware**, not just "has a default route":
 `_subnet_egress_kinds` classifies each subnet's effective route table (explicit
 association, else the VPC main table) as NAT (`NatGatewayId`/`NetworkInterfaceId`
 default route) or IGW (`igw-` default route). It prefers a **NAT** subnet (works
-regardless of a public IP), then an **IGW** subnet — and the template's Instance
-`NetworkInterfaces` block forces `AssociatePublicIpAddress: true`, so an
-IGW-routed subnet works even when its `MapPublicIpOnLaunch` is false. A subnet
+regardless of a public IP), then an **IGW** subnet — and the launcher threads the
+resolved egress kind into the template's `AssociatePublicIp` parameter: **IGW →
+`true`** (the Instance `NetworkInterfaces` block attaches a public IP, so an
+IGW-routed subnet works even when its `MapPublicIpOnLaunch` is false), **NAT →
+`false`** (a private-subnet instance gets NO public IP — it would be unused
+surface and can violate SCPs that deny RunInstances-with-public-IP). A subnet
 with only a local route (no 0.0.0.0/0 egress) is never chosen — the deploy would
 otherwise hang to the `WaitCondition` timeout. An **explicit** route-table
 association overrides the main table even when it has no egress: a subnet bound
 to a local-only table is treated as no-egress (excluded from the main-table
-fallback), so it can't be mistaken for having the main table's egress. The
-optional SSH CIDR is also **normalized** (host bits cleared, `1.2.3.4/24` →
+fallback), so it can't be mistaken for having the main table's egress.
+
+`launch --subnet <subnet-id>` bypasses discovery entirely —
+`resolve_explicit_subnet` pins the launch to the given subnet (the only way to
+target a dedicated/private-subnet VPC while a default VPC exists, since
+discovery always prefers the default VPC). The explicit path keeps discovery's
+launch-time guarantees: the subnet must exist in the region, its AZ must offer
+the chosen instance type, and it must pass the same `_subnet_egress_kinds`
+egress check (NAT or IGW) — each failing fast with actionable text instead of
+hanging to the `WaitCondition` timeout, and the same NAT→no-public-IP /
+IGW→public-IP parameter wiring applies. `--subnet` applies only to a **new**
+stack; reusing an existing stack warns interactively that its network is fixed,
+and **hard-fails under `--yes`** — a script's explicitly requested pin must not
+be silently ignored.
+
+The optional SSH CIDR is also **normalized** (host bits cleared, `1.2.3.4/24` →
 `1.2.3.0/24`) so the SG ingress rule is canonical. `get_stack_failures` sorts the
 specific bootstrap reason ahead of CloudFormation's generic `[WaitCondition]`
 cascade lines (events are newest-first, so the generic line would otherwise bury
@@ -303,14 +329,21 @@ exits non-zero.
   free-check→bind race: because only one process can bind the port, a listener
   answering while our SSM child has already exited is a foreign process that won
   the bind — so both paths refuse in that case rather than send the token/code.
-  Teardown kills the whole **process group** (`killpg`, since `open_port_forward`
+  Teardown kills the whole **process tree** (`killpg`, since `open_port_forward`
   uses `start_new_session=True`): `proc.terminate()` alone would signal only the
   `aws` wrapper and leave the `session-manager-plugin` child — which actually
   holds the forwarded port — alive after Ctrl+C or a mint failure. The shared
-  `ssm.kill_port_forward` does the group teardown, and **both** the dashboard
+  `ssm.kill_port_forward` does the tree teardown, and **both** the dashboard
   tunnel (`connect.Connection.close`/`_terminate`) and the login callback tunnel
   (`login._close_process`) go through it, so neither leaves an orphaned
-  plugin/port (group signal on POSIX, single-proc fallback otherwise). Every
+  plugin/port. **Windows** has no process groups (`start_new_session` is silently
+  ignored and `os.killpg`/`os.getpgid` do not exist), so it reaps the tree with
+  `taskkill /T /F` and falls through to the single-proc path only if that is
+  unavailable. Both platforms escalate SIGTERM→SIGKILL when the graceful stop does
+  not reap; signal numbers come from `platform_compat` (**never** `signal.SIGKILL`,
+  which is undefined on Windows — naming it inside the escalation's own
+  `except Exception` swallows the `AttributeError` and skips `proc.kill()`
+  entirely, on the very platform that reaches that path). Every
   no-URL exit reaps its tunnel too: `connect()` folds a mint failure — whether
   `mint_token` returns `""` **or raises** — into a `ready=False` Connection after
   `_terminate`; and the **social-login** paths close their callback tunnel on the
@@ -342,6 +375,9 @@ exits non-zero.
 `aws` CLI + `session-manager-plugin` + Python are present, then hand off to
 `kirocrew cloud launch`. They install *client* prerequisites only — the gateway
 always runs on the Linux EC2 box, never on Windows.
+`cloud-install.sh --voice` additionally installs the existing `voice` extra in
+the launcher's managed client venv; the EC2 bootstrap includes that extra by
+default regardless of this client-side flag.
 
 `kirocrew cloud launch` runs `python -m kiro_crew`, which imports the whole CLI —
 including gateway/cron/session modules (plus `apps/bridges` and the PTY

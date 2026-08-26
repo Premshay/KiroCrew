@@ -2,7 +2,8 @@
 
 Spin up a **throwaway, full-stack KiroCrew gateway** for any feature worktree —
 its own port, its own `KIROCREW_HOME` (own DB / sessions / memory), no Slack
-tunnel, `--no-crons`, resource-capped, and `rm -rf`'d on stop. Test a branch's
+tunnel, `--no-crons` (unless you pass `--crons`), resource-capped, and reclaimed
+by `pod down`. Test a branch's
 backend `/api/*` **and** the SPA bundle it serves, all **without touching your
 live gateway or your shared `~/.kiro/crew` data**.
 
@@ -17,12 +18,15 @@ kirocrew pod install              # lay down the systemd --user template unit (o
 kirocrew pod provision <wt>       # build the worktree's venv + SPA dist (the on-ramp)
 kirocrew pod up   <wt> [--json]   # bring up an isolated pod → {base_url, token, port}
 kirocrew pod up   <wt> --provision# provision (if needed) then bring it up
-kirocrew pod ls                   # what's running (≈ kubectl get pods)
+kirocrew pod up   <wt> --approval reads  # boot its gateway in an approval mode
+kirocrew pod up   <wt> --crons          # boot its gateway with the cron scheduler on
+kirocrew pod ls                   # what's running (≈ kubectl get pods) + orphaned HOMEs (with age)
+kirocrew pod prune [--all] [--dry-run]  # bulk-reclaim orphaned HOMEs (default: older than 3d; --all for every age)
 kirocrew pod status <wt>          # up/down + health
 kirocrew pod token  <wt> [--ttl]  # (re)mint a dashboard token for a running pod
 kirocrew pod url    <wt>          # print its base_url
 kirocrew pod logs   <wt> [-n N]   # tail its journal
-kirocrew pod down   <wt>          # evict → rm -rf its HOME (zero residue)
+kirocrew pod down   <wt>          # evict → delete its HOME, verified (zero residue)
 ```
 
 `<wt>` is a friendly worktree name. It is resolved to a checkout **git-natively**:
@@ -63,11 +67,25 @@ dist is missing — pointing you at the slow build — while `pod up <wt> --prov
 
 `kirocrew pod install` writes a template unit `kirocrew-pod@.service` whose
 `ExecStart` re-enters `kirocrew pod _run <wt>` (boot logic lives in
-`kiro_crew.pod.runtime.boot`) and whose `ExecStopPost` re-enters
-`kirocrew pod _cleanup <wt>`, which re-validates the name and refuses
-`..`/absolute/empty before deleting the pod's isolated HOME. Teardown is routed
-through Python (not a raw `rm -rf` on `%i`) because a systemd instance name *can*
-be `..`. `MemoryMax`/`CPUQuota` cap a runaway pod; `Restart=on-failure` self-heals.
+`kiro_crew.pod.runtime.boot`). `MemoryMax`/`CPUQuota` cap a runaway pod;
+`Restart=on-failure` self-heals.
+
+The unit has **no `ExecStopPost` teardown hook**, on purpose. systemd runs
+`ExecStopPost` *before* the final kill of the unit's cgroup, so a hook that
+deleted the pod's HOME raced the pod's own surviving subprocesses — they
+recreated the directory by reopening their audit log in append mode — and it also
+fired on the stop half of a `Restart=`, bringing the pod back on a home stripped
+of its sessions and config. So `kirocrew pod down` owns reclamation on every
+platform: it stops the service, waits for the unit's cgroup to drain, deletes the
+HOME through `runtime.cleanup_home` (which re-validates the name and refuses
+`..`/absolute/empty, since teardown safety must not rely on systemd `%i`
+semantics), then VERIFIES the directory is gone and fails loudly if it is not.
+The trade is that a pod which goes away without a `down` — a crash, a raw
+`systemctl --user stop`, a reboot — leaves its HOME behind; `pod ls` reports
+those with their age, `pod down <wt>` reclaims one, and `pod prune` reclaims
+them in bulk — by default only HOMEs whose last activity is older than 3 days
+(`--all` sweeps every age; each delete still routes through the same
+stop-drain-verify path `down` uses, with liveness re-checked per name).
 
 ### Port derivation
 
@@ -81,7 +99,7 @@ port ever resolves to the live port.
 |---|---|---|
 | `KIROCREW_POD_REPO` | invoking cwd | repo git is queried from to resolve worktree names |
 | `KIROCREW_POD_WORKTREES_ROOT` | (unset) | optional `name→path` fallback root (hermetic planes) |
-| `KIROCREW_POD_ROOT` | `~/.kirocrew-pods` | isolated pod HOMEs (nuked on stop) |
+| `KIROCREW_POD_ROOT` | `~/.kirocrew-pods` | isolated pod HOMEs (reclaimed by `pod down`) |
 | `KIROCREW_POD_ENV_DIR` | `~/.kiro/crew/pods` | per-pod `CHECKOUT=`/`PORT=`/`SEED=` files |
 | `KIROCREW_POD_BASE_PORT` | `7810` | port derivation base |
 | `KIROCREW_POD_LIVE_PORT` | `5476` | the port a pod must never bind |
@@ -95,9 +113,12 @@ that can't collide with a developer's live pods — used by the test suite.
 
 - A pod runs its own `KIROCREW_HOME` and binds `127.0.0.1` only; it never touches
   the shared `~/.kiro/crew` data and refuses the live port.
-- Every pod's `config.json` forces `tunnel.enabled=false`, and the booted env
-  scrubs `SLACK_*` + non-AWS `*_TOKEN`, so a pod can never grab the live Slack
-  identity. Pod HOME is `0700`; `config.json` is `0600`.
+- Every pod's `config.json` forces `enabled=false` on the tunnel and on every
+  channel that carries a config-level enable (`runtime.SEED_DISABLED_SECTIONS`),
+  and the booted env scrubs `SLACK_*`, `WECOM_*`, `MICROSOFT_APP_*` and non-AWS
+  `*_TOKEN`, so a pod can never grab a live messaging identity — not even a
+  seeded one, which is the point: `--seed ~/.kiro/crew` clones the real config.
+  Pod HOME is `0700`; `config.json` is `0600`.
 
 ## Platform
 

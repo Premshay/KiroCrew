@@ -1,6 +1,6 @@
 import type { RefObject } from 'react'
 import { Upload, Plus, X, ChevronLeft, ChevronRight, PencilRuler } from 'lucide-react'
-import { KIND_LABEL } from './constants'
+import { KIND_LABEL, kindLabel } from './constants'
 import { detectKind, recognise } from './utils'
 import { S } from './styles'
 import type { Blocked, ProjectContext, ReviewBrief, StagedItem } from './types'
@@ -8,6 +8,7 @@ import AgentSelector, { type KiroCrewAgent } from '../../components/AgentSelecto
 import ScopeBuilder from './ScopeBuilder'
 
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 interface Props {
   staged: StagedItem[]
   refText: string
@@ -43,13 +44,14 @@ interface Props {
 }
 
 export default function Composer(p: Props) {
+  const ime = useImeGuard()
   const { staged, refText, dragging, blocked, showAuth, busy, err, inputRef } = p
 
   const canStart = !busy && (staged.length > 0 || !!refText.trim())
   const det = detectKind(refText)
   const startLabel = staged.length > 1
-    ? 'Critique this flow · ' + staged.length + ' screens'
-    : staged.length === 1 ? 'Critique this screen'
+    ? i18nT('apps.designCritique.composer.critique_this_flow_count_screens', { count: staged.length })
+    : staged.length === 1 ? i18nT('apps.designCritique.composer.critique_this_screen')
     : refText.trim() ? 'Critique ' + (KIND_LABEL[(det || {}).kind as string] || 'this') : 'Critique'
 
   // What did they paste? Worked out live so we can say it back before they commit.
@@ -161,7 +163,7 @@ export default function Composer(p: Props) {
           value={refText} disabled={staged.length > 0 || busy}
           placeholder={staged.length ? 'Using your screenshots — clear them to critique a link instead' : 'Figma link · git repo · a folder on this machine · a running URL (localhost or a deployed preview)'}
           onChange={(e) => p.setRefText(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') p.start() }}
+          {...ime.bindEnter({ onEnter: () => p.start() })}
         />
         <button
           style={{ ...S.bigStart, ...(canStart ? {} : S.startOff) }} disabled={!canStart} onClick={p.start}
@@ -171,9 +173,9 @@ export default function Composer(p: Props) {
         </button>
         {recog ? (
           <p style={{ ...S.cardHint, color: recog.ok ? 'var(--muted)' : 'var(--error, #e5484d)' }}>
-            <b style={{ color: recog.ok ? 'var(--text)' : 'inherit' }}>{recog.ok ? (KIND_LABEL[(det || {}).kind as string] || '') : 'Unrecognised'}</b>
+            <b style={{ color: recog.ok ? 'var(--text)' : 'inherit' }}>{recog.ok ? kindLabel((det || {}).kind as string) : i18nT('apps.designCritique.composer.unrecognised')}</b>
             {recog.ok ? ' · ' : ' — '}
-            {recog.text.replace(/^[^—]*— /, '')}
+            {recog.text}
           </p>
         ) : null}
         <p style={S.cardHint}>{recog

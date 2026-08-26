@@ -1,10 +1,21 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Provider } from 'react-redux'
+import { configureStore } from '@reduxjs/toolkit'
 import React from 'react'
 import ModelEffortDropdown from '../components/ModelEffortDropdown'
+import chatReducer from '../store/chatSlice'
+import dashboardReducer from '../store/dashboardSlice'
+import notificationsReducer from '../store/notificationsSlice'
+import { api } from '../api/client'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
+
+// The nested ReasoningEffortDropdown persists slider picks over the wire
+// (#5120); none of these tests touch the slider, but the stub keeps an
+// accidental future interaction from hitting a real fetch.
+vi.spyOn(api, 'chatSlotReasoningEffort').mockResolvedValue({ ok: true } as never)
 
 /**
  * The in-session model picker carries two footer rows: an in-place "set as
@@ -34,19 +45,26 @@ const baseProps = {
 
 function wrap(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+  // The nested ReasoningEffortDropdown persists picks into the slot store
+  // (#5120), so the tree needs the redux context even where a test never
+  // touches the effort footer. A per-render store (not the app singleton)
+  // keeps one test's persist from leaking into the next.
+  const store = configureStore({
+    reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
+  })
+  return render(<Provider store={store}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider>)
 }
 
 describe('ModelEffortDropdown — global fallback link', () => {
   it('is absent when the call site passes no handler', () => {
     wrap(<ModelEffortDropdown {...baseProps} />)
-    expect(screen.queryByText(/Global fallback for new sessions/)).toBeNull()
+    expect(screen.queryByText(/Global default for new sessions/)).toBeNull()
   })
 
   it('renders and fires when a handler is supplied', () => {
     const onSetDefault = vi.fn()
     wrap(<ModelEffortDropdown {...baseProps} onSetDefault={onSetDefault} />)
-    const link = screen.getByText(/Global fallback for new sessions/)
+    const link = screen.getByText(/Global default for new sessions/)
     fireEvent.click(link)
     expect(onSetDefault).toHaveBeenCalledTimes(1)
   })
@@ -54,7 +72,7 @@ describe('ModelEffortDropdown — global fallback link', () => {
   it('coexists with the reasoning-effort footer', () => {
     wrap(<ModelEffortDropdown {...baseProps} hasEffort onSetDefault={vi.fn()} />)
     expect(screen.getByText('Reasoning')).toBeInTheDocument()
-    expect(screen.getByText(/Global fallback for new sessions/)).toBeInTheDocument()
+    expect(screen.getByText(/Global default for new sessions/)).toBeInTheDocument()
   })
 })
 
@@ -64,18 +82,23 @@ describe('ModelEffortDropdown — per-agent default row', () => {
   // scope is being changed.
   it('is absent without a handler', () => {
     wrap(<ModelEffortDropdown {...baseProps} agentName="oncall" />)
-    expect(screen.queryByText(/default for oncall/i)).toBeNull()
+    expect(screen.queryByText(/default model for oncall/i)).toBeNull()
   })
 
   it('is absent without an agent in scope', () => {
     wrap(<ModelEffortDropdown {...baseProps} onPinToAgent={vi.fn()} />)
-    expect(screen.queryByText(/Set as default for/)).toBeNull()
+    expect(screen.queryByRole('button', { name: /as default model for/ })).toBeNull()
   })
 
   it('names the agent and fires the in-place write', () => {
     const onPinToAgent = vi.fn()
     wrap(<ModelEffortDropdown {...baseProps} agentName="oncall" onPinToAgent={onPinToAgent} />)
-    fireEvent.click(screen.getByText('Set as default for oncall'))
+    // Queried by ACCESSIBLE NAME, not getByText: the row interpolates the model
+    // id and the agent name through <Trans> so each lands in its own mono
+    // <span>, and getByText joins only an element's DIRECT text nodes — it
+    // cannot see across that split. The accessible name is built from the whole
+    // subtree, so it also asserts what a screen reader announces.
+    fireEvent.click(screen.getByRole('button', { name: 'Set as default model for oncall' }))
     expect(onPinToAgent).toHaveBeenCalledTimes(1)
   })
 
@@ -89,8 +112,8 @@ describe('ModelEffortDropdown — per-agent default row', () => {
         onPinToAgent={onPinToAgent}
       />
     )
-    const row = screen.getByText('Default for oncall')
-    expect(screen.queryByText('Set as default for oncall')).toBeNull()
+    const row = screen.getByRole('button', { name: 'Default model for oncall' })
+    expect(screen.queryByRole('button', { name: 'Set as default model for oncall' })).toBeNull()
     fireEvent.click(row)
     expect(onPinToAgent).not.toHaveBeenCalled()
   })
@@ -106,8 +129,8 @@ describe('ModelEffortDropdown — per-agent default row', () => {
       />
     )
     expect(screen.getByText('Reasoning')).toBeInTheDocument()
-    expect(screen.getByText('Set as default for oncall')).toBeInTheDocument()
-    expect(screen.getByText(/Global fallback for new sessions/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Set as default model for oncall' })).toBeInTheDocument()
+    expect(screen.getByText(/Global default for new sessions/)).toBeInTheDocument()
   })
 })
 
@@ -138,11 +161,64 @@ describe('ModelEffortDropdown — effort footer value', () => {
 
 describe('SETTINGS_DEFAULT_MODEL_ID', () => {
   it('resolves to a real entry in the generated settings registry', () => {
-    // Registry ids derive from the setting's LABEL. If the fallback-model row
+    // Registry ids derive from the setting's LABEL. If the default-model row
     // is renamed without regenerating/updating this constant, the deep link
     // silently loses its highlight — fail here instead.
     const entry = SETTINGS_REGISTRY.find(e => e.id === SETTINGS_DEFAULT_MODEL_ID)
     expect(entry, `no registry entry for ${SETTINGS_DEFAULT_MODEL_ID}`).toBeDefined()
     expect(entry?.tab).toBe('chat')
+  })
+})
+/**
+ * The other half of the same classification: the pin row is a SENTENCE with two
+ * interpolated identifiers. Prose follows the Font Family setting; the model id
+ * and the agent name are verbatim identifiers and stay monospace — which is also
+ * what disambiguates "Set claude-opus-5 as default model for default", where the
+ * trailing word is an agent NAME and not the English adjective.
+ */
+describe('pin row monospaces only its two identifiers', () => {
+  function pinRow(props: Record<string, unknown> = {}) {
+    wrap(<ModelEffortDropdown
+      {...baseProps}
+      agentName="oncall"
+      pinModelName="claude-opus-5"
+      onPinToAgent={vi.fn()}
+      {...props}
+    />)
+    return screen.getByRole('button', { name: /default model for/i })
+  }
+
+  it('puts the model id and the agent name in mono, and nothing else', () => {
+    const row = pinRow()
+    const mono = Array.from(row.querySelectorAll('.font-mono')).map(e => e.textContent)
+    expect(mono).toEqual(['claude-opus-5', 'oncall'])
+    // The sentence around them must NOT be mono, or the whole row would ignore
+    // the Font Family setting again.
+    expect(row.querySelector('span')?.className).not.toContain('font-mono')
+    expect(row.textContent).toBe('Set claude-opus-5 as default model for oncall')
+  })
+
+  it('monospaces the agent name in the already-pinned state too', () => {
+    const row = pinRow({ pinnedToAgent: true })
+    expect(Array.from(row.querySelectorAll('.font-mono')).map(e => e.textContent)).toEqual(['oncall'])
+  })
+
+  it('monospaces the model id in the unavailable state too', () => {
+    // Same value reaches this branch, so styling only the other two states would
+    // leave one row rendering a bare id in prose type.
+    const row = wrap(<ModelEffortDropdown
+      {...baseProps} agentName="oncall" pinModelName="claude-opus-5"
+      onPinToAgent={vi.fn()} pinModelUnavailable
+    />) && screen.getByRole('button', { name: /claude-opus-5/ })
+    expect(Array.from(row.querySelectorAll('.font-mono')).map(e => e.textContent)).toEqual(['claude-opus-5'])
+  })
+
+  it('wraps instead of truncating so a long locale keeps the agent name', () => {
+    // Both identifiers sit at the ends of the sentence, so an ellipsis removes
+    // exactly the part the label exists to communicate. es/fr/it need 8-14 more
+    // characters than English for "default model", so this is load-bearing.
+    const label = pinRow().querySelector('span')
+    expect(label?.className).toContain('min-w-0')
+    expect(label?.className).not.toContain('truncate')
   })
 })

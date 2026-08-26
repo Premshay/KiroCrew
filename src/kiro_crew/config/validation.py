@@ -56,11 +56,27 @@ def _lookup_schema_node(schema: dict, dot_path: str) -> dict | None:
     parts = dot_path.split(".")
     node = schema
     for part in parts:
+        # Numeric path components (array indices like "0", "1") are consumed
+        # by descending into the schema's `items` — they carry no property
+        # name, just signal "inside an array element".
+        if part.isdigit():
+            items = node.get("items", {})
+            if items:
+                node = items
+            else:
+                return None
+            continue
         props = node.get("properties", {})
         if part in props:
             node = props[part]
         else:
-            return None
+            # For array-typed fields, descend into items.properties
+            items = node.get("items", {})
+            items_props = items.get("properties", {})
+            if part in items_props:
+                node = items_props[part]
+            else:
+                return None
     return node
 
 
@@ -119,18 +135,62 @@ def _actual_type_name(value: object) -> str:
     return type(value).__name__
 
 
-def _apply_field_default(data: dict, dot_path: str) -> None:
+#: Exact dot-paths whose malformed values must SURVIVE advisory validation.
+#:
+#: ``_apply_field_default`` repairs a violating value by removing it so the
+#: loader falls back to defaults. Whether that repair is safe depends on the
+#: DIRECTION of the field's default:
+#:
+#: * ``publish`` (the section) and ``publish.allowed_destinations``: the
+#:   default is **open** (no restriction), so repairing a malformed narrowing
+#:   silently widens it to allow-all with no denial and no audit record
+#:   (#4057). The loader's recording coercion (``_coerced_section``) and the
+#:   gate's fail-closed checks are the honest handlers — but they can only run
+#:   if validation leaves the evidence in place. Keeping the value also keeps
+#:   security behaviour identical whether or not ``jsonschema`` is installed
+#:   (validation is a no-op without it), which is the split that let this gap
+#:   ship unnoticed.
+#:
+#: * Every OTHER publish field stays repairable, deliberately. For a field
+#:   whose default is **restrictive** the repair is the safe direction, and
+#:   preserving the malformed value can itself widen: a dict-shaped
+#:   ``publish.relocate_roots`` of ``{"/etc": false}`` iterates as its keys in
+#:   the loader's comprehension and would inject ``/etc`` as an allowed
+#:   relocate root, where the repaired default ``[]`` means home-only.
+#:
+#: Exact-match only: this is a per-path judgment, not a subtree rule.
+_FAIL_CLOSED_PATHS = frozenset({"publish", "publish.allowed_destinations"})
+
+
+def _apply_field_default(data: dict, dot_path: str) -> bool:
     """Remove the invalid value at *dot_path* so the loader falls back to defaults.
 
-    Only handles top-level and one-level nested paths (e.g. ``agent.provider``).
+    Only handles top-level and one-level nested paths (e.g. ``agent.provider``);
+    returns whether the value was actually removed. The depth cap is
+    deliberate: deeper paths reach values inside dict-typed fields
+    (``memory_stores.<name>.embedding_provider``, declared terminal sub-keys)
+    that the LOADER tolerates and round-trips even where the generated schema
+    is stricter — removing them here would make validation destroy
+    loader-valid data. Callers use the return value to log honestly: a kept
+    value must not be reported as "using default".
+
+    Values at a fail-closed path (see :data:`_FAIL_CLOSED_PATHS`) are never
+    removed: repairing them to their open defaults silently widens a security
+    narrowing, and the loader/gate pair downstream turns the preserved
+    malformed value into a recorded degradation and a denial instead (#4057).
     """
+    if dot_path in _FAIL_CLOSED_PATHS:
+        return False
     parts = dot_path.split(".")
     if len(parts) == 1:
         data.pop(parts[0], None)
-    elif len(parts) == 2:
+        return True
+    if len(parts) == 2:
         section = data.get(parts[0])
         if isinstance(section, dict):
             section.pop(parts[1], None)
+            return True
+    return False
 
 
 def _coerce_legacy_numeric_values(data: dict, schema: dict) -> None:
@@ -317,35 +377,44 @@ def validate_config_data(data: dict) -> dict:
             value = err.instance
             display_val = _mask_value(value, sensitive)
 
-            # Determine error type
+            # Determine error type. The trailing clause of each warning must
+            # be TRUE: _apply_field_default is depth-capped (see its
+            # docstring), so a violation at a deeper path — a declared dict
+            # sub-key like dashboard.terminal.shell — keeps its value, and
+            # reporting "using default" there would misdirect anyone debugging
+            # why the setting still misbehaves. Deep values are coerced or
+            # re-validated by their consumers instead.
             if err.validator == "enum":
                 allowed = err.schema.get("enum", [])
+                removed = _apply_field_default(data, dot_path)
                 logger.warning(
-                    "Config: enum violation at '%s': " "allowed values %s, got %s; using default",
+                    "Config: enum violation at '%s': " "allowed values %s, got %s; %s",
                     dot_path,
                     allowed,
                     display_val,
+                    "using default" if removed else "value kept (validated by its consumer)",
                 )
-                _apply_field_default(data, dot_path)
             elif err.validator == "type":
                 expected = err.schema.get("type", "unknown")
                 actual = _actual_type_name(value)
+                removed = _apply_field_default(data, dot_path)
                 logger.warning(
                     "Config: type mismatch at '%s': "
-                    "expected %s, got %s (value: %s); using default",
+                    "expected %s, got %s (value: %s); %s",
                     dot_path,
                     expected,
                     actual,
                     display_val,
+                    "using default" if removed else "value kept (validated by its consumer)",
                 )
-                _apply_field_default(data, dot_path)
             else:
                 # Generic validation error
+                removed = _apply_field_default(data, dot_path)
                 logger.warning(
-                    "Config: validation error at '%s': %s; using default",
+                    "Config: validation error at '%s': %s; %s",
                     dot_path,
                     err.message,
+                    "using default" if removed else "value kept (validated by its consumer)",
                 )
-                _apply_field_default(data, dot_path)
 
     return data

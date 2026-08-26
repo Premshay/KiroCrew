@@ -4,8 +4,8 @@
  * Two views behind one route:
  *
  * - **No paper open** → `ProjectList`, which follows the standard page layout
- *   (`PageHeader` + `px-6 pb-8` container + `StatCard` row + `Card` sections).
- * - **A paper open** → a split-pane workspace: file tree, Monaco source pane and
+ *   (`PageHeader` + `px-4 md:px-6 pb-8` container + `StatCard` row + `Card` sections).
+ * - **A paper open** → a split-pane workspace: file tree, Pierre source pane and
  *   diagnostics on the left; the rendered PDF on the right; an optional co-author
  *   chat panel beyond that. A paper and its PDF need the full viewport, so the
  *   editor is deliberately full-bleed and carries its own toolbar.
@@ -21,12 +21,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  AlertTriangle, ArrowDownToLine, ArrowLeft, ArrowUpFromLine, FileDown, Loader2,
-  MessageSquare, Play, Sparkles, TerminalSquare, X,
-} from 'lucide-react'
+import { AlertTriangle, ArrowDownToLine, ArrowLeft, ArrowUpFromLine, FileDown, Loader2, MessageSquare, Play, Sparkles, TerminalSquare, X, ChevronDown, ChevronUp } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { Btn, Select } from '../../components/ui'
+import { Btn } from '../../components/ui'
+import { useConfirm } from '../../components/ConfirmDialog'
+import { useIsMobile } from '../../hooks/useIsMobile'
+import SearchableSelect from '../../components/SearchableSelect'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { addSlotOptimistic, fetchSlots } from '../../store/dashboardSlice'
 import { selectComposerBusy } from '../../store/chatSlice'
@@ -86,9 +86,6 @@ const FLUSH_FAILED = 'papyrus: buffer flush failed'
  *  unsaveable buffer does not overwrite the real write error with it. */
 const isFlushAbort = (err: Error): boolean => err.message === FLUSH_FAILED
 
-/** DOM id linking the toolbar's main-document label to its select. */
-const MAIN_DOC_SELECT_ID = 'papyrus-main-document'
-
 /**
  * Instructions handed to the co-author AGENT, not shown to the user.
  *
@@ -100,6 +97,7 @@ const MAIN_DOC_SELECT_ID = 'papyrus-main-document'
  */
 
 export default function PapyrusPage() {
+  const { confirm, confirmDialog } = useConfirm()
   const queryClient = useQueryClient()
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
@@ -116,6 +114,15 @@ export default function PapyrusPage() {
   const [compileMs, setCompileMs] = useState<number | null>(null)
   const [cursor, setCursor] = useState({ line: 1, column: 1 })
   const [chatOpen, setChatOpen] = useState(false)
+  const isMobile = useIsMobile()
+  // Four surfaces competed for one row: a 50% source column holding a 176px
+  // `w-44` file tree beside the editor, a PDF column, and a 420px co-author
+  // panel that alone exceeds a phone viewport. At 390px the editor -- the pane
+  // that carries the text being written -- measured 19px. While narrow the row
+  // becomes a column, the tree becomes a drawer reached from a bar at the TOP,
+  // and the co-author panel owns the pane when it is open.
+  const [treeOpen, setTreeOpen] = useState(false)
+  const narrowChat = isMobile && chatOpen
   const [slotKey, setSlotKey] = useState<string | null>(null)
   const [slotCreating, setSlotCreating] = useState(false)
   const [error, setError] = useState('')
@@ -145,7 +152,7 @@ export default function PapyrusPage() {
   // DURING the save, which is exactly what has to be detected.
   const bufferRef = useRef('')
   // Re-entry guard for save-and-compile. In a ref so the Cmd+S handler passed to
-  // Monaco keeps a stable identity across compile cycles.
+  // The editor keeps a stable identity across compile cycles.
   const compilingRef = useRef(false)
 
   useEffect(() => { bufferFileRef.current = currentFile }, [currentFile])
@@ -161,6 +168,10 @@ export default function PapyrusPage() {
     queryFn: () => papyrusApi.getProject(project as string),
     enabled: !!project,
     retry: false,
+    // The deleted-in-another-tab detection below depends on this query
+    // re-running on window focus. Finite staleTime lets focus-refetch fire
+    // here (global default is Infinity).
+    staleTime: 30_000,
   })
   const detail = projectQuery.data
   const mainFile = detail?.main_file ?? ''
@@ -443,11 +454,13 @@ export default function PapyrusPage() {
     //
     // Placed above the clear so the early return leaves every guard exactly as it
     // was; the ordering the tests pin (clear -> reload) is unchanged.
-    if (dirtyRef.current && !window.confirm(
-      i18nT('apps.papyrus.workspace.co_author_conflict_discard_confirm', {
+    if (dirtyRef.current && !(await confirm({
+      title: i18nT('apps.papyrus.workspace.co_author_conflict_discard_title'),
+      body: i18nT('apps.papyrus.workspace.co_author_conflict_discard_confirm', {
         file: conflicted ?? '',
       }),
-    )) return
+      confirmLabel: i18nT('apps.papyrus.workspace.co_author_conflict_discard_button'),
+    }))) return
     // Cleared BEFORE the reload, and the refs too: `reloadOpenFile` refuses to adopt
     // while the buffer is dirty, and its no-flush branch would otherwise re-record the
     // very conflict being resolved. So the guard has to be down for the reload to run.
@@ -477,7 +490,7 @@ export default function PapyrusPage() {
       dirtyRef.current = true
       setDirty(true)
     }
-  }, [reloadOpenFile])
+  }, [reloadOpenFile, confirm])
 
   const applyCompileResult = useCallback((result: Awaited<ReturnType<typeof papyrusApi.compile>>) => {
     setDiagnostics(Array.isArray(result.errors) ? result.errors : [])
@@ -516,13 +529,16 @@ export default function PapyrusPage() {
   const [compiling, setCompiling] = useState(false)
 
   const openFile = useCallback(async (path: string) => {
+    // Close the drawer on pick, or the full-width tree is a one-way door:
+    // the file opens behind it with nothing on screen to say so.
+    if (isMobile) setTreeOpen(false)
     if (!project || path === bufferFileRef.current) return
     // Flush the outgoing buffer before switching, so an unsaved edit is not lost
     // by the act of navigating away from it.
     if (!(await flushBuffer())) return
     setDirty(false)
     setCurrentFile(path)
-  }, [project, flushBuffer])
+  }, [project, flushBuffer, isMobile])
 
   const createFileMutation = useMutation({
     // Flush FIRST: on success this switches `currentFile` to the new file, which
@@ -704,6 +720,12 @@ export default function PapyrusPage() {
   const branchLabel = gitBranchLabel(git)
   const pdfSrc = project && hasPdf ? pdfUrl(project, pdfVersion) : null
   const mainCandidates = useMemo(() => texFiles(files), [files])
+  // Option objects, not just names: a new array identity on every render would
+  // bust `SearchableSelect`'s filter memo, and `mainCandidates` is already stable.
+  const mainOptions = useMemo(
+    () => mainCandidates.map(file => ({ value: file, label: file })),
+    [mainCandidates],
+  )
 
   // Warn before the BROWSER discards the buffer — reload, tab close, back out of the
   // SPA entirely. The in-app exits (`closeProject`, `openFile`, `openFullChat`,
@@ -829,30 +851,31 @@ export default function PapyrusPage() {
         </Btn>
         <span className="text-[13px] font-medium text-text-strong truncate max-w-[12rem]">{project}</span>
 
-        {/* Nested AND explicitly associated (`htmlFor`/`id`), which is what
-            actually reaches assistive technology through the shared `Select`.
-            `jsx-a11y/label-has-for` still fires because `Select` is a
-            `forwardRef` component, so the rule cannot see the `<select>` it
-            wraps and cannot verify the nesting half — the association is real,
-            the lint is not. Same false positive as the other `Select`-in-label
-            sites in this repo. */}
-        {/* eslint-disable-next-line jsx-a11y/label-has-for */}
-        <label
-          htmlFor={MAIN_DOC_SELECT_ID}
-          className="flex items-center gap-1.5 text-[12px] text-muted"
-        >
+        {/* The picker is a `<button>` now, not a `<select>`, and HTML-AAM
+            computes a button's accessible name from its own content — a
+            `<label for>` is NOT in that path the way it is for a `<select>`.
+            So the name comes from `aria-label` and the visible text is a
+            plain span; that also retires the `jsx-a11y/label-has-for`
+            suppression this site used to need, because there is no longer a
+            `<label>` for the rule to be wrong about.
+            `SearchableSelect` rather than `SimpleSelect`: the candidates are
+            every `.tex` file in the project's RECURSIVE walk (bounded at
+            `MAX_PROJECT_FILES`), so they are nested paths sharing a common
+            prefix — a Radix Select's first-letter typeahead cannot separate
+            `chapters/01.tex` from `chapters/02.tex`. */}
+        <span className="flex items-center gap-1.5 text-[12px] text-muted">
           {i18nT('apps.papyrus.workspace.main_document')}
-          <Select
-            id={MAIN_DOC_SELECT_ID}
+          <SearchableSelect
+            options={mainOptions}
             value={mainFile}
-            onChange={e => setMainMutation.mutate(e.target.value)}
+            onChange={file => setMainMutation.mutate(file)}
             disabled={setMainMutation.isPending || mainCandidates.length === 0}
-          >
-            {mainCandidates.map(file => (
-              <option key={file} value={file}>{file}</option>
-            ))}
-          </Select>
-        </label>
+            aria-label={i18nT('apps.papyrus.workspace.main_document')}
+            // The trigger is `w-full`, so it needs a definite flex basis in this
+            // wrapping toolbar; a path too long for it truncates inside the span.
+            style={{ flex: '0 0 14rem' }}
+          />
+        </span>
 
         <span className="text-[12px] text-muted truncate">
           {dirty
@@ -863,7 +886,7 @@ export default function PapyrusPage() {
         {hasConflict && (
           // The conflict has to be VISIBLE and have an exit. A silent read-only editor
           // whose saves fail would be worse than the overwrite it replaced.
-          <span className="flex items-center gap-2 text-[12px] text-warning">
+          <span className="flex items-center gap-2 text-[12px] text-warn">
             <AlertTriangle className="lucide-inline" />
             {i18nT('apps.papyrus.workspace.co_author_conflict')}
             <Btn onClick={resolveConflict}>
@@ -954,14 +977,31 @@ export default function PapyrusPage() {
       )}
 
       {/* Workspace */}
-      <div className="flex flex-1 min-h-0">
+      <div className={`flex flex-1 min-h-0 ${isMobile ? 'flex-col' : ''}`}>
         {/* Source column: file tree + editor + status bar (+ diagnostics) */}
         <div
-          className="flex flex-col min-h-0 min-w-0"
-          style={{ width: `${SOURCE_PANE_PERCENT}%` }}
+          className={`flex flex-col min-h-0 min-w-0 ${isMobile ? 'flex-1' : ''} ${narrowChat ? 'hidden' : ''}`}
+          style={{ width: isMobile ? '100%' : `${SOURCE_PANE_PERCENT}%` }}
         >
-          <div className="flex flex-1 min-h-0">
-            <div className="w-44 shrink-0 min-h-0">
+          {/* Narrow: the tree is reached from the TOP, so it reserves no
+              horizontal space and the editor gets the full width. */}
+          {isMobile && (
+            <Btn
+              onClick={() => setTreeOpen(!treeOpen)}
+              aria-expanded={treeOpen}
+              className="shrink-0 w-full justify-start gap-1.5 rounded-none border-x-0 border-t-0"
+            >
+              {treeOpen ? <ChevronUp className="lucide-inline" /> : <ChevronDown className="lucide-inline" />}
+              {i18nT('apps.papyrus.fileTree.files')}
+            </Btn>
+          )}
+          <div className={`flex flex-1 min-h-0 ${isMobile ? 'flex-col' : ''}`}>
+            {/* Height-bounded while stacked, or the tree pushes the editor off
+                the pane. `vh` rather than a percentage: no ancestor here has a
+                definite height, so a percentage max-height would not resolve. */}
+            <div className={`min-h-0 ${isMobile
+              ? `w-full shrink-0 max-h-[40vh] overflow-y-auto ${treeOpen ? '' : 'hidden'}`
+              : 'w-44 shrink-0'}`}>
               <FileTree
                 files={files}
                 currentFile={currentFile}
@@ -1020,7 +1060,7 @@ export default function PapyrusPage() {
           </div>
 
           {/* Status bar */}
-          <div className="flex items-center gap-4 px-3 py-1 border-t border-border bg-bg-subtle text-[12px] text-muted shrink-0">
+          <div className="flex items-center gap-4 px-3 py-1 border-t border-border bg-bg-accent text-[12px] text-muted shrink-0">
             <span title={i18nT('apps.papyrus.workspace.save_and_compile_hint')}>
               {i18nT('apps.papyrus.workspace.cursor_position', { line: cursor.line, column: cursor.column })}
             </span>
@@ -1060,8 +1100,12 @@ export default function PapyrusPage() {
           </AnimatePresence>
         </div>
 
-        {/* PDF column */}
-        <div className="flex flex-col flex-1 min-w-0 min-h-0 border-l border-border">
+        {/* PDF column. Stacked under the source while narrow, with a `vh` height
+            bound so it cannot push the editor off the pane -- a percentage would
+            not resolve against these ancestors. The divider turns with the axis. */}
+        <div className={`flex flex-col min-w-0 min-h-0 ${isMobile
+          ? `w-full shrink-0 max-h-[45vh] border-t border-border ${narrowChat ? 'hidden' : ''}`
+          : 'flex-1 border-l border-border'}`}>
           <PdfPreview src={pdfSrc} downloadName={`${project}.pdf`} />
         </div>
 
@@ -1071,12 +1115,16 @@ export default function PapyrusPage() {
             <motion.div
               key="co-author"
               initial={{ width: 0, opacity: 0 }}
-              animate={{ width: CHAT_PANEL_WIDTH, opacity: 1 }}
+              animate={{ width: isMobile ? '100%' : CHAT_PANEL_WIDTH, opacity: 1 }}
               exit={{ width: 0, opacity: 0 }}
               transition={{ duration: 0.18 }}
-              className="shrink-0 min-h-0 overflow-hidden"
+              className={`min-h-0 overflow-hidden ${isMobile ? 'flex-1' : 'shrink-0'}`}
             >
-              <div style={{ width: CHAT_PANEL_WIDTH }} className="h-full min-h-0">
+              {/* BOTH widths have to move together. This wrapper is animated and
+                  content-sized, so a percentage on the child alone resolves
+                  against a box that hugs its own content -- the panel would come
+                  out narrower than the pixel width it replaced, not wider. */}
+              <div style={{ width: isMobile ? '100%' : CHAT_PANEL_WIDTH }} className="h-full min-h-0">
                 <CoAuthorPanel
                   slotKey={slotKey}
                   creating={slotCreating}
@@ -1089,6 +1137,7 @@ export default function PapyrusPage() {
           )}
         </AnimatePresence>
       </div>
+      {confirmDialog}
     </div>
   )
 }

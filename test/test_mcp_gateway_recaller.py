@@ -42,7 +42,6 @@ def _register(session_key: str) -> dict[str, Any]:
         "autoapprove_set_hash": "2" * 64,
         "approval_mode": "interactive",
         "trust_all_tools": False,
-        "user_identity": "rc",
         "channel_id": "C_RC",
         "config_snapshot_hash": "3" * 64,
         "session_key": session_key,
@@ -140,7 +139,7 @@ async def _run(
         def log_api_access(self, **kwargs: Any) -> None:
             sel_calls.append(kwargs)
 
-    async def _fake_acquire(_pool: Any, _key: Any, _resolver: Any):
+    async def _fake_acquire(_pool: Any, _key: Any, _resolver: Any, **_kw: Any):
         return fake_backend, True
 
     async def _fake_drain(_inbox: Any, _writer: Any, _stub_uuid: str = "") -> None:

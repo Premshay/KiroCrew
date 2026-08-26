@@ -9,14 +9,18 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any
 
 from aiohttp import web
 
+from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.artifacts import get_default_store
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, data_home
+from kiro_crew.dashboard import part_stream
 from kiro_crew.dashboard.handlers.files import (
     _ZIP_CONTAINER_EXTS,
     _content_matches_ext,
@@ -36,16 +40,23 @@ from kiro_crew.knowledge.embedder import (
     floats_to_bytes,
 )
 from kiro_crew.knowledge.extractor import EntityExtractor
-from kiro_crew.knowledge.folder_watcher import SOURCE_TYPE_SKIP_DIRS
+from kiro_crew.knowledge.folder_watcher import (
+    estimate_scan_cost,
+    folder_chunk_budget,
+    max_files_prop,
+    walk_filters,
+)
 from kiro_crew.knowledge.ingestion import (
     IngestionPipeline,
     _redact,
     rebuild_embeddings,
     start_rebuild_job,
 )
-from kiro_crew.knowledge.llm_pool import LLMPool
+from kiro_crew.knowledge.llm_pool import DEFAULT_EXTRACTION_EFFORT, LLMPool
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.retrieval import HybridRetriever
+from kiro_crew.knowledge.spend import source_spend
+from kiro_crew.knowledge.store import KnowledgeBundleError
 from kiro_crew.knowledge.sync import SyncScheduler
 from kiro_crew.knowledge.watcher import KnowledgeWatcher
 from kiro_crew.security import is_sensitive_path
@@ -66,12 +77,129 @@ def _sel_log(tool: str, **kwargs: object) -> None:
     )
 
 
+_BUNDLE_LIST_FIELDS = ("items", "entities", "relations", "sources", "source_locations", "mentions")
+# The fields import_bundle's redaction loops pass to _redact(); each has to be
+# a string or null before it reaches _redact() -> redact_exfiltration_urls(),
+# whose regex .finditer() raises an unhandled TypeError on anything else.
+_BUNDLE_REDACTED_FIELDS = {
+    "items": ("title", "summary", "content"),
+    "entities": ("name", "description"),
+    "relations": ("relation_type", "description"),
+}
+
+
+def _validate_knowledge_bundle(body: object) -> str | None:
+    """Return an error string if body isn't an importable bundle shape, else None.
+
+    Runs before the redaction loops and the store call so a malformed bundle
+    fails with a clean 400 instead of an unhandled AttributeError/TypeError
+    (non-dict body or entries) or a silently-committed corrupt row (non-JSON
+    sources.properties / entities.aliases, which every reader parses with
+    json.loads()).
+    """
+    if not isinstance(body, dict):
+        return "bundle must be a JSON object"
+    for field in _BUNDLE_LIST_FIELDS:
+        value = body.get(field, [])
+        if not isinstance(value, list):
+            return f"'{field}' must be a list"
+        for entry in value:
+            if not isinstance(entry, dict):
+                return f"'{field}' entries must be objects"
+    for field, keys in _BUNDLE_REDACTED_FIELDS.items():
+        for entry in body.get(field, []):
+            for key in keys:
+                value = entry.get(key)
+                if value is not None and not isinstance(value, str):
+                    return f"'{field}.{key}' must be a string or null"
+    # store.import_bundle() writes these two columns through unparsed (with
+    # '{}'/'[]' defaults when ABSENT), so anything present must already be the
+    # JSON text every reader json.loads() back: readers such as the source
+    # detail handlers parse the raw column with no empty-string guard, and
+    # find_entity() calls .lower() on each parsed alias.  Only absent/null
+    # falls through to the store defaults; a present non-string (1 -> TEXT
+    # "1"), an empty string, or the wrong parsed shape would commit a row
+    # that crashes a later, unrelated read.  json.loads raises RecursionError
+    # (not ValueError) on deeply-nested input, so catch it here too.
+    for src in body.get("sources", []):
+        props = src.get("properties")
+        if props is None:
+            continue
+        if not isinstance(props, str):
+            return "'sources.properties' must be a JSON object string or null"
+        try:
+            parsed = json.loads(props)
+        except (ValueError, RecursionError):
+            return "'sources.properties' must be valid JSON"
+        if not isinstance(parsed, dict):
+            return "'sources.properties' must be a JSON object"
+    for ent in body.get("entities", []):
+        aliases = ent.get("aliases")
+        if aliases is None:
+            continue
+        if not isinstance(aliases, str):
+            return "'entities.aliases' must be a JSON array string or null"
+        try:
+            parsed = json.loads(aliases)
+        except (ValueError, RecursionError):
+            return "'entities.aliases' must be valid JSON"
+        if not isinstance(parsed, list) or not all(isinstance(a, str) for a in parsed):
+            return "'entities.aliases' must be a JSON array of strings"
+    return None
+
+
 def _store(request: web.Request):
     return request.app["state"].knowledge_store
 
 
 def _pipeline(request: web.Request):
     return request.app.get("knowledge_pipeline")
+
+
+async def _json_object_body(
+    request: web.Request, *, allow_absent: bool = False
+) -> tuple[dict[str, Any] | None, web.Response | None]:
+    """Parse the request body as a JSON **object**, or produce the 400 to return.
+
+    ``await request.json()`` happily returns a list, string, or number for a
+    body that is valid JSON but not an object, and every caller in this module
+    then calls ``.get()`` on the result -- which raises and turns a client
+    mistake into a 500. One owner for the parse-and-shape guard keeps the
+    module's ``request.json()`` call sites on a single contract instead of
+    bespoke per-handler guards.
+
+    Returns ``(body, None)`` on success, or ``(None, error_response)`` when
+    the caller should return early. *allow_absent* treats a request without a
+    readable body as an empty object, for endpoints whose fields all have
+    defaults.
+
+    Deliberately separate from ``_shared.read_bounded_json``, which shares the
+    ``invalid_json``/``body_not_object`` codes: switching these nine sites onto
+    it would mean choosing a byte cap per endpoint (its ``max_bytes`` must be
+    a number, and knowledge bundles have no principled ceiling today), would
+    change the ``"invalid JSON"`` message text existing tests and callers pin,
+    and it has no *allow_absent*. Consolidating the two helpers is deferred
+    scope, not a disagreement about the contract.
+    """
+    if allow_absent and not request.can_read_body:
+        return {}, None
+    try:
+        parsed = await request.json()
+    except (LookupError, RecursionError, ValueError):
+        # json.JSONDecodeError and UnicodeDecodeError are ValueError
+        # subclasses; LookupError is an unknown charset= codec in the
+        # client's Content-Type header; RecursionError is a deeply nested
+        # JSON document blowing the parser's stack. All are client mistakes.
+        # Transport failures (disconnect mid-body, read timeout) deliberately
+        # propagate: they are not a client JSON mistake and keep their 500
+        # status class.
+        return None, web.json_response(
+            {"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(parsed, dict):
+        return None, web.json_response(
+            {"error": "body must be a JSON object", "code": "body_not_object"},
+            status=400)
+    return parsed, None
 
 
 def _create_embedder(app):
@@ -132,10 +260,12 @@ async def _start_artifact_ingest_async(app: web.Application) -> None:
     create / content-update / delete (from the agent's MCP tools, the CLI, the
     dashboard, bookmarks, and provider pull/clone -- all of which funnel
     through the store in the gateway process) ingests or removes that
-    artifact's item group in the aggregate "Artifacts" Knowledge source. On the
-    first run that creates the source row, a one-time backfill ingests
-    pre-existing artifacts. Gated on ``knowledge.auto_ingest_artifacts`` (on by
-    default). See ``kiro_crew.knowledge.artifact_ingest`` for the full design.
+    artifact's item group in the aggregate "Artifacts" Knowledge source. Every
+    start also runs a reconcile pass that ingests what the store has and the
+    Library lacks and drops state for artifacts that are gone, so drift from the
+    window in which this was switched off is repaired rather than left permanent.
+    Gated on ``knowledge.auto_ingest_artifacts`` (off by default). See
+    ``kiro_crew.knowledge.artifact_ingest`` for the full design.
     """
     cfg = KiroCrewConfig.load()
     if not cfg.knowledge.auto_ingest_artifacts:
@@ -409,10 +539,10 @@ async def update_item(request: web.Request) -> web.Response:
     item_id = request.match_info["id"]
     if not store.get_item(item_id):
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     allowed = {"tags", "item_type", "status", "title", "summary", "namespace"}
     fields = {k: v for k, v in body.items() if k in allowed}
     if not fields:
@@ -529,18 +659,59 @@ async def get_related_items(request: web.Request) -> web.Response:
 
 
 async def get_full_graph(request: web.Request) -> web.Response:
-    """GET /api/knowledge/graph -- full entity graph (top N by connections)."""
+    """GET /api/knowledge/graph -- full entity graph (top N by connections).
+
+    Optional query params:
+      limit: max nodes (1-200, default 100)
+      source_id: comma-separated source IDs to filter entities by. When set,
+        only entities mentioned in items belonging to those sources are included.
+    """
     store = _store(request)
     try:
         limit = min(200, max(1, int(request.query.get("limit", 100) or 100)))
     except ValueError:
         return web.json_response({"error": "invalid limit"}, status=400)
-    nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+
+    # Source filter: restrict to entities mentioned in items from specific sources
+    source_id_param = request.query.get("source_id", "").strip()
+    if source_id_param:
+        source_ids = [s.strip() for s in source_id_param.split(",") if s.strip()]
+        if not source_ids:
+            return web.json_response({"nodes": [], "edges": []})
+        placeholders = ",".join("?" * len(source_ids))
+        # Find entity IDs mentioned in items belonging to the given sources.
+        # Items belong to a source via items.source_id (ownership) OR via
+        # source_locations.source_id (deduplication — item survives in another
+        # source after a duplicate collapse).
+        rows = await asyncio.to_thread(
+            lambda: store.db.execute(
+                f"SELECT DISTINCT m.entity_id FROM mentions m "  # noqa: S608
+                f"JOIN items i ON m.item_id = i.id "
+                f"WHERE i.status = 'active' AND ("
+                f"  i.source_id IN ({placeholders})"
+                f"  OR i.id IN ("
+                f"    SELECT sl.item_id FROM source_locations sl"
+                f"    WHERE sl.source_id IN ({placeholders})"
+                f"  )"
+                f")",
+                source_ids + source_ids,
+            ).fetchall()
+        )
+        allowed_entities = {row["entity_id"] for row in rows}
+        if not allowed_entities:
+            return web.json_response({"nodes": [], "edges": []})
+        # Rank allowed entities by degree, take top N
+        nodes_by_degree = sorted(
+            allowed_entities, key=lambda n: store.graph.degree(n) if store.graph.has_node(n) else 0, reverse=True
+        )[:limit]
+    else:
+        nodes_by_degree = sorted(store.graph.nodes, key=lambda n: store.graph.degree(n), reverse=True)[:limit]
+
     if not nodes_by_degree:
         return web.json_response({"nodes": [], "edges": []})
     node_set = set(nodes_by_degree)
     nodes = [{"id": n, "name": store.graph.nodes[n].get("name"), "type": store.graph.nodes[n].get("entity_type")}
-             for n in node_set]
+             for n in node_set if store.graph.has_node(n)]
     edges = [{"source": u, "target": v, "type": d.get("relation_type"), "weight": d.get("weight")}
              for u, v, d in store.graph.edges(data=True) if u in node_set and v in node_set]
     return web.json_response({"nodes": nodes, "edges": edges})
@@ -578,8 +749,14 @@ async def source_counts(request: web.Request) -> web.Response:
     # holds documents -- which the list view filters out, hiding a source the user
     # cannot then see or delete. The union is over item ids, so a document held both
     # ways counts once per source and never twice.
-    where_sl = [w.replace("source_id", "i.source_id") if "source_id" in w else f"i.{w}"
-                if w != "1=1" else w for w in where]
+    where_sl: list[str] = []
+    for w in where:
+        if "source_id" in w:
+            where_sl.append(w.replace("source_id", "i.source_id"))
+        elif w == "1=1":
+            where_sl.append(w)  # the constant-true clause takes no table alias
+        else:
+            where_sl.append(f"i.{w}")
     sql = (
         f"SELECT COALESCE(NULLIF(sid, ''), '{_NO_SOURCE}') AS sid, "  # noqa: S608
         "COUNT(DISTINCT item_id) AS cnt FROM ("
@@ -608,7 +785,14 @@ async def source_counts(request: web.Request) -> web.Response:
 
 
 async def list_sources(request: web.Request) -> web.Response:
-    """GET /api/knowledge/sources."""
+    """GET /api/knowledge/sources.
+
+    Each source carries a ``spend`` block: how far its indexing has got and how
+    many Kiro requests it still owes -- one model call is one billed request, so
+    the figure is directly comparable to a bill. Indexing draws those requests
+    sweep after sweep at idle, so without them here the only place the ongoing
+    cost surfaces is a credit balance after the fact.
+    """
     store = _store(request)
     uri_filter = request.query.get("uri")
     if uri_filter:
@@ -625,7 +809,14 @@ async def list_sources(request: web.Request) -> web.Response:
             "FROM sources s LEFT JOIN (SELECT source_id, COUNT(*) AS cnt FROM items GROUP BY source_id) c "
             "ON s.id = c.source_id ORDER BY s.updated_at DESC"
         ).fetchall()
-    return web.json_response([dict(r) for r in rows])
+    sources = [dict(r) for r in rows]
+    # Aggregate scans plus a size stat per outstanding file, and the dashboard polls
+    # this list while a source is syncing -- offloaded so a large folder cannot stall
+    # chat and heartbeat processing on the event loop.
+    spend = await asyncio.to_thread(source_spend, store, sources)
+    for source in sources:
+        source["spend"] = spend.get(source["id"], {})
+    return web.json_response(sources)
 
 
 # Max wall-clock the native folder dialog may stay open before we give up.
@@ -681,10 +872,10 @@ async def pick_folder(request: web.Request) -> web.Response:
 async def add_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources -- add a remote source."""
     store = _store(request)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     name = body.get("name", "")
     source_type = body.get("source_type", "")
     uri = body.get("uri", "")
@@ -707,6 +898,32 @@ async def add_source(request: web.Request) -> web.Response:
 
     if not source_type:
         return web.json_response({"error": "source_type required"}, status=400)
+
+    # Refuse UNC ("\\host\share") and Win32 extended-length ("\\?\") prefixes
+    # BEFORE anything filesystem-adjacent runs — connector.validate_config()
+    # can do Path.exists() on the value, and resolving a UNC path on Windows
+    # fires an outbound SMB/DNS lookup to `host` before any sensitive-path
+    # check would reject it. This gate also has to precede the Path.resolve()
+    # below, because resolve() leaves "\\?\" un-normalized so is_sensitive_path
+    # misses a `\\?\C:\Users\me\.ssh\id_rsa` bypass of the credential floor.
+    # Windows accepts either slash flavour AND their mixture as a device-path
+    # prefix — Path("\\/?\\C:\\...") normalizes to the same extended path as
+    # \\?\ — so match on "first two chars are any slash", not literal "\\" /
+    # "//" alone.
+    if (
+        isinstance(uri, str)
+        and len(uri) >= 2
+        and uri[0] in ("\\", "/")
+        and uri[1] in ("\\", "/")
+    ):
+        _sel_log("source.add_denied", reason="unsupported_prefix", uri=uri)
+        return web.json_response(
+            {
+                "error": "UNC and extended-length paths are not supported",
+                "code": "uri_unsupported_prefix",
+            },
+            status=400,
+        )
 
     # Validate via connector if available
     sync_scheduler = request.app.get("knowledge_sync")
@@ -734,7 +951,15 @@ async def add_source(request: web.Request) -> web.Response:
         # drive letter (C:\... or C:/...), never "/", so the string test
         # rejected every valid Windows input and made single-file ingest 100%
         # unusable there.
-        if not Path(uri).is_absolute():
+        #
+        # UNC / extended-length prefixes are already refused by the pre-gate
+        # above (before any Path.resolve() call), so we do not re-check them
+        # here — that check has to precede the sandbox guard's own resolve().
+        # is_absolute() is flavour-bound to the RUNNING host, so a Windows drive
+        # path is NOT "absolute" to a POSIX gateway (the documented Windows
+        # browser -> Linux gateway topology). Accept either flavour explicitly so
+        # the answer does not depend on which OS the gateway happens to run.
+        if not (PurePosixPath(uri).is_absolute() or PureWindowsPath(uri).is_absolute()):
             return web.json_response(
                 {"error": "local_file URI must be an absolute path", "code": "uri_not_absolute"},
                 status=400,
@@ -771,11 +996,22 @@ async def add_source(request: web.Request) -> web.Response:
         # Run discovery walk to count files (no ingestion)
         watcher = request.app.get("knowledge_watcher")
         file_count = 0
+        # Scale of the ingestion this source is about to start, so the user sees
+        # the cost before it is spent rather than in a credit balance afterwards.
+        # Zeroed when no watcher is wired: reporting 0 files is honest there,
+        # inventing an estimate is not.
+        cost = {"files": 0, "capped": 0, "chunks": 0, "llm_calls": 0}
+        budget = folder_chunk_budget(properties)
         if watcher:
-            extra_skip = SOURCE_TYPE_SKIP_DIRS.get(source_type, set())
-            ignore_patterns = properties.get("ignore_patterns", [])
-            discovered = await asyncio.to_thread(watcher._folder_watcher._walk, str(folder_path), ignore_patterns, extra_skip)
+            # The same filters the sweep applies, or the count describes a
+            # different file set from the one that gets ingested.
+            discovered = await asyncio.to_thread(
+                watcher._folder_watcher._walk, str(folder_path),
+                **walk_filters(properties, source_type))
             file_count = len(discovered)
+            cost = await asyncio.to_thread(
+                estimate_scan_cost, discovered,
+                max_files=max_files_prop(properties))
 
         # Store with pending_confirmation status
         if isinstance(properties, dict):
@@ -786,7 +1022,22 @@ async def add_source(request: web.Request) -> web.Response:
         sid = store.add_source(name=name or uri, source_type=source_type, uri=uri,
                                properties=properties)
         _sel_log("source.add", source_id=sid, source_type=source_type)
-        return web.json_response({"id": sid, "status": "pending_confirmation", "file_count": file_count}, status=201)
+        return web.json_response(
+            {
+                "id": sid,
+                "status": "pending_confirmation",
+                "file_count": file_count,
+                # Files beyond the source's max_files cap, which are discovered
+                # but never ingested.
+                "capped_file_count": cost["capped"],
+                "estimated_chunks": cost["chunks"],
+                # One extraction call per chunk plus one summary call per file.
+                "estimated_llm_calls": cost["llm_calls"],
+                # 0 means unbounded: everything lands in the first sweep.
+                "chunk_budget_per_sweep": budget or 0,
+            },
+            status=201,
+        )
 
     sid = store.add_source(name=name or uri, source_type=source_type, uri=uri,
                            properties=properties)
@@ -885,7 +1136,10 @@ async def sync_source(request: web.Request) -> web.Response:
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
-    pool = request.app["knowledge_llm_pool"]
+    pool = request.app.get("knowledge_fetch_pool")
+    if pool is None:
+        # Compatibility for minimal callers that predate workload-isolated pools.
+        pool = request.app["knowledge_llm_pool"]
     task = asyncio.create_task(_background_agent_sync(source_id, url, source["name"], store, pipeline, pool))
     app_tasks = request.app.setdefault("_bg_tasks", set())
     app_tasks.add(task)
@@ -967,10 +1221,10 @@ async def rename_source(request: web.Request) -> web.Response:
     source_id = request.match_info["id"]
     if not store.db.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone():
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     name = body.get("name")
     if not isinstance(name, str):
         return web.json_response({"error": "name must be a string"}, status=400)
@@ -1014,7 +1268,12 @@ async def confirm_source(request: web.Request) -> web.Response:
     watcher = request.app.get("knowledge_watcher")
     if watcher:
         source = {"id": source_id, "uri": row["uri"], "source_type": row["source_type"], "properties": json.dumps(props)}
-        task = asyncio.create_task(watcher._folder_watcher.scan_source(source))
+        # Paced like the watcher's own sweeps. This is the burst that costs the
+        # most -- nothing is ingested yet, so every discovered file is new -- so
+        # skipping the budget here would spend the whole folder before the first
+        # sweep ever ran.
+        task = asyncio.create_task(watcher._folder_watcher.scan_source(
+            source, chunk_budget=folder_chunk_budget(props)))
         _track_scan_task(request.app, task)
     return web.json_response({"status": "scanning"})
 
@@ -1060,7 +1319,8 @@ async def resume_source(request: web.Request) -> web.Response:
     watcher = request.app.get("knowledge_watcher")
     if watcher:
         source = {"id": source_id, "uri": row["uri"], "source_type": row["source_type"], "properties": json.dumps(props)}
-        task = asyncio.create_task(watcher._folder_watcher.scan_source(source))
+        task = asyncio.create_task(watcher._folder_watcher.scan_source(
+            source, chunk_budget=folder_chunk_budget(props)))
         _track_scan_task(request.app, task)
     return web.json_response({"status": "scanning"})
 
@@ -1089,7 +1349,10 @@ async def retry_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/retry -- reset file to pending."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body = await request.json()
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1108,7 +1371,10 @@ async def skip_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/skip -- mark file as skipped."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body = await request.json()
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1133,10 +1399,10 @@ async def ingest_text(request: web.Request) -> web.Response:
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     text = body.get("text", "")
     if not text:
         return web.json_response({"error": "no text provided"}, status=400)
@@ -1258,39 +1524,32 @@ async def ingest_file(request: web.Request) -> web.Response:
     filename = getattr(field, "filename", None) or "upload"
     suffix = Path(filename).suffix
     ext = suffix.lower()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix="kn_")
+    staged = Path(tempfile.gettempdir()) / f"kn_{uuid.uuid4().hex}{suffix}"
     try:
-        total_size = 0
-        # Capture the leading bytes so the claimed extension can be verified
-        # against the file signature; 16 bytes covers every prefix in the
-        # sibling gate (PNG magic is 8, WEBP needs bytes 8:12, zip/PDF fewer).
-        head = bytearray()
-        while True:
-            chunk = await field.read_chunk()  # type: ignore[union-attr]
-            if not chunk:
-                break
-            total_size += len(chunk)
-            if total_size > _MAX_INGEST_FILE_SIZE:
-                tmp.close()
-                Path(tmp.name).unlink(missing_ok=True)
-                return web.json_response(
-                    {"error": f"file too large (max {_MAX_INGEST_FILE_SIZE // (1024 * 1024)} MB)"}, status=413)
-            if len(head) < 16:
-                head.extend(chunk[: 16 - len(head)])
-            tmp.write(chunk)
-        tmp.close()
+        # The signature gate (CWE-434) and the byte ceiling are both enforced by
+        # the shared streaming path, which judges the leading bytes while they
+        # are still in memory. That is stricter than this call site used to be:
+        # it wrote the whole file first and only then sniffed, so rejected
+        # content did reach the filesystem. Cleanup on cancellation is the
+        # helper's, not this function's -- see part_stream's docstring.
+        await part_stream.stream_part_to_file(
+            field,  # type: ignore[arg-type]
+            staged,
+            max_bytes=_MAX_INGEST_FILE_SIZE,
+            accepts=lambda head: _content_matches_ext(ext, head),
+        )
+    except part_stream.PartTooLarge:
+        return web.json_response(
+            {"error": f"file too large (max {_MAX_INGEST_FILE_SIZE // (1024 * 1024)} MB)"},
+            status=413,
+        )
+    except part_stream.PartContentMismatch:
+        _sel_log("ingest", filename=filename, outcome="rejected")
+        return web.json_response(
+            {"error": f"file content does not match its type: {ext}"}, status=400
+        )
 
-        # Content-signature gate (CWE-434): the extension is attacker-controlled
-        # and FileReader dispatches to binary parsers (.pdf/.docx) purely by
-        # extension, so verify the magic bytes match the claimed type BEFORE the
-        # file is handed to a parser. Text formats have no reliable signature and
-        # pass through, matching the sibling upload gate in handlers/files.py.
-        if not _content_matches_ext(ext, bytes(head)):
-            Path(tmp.name).unlink(missing_ok=True)
-            _sel_log("ingest", filename=filename, outcome="rejected")
-            return web.json_response(
-                {"error": f"file content does not match its type: {ext}"}, status=400)
-
+    try:
         # Decompression-bomb guard (CWE-770): a valid-signature OOXML/zip can
         # still be a bomb whose members expand unbounded once python-docx / the
         # zip parser opens it. Bound the declared member count and aggregate
@@ -1299,9 +1558,9 @@ async def ingest_file(request: web.Request) -> web.Response:
         # corrupt/lying archive. Run off the event loop so a hostile central
         # directory can't stall the gateway loop/heartbeat.
         if ext in _ZIP_CONTAINER_EXTS:
-            reason = await asyncio.to_thread(_inspect_zip_archive, tmp.name)
+            reason = await asyncio.to_thread(_inspect_zip_archive, str(staged))
             if reason is not None:
-                Path(tmp.name).unlink(missing_ok=True)
+                staged.unlink(missing_ok=True)
                 _sel_log("ingest", filename=filename, outcome="rejected", reason=reason)
                 return web.json_response(
                     {"error": f"{ext} archive rejected ({reason})"}, status=400)
@@ -1331,7 +1590,7 @@ async def ingest_file(request: web.Request) -> web.Response:
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
 
-        task = asyncio.create_task(_bg_ingest(tmp.name, source_id))
+        task = asyncio.create_task(_bg_ingest(str(staged), source_id))
         app_tasks = request.app.setdefault("_bg_tasks", set())
         app_tasks.add(task)
         task.add_done_callback(app_tasks.discard)
@@ -1340,7 +1599,7 @@ async def ingest_file(request: web.Request) -> web.Response:
         return web.json_response({"source_id": source_id, "status": "processing"})
     except Exception:
         logger.exception("Ingestion failed for %s", filename)
-        Path(tmp.name).unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
         return web.json_response({"error": "internal server error"}, status=500)
 
 
@@ -1381,10 +1640,17 @@ async def export_all(request: web.Request) -> web.Response:
 
 async def import_bundle(request: web.Request) -> web.Response:
     """POST /api/knowledge/import -- accept .knowledge JSON bundle."""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
+    shape_error = _validate_knowledge_bundle(body)
+    if shape_error is not None:
+        _sel_log("import", outcome="rejected", reason=shape_error)
+        return web.json_response(
+            {"error": f"malformed bundle: {shape_error}", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
     # Redact imported text fields (may contain LLM-derived content from another instance)
     for item in body.get("items", []):
         redacted_title = _redact(item.get("title"))
@@ -1400,7 +1666,48 @@ async def import_bundle(request: web.Request) -> web.Response:
         redacted_type = _redact(rel.get("relation_type"))
         rel["relation_type"] = redacted_type if redacted_type is not None else ""
         rel["description"] = _redact(rel.get("description"))
-    result = _store(request).import_bundle(body)
+    try:
+        result = _store(request).import_bundle(body)
+    except KnowledgeBundleError as exc:
+        # The store enforces the JSON-column well-formedness invariant
+        # (sources.properties / entities.aliases) at the writer; surface its
+        # typed rejection as a clean 400.  Unlike the driver errors below,
+        # its message is validator-crafted (the same class as the handler's
+        # own shape errors above), so it is safe to render verbatim.
+        _sel_log("import", outcome="rejected", reason=str(exc))
+        return web.json_response(
+            {"error": f"malformed bundle: {exc}", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
+    except (KeyError, OverflowError, sqlite3.IntegrityError,
+            sqlite3.ProgrammingError, sqlite3.DataError) as exc:
+        # Only failures that genuinely mean a bad bundle earn a 400:
+        # IntegrityError (constraint/FK violations), ProgrammingError and
+        # DataError (bad values reaching the SQL layer), KeyError (missing
+        # required field), and OverflowError (a bundle integer field, e.g.
+        # chunk_index, too large for SQLite's 64-bit INTEGER, raised at bind
+        # time inside the store call -- neither a KeyError nor a
+        # sqlite3.Error, so it needs its own arm).  The exception detail
+        # stays server-side: the dashboard renders ``error`` verbatim, so
+        # raw driver text must not reach the client.
+        logger.warning("Knowledge bundle import rejected: %s", exc)
+        _sel_log("import", outcome="rejected", reason=str(exc))
+        return web.json_response(
+            {"error": "malformed bundle", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
+    except sqlite3.Error as exc:
+        # Operational store failures -- OperationalError from a locked DB
+        # past busy_timeout or a full disk, and every other sqlite3.Error --
+        # are not the client's fault: a 400 "malformed bundle" for a valid
+        # file sends the user off debugging their export.  Surface them as a
+        # 5xx with a generic body; the detail is logged server-side only.
+        logger.exception("Knowledge bundle import failed in the store")
+        _sel_log("import", outcome="error", reason=str(exc))
+        return web.json_response(
+            {"error": "internal server error", "code": "knowledge_import_failed"},
+            status=500,
+        )
     _sel_log("import", **result)
     return web.json_response(result)
 
@@ -1479,7 +1786,10 @@ async def batch_embed_items(request: web.Request) -> web.Response:
     if not await embedder.is_available_async():
         return web.json_response({"error": "Embedding model not available"}, status=503)
 
-    body = await request.json() if request.can_read_body else {}
+    body, body_err = await _json_object_body(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     rebuild = body.get("rebuild", False)
     force = body.get("force", False)
 
@@ -1650,11 +1960,10 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "pipeline not configured",
              "code": "pipeline_unavailable"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response(
-            {"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     result = await add_agent_document(
         pipeline,
         title=str(body.get("title") or ""),
@@ -1670,16 +1979,51 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def _shutdown_knowledge_pools(app: web.Application) -> None:
+    """Shut down each workload pool once, including the legacy alias."""
+    seen: set[int] = set()
+    for key in (
+        "knowledge_extraction_pool",
+        "knowledge_fetch_pool",
+        "knowledge_llm_pool",
+    ):
+        pool = app.get(key)
+        if pool is None or id(pool) in seen:
+            continue
+        seen.add(id(pool))
+        try:
+            await pool.shutdown()
+        except Exception:
+            logger.exception("Knowledge pool shutdown failed: %s", key)
+
+
 def setup_knowledge_routes(app: web.Application) -> None:
     # Initialize pipeline and sync scheduler if not already set
     if "knowledge_pipeline" not in app:
         store = app["state"].knowledge_store
-        pool = LLMPool()
+        cfg = KiroCrewConfig.load()
+        extraction_pool = LLMPool(
+            pool_size=cfg.knowledge.extraction_pool_size,
+            effort=DEFAULT_EXTRACTION_EFFORT,
+            use_config_pool_size=False,
+        )
+        fetch_pool = LLMPool(
+            pool_size=1,
+            use_config_pool_size=False,
+        )
         embedder = _create_embedder(app)
-        pipeline = IngestionPipeline(store=store, extractor=EntityExtractor(pool=pool),
-                                     chunker=HeadingAwareChunker(), reader=FileReader(),
-                                     embedder=embedder)
-        app["knowledge_llm_pool"] = pool
+        pipeline = IngestionPipeline(
+            store=store,
+            extractor=EntityExtractor(pool=extraction_pool),
+            chunker=HeadingAwareChunker(),
+            reader=FileReader(),
+            embedder=embedder,
+        )
+        app["knowledge_extraction_pool"] = extraction_pool
+        app["knowledge_fetch_pool"] = fetch_pool
+        # Keep the old key as an extraction-only compatibility alias. Production
+        # URL sync uses knowledge_fetch_pool above.
+        app["knowledge_llm_pool"] = extraction_pool
         app["knowledge_embedder"] = embedder
         connectors: dict[str, "BaseConnector"] = {}
         # Local folder connector (always available)
@@ -1755,12 +2099,7 @@ def setup_knowledge_routes(app: web.Application) -> None:
     app.router.add_get("/api/knowledge/search-for-context", search_for_context)
 
     # Pool lifecycle: lazy start on first request, shutdown on app exit
-    async def _shutdown_pool(app: web.Application) -> None:
-        pool = app.get("knowledge_llm_pool")
-        if pool:
-            await pool.shutdown()
-
-    app.on_cleanup.append(_shutdown_pool)
+    app.on_cleanup.append(_shutdown_knowledge_pools)
 
     async def _stop_watcher(app: web.Application) -> None:
         watcher = app.get("knowledge_watcher")

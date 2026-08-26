@@ -9,8 +9,10 @@ import { useRef } from 'react'
 import { Plus, Trash2, X } from 'lucide-react'
 
 import { i18nT } from '../../../i18n/t'
-import { Badge, Btn, Input, Select, SendBtn } from '../../../components/ui'
+import SimpleSelect from '../../../components/SimpleSelect'
+import { Badge, Btn, Input, SendBtn } from '../../../components/ui'
 import { PRIORITY_LABEL_KEY, type Task, type TaskPriority } from '../api'
+import { useImeGuard } from '../../../hooks/useImeGuard'
 
 const PRIORITIES: TaskPriority[] = ['high', 'medium', 'low']
 
@@ -29,6 +31,7 @@ interface Props {
 }
 
 export default function TaskSidebar({ tasks, onClose, onAdd, onUpdate, onDelete }: Props) {
+  const ime = useImeGuard()
   const quickAddRef = useRef<HTMLInputElement>(null)
 
   const quickAdd = () => {
@@ -41,8 +44,12 @@ export default function TaskSidebar({ tasks, onClose, onAdd, onUpdate, onDelete 
   const open = tasks.filter(task => task.review_status !== 'archived')
 
   return (
+    // Full width below `lg`, stacked under the meeting with a bounded height --
+    // the same shape MeetingWorkspace's transcript pane uses. The divider turns
+    // with the layout: a left border between two stacked blocks draws a line down
+    // the side of the sidebar instead of between the two.
     <aside
-      className="flex-none w-[340px] border-l border-border bg-bg flex flex-col overflow-hidden"
+      className="flex-none w-full h-[42%] min-h-[260px] border-t border-border lg:h-full lg:w-[340px] lg:border-t-0 lg:border-l bg-bg flex flex-col overflow-hidden"
       aria-label={i18nT('apps.meetings.taskSidebar.title')}
     >
       <div className="flex items-center gap-2 px-4 py-3 border-b border-border">
@@ -98,17 +105,19 @@ export default function TaskSidebar({ tasks, onClose, onAdd, onUpdate, onDelete 
                     }
                   }}
                 />
-                <Select
+                <SimpleSelect
+                  options={PRIORITIES}
+                  optionLabels={PRIORITIES.map(priority =>
+                    i18nT(PRIORITY_LABEL_KEY[priority]),
+                  )}
                   value={task.priority}
                   aria-label={i18nT('apps.meetings.taskSidebar.priorityLabel')}
-                  onChange={e => onUpdate(task.id, { priority: e.target.value as TaskPriority })}
-                >
-                  {PRIORITIES.map(priority => (
-                    <option key={priority} value={priority}>
-                      {i18nT(PRIORITY_LABEL_KEY[priority])}
-                    </option>
-                  ))}
-                </Select>
+                  onChange={value => onUpdate(task.id, { priority: value as TaskPriority })}
+                  // The old select carried `flexShrink: 0` from the shared wrapper:
+                  // the description Input beside it is `flex-1`, so the priority
+                  // picker must keep its own width instead of being squeezed.
+                  style={{ flex: '0 0 auto', minWidth: 110 }}
+                />
               </div>
               <div className="flex items-center gap-2">
                 <Badge variant={priorityBadge(task.priority)}>
@@ -138,9 +147,7 @@ export default function TaskSidebar({ tasks, onClose, onAdd, onUpdate, onDelete 
           className="flex-1"
           placeholder={i18nT('apps.meetings.taskSidebar.quickAddPlaceholder')}
           aria-label={i18nT('apps.meetings.taskSidebar.quickAddPlaceholder')}
-          onKeyDown={e => {
-            if (e.key === 'Enter') quickAdd()
-          }}
+          {...ime.bindEnter({ onEnter: quickAdd })}
         />
         <SendBtn onClick={quickAdd} aria-label={i18nT('apps.meetings.taskSidebar.add')}>
           <Plus className="lucide-inline" />

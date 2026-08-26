@@ -1,6 +1,16 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { waitForGateway, describeGatewayFailure, tailLines, isPortInUse } = require("../gateway-wait");
+const fs = require("node:fs");
+const path = require("node:path");
+const {
+  DEFAULT_GATEWAY_WAIT_MS,
+  WINDOWS_LOCAL_GATEWAY_WAIT_MS,
+  gatewayWaitTimeoutMs,
+  waitForGateway,
+  describeGatewayFailure,
+  tailLines,
+  isPortInUse,
+} = require("../gateway-wait");
 
 // Synchronous fake clock + timer so poll loops resolve instantly and
 // deterministically (no real waiting). setTimeoutFn advances the clock by the
@@ -42,6 +52,45 @@ test("waitForGateway resolves after a few unhealthy polls", async () => {
   });
   await p;
   assert.strictEqual(n, 3);
+});
+
+test("Windows local cold start stays on the splash past the ordinary deadline", async () => {
+  let polls = 0;
+  const maxWaitMs = gatewayWaitTimeoutMs({ platform: "win32", watchSpawn: true });
+  const { p } = harness({
+    // 110 failed 500ms polls model a 55-second packaged cold start.
+    checkBackend: () => (++polls <= 110
+      ? Promise.reject(new Error("not yet"))
+      : Promise.resolve()),
+    maxWaitMs,
+  });
+
+  await p;
+  assert.strictEqual(polls, 111);
+  assert.ok(maxWaitMs > DEFAULT_GATEWAY_WAIT_MS);
+});
+
+test("gateway wait policy extends only the primary Windows gateway", () => {
+  assert.strictEqual(
+    gatewayWaitTimeoutMs({ platform: "win32", watchSpawn: true }),
+    WINDOWS_LOCAL_GATEWAY_WAIT_MS,
+  );
+  assert.strictEqual(
+    gatewayWaitTimeoutMs({ platform: "win32", watchSpawn: false }),
+    DEFAULT_GATEWAY_WAIT_MS,
+  );
+  assert.strictEqual(
+    gatewayWaitTimeoutMs({ platform: "darwin", watchSpawn: true }),
+    DEFAULT_GATEWAY_WAIT_MS,
+  );
+});
+
+test("main extends the Windows deadline only for a gateway it spawned", () => {
+  const main = fs.readFileSync(path.join(__dirname, "..", "main.js"), "utf8");
+  assert.match(
+    main,
+    /watchSpawn: watchSpawn && gatewayOwnership === "spawned"/,
+  );
 });
 
 test("waitForGateway fails fast when the spawned gateway exited (no health polling)", async () => {
@@ -91,8 +140,41 @@ test("waitForGateway aborts when the window is gone", async () => {
 
 // ── describeGatewayFailure ──
 
+// An incomplete bundle is not a launch failure: the installer is still writing
+// the backend. Prefixing "could not be launched" would open with failure
+// vocabulary under a title that says the install is still finishing.
+test("describeGatewayFailure: an incomplete bundle passes its message through bare", () => {
+  const msg = "Kiro Crew's bundled Python runtime is still being installed — retry.";
+  assert.strictEqual(describeGatewayFailure({ error: msg, incompleteBundle: true }), msg);
+});
+
+test("describeGatewayFailure: an ordinary spawn error keeps the launch-failure prefix", () => {
+  assert.match(describeGatewayFailure({ error: "EACCES" }), /could not be launched/);
+});
+
 test("describeGatewayFailure: exit code", () => {
   assert.match(describeGatewayFailure({ code: 1, signal: null }), /code 1/);
+});
+
+test("describeGatewayFailure: the disabled case names the port and both ways out", () => {
+  const s = describeGatewayFailure({ disabled: true, port: 5476 });
+  assert.match(s, /5476/);
+  assert.match(s, /set not to start one on this machine/);
+  assert.match(s, /start one here/);
+  // Must NOT send the user to Settings: that page is served by the gateway that
+  // is not running, so the instruction would be unreachable exactly when shown.
+  assert.doesNotMatch(s, /Settings/);
+  // Nothing was launched, so wording that sends the user hunting a crash or a
+  // launch log is wrong for this case.
+  assert.doesNotMatch(s, /could not be launched|exited on launch|failed to start/);
+});
+
+test("describeGatewayFailure: disabled wins over a stale error field", () => {
+  // waitForGateway hands over whatever record it was given; the deliberate
+  // no-spawn reason must not be reported as a launch failure.
+  const s = describeGatewayFailure({ disabled: true, port: 7000, error: "spawn ENOENT" });
+  assert.match(s, /7000/);
+  assert.doesNotMatch(s, /ENOENT/);
 });
 
 test("describeGatewayFailure: SIGKILL carries the Gatekeeper + xattr hint", () => {

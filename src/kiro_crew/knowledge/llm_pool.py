@@ -1,7 +1,8 @@
 """Unified LLM worker pool for Knowledge Library.
 
 Provider-agnostic bounded pool of long-lived workers (CC or ACP).
-Both entity extraction and URL fetch acquire workers from this pool.
+Knowledge extraction and URL fetch use separate instances of this pool so their
+workload policies and session state remain isolated.
 """
 from __future__ import annotations
 
@@ -15,14 +16,13 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 from kiro_crew.config.paths import config_dir
+from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort
 from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
 
 try:
     from kiro_crew.acp.client import AcpClient, AcpTimeoutError
 except ImportError:
     AcpClient = None  # type: ignore[assignment,misc]
-    # Empty tuple keeps isinstance() checks valid (and always False) when the
-    # ACP layer is absent, mirroring the AcpClient fallback above.
     AcpTimeoutError = ()  # type: ignore[assignment,misc]
 
 # Sweep-protection shield for AcpClient-backed workers. These are direct,
@@ -58,12 +58,31 @@ FETCH_TIMEOUT = 120.0
 # in config.json overrides this floor.
 BOUND_TIMEOUT_FLOOR = 300.0
 AGENT_NAME = "kirocrew-knowledge"
+# Knowledge extraction is deliberately high-effort by default. URL fetching uses
+# a separate pool and passes no explicit effort, so it retains provider default.
+DEFAULT_EXTRACTION_EFFORT = "high"
 
 # Seconds the pool may sit FULLY idle (no worker checked out) before it is
 # scaled to zero — all workers shut down, freeing ~1GB of held process trees.
 # Workers respawn lazily on the next acquire(). 0 keeps them warm indefinitely
 # (the always-on behaviour).
 DEFAULT_IDLE_TTL_SECS = 300.0
+
+# Conversation-recycle thresholds for a checked-out worker.
+#
+# Pool workers are long-lived sessions, but every prompt they serve is
+# self-contained: ``extractor.EXTRACTION_PROMPT`` inlines the whole chunk between
+# per-call nonce markers, and ``agent_fetch`` inlines the whole URL, so no call
+# depends on anything an earlier call said. The accumulating transcript is
+# therefore pure cost — and once it reaches the backend's own ceiling the backend
+# auto-compacts, which is a BILLED summarization turn over the entire transcript,
+# repeated every few minutes for the rest of a large ingestion.
+#
+# Recycling the conversation first makes that never happen. The percentage is the
+# real signal; the call count is the fallback for backends that report no context
+# telemetry at all (a 0% reading is indistinguishable from an empty transcript).
+WORKER_RECYCLE_PCT = 50.0
+WORKER_RECYCLE_CALLS = 20
 
 
 # Sandbox modes accepted by ``kiro_crew.sandbox.wrap_argv`` (see its docstring).
@@ -198,24 +217,6 @@ def _get_timeout_floor(config: Optional[dict] = None, bound: bool = False) -> fl
     return BOUND_TIMEOUT_FLOOR
 
 
-def _get_pool_size(config: Optional[dict] = None) -> int:
-    """Worker count for pools that did not fix a size at construction.
-
-    ``knowledge.llm_pool_size`` (int, 1-16) sizes the pool per deployment: a
-    single-slot serving lane wants 1 — extra workers cannot run concurrently
-    there, they only queue behind each other until every prompt exceeds its
-    timeout (and, against an admission-controlled router, turn the excess into
-    503 storms). A malformed or out-of-range value falls back to the default
-    rather than silently starving the pool.
-    """
-    data = _read_config() if config is None else config
-    knowledge = data.get("knowledge") if isinstance(data, dict) else None
-    raw = knowledge.get("llm_pool_size") if isinstance(knowledge, dict) else None
-    if isinstance(raw, int) and not isinstance(raw, bool) and 1 <= raw <= 16:
-        return raw
-    return DEFAULT_POOL_SIZE
-
-
 def _get_sandbox_mode(config: Optional[dict] = None) -> str:
     """OS-level sandbox mode for knowledge-worker subprocesses.
 
@@ -224,18 +225,18 @@ def _get_sandbox_mode(config: Optional[dict] = None) -> str:
 
     Fallbacks distinguish two cases so a config ERROR can never silently disable
     sandboxing (fail-secure security control):
-    - ``sandbox`` **absent/unset** -> ``"off"``: the intended default, deferring
-      isolation to kiro-cli's own internal sandbox (kiro-cli >= 2.13).
+    - ``sandbox`` **absent/unset** -> ``"auto"``: the intended default, engages
+      OS-level isolation and automatically defers to kiro-cli's own internal
+      sandbox on macOS when it is enabled (kiro-cli >= 2.13).
     - ``sandbox`` **present but malformed/unrecognised** (typo, wrong type) ->
       ``"auto"``: fail SECURE. A garbage value is a misconfiguration, not an
       intent to run unsandboxed, so we re-enable KiroCrew's OS-level confinement
       rather than degrade to no isolation.
-    Set ``agent.sandbox="auto"`` to explicitly re-enable KiroCrew confinement.
     """
     data = _read_config() if config is None else config
     mode = _section(data, "agent").get("sandbox")
     if mode is None:
-        return "off"  # unset -> intended default (defer to kiro-cli sandbox)
+        return "auto"  # unset -> intended default (OS-level isolation engaged)
     if isinstance(mode, str) and mode in _VALID_SANDBOX_MODES:
         return mode
     return "auto"  # present but malformed -> fail secure, never silently unsandboxed
@@ -259,8 +260,59 @@ def _get_idle_ttl(config: Optional[dict] = None) -> float:
     return DEFAULT_IDLE_TTL_SECS
 
 
+def _get_pool_size(config: Optional[dict] = None) -> int:
+    """Configured extraction pool size; defaults to ``DEFAULT_POOL_SIZE``.
+
+    Reads ``knowledge.extraction_pool_size`` (default 3, clamped 1–10).
+    """
+    data = _read_config() if config is None else config
+    value = _section(data, "knowledge").get(
+        "extraction_pool_size", DEFAULT_POOL_SIZE
+    )
+    if isinstance(value, bool):
+        return DEFAULT_POOL_SIZE
+    if isinstance(value, int) and 1 <= value <= 10:
+        return value
+    return DEFAULT_POOL_SIZE
+
+
+def _normalize_effort(value: object) -> Optional[str]:
+    """Return a valid explicit effort level, or ``None`` for provider default."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str) and is_valid_effort(value):
+        return value
+    logger.warning("Ignoring invalid Knowledge worker effort: %r", value)
+    return None
+
+
+def _select_effort_level(requested: str, supported: list[str]) -> Optional[str]:
+    """Select the highest advertised effort no higher than ``requested``."""
+    supported_levels = {
+        level for level in supported
+        if isinstance(level, str) and is_valid_effort(level)
+    }
+    if not supported_levels:
+        # An advertised option without a usable level is treated like a lazy
+        # backend: attempt the requested value and let ACP confirm it.
+        return requested
+    requested_index = EFFORT_LEVELS.index(requested)
+    eligible = [
+        level for level in EFFORT_LEVELS
+        if level in supported_levels and EFFORT_LEVELS.index(level) <= requested_index
+    ]
+    return eligible[-1] if eligible else None
+
+
 class Worker(ABC):
     """Abstract base for a long-lived LLM worker."""
+
+    # Prompts served since this worker's conversation was last reset. The pool
+    # reads it to decide when the transcript has grown far enough to be worth
+    # dropping (see WORKER_RECYCLE_CALLS). Declared at class level, not set in an
+    # ``__init__``, so a subclass that does not chain up still has the counter
+    # (``+=`` rebinds it per instance).
+    calls_since_reset: int = 0
 
     @abstractmethod
     async def start(self) -> None:
@@ -278,15 +330,38 @@ class Worker(ABC):
     def is_alive(self) -> bool:
         """True if this worker can still process messages."""
 
+    def context_pct(self) -> float:
+        """Backend-reported context usage for this worker's conversation.
+
+        ``0.0`` when the backend reports nothing (the pool then falls back to the
+        call count), so a subclass with no telemetry needs no override.
+        """
+        return 0.0
+
+    @abstractmethod
+    async def reset_conversation(self) -> None:
+        """Drop the accumulated transcript, leaving the worker ready to serve.
+
+        Must leave ``is_alive()`` true on success so the pool's dead-worker
+        replacement path stays reserved for genuine deaths.
+        """
+
 
 class AcpWorker(Worker):
     """Long-lived AcpClient session with kirocrew-knowledge agent."""
 
-    def __init__(self, *, sandbox_mode: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        *,
+        sandbox_mode: Optional[str] = None,
+        effort: Optional[str] = None,
+    ) -> None:
         self._client: Optional[AcpClient] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
         self._sandbox_mode = sandbox_mode
+        self._effort = _normalize_effort(effort)
+        self._effective_effort: Optional[str] = None
         # PID currently shielded from the gateway orphan sweep (see module note).
         self._protected_pid: Optional[int] = None
 
@@ -335,7 +410,9 @@ class AcpWorker(Worker):
             audit_source="subagent",
             **binding,
         )
+        self._effective_effort = None
         await self._client.ensure_ready()
+        await self._apply_effort()
         # Shield the live worker PID from the periodic orphan sweep for as long
         # as it runs. Paired with unregister in shutdown() and on respawn above.
         pid = getattr(self._client, "_pid", None)
@@ -345,6 +422,50 @@ class AcpWorker(Worker):
         else:
             self._protected_pid = None
         logger.info("AcpWorker: ready (agent=%s, pid=%s)", AGENT_NAME, getattr(self._client, '_pid', 'unknown'))
+
+    async def _apply_effort(self) -> None:
+        """Apply the requested effort without breaking provider-default fallback."""
+        client = self._client
+        requested = self._effort
+        if client is None or requested is None:
+            return
+        try:
+            is_claude = bool(getattr(client, "_is_claude", False))
+            if is_claude and not client.supports_config_option("effort"):
+                logger.warning(
+                    "AcpWorker: effort=%s unsupported; using provider default",
+                    requested,
+                )
+                return
+            supported = client.get_valid_effort_levels()
+            if not isinstance(supported, list):
+                supported = []
+            effective = _select_effort_level(requested, supported)
+            if effective is None:
+                logger.warning(
+                    "AcpWorker: no supported effort at or below %s; "
+                    "using provider default",
+                    requested,
+                )
+                return
+            if is_claude:
+                await client.set_config_option("effort", effective)
+            else:
+                await client.send_command("/effort", args={"level": effective})
+        except Exception:
+            logger.warning(
+                "AcpWorker: could not apply effort=%s; using provider default",
+                requested,
+                exc_info=True,
+            )
+            return
+        self._effective_effort = effective
+        if effective != requested:
+            logger.warning(
+                "AcpWorker: effort=%s downgraded to supported effort=%s",
+                requested,
+                effective,
+            )
 
     async def send_message(self, prompt: str, timeout: float = DEFAULT_TIMEOUT) -> str:
         if self._client is None or not self._client.is_ready:
@@ -368,6 +489,26 @@ class AcpWorker(Worker):
 
     def is_alive(self) -> bool:
         return self._client is not None and self._client.is_process_alive()
+
+    def context_pct(self) -> float:
+        client = self._client
+        if client is None:
+            return 0.0
+        try:
+            return float(client.last_prompt_stats.context_pct)
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+    async def reset_conversation(self) -> None:
+        """Spawn a fresh ACP session, discarding the accumulated transcript.
+
+        ``start()`` already tears the previous client down (and moves the sweep
+        shield to the new PID), so re-running it is the whole reset. It costs one
+        cold start per WORKER_RECYCLE_CALLS prompts, far less than the billed
+        auto-compaction the growing transcript would otherwise trigger.
+        """
+        await self.start()
+        self.calls_since_reset = 0
 
 
 class CCWorker(Worker):
@@ -496,23 +637,44 @@ class CCWorker(Worker):
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
+    async def reset_conversation(self) -> None:
+        """Respawn the CLI subprocess, discarding the accumulated transcript.
+
+        The transcript lives only in the process's own stream-json conversation,
+        so replacing the process is the reset. ``_spawn()`` cancels the old
+        reader task and installs a fresh event queue, leaving the worker ready.
+        """
+        old = self._proc
+        await self._spawn()
+        if old is not None and old is not self._proc:
+            try:
+                old.kill()
+                await old.wait()
+            except Exception:
+                logger.debug("CCWorker: stale process reap failed", exc_info=True)
+        self.calls_since_reset = 0
+
 
 class LLMPool:
     """Bounded pool of long-lived LLM workers.
 
-    Both extraction and URL fetch acquire workers from this pool.
+    Callers may bind a pool to one workload's effort profile. Extraction and URL
+    fetch use separate instances so an effort setting cannot leak between them.
     If all workers are busy, callers wait on the semaphore.
     Dead workers are replaced transparently on acquire.
     """
 
-    def __init__(self, pool_size: Optional[int] = None):
-        # An explicit constructor size is fixed for the pool's lifetime; when
-        # omitted, start() resolves ``knowledge.llm_pool_size`` from config on
-        # every (re)spawn, so an operator resize takes effect at the next
-        # idle-TTL respawn without a code change.
-        self._fixed_pool_size = pool_size
-        self._pool_size = pool_size if pool_size is not None else DEFAULT_POOL_SIZE
-        self._semaphore = asyncio.Semaphore(self._pool_size)
+    def __init__(
+        self,
+        pool_size: int = DEFAULT_POOL_SIZE,
+        *,
+        effort: Optional[str] = None,
+        use_config_pool_size: bool = True,
+    ):
+        self._pool_size = pool_size
+        self._effort = _normalize_effort(effort)
+        self._use_config_pool_size = use_config_pool_size
+        self._semaphore = asyncio.Semaphore(pool_size)
         self._workers: list[Worker] = []
         self._available: asyncio.Queue[int] = asyncio.Queue()
         self._started = False
@@ -548,18 +710,23 @@ class LLMPool:
             config = await asyncio.to_thread(_read_config)
             self._provider_type = _get_provider_type(config)
             self._sandbox_mode = _get_sandbox_mode(config)
+            # Allow config to override pool size (knowledge.extraction_pool_size).
+            # Only applies when the key is explicitly set in config (not the
+            # fallback default), so callers that pass a specific pool_size to the
+            # constructor are not overridden.
+            configured_size = _get_pool_size(config)
+            explicit = "extraction_pool_size" in (_section(
+                config, "knowledge") if config else {})
+            if (
+                self._use_config_pool_size
+                and explicit
+                and configured_size != self._pool_size
+            ):
+                self._pool_size = configured_size
+                self._semaphore = asyncio.Semaphore(configured_size)
             self._idle_ttl = _get_idle_ttl(config)
             self._config = config
             binding, _ = await asyncio.to_thread(_resolve_client_binding)
-            if self._fixed_pool_size is None:
-                size = _get_pool_size(config)
-                if size != self._pool_size:
-                    # Safe to swap here: _started is False under the lock, so no
-                    # caller holds a permit and any acquire() blocked on the old
-                    # semaphore re-checks _started and retries against the new
-                    # one (same invariant _maybe_scale_to_zero relies on).
-                    self._pool_size = size
-                    self._semaphore = asyncio.Semaphore(size)
             self._timeout_floor = _get_timeout_floor(config, bound=bool(binding))
             if self._timeout_floor:
                 logger.info(
@@ -596,7 +763,10 @@ class LLMPool:
         if self._provider_type == "claude_code":
             worker: Worker = CCWorker()
         else:
-            worker = AcpWorker(sandbox_mode=self._sandbox_mode)
+            worker = AcpWorker(
+                sandbox_mode=self._sandbox_mode,
+                effort=self._effort,
+            )
         await worker.start()
         return worker
 
@@ -743,7 +913,40 @@ class LLMPool:
                 prompt, timeout=max(timeout, self._timeout_floor)
             )
         finally:
-            self.release(idx)
+            try:
+                await self._maybe_recycle(idx, worker)
+            finally:
+                self.release(idx)
+
+    async def _maybe_recycle(self, idx: int, worker: Worker) -> None:
+        """Reset *worker*'s conversation once its transcript has grown enough.
+
+        Runs while the worker is still checked out, so no other caller can send
+        into a half-reset session. Every knowledge prompt is self-contained, so a
+        reset loses nothing — and it must land BEFORE the backend's own
+        auto-compaction, which bills a summarization turn over the whole
+        transcript every time it fires.
+
+        A failed reset is not fatal: the worker is left reporting dead and
+        ``acquire()`` replaces it on the next checkout.
+        """
+        worker.calls_since_reset += 1
+        try:
+            pct = worker.context_pct()
+        except Exception:
+            pct = 0.0
+        by_pct = pct >= WORKER_RECYCLE_PCT
+        if not by_pct and worker.calls_since_reset < WORKER_RECYCLE_CALLS:
+            return
+        reason = f"context at {pct:.0f}%" if by_pct else f"{worker.calls_since_reset} calls"
+        logger.info("LLMPool: recycling worker %d conversation — %s", idx, reason)
+        try:
+            await worker.reset_conversation()
+        except Exception:
+            logger.warning(
+                "LLMPool: worker %d conversation reset failed; will be replaced on "
+                "next acquire", idx, exc_info=True,
+            )
 
     async def send_batch(self, prompts: list[str], timeout: float = DEFAULT_TIMEOUT) -> list[str]:
         """Send multiple prompts concurrently, bounded by pool size.
@@ -761,55 +964,38 @@ class LLMPool:
 
         An unclassified or transient failure keeps the previous behaviour: that
         item fails alone and the rest of the batch proceeds.
-
-        A timeout in a BOUND pool also abandons the batch, loudly: the floor
-        (see BOUND_TIMEOUT_FLOOR) is sized for a healthy lane's worst case, so
-        exhausting it means the lane itself is unhealthy and the queued
-        remainder would only reproduce the wait. Unbound pools keep the
-        per-item timeout behaviour — their callers chose fast-fail budgets
-        deliberately.
         """
         if not prompts:
             return []
 
         results: list[str] = [""] * len(prompts)
         terminal: list[BaseException] = []
-        # A bound-pool prompt that exhausts the timeout FLOOR is an alarm, not
-        # an item failure: the floor already covers a healthy lane's worst
-        # case (service + cold swap), so reaching it means the lane cannot
-        # meet its budget right now and every queued sibling will meet the
-        # same fate — dispatching them just extends the outage and re-queues
-        # work the lane may still be chewing on for a departed client
-        # (operator ruling 2026-08-11: "we shouldn't be getting there; if we
-        # do, re-evaluate strategy", not raise the number).
         floor_hit: list[BaseException] = []
 
         async def _do_one(idx: int, prompt: str) -> None:
             if terminal or floor_hit:
                 return
             slot, worker = await self.acquire()
+            sent = False
             try:
                 # Re-checked after the wait: a prompt queued behind a full pool
                 # may have been waiting while an earlier one proved the backend
-                # terminal (or hit the floor), and spending its slot would buy
-                # nothing.
+                # terminal or exceeded the bound-lane floor, and spending its
+                # slot would buy nothing.
                 if terminal or floor_hit:
                     return
+                sent = True
                 results[idx] = await worker.send_message(
                     prompt, timeout=max(timeout, self._timeout_floor)
                 )
             except Exception as e:
                 if self._timeout_floor > 0 and isinstance(e, AcpTimeoutError):
-                    if floor_hit:
-                        logger.debug("LLMPool: batch item %d also hit the floor", idx)
-                    else:
+                    if not floor_hit:
                         floor_hit.append(e)
                         logger.warning(
-                            "LLMPool: prompt exceeded the %.0fs timeout floor — "
-                            "the serving lane cannot meet its healthy budget; "
-                            "abandoning the remaining batch. The floor is an "
-                            "alarm, not a budget: fix lane health or pool "
-                            "concurrency instead of raising it.",
+                            "LLMPool: prompt exceeded the %.0fs timeout floor; "
+                            "the serving lane is unhealthy, abandoning the remaining "
+                            "batch. The floor is an alarm, not a budget.",
                             self._timeout_floor,
                         )
                 elif getattr(e, "transient", None) is False:
@@ -822,7 +1008,11 @@ class LLMPool:
                     logger.warning("LLMPool: batch item %d failed: %s", idx, e)
                 results[idx] = ""
             finally:
-                self.release(slot)
+                try:
+                    if sent:
+                        await self._maybe_recycle(slot, worker)
+                finally:
+                    self.release(slot)
 
         await asyncio.gather(*[_do_one(i, p) for i, p in enumerate(prompts)])
         return results

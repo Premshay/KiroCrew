@@ -128,6 +128,34 @@ describe('create-button caret menu', () => {
     expect(screen.getByText('New autopilot chat')).toBeTruthy()
   })
 
+  it('explains what each engineered mode does, at the point of choice', async () => {
+    // The moment a user cannot tell Autopilot from Crew Mode is the moment this
+    // menu opens. Before this, the only explanation was a native title= on the
+    // sidebar badge — i.e. visible only after the session already existed.
+    renderSidebar()
+    openCreateMenu()
+    await screen.findByText('New autopilot chat')
+    // The contrast that matters: one job in stages vs several at once.
+    expect(screen.getByText(/One job, done in steps/)).toBeTruthy()
+    expect(screen.getByText(/Several jobs at once/)).toBeTruthy()
+  })
+
+  it('leaves the plain entries single-line', async () => {
+    // "New chat" / "New folder" need no gloss, and describing them would bury
+    // the contrast between the two engineered modes.
+    renderSidebar()
+    openCreateMenu()
+    await screen.findByText('New chat')
+    // Assert on the menu ITEM (the role=menuitem ancestor), not the text node:
+    // "New chat" is a bare child of the menu container, so parentElement there
+    // is the whole menu and would sweep in every sibling's copy.
+    for (const label of ['New chat', 'New folder']) {
+      const item = screen.getByText(label).closest('[role="menuitem"]')
+      expect(item).not.toBeNull()
+      expect(item?.textContent?.trim()).toBe(label)
+    }
+  })
+
   it('"New chat" creates a plain session even when defaultAutopilot is on', async () => {
     cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: true }
     renderSidebar()
@@ -146,5 +174,25 @@ describe('create-button caret menu', () => {
     fireEvent.click(await screen.findByText('New autopilot chat'))
     await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalled())
     expect(mocks.createChatSlot.mock.calls.some(c => c.includes('orchestrator'))).toBe(true)
+  })
+
+  it('tags Crew Mode experimental where the mode is chosen, and only there', async () => {
+    // Crew Mode dispatches every message to a sub-session and relays a summary
+    // rather than the reply, so it does not yet read like a conversation. Until
+    // that is fixed the mode has to announce itself, and the only moment that
+    // helps is BEFORE the click — a warning on the resulting session's badge is
+    // read once the session already exists.
+    renderSidebar()
+    openCreateMenu()
+    const crewItem = (await screen.findByText('New Crew Mode chat')).closest('[role="menuitem"]')
+    expect(crewItem).not.toBeNull()
+    // Scoped to the crew item, not the menu: asserting the word merely appears
+    // somewhere would still pass if the tag drifted onto a sibling entry.
+    const tag = crewItem?.querySelector('[data-testid="crew-experimental-tag"]')
+    expect(tag?.textContent).toBe('Experimental')
+    // The neighbouring mode is NOT experimental; a tag that leaks onto it turns
+    // a targeted caution into noise on a shipped feature.
+    const autopilotItem = screen.getByText('New autopilot chat').closest('[role="menuitem"]')
+    expect(autopilotItem?.querySelector('[data-testid="crew-experimental-tag"]')).toBeNull()
   })
 })

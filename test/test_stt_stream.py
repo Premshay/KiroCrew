@@ -367,9 +367,92 @@ class TestAppleStreamingSession:
             assert "Command Line Tools" in msg["message"]
             await ws.close()
 
+    @pytest.mark.asyncio
+    async def test_cancelled_start_still_closes_the_session(self, monkeypatch):
+        """`await session.start()` runs BEFORE the teardown `finally` exists.
+
+        A cancellation landing there (client gone, gateway shutdown) therefore
+        has no caller-side owner: without the call-site guard, the helper
+        session — and the sandbox launcher it may hold — is never closed, and
+        the `stt_stream_start` already emitted gets no matching end audit. The
+        guard must close the session, balance the trail, and re-raise.
+        """
+        started = asyncio.Event()
+        closed: list[bool] = []
+        outcomes: list[str] = []
+
+        class HangingSession:
+            def __init__(self, **kwargs):
+                pass
+
+            async def start(self):
+                started.set()
+                await asyncio.sleep(60)
+                return ""
+
+            async def close(self):
+                closed.append(True)
+
+        self._install(monkeypatch, session=HangingSession)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream._emit_end_audit",
+            lambda caller, *, outcome: outcomes.append(outcome),
+        )
+        from kiro_crew.dashboard import stt_stream
+
+        task = asyncio.create_task(
+            stt_stream._run_apple_session(
+                MagicMock(), _cfg(provider="apple"), MagicMock(), "test-caller"
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed == [True]
+        assert outcomes == ["error"]
+
+
+@pytest.fixture()
+def transcribe_consented(tmp_path_factory, monkeypatch):
+    """Record operator consent for Transcribe in a throwaway data home.
+
+    Streaming Transcribe is a paid service, so ``api_ws_stt`` refuses without a
+    grant for the configured profile+region. Every class that drives that handler
+    needs this; it is module-level rather than copied per class so the two cannot
+    drift. Cases that assert the REFUSAL live in ``test_aws_consent.py``.
+
+    Also stubs the live-account check, which would otherwise spawn the AWS CLI --
+    these cases are about the stream, not the identity probe.
+    """
+    home = tmp_path_factory.mktemp("stt-consent-home")
+    monkeypatch.setenv("KIROCREW_HOME", str(home))
+    from kiro_crew import aws_consent
+    from kiro_crew.config.loader import config_dir
+
+    config_dir().mkdir(parents=True, exist_ok=True)
+    cfg = _cfg()
+    aws_consent.record_grant(
+        aws_consent.SERVICE_TRANSCRIBE,
+        profile=cfg.stt.transcribe_profile,
+        region=cfg.stt.transcribe_region,
+        account="111122223333",
+        arn="arn:aws:iam::111122223333:user/test",
+        granted_at="2026-08-21T00:00:00+00:00",
+    )
+
+    async def _probe(_profile, _region, *, use_cache=True):
+        return aws_consent.Identity(ok=True, account="111122223333")
+
+    monkeypatch.setattr(aws_consent, "probe_identity", _probe)
+
 
 class TestStreamLifecycle:
     """Mock TranscribeStreamingClient to verify lifecycle + redaction."""
+
+    @pytest.fixture(autouse=True)
+    def _consented(self, transcribe_consented):
+        """Every case here drives ``api_ws_stt``, which is consent-gated."""
 
     @pytest.fixture(autouse=True)
     def _require_amazon_transcribe(self):
@@ -742,8 +825,68 @@ class TestConfigPutRoundTrip:
             assert "he-IL" in data["language_codes"]
 
 
+class TestSttLanguageCodes:
+    """The language list that drives the Chat Settings STT picker.
+
+    The picker is the only supported way to choose a recognition language, so a
+    language missing from this list is unreachable without hand-editing
+    config.json — even when the provider (AWS Transcribe) supports it.
+    """
+
+    def test_korean_is_offered(self):
+        """Korean must be selectable in the picker.
+
+        Regression: `ko-KR` was absent while ja-JP and zh-CN were present, so
+        Korean speakers could not choose their language from the dashboard.
+        """
+        from kiro_crew.dashboard.handlers.core import _STT_LANGUAGE_CODES
+
+        assert "ko-KR" in _STT_LANGUAGE_CODES
+
+    def test_codes_are_unique_and_well_formed(self):
+        """Every entry is a distinct `ll-CC` BCP-47 tag.
+
+        A duplicate renders twice in the dropdown, and a malformed tag is
+        rejected by Transcribe at stream-start rather than at selection time.
+        """
+        from kiro_crew.dashboard.handlers.core import _STT_LANGUAGE_CODES
+
+        assert len(set(_STT_LANGUAGE_CODES)) == len(_STT_LANGUAGE_CODES)
+        for code in _STT_LANGUAGE_CODES:
+            language, _, region = code.partition("-")
+            assert language.isalpha() and language.islower() and len(language) == 2, code
+            assert region.isalpha() and region.isupper() and len(region) == 2, code
+
+    @pytest.mark.asyncio
+    async def test_korean_round_trips_through_the_config_api(self, tmp_path, monkeypatch):
+        """Selecting Korean persists and is served back to the UI."""
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        from kiro_crew.dashboard import handlers
+
+        app = web.Application()
+        app.router.add_get("/api/config/stt", handlers.api_stt_config)
+        app.router.add_put("/api/config/stt", handlers.api_stt_config)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.put(
+                "/api/config/stt",
+                json={"provider": "transcribe", "language_code": "ko-KR"},
+            )
+            assert resp.status == 200
+
+            resp = await client.get("/api/config/stt")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["language_code"] == "ko-KR"
+            assert "ko-KR" in data["language_codes"]
+
+
 class TestDefensiveGuards:
     """Regression tests for review-bot rev 2 findings (posts #9, #10)."""
+
+    @pytest.fixture(autouse=True)
+    def _consented(self, transcribe_consented):
+        """Every case here drives ``api_ws_stt``, which is consent-gated."""
 
     @pytest.mark.asyncio
     async def test_guard_audit_sel_failure_preserves_status_code(self, monkeypatch):
@@ -974,7 +1117,32 @@ class TestSttProviderGating:
         monkeypatch.setattr(
             apple_speech, "availability", lambda: apple_speech.Availability(False, "pinned off")
         )
-        assert core._stt_providers() == ["whisper", "mlx", "transcribe"]
+        # `parakeet` is gated the same way as `mlx` (Apple-Silicon-only), so both
+        # are present here.
+        assert core._stt_providers() == ["whisper", "mlx", "parakeet", "transcribe"]
+
+    def test_stt_providers_calls_is_apple_silicon_exactly_once(self, monkeypatch):
+        """`parakeet` reuses the `mlx` gate's already-computed Apple-Silicon
+        result rather than re-probing. Off Apple Silicon (e.g. under Rosetta),
+        `_is_apple_silicon()` shells out to `sysctl` synchronously, and
+        `_stt_providers()` runs on the dashboard's event loop (GET/PUT
+        /api/config/stt) -- a second call would double that blocking cost on
+        every request."""
+        from kiro_crew import apple_speech
+        from kiro_crew.dashboard.handlers import core
+
+        calls = []
+
+        def fake_is_apple_silicon():
+            calls.append(1)
+            return True
+
+        monkeypatch.setattr(core, "_is_apple_silicon", fake_is_apple_silicon)
+        monkeypatch.setattr(
+            apple_speech, "availability", lambda: apple_speech.Availability(False, "pinned off")
+        )
+        core._stt_providers()
+        assert len(calls) == 1
 
     def test_providers_exclude_mlx_off_apple_silicon(self, monkeypatch):
         from kiro_crew import apple_speech
@@ -995,7 +1163,7 @@ class TestSttProviderGating:
 
         monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
         monkeypatch.setattr(apple_speech, "availability", lambda: apple_speech.Availability(True))
-        assert core._stt_providers() == ["whisper", "mlx", "apple", "transcribe"]
+        assert core._stt_providers() == ["whisper", "mlx", "apple", "parakeet", "transcribe"]
 
     def test_providers_exclude_apple_when_toolchain_missing(self, monkeypatch):
         """A host that could run the framework but has no Swift toolchain must not be
@@ -1012,13 +1180,14 @@ class TestSttProviderGating:
         assert "apple" not in core._stt_providers()
 
     def test_mlx_prereqs_empty_when_brew_present(self, monkeypatch):
-        """The Install button installs ffmpeg/pipx/mlx-whisper, so when brew is
-        present there are no manual prereqs to surface (no duplication)."""
+        """The Install button installs pipx/mlx-whisper, so with brew present
+        and ffmpeg on PATH there are no manual prereqs to surface."""
         from kiro_crew.dashboard.handlers import core
 
         monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
         monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
         monkeypatch.setattr(core, "find_brew", lambda: "/opt/homebrew/bin/brew")
+        monkeypatch.setattr(core.shutil, "which", lambda _n: "/opt/homebrew/bin/ffmpeg")
         assert core._stt_prereq_commands("mlx") == []
 
     def test_mlx_prereqs_empty_when_brew_off_path(self, monkeypatch):
@@ -1034,7 +1203,10 @@ class TestSttProviderGating:
 
         monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
         monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
-        monkeypatch.setattr("shutil.which", lambda _name, **_kw: None)
+        monkeypatch.setattr(
+            "shutil.which",
+            lambda name, **_kw: "/opt/homebrew/bin/ffmpeg" if name == "ffmpeg" else None,
+        )
         monkeypatch.setattr("os.path.isfile", lambda p: p == "/opt/homebrew/bin/brew")
         monkeypatch.setattr("os.access", lambda p, _mode: p == "/opt/homebrew/bin/brew")
         assert core._stt_prereq_commands("mlx") == []
@@ -1124,3 +1296,112 @@ class TestSttInstallScriptPath:
             env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(tmp_path)},
         )
         assert "FOUND" in out.stdout
+
+
+class TestSttInstallScriptWheels:
+    """The pip fallback must never drop into a source build.
+
+    openai-whisper is a pure-Python sdist, but numpy / numba / llvmlite / torch /
+    triton / tiktoken ship compiled wheels. On a host whose glibc is older than the
+    wheel's tag (Amazon Linux 2 = glibc 2.26, so manylinux_2_17 is the ceiling while
+    current numpy publishes manylinux_2_28) pip falls back to the source tarball and
+    the failure surfaces as a compiler error naming numpy — "GCC >= 9.3",
+    "metadata-generation-failed" — which reads as a numpy bug rather than the
+    wheel-compatibility problem it is.
+    """
+
+    def _pip_section(self):
+        """Return (full script, the pip-fallback section only).
+
+        Scoped deliberately: the brew branch above also mentions
+        ``openai-whisper``, so a whole-script index() would measure the wrong
+        occurrence and the ordering assertions would silently pass.
+        """
+        from kiro_crew.dashboard.handlers import core
+
+        script = core._build_stt_install_script("whisper")
+        marker = "# Fallback: pip install"
+        assert marker in script, "pip fallback section not found"
+        return script, script[script.index(marker) :]
+
+    def _pip_commands(self, section):
+        """Real pip invocations: continuations joined, comments dropped.
+
+        Each command is truncated at its ``||`` recovery clause — the CPU-torch
+        step's fallback ``echo`` mentions openai-whisper, and counting that as an
+        install target would inflate the command list.
+        """
+        joined = section.replace("\\\n", " ")
+        cmds = []
+        for ln in joined.splitlines():
+            stripped = ln.strip()
+            if stripped.startswith("#") or "pip install" not in stripped:
+                continue
+            cmds.append(" ".join(stripped.split()).split("||")[0].strip())
+        return cmds
+
+    def test_compiled_deps_are_wheel_only(self):
+        """Every pip install of the whisper stack constrains source builds."""
+        script, section = self._pip_section()
+        cmds = self._pip_commands(section)
+        assert cmds, "expected at least one pip install command"
+        for cmd in cmds:
+            assert "--only-binary" in cmd, f"unconstrained pip install: {cmd}"
+        # The named set must cover the deps that actually compile.
+        for pkg in ("numpy", "numba", "llvmlite", "torch", "triton", "tiktoken", "regex"):
+            assert pkg in section, f"{pkg} missing from the wheel-only set"
+
+    def test_no_hardcoded_version_ceiling(self):
+        """Wheel-only is the mechanism; a pinned cap would rot.
+
+        ``--only-binary`` drops sdists from the candidate set, so pip backtracks
+        to the newest release that HAS a compatible wheel on its own (glibc 2.26:
+        numpy 2.5.1 -> 2.2.6 manylinux_2_17). Pinning a ceiling instead would go
+        stale as hosts and wheel tags move, and would hold back a modern host.
+        """
+        _, section = self._pip_section()
+        whisper = [c for c in self._pip_commands(section) if "openai-whisper" in c]
+        assert len(whisper) == 1, f"expected one whisper install, got {len(whisper)}"
+        assert "numpy<" not in section, "no hardcoded numpy ceiling"
+        assert "numpy==" not in section, "no hardcoded numpy pin"
+
+    def test_cpu_torch_installed_first_when_no_gpu(self):
+        """A GPU-less Linux host must not pull ~2.5 GB of CUDA wheels."""
+        _, section = self._pip_section()
+        assert "nvidia-smi" in section, "GPU probe missing"
+        assert "download.pytorch.org/whl/cpu" in section
+        # --extra-index-url only ADDS a source; pip would still prefer the
+        # higher-versioned CUDA build, so the CPU index must be the ONLY index.
+        assert "--extra-index-url https://download.pytorch.org/whl/cpu" not in section
+        # torch has to land before the whisper resolve, or it is already satisfied
+        # by the CUDA build and the CPU step is a no-op.
+        assert section.index("download.pytorch.org/whl/cpu") < section.index(
+            "Installing openai-whisper"
+        )
+
+    def test_cpu_torch_failure_is_not_fatal(self):
+        """An unreachable CPU index must not fail an otherwise-fine install."""
+        _, section = self._pip_section()
+        tail = section[
+            section.index("download.pytorch.org/whl/cpu") : section.index(
+                "Installing openai-whisper"
+            )
+        ]
+        # The CPU-torch step recovers with `|| echo`, never `exit 1`.
+        assert "|| echo" in tail
+        assert "exit 1" not in tail
+
+    def test_pip_path_still_targets_system_python(self):
+        """Regression guard on a deliberate design choice, not an accident.
+
+        ``--user`` lands in ``~/.local/bin``, which ``transcribe._find_whisper``
+        probes explicitly via ``_WHISPER_SEARCH_PATHS`` (``_python3_bin_dir``
+        returns the interpreter's OWN prefix bin, not the --user target, so it is
+        not what covers this). Redirecting the install into the gateway's venv
+        would make the binary undiscoverable at runtime, and ``--user`` is
+        rejected outright inside a virtualenv.
+        """
+        script, section = self._pip_section()
+        for cmd in self._pip_commands(section):
+            assert "--user" in cmd, f"pip install must stay a --user install: {cmd}"
+        assert "sys.executable" not in script

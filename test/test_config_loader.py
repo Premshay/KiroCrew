@@ -6,10 +6,12 @@ for property-based testing.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
 import platform
+import re
 import tempfile
 import unittest.mock
 from pathlib import Path
@@ -88,6 +90,28 @@ def _load_from_dict(data: object) -> KiroCrewConfig:
             return KiroCrewConfig.load()
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _load_absent_config() -> KiroCrewConfig:
+    """Load with NEITHER config.json nor config.local.json present.
+
+    This is the only path that reaches the dataclass field defaults, so it is
+    what a default must be compared against.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        missing = Path(d) / "config.json"
+        missing_local = Path(d) / "config.local.json"
+        with (
+            unittest.mock.patch(
+                "kiro_crew.config.loader.config_path",
+                return_value=missing,
+            ),
+            unittest.mock.patch(
+                "kiro_crew.config.loader.config_local_path",
+                return_value=missing_local,
+            ),
+        ):
+            return KiroCrewConfig.load()
 
 
 def _load_from_raw_string(content: str) -> KiroCrewConfig:
@@ -180,6 +204,56 @@ def test_sandbox_allow_unsandboxed_exec_loads_from_config() -> None:
     assert enabled.agent.sandbox_allow_unsandboxed_exec is True
 
 
+def test_max_stop_hook_nudges_loads_from_config_and_round_trips() -> None:
+    """The Stop-hook nudge cap is built field-by-field in load(), so an
+    operator's value must hydrate and survive a to_dict() -> load() round-trip.
+    Without the loader wiring, load() re-defaults it to 100 and save() then
+    overwrites the operator's file value.
+    """
+    assert KiroCrewConfig().agent.max_stop_hook_nudges == 100
+    assert _load_from_dict({}).agent.max_stop_hook_nudges == 100
+    pinned = _load_from_dict({"agent": {"max_stop_hook_nudges": 7}})
+    assert pinned.agent.max_stop_hook_nudges == 7
+    # 0 = uncapped opt-in must survive too, not be re-defaulted to 100.
+    uncapped = _load_from_dict({"agent": {"max_stop_hook_nudges": 0}})
+    assert uncapped.agent.max_stop_hook_nudges == 0
+    # Round-trip: save() (to_dict) -> load() preserves the pinned value.
+    assert _load_from_dict(pinned.to_dict()).agent.max_stop_hook_nudges == 7
+
+
+def test_dashboard_tailscale_hydrates_and_survives_a_round_trip() -> None:
+    """The opt-in must survive ``load()`` and a later ``save()``.
+
+    ``DashboardConfig`` is built field-by-field in ``load()``, so a nested
+    section that nobody wires up is silently dropped: the documented
+    ``kirocrew config set dashboard.tailscale.enabled true`` would land in
+    config.json, read back as ``False``, and — because ``to_dict()`` re-serializes
+    the default — be rewritten to ``false`` by the next unrelated ``save()``.
+    That makes the whole feature inert while looking configured, so both halves
+    are pinned here: hydration, and the round trip that would erase it.
+    """
+    assert KiroCrewConfig().dashboard.tailscale.enabled is False
+    assert _load_from_dict({}).dashboard.tailscale.enabled is False
+
+    enabled = _load_from_dict({"dashboard": {"tailscale": {"enabled": True}}})
+    assert enabled.dashboard.tailscale.enabled is True
+
+    # A save() built from the loaded config must not drop the operator's value.
+    assert _load_from_dict(enabled.to_dict()).dashboard.tailscale.enabled is True
+
+    # A malformed section degrades to the default instead of raising.
+    for bad in ("yes", 1, [], None):
+        assert _load_from_dict({"dashboard": {"tailscale": bad}}).dashboard.tailscale.enabled is (
+            False
+        ), bad
+    assert (
+        _load_from_dict(
+            {"dashboard": {"tailscale": {"enabled": "true"}}}
+        ).dashboard.tailscale.enabled
+        is False
+    )
+
+
 def test_sandbox_allow_unsandboxed_exec_default_is_platform_independent(monkeypatch) -> None:
     """No platform may flip this default on its own.
 
@@ -238,6 +312,55 @@ def test_publish_relocate_roots_parsed_and_round_trips():
     # Survives a to_dict() -> load() round-trip.
     reloaded = _load_from_dict(loaded.to_dict())
     assert reloaded.publish.relocate_roots == ["/srv/shared"]
+
+
+def test_agent_spawn_min_memory_gb_parsed_and_round_trips():
+    # Regression: agent.spawn_min_memory_gb was declared + consumed (the
+    # subagent admission gate) and emitted by to_dict(), but NOT parsed in
+    # load(), so an operator value was silently ignored (stuck at the 4.0
+    # default) and overwritten on the next save().
+    loaded = _load_from_dict({"agent": {"spawn_min_memory_gb": 9.5}})
+    assert loaded.agent.spawn_min_memory_gb == 9.5
+    # Survives a to_dict() -> load() round-trip.
+    reloaded = _load_from_dict(loaded.to_dict())
+    assert reloaded.agent.spawn_min_memory_gb == 9.5
+
+
+def test_slack_home_tab_sessions_per_kind_parsed_and_round_trips():
+    # Regression: slack.home_tab_sessions_per_kind was declared + consumed (the
+    # Slack Home Tab per-category cap) and emitted by to_dict(), but NOT parsed
+    # in load(), so an operator value was silently ignored (stuck at 5) and
+    # overwritten on the next save().
+    loaded = _load_from_dict({"slack": {"home_tab_sessions_per_kind": 42}})
+    assert loaded.slack.home_tab_sessions_per_kind == 42
+    # Survives a to_dict() -> load() round-trip.
+    reloaded = _load_from_dict(loaded.to_dict())
+    assert reloaded.slack.home_tab_sessions_per_kind == 42
+
+
+class TestFallbackModelLoad:
+    """agent.fallback_model flows through the explicit load() kwargs."""
+
+    def test_load_coerces_registry_alias(self) -> None:
+        loaded = _load_from_dict({"agent": {"fallback_model": "opus-4.8-1m"}})
+        assert loaded.agent.fallback_model == "claude-opus-4.8"
+
+    def test_load_default_is_auto(self) -> None:
+        # DEFAULT PIN: a config without the key loads "auto" — fallback ON via
+        # the backend's availability-aware routing.
+        assert _load_from_dict({}).agent.fallback_model == "auto"
+
+    def test_load_explicit_empty_disables(self) -> None:
+        # ROLLBACK PIN: fallback_model "" is the opt-out — pre-feature behavior.
+        assert _load_from_dict({"agent": {"fallback_model": ""}}).agent.fallback_model == ""
+
+    def test_load_malformed_value_never_crashes(self) -> None:
+        loaded = _load_from_dict({"agent": {"fallback_model": {"not": "a string"}}})
+        assert loaded.agent.fallback_model == "auto"
+
+    def test_round_trips_through_to_dict(self) -> None:
+        loaded = _load_from_dict({"agent": {"fallback_model": "claude-opus-5"}})
+        assert loaded.to_dict()["agent"]["fallback_model"] == "claude-opus-5"
 
 
 class TestMalformedConfigValuesNeverCrashLoad:
@@ -308,9 +431,7 @@ class TestMalformedConfigValuesNeverCrashLoad:
         assert cfg.wecom.hard_threshold_pct == 95
 
     def test_non_numeric_wecom_thresholds_fall_back(self):
-        cfg = _load_from_dict(
-            {"wecom": {"soft_threshold_pct": "lots", "hard_threshold_pct": None}}
-        )
+        cfg = _load_from_dict({"wecom": {"soft_threshold_pct": "lots", "hard_threshold_pct": None}})
         assert cfg.wecom.soft_threshold_pct == 80
         assert cfg.wecom.hard_threshold_pct == 95
 
@@ -1455,6 +1576,23 @@ class TestEdgeCases:
         cfg = _load_from_dict({})
         assert cfg.dashboard.recent_tint_count == 0
 
+    def test_update_nudge_loaded_from_config(self) -> None:
+        """The popup's snooze/skip record round-trips through load, so a GET
+        after a PATCH reads back what was written."""
+        rec = {"version": "0.5.0", "snoozed_until": 1756000000.0, "skipped": True}
+        cfg = _load_from_dict({"dashboard": {"update_nudge": rec}})
+        assert cfg.dashboard.update_nudge == rec
+
+    def test_update_nudge_defaults_to_empty_dict(self) -> None:
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.update_nudge == {}
+
+    def test_update_nudge_non_dict_coerces_to_empty(self) -> None:
+        """A hand-edited scalar must not crash load or leak a non-dict to the
+        dashboard's config read-back."""
+        cfg = _load_from_dict({"dashboard": {"update_nudge": "corrupt"}})
+        assert cfg.dashboard.update_nudge == {}
+
     def test_embedding_provider_defaults_to_llama_cpp(self) -> None:
         """embedding_provider defaults to 'llama_cpp' (in-process, default-on)."""
         cfg = _load_from_dict({})
@@ -1850,8 +1988,14 @@ class TestMultiAgentOrchestrationProperties:
             default_memory_store=store_name,
         )
 
-        result_unknown = resolve_agent_bindings(config, agent_name=unknown_name)
-        result_default = resolve_agent_bindings(config, agent_name=default_name)
+        # Isolate from host ~/.kiro/agents/: pin the materialized-agent snapshot
+        # as empty and ready so _materialized_kiro_agent never scans the host
+        # filesystem. Without this, Hypothesis-generated names like "do" or
+        # "architect" collide with real agent configs on macOS developer hosts.
+        with unittest.mock.patch.object(loader_module, "_MATERIALIZED_AGENTS", frozenset()):
+            with unittest.mock.patch.object(loader_module, "_MATERIALIZED_AGENTS_READY", True):
+                result_unknown = resolve_agent_bindings(config, agent_name=unknown_name)
+                result_default = resolve_agent_bindings(config, agent_name=default_name)
 
         assert result_unknown.workspace_dir == result_default.workspace_dir, (
             f"Unknown agent workspace_dir={result_unknown.workspace_dir} "
@@ -2649,6 +2793,33 @@ class TestSecurityBoundClamping:
             cfg = _load_from_dict({"session": {"pool_size": 1000}})
         assert cfg.session.pool_size == POOL_SIZE_MAX == 10
 
+    def test_session_start_timeout_default(self) -> None:
+        """Omitted from config.json, the budget is the built-in 90s default."""
+        cfg = _load_from_dict({})
+        assert cfg.agent.session_start_timeout_secs == 90
+
+    def test_session_start_timeout_custom_in_range(self) -> None:
+        """An in-range value from disk is preserved verbatim."""
+        cfg = _load_from_dict({"agent": {"session_start_timeout_secs": 240}})
+        assert cfg.agent.session_start_timeout_secs == 240
+
+    def test_session_start_timeout_floored_to_min(self) -> None:
+        """A value below the floor is clamped UP: a session-start budget under
+        the backend's 30s OAuth authorization wait recreates the race the
+        dedicated budget exists to prevent (issue #2946)."""
+        from kiro_crew.config.loader import SESSION_START_TIMEOUT_MIN
+
+        with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
+            cfg = _load_from_dict({"agent": {"session_start_timeout_secs": 10}})
+        assert cfg.agent.session_start_timeout_secs == SESSION_START_TIMEOUT_MIN == 90
+
+    def test_session_start_timeout_clamped_to_max(self) -> None:
+        with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
+            cfg = _load_from_dict({"agent": {"session_start_timeout_secs": 99999}})
+        from kiro_crew.config.loader import SESSION_START_TIMEOUT_MAX
+
+        assert cfg.agent.session_start_timeout_secs == SESSION_START_TIMEOUT_MAX == 900
+
     def test_full_pentest_reproduction_clamped(self) -> None:
         """The exact tester payload is clamped, and to_dict() (what the GET API
         serializes) reports the clamped values, not the inflated ones."""
@@ -2673,6 +2844,73 @@ class TestSecurityBoundClamping:
         assert d["agent"]["max_subagents"] == 64
         assert d["agent"]["subagent_max_turns"] == 200
         assert d["session"]["pool_size"] == 10
+
+    def test_numeric_string_ceiling_is_still_enforced_at_extraction(self) -> None:
+        """``_clamp_security_bounds`` runs over the RAW dict and deliberately
+        skips non-int values (see ``test_non_int_value_not_clamped``) --
+        ``_safe_int``'s own docstring says clamping at the coercion site is
+        what actually enforces the range for a numeric STRING that slips past
+        it. ``max_subagents``/``subagent_max_turns`` previously reached the
+        dataclass with NO coercion at all, and ``subagent_auto_max``/
+        ``pool_size`` were ``_safe_int``-coerced but without bounds -- all
+        four let a numeric-string value bypass the declared ceiling entirely."""
+        from kiro_crew.config.loader import (
+            POOL_SIZE_MAX,
+            SUBAGENT_AUTO_MAX_CEILING,
+            SUBAGENT_MAX_TURNS_CEILING,
+        )
+
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "max_subagents": "200",
+                    "subagent_max_turns": "99999",
+                    "subagent_auto_max": "500",
+                },
+                "session": {"pool_size": "1000"},
+            }
+        )
+        assert cfg.agent.max_subagents == SUBAGENT_AUTO_MAX_CEILING == 64
+        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 200
+        assert cfg.agent.subagent_auto_max == SUBAGENT_AUTO_MAX_CEILING == 64
+        assert cfg.session.pool_size == POOL_SIZE_MAX == 10
+        for v in (
+            cfg.agent.max_subagents,
+            cfg.agent.subagent_max_turns,
+            cfg.agent.subagent_auto_max,
+            cfg.session.pool_size,
+        ):
+            assert isinstance(v, int) and not isinstance(v, bool)
+
+    def test_numeric_string_in_range_still_parses(self) -> None:
+        """A well-formed numeric string within bounds must keep working --
+        the fix must not turn a previously-accepted legacy string value into
+        the default."""
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "max_subagents": "8",
+                    "subagent_max_turns": "150",
+                    "subagent_auto_max": "32",
+                },
+                "session": {"pool_size": "4"},
+            }
+        )
+        assert cfg.agent.max_subagents == 8
+        assert cfg.agent.subagent_max_turns == 150
+        assert cfg.agent.subagent_auto_max == 32
+        assert cfg.session.pool_size == 4
+
+    def test_subagent_max_turns_as_string_no_longer_crashes_a_turn_limit_check(
+        self,
+    ) -> None:
+        """The concrete downstream failure this bug caused: subagent.py compares
+        ``turns > turn_limit`` where turns is always a real int -- a string
+        subagent_max_turns reaching that comparison raised TypeError on the
+        first tool call of every subagent. Assert the loaded value is always
+        int-comparable."""
+        cfg = _load_from_dict({"agent": {"subagent_max_turns": "50"}})
+        assert not (cfg.agent.subagent_max_turns > 999)  # must not raise TypeError
 
     def test_in_range_values_unchanged(self) -> None:
         with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event") as mock_event:
@@ -2751,6 +2989,123 @@ class TestSecurityBoundClamping:
             _log_config_clamp_event("agent.subagent_auto_max", 200, 64, 1, 64)
 
 
+class TestAutocompactPctLoadClamp:
+    """session.autocompact_pct clamps into the documented 5-90 range at load
+    time (issue #4734).
+
+    The dashboard config API rejected out-of-range writes but a hand-edited
+    config.json loaded verbatim: at 500 the autocompactor trigger
+    (``pct >= autocompact_pct``) can never fire, silently disabling the
+    context-window backstop, and at 0 or below it fires on every turn.
+    """
+
+    def test_above_range_clamped_to_max(self) -> None:
+        from kiro_crew.config.loader import AUTOCOMPACT_PCT_MAX
+
+        cfg = _load_from_dict({"session": {"autocompact_pct": 500}})
+        assert cfg.session.autocompact_pct == AUTOCOMPACT_PCT_MAX == 90.0
+
+    def test_negative_clamped_to_min(self) -> None:
+        from kiro_crew.config.loader import AUTOCOMPACT_PCT_MIN
+
+        cfg = _load_from_dict({"session": {"autocompact_pct": -10}})
+        assert cfg.session.autocompact_pct == AUTOCOMPACT_PCT_MIN == 5.0
+
+    def test_zero_clamped_to_min(self) -> None:
+        """0 would fire auto-compaction on every turn; clamped UP to the floor."""
+        cfg = _load_from_dict({"session": {"autocompact_pct": 0}})
+        assert cfg.session.autocompact_pct == 5.0
+
+    def test_in_range_value_preserved(self) -> None:
+        cfg = _load_from_dict({"session": {"autocompact_pct": 75.5}})
+        assert cfg.session.autocompact_pct == 75.5
+
+    def test_default_when_omitted(self) -> None:
+        """An omitted key takes the module default, not a clamp bound. Asserted
+        against the constant rather than a literal so the two cannot drift: a
+        ``load()`` fallback restated as its own literal still fails here."""
+        from kiro_crew.config.loader import DEFAULT_AUTOCOMPACT_PCT
+
+        cfg = _load_from_dict({})
+        assert cfg.session.autocompact_pct == DEFAULT_AUTOCOMPACT_PCT
+
+    def test_load_range_and_dashboard_validator_share_one_constant(self) -> None:
+        """Drift guard: the dashboard write-gate bounds for
+        ``session.autocompact_pct`` must BE the loader's clamp constants — the
+        same objects, not two sets of literals that can drift apart (the drift
+        is exactly how the load path lost the range in the first place)."""
+        from kiro_crew.config.loader import AUTOCOMPACT_PCT_MAX, AUTOCOMPACT_PCT_MIN
+        from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+        spec = _EDITABLE_CONFIG["session.autocompact_pct"]
+        assert spec["type"] == "float"
+        assert spec["min"] is AUTOCOMPACT_PCT_MIN
+        assert spec["max"] is AUTOCOMPACT_PCT_MAX
+        assert (AUTOCOMPACT_PCT_MIN, AUTOCOMPACT_PCT_MAX) == (5.0, 90.0)
+
+
+class TestPoolSizeDefaultSingleSource:
+    """``session.pool_size`` has TWO independent paths to its default and they
+    must not be able to disagree.
+
+    A home with no ``config.json`` at all constructs ``SessionConfig()`` and
+    takes the dataclass field default; a home WITH a ``config.json`` that omits
+    the key reaches ``load()``'s file-parse fallback instead. An install that has
+    run setup is always the second case, so a literal at the parse site decides
+    the real default for essentially every host while the field default decides
+    what the schema, the docs, and a never-set-up home report. The disagreement
+    is invisible on disk: nothing serializes the difference, and each pooled slot
+    it silently buys is a kiro-cli process plus that agent's MCP stdio servers.
+    """
+
+    def test_field_default_reads_the_shared_constant(self) -> None:
+        assert loader_module.DEFAULT_POOL_SIZE == 0
+        assert (
+            SessionConfig.__dataclass_fields__["pool_size"].default
+            == loader_module.DEFAULT_POOL_SIZE
+        )
+        assert SessionConfig().pool_size == loader_module.DEFAULT_POOL_SIZE
+
+        # A dataclass default is bound at class creation, so no runtime
+        # assertion can tell a literal that happens to equal the constant from
+        # the constant itself. Read the declaration to close that gap: a literal
+        # here is exactly how the two spellings come apart.
+        decl = re.search(
+            r"pool_size:\s*int\s*=\s*field\(\s*default=([^,\s]+)\s*,",
+            inspect.getsource(SessionConfig),
+        )
+        assert decl is not None, "SessionConfig.pool_size field declaration not found"
+        assert decl.group(1) == "DEFAULT_POOL_SIZE"
+
+    def test_omitted_key_and_absent_file_agree(self) -> None:
+        """The behavioural invariant, stated without naming a value: whether a
+        config file omits ``pool_size``, omits the whole ``session`` block, or
+        does not exist, all three land on the same warm-pool size."""
+        omits_key = _load_from_dict({"session": {"timeout_secs": 1800}}).session.pool_size
+        omits_section = _load_from_dict({"agent": {"provider": "acp"}}).session.pool_size
+        no_file = _load_absent_config().session.pool_size
+
+        assert omits_key == omits_section == no_file == loader_module.DEFAULT_POOL_SIZE
+
+    def test_parse_fallback_holds_no_literal_of_its_own(self) -> None:
+        """Repoint the constant and the file-parse path must follow it.
+
+        This is what makes the constant the ONLY definition rather than merely
+        one that happens to agree today: with a literal at the parse site, the
+        loaded value ignores the repoint and this fails.
+        """
+        with unittest.mock.patch.object(loader_module, "DEFAULT_POOL_SIZE", 7):
+            assert _load_from_dict({"session": {}}).session.pool_size == 7
+            # The same fallback catches an unparseable value, so it must be
+            # sourced from the constant there too.
+            assert _load_from_dict({"session": {"pool_size": "two"}}).session.pool_size == 7
+
+    def test_explicit_value_still_wins_over_the_default(self) -> None:
+        """The reconciliation must not swallow a configured pool."""
+        assert _load_from_dict({"session": {"pool_size": 2}}).session.pool_size == 2
+        assert _load_from_dict({"session": {"pool_size": 0}}).session.pool_size == 0
+
+
 class TestConfigWriteProtection:
     """config.json / config.local.json are WRITE-protected (reads allowed)."""
 
@@ -2792,62 +3147,6 @@ class TestConfigWriteProtection:
         assert is_sensitive_write_path("~/.kiro/crew/sessions.db") is False
         assert is_sensitive_write_path("~/.kirocrew/sessions.db") is False
 
-    def test_migration_marker_is_write_protected(self) -> None:
-        # The data-home completion marker is authoritative: an agent that could
-        # plant it in a pre-migration new home would make the next boot skip
-        # migration and ignore the legacy home's governance + secrets. Writes
-        # blocked; reads allowed (doctor/diagnostics read it).
-        from kiro_crew.config.paths import MIGRATION_MARKER_NAME
-        from kiro_crew.security import is_sensitive_path, is_sensitive_write_path
-
-        for prefix in ("~/.kiro/crew", "~/.kirocrew"):
-            marker = f"{prefix}/{MIGRATION_MARKER_NAME}"
-            assert is_sensitive_write_path(marker), marker
-            assert is_sensitive_write_path(str(Path.home() / prefix[2:] / MIGRATION_MARKER_NAME))
-            # reads are not blocked (superset gate is write-only for this leaf)
-            assert is_sensitive_path(marker) is False, marker
-
-    def test_migration_marker_shell_writes_blocked_reads_allowed(self) -> None:
-        # Bash-layer protection: unlike config.json (whose inflated values the
-        # loader clamps at load time), the marker's mere PRESENCE is the trust
-        # signal, so a shell command that plants/removes it must be blocked at
-        # the bash gate too — the file-edit tool gate alone is not enough. We
-        # block it VERB-INDEPENDENTLY (any command naming it), so a quoted
-        # redirect / cp / python open / novel write verb cannot bypass an
-        # enumerated allowlist. Reads are incidentally blocked too — harmless:
-        # the marker holds no secret and legitimate readers (doctor, migration)
-        # use Python os calls, not bash.
-        from kiro_crew.config.paths import MIGRATION_MARKER_NAME
-        from kiro_crew.security import (
-            _WRITE_PROTECTED_BASH_LEAVES,
-            is_sensitive_bash_command,
-        )
-
-        # drift guard: the bash leaf list must stay pinned to the real marker
-        assert MIGRATION_MARKER_NAME in _WRITE_PROTECTED_BASH_LEAVES
-
-        for prefix in ("~/.kiro/crew", "~/.kirocrew"):
-            marker = f"{prefix}/{MIGRATION_MARKER_NAME}"
-            blocked = [
-                f"touch {marker}",
-                f"echo done > {marker}",
-                f"echo done >> {marker}",
-                f"rm {marker}",
-                f"tee {marker}",
-                f"mv /tmp/x {marker}",
-                # bypasses an enumerated write-verb allowlist would miss:
-                f'echo done > "{marker}"',  # quoted redirect target
-                f"cp /tmp/x {marker}",  # copy write verb
-                f"python -c \"open('{marker}','w')\"",  # script open
-                f"mkdir -p {marker}/x",  # marker-as-dir also exists()
-                f"cat {marker}",  # read (blocked too — no secret)
-            ]
-            for cmd in blocked:
-                assert is_sensitive_bash_command(cmd) is not None, cmd
-            # unrelated writes under the crew home stay allowed
-            assert is_sensitive_bash_command(f"touch {prefix}/sessions.db") is None
-            assert is_sensitive_bash_command(f"ls {prefix}/") is None
-
 
 class TestConfigEditToolBlocked:
     """The file-edit tool gate (HookManager.on_tool_call) denies edits to config."""
@@ -2881,6 +3180,56 @@ class TestConfigEditToolBlocked:
             raw_params={"path": "~/.kirocrew/workspace/notes.md"},
         )
         assert result.action != "deny"
+
+
+class TestFeishuConfigCoercionFailsClosed:
+    """A malformed feishu section must degrade to deny, never open a gate.
+
+    Two layers hold this: the schema type check rejects a wrong-typed value and
+    substitutes the field default, and the per-channel parse uses ``_safe_bool``
+    / ``_coerce_opaque_str_ids`` rather than raw ``bool()`` and comprehensions.
+    These tests pin the OBSERVABLE end state, so the guarantee survives either
+    layer being refactored.
+    """
+
+    def test_string_false_does_not_open_the_group_gate(self) -> None:
+        cfg = _load_from_dict(
+            {
+                "feishu": {
+                    "enabled": "true",
+                    "allow_group": "false",
+                    "allowed_group_ids": ["oc_g1"],
+                }
+            }
+        )
+        assert cfg.feishu.allow_group is False
+        assert cfg.feishu.enabled is False
+
+    def test_real_bools_are_preserved(self) -> None:
+        cfg = _load_from_dict({"feishu": {"enabled": True, "allow_group": True}})
+        assert cfg.feishu.enabled is True
+        assert cfg.feishu.allow_group is True
+
+    def test_null_id_lists_do_not_crash_config_load(self) -> None:
+        # A null or non-list value must yield the deny-everybody default rather
+        # than reaching an iteration that would raise during gateway startup.
+        cfg = _load_from_dict({"feishu": {"allowed_open_ids": None, "allowed_group_ids": "oc_g1"}})
+        assert cfg.feishu.allowed_open_ids == []
+        assert cfg.feishu.allowed_group_ids == []
+
+    def test_opaque_ids_survive_and_are_deduped(self) -> None:
+        # Feishu ids are opaque (ou_/oc_ prefixes), so a digit-only filter would
+        # drop every entry and lock out the intended senders.
+        cfg = _load_from_dict(
+            {
+                "feishu": {
+                    "allowed_open_ids": ["ou_abc123", "  ou_abc123 ", "", "ou_zzz"],
+                    "allowed_group_ids": ["oc_g1"],
+                }
+            }
+        )
+        assert cfg.feishu.allowed_open_ids == ["ou_abc123", "ou_zzz"]
+        assert cfg.feishu.allowed_group_ids == ["oc_g1"]
 
 
 class TestTelegramAllowedUserIdsGuard:
@@ -2987,6 +3336,41 @@ class TestAppsAllowThirdParty:
         assert cfg.agent.apps_allow_third_party is False
 
 
+class TestTrustedAppRepositories:
+    def test_defaults_to_empty(self) -> None:
+        assert AgentConfig().apps_trusted_repositories == {}
+        assert _load_from_dict({}).agent.apps_trusted_repositories == {}
+
+    def test_string_bindings_round_trip_and_junk_is_dropped(self) -> None:
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "apps_trusted_repositories": {
+                        "good-app": "https://example.test/owner/repo",
+                        "bad-value": 5,
+                    }
+                }
+            }
+        )
+        assert cfg.agent.apps_trusted_repositories == {
+            "good-app": "https://example.test/owner/repo"
+        }
+        assert cfg.to_dict()["agent"]["apps_trusted_repositories"] == {
+            "good-app": "https://example.test/owner/repo"
+        }
+
+
+class TestTrustedLocalApps:
+    def test_defaults_to_empty(self) -> None:
+        assert AgentConfig().apps_trusted_local == []
+        assert _load_from_dict({}).agent.apps_trusted_local == []
+
+    def test_string_markers_round_trip_and_junk_is_dropped(self) -> None:
+        cfg = _load_from_dict({"agent": {"apps_trusted_local": ["local-app", 5, "", None]}})
+        assert cfg.agent.apps_trusted_local == ["local-app"]
+        assert cfg.to_dict()["agent"]["apps_trusted_local"] == ["local-app"]
+
+
 def test_heartbeat_default_deliver_default_is_slack():
     """Absent config -> backward-compatible 'slack' default."""
     cfg = _load_from_dict({})
@@ -3007,8 +3391,10 @@ def test_heartbeat_default_deliver_invalid_falls_back_to_slack():
 class TestKnowledgeAutoIngest:
     """The auto-add / project-docs / budget / dedup-cadence keys."""
 
-    def test_auto_add_documents_defaults_on(self) -> None:
-        assert _load_from_dict({}).knowledge.auto_add_documents is True
+    def test_auto_add_documents_defaults_off(self) -> None:
+        # Auto-ingest is opt-in: a config that never mentions the key must not
+        # start writing to the Library or spending extraction calls.
+        assert _load_from_dict({}).knowledge.auto_add_documents is False
 
     def test_auto_add_documents_reads_canonical_key(self) -> None:
         cfg = _load_from_dict({"knowledge": {"auto_add_documents": False}})
@@ -3021,8 +3407,9 @@ class TestKnowledgeAutoIngest:
         assert cfg.knowledge.auto_add_documents is False
 
     def test_canonical_wins_over_legacy(self) -> None:
-        cfg = _load_from_dict({"knowledge": {
-            "auto_add_documents": False, "auto_ingest_doc_links": True}})
+        cfg = _load_from_dict(
+            {"knowledge": {"auto_add_documents": False, "auto_ingest_doc_links": True}}
+        )
         assert cfg.knowledge.auto_add_documents is False
 
     def test_round_trip_settles_on_the_canonical_key(self) -> None:
@@ -3030,8 +3417,21 @@ class TestKnowledgeAutoIngest:
         assert data["knowledge"]["auto_add_documents"] is True
         assert "auto_ingest_doc_links" not in data["knowledge"]
 
-    def test_project_docs_defaults_on(self) -> None:
-        assert _load_from_dict({}).knowledge.auto_register_project_docs is True
+    def test_project_docs_defaults_off(self) -> None:
+        assert _load_from_dict({}).knowledge.auto_register_project_docs is False
+
+    def test_artifact_ingest_defaults_off(self) -> None:
+        assert _load_from_dict({}).knowledge.auto_ingest_artifacts is False
+
+    def test_an_empty_knowledge_section_leaves_every_auto_path_off(self) -> None:
+        # All three arrive through different readers (a legacy-aware helper and
+        # two inline .get() calls), so one flipped in isolation is a real risk.
+        kc = _load_from_dict({"knowledge": {}}).knowledge
+        assert (kc.auto_add_documents, kc.auto_register_project_docs, kc.auto_ingest_artifacts) == (
+            False,
+            False,
+            False,
+        )
 
     def test_project_docs_reads_value(self) -> None:
         cfg = _load_from_dict({"knowledge": {"auto_register_project_docs": False}})
@@ -3053,6 +3453,22 @@ class TestKnowledgeAutoIngest:
         cfg = _load_from_dict({"knowledge": {"auto_ingest_chunk_budget": bad}})
         assert cfg.knowledge.auto_ingest_chunk_budget == 150
 
+    def test_folder_chunk_budget_default(self) -> None:
+        assert _load_from_dict({}).knowledge.folder_ingest_chunk_budget == 300
+
+    def test_folder_chunk_budget_reads_value(self) -> None:
+        cfg = _load_from_dict({"knowledge": {"folder_ingest_chunk_budget": 40}})
+        assert cfg.knowledge.folder_ingest_chunk_budget == 40
+
+    def test_folder_chunk_budget_zero_is_allowed(self) -> None:
+        cfg = _load_from_dict({"knowledge": {"folder_ingest_chunk_budget": 0}})
+        assert cfg.knowledge.folder_ingest_chunk_budget == 0
+
+    @pytest.mark.parametrize("bad", [-5, "many", True, None, 1.5])
+    def test_folder_chunk_budget_rejects_junk(self, bad: object) -> None:
+        cfg = _load_from_dict({"knowledge": {"folder_ingest_chunk_budget": bad}})
+        assert cfg.knowledge.folder_ingest_chunk_budget == 300
+
     def test_dedup_cadence_default(self) -> None:
         assert _load_from_dict({}).knowledge.dedup_every_n_sweeps == 12
 
@@ -3069,11 +3485,15 @@ class TestKnowledgeAutoIngest:
         # A key absent from the allowlist is rejected by PATCH /api/config/kirocrew,
         # so its toggle would render and then fail to save.
         from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
-        for key in ("knowledge.auto_add_documents",
-                    "knowledge.auto_register_project_docs",
-                    "knowledge.auto_ingest_artifacts",
-                    "knowledge.auto_ingest_chunk_budget",
-                    "knowledge.dedup_every_n_sweeps"):
+
+        for key in (
+            "knowledge.auto_add_documents",
+            "knowledge.auto_register_project_docs",
+            "knowledge.auto_ingest_artifacts",
+            "knowledge.auto_ingest_chunk_budget",
+            "knowledge.folder_ingest_chunk_budget",
+            "knowledge.dedup_every_n_sweeps",
+        ):
             assert key in _EDITABLE_CONFIG, key
 
 
@@ -3194,6 +3614,16 @@ class TestKnowledgePoolIdleTtl:
         assert cfg.knowledge.pool_idle_ttl_secs == 300
 
 
+class TestKnowledgePoolTimeoutRoundTrip:
+    """The raw pool timeout override must survive a configuration save."""
+
+    def test_llm_timeout_secs_survives_round_trip(self) -> None:
+        cfg = _load_from_dict({"knowledge": {"llm_timeout_secs": 600}})
+
+        assert cfg.knowledge.llm_timeout_secs == 600.0
+        assert cfg.to_dict()["knowledge"]["llm_timeout_secs"] == 600.0
+
+
 class TestSaveRoundTripPreservesAllSections:
     """to_dict() (which save() writes as the ENTIRE config.json) previously
     omitted knowledge/heartbeat/snapshot_dir/watchdog, so any save silently
@@ -3273,6 +3703,98 @@ class TestOrchestratorWatchdogThemeAreParsed:
             "mcp_gateway_socket": "/run/kiro/gateway.sock",
         }
 
+    def test_per_agent_watchdog_overrides_are_parsed(self) -> None:
+        """agents.*.watchdog_tool_stall_* overrides survive load(); read by
+        acp/session_handle._load_watchdog_settings for sessions on that agent."""
+        cfg = _load_from_dict(
+            {
+                "agents": {
+                    "pr-reviewer": {
+                        "kiro_agent": "pr-reviewer-kiro",
+                        "watchdog_tool_stall_suspect_secs": 900.0,
+                        "watchdog_tool_stall_hard_cap_secs": 1800.0,
+                    }
+                }
+            }
+        )
+        assert cfg.agents["pr-reviewer"].watchdog_tool_stall_suspect_secs == 900.0
+        assert cfg.agents["pr-reviewer"].watchdog_tool_stall_hard_cap_secs == 1800.0
+
+    def test_per_agent_watchdog_overrides_default_to_inherit(self) -> None:
+        """An agent entry without overrides parses to 0 (inherit the global)."""
+        cfg = _load_from_dict({"agents": {"builder": {"kiro_agent": "kirocrew"}}})
+        assert cfg.agents["builder"].watchdog_tool_stall_suspect_secs == 0.0
+        assert cfg.agents["builder"].watchdog_tool_stall_hard_cap_secs == 0.0
+
+    def test_per_agent_watchdog_override_junk_and_negative_collapse_to_inherit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """config.json is hand-editable: junk collapses to 0 (inherit) and a
+        negative value is clamped to 0 — never an instant-cancel window, never
+        a crashed load. jsonschema is disabled so the raw values reach the
+        _safe_float guards (with it enabled, validation strips them first)."""
+        import kiro_crew.config.validation as validation
+
+        monkeypatch.setattr(validation, "_HAS_JSONSCHEMA", False)
+
+        cfg = _load_from_dict(
+            {
+                "agents": {
+                    "a": {
+                        "kiro_agent": "kirocrew",
+                        "watchdog_tool_stall_suspect_secs": "junk",
+                        "watchdog_tool_stall_hard_cap_secs": -5,
+                    }
+                }
+            }
+        )
+        assert cfg.agents["a"].watchdog_tool_stall_suspect_secs == 0.0
+        assert cfg.agents["a"].watchdog_tool_stall_hard_cap_secs == 0.0
+
+    def test_per_agent_watchdog_overrides_round_trip(self) -> None:
+        """to_dict() (what save() writes) carries the overrides, so a save
+        from any routine path does not silently drop a hand-written override."""
+        cfg = _load_from_dict(
+            {
+                "agents": {
+                    "pr-reviewer": {
+                        "kiro_agent": "pr-reviewer-kiro",
+                        "watchdog_tool_stall_suspect_secs": 900.0,
+                    }
+                }
+            }
+        )
+        td = cfg.to_dict()
+        assert td["agents"]["pr-reviewer"]["watchdog_tool_stall_suspect_secs"] == 900.0
+
+    def test_factory_resolves_canonical_crew_identity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The provider factory resolves crew_agent ONCE at provider-creation:
+        an explicit kwarg wins verbatim (the dashboard's resolved identity,
+        including the authoritative ""), and absent that, a crew-name-passing
+        surface (Slack/cron — see _resolve_model_for_agent's surface
+        convention) is covered by crew-namespace membership; a non-crew name
+        (a kiro template) yields "" so no override can attach to it."""
+        import kiro_crew.providers.acp as acp_mod
+
+        captured: list[dict] = []
+
+        class _FakeProvider:
+            def __init__(self, **kwargs: object) -> None:
+                captured.append(kwargs)
+
+        monkeypatch.setattr(acp_mod, "AcpProvider", _FakeProvider)
+        cfg = _load_from_dict({"agents": {"pr-reviewer": {"kiro_agent": "pr-reviewer-kiro"}}})
+        factory = cfg.create_provider_factory()
+
+        factory("k1", agent="pr-reviewer-kiro", crew_agent="pr-reviewer")
+        factory("k2", agent="pr-reviewer")  # crew-name surface, no kwarg
+        factory("k3", agent="pr-reviewer-kiro")  # kiro template, no kwarg
+        factory("k4", agent="pr-reviewer-kiro", crew_agent="")  # explicit no-crew
+
+        assert [c["crew_agent"] for c in captured] == ["pr-reviewer", "pr-reviewer", "", ""]
+
     def test_dashboard_theme_fields_are_parsed(self) -> None:
         cfg = _load_from_dict(
             {
@@ -3328,7 +3850,7 @@ class TestOrchestratorWatchdogThemeAreParsed:
     def test_absent_sections_use_defaults(self) -> None:
         cfg = _load_from_dict({})
         assert cfg.orchestrator.stage_timeout_seconds == 1800
-        assert cfg.watchdog.tool_stall_hard_cap_secs == 10800.0
+        assert cfg.watchdog.tool_stall_hard_cap_secs == 3600.0
         assert cfg.dashboard.theme_mode == ""
         assert cfg.dashboard.onboarded is False
         assert cfg.dashboard.import_onboarded is False
@@ -3371,8 +3893,10 @@ class TestMalformedConfigNeverBricksLoad:
 
     def test_non_numeric_int_field_falls_back(self) -> None:
         # Pre-fix: ValueError: invalid literal for int() with base 10: 'two'.
+        # The fallback is the field's own default, read from the one constant
+        # that defines it rather than restated here.
         cfg = _load_from_dict({"session": {"pool_size": "two"}})
-        assert cfg.session.pool_size == 2
+        assert cfg.session.pool_size == loader_module.DEFAULT_POOL_SIZE
 
     def test_non_numeric_float_field_falls_back(self) -> None:
         cfg = _load_from_dict({"agent": {"subagent_cost_gb": "lots"}})
@@ -3685,9 +4209,7 @@ class TestAppAgentDispatch(unittest.TestCase):
             with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
                 cfg = self._config()
                 assert loader.resolve_agent_bindings(cfg, "mochi").kiro_agent == "mochi"
-                assert (
-                    loader.resolve_agent_bindings(cfg, "mochi--mochi").kiro_agent == "kirocrew"
-                )
+                assert loader.resolve_agent_bindings(cfg, "mochi--mochi").kiro_agent == "kirocrew"
 
     def test_stem_is_used_when_no_name_is_declared(self):
         # With no `name` the stem is the only identifier, so it is trusted there.
@@ -3740,8 +4262,7 @@ class TestAppAgentDispatch(unittest.TestCase):
                 # default silently, which is the mismatch this change removes.
                 for stem in ("junk", "broken"):
                     assert (
-                        loader.resolve_agent_bindings(cfg, agent_name=stem).kiro_agent
-                        == "kirocrew"
+                        loader.resolve_agent_bindings(cfg, agent_name=stem).kiro_agent == "kirocrew"
                     )
 
     def test_lookup_does_no_filesystem_io(self):
@@ -4009,10 +4530,178 @@ class TestAppAgentDispatch(unittest.TestCase):
 
             with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
                 with unittest.mock.patch.object(loader, "_MATERIALIZED_AGENTS", frozenset()):
-                    with unittest.mock.patch.object(
-                        loader, "_MATERIALIZED_AGENTS_READY", False
-                    ):
+                    with unittest.mock.patch.object(loader, "_MATERIALIZED_AGENTS_READY", False):
                         assert asyncio.run(_on_loop()).kiro_agent == "kirocrew"
+
+    def _project_dir(self, tmp: Path, files: dict[str, dict]) -> Path:
+        d = tmp / "repo" / ".kiro" / "agents"
+        d.mkdir(parents=True, exist_ok=True)
+        for filename, body in files.items():
+            (d / filename).write_text(json.dumps(body), encoding="utf-8")
+        return tmp / "repo"
+
+    def test_project_agent_dispatches_itself(self):
+        # A project-local agent is resolvable by kiro-cli (Kiro Crew spawns it with
+        # the project dir as cwd) but is not a Kiro Crew alias, so without the
+        # project scope it fell through to default_agent and the DEFAULT agent
+        # answered a session the user bound to the repo's own agent.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            agents = self._agents_dir(Path(td), {})
+            proj = self._project_dir(Path(td), {"repobot.json": {"name": "repobot"}})
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: agents):
+                r = loader.resolve_agent_bindings(
+                    self._config(), agent_name="repobot", project_dir=str(proj)
+                )
+        assert r.kiro_agent == "repobot"
+        assert r.requested_resolved is True
+
+    def test_project_agent_needs_the_project_dir_to_dispatch(self):
+        # Without the project dir there is no second scope to search, so the same
+        # agent must still fall back — the pre-existing contract for callers that
+        # have no session context.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            agents = self._agents_dir(Path(td), {})
+            self._project_dir(Path(td), {"repobot.json": {"name": "repobot"}})
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: agents):
+                r = loader.resolve_agent_bindings(self._config(), agent_name="repobot")
+        assert r.kiro_agent == "kirocrew"
+        assert r.requested_resolved is False
+
+    def test_alias_still_wins_over_a_project_agent(self):
+        # An explicit Kiro Crew alias is authored config; it must not be displaced by
+        # a file that happens to share its name.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            agents = self._agents_dir(Path(td), {})
+            proj = self._project_dir(Path(td), {"default.json": {"name": "default"}})
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: agents):
+                r = loader.resolve_agent_bindings(
+                    self._config(), agent_name="default", project_dir=str(proj)
+                )
+        assert r.kiro_agent == "kirocrew"
+
+    def test_unknown_name_still_falls_back_with_a_project_dir(self):
+        # The project scope widens where a name can be found; it must not make an
+        # unknown name dispatchable.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            agents = self._agents_dir(Path(td), {})
+            proj = self._project_dir(Path(td), {"repobot.json": {"name": "repobot"}})
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: agents):
+                r = loader.resolve_agent_bindings(
+                    self._config(), agent_name="nope", project_dir=str(proj)
+                )
+        assert r.kiro_agent == "kirocrew"
+        assert r.requested_resolved is False
+
+    def test_user_level_hit_does_no_project_filesystem_io(self):
+        # The hot path must stay filesystem-free: a name already in the snapshot
+        # must not trigger the project probe, even when a project dir is supplied.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            d = self._agents_dir(Path(td), {"mochi--mochi.json": {"name": "mochi"}})
+            proj = self._project_dir(Path(td), {})
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
+                loader.refresh_materialized_agents()
+                with unittest.mock.patch.object(
+                    loader, "_project_declares_agent", side_effect=AssertionError("probed")
+                ) as probe:
+                    r = loader.resolve_agent_bindings(
+                        self._config(), agent_name="mochi", project_dir=str(proj)
+                    )
+                probe.assert_not_called()
+        assert r.kiro_agent == "mochi"
+
+    def test_project_lookup_reads_nothing_on_the_loop_with_a_cold_cache(self):
+        # The project lookup reads a checkout, so on the loop it consults the cache
+        # and nothing else. Cold cache => "not declared" => default agent for that
+        # turn, mirroring the user-level cold-snapshot rule. A slow/network checkout
+        # would otherwise stall every turn of a project-bound session.
+        import asyncio
+
+        import kiro_crew.agent_discovery as ad
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            agents = self._agents_dir(Path(td), {})
+            proj = self._project_dir(Path(td), {"repobot.json": {"name": "repobot"}})
+            ad.clear_project_agent_cache()
+
+            async def _on_loop():
+                return loader.resolve_agent_bindings(
+                    self._config(), agent_name="repobot", project_dir=str(proj)
+                )
+
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: agents):
+                with unittest.mock.patch.object(loader, "_MATERIALIZED_AGENTS_READY", True):
+                    assert asyncio.run(_on_loop()).kiro_agent == "kirocrew"
+
+    def test_warming_off_loop_lets_the_loop_resolve_a_project_agent(self):
+        # The shape the dashboard call sites use: warm through the discovery pool,
+        # then resolve inline. The on-loop read is then a cache HIT, so a
+        # project-bound session dispatches its own agent on the very first turn.
+        import asyncio
+
+        import kiro_crew.agent_discovery as ad
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            agents = self._agents_dir(Path(td), {})
+            proj = self._project_dir(Path(td), {"repobot.json": {"name": "repobot"}})
+            ad.clear_project_agent_cache()
+
+            async def _warm_then_resolve():
+                await ad.warm_project_agent_names(str(proj))
+                return loader.resolve_agent_bindings(
+                    self._config(), agent_name="repobot", project_dir=str(proj)
+                )
+
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: agents):
+                with unittest.mock.patch.object(loader, "_MATERIALIZED_AGENTS_READY", True):
+                    assert asyncio.run(_warm_then_resolve()).kiro_agent == "repobot"
+
+    def test_resolution_raises_stopiteration_synchronously(self):
+        # resolve_agent_bindings raises StopIteration on a malformed config (the
+        # defensive `next(iter(config.agents))` branch), and callers rely on catching
+        # it: _run_chat's `except Exception` logs and continues.
+        #
+        # This is why the resolver MUST stay inline and only the cache warm is
+        # offloaded. StopIteration cannot be delivered through a Future, so running
+        # this in an executor makes the awaiting caller hang on 3.10 (and raise an
+        # unrelated RuntimeError on newer runtimes) instead of seeing the error.
+        # The offloaded half is deliberately NOT exercised here -- reproducing it
+        # would hang the suite on the very runtime the bug affects.
+        import kiro_crew.config.loader as loader
+
+        with self.assertRaises(StopIteration):
+            loader.resolve_agent_bindings(unittest.mock.MagicMock(), "anything", None)
+
+    def test_legacy_spec_is_not_dispatchable(self):
+        # kiro-cli cannot activate a name declared only in
+        # <project>/.kiro/*.agent-spec.json, so resolution must NOT dispatch it --
+        # otherwise the slot advertises an agent that fails at set_mode.
+        import kiro_crew.agent_discovery as ad
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            agents = self._agents_dir(Path(td), {})
+            kiro = Path(td) / "repo" / ".kiro"
+            kiro.mkdir(parents=True, exist_ok=True)
+            (kiro / "legacy.agent-spec.json").write_text(json.dumps({}), encoding="utf-8")
+            ad.clear_project_agent_cache()
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: agents):
+                r = loader.resolve_agent_bindings(
+                    self._config(), agent_name="legacy", project_dir=str(Path(td) / "repo")
+                )
+        assert r.kiro_agent == "kirocrew"
+        assert r.requested_resolved is False
 
 
 class TestWeixinConfig(unittest.TestCase):
@@ -4047,9 +4736,7 @@ class TestWeixinConfig(unittest.TestCase):
         self.assertEqual(cfg.weixin.allowed_user_ids, [])
 
     def test_blank_and_duplicate_ids_are_dropped(self):
-        cfg = _load_from_dict(
-            {"weixin": {"allowed_user_ids": ["  wxid_a  ", "wxid_a", "", "   "]}}
-        )
+        cfg = _load_from_dict({"weixin": {"allowed_user_ids": ["  wxid_a  ", "wxid_a", "", "   "]}})
         self.assertEqual(cfg.weixin.allowed_user_ids, ["wxid_a"])
 
     def test_dm_policy_defaults_to_deny_by_default(self):
@@ -4195,29 +4882,614 @@ def test_agent_triggers_load() -> None:
     assert cfg.agents["weird"].triggers == ""
 
 
-class TestKnowledgePoolKnobsRoundTrip:
-    """The pool knobs must survive a load() -> to_dict() round-trip.
+# ---------------------------------------------------------------------------
+# Tests for update_config_locked
+# ---------------------------------------------------------------------------
 
-    llm_pool.py reads these keys from RAW config.json at each pool (re)spawn —
-    they are not consumed through the dataclass — so their only schema duty is
-    to survive serialization. On 2026-08-11 an operator-staged llm_pool_size=1
-    was silently erased because the schema did not declare the field: to_dict()
-    dropped it and the pool respawned at the default 3. These tests red if
-    either knob falls out of the schema again.
+
+class TestUpdateConfigLocked:
+    """Tests for the locked read-modify-write helper."""
+
+    def test_lost_update_without_lock(self, tmp_path: Path) -> None:
+        """Control: interleaved RMW without the lock loses one update."""
+        import threading
+
+        from kiro_crew.config.loader import read_config_for_update, write_config_atomically
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"counter": 0}))
+
+        barrier = threading.Barrier(2)
+
+        def writer_a() -> None:
+            data = read_config_for_update(cfg)
+            barrier.wait()  # Force interleave: both read before either writes
+            data["key_a"] = "from_a"
+            write_config_atomically(cfg, data)
+
+        def writer_b() -> None:
+            data = read_config_for_update(cfg)
+            barrier.wait()
+            data["key_b"] = "from_b"
+            write_config_atomically(cfg, data)
+
+        t_a = threading.Thread(target=writer_a)
+        t_b = threading.Thread(target=writer_b)
+        t_a.start()
+        t_b.start()
+        t_a.join()
+        t_b.join()
+
+        result = json.loads(cfg.read_text())
+        # One of the keys is lost: the last writer overwrites the first's change.
+        has_a = "key_a" in result
+        has_b = "key_b" in result
+        assert not (has_a and has_b), (
+            "Both keys present without a lock — the interleave did not manifest "
+            "(this is expected to fail on some runs; the test is probabilistic as a control)"
+        )
+
+    def test_locked_update_preserves_both_writes(self, tmp_path: Path) -> None:
+        """Deterministic interleave through update_config_locked preserves both keys."""
+        import threading
+
+        from kiro_crew.config.loader import update_config_locked
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"counter": 0}))
+
+        # Use events to force deterministic ordering:
+        # writer_a enters mutate → signals a_in_mutate → writer_b tries to enter
+        # (blocks on lock) → writer_a finishes → writer_b enters and sees key_a.
+        a_in_mutate = threading.Event()
+        a_may_finish = threading.Event()
+
+        def mutate_a(data: dict) -> dict:
+            a_in_mutate.set()
+            a_may_finish.wait()
+            data["key_a"] = "from_a"
+            return data
+
+        def mutate_b(data: dict) -> dict:
+            data["key_b"] = "from_b"
+            return data
+
+        def writer_a() -> None:
+            update_config_locked(cfg, mutate=mutate_a, stamp_meta=False)
+
+        def writer_b() -> None:
+            a_in_mutate.wait()  # Ensure A holds the lock first
+            update_config_locked(cfg, mutate=mutate_b, stamp_meta=False)
+
+        t_a = threading.Thread(target=writer_a)
+        t_b = threading.Thread(target=writer_b)
+        t_a.start()
+        t_b.start()
+        # Let A finish after B has started (B will block on the lock)
+        import time
+
+        time.sleep(0.05)
+        a_may_finish.set()
+        t_a.join()
+        t_b.join()
+
+        result = json.loads(cfg.read_text())
+        assert result["key_a"] == "from_a"
+        assert result["key_b"] == "from_b"
+        assert result["counter"] == 0
+
+    def test_fail_closed_unreadable_config(self, tmp_path: Path) -> None:
+        """A mutate over an unreadable config raises ConfigReadError; file untouched."""
+        from kiro_crew.config.loader import ConfigReadError, update_config_locked
+
+        cfg = tmp_path / "config.json"
+        corrupt_content = "not valid json {{{"
+        cfg.write_text(corrupt_content)
+
+        with pytest.raises(ConfigReadError):
+            update_config_locked(cfg, mutate=lambda d: {**d, "key": "val"})
+
+        # File must be untouched.
+        assert cfg.read_text() == corrupt_content
+        # Lockfile must not be left open (fd is closed).
+        lock = tmp_path / "config.json.lock"
+        assert lock.exists()  # lockfile itself is fine to exist
+
+    def test_mode_preservation(self, tmp_path: Path) -> None:
+        """A 0600 config stays 0600 through a locked update."""
+        if platform.system() == "Windows":
+            pytest.skip("POSIX mode test")
+
+        from kiro_crew.config.loader import update_config_locked
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text(json.dumps({"x": 1}))
+        os.chmod(cfg, 0o600)
+
+        update_config_locked(cfg, mutate=lambda d: {**d, "y": 2}, stamp_meta=False)
+
+        import stat
+
+        mode = stat.S_IMODE(cfg.stat().st_mode)
+        assert mode == 0o600
+
+    def test_mutate_returning_none_skips_write(self, tmp_path: Path) -> None:
+        """When mutate returns None, the file is not rewritten."""
+        from kiro_crew.config.loader import update_config_locked
+
+        cfg = tmp_path / "config.json"
+        original = json.dumps({"unchanged": True})
+        cfg.write_text(original)
+        mtime_before = cfg.stat().st_mtime_ns
+
+        import time
+
+        time.sleep(0.01)  # ensure mtime would change if written
+        result = update_config_locked(cfg, mutate=lambda d: None, stamp_meta=False)
+
+        assert result == {"unchanged": True}
+        assert cfg.stat().st_mtime_ns == mtime_before
+
+    def test_lockfile_is_sidecar(self, tmp_path: Path) -> None:
+        """The lockfile is a sidecar (.lock suffix), not the config itself."""
+        from kiro_crew.config.loader import update_config_locked
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text("{}")
+
+        update_config_locked(cfg, mutate=lambda d: {**d, "k": 1}, stamp_meta=False)
+
+        lock = tmp_path / "config.json.lock"
+        assert lock.exists()
+
+    def test_stamp_meta_default(self, tmp_path: Path) -> None:
+        """With stamp_meta=True (default), a meta block is added."""
+        from kiro_crew.config.loader import update_config_locked
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text("{}")
+
+        result = update_config_locked(cfg, mutate=lambda d: {**d, "key": "val"})
+
+        on_disk = json.loads(cfg.read_text())
+        assert "meta" in on_disk
+        assert "lastTouchedVersion" in on_disk["meta"]
+        assert on_disk["key"] == "val"
+        assert "meta" in result
+
+    def test_new_file_creation(self, tmp_path: Path) -> None:
+        """update_config_locked works when the config file does not yet exist."""
+        from kiro_crew.config.loader import update_config_locked
+
+        cfg = tmp_path / "config.json"
+        # File does not exist yet
+
+        result = update_config_locked(cfg, mutate=lambda d: {**d, "new": True}, stamp_meta=False)
+
+        assert result == {"new": True}
+        assert json.loads(cfg.read_text()) == {"new": True}
+
+    def test_on_corrupt_fail_is_default(self, tmp_path: Path) -> None:
+        """Default on_corrupt='fail' raises ConfigReadError; file untouched."""
+        from kiro_crew.config.loader import ConfigReadError, update_config_locked
+
+        cfg = tmp_path / "config.json"
+        corrupt = "not json {{{"
+        cfg.write_text(corrupt)
+
+        with pytest.raises(ConfigReadError):
+            update_config_locked(cfg, mutate=lambda d: {**d, "k": 1}, stamp_meta=False)
+
+        assert cfg.read_text() == corrupt
+
+    def test_on_corrupt_reset_writes_from_empty(self, tmp_path: Path) -> None:
+        """on_corrupt='reset' invokes mutate with {} and writes the result."""
+        from kiro_crew.config.loader import update_config_locked
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text("broken {{")
+
+        result = update_config_locked(
+            cfg, mutate=lambda d: {**d, "key": "val"}, stamp_meta=False, on_corrupt="reset"
+        )
+
+        assert result == {"key": "val"}
+        assert json.loads(cfg.read_text()) == {"key": "val"}
+
+    def test_on_corrupt_reset_mode_0o600(self, tmp_path: Path) -> None:
+        """on_corrupt='reset' writes with 0o600 since no valid mode to preserve."""
+        if platform.system() == "Windows":
+            pytest.skip("POSIX mode test")
+        import stat
+
+        from kiro_crew.config.loader import update_config_locked
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text("corrupt!")
+        # Give it a weird mode to show it's not preserved (file is corrupt)
+        os.chmod(cfg, 0o644)
+
+        update_config_locked(
+            cfg, mutate=lambda d: {**d, "x": 1}, stamp_meta=False, on_corrupt="reset"
+        )
+
+        mode = stat.S_IMODE(cfg.stat().st_mode)
+        # write_config_atomically preserves mode of the existing file, even if
+        # corrupt; this verifies it at least got written
+        assert json.loads(cfg.read_text()) == {"x": 1}
+        # Mode is preserved from the existing inode (0o644 in this case)
+        assert mode == 0o644
+
+    def test_on_corrupt_reset_single_lock_hold(self, tmp_path: Path) -> None:
+        """Corrupt-triggered reset holds the lock for the entire operation.
+
+        Writer A holds the lock repairing the overlay (on_corrupt='reset');
+        writer B blocks until A finishes. Both writes are serialized under
+        ONE lock hold — the window where the old two-critical-section shape
+        allowed B to land between A's read and write is gone.
+        """
+        import threading
+
+        from kiro_crew.config.loader import update_config_locked
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text("corrupt file {{{")
+
+        # Events for deterministic interleave
+        a_in_mutate = threading.Event()
+        a_may_finish = threading.Event()
+
+        def mutate_a(data: dict) -> dict:
+            # data should be {} (corrupt → reset)
+            assert data == {}
+            a_in_mutate.set()
+            a_may_finish.wait()
+            data["key_a"] = "from_a"
+            return data
+
+        def mutate_b(data: dict) -> dict:
+            # B enters AFTER A finishes (lock serializes); sees A's result
+            data["key_b"] = "from_b"
+            return data
+
+        def writer_a() -> None:
+            update_config_locked(cfg, mutate=mutate_a, stamp_meta=False, on_corrupt="reset")
+
+        def writer_b() -> None:
+            a_in_mutate.wait()  # Wait for A to be inside mutate (holding the lock)
+            # B uses on_corrupt="reset" too (it would see a valid file after A)
+            update_config_locked(cfg, mutate=mutate_b, stamp_meta=False)
+
+        t_a = threading.Thread(target=writer_a)
+        t_b = threading.Thread(target=writer_b)
+        t_a.start()
+        t_b.start()
+
+        import time
+
+        time.sleep(0.05)  # Let B start and block on the lock
+        a_may_finish.set()
+        t_a.join()
+        t_b.join()
+
+        result = json.loads(cfg.read_text())
+        # Both keys present: B saw A's write (serialized), no clobber
+        assert result["key_a"] == "from_a"
+        assert result["key_b"] == "from_b"
+
+    def test_on_corrupt_reset_non_dict_file(self, tmp_path: Path) -> None:
+        """on_corrupt='reset' also handles a file that is valid JSON but not a dict."""
+        from kiro_crew.config.loader import update_config_locked
+
+        cfg = tmp_path / "config.json"
+        cfg.write_text('"just a string"')
+
+        result = update_config_locked(
+            cfg, mutate=lambda d: {**d, "repaired": True}, stamp_meta=False, on_corrupt="reset"
+        )
+
+        assert result == {"repaired": True}
+        assert json.loads(cfg.read_text()) == {"repaired": True}
+
+
+class TestMigrationBackupContainment:
+    """``load()`` must not create files beside a config path it does not own.
+
+    The one-time agents migration copies the pre-migration config aside. The
+    copy landed next to whatever ``config_path()`` resolved to, so every caller
+    that redirects the loader at its own temp file (this module's own helpers do
+    exactly that) silently accumulated a ``<tmpname>.json.bak`` orphan it never
+    cleaned up -- 72k of them on one dev host, against a tmpfs inode cap.
     """
 
-    def test_llm_pool_size_survives_round_trip(self):
-        cfg = _load_from_dict({"knowledge": {"llm_pool_size": 1}})
-        assert cfg.knowledge.llm_pool_size == 1
-        assert cfg.to_dict()["knowledge"]["llm_pool_size"] == 1
+    # A config with neither "agents" nor "default_agent" is what makes
+    # load() take the migration write-back branch that writes the backup.
+    _LEGACY = {"telegram": {"allow_forum": True}}
 
-    def test_llm_timeout_secs_survives_round_trip(self):
-        cfg = _load_from_dict({"knowledge": {"llm_timeout_secs": 600}})
-        assert cfg.knowledge.llm_timeout_secs == 600.0
-        assert cfg.to_dict()["knowledge"]["llm_timeout_secs"] == 600.0
+    def _load_with(self, home: Path, cfg_file: Path) -> KiroCrewConfig:
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=home),
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_file),
+        ):
+            return KiroCrewConfig.load()
 
-    def test_unset_knobs_serialize_as_zero_meaning_unset(self):
-        """0 is the unset sentinel: llm_pool treats non-positive as absent."""
-        cfg = _load_from_dict({})
-        assert cfg.to_dict()["knowledge"]["llm_pool_size"] == 0
-        assert cfg.to_dict()["knowledge"]["llm_timeout_secs"] == 0.0
+    def test_no_sibling_left_beside_a_redirected_config(self, tmp_path: Path) -> None:
+        """A caller-owned directory gains nothing from a migrating load()."""
+        caller_dir = tmp_path / "caller-owned"
+        caller_dir.mkdir()
+        cfg_file = caller_dir / "tmpdeadbeef.json"
+        cfg_file.write_text(json.dumps(self._LEGACY), encoding="utf-8")
+        home = tmp_path / "home"
+        home.mkdir()
+
+        before = {p.name for p in caller_dir.iterdir()}
+        cfg = self._load_with(home, cfg_file)
+        after = {p.name for p in caller_dir.iterdir()}
+
+        # Guard the guard: assert the migration branch actually ran, otherwise
+        # this test would pass for the wrong reason if that branch stops firing.
+        assert cfg.agents, "migration write-back did not run, test is vacuous"
+        assert after == before, "load() left orphans beside the caller's config: %s" % sorted(
+            after - before
+        )
+
+    def test_real_config_in_the_data_home_is_still_backed_up(self, tmp_path: Path) -> None:
+        """The production path keeps its backup exactly where it always was."""
+        home = tmp_path / "home"
+        home.mkdir()
+        cfg_file = home / "config.json"
+        cfg_file.write_text(json.dumps(self._LEGACY), encoding="utf-8")
+
+        cfg = self._load_with(home, cfg_file)
+
+        assert cfg.agents, "migration write-back did not run, test is vacuous"
+        assert (home / "config.json.bak").exists()
+
+    def test_backup_appends_the_suffix_instead_of_replacing_it(self, tmp_path: Path) -> None:
+        """A config whose name is not ``*.json`` is backed up, not renamed.
+
+        ``Path.with_suffix(".json.bak")`` REPLACES the final suffix, so
+        ``settings.conf`` would have produced ``settings.json.bak``.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        cfg_file = home / "settings.conf"
+        cfg_file.write_text(json.dumps(self._LEGACY), encoding="utf-8")
+
+        self._load_with(home, cfg_file)
+
+        assert (home / "settings.conf.bak").exists()
+        assert not (home / "settings.json.bak").exists()
+
+    def test_failed_backup_still_aborts_the_migration_save(self, tmp_path: Path) -> None:
+        """A config we could not copy aside is not rewritten either.
+
+        The caller's ``except`` is what skips ``cfg.save()``, so containing the
+        LOCATION decision must not also swallow a failing copy: otherwise the
+        only pre-migration copy is overwritten with no backup anywhere.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        cfg_file = home / "config.json"
+        original = json.dumps(self._LEGACY)
+        cfg_file.write_text(original, encoding="utf-8")
+
+        with unittest.mock.patch(
+            "kiro_crew.config.loader.shutil.copy2",
+            side_effect=OSError("backup target is read-only"),
+        ):
+            cfg = self._load_with(home, cfg_file)
+
+        # load() still returns a usable config -- the write-back is best-effort.
+        assert cfg.agents
+        # But the on-disk config is untouched, so the migration retries next load.
+        assert json.loads(cfg_file.read_text(encoding="utf-8")) == json.loads(original)
+        assert not (home / "config.json.bak").exists()
+
+
+# Transports carrying a soft/hard context-threshold pair, and those carrying
+# only the soft nudge (their hard backstop is the backend autocompactor).
+# A future transport that forgets _threshold_pct / _normalize_threshold_pair
+# fails these tests rather than shipping an unclamped read.
+_THRESHOLD_PAIR_TRANSPORTS = ["weixin", "webex", "teams", "wecom", "whatsapp", "imessage"]
+_THRESHOLD_SOFT_ONLY_TRANSPORTS = ["telegram", "discord"]
+
+
+class TestTransportThresholdConsistency:
+    """Every transport's context thresholds share ONE validation.
+
+    Locks in the invariant that validity is a property of the type: the loader
+    coerces every read through _threshold_pct (clamped to 1..100) and each
+    dataclass's __post_init__ normalizes its fields (pair transports also
+    enforce soft <= hard), so neither a hand-edited config nor a
+    code-constructed object can hold an out-of-range or inverted value.
+    """
+
+    @staticmethod
+    def _section(cfg, transport: str):
+        return getattr(cfg, transport)
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_defaults_when_missing(self, transport: str) -> None:
+        section = self._section(_load_from_dict({transport: {}}), transport)
+        assert section.soft_threshold_pct == 80
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert section.hard_threshold_pct == 95
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    @pytest.mark.parametrize("raw", [-5, 0, 101, 10_000])
+    def test_out_of_range_values_are_clamped(self, transport: str, raw: int) -> None:
+        payload: dict = {"soft_threshold_pct": raw}
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            payload["hard_threshold_pct"] = raw
+        section = self._section(_load_from_dict({transport: payload}), transport)
+        assert 1 <= section.soft_threshold_pct <= 100
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert 1 <= section.hard_threshold_pct <= 100
+            assert section.soft_threshold_pct <= section.hard_threshold_pct
+
+    @pytest.mark.parametrize("transport", _THRESHOLD_PAIR_TRANSPORTS)
+    def test_soft_above_hard_is_corrected(self, transport: str) -> None:
+        # An inverted pair (soft=90, hard=50) would make the soft nudge
+        # unreachable -- the transports check pct >= hard first.
+        section = self._section(
+            _load_from_dict({transport: {"soft_threshold_pct": 90, "hard_threshold_pct": 50}}),
+            transport,
+        )
+        assert section.hard_threshold_pct == 50
+        assert section.soft_threshold_pct == 50
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_non_numeric_values_fall_back_to_defaults(self, transport: str) -> None:
+        payload: dict = {"soft_threshold_pct": "abc"}
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            payload["hard_threshold_pct"] = None
+        section = self._section(_load_from_dict({transport: payload}), transport)
+        assert section.soft_threshold_pct == 80
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert section.hard_threshold_pct == 95
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_code_constructed_object_is_normalized(self, transport: str) -> None:
+        # __post_init__ makes an object constructed in code valid too, not just
+        # one loaded from disk.
+        cls = {
+            "telegram": loader_module.TelegramConfig,
+            "weixin": loader_module.WeixinConfig,
+            "discord": loader_module.DiscordConfig,
+            "webex": loader_module.WebexConfig,
+            "teams": loader_module.TeamsConfig,
+            "wecom": loader_module.WeComConfig,
+            "whatsapp": loader_module.WhatsAppConfig,
+            "imessage": loader_module.IMessageConfig,
+        }[transport]
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            obj = cls(soft_threshold_pct=150, hard_threshold_pct=-3)
+            assert obj.hard_threshold_pct == 1
+            assert obj.soft_threshold_pct == 1
+        else:
+            obj = cls(soft_threshold_pct=150)
+            assert obj.soft_threshold_pct == 100
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_an_integral_float_is_honoured_on_a_shipped_install(
+        self, transport: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A threshold written as ``90.0`` is the value the operator chose.
+
+        Asserted with the schema layer OFF, because that is the shipped
+        configuration: ``jsonschema`` is a dev-only dependency, so on a user's
+        install ``validate_config_data`` returns early and its
+        ``_coerce_legacy_numeric_values`` pre-pass -- which is what turns an
+        integral float into an int -- never runs. The loader's own coercion is
+        then the only one there is, and the shared ``_threshold_pct`` accepts an
+        integral float where a hand-rolled ``int(str(raw))`` raises on ``"90.0"``
+        and silently substitutes the default. That channel would keep firing at
+        80 for someone who configured 90, with nothing logged.
+
+        Leaving jsonschema installed here (as CI does) makes this pass against a
+        hand-rolled clamp too, which is exactly the mistake that hides the bug.
+        """
+        import kiro_crew.config.validation as validation
+
+        monkeypatch.setattr(validation, "_HAS_JSONSCHEMA", False)
+        payload: dict = {"soft_threshold_pct": 90.0}
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            payload["hard_threshold_pct"] = 99.0
+        section = self._section(_load_from_dict({transport: payload}), transport)
+        assert section.soft_threshold_pct == 90
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert section.hard_threshold_pct == 99
+
+    def test_telegram_account_soft_threshold_clamped(self) -> None:
+        # Deprecated/inert telegram.accounts entries still parse through the
+        # same coercion so a round-tripped config stays in range.
+        cfg = _load_from_dict(
+            {
+                "telegram": {
+                    "accounts": {"acct-1": {"bot_token": "123:abc", "soft_threshold_pct": 400}}
+                }
+            }
+        )
+        assert cfg.telegram.accounts["acct-1"].soft_threshold_pct == 100
+
+
+#: One non-default sample per ``WeComConfig`` field, keyed by field name. The map
+#: must cover EVERY field: ``load()`` enumerates the section's keys by hand, so a
+#: field added to the dataclass but forgotten there loads as its default and is
+#: then written back as its default — the operator's setting is both ignored and
+#: erased, with nothing failing — a key that looks wired (it appears in the config
+#: schema, which IS derived from the dataclass) while being discarded at load. This
+#: map is the ratchet: a new field fails the test below until a sample is added,
+#: which forces the author through the load path.
+_WECOM_FIELD_SAMPLES: dict[str, object] = {
+    "enabled": True,
+    "allowed_users": [{"userid": "zhangsan", "name": "Z"}],
+    "allow_all_users": True,
+    "ws_url": "wss://example.invalid/ws",
+    "soft_threshold_pct": 71,
+    "hard_threshold_pct": 91,
+    "session_folder": "wecom-folder",
+}
+
+
+class TestWeComSectionSurvivesLoad:
+    def test_the_sample_map_covers_every_field(self) -> None:
+        import dataclasses
+
+        declared = {f.name for f in dataclasses.fields(loader_module.WeComConfig)}
+        missing = declared - set(_WECOM_FIELD_SAMPLES)
+        assert not missing, (
+            f"WeComConfig gained field(s) {sorted(missing)} with no sample here. Add one, "
+            "and check KiroCrewConfig.load() actually reads the key -- it enumerates them "
+            "by hand, so an omission silently discards the operator's value."
+        )
+        assert not set(_WECOM_FIELD_SAMPLES) - declared, "sample for a field that no longer exists"
+
+    @pytest.mark.parametrize("field_name", sorted(_WECOM_FIELD_SAMPLES))
+    def test_each_configured_value_survives_load(self, field_name: str) -> None:
+        sample = _WECOM_FIELD_SAMPLES[field_name]
+        cfg = _load_from_dict({"wecom": {field_name: sample}})
+        loaded = getattr(cfg.wecom, field_name)
+        default = getattr(loader_module.WeComConfig(), field_name)
+        assert loaded != default, (
+            f"wecom.{field_name} loaded as its default {default!r} despite being configured "
+            f"as {sample!r} -- KiroCrewConfig.load() is not reading the key"
+        )
+
+    @pytest.mark.parametrize("junk", [None, 7, "zhangsan", {"a": 1}, True])
+    def test_a_non_list_allow_list_degrades_to_empty_rather_than_crashing_load(
+        self, junk: object
+    ) -> None:
+        # An explicit `null`, or any non-list, must not raise out of load(): a
+        # config file the operator can write is not a trusted type, and a TypeError
+        # here prevents STARTUP rather than degrading one setting. A bare string is
+        # the subtle one -- iterating it would char-split into single-letter userids.
+        cfg = _load_from_dict({"wecom": {"allowed_users": junk}})
+        assert cfg.wecom.allowed_users == []
+
+    @pytest.mark.parametrize("field", ["enabled", "allow_all_users"])
+    @pytest.mark.parametrize("junk", ["false", "off", "0", 0, 1, [], {}, None, "true"])
+    def test_a_non_bool_never_turns_a_switch_ON(self, field: str, junk: object) -> None:
+        # `bool("false")` is True, so a JSON string would invert the operator's
+        # intent -- enabling the channel, or opening it to every org member, from a
+        # value that says the opposite. Even the "helpfully" correct-looking "true"
+        # must not enable it: a parse that guesses at a string is the same parse that
+        # cannot refuse "false".
+        cfg = _load_from_dict({"wecom": {field: junk}})
+        assert getattr(cfg.wecom, field) is False
+
+    @pytest.mark.parametrize("field", ["enabled", "allow_all_users"])
+    def test_a_real_bool_still_works(self, field: str) -> None:
+        cfg = _load_from_dict({"wecom": {field: True}})
+        assert getattr(cfg.wecom, field) is True

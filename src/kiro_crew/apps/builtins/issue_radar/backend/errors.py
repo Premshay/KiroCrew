@@ -17,6 +17,12 @@ from __future__ import annotations
 
 import re
 
+# RepoUrlError is defined by the shared gh runner (kiro_crew.github_runner),
+# where parse_github_repo_url raises it; re-exported here so both provider
+# clients and all route-level ``except`` clauses keep catching the SAME class.
+# Callers map it to HTTP 400 (bad client input), as distinct from
+# ProviderCliError, which is an upstream problem (502).
+from kiro_crew.github_runner import RepoUrlError  # noqa: F401
 from kiro_crew.security import redact_local_paths
 
 # Public provider endpoints are not host topology: the user is talking to them on
@@ -50,14 +56,6 @@ def sanitize_cli_stderr(text: str) -> str:
         return match.group(0) if host in _PUBLIC_HOSTS else _REDACTED
 
     return _URL_RE.sub(_host, out)
-
-
-class RepoUrlError(ValueError):
-    """Raised when a repo URL is not a well-formed, supported provider URL.
-
-    Callers map this to HTTP 400 (bad client input), as distinct from
-    :class:`ProviderCliError`, which is an upstream problem (502).
-    """
 
 
 class ProviderCliError(RuntimeError):
@@ -94,6 +92,31 @@ class ProviderPermissionError(ProviderCliError):
     back to the issue-derived set, and the write routes special-case it into an
     HTTP 403 rather than a generic 502.
     """
+
+
+class ProviderInvalidInputError(ProviderCliError):
+    """Raised when the provider REJECTED the request because a value in it is not
+    acceptable -- as distinct from the caller lacking permission (403) or the
+    upstream being broken (502).
+
+    The motivating case is an assignee the forge will not accept. GitHub answers
+    ``PATCH /issues/{n}`` with HTTP 422 ``{"field": "assignees", "code":
+    "invalid"}`` and applies NONE of the request; GitLab ignores an
+    ``assignee_id`` for a non-member. Both are the user having picked someone
+    unassignable, so the route must answer 400 and name them -- a 502 would tell
+    the user the forge is down and invite a pointless retry, and a silent success
+    would show an assignee the issue does not carry.
+
+    A subclass of :class:`ProviderCliError` so existing handlers still catch it,
+    following the same reasoning as :class:`ProviderPermissionError`.
+
+    ``values`` holds the rejected inputs when the provider named them, so the
+    route can say WHICH login was refused rather than echoing raw CLI stderr.
+    """
+
+    def __init__(self, message: str, *, values: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.values = list(values or [])
 
 
 class PrSearchError(ValueError):

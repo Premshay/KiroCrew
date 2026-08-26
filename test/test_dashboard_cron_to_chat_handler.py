@@ -22,16 +22,37 @@ def _make_state(jobs=None, history_messages=None, notifications=None):
     state = MagicMock()
     slots = {}
 
-    def get_or_create_slot(name=None, agent=""):
+    def get_or_create_slot(name=None, agent="", origin=""):
+        # ``origin`` is recorded, not just tolerated: the cron paths must
+        # declare SlotOrigin.CRON, and a fake that swallowed the kwarg
+        # would let that regress silently (a cron slot relabelled USER is
+        # readable by any app holding `slots:user`).
         if name not in slots:
             slot = MagicMock()
             slot.key = name
+            slot._origin = origin
             slot.linked_session_key = ""
             slot.messages = []
             slot.title = ""
 
-            def append(role, content, cls, broadcast=True):
-                slot.messages.append({"role": role, "content": content, "cls": cls})
+            def append(role, content, cls, broadcast=True, meta=None):
+                # Mirror the real ``_ChatSlot.append`` contract: accept ``meta``
+                # (hydration threads each disk row's meta through so a persisted
+                # ``meta.mid`` survives), preserve a supplied id, mint one
+                # otherwise, and hand the appended row back for the dual-write
+                # id pass-through.
+                supplied = meta.get("mid") if isinstance(meta, dict) else None
+                msg = {
+                    "role": role,
+                    "content": content,
+                    "cls": cls,
+                    "meta": {
+                        **(meta if isinstance(meta, dict) else {}),
+                        "mid": supplied or f"m-test-{len(slot.messages)}",
+                    },
+                }
+                slot.messages.append(msg)
+                return msg
 
             slot.append = append
             slots[name] = slot

@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.executors import subprocess_executor
@@ -60,6 +60,13 @@ _BRIDGE_PING_TYPE = "ping"
 # would reproduce the defect it exists to fix.
 _ERROR_EMIT_TIMEOUT_SECS = 5.0
 _BRIDGE_PONG_TYPE = "pong"
+# Reserved type for the gateway->stub keepalive control frame. The gateway
+# writes one to every live stub each heartbeat sweep so that a half-open
+# transport — which a parked reader cannot observe — fails an actual write and
+# becomes detectable. It carries no payload and expects no reply: the write
+# succeeding or failing IS the signal, and it is consumed here rather than
+# forwarded, exactly like the pong frame above.
+_BRIDGE_KEEPALIVE_TYPE = "keepalive"
 # Pre-flight ``ensure_backend`` reply timeout. Must comfortably
 # exceed cold backend fork latency. On timeout the stub falls back to a
 # direct per-session exec, so an over-generous value only costs a slower
@@ -160,7 +167,34 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--auto-approve", default="", dest="auto_approve")
     p.add_argument("--approval-mode", default="interactive", dest="approval_mode")
     p.add_argument("--trust-all", action="store_true", dest="trust_all")
+    p.add_argument(
+        "--poolable",
+        action="store_true",
+        dest="poolable",
+        help=(
+            "Declare this connection's backend shareable with other connections "
+            "carrying an identical PoolKey. Absent, the gateway gives this "
+            "connection its own backend -- the same process topology as no "
+            "gateway at all, which is why absent is the safe default: a stub "
+            "from an overlay predating this flag never silently starts sharing."
+        ),
+    )
     p.add_argument("--channel-id", default=None, dest="channel_id")
+    p.add_argument(
+        "--pool-identity-env",
+        default="",
+        dest="pool_identity_env",
+        help=(
+            "Env variable NAMES (separated by --target-args-sep) whose value the "
+            "operator declared part of backend identity via "
+            "mcp_gateway.pool_identity_env. Folded into effective_env_hash even "
+            "when the name looks like a rotating secret. Names only, never "
+            "values, so this is safe on argv. Carries NO authority: gatewayd "
+            "re-reads the operator's own list at spawn and refuses to forward "
+            "when the hash it recomputes does not match the one registered here, "
+            "so a stub cannot widen what gets applied to a shared backend."
+        ),
+    )
     p.add_argument(
         "--socket",
         default=os.environ.get("KIROCREW_MCP_SOCKET") or os.environ.get("MC_MCP_SOCKET") or _default_socket_path(),
@@ -234,7 +268,7 @@ def _parse_auto_approve(raw: str) -> list[str]:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
             return [str(s) for s in parsed if s]
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         pass
     # Back-compat: legacy CSV form.
     return [s for s in raw.split(",") if s]
@@ -278,6 +312,16 @@ def _binary_version(command: str) -> str:
         return h.hexdigest()[:24]
     except OSError:
         return "unknown"
+
+
+def binary_fingerprint(command: str) -> str:
+    """Public alias of :func:`_binary_version`.
+
+    The shareability cache keys on the same token the pool does, so an in-place
+    binary upgrade invalidates both. One implementation, two consumers — a second
+    copy would drift and let one of them keep a stale identity.
+    """
+    return _binary_version(command)
 
 
 def _resolve_channel_id(cli_value: Optional[str]) -> Optional[str]:
@@ -325,8 +369,12 @@ def _build_caller_block(channel_id: Optional[str]) -> dict[str, str]:
     both ends of the wire in agreement. If the key is still unknown at register
     (claim hasn't happened yet), the recaller loop repairs it later."""
     session_key = CallerContext.from_env().session_key
+    # Diagnostic identity only — the OS user. USERNAME is the Windows spelling
+    # of USER; check both so this dimension is not empty on one platform.
+    # (A ``KIROCREW_PRINCIPAL`` override existed historically but nothing ever
+    # set it — Kiro Crew is single-operator, so it was deleted.)
     principal = (
-        os.environ.get("KIROCREW_PRINCIPAL") or os.environ.get("USER") or ""
+        os.environ.get("USER") or os.environ.get("USERNAME") or ""
     )
     if session_key.startswith("cron:"):
         session_type = "cron"
@@ -363,6 +411,12 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         env_pairs = _parse_env_csv(args.env)
     auto_approve = _parse_auto_approve(args.auto_approve)
     channel_id = _resolve_channel_id(args.channel_id)
+    # Reuses the target-args separator rather than ',' so a name can never be
+    # split the way the legacy CSV env encoding split values. Empty -> the
+    # default set, which hashes exactly as it did before this flag existed.
+    identity_keys = frozenset(
+        n for n in args.pool_identity_env.split(args.target_args_sep) if n
+    )
 
     try:
         work_dir = str(Path(args.work_dir).resolve())
@@ -370,14 +424,6 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         work_dir = str(args.work_dir)
 
     caller = _build_caller_block(channel_id)
-    # USERNAME is the Windows spelling of USER; check both so this diagnostic
-    # dimension is not empty on one platform.
-    user_identity = (
-        caller["principal_id"]
-        or os.environ.get("USER", "")
-        or os.environ.get("USERNAME", "")
-        or "unknown"
-    )
 
     return {
         "type": "register",
@@ -385,7 +431,7 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         "server_name": args.server,
         "agent_name": args.agent,
         "command_args_hash": hash_command(args.target_command, target_args),
-        "effective_env_hash": hash_effective_env(env_pairs),
+        "effective_env_hash": hash_effective_env(env_pairs, identity_keys=identity_keys),
         "work_dir": work_dir,
         "binary_version": _binary_version(args.target_command),
         # Not os.getuid(): that attribute does not exist on Windows, where an
@@ -401,7 +447,21 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         ),
         "approval_mode": args.approval_mode,
         "trust_all_tools": bool(args.trust_all),
-        "user_identity": user_identity,
+        # Not a PoolKey dimension: it selects HOW the backend is acquired
+        # (shared bucket vs this connection's own), not WHICH backends are
+        # interchangeable. Keeping it out of the key is what lets a
+        # per-connection backend exist without making every key
+        # connection-private.
+        "poolable": bool(args.poolable),
+        # Wire-compat ballast, NOT a pool dimension: an adopted daemon that
+        # outlived a package upgrade (the manager adopts anything answering
+        # ``pong`` with no version handshake — see gatewayd's capability
+        # comment) still runs a ``PoolKey.from_register`` that hard-requires
+        # ``user_identity``. Omitting the key would make that daemon reject
+        # every new stub's register as malformed, silently un-pooling the
+        # whole install until the daemon restarts. A current daemon ignores
+        # the key. Safe to drop once no pre-#3604 daemon can be adopted.
+        "user_identity": caller["principal_id"] or "unknown",
         "channel_id": channel_id,
         "config_snapshot_hash": _CONFIG_SNAPSHOT_PLACEHOLDER,
         "caller": caller,
@@ -461,6 +521,22 @@ async def _safe_close(writer: asyncio.StreamWriter) -> None:
         await writer.wait_closed()
     except Exception:
         pass
+
+
+def must_degrade_unshareable(poolable: bool, capabilities: list[str]) -> bool:
+    """Should this connection abandon the gateway rather than risk being pooled?
+
+    True only when the stub asked for a PRIVATE backend and the daemon did not
+    attest that it reads the ``poolable`` register field. Such a daemon ignores
+    the flag and routes the register through the shared index, so a server the
+    operator never allowlisted would be silently co-tenanted — and a stub cannot
+    detect that after the fact. Degrading gives the per-session exec, which is
+    the private topology it asked for.
+
+    A stub that DID ask to share needs no attestation: an older daemon pools it,
+    which is what it wanted.
+    """
+    return not poolable and "poolable_ack" not in capabilities
 
 
 class FallbackRequestedError(Exception):
@@ -647,7 +723,7 @@ async def run_bridge(
                 msg = json.loads(line)
                 if isinstance(msg, dict) and "method" in msg and "id" in msg:
                     _outstanding_ids.add(msg["id"])
-            except (json.JSONDecodeError, ValueError, TypeError):
+            except (ValueError, TypeError):
                 pass
             try:
                 # Serialize with _recaller_loop's _write_frame writes on the
@@ -730,24 +806,32 @@ async def run_bridge(
                     return
                 if not line:
                     return
-                # Intercept pong control frames (gateway liveness reply) and
-                # track response IDs to clear outstanding requests.
+                # Intercept control frames (gateway liveness reply, gateway
+                # keepalive) and track response IDs to clear outstanding
+                # requests.
                 # Best-effort: parse failures pass the line through verbatim.
-                _is_pong = False
+                _is_control = False
                 try:
                     msg = json.loads(line)
                     if isinstance(msg, dict):
-                        if msg.get("type") == _BRIDGE_PONG_TYPE:
+                        _mtype = msg.get("type")
+                        if _mtype == _BRIDGE_PONG_TYPE:
                             _pong_received.set()
-                            _is_pong = True
+                            _is_control = True
+                        elif _mtype == _BRIDGE_KEEPALIVE_TYPE:
+                            # Gateway-side transport probe. Nothing to do: the
+                            # gateway learns what it needs from whether the
+                            # write succeeded. Swallow it.
+                            _is_control = True
                         elif "id" in msg and "method" not in msg:
                             # A response (has id, no method) — clear from
                             # outstanding set.
                             _outstanding_ids.discard(msg["id"])
-                except (json.JSONDecodeError, ValueError, TypeError):
+                except (ValueError, TypeError):
                     pass
-                # Pong is a control frame; never forward to kiro-cli stdout.
-                if _is_pong:
+                # Control frames are gateway<->stub only; never forward to
+                # kiro-cli stdout.
+                if _is_control:
                     continue
                 try:
                     await _emit(line)
@@ -866,6 +950,14 @@ def _fallback_log_path() -> Path:
     return _crew_home() / "logs" / "stub_fallback.jsonl"
 
 
+# Rotate the fallback log once it exceeds this size, keeping ONE previous
+# generation (``.jsonl.1``). The log grew unbounded before (467 KB in 15 h on
+# one degraded host, issue #3495); a 1 MiB cap bounds total disk use at ~2 MiB
+# while keeping enough history for the gateway's per-server fallback-rate
+# aggregation (see ``gatewayd`` stats).
+_FALLBACK_LOG_MAX_BYTES = 1024 * 1024
+
+
 def log_fallback(
     reason: str, stub_uuid: str, pool_label: str, args: argparse.Namespace
 ) -> None:
@@ -887,10 +979,104 @@ def log_fallback(
             "channel_id": args.channel_id or "",
             "target_command": args.target_command,
         }
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        # Rotation is guarded by a NON-BLOCKING try-lock on a sibling lock
+        # file: only the holder rotates, so two stubs hitting the size cap
+        # together can no longer both rotate (the second would replace ``.1``
+        # with the first's fresh live file, discarding a generation). A loser
+        # appends without rotating — never waits, so no log_fallback call can
+        # stall its stub's event loop — and the next writer rotates. Worst
+        # case the live file overshoots the cap by a few racing records.
+        lock_fd = os.open(
+            log_path.with_suffix(".jsonl.lock"), os.O_CREAT | os.O_RDWR, 0o600
+        )
+        locked = False
+        try:
+            locked = platform_compat.try_acquire_lock(lock_fd, exclusive=True)
+            if locked:
+                try:
+                    if log_path.stat().st_size >= _FALLBACK_LOG_MAX_BYTES:
+                        os.replace(log_path, log_path.with_suffix(".jsonl.1"))
+                except OSError:
+                    # Missing file (fresh boot) or a Windows sharing violation
+                    # (another process holds the log open, so the rename is
+                    # rejected). Rotation is best-effort; the append below must
+                    # still happen — letting this propagate to the outer
+                    # handler would silently DROP the record.
+                    pass
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        finally:
+            if locked:
+                platform_compat.release_lock(lock_fd)
+            os.close(lock_fd)
     except OSError:
         pass
+
+
+# Sliding window for fallback aggregation: long enough to catch a slow drip
+# (tens per hour), short enough that a fixed incident ages out of the count.
+_FALLBACK_COUNT_WINDOW_SECS = 24 * 3600.0
+
+
+def fallback_counts() -> dict[str, Any]:
+    """Aggregate the fallback audit log into per-server counts.
+
+    Reads the live log plus the one rotated generation (see
+    ``_FALLBACK_LOG_MAX_BYTES``) and counts records whose ``ts`` falls within
+    the last ``_FALLBACK_COUNT_WINDOW_SECS``. This is the reader the log never
+    had: degradations accrued with no signal anywhere. gatewayd folds the
+    result into its ``stats`` reply, making the per-server fallback rate
+    queryable from the gateway control socket instead of the operator having
+    to read a process tree.
+
+    Returns ``{"window_secs": ..., "total": n, "by_server": {name: n},
+    "by_reason": {reason: n}}``. Never raises — an unreadable or torn log
+    yields the counts of whatever parsed.
+    """
+    cutoff = time.time() - _FALLBACK_COUNT_WINDOW_SECS
+    total = 0
+    by_server: dict[str, int] = {}
+    by_reason: dict[str, int] = {}
+    live = _fallback_log_path()
+    for path in (live.with_suffix(".jsonl.1"), live):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # torn tail line from a racing writer
+                    if not isinstance(rec, dict):
+                        continue
+                    ts = rec.get("ts")
+                    if not isinstance(ts, (int, float)) or ts < cutoff:
+                        continue
+                    total += 1
+                    server = str(rec.get("server") or rec.get("pool_label") or "?")
+                    by_server[server] = by_server.get(server, 0) + 1
+                    reason = str(rec.get("reason") or "?")
+                    by_reason[reason] = by_reason.get(reason, 0) + 1
+        except OSError:
+            continue
+    return {
+        "window_secs": _FALLBACK_COUNT_WINDOW_SECS,
+        "total": total,
+        "by_server": by_server,
+        "by_reason": by_reason,
+    }
+
+
+async def alog_fallback(
+    reason: str, stub_uuid: str, pool_label: str, args: argparse.Namespace
+) -> None:
+    """Run :func:`log_fallback` in a worker thread.
+
+    The async bridge calls this before every terminal fallback: the write is
+    plain blocking file I/O (open/append, plus the best-effort rotation), so
+    it runs off the event loop, and awaiting it guarantees the record is on
+    disk before the caller proceeds to ``fallback_exec`` (which replaces the
+    process image and would otherwise race the write)."""
+    await asyncio.to_thread(log_fallback, reason, stub_uuid, pool_label, args)
 
 
 def fallback_exec(args: argparse.Namespace) -> None:
@@ -1050,16 +1236,42 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
             timeout=_HANDSHAKE_TIMEOUT_SECS,
         )
     except asyncio.TimeoutError:
-        log_fallback("handshake_timeout", payload["stub_uuid"], pool_label, args)
+        await alog_fallback("handshake_timeout", payload["stub_uuid"], pool_label, args)
         logger.warning("handshake timed out; falling back pool=%s", pool_label)
         fallback_exec(args)
         return 1  # unreachable
     except FallbackRequestedError as exc:
-        log_fallback(exc.reason, payload["stub_uuid"], pool_label, args)
+        await alog_fallback(exc.reason, payload["stub_uuid"], pool_label, args)
         logger.warning("handshake failed (%s); falling back pool=%s", exc.reason, pool_label)
         fallback_exec(args)
         return 1  # unreachable
     logger.info("registered stub_uuid=%s pool=%s", stub_uuid, pool_label)
+
+    capabilities = registered.get("capabilities") if isinstance(registered, dict) else None
+    _caps = capabilities if isinstance(capabilities, list) else []
+
+    # A private backend is the one thing this connection cannot verify after the
+    # fact. ``poolable`` is a register-payload field, so a daemon predating it
+    # ignores the flag and routes this register through the shared index —
+    # silently co-tenanting a server the operator never allowlisted. Such a
+    # daemon is reachable: the manager adopts anything answering ``pong``, with
+    # no version handshake, so one that outlived a package upgrade serves new
+    # stubs. Degrade instead: the per-session exec IS the private topology this
+    # connection asked for, and kiro-cli's ``initialize`` is still unread, so the
+    # fallback is clean. A stub that DID ask to share needs no check — an old
+    # daemon pools it, which is what it wanted.
+    if must_degrade_unshareable(bool(args.poolable), _caps):
+        reason = "gateway does not honour the poolable field"
+        await alog_fallback(reason, payload["stub_uuid"], pool_label, args)
+        logger.warning(
+            "handshake: gateway did not advertise poolable_ack and this server is "
+            "not shareable; falling back to a per-session exec rather than risk "
+            "being pooled pool=%s",
+            pool_label,
+        )
+        await _safe_close(writer)
+        fallback_exec(args)
+        return 1  # unreachable
 
     # B1 pre-flight: trigger the gateway's backend spawn with a
     # control frame BEFORE forwarding any real MCP traffic, so a capacity /
@@ -1069,8 +1281,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
     # would treat the control frame as a real MCP frame and never reply, so we
     # skip the pre-flight and bridge directly (legacy lazy-spawn path, no 25s
     # skew penalty).
-    capabilities = registered.get("capabilities") if isinstance(registered, dict) else None
-    if isinstance(capabilities, list) and "ensure_backend" in capabilities:
+    if "ensure_backend" in _caps:
         try:
             await _write_frame(writer, {"type": "ensure_backend"})
             ready = await asyncio.wait_for(
@@ -1080,7 +1291,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
             # Gateway unreachable / wedged mid-pre-flight — same posture as a
             # connect failure: fall back to a direct per-session exec.
             await _safe_close(writer)
-            log_fallback(
+            await alog_fallback(
                 f"ensure_backend_io:{type(exc).__name__}",
                 payload["stub_uuid"], pool_label, args,
             )
@@ -1110,7 +1321,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
                 if isinstance(ready, dict) else "ensure_backend_closed"
             )
             await _safe_close(writer)
-            log_fallback(reason, payload["stub_uuid"], pool_label, args)
+            await alog_fallback(reason, payload["stub_uuid"], pool_label, args)
             logger.warning("gateway fallback-rejected ensure_backend (%s); falling back pool=%s", reason, pool_label)
             fallback_exec(args)
             return 1  # unreachable
@@ -1191,7 +1402,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
             # is already being abandoned. Exiting still closes stdout, which is
             # what tells kiro-cli this server is done.
             logger.warning("could not emit liveness error frames pool=%s", pool_label)
-        log_fallback("bridge_liveness_dead", stub_uuid, pool_label, args)
+        await alog_fallback("bridge_liveness_dead", stub_uuid, pool_label, args)
         logger.warning(
             "bridge peer stopped answering pings; failed %d outstanding call(s) "
             "pool=%s",

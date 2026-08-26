@@ -26,6 +26,8 @@ function buildMenuTemplate(deps) {
     zoomActualSize,
     zoomIn,
     zoomOut,
+    alwaysOnTop, // initial checked state for Keep on Top (restored preference)
+    toggleAlwaysOnTop,
     openNewConnectionWindow,
     renameCurrentWindow,
     promptRemoteHost,
@@ -42,6 +44,7 @@ function buildMenuTemplate(deps) {
     ...(isMac
       ? [
           {
+            id: "app-menu",
             label: appName,
             submenu: [
               aboutItem,
@@ -60,14 +63,16 @@ function buildMenuTemplate(deps) {
         ]
       : [
           {
+            id: "file-menu",
             // Windows/Linux home for Settings; the quit role renders as
             // "Exit" on Windows and "Quit" on Linux.
             label: "File",
             submenu: [settingsItem, { type: "separator" }, { role: "quit" }],
           },
         ]),
-    { role: "editMenu" },
+    { id: "edit-menu", role: "editMenu" },
     {
+      id: "view-menu",
       label: "View",
       submenu: [
         // Explicit handlers, not { role: ... }: the roles target the focused
@@ -80,6 +85,17 @@ function buildMenuTemplate(deps) {
         { label: "Zoom Out", accelerator: "CmdOrCtrl+-", click: zoomOut },
         { type: "separator" },
         { role: "togglefullscreen" },
+        // Checkable, no accelerator: there is no cross-platform convention for
+        // always-on-top, and inventing one risks colliding with an existing
+        // binding. `checked` seeds from the restored preference; main.js
+        // reconciles it with the window's ACTUAL state after every toggle.
+        {
+          label: "Keep on Top",
+          type: "checkbox",
+          id: "keep-on-top",
+          checked: !!alwaysOnTop,
+          click: toggleAlwaysOnTop,
+        },
         { type: "separator" },
         {
           label: "Toggle Developer Tools",
@@ -91,6 +107,7 @@ function buildMenuTemplate(deps) {
       ],
     },
     {
+      id: "connection-menu",
       label: "Connection",
       submenu: [
         { label: "New Connection Window…", accelerator: "CmdOrCtrl+N", click: openNewConnectionWindow },
@@ -102,9 +119,9 @@ function buildMenuTemplate(deps) {
         { label: "Open Config File", click: openConfigFile },
       ],
     },
-    { role: "windowMenu" },
+    { id: "window-menu", role: "windowMenu" },
     // Windows/Linux home for About (Help > About <app>).
-    ...(isMac ? [] : [{ label: "Help", submenu: [aboutItem] }]),
+    ...(isMac ? [] : [{ id: "help-menu", label: "Help", submenu: [aboutItem] }]),
   ];
 }
 

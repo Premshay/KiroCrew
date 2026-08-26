@@ -87,10 +87,18 @@ const SelectContent = React.forwardRef<
       }}
       className={cn(
         'z-[9999] max-h-[240px] overflow-hidden rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
-        'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
+        // Entry animation only. Radix suspends unmount until an exit animation
+        // finishes, and the still-mounted dismissable layer consumes the next
+        // pointer-down — so an exit animation makes a re-click on the trigger a
+        // no-op for the animation's whole duration.
+        'data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95',
         'data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2',
-        // Popper mode: panel matches the trigger width
-        position === 'popper' && 'w-[var(--radix-select-trigger-width)] min-w-[180px]',
+        // Popper mode: the panel is EXACTLY the trigger's width. No `min-w`
+        // here on purpose — a floor wider than the trigger makes the popup
+        // visibly overhang it, which is the inconsistency this is avoiding. A
+        // caller whose rows need more room widens the TRIGGER instead, so the
+        // two stay in lockstep.
+        position === 'popper' && 'w-[var(--radix-select-trigger-width)]',
         className
       )}
       {...props}

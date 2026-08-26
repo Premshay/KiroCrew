@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import struct
 import subprocess
 import time
@@ -19,6 +20,7 @@ from aiohttp import web
 
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import config_path
+from kiro_crew.dashboard import terminal_commands
 from kiro_crew.dashboard.origin import check_origin
 from kiro_crew.executors import discovery_executor, subprocess_executor
 from kiro_crew.hooks import validate_file_path
@@ -52,20 +54,6 @@ logger = logging.getLogger(__name__)
 _MAX_SESSIONS = 12
 _ORPHAN_TIMEOUT_S = 900  # 15 min with no WS → reap PTY (grace window for reload/network drops; in-app nav keeps the WS alive)
 _SCROLLBACK_MAX = 50 * 1024  # 50KB ring buffer per session for reconnect replay
-
-
-def _redact_terminal(data: bytes | bytearray) -> bytes:
-    """Strip credentials/exfiltration URLs from PTY output before it reaches a
-    client. ``kiro_crew.security`` redactors return ``(text, warnings)`` tuples
-    (unlike upstream's str-returning ``redaction`` module), so unpack both.
-
-    Accepts ``bytearray`` too: the reconnect-replay path passes the
-    ``_TerminalSession.scrollback`` ring buffer (a ``bytearray``) directly, and
-    ``.decode()`` behaves identically on both."""
-    text = data.decode("utf-8", errors="replace")
-    text, _ = redact_exfiltration_urls(text)
-    text, _ = redact_credentials(text)
-    return text.encode("utf-8")
 
 
 def _sel():
@@ -122,6 +110,25 @@ class _TerminalSession:
     # _session_cwd_cached). Cleared as soon as the client submits a line, since
     # that line may be the `cd` the memo would otherwise hide.
     cwd_probe: tuple[float, str | None] | None = None
+    # Whether the title/cwd poller still has anything to recompute. A shell
+    # cannot change directory, or start or finish a command, without writing to
+    # the PTY — so a session that has produced no output since the last probe
+    # cannot have gone stale, and probing it again would spend a process
+    # introspection call (a forked `lsof` where nothing cheaper answers) to
+    # re-derive a label it already has. Set on PTY output, on a submitted line,
+    # and on (re)connect, where the dedup markers are cleared and both frames
+    # must be pushed again.
+    frames_dirty: bool = True
+    # A WebSocket upgrade completes before startup has yielded the terminal back
+    # to a freshly spawned login shell. Run-in-terminal callers must not release
+    # queued commands until this barrier has been crossed.
+    shell_ready: bool = False
+    # Bash receives a one-use init file that emits this randomized OSC marker
+    # only after its login profiles return. ``ready_probe`` retains the small
+    # suffix needed when the marker straddles two PTY reads; output itself is
+    # still forwarded byte-for-byte.
+    ready_marker: bytes | None = None
+    ready_probe: bytearray = field(default_factory=bytearray)
     # Serializes concurrent WS writes (reader loop + title poller + pong);
     # aiohttp's WebSocket writer is not safe for concurrent sends.
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -136,7 +143,7 @@ def _get_config(request: web.Request) -> dict:
     try:
         data = json.loads(config_path().read_text(encoding="utf-8"))
         return data.get("dashboard", {}).get("terminal", {})
-    except (OSError, json.JSONDecodeError, ValueError):
+    except (OSError, ValueError):
         return {}
 
 
@@ -174,6 +181,59 @@ def _resolve_cwd(cfg: dict, requested: str | None) -> str:
     return default
 
 
+def _resolve_shell(cfg: dict) -> tuple[str, str | None]:
+    """Resolve the shell program the terminal launches.
+
+    Resolution order is unchanged from the historical one — the configured
+    ``dashboard.terminal.shell``, else ``$SHELL`` (POSIX only), else the
+    platform default (``/bin/bash`` / ``powershell.exe``) — but each candidate
+    must now resolve to an executable (``shutil.which`` handles both absolute
+    paths and bare names on ``PATH``). A configured value that does not resolve
+    falls back rather than failing the open: a typo'd setting must never leave
+    the user without a terminal.
+
+    The value returned is the ABSOLUTE path ``shutil.which`` resolved, not the
+    candidate as written: the spawn runs with the session's cwd (the chat's
+    project directory), so a bare name would be resolved a second time there,
+    and a relative ``PATH`` entry would let a project-planted executable win a
+    race the validation here already decided. Pinning the resolved path makes
+    the program validated the program spawned.
+
+    Blocking note: ``shutil.which`` stats every ``PATH`` entry, so callers on
+    the event loop must run this via an executor (they do — see the three call
+    sites), never inline.
+
+    Returns ``(shell, rejected)`` where ``rejected`` is the configured value
+    when it was set but skipped, so callers can surface the fallback (session
+    response, log) instead of silently launching a different shell.
+
+    When no candidate resolves at all, the platform default is returned
+    unvalidated so the spawn's own error — not a silent substitution — is what
+    the user sees, matching the historical behavior on such a host.
+    """
+    configured = str(cfg.get("shell") or "").strip()
+    if configured:
+        resolved = shutil.which(configured)
+        if resolved:
+            return os.path.abspath(resolved), None
+    rejected = configured or None
+    if platform_compat.IS_WINDOWS:
+        candidates = ["powershell.exe"]
+    else:
+        env_shell = os.environ.get("SHELL", "")
+        candidates = ([env_shell] if env_shell else []) + ["/bin/bash"]
+    for cand in candidates:
+        resolved = shutil.which(cand)
+        if resolved:
+            # abspath (both branches): `which` joins the matching PATH entry
+            # verbatim, so a RELATIVE entry (PATH=bin:…) yields a relative
+            # result the spawn's project cwd would re-resolve — exactly the
+            # substitution pinning exists to prevent. Anchoring here binds the
+            # path to the gateway cwd the validation ran in.
+            return os.path.abspath(resolved), rejected
+    return candidates[-1], rejected
+
+
 def _proc_comm(pid: int) -> str | None:
     """Command name of a process (Linux /proc). None if unavailable."""
     try:
@@ -192,14 +252,16 @@ _LSOF_PATHS = ("/usr/sbin/lsof", "/usr/bin/lsof")
 
 
 def _proc_cwd(pid: int) -> str | None:
-    """Current working directory of a process. Linux /proc first; on hosts
-    without /proc (macOS/BSD) falls back to `lsof -d cwd`, whose ``-Fn`` output
-    carries the path on an ``n``-prefixed line. Blocking (subprocess) — callers
-    must run this off the event loop (the title poller already does)."""
-    try:
-        return os.readlink(f"/proc/{pid}/cwd")
-    except OSError:
-        pass
+    """Current working directory of a process, or None if it cannot be read.
+
+    Prefers the subprocess-free sources (``/proc`` on Linux, ``libproc`` on
+    macOS) and only falls back to ``lsof -d cwd`` — whose ``-Fn`` output carries
+    the path on an ``n``-prefixed line — on a host where neither answers. That
+    fallback forks, so callers must still run this off the event loop.
+    """
+    cwd = platform_compat.process_cwd(pid)
+    if cwd is not None:
+        return cwd
     lsof = next((p for p in _LSOF_PATHS if os.path.isfile(p)), None)
     if not lsof:
         return None  # fail closed rather than resolve via PATH
@@ -216,22 +278,36 @@ def _proc_cwd(pid: int) -> str | None:
     return None
 
 
-def _session_cwd(sess: "_TerminalSession") -> str | None:
-    """Full current working directory of the session's shell, or None."""
-    if not platform_compat.IS_POSIX or sess.proc is None:
-        return None
-    return _proc_cwd(sess.proc.pid)
-
-
-# How long a completion request may reuse the previous cwd probe. Short enough
-# that `cd foo` followed immediately by a completion sees the new directory,
-# long enough that holding a key down does not spawn an lsof per keystroke
-# (_proc_cwd shells out on macOS, where there is no /proc).
+# How long a cwd probe may be reused. Short enough that `cd foo` followed
+# immediately by a completion sees the new directory, long enough that one poll
+# tick — which needs the cwd for both the title and the cwd frame — probes the
+# shell once rather than twice, and that holding a key down does not re-probe
+# per keystroke.
 _CWD_PROBE_TTL_S = 0.4
 
 
+def _session_cwd(sess: "_TerminalSession") -> str | None:
+    """Full current working directory of the session's shell, or None.
+
+    Memoized on the session for :data:`_CWD_PROBE_TTL_S`, because the answer has
+    two consumers a fraction of a millisecond apart (the title label and the cwd
+    frame) and on a host where ``_proc_cwd`` has to fork ``lsof`` the probe, not
+    the polling, is the cost that matters.
+    """
+    if not platform_compat.IS_POSIX or sess.proc is None:
+        return None
+    now = time.monotonic()
+    probe = sess.cwd_probe
+    if probe is not None and now - probe[0] < _CWD_PROBE_TTL_S:
+        return probe[1]
+    cwd = _proc_cwd(sess.proc.pid)
+    sess.cwd_probe = (now, cwd)
+    return cwd
+
+
 async def _session_cwd_cached(sess: "_TerminalSession") -> str | None:
-    """``_session_cwd`` with a short TTL memo, probed off the event loop.
+    """``_session_cwd`` probed off the event loop, skipping the executor hop
+    entirely on a memo hit.
 
     The title poller's ``sess.last_cwd`` is deliberately NOT reused here: it is
     refreshed on a 1 s cadence, so a completion issued right after a ``cd``
@@ -244,15 +320,21 @@ async def _session_cwd_cached(sess: "_TerminalSession") -> str | None:
         return probe[1]
     loop = asyncio.get_running_loop()
     cwd = await loop.run_in_executor(subprocess_executor(), _session_cwd, sess)
+    # _session_cwd memoizes its own probes; this covers the branches where it
+    # returns without probing (no shell, non-POSIX host) so those do not re-hop
+    # to the executor on every keystroke.
     sess.cwd_probe = (now, cwd)
     return cwd
 
 
 def _session_title(sess: "_TerminalSession") -> str | None:
     """Best-effort "what is this terminal doing" label: the foreground command
-    name while one runs, else the shell's cwd basename. Linux /proc based;
-    returns None when it can't tell (client keeps its current title, so on
-    non-Linux hosts the tab simply stays at its cwd default)."""
+    name while one runs, else the shell's cwd basename. Returns None when it
+    can't tell (client keeps its current title, so a host that can resolve
+    neither source simply stays at the tab's cwd default).
+
+    The cwd goes through :func:`_session_cwd` rather than :func:`_proc_cwd` so
+    that deriving this label shares one probe with the poller's cwd frame."""
     if not platform_compat.IS_POSIX or sess.master_fd < 0 or sess.proc is None:  # wokeignore:rule=master
         return None
     try:
@@ -265,10 +347,53 @@ def _session_title(sess: "_TerminalSession") -> str | None:
         name = _proc_comm(fg)
         if name:
             return name
-    cwd = _proc_cwd(sess.proc.pid)
+    cwd = _session_cwd(sess)
     if cwd:
         return os.path.basename(cwd.rstrip("/")) or cwd
     return None
+
+
+def _is_bash_shell(shell: str) -> bool:
+    """Whether *shell* supports the injected post-profile readiness marker."""
+    name = shell.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return name in {"bash", "bash.exe"}
+
+
+def _bash_init_script(token: str) -> bytes:
+    """Build the Bash init file that emulates ``-l`` then marks readiness.
+
+    Bash ignores ``--init-file`` for a login shell, so the injected interactive
+    init file sources the same profile chain itself. The marker comes strictly
+    after those files return, including shell builtins such as ``read`` that do
+    not change the PTY foreground process group.
+    """
+    return (
+        "if [ -r /etc/profile ]; then . /etc/profile; fi\n"
+        'if [ -r "$HOME/.bash_profile" ]; then\n'
+        '    . "$HOME/.bash_profile"\n'
+        'elif [ -r "$HOME/.bash_login" ]; then\n'
+        '    . "$HOME/.bash_login"\n'
+        'elif [ -r "$HOME/.profile" ]; then\n'
+        '    . "$HOME/.profile"\n'
+        "fi\n"
+        f"builtin printf '\\033]697;KiroCrewReady;{token}\\007'\n"
+    ).encode("utf-8")
+
+
+def _consume_ready_marker(sess: "_TerminalSession", data: bytes) -> bool:
+    """Advance the split-safe Bash marker matcher for one raw PTY read."""
+    marker = sess.ready_marker
+    if sess.shell_ready or marker is None:
+        return False
+    combined = bytes(sess.ready_probe) + data
+    if marker in combined:
+        sess.shell_ready = True
+        sess.ready_marker = None
+        sess.ready_probe.clear()
+        return True
+    keep = max(0, len(marker) - 1)
+    sess.ready_probe = bytearray(combined[-keep:]) if keep else bytearray()
+    return False
 
 
 def _sess_alive(sess: "_TerminalSession") -> bool:
@@ -446,8 +571,35 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
     registry = _get_registry(request)
     cfg = _get_config(request)
     max_sessions = cfg.get("max_sessions", _MAX_SESSIONS)
+    # Resolve the shell HERE, before the reservation region below: the
+    # resolution is a PATH scan (shutil.which stats every entry) that must run
+    # off-loop, and the spawn branches sit between the placeholder reservation
+    # and the session registration, where an added await would suspend the
+    # handler with the registry still holding the None placeholder — a window
+    # every concurrent reader of the registry would then observe. One hop per
+    # WS open; the reconnect path simply ignores the value.
+    shell, rejected_shell = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), _resolve_shell, cfg,
+    )
 
-    # Check if reconnecting to existing session
+    # Check if reconnecting to existing session. A None VALUE under an
+    # existing key is another handler's reservation placeholder (set below,
+    # held across its awaits): treat it as "session already being opened" and
+    # refuse, instead of reading it as absent — two tabs racing the same
+    # unregistered session id would otherwise both pass the reservation check
+    # and spawn two PTYs, leaking one. This guards every await in this
+    # handler (the off-loop shell resolution above and ws.prepare below).
+    if session_id in registry and registry[session_id] is None:
+        _sel().log_api_access(
+            caller=caller,
+            operation="terminal.ws.open",
+            outcome="denied",
+            source="dashboard",
+            resources=f"session={session_id},reservation_in_flight=1",
+        )
+        return web.Response(
+            status=409, text="Terminal session is already being opened"
+        )
     existing = registry.get(session_id)
     if existing and not _sess_alive(existing):
         # Process died — clean up stale entry
@@ -484,14 +636,26 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         # Replay scrollback BEFORE assigning ws to prevent read_pty from
         # forwarding live data before replay completes.
         if existing.scrollback:
-            await ws.send_bytes(_redact_terminal(existing.scrollback))
+            # Replay the ring buffer verbatim. It holds the raw stream, and the
+            # client runs its own incremental decoder, so a character the
+            # buffer's head cut in half is the client's to render — the server
+            # never decodes and so cannot desynchronize from it.
+            await ws.send_bytes(bytes(existing.scrollback))
         existing.ws = ws
         existing.last_ws_disconnect = None
         # A fresh client starts with empty title/cwd state; clear the dedup
         # markers so the next poll re-pushes both frames even when unchanged.
         existing.last_title = None
         existing.last_cwd = None
+        existing.frames_dirty = True
         sess = existing
+        if existing.shell_ready:
+            try:
+                async with existing.send_lock:
+                    if existing.ws is ws and not ws.closed:
+                        await ws.send_str(json.dumps({"type": "ready"}))
+            except (ConnectionResetError, RuntimeError, OSError):
+                pass
         _sel().log_api_access(
             caller=caller,
             operation="terminal.ws.reconnect",
@@ -505,7 +669,11 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         # ctypes (stdlib, no extra dependency).
         from kiro_crew.conpty import WindowsPty
 
-        shell = str(cfg.get("shell") or "powershell.exe")
+        if rejected_shell:
+            logger.warning(
+                "terminal: configured shell %r not executable; falling back to %r",
+                rejected_shell, shell,
+            )
         cwd = _resolve_cwd(cfg, request.query.get("cwd"))
         if not os.path.isdir(cwd):
             cwd = os.path.expanduser("~")
@@ -536,20 +704,37 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             resources=f"session={session_id},pid={wp.pid},shell={shell}",
         )
     else:
-        # Spawn new PTY
+        if rejected_shell:
+            logger.warning(
+                "terminal: configured shell %r not executable; falling back to %r",
+                rejected_shell, shell,
+            )
+        # Spawn new PTY. Bash gets a one-use init stream so it can emit a
+        # definitive readiness marker after login profiles return. Foreground
+        # process ownership alone is insufficient: a profile's builtin `read`
+        # runs in the shell process and would consume an early command batch.
         master_fd, worker_fd = _pty.openpty()
+        init_read_fd: int | None = None
+        init_write_fd: int | None = None
+        ready_marker: bytes | None = None
         try:
             fcntl.ioctl(
                 worker_fd,
                 termios.TIOCSWINSZ,
                 struct.pack("HHHH", 24, 80, 0, 0),
             )
-            shell = str(cfg.get("shell") or os.environ.get("SHELL", "/bin/bash"))
             cwd = _resolve_cwd(cfg, request.query.get("cwd"))
             env = {
                 **os.environ,
                 "TERM": "xterm-256color",
                 "KIROCREW_TERMINAL": "1",
+                # Export the shell actually being spawned (already resolved to
+                # an absolute path). Without this, a configured shell that
+                # differs from the login shell leaves the inherited $SHELL
+                # pointing at the login shell, so programs that consult it
+                # (vim's :sh, tmux default-shell) open the wrong one. POSIX
+                # branch only: PowerShell does not consult $SHELL.
+                "SHELL": shell,
             }
             # Security: intentionally unsandboxed — this is the user's own
             # interactive terminal (like SSH), not agent-executed code.
@@ -579,14 +764,28 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 # no Python allocation or lock acquisition.
                 fcntl.ioctl(0, tiocsctty, 0)
 
+            argv = [shell, "-l"]
+            pass_fds: tuple[int, ...] = ()
+            if _is_bash_shell(shell):
+                token = uuid.uuid4().hex
+                ready_marker = (
+                    f"\x1b]697;KiroCrewReady;{token}\x07".encode("ascii")
+                )
+                init_read_fd, init_write_fd = os.pipe()
+                os.write(init_write_fd, _bash_init_script(token))
+                os.close(init_write_fd)
+                init_write_fd = None
+                argv = [shell, "--init-file", f"/dev/fd/{init_read_fd}", "-i"]
+                pass_fds = (init_read_fd,)
+
             proc = await asyncio.create_subprocess_exec(
-                shell,
-                "-l",
+                *argv,
                 stdin=worker_fd,
                 stdout=worker_fd,
                 stderr=worker_fd,
                 start_new_session=True,
                 preexec_fn=_setup_ctty,
+                pass_fds=pass_fds,
                 cwd=cwd,
                 env=env,
             )
@@ -603,12 +802,17 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             return ws
         finally:
             os.close(worker_fd)
+            if init_read_fd is not None:
+                os.close(init_read_fd)
+            if init_write_fd is not None:
+                os.close(init_write_fd)
 
         sess = _TerminalSession(
             session_id=session_id,
             master_fd=master_fd,
             proc=proc,
             ws=ws,
+            ready_marker=ready_marker,
         )
         registry[session_id] = sess
         _sel().log_api_access(
@@ -618,6 +822,17 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             source="dashboard",
             resources=f"session={session_id},pid={proc.pid},shell={shell}",
         )
+        if ready_marker is None:
+            # The reliable injection above intentionally targets Bash, the
+            # reported shell. Preserve the historical transport-ready behavior
+            # for configured shells whose startup protocol we cannot control.
+            sess.shell_ready = True
+            try:
+                async with sess.send_lock:
+                    if sess.ws is ws and not ws.closed:
+                        await ws.send_str(json.dumps({"type": "ready"}))
+            except (ConnectionResetError, RuntimeError, OSError):
+                pass
 
     # --- Read loop: PTY → WebSocket ---
     async def read_pty():
@@ -631,12 +846,42 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 data = await loop.run_in_executor(None, reader)
                 if not data:
                     break
+                became_ready = _consume_ready_marker(sess, data)
                 sess.scrollback.extend(data)
+                sess.frames_dirty = True
                 if len(sess.scrollback) > _SCROLLBACK_MAX:
                     sess.scrollback = sess.scrollback[-_SCROLLBACK_MAX:]
-                if sess.ws and not sess.ws.closed:
+                # Capture the socket into a local and re-check it after the lock
+                # await: `sess.ws` is set to None by the WS handler on
+                # disconnect, so touching it after a suspension point can raise
+                # AttributeError, which `except OSError` does NOT catch — that
+                # would kill this task and stop PTY draining and scrollback
+                # capture for a session the client may yet reconnect to. Same
+                # capture-and-revalidate rule the title poller already follows.
+                live = sess.ws
+                if live is not None and not live.closed:
+                    # Forward the read byte-for-byte. The server never decodes
+                    # PTY output: xterm.js runs its own incremental decoder, so
+                    # a multi-byte character split across two reads is
+                    # reassembled on the client and no read boundary can turn
+                    # one into U+FFFD.
                     async with sess.send_lock:
-                        await sess.ws.send_bytes(_redact_terminal(data))
+                        if sess.ws is not live or live.closed:
+                            continue  # client went away while we waited
+                        await live.send_bytes(data)
+                        # ConPTY has no foreground-process-group probe. Its first
+                        # output is the earliest portable startup signal, so do
+                        # not release queued input before output reaches the client.
+                        if sess.winpty is not None and not sess.shell_ready:
+                            sess.shell_ready = True
+                            became_ready = True
+                        if became_ready:
+                            try:
+                                await live.send_str(json.dumps({"type": "ready"}))
+                            except (ConnectionResetError, RuntimeError, OSError):
+                                # Preserve shell_ready so a reconnect can receive
+                                # the frame even if this socket disappeared here.
+                                pass
         except OSError:
             pass
 
@@ -667,10 +912,11 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 # the memo's TTL alone leaves a window where it would.
                 if b"\r" in msg.data or b"\n" in msg.data:
                     sess.cwd_probe = None
+                    sess.frames_dirty = True
             elif msg.type == web.WSMsgType.TEXT:
                 try:
                     ctrl = json.loads(msg.data)
-                except (json.JSONDecodeError, ValueError):
+                except ValueError:
                     continue
                 if ctrl.get("type") == "resize":
                     try:
@@ -701,9 +947,14 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
                 break
     finally:
-        # WS disconnected — mark for orphan reaper, but keep PTY alive
-        sess.ws = None
-        sess.last_ws_disconnect = time.monotonic()
+        # WS disconnected — mark for orphan reaper, but keep PTY alive.
+        # Identity-guarded: a reconnect (e.g. the terminal panel popping out to
+        # its own window) REPLACES sess.ws while this displaced handler is
+        # still draining; unconditionally clearing it here would silence PTY
+        # output to the freshly attached socket.
+        if sess.ws is ws:
+            sess.ws = None
+            sess.last_ws_disconnect = time.monotonic()
         _sel().log_api_access(
             caller=caller,
             operation="terminal.ws.disconnect",
@@ -755,7 +1006,11 @@ async def api_terminal_create(request: web.Request) -> web.Response:
         )
 
     session_id = uuid.uuid4().hex[:12]
-    shell = cfg.get("shell") or os.environ.get("SHELL", "/bin/bash")
+    # Off-loop for the same reason as the spawn sites: the PATH scan must not
+    # stall the event loop at request rate.
+    shell, rejected_shell = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), _resolve_shell, cfg,
+    )
     _sel().log_api_access(
         caller=caller,
         operation="terminal.session.create",
@@ -763,12 +1018,19 @@ async def api_terminal_create(request: web.Request) -> web.Response:
         source="dashboard",
         resources=f"session={session_id}",
     )
-    return web.json_response(
-        {
-            "session_id": session_id,
-            "shell": shell,
-        }
-    )
+    body: dict = {
+        "session_id": session_id,
+        "shell": shell,
+    }
+    # Surface a rejected configured shell at the API level rather than
+    # silently substituting: an API caller can tell a typo'd setting from a
+    # deliberate default. The dashboard panel spawns via the WS handler and
+    # does not read these fields — its typo surface is the save-time Settings
+    # validation (config PATCH), with the spawn-site log as the backstop.
+    if rejected_shell:
+        body["shell_fallback"] = True
+        body["configured_shell"] = rejected_shell
+    return web.json_response(body)
 
 
 # Selection hand-off size cap. Generous for terminal selections (xterm buffers
@@ -778,11 +1040,13 @@ _REDACT_MAX_BYTES = 256 * 1024
 
 
 async def api_terminal_redact(request: web.Request) -> web.Response:
-    """POST /api/terminal/redact — re-scan a COMPLETE terminal selection before
-    it is inserted into chat. Streaming output is redacted per read chunk, so a
-    credential straddling a chunk boundary can evade both scans; the selection
-    hand-off re-runs the redactors over the contiguous text. Callers MUST fail
-    closed: no chat insertion unless this returns 200 with redacted text."""
+    """POST /api/terminal/redact — scan a COMPLETE terminal selection before it
+    is inserted into chat. This is the whole credential boundary for the web
+    terminal: the live PTY stream is forwarded to the browser unscanned, and the
+    scrollback ring buffer is replayed only there, so the selection hand-off is
+    the one path by which terminal output reaches a model. It therefore runs
+    unconditionally, and callers MUST fail closed: no chat insertion unless this
+    returns 200 with redacted text."""
     caller = request.get("user")
     if not caller:
         _sel().log_api_access(
@@ -811,9 +1075,12 @@ async def api_terminal_redact(request: web.Request) -> web.Response:
         return web.json_response({"error": "expected JSON body {text: string}"}, status=400)
     if len(text.encode("utf-8", errors="replace")) > _REDACT_MAX_BYTES:
         return web.json_response({"error": "selection too large"}, status=413)
-    # Same redactors as the streaming path (_redact_terminal), applied to the
-    # contiguous selection so boundary-straddling secrets cannot slip through.
-    # Run off-loop: the redactors are regex scans that scale with input size.
+    # This is the ONLY credential scan on the path from PTY output to a model,
+    # so it runs unconditionally and there is no configuration that skips it.
+    # A contiguous selection is also the only input the redactors can be
+    # accurate on: they are regex scans, and a secret split across two reads is
+    # invisible to a per-chunk scan by construction.
+    # Run off-loop: the redactors scale with input size.
     loop = asyncio.get_running_loop()
 
     def _scan(t: str) -> str:
@@ -1100,7 +1367,14 @@ def _log_complete(caller: str, outcome: str, reason: str) -> None:
     reason word only. This route fires per keystroke, and the token, the prefix,
     the resolved directory and the entry names are all user filesystem contents;
     recording them would turn the audit log into a continuous transcript of what
-    the user types and what their disk contains."""
+    the user types and what their disk contains.
+
+    The command tier obeys the same rule and is why it needs its own words rather
+    than reusing ``listed``: a reason that named the command or the flag being
+    completed would put the user's command line in the audit trail, which is
+    exactly what this coarseness exists to prevent. ``cmd_unknown`` covers both
+    "not allowlisted" and "not on PATH" for the same reason — distinguishing them
+    would disclose which tools are installed."""
     _sel().log_api_access(
         caller=caller,
         operation="terminal.complete",
@@ -1111,23 +1385,37 @@ def _log_complete(caller: str, outcome: str, reason: str) -> None:
 
 
 async def api_terminal_complete(request: web.Request) -> web.Response:
-    """POST /api/terminal/complete — path completions for a terminal session.
+    """POST /api/terminal/complete — completions for the word under a terminal cursor.
 
-    Body: ``{session_id, token, folders_only?}`` where ``token`` is the DEQUOTED
-    literal path the cursor sits in (``"../Kiro"``, ``"src/"``, ``""``) — the
-    client decodes backslash escapes before asking, so an on-screen ``my\\ dir/``
-    arrives here as ``my dir/``.
+    Two mutually exclusive tiers, chosen by the CLIENT because only the client can
+    see the screen row:
 
-    Authority note: this lists a directory on behalf of an authenticated caller
-    who already owns a LIVE PTY in this gateway — i.e. an interactive shell with
-    the gateway user's full filesystem access. Requiring an existing session id
-    is what keeps it from being a general filesystem-enumeration endpoint; it
-    grants nothing the session's own `ls` does not. Paths are therefore resolved
-    without a root restriction, exactly like the shell would — with one carve-out:
-    the governance trust-root and credential dirs (``is_sensitive_path``) are
-    never enumerated, and no individual ENTRY inside an allowed directory is
-    returned if it (or its symlink target) is itself protected, so the panel
-    cannot be used to harvest protected metadata names."""
+    * **path** (no ``argv`` in the body) — the historical behaviour. Body
+      ``{session_id, token, folders_only?}`` where ``token`` is the DEQUOTED
+      literal path the cursor sits in (``"../Kiro"``, ``"src/"``, ``""``); the
+      client decodes backslash escapes before asking, so an on-screen ``my\\ dir/``
+      arrives here as ``my dir/``.
+    * **command** (``argv`` present) — subcommands and flags for an allowlisted
+      CLI, e.g. ``argv: ["gh", "pr"]`` with ``token: "cre"``. See
+      ``dashboard/terminal_commands.py`` for the protocols and the authority
+      argument.
+
+    The tiers do not fall back into one another. The client sends ``argv`` only for
+    a word that cannot be a path (no separator, not ``~``-rooted) under a command
+    that is not a known path command, so the two never both apply — and keeping
+    them disjoint means the path tier's response shape is untouched by this
+    addition.
+
+    Authority note (path tier): this lists a directory on behalf of an
+    authenticated caller who already owns a LIVE PTY in this gateway — i.e. an
+    interactive shell with the gateway user's full filesystem access. Requiring an
+    existing session id is what keeps it from being a general filesystem-
+    enumeration endpoint; it grants nothing the session's own `ls` does not. Paths
+    are therefore resolved without a root restriction, exactly like the shell
+    would — with one carve-out: the governance trust-root and credential dirs
+    (``is_sensitive_path``) are never enumerated, and no individual ENTRY inside an
+    allowed directory is returned if it (or its symlink target) is itself
+    protected, so the panel cannot be used to harvest protected metadata names."""
     caller = request.get("user")
     if not caller:
         _sel().log_api_access(
@@ -1159,7 +1447,8 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         _log_complete(caller, "denied", "invalid_body")
         return web.json_response(
             {"error": "expected JSON body "
-                      "{session_id: string, token?: string, folders_only?: boolean}"},
+                      "{session_id: string, token?: string, folders_only?: boolean, "
+                      "argv?: string[]}"},
             status=400,
         )
     if len(token) > _COMPLETE_TOKEN_MAX:
@@ -1173,6 +1462,66 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
 
     cwd = await _session_cwd_cached(sess)
     dir_part, prefix = _split_path_token(token)
+
+    # ── Command tier ──
+    # Ordered before the unknown-cwd branch: a subcommand list does not depend on
+    # the working directory (a cobra probe answers without one), so a session whose
+    # cwd cannot be read still gets `gh pr` completions even though it can get no
+    # path ones.
+    raw_argv = body.get("argv")
+    if raw_argv is not None:
+        argv = terminal_commands.parse_argv(raw_argv)
+        if argv is None:
+            _log_complete(caller, "denied", "invalid_argv")
+            return web.json_response(
+                {
+                    "error": "argv must be a non-empty list of plain words whose first "
+                             "entry is a bare command name",
+                    "code": "terminal_invalid_argv",
+                },
+                status=400,
+            )
+        # `completion` is read defensively AND off the event loop: `_get_config`
+        # does a synchronous `read_text()` of config.json, and this route fires per
+        # keystroke, so on a slow home filesystem (NFS, a stalled mount) an inline
+        # read would stall every gateway task. It is also hand-edited, so
+        # `"completion": false` would make a chained `.get` raise on a boolean — an
+        # HTTP 500 from a typo. A non-object value means "no operator additions",
+        # which is also the default.
+        # Read off the event loop (a synchronous `read_text` per keystroke would
+        # stall the gateway on a slow home filesystem) AND type-checked at BOTH
+        # levels: config.json is hand-edited, so `"terminal": false` would make
+        # `.get("completion")` raise on a boolean and `"completion": false` would
+        # make the next `.get` raise — each an HTTP 500 from a typo. A non-object at
+        # either level means "no operator additions", which is also the default.
+
+        def _completion_cfg() -> dict:
+            cfg = _get_config(request)
+            if not isinstance(cfg, dict):
+                return {}
+            inner = cfg.get("completion")
+            return inner if isinstance(inner, dict) else {}
+
+        completion_cfg = await asyncio.get_running_loop().run_in_executor(
+            discovery_executor(), _completion_cfg,
+        )
+        cmd_entries, reason = await terminal_commands.complete(
+            argv, token, cwd, completion_cfg.get("commands"),
+        )
+        _log_complete(caller, "denied" if reason == "sensitive_path" else "ok", reason)
+        # `dir: null` — the same "nothing was resolved on the filesystem" signal
+        # the path tier uses for an unknown cwd, so the client needs no new
+        # top-level field to tell a command answer from a path one; the per-entry
+        # `kind` carries that.
+        return web.json_response(
+            {
+                "dir": None,
+                "prefix": prefix,
+                "entries": [e.to_json() for e in cmd_entries],
+                "truncated": False,
+            }
+        )
+
     if not cwd:
         # cwd is unknowable (Windows, or the probe failed) — no completions
         # rather than an error the frontend would have to special-case. A null
@@ -1343,9 +1692,13 @@ async def reap_orphaned_terminals(app: web.Application) -> None:
 
 async def poll_terminal_titles(app: web.Application) -> None:
     """Background task: push a per-session title (foreground command name while
-    one runs, else the shell's cwd basename) to each connected terminal ~1/s,
-    and only when it changes. Fast commands that finish within the poll interval
-    never flip the title, so there's no flicker at the prompt."""
+    one runs, else the shell's cwd basename) and the shell's full cwd to each
+    connected terminal, on change only. Fast commands that finish within the
+    poll interval never flip the title, so there's no flicker at the prompt.
+
+    The cadence is an upper bound, not a rate: a session is only probed when it
+    has written to the PTY since its last probe, so a terminal idling at a
+    prompt costs nothing at all."""
     try:
         while True:
             await asyncio.sleep(1.0)
@@ -1357,11 +1710,19 @@ async def poll_terminal_titles(app: web.Application) -> None:
             for sess in list(registry.values()):
                 if sess is None or sess.ws is None or sess.ws.closed:
                     continue
+                if not sess.frames_dirty:
+                    continue
+                # Cleared BEFORE probing, never after: output landing while a
+                # probe is in flight must re-dirty the session so the next tick
+                # picks up the change instead of the flag swallowing it.
+                sess.frames_dirty = False
                 # _session_title / _session_cwd do blocking syscalls (tcgetpgrp
-                # ioctl, /proc reads, lsof on macOS) that can wedge on a D-state
-                # process or a stuck fs; run them off the loop on the subprocess
-                # pool (same rationale as the os.close offload in _kill_session)
-                # so one stuck read can never freeze the gateway event loop.
+                # ioctl, /proc reads, lsof where nothing cheaper answers) that
+                # can wedge on a D-state process or a stuck fs; run them off the
+                # loop on the subprocess pool (same rationale as the os.close
+                # offload in _kill_session) so one stuck read can never freeze
+                # the gateway event loop. Both probes share one cwd lookup via
+                # the session's memo.
                 # The WS can detach (sess.ws = None) while an executor probe is
                 # in flight — capture + revalidate the socket after EACH hop so
                 # a disconnect can never AttributeError the singleton poller.

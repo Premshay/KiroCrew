@@ -6,12 +6,14 @@ import json
 import logging
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from kiro_crew.knowledge.llm_pool import (
     DEFAULT_IDLE_TTL_SECS,
+    WORKER_RECYCLE_CALLS,
+    WORKER_RECYCLE_PCT,
     AcpWorker,
     CCWorker,
     LLMPool,
@@ -259,6 +261,7 @@ class FakeWorker(Worker):
         self._call_count = 0
         self._alive = True
         self._started = False
+        self.resets = 0
 
     async def start(self) -> None:
         self._started = True
@@ -275,6 +278,10 @@ class FakeWorker(Worker):
 
     def is_alive(self) -> bool:
         return self._alive
+
+    async def reset_conversation(self) -> None:
+        self.resets += 1
+        self.calls_since_reset = 0
 
 
 class _TerminalError(Exception):
@@ -296,6 +303,7 @@ class _FailingWorker(Worker):
         self._error = error
         self._fail_times = fail_times
         self.calls = 0
+        self.calls_since_reset = 0
         self._alive = True
 
     async def start(self) -> None:
@@ -312,6 +320,9 @@ class _FailingWorker(Worker):
 
     def is_alive(self) -> bool:
         return self._alive
+
+    async def reset_conversation(self) -> None:
+        self.calls_since_reset = 0
 
 
 class DeadOnSecondCallWorker(Worker):
@@ -336,6 +347,9 @@ class DeadOnSecondCallWorker(Worker):
 
     def is_alive(self) -> bool:
         return self._alive
+
+    async def reset_conversation(self) -> None:
+        self.calls_since_reset = 0
 
 
 def _make_pool_with_fake_workers(
@@ -483,6 +497,9 @@ class TestLLMPoolConcurrency:
             def is_alive(self) -> bool:
                 return True
 
+            async def reset_conversation(self) -> None:
+                self.calls_since_reset = 0
+
         pool = LLMPool(pool_size=2)
         pool._started = True
         pool._provider_type = "test"
@@ -568,6 +585,9 @@ class TestLLMPoolBatchErrors:
             def is_alive(self) -> bool:
                 return True
 
+            async def reset_conversation(self) -> None:
+                self.calls_since_reset = 0
+
         pool = LLMPool(pool_size=1)
         pool._started = True
         pool._provider_type = "test"
@@ -620,13 +640,13 @@ class TestProviderDetection:
 
 class TestSandboxMode:
     """Knowledge workers (kiro + claude) run under the same OS-level sandbox as
-    chat, honouring ``agent.sandbox`` (default ``"off"`` — defers to kiro-cli's
-    internal agent sandbox). The earlier hardcoded ``"off"`` bypassed
-    least-privilege; these lock in the restored behaviour."""
+    chat, honouring ``agent.sandbox`` (default ``"auto"`` — engages OS-level
+    isolation and defers to kiro-cli's internal sandbox on macOS when enabled).
+    These lock in the shipped behaviour."""
 
-    def test_default_is_off(self, tmp_path):
+    def test_default_is_auto(self, tmp_path):
         with patch("pathlib.Path.home", return_value=tmp_path):
-            assert _get_sandbox_mode() == "off"
+            assert _get_sandbox_mode() == "auto"
 
     def test_reads_sandbox_from_config(self, tmp_path):
         config = tmp_path / ".kirocrew" / "config.json"
@@ -635,14 +655,14 @@ class TestSandboxMode:
         with patch("pathlib.Path.home", return_value=tmp_path):
             assert _get_sandbox_mode() == "off"
 
-    def test_unparseable_config_defaults_off(self, tmp_path):
+    def test_unparseable_config_defaults_auto(self, tmp_path):
         # A file that isn't valid JSON parses to {} → sandbox UNSET → the
-        # intended default "off" (not a present-but-malformed value).
+        # intended default "auto" (OS-level isolation engaged).
         config = tmp_path / ".kirocrew" / "config.json"
         config.parent.mkdir(parents=True)
         config.write_text("not json")
         with patch("pathlib.Path.home", return_value=tmp_path):
-            assert _get_sandbox_mode() == "off"
+            assert _get_sandbox_mode() == "auto"
 
     def test_unknown_mode_falls_back_to_auto_fail_secure(self, tmp_path):
         """A PRESENT but unrecognised value is a config error → fail SECURE to
@@ -664,10 +684,10 @@ class TestSandboxMode:
 
     def test_accepts_prereadm_config_dict(self):
         """Pure-parser path: a passed dict is used without touching disk.
-        Present-but-invalid fails secure to 'auto'; absent takes 'off'."""
+        Present-but-invalid fails secure to 'auto'; absent takes 'auto'."""
         assert _get_sandbox_mode({"agent": {"sandbox": "strict"}}) == "strict"
         assert _get_sandbox_mode({"agent": {"sandbox": "nope"}}) == "auto"  # malformed → fail secure
-        assert _get_sandbox_mode({}) == "off"  # unset → intended default
+        assert _get_sandbox_mode({}) == "auto"  # unset → intended default
 
 
 # ---------------------------------------------------------------------------
@@ -725,7 +745,7 @@ class TestReadConfig:
         must not crash the pure parsers — they fall back to defaults, matching
         the no-op-on-malformed-config contract of ``_read_config``."""
         assert _get_provider_type(bad) == "acp"
-        assert _get_sandbox_mode(bad) == "off"
+        assert _get_sandbox_mode(bad) == "auto"
 
     def test_read_config_coerces_non_dict_sections(self, tmp_path):
         """``_read_config`` normalises non-dict ``agent``/``knowledge`` to ``{}``
@@ -753,16 +773,17 @@ class TestReadConfig:
         assert mk.call_args.kwargs["sandbox_mode"] == "off"
 
     @pytest.mark.asyncio
-    async def test_start_defaults_sandbox_to_off(self, tmp_path):
-        # With no config, the sandbox mode defaults to "off" — deferring
-        # isolation to kiro-cli's internal agent sandbox (kiro-cli >= 2.13).
+    async def test_start_defaults_sandbox_to_auto(self, tmp_path):
+        # With no config, the sandbox mode defaults to "auto" — engaging
+        # OS-level isolation (namespace on Linux, seatbelt on macOS) and
+        # automatically deferring to kiro-cli's internal sandbox when enabled.
         mock_client = AsyncMock()
         mock_client.is_ready = True
         with patch("pathlib.Path.home", return_value=tmp_path), \
              patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=mock_client) as mk:
             worker = AcpWorker()
             await worker.start()
-        assert mk.call_args.kwargs["sandbox_mode"] == "off"
+        assert mk.call_args.kwargs["sandbox_mode"] == "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -970,6 +991,151 @@ class TestAcpWorker:
             await worker.start()     # stale-drop: unregister 100, then register 200
         assert registered == [100, 200]
         assert unregistered == [100]
+
+
+def _mock_effort_client(
+    levels: list[str], *, supports: bool = True, claude: bool = False
+) -> AsyncMock:
+    client = AsyncMock()
+    client.is_ready = True
+    client._pid = None
+    client._is_claude = claude
+    client.is_process_alive = lambda: True
+    client.supports_config_option = MagicMock(return_value=supports)
+    client.get_valid_effort_levels = MagicMock(return_value=levels)
+    client.send_command = AsyncMock()
+    client.set_config_option = AsyncMock()
+    return client
+
+
+class TestAcpWorkerEffort:
+    @pytest.mark.asyncio
+    async def test_applies_kiro_effort_after_ready_before_use(self, tmp_path):
+        client = _mock_effort_client(["low", "medium", "high"])
+        events: list[str] = []
+        client.ensure_ready.side_effect = lambda: events.append("ready")
+        client.send_command.side_effect = lambda *_args, **_kwargs: events.append("set")
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+
+        assert events == ["ready", "set"]
+        client.send_command.assert_awaited_once_with("/effort", args={"level": "high"})
+        client.set_config_option.assert_not_awaited()
+        assert worker._effective_effort == "high"
+
+    @pytest.mark.asyncio
+    async def test_applies_claude_effort_via_config_option(self, tmp_path):
+        client = _mock_effort_client(["low", "medium", "high"], claude=True)
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+
+        client.set_config_option.assert_awaited_once_with("effort", "high")
+        client.send_command.assert_not_awaited()
+        assert worker._effective_effort == "high"
+
+    @pytest.mark.asyncio
+    async def test_reapplies_effort_after_respawn(self, tmp_path):
+        first = _mock_effort_client(["low", "medium", "high"])
+        second = _mock_effort_client(["low", "medium", "high"])
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+            await worker.start()
+
+        first.send_command.assert_awaited_once_with("/effort", args={"level": "high"})
+        second.send_command.assert_awaited_once_with("/effort", args={"level": "high"})
+
+    @pytest.mark.asyncio
+    async def test_downgrades_to_highest_supported_lower_level(self, tmp_path, caplog):
+        client = _mock_effort_client(["low", "medium"])
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+
+        client.send_command.assert_awaited_once_with("/effort", args={"level": "medium"})
+        assert worker._effective_effort == "medium"
+        assert "downgraded" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_uses_provider_default_when_claude_effort_is_unsupported(
+        self, tmp_path, caplog
+    ):
+        client = _mock_effort_client([], supports=False, claude=True)
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+
+        client.set_config_option.assert_not_awaited()
+        client.send_command.assert_not_awaited()
+        assert worker._effective_effort is None
+        assert "unsupported" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_uses_provider_default_when_kiro_effort_command_fails(
+        self, tmp_path, caplog
+    ):
+        client = _mock_effort_client(["low", "medium", "high"])
+        client.send_command.side_effect = RuntimeError("effort command rejected")
+        with patch("pathlib.Path.home", return_value=tmp_path), \
+             patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client):
+            worker = AcpWorker(effort="high")
+            await worker.start()
+
+        client.send_command.assert_awaited_once_with("/effort", args={"level": "high"})
+        assert worker._effective_effort is None
+        assert "could not apply effort=high" in caplog.text
+
+
+class TestLLMPoolEffort:
+    @pytest.mark.asyncio
+    async def test_passes_effort_to_acp_worker(self):
+        pool = LLMPool(pool_size=1, effort="high")
+        pool._provider_type = "acp"
+        pool._sandbox_mode = "auto"
+        fake_worker = AsyncMock()
+        with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
+            result = await pool._create_worker()
+
+        worker_type.assert_called_once_with(sandbox_mode="auto", effort="high")
+        assert result is fake_worker
+
+    @pytest.mark.asyncio
+    async def test_default_pool_does_not_pass_effort(self):
+        pool = LLMPool(pool_size=1)
+        pool._provider_type = "acp"
+        pool._sandbox_mode = "auto"
+        fake_worker = AsyncMock()
+        with patch("kiro_crew.knowledge.llm_pool.AcpWorker", return_value=fake_worker) as worker_type:
+            await pool._create_worker()
+
+        worker_type.assert_called_once_with(sandbox_mode="auto", effort=None)
+
+    @pytest.mark.asyncio
+    async def test_fetch_sized_pool_ignores_extraction_size_config(self):
+        pool = LLMPool(pool_size=1, use_config_pool_size=False)
+        created: list[FakeWorker] = []
+
+        async def _mock_create():
+            worker = FakeWorker()
+            created.append(worker)
+            return worker
+
+        pool._create_worker = _mock_create  # type: ignore[assignment]
+        with patch(
+            "kiro_crew.knowledge.llm_pool._read_config",
+            return_value={"knowledge": {"extraction_pool_size": 3}},
+        ):
+            await pool.start()
+
+        assert pool._pool_size == 1
+        assert len(created) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1223,6 +1389,185 @@ class TestIdleReaper:
         assert pool._started is False
 
 
+# ---------------------------------------------------------------------------
+# Tests: conversation recycling (billed auto-compaction avoidance)
+# ---------------------------------------------------------------------------
+
+
+class _PctWorker(Worker):
+    """Worker whose reported context percentage the test drives directly."""
+
+    def __init__(self, pct: float = 0.0) -> None:
+        self.pct = pct
+        self.resets = 0
+        self.sends = 0
+
+    async def start(self) -> None:
+        pass
+
+    async def send_message(self, prompt: str, timeout: float = 60.0) -> str:
+        self.sends += 1
+        return "ok"
+
+    async def shutdown(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return True
+
+    def context_pct(self) -> float:
+        return self.pct
+
+    async def reset_conversation(self) -> None:
+        self.resets += 1
+        self.calls_since_reset = 0
+
+
+def _pool_with(worker: Worker) -> LLMPool:
+    pool = LLMPool(pool_size=1)
+    pool._started = True
+    pool._provider_type = "test"
+    pool._workers.append(worker)
+    pool._available.put_nowait(0)
+    return pool
+
+
+class TestWorkerConversationRecycle:
+    """The pool must drop a worker's transcript before the backend compacts it.
+
+    Every knowledge prompt is self-contained, so the accumulated transcript buys
+    nothing while the backend's own auto-compaction bills a summarization turn
+    over all of it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_recycles_when_context_crosses_threshold(self):
+        worker = _PctWorker(pct=WORKER_RECYCLE_PCT)
+        pool = _pool_with(worker)
+
+        await pool.send("prompt")
+
+        assert worker.resets == 1
+        assert worker.calls_since_reset == 0
+
+    @pytest.mark.asyncio
+    async def test_no_recycle_below_threshold(self):
+        worker = _PctWorker(pct=WORKER_RECYCLE_PCT - 1)
+        pool = _pool_with(worker)
+
+        await pool.send("prompt")
+
+        assert worker.resets == 0
+        assert worker.calls_since_reset == 1
+
+    @pytest.mark.asyncio
+    async def test_recycles_on_call_count_when_backend_reports_no_pct(self):
+        """A 0% reading is indistinguishable from an empty transcript, so the
+        call count is the fallback that keeps an untelemetered backend from
+        growing without bound."""
+        worker = _PctWorker(pct=0.0)
+        pool = _pool_with(worker)
+
+        for _ in range(WORKER_RECYCLE_CALLS - 1):
+            await pool.send("prompt")
+        assert worker.resets == 0
+
+        await pool.send("prompt")
+        assert worker.resets == 1
+        assert worker.calls_since_reset == 0
+
+    @pytest.mark.asyncio
+    async def test_recycle_happens_between_calls_not_mid_call(self):
+        """The reset lands while the worker is still checked out, so a second
+        caller can never send into a half-reset session."""
+        worker = _PctWorker(pct=WORKER_RECYCLE_PCT)
+        order: list[str] = []
+
+        original_send = worker.send_message
+        original_reset = worker.reset_conversation
+
+        async def _send(prompt: str, timeout: float = 60.0) -> str:
+            order.append("send")
+            return await original_send(prompt, timeout=timeout)
+
+        async def _reset() -> None:
+            order.append("reset")
+            await original_reset()
+
+        worker.send_message = _send  # type: ignore[method-assign]
+        worker.reset_conversation = _reset  # type: ignore[method-assign]
+
+        pool = _pool_with(worker)
+        await pool.send("a")
+        await pool.send("b")
+
+        assert order == ["send", "reset", "send", "reset"]
+
+    @pytest.mark.asyncio
+    async def test_send_batch_recycles_through_the_same_chokepoint(self):
+        worker = _PctWorker(pct=WORKER_RECYCLE_PCT)
+        pool = _pool_with(worker)
+
+        await pool.send_batch(["a", "b", "c"])
+
+        assert worker.sends == 3
+        assert worker.resets == 3
+
+    @pytest.mark.asyncio
+    async def test_failed_reset_still_releases_the_worker(self):
+        """A reset failure must not wedge the pool — the worker is released and
+        ``acquire()`` replaces it on the next checkout."""
+        worker = _PctWorker(pct=WORKER_RECYCLE_PCT)
+
+        async def _boom() -> None:
+            raise RuntimeError("respawn failed")
+
+        worker.reset_conversation = _boom  # type: ignore[method-assign]
+        pool = _pool_with(worker)
+
+        assert await pool.send("prompt") == "ok"
+        # Permit returned and the index is queued again.
+        assert pool._available.qsize() == 1
+        assert pool._in_use == 0
+        assert await pool.send("prompt") == "ok"
+
+    @pytest.mark.asyncio
+    async def test_acp_worker_reset_respawns_the_client(self):
+        """``AcpWorker.reset_conversation`` must produce a NEW ACP session, not
+        reuse the one carrying the transcript."""
+        worker = AcpWorker(sandbox_mode="off")
+        old_client = AsyncMock()
+        old_client.is_process_alive = lambda: True
+        worker._client = old_client
+        worker.calls_since_reset = 7
+
+        new_client = AsyncMock()
+        new_client._pid = 4242
+        new_client.is_process_alive = lambda: True
+
+        # Patch the sweep shield like the other AcpWorker tests: it is a
+        # process-global registry, and a real registration leaked from a test
+        # makes _collect_active_pids report a non-empty protected set to whatever
+        # else shares this worker.
+        with patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=new_client), \
+             patch("kiro_crew.knowledge.llm_pool.register_protected_pid"), \
+             patch("kiro_crew.knowledge.llm_pool.unregister_protected_pid"):
+            await worker.reset_conversation()
+
+        old_client.shutdown.assert_awaited_once()
+        assert worker._client is new_client
+        new_client.ensure_ready.assert_awaited_once()
+        assert worker.calls_since_reset == 0
+
+    @pytest.mark.asyncio
+    async def test_acp_worker_context_pct_reads_client_stats(self):
+        worker = AcpWorker()
+        assert worker.context_pct() == 0.0
+
+        client = AsyncMock()
+        client.last_prompt_stats.context_pct = 63.5
+        worker._client = client
+        assert worker.context_pct() == 63.5
 class _TimeoutRecordingWorker(FakeWorker):
     """FakeWorker that records the timeout each send arrived with."""
 
@@ -1314,45 +1659,35 @@ class TestBoundTimeoutFloor:
         assert worker.timeouts == [300.0, 300.0]
 
 
-class TestPoolSizeKnob:
-    """``knowledge.llm_pool_size`` sizes config-driven pools per deployment.
+class TestExtractionPoolSize:
+    """``knowledge.extraction_pool_size`` sizes each deployment's lane."""
 
-    A single-slot serving lane wants 1 worker: extra workers cannot run
-    concurrently there — they queue behind each other until every prompt
-    exceeds its timeout, and against an admission-controlled router the
-    excess becomes 503 storms. A constructor-fixed size stays fixed: callers
-    like auto_research chose it deliberately.
-    """
-
-    def test_config_size_wins_for_default_pools(self):
+    def test_config_size_accepts_a_single_lane_worker(self):
         from kiro_crew.knowledge.llm_pool import _get_pool_size
 
-        assert _get_pool_size({"knowledge": {"llm_pool_size": 1}}) == 1
+        assert _get_pool_size({"knowledge": {"extraction_pool_size": 1}}) == 1
 
     def test_absent_config_keeps_default(self):
         from kiro_crew.knowledge.llm_pool import DEFAULT_POOL_SIZE, _get_pool_size
 
         assert _get_pool_size({}) == DEFAULT_POOL_SIZE
 
-    @pytest.mark.parametrize("raw", [0, -1, 17, "2", 2.5, True, None, [1]])
+    @pytest.mark.parametrize("raw", [0, -1, 11, "2", 2.5, True, None, [1]])
     def test_malformed_or_out_of_range_falls_back(self, raw):
         """A broken knob must not starve or explode the pool."""
         from kiro_crew.knowledge.llm_pool import DEFAULT_POOL_SIZE, _get_pool_size
 
-        cfg = {"knowledge": {"llm_pool_size": raw}}
+        cfg = {"knowledge": {"extraction_pool_size": raw}}
         assert _get_pool_size(cfg) == DEFAULT_POOL_SIZE
 
-    def test_constructor_size_is_marked_fixed(self):
-        pool = LLMPool(pool_size=1)
-        assert pool._fixed_pool_size == 1
+    def test_fetch_pool_can_opt_out_of_extraction_sizing(self):
+        pool = LLMPool(pool_size=1, use_config_pool_size=False)
         assert pool._pool_size == 1
+        assert pool._use_config_pool_size is False
 
     def test_default_construction_is_config_driven(self):
-        from kiro_crew.knowledge.llm_pool import DEFAULT_POOL_SIZE
-
         pool = LLMPool()
-        assert pool._fixed_pool_size is None
-        assert pool._pool_size == DEFAULT_POOL_SIZE
+        assert pool._use_config_pool_size is True
 
 
 class TestFloorHitAlarm:

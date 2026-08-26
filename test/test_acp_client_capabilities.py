@@ -45,6 +45,25 @@ def test_both_acp_transports_send_capabilities() -> None:
         assert "ACP_CLIENT_CAPABILITIES" in src.read_text(encoding="utf-8"), rel
 
 
+def test_both_acp_transports_send_client_info_name() -> None:
+    """Both transports must declare the client name under `clientInfo.name`.
+
+    kiro-cli reads the driving ACP client name from the initialize request's
+    `clientInfo.name` (agent/acp/acp_agent.rs: `if let Some(info) =
+    request.client_info`). A flat top-level `clientName` key is ignored, which
+    leaves the session unnamed in telemetry (bucketed as "(none)" instead of
+    "kirocrew"). AcpRuntime previously sent the flat key; this locks in the
+    nested form on BOTH transports. Asserted on source because neither params
+    dict is reachable without spawning a real agent subprocess.
+    """
+    for rel in ("src/kiro_crew/acp/client.py", "src/kiro_crew/acp/runtime.py"):
+        src = Path(__file__).resolve().parents[1] / rel
+        text = src.read_text(encoding="utf-8")
+        assert '"clientInfo": {"name": CLIENT_NAME' in text, rel
+        # The flat key kiro-cli ignores must not come back.
+        assert '"clientName": CLIENT_NAME' not in text, rel
+
+
 def test_session_capability_server_carries_the_bound_session_key() -> None:
     """A backend-spawned MCP process must not lose its dashboard binding."""
     client = AcpClient(session_key="dashboard:bound-slot")

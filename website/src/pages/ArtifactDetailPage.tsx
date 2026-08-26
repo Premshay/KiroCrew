@@ -1,9 +1,12 @@
 import { safeSetItem } from '../utils/safeStorage'
+import { useIsMobile } from '../hooks/useIsMobile'
+import { useImeGuard } from '../hooks/useImeGuard'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import WebAppArtifactCard from '../components/WebAppArtifactCard'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query'
-import { ArrowLeft, AlertTriangle, ArrowUp, Camera, ExternalLink, Download, GitFork, Pencil, RefreshCw, X, AlertCircle, RotateCcw, Plus, Sparkles, MessageSquare, Monitor, Undo2, Upload, Star, Folder as FolderIcon } from 'lucide-react'
+import { ArrowLeft, AlertTriangle, ArrowUp, Camera, Check, Copy, ExternalLink, Download, GitFork, Pencil, RefreshCw, X, AlertCircle, RotateCcw, Plus, Sparkles, MessageSquare, Monitor, Undo2, Upload, Star, Folder as FolderIcon } from 'lucide-react'
+import { copyToClipboard } from '../utils/clipboard'
 import { useTheme } from '../hooks/useTheme'
 import { type IframeSelection } from '../hooks/useCommentBridge'
 import { useAppDispatch, useAppSelector } from '../store'
@@ -14,6 +17,8 @@ import { sanitizeCssValue } from '../lib/cssSanitize'
 import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
 import { api } from '../api/client'
 import { PageHeader, Card, Badge, Btn, Input } from '../components/ui'
+import SimpleSelect from '../components/SimpleSelect'
+import { useConfirm } from '../components/ConfirmDialog'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../components/ui/dropdown-menu'
 import ReadingWidthToggle from '../components/ReadingWidthToggle'
 import { useReadingWidth } from '../hooks/useReadingWidth'
@@ -26,7 +31,7 @@ import { ArtifactChatPanel } from '../components/ArtifactChatPanel'
 import { CommentThreadPopover } from '../components/CommentThreadPopover'
 import { findCoords, resolveSourcePos } from '../components/MarkdownPanel'
 // Artifact body renderers, extracted here so the chat side panel shares them.
-import { ArtifactBodyNative, ArtifactBodyIframe, isEditableKind } from '../components/ArtifactBody'
+import { ArtifactBodyNative, ArtifactBodyIframe, ArtifactBodyImage, artifactAssetUrl, isEditableKind } from '../components/ArtifactBody'
 import { useArtifactPopouts } from '../hooks/useArtifactPopouts'
 import { forwardToMain, type NavIntent } from '../utils/artifactPopout'
 import { writePrefill } from '../utils/navIntent'
@@ -41,6 +46,7 @@ import type { Artifact, ArtifactEvent, ArtifactComment, CommentAnchor, ChatSlot 
 import { i18nT } from '../i18n/t'
 import { fmtDateFields } from '../i18n/format'
 import ErrorNotice from '../components/ErrorNotice'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /**
  * The artifact's active companion session: the bound slot for `slug`, or the most
  * recently active one if a race or a History-page resume left more than one.
@@ -127,6 +133,7 @@ const ActivityTimeline = memo(function ActivityTimeline({
   events: ArtifactEvent[]
   navigateToSlot: (slotKey: string) => void
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   if (!events.length) {
     return (
       <div className="text-[12px] text-muted">{i18nT('pages.artifactDetailPage.no_lifecycle_events_yet')}</div>
@@ -274,6 +281,7 @@ function ArtifactPopoutControl({ slug, name }: { slug: string; name: string }) {
 export default function ArtifactDetailPage({ popout = false }: { popout?: boolean } = {}) {
   const { slug = '' } = useParams<{ slug: string }>()
   const navigate = useNavigate()
+  const { confirm, confirmDialog, confirmOpen } = useConfirm()
   // Claimed once from the library's "New Artifact" action, which creates the
   // document empty and hands it over here. Two behaviours hang off it: the editor
   // opens focused (so the user starts typing rather than hunting for an Edit
@@ -349,6 +357,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // posts metadata-only (no version bump). Removing a tag works the same way.
   const [addingTag, setAddingTag] = useState(false)
   const [newTag, setNewTag] = useState('')
+  const ime = useImeGuard()
   // ── Inline-comment state (durable via /api/artifacts/:slug/comments) ──
   const commentsQuery = useQuery<{ comments: ArtifactComment[]; remote_sync_error?: string | null }>({
     queryKey: ['artifact-comments', slug],
@@ -367,6 +376,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // show/hide applies to the current view only; we intentionally do NOT persist
   // it, so every artifact independently does the right thing instead of a
   // global pin re-opening empty panels everywhere.
+  const isMobile = useIsMobile()
   const [panel, setPanel] = useState<'none' | 'comments' | 'chat'>('none')
   // Flipped once the user manually toggles, so the comment-driven auto-reveal
   // below stops overriding an explicit choice — but only for the current
@@ -395,9 +405,15 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     if (sidebarUserToggledRef.current) return
     setPanel(p => {
       if (p === 'chat' && !navigated) return p
-      return commentCount > 0 ? 'comments' : 'none'
+      // NOT while narrow. There the panel takes the whole pane and the artifact
+      // body steps aside, so auto-revealing lands every commented artifact on
+      // comments about content the reader cannot see, with a close button to
+      // find first. Auto-reveal was written for the side-by-side layout, where
+      // the body stayed visible beside it. A manual open still survives, via the
+      // user-toggled override this effect returns on above.
+      return commentCount > 0 && !isMobile ? 'comments' : 'none'
     })
-  }, [slug, commentCount])
+  }, [slug, commentCount, isMobile])
   const [popover, setPopover] = useState<{ x: number; y: number; anchor: string; line?: number; column?: number; prefix?: string; suffix?: string; startOffset?: number; endOffset?: number } | null>(null)
   // Bidirectional anchor↔comment linking: flash a sidebar row when
   // its in-iframe highlight is clicked; scroll the iframe highlight when a
@@ -416,6 +432,10 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     setSelectedVersion(null)
     setEditing(false)
     setEditedContent('')
+    // Reset with the rest of the edit state: this flag is per-document, and
+    // leaking it across a navigation left the next artifact opening its editor
+    // into a rendered preview.
+    setPreviewDuringEdit(false)
     setSaveError(null)
     setPopover(null)
     setAddingTag(false)
@@ -677,13 +697,16 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     }
   }, [justCreatedBlank, queryClient])
 
-  const cancelEditing = useCallback(() => {
-    if (dirty && !window.confirm(i18nT('pages.artifactDetailPage.discard_unsaved_changes'))) return
+  const cancelEditing = useCallback(async () => {
+    if (dirty && !(await confirm({
+      title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
+      confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
+    }))) return
     setEditing(false)
     setEditedContent('')
     setSaveError(null)
     setPreviewDuringEdit(false)
-  }, [dirty])
+  }, [dirty, confirm])
 
   const handleSave = useCallback(async (snapshot = false) => {
     if (!artifact || !dirty) return
@@ -798,6 +821,12 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   useEffect(() => {
     if (!editing) return
     const h = (e: KeyboardEvent) => {
+      // While the discard-confirm dialog is open, the keyboard belongs to it.
+      // Escape dismisses it via the dialog's own handler (re-running the guard
+      // here would re-open the dialog the same keystroke just closed), and the
+      // save shortcut must not fire — a mid-dialog Cmd+S would persist the very
+      // draft the user is about to confirm discarding.
+      if (confirmOpen) return
       if ((e.metaKey || e.ctrlKey) && e.key === 's' && dirty) {
         e.preventDefault()
         // Cmd+Shift+S → snapshot (creates a new version), Cmd+S → silent save.
@@ -807,7 +836,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     }
     document.addEventListener('keydown', h)
     return () => document.removeEventListener('keydown', h)
-  }, [editing, dirty, cancelEditing])
+  }, [editing, dirty, cancelEditing, confirmOpen])
 
   // Tell the WS transport this artifact is being edited, so a live
   // `artifact_update` does not refetch the content out from under the editor and
@@ -962,11 +991,16 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     // would yank the conversation out from under the user. The toolbar's comment
     // badge already increments, so the add is still visibly acknowledged. Same
     // rationale as the auto-reveal guard in the panel effect above.
-    sidebarUserToggledRef.current = false
+    // Narrow: keep the override SET. Clearing it hands control back to the
+    // auto-reveal effect, which is gated off while narrow -- so the panel the
+    // user just posted into would be closed again the moment `commentCount`
+    // changes. Revealing it here is a user-initiated open, which is exactly what
+    // the override means.
+    sidebarUserToggledRef.current = isMobile
     setPanel(p => (p === 'chat' ? p : 'comments'))
     setPopover(null)
     window.getSelection()?.removeAllRanges()
-  }, [popover, postCommentMut])
+  }, [popover, postCommentMut, isMobile])
 
   // Doc-level add (from the sidebar) — works for ALL kinds, including
   // HTML/widget where in-iframe text selection isn't reachable.
@@ -1084,6 +1118,17 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         running: false,
         artifact: artifact.slug,
       } as ChatSlot))
+      // Activate the bound slot NOW — back-to-back with writePrefill, mirroring
+      // ChatPage's follow-up worktree handler — so activeSlot is already this
+      // slot BEFORE boundSlot resolves and ArtifactChatPanel mounts the embedded
+      // ChatPage. Otherwise the switch lands in the same commit as that mount,
+      // where ChatPage's mount-only slot re-fetch effect (StrictMode
+      // double-invoked, empty deps → stale activeSlot capture) re-asserts the
+      // PRIOR active slot as the last write. activeSlot then never becomes this
+      // slot on first open, so the per-slot draft-restore effect can't consume
+      // the staged prefill and the composer opens empty (correct only on the
+      // second open). Idempotent once active === res.key.
+      dispatch(switchSlot(res.key))
       api.chatSlotContext(res.key, buildCompanionContext(), {
         source: 'artifact-companion', ephemeral: true,
       }).catch(() => undefined)
@@ -1236,6 +1281,10 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const themeVars = useMemo(() => readThemeVars(), [theme, colorTheme, themeVersion])
   const usesIframe = artifact?.kind === 'widget' || artifact?.kind === 'html'
+  // HTML/widget artifacts own a full-width iframe surface. Reading width only
+  // constrains native document bodies, and the copy control follows whichever
+  // width the active body actually uses.
+  const contentWidthStyle = usesIframe ? undefined : mdPreviewStyle
   const exportSrcdoc = useMemo(
     () => artifact?.content && usesIframe
       ? buildSrcdoc({ html: artifact.content, themeVars, mode: theme })
@@ -1295,8 +1344,60 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     }
   }, [markThreadRead, usesIframe])
 
+  // ── Copy raw content ──────────────────────────────────────────────────────
+  // Copies the stored source (markdown/HTML/JSON/text as-is) of the version
+  // currently on screen — `artifact` already resolves to the selected
+  // snapshot, so a historical view copies that snapshot's content. The button
+  // swaps to a check or warning for a moment as the result confirmation (the
+  // same success pattern chat messages and diff blocks use).
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const copyAttemptRef = useRef(0)
+  useEffect(() => () => {
+    copyAttemptRef.current += 1
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
+  }, [])
+  const handleCopyContent = useCallback(() => {
+    const attempt = ++copyAttemptRef.current
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
+    setCopyStatus('idle')
+    copyToClipboard(artifact?.content ?? '')
+      .then(() => {
+        if (attempt !== copyAttemptRef.current) return
+        setCopyStatus('copied')
+        copiedTimerRef.current = setTimeout(() => {
+          if (attempt === copyAttemptRef.current) setCopyStatus('idle')
+        }, 1500)
+      })
+      .catch(() => {
+        if (attempt !== copyAttemptRef.current) return
+        setCopyStatus('failed')
+        copiedTimerRef.current = setTimeout(() => {
+          if (attempt === copyAttemptRef.current) setCopyStatus('idle')
+        }, 1500)
+      })
+  }, [artifact])
+  const copyLabel = copyStatus === 'copied'
+    ? i18nT('pages.artifactDetailPage.copied')
+    : copyStatus === 'failed'
+      ? i18nT('pages.artifactDetailPage.copy_failed')
+      : i18nT('pages.artifactDetailPage.copy_content')
+
   const downloadAsHtml = () => {
     if (!artifact) return
+    // Image artifacts carry no text content — their bytes live behind the asset
+    // endpoint. Blobbing `artifact.content` here would hand the user an empty
+    // `.html` file from the toolbar's habituated download spot.
+    if (artifact.kind === 'image') {
+      const a = document.createElement('a')
+      a.href = artifactAssetUrl(artifact.slug)
+      a.download = artifact.image?.original_filename
+        || `${artifact.slug}.${artifact.image?.ext || 'png'}`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      return
+    }
     const isMarkdownLike = artifact.kind === 'markdown' || artifact.kind === 'text' || artifact.kind === 'json' || artifact.kind === 'svg'
     const blobBody = exportSrcdoc ?? artifact.content ?? ''
     const mime = isMarkdownLike
@@ -1324,8 +1425,10 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     const msg = detailQuery.error instanceof Error ? detailQuery.error.message : String(detailQuery.error)
     return (
       <>
-        <PageHeader title={i18nT('pages.artifactDetailPage.artifact')} subtitle={slug} />
-        <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+        <div className="sticky top-0 z-10 bg-bg border-b border-border">
+          <PageHeader title={i18nT('pages.artifactDetailPage.artifact')} subtitle={slug} />
+        </div>
+        <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
           <Card>
             <div className="flex items-start gap-3">
               <AlertTriangle className="lucide-inline text-danger" />
@@ -1347,8 +1450,17 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   }
   if (!artifact) return <div className="p-6 text-muted">{i18nT('pages.artifactDetailPage.not_found')}</div>
 
-  const sel =
-    'bg-bg-elevated border border-border rounded-md px-2 py-1 text-text text-[12px] font-body outline-none cursor-pointer transition-colors focus-ring'
+  // Version-picker rows as two PARALLEL arrays, newest snapshot first, the order
+  // the <option> list had. `live` leads as a static entry: Live is always-current
+  // state, distinct from any numbered snapshot because in the explicit-snapshot
+  // model saves update Live without bumping versions, so Live can be ahead of the
+  // latest numbered snapshot.
+  const versionsDesc = versions.slice().reverse()
+  const versionOptions = ['live', ...versionsDesc.map(String)]
+  const versionOptionLabels = [
+    i18nT('pages.artifactDetailPage.live'),
+    ...versionsDesc.map((v) => `${i18nT('pages.artifactDetailPage.v')}${v}`),
+  ]
 
   // Cron-source warning shown only while editing — surface the foot-gun
   // (next cron run will create a newer version) without noisy chrome on
@@ -1357,38 +1469,41 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
 
   return (
     <>
-      <PageHeader
-        title={renaming ? (
-          <Input
-            autoFocus
-            value={nameDraft}
-            aria-label={i18nT('pages.artifactDetailPage.artifact_name')}
-            onChange={(e) => setNameDraft(e.target.value)}
-            onBlur={commitRename}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') { e.preventDefault(); void commitRename() }
-              else if (e.key === 'Escape') { e.preventDefault(); setRenaming(false) }
-            }}
-            className="px-2 py-0.5 text-2xl font-bold tracking-tight text-text-strong w-full max-w-[36rem]"
-          />
-        ) : (
-          <Btn
-            ref={titleButtonRef}
-            onClick={startRenaming}
-            title={i18nT('pages.artifactDetailPage.rename_this_artifact')}
-            className="group gap-2 bg-transparent border-none p-0 text-2xl font-bold tracking-tight text-text-strong cursor-text hover:bg-transparent hover:border-none"
-          >
-            {artifact.name}
-            <Pencil size={14} className="text-muted opacity-0 group-hover:opacity-100 transition-opacity shrink-0" aria-hidden="true" />
-          </Btn>
-        )}
-        subtitle={i18nT('pages.artifactDetailPage.artifact_slug', { slug: artifact.slug })}
-      />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
-        <div className="flex flex-wrap items-center gap-2 mb-4">
+      <div className="sticky top-0 z-10 bg-bg border-b border-border">
+        <PageHeader
+          title={renaming ? (
+            <Input
+              autoFocus
+              value={nameDraft}
+              aria-label={i18nT('pages.artifactDetailPage.artifact_name')}
+              onChange={(e) => setNameDraft(e.target.value)}
+              {...ime.bindEnter({
+                onEnter: () => void commitRename(),
+                onEscape: () => setRenaming(false),
+                onBlur: () => void commitRename(),
+              })}
+              className="px-2 py-0.5 text-2xl font-bold tracking-tight text-text-strong w-full max-w-[36rem]"
+            />
+          ) : (
+            <Btn
+              ref={titleButtonRef}
+              onClick={startRenaming}
+              title={i18nT('pages.artifactDetailPage.rename_this_artifact')}
+              className="group gap-2 bg-transparent border-none p-0 text-2xl font-bold tracking-tight text-text-strong cursor-text hover:bg-transparent hover:border-none"
+            >
+              {artifact.name}
+              <Pencil size={14} className="text-muted opacity-0 group-hover:opacity-100 transition-opacity shrink-0" aria-hidden="true" />
+            </Btn>
+          )}
+          subtitle={i18nT('pages.artifactDetailPage.artifact_slug', { slug: artifact.slug })}
+        />
+        <div className="px-4 md:px-6 py-2 flex flex-wrap items-center gap-2">
           {!popout && (
-            <Btn onClick={() => {
-              if (dirty && !window.confirm(i18nT('pages.artifactDetailPage.discard_unsaved_changes'))) return
+            <Btn onClick={async () => {
+              if (dirty && !(await confirm({
+                title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
+                confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
+              }))) return
               navigate('/artifacts')
             }} className="flex items-center gap-1">
               <ArrowLeft size={13} /> {i18nT('pages.artifactDetailPage.back')}
@@ -1402,18 +1517,18 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             * would strand a document the user is typing in. Choosing a type also
             * PINS it, stopping the auto-detect from re-typing it later. */}
           {editable ? (
-            <select
-              className="text-[11px] px-1.5 py-0.5 rounded bg-accent-soft border border-accent-soft-border text-accent font-mono cursor-pointer outline-none focus-ring"
-              value={artifact.kind}
-              aria-label={i18nT('pages.artifactDetailPage.document_type')}
-              title={i18nT('pages.artifactDetailPage.change_how_this_document_is_rendered')}
-              disabled={changingKind}
-              onChange={(e) => void changeKind(e.target.value)}
-            >
-              {USER_SELECTABLE_KINDS.map((k) => (
-                <option key={k} value={k}>{k}</option>
-              ))}
-            </select>
+            /* SimpleSelect has no `title` channel, so the hover tooltip moves to
+             * a wrapper element; the accessible name still rides on the trigger
+             * itself via aria-label. */
+            <div title={i18nT('pages.artifactDetailPage.change_how_this_document_is_rendered')}>
+              <SimpleSelect
+                options={USER_SELECTABLE_KINDS}
+                value={artifact.kind}
+                aria-label={i18nT('pages.artifactDetailPage.document_type')}
+                disabled={changingKind}
+                onChange={(v) => void changeKind(v)}
+              />
+            </div>
           ) : (
             <Badge variant="aim">{artifact.kind}</Badge>
           )}
@@ -1431,7 +1546,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
                   ? 'bg-accent/10 border-accent text-accent'
                   : 'bg-bg-elevated border-border text-muted hover:text-accent hover:border-accent'
               }`}
-              title={artifact.pinned ? i18nT('pages.artifactsPage.starred_click_to_unstar') : i18nT('pages.artifactsPage.star_save_to_library')}
+              title={artifact.pinned ? i18nT('pages.artifactsPage.starred_click_to_unstar') : i18nT('pages.artifactsPage.star_artifact')}
               aria-label={artifact.pinned ? i18nT('pages.artifactsPage.remove_star_from_artifact') : i18nT('pages.artifactsPage.star_artifact')}
               aria-pressed={!!artifact.pinned}
             >
@@ -1461,20 +1576,31 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               value={newTag}
               onChange={e => setNewTag(e.target.value)}
               onKeyDown={e => {
-                if (e.key === 'Enter') addTag(newTag)
-                if (e.key === ',' || e.key === ' ') {
-                  e.preventDefault()
-                  if (newTag.trim()) addTag(newTag)
+                if (e.key === 'Enter') {
+                  // Rule 2 shape: this handler carries more than Enter (comma/space
+                  // also commit), so only the Enter path is gated. Rule 1: single-line
+                  // input, so the guard alone is enough.
+                  if (ime.isComposing(e)) return
+                  addTag(newTag)
                 }
-                if (e.key === 'Escape') { setNewTag(''); setAddingTag(false) }
+                if (e.key === ',' || e.key === ' ') {
+                  // Space cycles IME candidates mid-composition; committing here
+                  // would post the composing buffer and kill candidate selection.
+                  // The claim is key-agnostic: it consumes the separator only
+                  // when the IME is not itself using the keypress.
+                  if (ime.claimEnter(e) && newTag.trim()) addTag(newTag)
+                }
+                if (e.key === 'Escape') { ime.reset(); setNewTag(''); setAddingTag(false) }
               }}
-              onBlur={() => {
-                if (newTag.trim()) addTag(newTag)
-                else setAddingTag(false)
-              }}
+              {...ime.bindComposition({
+                onBlur: () => {
+                  if (newTag.trim()) addTag(newTag)
+                  else setAddingTag(false)
+                },
+              })}
               autoFocus
               placeholder={i18nT('pages.artifactDetailPage.tag')}
-              className="text-[11px] px-1.5 py-0.5 rounded bg-bg-elevated border border-accent text-text outline-none"
+              className="text-[11px] px-1.5 py-0.5 rounded bg-bg-elevated border border-accent text-text outline-none focus-ring"
               style={{ width: '90px' }}
               aria-label={i18nT('pages.artifactDetailPage.add_a_tag')}
             />
@@ -1489,38 +1615,35 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               <Plus size={10} /> {i18nT('pages.artifactDetailPage.tag_2')}
             </button>
           )}
-          <span className="mc-art-toolbar ml-auto flex items-center gap-2 text-[13px] text-muted">
+          {/* `flex-wrap`: the parent row wraps, but this group did not, so at a
+              narrow window the trailing controls (Download last) ran past the
+              viewport edge and became unreachable. Wrapping keeps every action
+              on screen; `justify-end` keeps the group right-aligned when it
+              spills onto a second line. */}
+          <span className="mc-art-toolbar ml-auto flex flex-wrap items-center justify-end gap-2 text-[13px] text-muted">
             <span>{i18nT('pages.artifactDetailPage.version')}</span>
-            <select
-              className={sel}
+            <SimpleSelect
               // Named so it is distinguishable from the document-type control
               // beside it -- both for assistive tech and for tests.
               aria-label={i18nT('pages.artifactDetailPage.version')}
               disabled={saving}
+              options={versionOptions}
+              optionLabels={versionOptionLabels}
               value={selectedVersion === null ? 'live' : String(selectedVersion)}
-              onChange={(e) => {
-                if (dirty && !window.confirm(i18nT('pages.artifactDetailPage.discard_unsaved_changes'))) return
+              onChange={async (raw) => {
+                if (dirty && !(await confirm({
+                  title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
+                  confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
+                }))) return
                 setEditing(false)
                 setEditedContent('')
-                const raw = e.target.value
                 if (raw === 'live') {
                   setSelectedVersion(null)
                 } else {
                   setSelectedVersion(parseInt(raw, 10))
                 }
               }}
-            >
-              {/* Live = always-current state. Distinct from any numbered
-                  snapshot because in the explicit-snapshot model saves
-                  update Live without bumping versions, so Live can be
-                  ahead of the latest numbered snapshot. */}
-              <option value="live">{i18nT('pages.artifactDetailPage.live')}</option>
-              {versions.slice().reverse().map((v) => (
-                <option key={v} value={v}>
-                  {i18nT('pages.artifactDetailPage.v')}{v}
-                </option>
-              ))}
-            </select>
+            />
 
             {/* Revert: only meaningful when viewing a historical version */}
             {!isCurrent && (
@@ -1568,15 +1691,17 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
                 >
                   <span className="inline-flex items-center gap-1"><X size={13} /> {i18nT('pages.artifactDetailPage.cancel')}</span>
                 </button>
-                <button
-                  type="button"
-                  onClick={() => setPreviewDuringEdit(p => !p)}
-                  disabled={saving}
-                  className={`px-2 py-1 rounded-md text-[12px] font-medium border cursor-pointer transition-all disabled:opacity-40 ${previewDuringEdit ? 'border-accent text-accent bg-accent-subtle' : 'border-border text-muted hover:text-text hover:border-border-strong'}`}
-                  title={previewDuringEdit ? i18nT('pages.artifactDetailPage.back_to_editor') : i18nT('pages.artifactDetailPage.preview_rendered_output_of_current_edits')}
-                >
-                  {previewDuringEdit ? i18nT('pages.artifactDetailPage.edit') : i18nT('pages.artifactDetailPage.preview')}
-                </button>
+                {artifact.kind !== 'svg' && (
+                  <button
+                    type="button"
+                    onClick={() => setPreviewDuringEdit(p => !p)}
+                    disabled={saving}
+                    className={`px-2 py-1 rounded-md text-[12px] font-medium border cursor-pointer transition-all disabled:opacity-40 ${previewDuringEdit ? 'border-accent text-accent bg-accent-subtle' : 'border-border text-muted hover:text-text hover:border-border-strong'}`}
+                    title={previewDuringEdit ? i18nT('pages.artifactDetailPage.back_to_editor') : i18nT('pages.artifactDetailPage.preview_rendered_output_of_current_edits')}
+                  >
+                    {previewDuringEdit ? i18nT('pages.artifactDetailPage.edit') : i18nT('pages.artifactDetailPage.preview')}
+                  </button>
+                )}
               </>
             ) : (
               <>
@@ -1621,7 +1746,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               </>
             )}
 
-            {(!editing || previewDuringEdit) && (
+            {(!editing || previewDuringEdit) && !usesIframe && (
               <ReadingWidthToggle value={readingWidth} onToggle={toggleReadingWidth} />
             )}
             {/* Comments toggle, Publish, Full screen, Download — icon-only to
@@ -1655,7 +1780,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
                 surface (Link2 + ArtifactSharePanel) is intentionally absent
                 here — a deliberate public-edition divergence, so an upstream
                 sync must NOT re-add it. */}
-            {artifact.kind !== 'webapp' && (
+            {artifact.kind !== 'webapp' && artifact.kind !== 'image' && (
               <Btn
                 type="button"
                 onClick={() => setShowPublish(v => !v)}
@@ -1678,7 +1803,9 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             </Btn>
           </span>
         </div>
+      </div>
 
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         {artifact.description && (
           <div className="mb-3 text-sm text-muted italic">{artifact.description}</div>
         )}
@@ -1725,7 +1852,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         )}
 
         {/* Publish panel — toggled by the Publish toolbar button */}
-        {showPublish && artifact.kind !== 'webapp' && (
+        {showPublish && artifact.kind !== 'webapp' && artifact.kind !== 'image' && (
           <div className="mb-3">
             <PublishHub artifact={artifact} onClose={() => setShowPublish(false)} />
           </div>
@@ -1737,15 +1864,47 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             would let a click on a webapp artifact create/activate a session with
             nowhere to display. */}
         <div className="flex gap-4 items-start">
-          <div className="flex-1 min-w-0">
+          {/* An open panel owns the width while narrow, so the artifact body
+              steps aside -- giving the panel `w-full` alone would still leave the
+              two of them splitting 390px. Hidden rather than unmounted: the body
+              holds scroll position and, for markdown, an in-progress anchored
+              comment selection, and rotating a phone crosses the breakpoint. */}
+          <div className={`flex-1 min-w-0 ${isMobile && panel !== 'none' ? 'hidden' : ''}`}>
+            {/* Copy raw source — its own right-aligned slot ABOVE the body (not
+                the header toolbar, which must not grow; not an overlay, which
+                could obscure a heading's trailing text or cover a top-right
+                control inside a widget artifact). Hidden for image (bytes, not
+                text) and webapp (deploy card has its own affordances), and
+                while the editor owns the surface. */}
+            {artifact.kind !== 'webapp' && artifact.kind !== 'image' && !editing && (
+              <div className="mb-1.5">
+                <div className="flex justify-end" style={contentWidthStyle}>
+                  <Btn
+                    type="button"
+                    onClick={handleCopyContent}
+                    className={`p-1.5 rounded-md border border-border hover:border-border-strong cursor-pointer transition-all ${copyStatus === 'failed' ? 'text-danger hover:text-danger' : 'text-muted hover:text-text'}`}
+                    title={copyLabel}
+                    aria-label={copyLabel}
+                    aria-live="polite"
+                  >
+                    {copyStatus === 'copied'
+                      ? <Check size={13} className="text-ok" />
+                      : copyStatus === 'failed'
+                        ? <AlertCircle size={13} aria-hidden="true" />
+                        : <Copy size={13} />}
+                  </Btn>
+                </div>
+              </div>
+            )}
             {artifact.kind === 'webapp' ? (
               <WebAppArtifactCard artifact={artifact} />
+            ) : artifact.kind === 'image' ? (
+              <ArtifactBodyImage artifact={artifact} slug={slug} />
             ) : usesIframe ? (
               <>
                 <ArtifactBodyIframe
                   artifact={artifact}
                   slug={slug}
-                  previewStyle={mdPreviewStyle}
                   comments={durableComments}
                   onSelect={(sel: IframeSelection) => setPopover({ x: sel.x, y: sel.y, anchor: sel.quote, prefix: sel.prefix, suffix: sel.suffix })}
                   onOpenThread={(id: string, rect) => openThreadHandler(id, rect)}
@@ -1766,14 +1925,18 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               <div
                 ref={bodyRef}
                 className="relative"
-                style={mdPreviewStyle}
+                style={contentWidthStyle}
                 onMouseDown={() => { selectingRef.current = true }}
                 onMouseUp={() => { selectingRef.current = false; handleMouseUp() }}
               >
                 <ArtifactBodyNative
                   kind={artifact.kind}
                   content={editing ? editedContent : (artifact.content ?? '')}
-                  editing={editing && !previewDuringEdit}
+                  // SVG shows preview AND source together while editing, so the
+                  // preview toggle does not apply to it — and must not gate it:
+                  // the toggle is hidden for SVG, so honoring a stale `true`
+                  // here would strand the editor with no control to restore it.
+                  editing={editing && (artifact.kind === 'svg' || !previewDuringEdit)}
                   onChange={setEditedContent}
                   previewRef={previewRef}
                   comments={durableComments}
@@ -1874,6 +2037,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
           />
         </div>
       </div>
+      {confirmDialog}
     </>
   )
 }

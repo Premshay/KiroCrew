@@ -114,7 +114,8 @@ class TestSessionChannelTools:
         )
 
         assert result == "Peer report cafebabe. Delivery: cafebabe: delivered."
-        post.assert_called_once_with(
+        path, payload = post.call_args.args
+        assert (path, payload) == (
             "/api/session-channel",
             {
                 "action": "post",
@@ -124,8 +125,8 @@ class TestSessionChannelTools:
                 "msg_type": "progress",
                 "delivery": "next_turn",
             },
-            require_strict_session=True,
         )
+        assert post.call_args.kwargs["session_key"].startswith("dashboard:")
 
     def test_arms_a_strict_post_restart_verification(self, monkeypatch) -> None:
         post = MagicMock(return_value={"ok": True})
@@ -137,11 +138,12 @@ class TestSessionChannelTools:
         )
 
         assert result == "Post-restart verification is armed for this session."
-        post.assert_called_once_with(
+        path, payload = post.call_args.args
+        assert (path, payload) == (
             "/api/session-restart-continuation",
             {"checklist": "Check gateway health and the changed endpoint."},
-            require_strict_session=True,
         )
+        assert post.call_args.kwargs["session_key"].startswith("dashboard:")
 
     def test_rejects_invalid_persistent_channel_identifier(self) -> None:
         with pytest.raises(ValidationError):

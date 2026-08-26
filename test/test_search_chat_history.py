@@ -42,6 +42,23 @@ class TestHelpers:
         assert mcp_core._extract_history_snippet([{"role": "user", "content": "abc"}], "") == ""
         assert mcp_core._extract_history_snippet([{"role": "user", "content": "abc"}], "   ") == ""
 
+    def test_snippet_multi_word_query_falls_back_to_a_token(self):
+        # search_sessions matches a session when every TOKEN appears somewhere, so
+        # this extractor must locate a token too. Searching only the whole phrase
+        # returned "" and the handler suppresses snippet-less rows -- so exactly
+        # the multi-word queries token-wise matching enables came back bare.
+        msgs = [{"role": "user", "content": "the ack path shows contention under load"}]
+        snip = mcp_core._extract_history_snippet(msgs, "ack contention hypotheses")
+        assert snip, "a scattered multi-word match must still yield a snippet"
+        assert "<<<" in snip and ">>>" in snip, "the located token must be delimited"
+
+    def test_snippet_prefers_the_exact_phrase_over_a_token(self):
+        # Phrase first: when the words DO sit together, the snippet centres on the
+        # phrase rather than on whichever token happens to appear earliest.
+        msgs = [{"role": "user", "content": "ping alone, then the ping pong bench"}]
+        snip = mcp_core._extract_history_snippet(msgs, "ping pong")
+        assert "<<<ping pong>>>" in snip
+
     def test_snippet_full_casefold_match_is_delimited(self):
         # The selection (str.casefold().find) and the wrap must use the SAME full
         # casefolding: 'straße'.casefold() == 'strasse' matches 'STRASSE', but a
@@ -129,6 +146,32 @@ class TestSearchChatHistoryHandler:
         _seed_sessions(tmp_path)
         out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-1"})
         assert "redis.timeout" in out
+
+    def test_get_chat_session_reads_recall_roles(self, tmp_path, monkeypatch):
+        """An inject-role breadcrumb is readable here, and a system-role one is not.
+
+        A ``/note`` breadcrumb is appended with ``role="inject"``, and reading a
+        past session is the clearest case of crossing the boundary those notes
+        exist to survive -- so a handler that filtered on a hardcoded
+        ``{"user", "assistant"}`` dropped exactly the messages it was asked for.
+        ``RECALL_ROLES`` already governs replay and compression; this asserts the
+        same constant governs the fetch.
+
+        The system-role half is the negative direction, and it is what makes the
+        test measure the CONSTANT rather than merely the absence of a filter:
+        ``ConversationLog.recent`` guards with ``if roles:``, so deleting the
+        argument is permissive and would satisfy the inject assertion on its own
+        while quietly admitting internal system rows into the transcript.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        cl = _seed_sessions(tmp_path)
+        cl.append("dashboard_chat-1", "inject", "note breadcrumb: rotate the staging key")
+        cl.append("dashboard_chat-1", "system", "internal marker, not for recall")
+
+        out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-1"})
+
+        assert "rotate the staging key" in out, "an inject breadcrumb must be readable here"
+        assert "internal marker, not for recall" not in out, "system is absent from RECALL_ROLES"
 
     def test_legacy_metadataless_session_still_surfaces(self, tmp_path, monkeypatch):
         # A legacy session file whose first line is a message (predates the

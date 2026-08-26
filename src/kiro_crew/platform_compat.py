@@ -11,8 +11,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ctypes.util
+import errno
+import functools
 import io
 import logging
+import ntpath
 import os
 import shutil
 import signal
@@ -20,13 +23,15 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import zlib
 from ctypes import wintypes  # type aliases only; imports cleanly on every platform
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, NamedTuple, Optional, Sequence
 
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +39,73 @@ IS_WINDOWS: bool = sys.platform == "win32"
 IS_POSIX: bool = not IS_WINDOWS
 IS_LINUX: bool = sys.platform == "linux"
 IS_MACOS: bool = sys.platform == "darwin"
+
+
+_UTF8_PROCESS_ENV = {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8:backslashreplace",
+}
+
+
+def _ensure_utf8_process_environment() -> None:
+    """Pin UTF-8 for Python successors and child processes on every platform.
+
+    ``sys.stdout.reconfigure`` can repair the current process, but Windows
+    implements ``os.execv`` by creating a successor process.  Its standard
+    streams are constructed before Kiro Crew code runs, so the encoding must be
+    present in the environment at interpreter startup.  POSIX ``execv`` keeps
+    the current environment, where an inherited ``PYTHONIOENCODING`` can also
+    override the platform's normal UTF-8 defaults.  Overwrite inherited settings
+    deliberately: Kiro Crew's process tree emits Unicode as part of its normal
+    protocols and boot output.
+    """
+    os.environ.update(_UTF8_PROCESS_ENV)
+
+
+def reexec_python_module(module: str, args: Sequence[str]) -> None:
+    """Replace this process with ``sys.executable -m module``.
+
+    Windows reconstructs an ``execv`` command line from ``argv`` and reparses
+    it in the child.  A full ``argv[0]`` containing spaces is split before the
+    module flag, so Python treats the path suffix as a script name.  The
+    executable path passed separately to ``execv`` still selects the exact
+    interpreter; only its display name needs to be space-free.
+    """
+    # Publish UTF-8 before exec so in-app gateway restarts (Tailnet, update,
+    # stale-assets, explicit restart) cannot create a successor that inherits a
+    # Windows ANSI stream or a hostile POSIX PYTHONIOENCODING and crashes on the
+    # first emoji printed during boot.
+    _ensure_utf8_process_environment()
+    executable = sys.executable
+    argv0 = ntpath.basename(executable) if IS_WINDOWS else executable
+    os.execv(executable, [argv0, "-m", module, *args])
+
+
+# Python's os.rename() replaces an existing empty directory on POSIX. Directory
+# publication sometimes needs the stronger create-if-absent contract, which the
+# kernel exposes but the stdlib does not: renameat2(RENAME_NOREPLACE) on Linux
+# and renameatx_np(RENAME_EXCL) on macOS. Resolve the native seam once so callers
+# can advertise the capability honestly and fail closed everywhere else.
+_RENAME_NOREPLACE_FN: Any = None
+_RENAME_NOREPLACE_FLAG = 0
+if IS_LINUX or IS_MACOS:
+    try:
+        _rename_libc = ctypes.CDLL(None, use_errno=True)
+        _rename_symbol = "renameat2" if IS_LINUX else "renameatx_np"
+        _RENAME_NOREPLACE_FN = getattr(_rename_libc, _rename_symbol)
+        _RENAME_NOREPLACE_FN.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        _RENAME_NOREPLACE_FN.restype = ctypes.c_int
+        _RENAME_NOREPLACE_FLAG = 1 if IS_LINUX else 4
+    except (AttributeError, OSError):
+        _RENAME_NOREPLACE_FN = None
+
+RENAME_NOREPLACE_AVAILABLE: bool = _RENAME_NOREPLACE_FN is not None
 
 # Portable signal constants — signal.SIGKILL is undefined on Windows.
 SIGKILL: int = getattr(signal, "SIGKILL", 9)
@@ -53,6 +125,14 @@ SIGTERM: int = getattr(signal, "SIGTERM", 15)
 # to the real flags on Windows. Mirrors the ``SIGKILL`` pattern above.
 CREATE_NEW_PROCESS_GROUP: int = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 DETACHED_PROCESS: int = getattr(subprocess, "DETACHED_PROCESS", 0)
+# CREATE_SUSPENDED has no ``subprocess`` alias to getattr from (that module
+# re-exports only a subset of the Win32 creation flags), so the value is spelled
+# out. It is the load-bearing half of race-free Job object assignment: a process
+# created suspended has not executed a single instruction, so it provably has no
+# descendants yet and none can escape the job. See :func:`apply_job_limits` and
+# :func:`resume_process_main_thread`. 0 on POSIX, where it is never used, so a
+# caller can OR it into ``creationflags`` unconditionally.
+CREATE_SUSPENDED: int = 0x00000004 if os.name == "nt" else 0
 # For the short-lived helper tools this module shells out to on Windows
 # (whoami / netstat / taskkill / icacls / powershell): a console-less parent
 # (gateway respawned with DETACHED_PROCESS, or pythonw) would otherwise
@@ -71,6 +151,35 @@ _SUBPROCESS_NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # (start_new_session is silently ignored) and CREATE_NEW_PROCESS_GROUP makes the
 # child tree taskkill /T-reapable. Add DETACHED_PROCESS to the flags for a
 # fully detached, console-less child (e.g. the gateway respawn).
+
+# ── Desktop-app bundled interpreter detection ──
+#: Directory name the desktop build stages the bundled python-build-standalone
+#: runtime under (``Resources/backend-dist/…`` inside the app bundle). The
+#: authoritative spellings live in the packaging layer — electron-builder's
+#: ``extraResources`` mapping in ``website/electron/package.json`` and the
+#: staging steps in ``packaging/build-desktop.sh`` — and this constant MUST
+#: match them: ``test_platform_compat.py`` pins the two together so a packaging
+#: rename breaks a test instead of a runtime guarantee.
+BUNDLED_BACKEND_DIST_DIRNAME: str = "backend-dist"
+
+
+def is_bundled_interpreter() -> bool:
+    """Return True when this process runs on the desktop app's bundled interpreter.
+
+    Contract: the desktop build ships a python-build-standalone runtime inside
+    the application bundle, always under a ``backend-dist`` path component
+    (see :data:`BUNDLED_BACKEND_DIST_DIRNAME`). On macOS that bundle is
+    code-signed, so anything that would write into the interpreter's tree —
+    most notably ``pip install`` into its site-packages — invalidates the
+    signature and breaks subsequent launches/updates, and the write is
+    discarded on every app update anyway. Callers use this predicate to refuse
+    such writes loudly.
+
+    This is the ONE place the packaging layout's directory name is interpreted
+    at runtime; never re-inline the sentinel at a call site.
+    """
+    return BUNDLED_BACKEND_DIST_DIRNAME in Path(sys.executable).resolve().parts
+
 
 # ── macOS TCC-protected home subdirectories ──
 # macOS gates these home subdirectories behind TCC (Transparency, Consent and
@@ -135,6 +244,50 @@ TCC_LIBRARY_WALKABLE_CHILDREN: frozenset[str] = frozenset(
 #: The single ``~/Library`` component name, kept as a constant because the walk
 #: pruner compares it positionally rather than by membership.
 _LIBRARY_DIR = "Library"
+
+
+def rename_noreplace(
+    src: str | os.PathLike,
+    dst: str | os.PathLike,
+    *,
+    src_dir_fd: int,
+    dst_dir_fd: int,
+) -> None:
+    """Atomically rename *src* to an absent *dst*, or raise.
+
+    Unlike :func:`os.rename`, an existing destination is never replaced. Both
+    names are resolved relative to caller-pinned directory descriptors. A
+    filesystem or platform that cannot preserve that contract raises
+    :class:`NotImplementedError`; callers must not fall back to a check followed
+    by ordinary rename because another writer can create the destination between
+    those two operations.
+    """
+    fn = _RENAME_NOREPLACE_FN
+    if fn is None:
+        raise NotImplementedError("atomic no-replace rename is unavailable")
+    src_bytes = os.fsencode(src)
+    dst_bytes = os.fsencode(dst)
+    ctypes.set_errno(0)
+    if (
+        fn(
+            src_dir_fd,
+            src_bytes,
+            dst_dir_fd,
+            dst_bytes,
+            _RENAME_NOREPLACE_FLAG,
+        )
+        == 0
+    ):
+        return
+    error = ctypes.get_errno()
+    if error in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error, os.strerror(error), os.fspath(dst))
+    unsupported = {errno.ENOSYS, errno.EINVAL}
+    unsupported.add(getattr(errno, "EOPNOTSUPP", errno.EINVAL))
+    unsupported.add(getattr(errno, "ENOTSUP", errno.EINVAL))
+    if error in unsupported:
+        raise NotImplementedError("filesystem lacks atomic no-replace rename")
+    raise OSError(error, os.strerror(error), os.fspath(dst))
 
 
 def tcc_protected_dirs_for_walk(root: str | os.PathLike) -> frozenset[str]:
@@ -212,20 +365,28 @@ def tcc_prune_walk_dirs(root: str, dirpath: str, dirnames: list[str]) -> list[st
 
 
 def ensure_utf8_console() -> None:
-    """Make stdout/stderr UTF-8 on Windows so KiroCrew's emoji output can't crash it.
+    """Keep Kiro Crew's process tree UTF-8 and repair current Windows streams.
 
     KiroCrew prints non-ASCII glyphs throughout its CLI/gateway output. On
     Windows the default console code page is cp1252, and when stdout is a pipe
     (e.g. the gateway launched detached with redirected output, or under the
     KiroCrewHub client) Python encodes prints as cp1252 — so the FIRST non-ASCII
     print raises ``UnicodeEncodeError: 'charmap' codec can't encode character``
-    and the process dies before the gateway binds. POSIX defaults to UTF-8, so
-    this is a no-op there. Best-effort: reconfigure (Python 3.7+) the streams to
-    UTF-8 with backslashreplace so a stray un-encodable char degrades to an
-    escape instead of crashing. Idempotent and safe to call once at startup.
+    and the process dies before the gateway binds.  On every platform, publish
+    the encoding contract for later re-exec and child processes; an inherited
+    ``PYTHONIOENCODING`` can otherwise override POSIX UTF-8 defaults too.  On
+    Windows, best-effort reconfigure (Python 3.7+) the current streams to UTF-8
+    with backslashreplace so a stray un-encodable char degrades to an escape
+    instead of crashing. Idempotent and safe to call once at startup.
     """
+    _ensure_utf8_process_environment()
     if not IS_WINDOWS:
         return
+    # Repair the current streams below, and separately make the invariant
+    # inheritable by MCP/session children and any later re-exec.  Environment
+    # variables affect the next interpreter at construction time; setting them
+    # here is intentional even though they cannot retroactively rebuild the
+    # current process's streams.
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name, None)
         if stream is None:  # pythonw / fully detached — no stream to fix
@@ -283,17 +444,16 @@ else:
 # EACCES), so an unbounded spin would turn a permission error into a hang.
 #
 # Two ceilings, because on-loop and off-loop have opposite needs:
-#  - OFF the loop (cron, home migration, app backends — threads/subprocesses):
-#    the wait must cover a legitimately long holder. home_migration holds the
-#    lock across a full copy+verify+delete of the data home, which can exceed
-#    many seconds, and a waiter there must NOT give up and race it. So use a
-#    generous ceiling that no real hold approaches, matching POSIX's "wait for
-#    the lock" as closely as a bounded spin can.
+#  - OFF the loop (cron, app backends — threads/subprocesses): the wait must
+#    cover a legitimately long holder that can hold the lock across a
+#    multi-second operation, and a waiter there must NOT give up and race it. So
+#    use a generous ceiling that no real hold approaches, matching POSIX's "wait
+#    for the lock" as closely as a bounded spin can.
 #  - ON the loop (e.g. bridges._mcp_lock during app enable): a spin-sleep would
 #    freeze chat/heartbeat, so that path never sleeps at all (single-shot).
 _WIN_LOCK_POLL_SECS = 0.01
-# Generous off-loop ceiling: longer than any legitimate hold (a large data-home
-# migration), short enough that a truly stuck/permission-denied fd still fails.
+# Generous off-loop ceiling: longer than any legitimate hold, short enough that
+# a truly stuck/permission-denied fd still fails.
 _WIN_LOCK_TIMEOUT_SECS = 300.0
 
 
@@ -308,9 +468,10 @@ def _win_acquire_blocking(fd: int, *, timeout: float = _WIN_LOCK_TIMEOUT_SECS) -
     loop is detected the acquire is single-shot — take it if free, else return
     False at once — and the caller fails closed rather than stalling the loop.
     Off the loop (the common case) it polls up to ``timeout`` as a real
-    blocking wait, so a legitimately long holder (a data-home migration) is
-    waited out rather than raced.
+    blocking wait, so a legitimately long holder is waited out rather than
+    raced.
     """
+
     def _try_once() -> bool:
         try:
             os.lseek(fd, 0, os.SEEK_SET)
@@ -468,6 +629,381 @@ def try_acquire_lock(fd: int, *, exclusive: bool = False) -> bool:
         return False
 
 
+def probe_file_persistence(directory: Path) -> str | None:
+    """Verify that *directory* supports every primitive the Kiro Crew
+    persistence paths depend on: creating a new file (``tempfile.mkstemp``),
+    writing bytes to it, taking an advisory lock (:func:`file_lock`),
+    atomically replacing it (``os.replace``), and removing it — the exact
+    operations ``atomic_write`` and the ``.lock``-file helpers perform.
+
+    Returns ``None`` when all of them work, otherwise a human-readable
+    description of the first failure. A process whose environment breaks any
+    of these primitives cannot save chat history, cron history, or session
+    state — but it CAN still serve traffic and append to already-open log fds,
+    so without this probe it limps along losing writes silently. The known way
+    to get into that state is inheriting a seccomp syscall filter from a
+    sandboxed parent (seccomp survives fork/exec, ``nohup`` included):
+    filtered syscalls fail with ``ENOSYS`` while everything else looks
+    healthy. The returned message names that cause when ``errno`` says so.
+
+    Probe files carry a ``.persistence-probe-`` prefix, and their removal is
+    part of the probed contract: an environment that allows creating files but
+    denies deleting them (delete-scoped ACLs) breaks the atomic
+    rename/replace paths just the same, so a failed cleanup is reported as a
+    preflight failure rather than suppressed. On the failure path probe files
+    are best-effort removed; one may remain only when removal itself is what
+    is broken.
+    """
+    fd: int | None = None
+    path: str | None = None
+    replaced: str | None = None
+    step = "create files in"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, path = tempfile.mkstemp(dir=directory, prefix=".persistence-probe-")
+        step = "write files in"
+        os.write(fd, b"probe")
+        step = "flush files in"
+        os.fsync(fd)
+        step = "lock files in"
+        with file_lock(fd, exclusive=True):
+            pass
+        os.close(fd)
+        fd = None
+        step = "atomically replace files in"
+        replaced = f"{path}.target"
+        # The same replace primitive atomic_write commits with: plain
+        # os.replace on POSIX, bounded retry over the Windows AV/indexer
+        # sharing-violation window — a healthy Windows data home must not fail
+        # the preflight over that transient. Imported lazily because
+        # atomic_write imports this module at top level.
+        from kiro_crew.atomic_write import replace_with_retry
+
+        replace_with_retry(path, replaced)
+        path = None
+        step = "remove files from"
+        os.unlink(replaced)
+        replaced = None
+    except OSError as exc:
+        hint = ""
+        if exc.errno == errno.ENOSYS:
+            hint = (
+                " (ENOSYS from a basic file syscall usually means this process"
+                " inherited a seccomp filter from a sandboxed parent — e.g. a"
+                " gateway spawned from inside an agent session; start it from a"
+                " regular shell or the system service instead)"
+            )
+        return f"cannot {step} {directory}: {exc}{hint}"
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        for leftover in (path, replaced):
+            if leftover is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(leftover)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Win32 struct layouts
+# ---------------------------------------------------------------------------
+# These MUST stay at module scope, never inside the functions that use them.
+# ``ctypes.POINTER(T)`` memoises T -> POINTER(T) in a module-level dict inside
+# ctypes and never evicts it, so a Structure subclass declared in a function
+# body pins a BRAND-NEW pair of type objects on every call. The helpers below
+# are polled (the dashboard's system metrics, the RSS-recycle watchdog, the
+# tree-kill parent-map walk, the MCP pipe's per-connection peer check), which
+# turns that into unbounded growth in a long-lived gateway. Declared once here,
+# the memo holds a single entry for the process lifetime.
+#
+# ``wintypes`` supplies type aliases only, so these definitions import cleanly
+# on POSIX; the functions below still resolve the DLLs lazily, which is what
+# keeps them patchable from the non-Windows test fleet.
+
+
+class _ProcessEntry32(ctypes.Structure):
+    """Toolhelp ``PROCESSENTRY32`` — process-enumeration snapshot entry."""
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", ctypes.c_char * 260),
+    ]
+
+
+class _ProcessMemoryCounters(ctypes.Structure):
+    """psapi ``PROCESS_MEMORY_COUNTERS`` — per-process working set."""
+
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+class _MemoryStatusEx(ctypes.Structure):
+    """kernel32 ``MEMORYSTATUSEX`` — system-wide physical memory."""
+
+    _fields_ = [
+        ("dwLength", wintypes.DWORD),
+        ("dwMemoryLoad", wintypes.DWORD),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+class _SidAndAttributes(ctypes.Structure):
+    """advapi32 ``SID_AND_ATTRIBUTES``."""
+
+    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+
+class _TokenUser(ctypes.Structure):
+    """advapi32 ``TOKEN_USER`` — the ``TokenUser`` information-class payload."""
+
+    _fields_ = [("User", _SidAndAttributes)]
+
+
+class _IoCounters(ctypes.Structure):
+    """kernel32 ``IO_COUNTERS`` — the I/O accounting block inside a job's limits.
+
+    Never read; present only so the extended-limit layout below has the correct
+    size and field offsets.
+    """
+
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    """kernel32 ``JOBOBJECT_BASIC_LIMIT_INFORMATION``."""
+
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    """kernel32 ``JOBOBJECT_EXTENDED_LIMIT_INFORMATION`` — the ceiling payload.
+
+    ``ActiveProcessLimit`` (in the basic block) bounds the process count where
+    ``TasksMax`` bounds tasks, and ``JobMemoryLimit`` is the ``MemoryMax``
+    equivalent. See :func:`apply_job_limits` for why the process row is not a
+    one-for-one mapping.
+    """
+
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class _ThreadEntry32(ctypes.Structure):
+    """Toolhelp ``THREADENTRY32`` — thread-enumeration snapshot entry.
+
+    Used by :func:`resume_process_main_thread`, which takes
+    ``ctypes.POINTER(_ThreadEntry32)`` for the ``Thread32First`` /
+    ``Thread32Next`` argtypes — so this layout in particular MUST stay at module
+    scope: it is pointed at, which is exactly what pins a type in ctypes'
+    unbounded memo, and the helper runs once per agent spawn.
+    """
+
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", wintypes.LONG),
+        ("tpDeltaPri", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Process introspection
+# ---------------------------------------------------------------------------
+
+# Byte layout of the macOS ``proc_vnodepathinfo`` struct filled by
+# ``proc_pidinfo(PROC_PIDVNODEPATHINFO)``: two ``vnode_info_path`` records (the
+# process's cwd, then its root), each a fixed-size ``vnode_info`` header
+# followed by a NUL-terminated path of up to ``MAXPATHLEN``. Only the header
+# size matters to us, since it is the offset the cwd path starts at.
+_DARWIN_PROC_PIDVNODEPATHINFO = 9
+_DARWIN_VNODE_INFO_SIZE = 152
+_DARWIN_MAXPATHLEN = 1024
+_DARWIN_VNODE_INFO_PATH_SIZE = _DARWIN_VNODE_INFO_SIZE + _DARWIN_MAXPATHLEN
+_DARWIN_PROC_VNODEPATHINFO_SIZE = 2 * _DARWIN_VNODE_INFO_PATH_SIZE
+
+# ``proc_pidinfo(PROC_PIDTBSDINFO)`` fills a ``proc_bsdinfo`` struct whose
+# start-time pair lives at fixed offsets: 12 leading uint32 fields (48 bytes),
+# ``pbi_comm[16]`` + ``pbi_name[32]`` (96), then 6 more 4-byte fields (120),
+# then ``pbi_start_tvsec`` / ``pbi_start_tvusec`` as two uint64s (120 / 128,
+# struct size 136). Only those two matter here; the total size doubles as the
+# layout check.
+_DARWIN_PROC_PIDTBSDINFO = 3
+_DARWIN_PROC_BSDINFO_SIZE = 136
+_DARWIN_PBI_START_TVSEC_OFFSET = 120
+_DARWIN_PBI_START_TVUSEC_OFFSET = 128
+
+_darwin_libproc: Any = None
+_darwin_libproc_loaded = False
+
+
+def _darwin_libproc_handle() -> Any:
+    """Cached ``libproc`` handle, or None when it cannot be loaded.
+
+    Cached rather than opened per call because the cwd probe runs on a poll
+    cadence per open terminal, and a fresh ``CDLL`` would dlopen every time.
+    """
+    global _darwin_libproc, _darwin_libproc_loaded
+    if _darwin_libproc_loaded:
+        return _darwin_libproc
+    _darwin_libproc_loaded = True
+    try:
+        path = ctypes.util.find_library("proc")
+        if path is None:
+            return None
+        lib = ctypes.CDLL(path)
+        lib.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        lib.proc_pidinfo.restype = ctypes.c_int
+        _darwin_libproc = lib
+    except Exception:
+        _darwin_libproc = None
+    return _darwin_libproc
+
+
+def _darwin_process_cwd(pid: int) -> str | None:
+    """macOS cwd of *pid* via ``libproc``, or None when it cannot be read.
+
+    Requires no entitlement for a same-uid process. The kernel reports how many
+    bytes it filled; anything other than the exact struct size means the layout
+    assumed by the offsets above no longer matches, so the answer is refused
+    rather than sliced out of the wrong place.
+    """
+    lib = _darwin_libproc_handle()
+    if lib is None:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(_DARWIN_PROC_VNODEPATHINFO_SIZE)
+        filled = lib.proc_pidinfo(
+            pid,
+            _DARWIN_PROC_PIDVNODEPATHINFO,
+            0,
+            buf,
+            _DARWIN_PROC_VNODEPATHINFO_SIZE,
+        )
+        if filled != _DARWIN_PROC_VNODEPATHINFO_SIZE:
+            return None
+        raw = buf.raw[_DARWIN_VNODE_INFO_SIZE:_DARWIN_VNODE_INFO_PATH_SIZE]
+        cwd = raw.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+        return cwd or None
+    except Exception:
+        return None
+
+
+def _darwin_process_start_microtime(pid: int) -> str | None:
+    """macOS start time of *pid* via ``libproc``, at microsecond resolution.
+
+    ``proc_pidinfo(PROC_PIDTBSDINFO)`` needs no entitlement for a same-uid
+    process and never spawns a subprocess. The value is the absolute wall-clock
+    start instant (``pbi_start_tvsec`` / ``pbi_start_tvusec``), so it stays
+    unique across reboots and is six decimal orders finer than the 1s ``ps -o
+    lstart=`` probe — fine enough that a recycled PID cannot alias within the
+    same second. The kernel reports how many bytes it filled; anything other
+    than the exact struct size means the layout assumed by the offsets above no
+    longer matches, so the answer is refused rather than sliced out of the
+    wrong place (same rule as the cwd probe).
+    """
+    lib = _darwin_libproc_handle()
+    if lib is None:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(_DARWIN_PROC_BSDINFO_SIZE)
+        filled = lib.proc_pidinfo(
+            pid,
+            _DARWIN_PROC_PIDTBSDINFO,
+            0,
+            buf,
+            _DARWIN_PROC_BSDINFO_SIZE,
+        )
+        if filled != _DARWIN_PROC_BSDINFO_SIZE:
+            return None
+        # Both x86_64 and arm64 macOS are little-endian.
+        sec = int.from_bytes(
+            buf.raw[_DARWIN_PBI_START_TVSEC_OFFSET:_DARWIN_PBI_START_TVUSEC_OFFSET], "little"
+        )
+        usec = int.from_bytes(
+            buf.raw[_DARWIN_PBI_START_TVUSEC_OFFSET:_DARWIN_PROC_BSDINFO_SIZE], "little"
+        )
+        if sec <= 0:
+            return None
+        return f"{sec}.{usec:06d}"
+    except Exception:
+        return None
+
+
+def process_cwd(pid: int) -> str | None:
+    """Current working directory of *pid*, or None when no source can answer.
+
+    Never spawns a subprocess. Callers poll this per open terminal, where a
+    fork+exec of the whole gateway costs orders of magnitude more than the
+    answer is worth. ``/proc`` serves Linux; macOS goes to ``libproc``. Windows
+    and any host with neither source get None, leaving the caller to decide
+    whether a costlier fallback is warranted.
+    """
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        pass
+    if sys.platform == "darwin":
+        return _darwin_process_cwd(pid)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Process termination / existence
 # ---------------------------------------------------------------------------
@@ -514,26 +1050,13 @@ def get_ppid(pid: int) -> int:
 
             TH32CS_SNAPPROCESS = 0x00000002  # noqa: N806 — Windows API constant
             kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-
-            class PE32(ctypes.Structure):
-                _fields_ = [
-                    ("dwSize", wintypes.DWORD),
-                    ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD),
-                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                    ("th32ModuleID", wintypes.DWORD),
-                    ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD),
-                    ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", wintypes.DWORD),
-                    ("szExeFile", ctypes.c_char * 260),
-                ]
+            entry_ptr = ctypes.POINTER(_ProcessEntry32)
 
             kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
             kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-            kernel32.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE32)]
+            kernel32.Process32First.argtypes = [wintypes.HANDLE, entry_ptr]
             kernel32.Process32First.restype = wintypes.BOOL
-            kernel32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE32)]
+            kernel32.Process32Next.argtypes = [wintypes.HANDLE, entry_ptr]
             kernel32.Process32Next.restype = wintypes.BOOL
             kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
             kernel32.CloseHandle.restype = wintypes.BOOL
@@ -542,8 +1065,8 @@ def get_ppid(pid: int) -> int:
             if snap == wintypes.HANDLE(-1).value:
                 return -1
             try:
-                entry = PE32()
-                entry.dwSize = ctypes.sizeof(PE32)
+                entry = _ProcessEntry32()
+                entry.dwSize = ctypes.sizeof(_ProcessEntry32)
                 if not kernel32.Process32First(snap, ctypes.byref(entry)):
                     return -1
                 while True:
@@ -643,7 +1166,42 @@ def _descendants_from_parent_map(root_pid: int, parent_map: dict[int, int]) -> l
     return result
 
 
-_TRUSTED_SYSTEM_BIN_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+@functools.lru_cache(maxsize=None)
+def _folded_env_allowlist(allowed: frozenset[str] | tuple[str, ...]) -> frozenset[str]:
+    """Upper-cased view of *allowed*, cached per allowlist constant."""
+    return frozenset(name.upper() for name in allowed)
+
+
+def env_key_allowed(key: str, allowed: frozenset[str] | tuple[str, ...]) -> bool:
+    """Whether env-var *key* is in *allowed*, honoring Windows' case-insensitive env.
+
+    On Windows, environment variable names are case-INSENSITIVE and CPython's
+    ``os.environ`` upper-cases every key, so ``os.environ.items()`` yields
+    ``SYSTEMROOT`` — never the ``SystemRoot`` spelling Microsoft documents and
+    that env allowlists are written in. A literal membership test therefore
+    drops exactly the variables the allowlist was extended to carry, and the
+    failure is silent at the boundary and only surfaces in the spawned child as
+    an unrelated-looking error: a Windows process without ``SystemRoot`` cannot
+    resolve side-by-side assemblies or initialize Winsock, so it dies before
+    ``main()`` or fails a fetch with ``getaddrinfo() thread failed to start``.
+
+    Folding on Windows only, rather than upper-casing the allowlists, keeps
+    POSIX exact: ``PATH`` and ``Path`` are genuinely different variables there,
+    and a case-insensitive match would let a lookalike through.
+
+    This is the single shared membership predicate for subprocess env
+    allowlists. Each caller keeps its own *allowed* set — the sets are
+    deliberately different trust boundaries — and only the matching convention
+    is shared, so correctness never depends on an individual allowlist's
+    casing. *allowed* must be hashable (a frozenset or tuple); the folded view
+    is cached per distinct allowlist value.
+    """
+    if IS_WINDOWS:
+        return key.upper() in _folded_env_allowlist(allowed)
+    return key in allowed
+
+
+_TRUSTED_SYSTEM_BIN_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/run/current-system/sw/bin")
 
 # Windows argv carries a bare name (``taskkill``) while the file on disk carries
 # an extension (``taskkill.exe``), so a trusted lookup must try the suffixes the
@@ -661,6 +1219,17 @@ def _windows_system_dirs() -> tuple[str, ...]:
     unexpected case where the API call fails. PowerShell ships in a versioned
     directory beside the system binaries, not inside it, so it is appended per
     root rather than assumed to sit alongside ``taskkill``.
+
+    **The early ``return`` below is what makes "fallback" mean fallback**, and it is
+    load-bearing rather than tidy. Appending the environment-derived path alongside a
+    successful API read reintroduces the input this function exists to avoid: it carries
+    a different casefold from what ``GetSystemDirectoryW`` reports, so the dedupe does
+    not collapse the two, and any caller treating the result as "directories the user
+    cannot write" then trusts a path the user names. Measured: with ``SystemRoot``
+    pointed at a temp directory, ``<temp>\\System32`` appears in this tuple while the API
+    answers normally, and ``computer_use.launch_windows`` accepts a binary planted there
+    as system-installed. ``HKCU\\Environment`` is writable without elevation, so a
+    restarted process inherits such a value.
     """
 
     dirs: list[str] = []
@@ -673,11 +1242,15 @@ def _windows_system_dirs() -> tuple[str, ...]:
             dirs.append(buf.value)
     except Exception:
         pass
+    if dirs:
+        # The API answered. Adding an environment-derived sibling here would buy
+        # nothing (the real directory is already in hand) and would cost the
+        # guarantee every caller of this function relies on.
+        return tuple(dirs) + tuple(os.path.join(d, "WindowsPowerShell", "v1.0") for d in dirs)
     root = os.environ.get("SystemRoot") or r"C:\Windows"
-    # Case-insensitive dedupe: GetSystemDirectoryW reports the on-disk casing
-    # ("C:\Windows\system32"), which names the same directory as the
-    # conventionally-cased fallback and must not be probed twice.
-    seen = {d.casefold() for d in dirs}
+    # Case-insensitive dedupe: the conventionally-cased fallback can name the same
+    # directory as the environment-derived one and must not be probed twice.
+    seen: set[str] = set()
     for fallback in (os.path.join(root, "System32"), r"C:\Windows\System32"):
         if fallback.casefold() not in seen:
             seen.add(fallback.casefold())
@@ -723,6 +1296,41 @@ def _log_tool_outside_trusted_dirs(name: str, directories: tuple[str, ...]) -> N
     )
 
 
+#: Git for Windows' fixed install roots. ``trusted_system_bin`` only probes the
+#: system directories, and git is never there on Windows, so without this every
+#: Windows source install resolves ``git`` to ``None``. Fixed literal roots, not
+#: ``%ProgramFiles%``: reading the environment would let a poisoned variable
+#: redirect the lookup to an agent-writable directory — the exact hole the pin
+#: exists to close. A non-default-drive install still misses and degrades to
+#: "unavailable", which is honest: the fallback widens the pin only to paths an
+#: unprivileged attacker cannot write.
+_WINDOWS_GIT_DIRS = (
+    r"C:\Program Files\Git\cmd",
+    r"C:\Program Files (x86)\Git\cmd",
+)
+
+
+def trusted_git_bin() -> str | None:
+    """The ``git`` executable resolved off ``PATH``, or ``None`` if untrustworthy.
+
+    :func:`trusted_system_bin` plus the Windows install-root fallback, shared by
+    every caller that spawns git for a privileged or unattended purpose (the
+    doctor's read-only probes, and the update seam — where what git returns
+    decides which code the process installs and re-executes).
+
+    ``None`` means "do not spawn git at all". Callers MUST treat it as a refusal;
+    falling back to a bare ``"git"`` reinstates the hazard.
+    """
+    git = trusted_system_bin("git")
+    if git is None and IS_WINDOWS:
+        for directory in _WINDOWS_GIT_DIRS:
+            candidate = os.path.join(directory, "git.exe")
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+    return git
+
+
 def trusted_system_bin(name: str) -> str | None:
     """Resolve *name* from fixed system directories, ignoring ``PATH``.
 
@@ -754,6 +1362,142 @@ def trusted_system_bin(name: str) -> str | None:
                 return candidate
     _log_tool_outside_trusted_dirs(name, directories)
     return None
+
+
+def trusted_system_path() -> str | None:
+    """A ``PATH`` value containing only the trusted system directories.
+
+    Pinning a spawned binary is not always enough: some launchers are shell
+    scripts that dispatch to helpers of their own through ``PATH``, and
+    ``xdg-open`` is the one that matters here — it reaches for ``gio``,
+    ``gvfs-open``, ``exo-open`` or ``kde-open``. Handing such a process the
+    gateway's inherited ``PATH`` would reopen at one remove exactly the hole
+    :func:`trusted_system_bin` closes, so callers replace ``PATH`` with this and
+    leave the rest of the environment alone (``DISPLAY``,
+    ``DBUS_SESSION_BUS_ADDRESS`` and ``XDG_*`` are what let a launcher reach the
+    running desktop session).
+
+    ``None`` on Windows, where helpers live beside their install rather than
+    being resolved from a colon-separated search path.
+    """
+
+    if IS_WINDOWS:
+        return None
+    return os.pathsep.join(_TRUSTED_SYSTEM_BIN_DIRS)
+
+
+def reveal_in_file_manager(target: str) -> bool:
+    """Show *target* in the host's file manager. ``True`` if a launcher started.
+
+    Off macOS the **containing folder** is opened, never the target itself, and
+    unconditionally so: ``explorer.exe <file>`` launches the file's *associated
+    application* — the execution sink this capability exists to avoid — and making
+    the rule structural means a caller handing over a request-derived path cannot
+    reach it, with no filesystem probe of that path needed to decide. It also
+    matches what this endpoint already did before the launcher moved here. macOS is
+    the exception that needs no derivation: ``open -R`` reveals its argument and
+    never opens it.
+
+    This lives beside :func:`trusted_system_bin` rather than in the dashboard
+    handler that wants it, because three separate rules meet on the ``Popen``
+    lines below and only this location satisfies all of them:
+
+    * The launcher must be an ABSOLUTE path, never a bare ``open`` / ``xdg-open``
+      argv name: a gateway's ``PATH`` can lead with an agent-writable directory,
+      so a bare name lets a planted shim run on a click the user initiated.
+    * Those absolute paths are POSIX path literals, which the cross-platform
+      portability gate rejects everywhere except this module — the module it
+      excludes precisely because such literals have to live somewhere.
+    * The command position must be a literal at the call site, with the
+      caller-supplied target as a later element of that same literal list.
+      Hoisting either into a variable makes the whole command line read as
+      user-controlled to the SAST passes.
+
+    A launcher that is absent (or present and refusing to run — AppLocker, a
+    revoked exec bit, an exhausted process table) returns ``False`` so the caller
+    can degrade rather than fail the request.
+    """
+
+    env = _reveal_env()
+    try:
+        if sys.platform == "darwin":
+            if not os.path.isfile("/usr/bin/open"):
+                return False
+            subprocess.Popen(["/usr/bin/open", "-R", target], env=env)
+            return True
+        # Everything else opens the CONTAINING FOLDER, never the target itself —
+        # `explorer.exe <file>` would launch the file's associated application, the
+        # execution sink this capability exists to avoid. Unconditional, so no
+        # filesystem probe of a caller-supplied path is needed to decide, and so a
+        # caller cannot reach the sink by handing over a file.
+        folder = os.path.dirname(target)
+        if not folder:
+            return False
+        if IS_WINDOWS:
+            # A literal, so the command position stays constant. The conventional
+            # location is not universal, so an image that keeps Windows elsewhere
+            # reads as "no file manager here" rather than spawning something else.
+            if not os.path.isfile(r"C:\Windows\explorer.exe"):
+                return False
+            subprocess.Popen([r"C:\Windows\explorer.exe", folder], env=env)
+            return True
+        if not os.path.isfile("/usr/bin/xdg-open"):
+            return False
+        subprocess.Popen(["/usr/bin/xdg-open", folder], env=env)
+        return True
+    except OSError:
+        logger.warning(
+            "file manager did not start for %s; caller should degrade", target, exc_info=True
+        )
+        return False
+
+
+def open_with_default_app(target: str) -> bool:
+    """Launch *target* with its associated application. ``True`` if it started.
+
+    Separate from :func:`reveal_in_file_manager` because it is the opposite
+    intent — this one deliberately RUNS what the path points at — and because
+    Windows is refused outright: there, launching by association is reached
+    through the shell rather than an argv the caller can inspect, and the path
+    typically arrives from a request. POSIX keeps it: ``open`` / ``xdg-open`` hand
+    the file to the desktop's handler without a shell in between.
+    """
+
+    if IS_WINDOWS:
+        return False
+    env = _reveal_env()
+    try:
+        if sys.platform == "darwin":
+            if not os.path.isfile("/usr/bin/open"):
+                return False
+            subprocess.Popen(["/usr/bin/open", target], env=env)
+            return True
+        if not os.path.isfile("/usr/bin/xdg-open"):
+            return False
+        subprocess.Popen(["/usr/bin/xdg-open", target], env=env)
+        return True
+    except OSError:
+        logger.warning(
+            "default application did not start for %s; caller should degrade", target, exc_info=True
+        )
+        return False
+
+
+def _reveal_env() -> dict[str, str]:
+    """The gateway environment with ``PATH`` pinned to trusted system directories.
+
+    Pinning the launcher binary is not enough on its own: ``xdg-open`` is a shell
+    script that dispatches to whichever helper it finds on ``PATH`` — ``gio``,
+    ``gvfs-open``, ``exo-open``, ``kde-open``. Only ``PATH`` is replaced, because
+    the rest of the environment is what lets a launcher reach the running desktop
+    session (``DISPLAY``, ``DBUS_SESSION_BUS_ADDRESS``, ``XDG_*``).
+    """
+
+    env = dict(os.environ)
+    pinned = trusted_system_path()
+    if pinned is not None:
+        env["PATH"] = pinned
+    return env
 
 
 def tool_outside_trusted_dirs(name: str) -> str | None:
@@ -813,9 +1557,7 @@ def process_descendants(pid: int) -> list[int]:
     if type(pid) is not int or pid <= 1:
         return []
     try:
-        parent_map = (
-            _windows_process_parent_map() if IS_WINDOWS else _posix_process_parent_map()
-        )
+        parent_map = _windows_process_parent_map() if IS_WINDOWS else _posix_process_parent_map()
     except Exception:  # noqa: BLE001 - introspection must never break a kill path
         return []
     return _descendants_from_parent_map(pid, parent_map)
@@ -830,31 +1572,13 @@ def _windows_process_parent_map() -> dict[int, int]:
         th32cs_snapprocess = 0x00000002
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
 
-        class ProcessEntry32(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", ctypes.c_char * 260),
-            ]
+        entry_ptr = ctypes.POINTER(_ProcessEntry32)
 
         kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
         kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.Process32First.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(ProcessEntry32),
-        ]
+        kernel32.Process32First.argtypes = [wintypes.HANDLE, entry_ptr]
         kernel32.Process32First.restype = wintypes.BOOL
-        kernel32.Process32Next.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(ProcessEntry32),
-        ]
+        kernel32.Process32Next.argtypes = [wintypes.HANDLE, entry_ptr]
         kernel32.Process32Next.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
@@ -865,8 +1589,8 @@ def _windows_process_parent_map() -> dict[int, int]:
         if snapshot == wintypes.HANDLE(-1).value:
             raise OSError("Windows process snapshot creation failed")
         try:
-            entry = ProcessEntry32()
-            entry.dwSize = ctypes.sizeof(ProcessEntry32)
+            entry = _ProcessEntry32()
+            entry.dwSize = ctypes.sizeof(_ProcessEntry32)
             if not kernel32.Process32First(snapshot, ctypes.byref(entry)):
                 raise OSError("Windows first process enumeration failed")
             result: dict[int, int] = {}
@@ -971,9 +1695,9 @@ def _windows_last_error() -> int:
 
 
 # Bounds for the exited-but-exit-FILETIME-unpublished window (see
-# _windows_process_handle_identity). The observed window closes within ~20ms;
-# the ceiling is generous enough to absorb a loaded host without letting a
-# genuinely unreadable handle stall a caller.
+# _windows_process_handle_identity). The window closes within a few tens of
+# milliseconds; the ceiling is generous enough to absorb a loaded host without
+# letting a genuinely unreadable handle stall a caller.
 _WINDOWS_EXIT_FILETIME_TIMEOUT_SECS = 0.25
 _WINDOWS_EXIT_FILETIME_POLL_SECS = 0.002
 
@@ -1043,11 +1767,10 @@ def _windows_process_handle_identity(handle: int) -> tuple[int, int, int | None]
         exit_value = _filetime_value(exit_)
         # GetExitCodeProcess reports the exit BEFORE the kernel publishes the
         # exit FILETIME, so a just-terminated process reads back as
-        # exited-with-exit_time==0 for a sub-millisecond-to-tens-of-milliseconds
-        # window (observed on 57/60 back-to-back spawns, resolving in
-        # 0.05-20ms). Treating that window as "no identity" makes the caller
-        # reject a perfectly good handle, so poll briefly for the real value
-        # instead. The bound stays short because the only alternative to a
+        # exited-with-exit_time==0 for a brief window (sub-millisecond to a few
+        # tens of milliseconds). Treating that window as "no identity" makes the
+        # caller reject a perfectly good handle, so poll briefly for the real
+        # value. The bound stays short because the only alternative to a
         # published exit time is refusing the handle.
         if not active and exit_value <= 0:
             deadline = time.monotonic() + _WINDOWS_EXIT_FILETIME_TIMEOUT_SECS
@@ -1284,26 +2007,13 @@ def _win_process_image_name(pid: int) -> str | None:
 
         TH32CS_SNAPPROCESS = 0x00000002  # noqa: N806 — Windows API constant
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-
-        class PE32(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", ctypes.c_char * 260),
-            ]
+        entry_ptr = ctypes.POINTER(_ProcessEntry32)
 
         kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
         kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE32)]
+        kernel32.Process32First.argtypes = [wintypes.HANDLE, entry_ptr]
         kernel32.Process32First.restype = wintypes.BOOL
-        kernel32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE32)]
+        kernel32.Process32Next.argtypes = [wintypes.HANDLE, entry_ptr]
         kernel32.Process32Next.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
@@ -1312,8 +2022,8 @@ def _win_process_image_name(pid: int) -> str | None:
         if snap == wintypes.HANDLE(-1).value:
             return None
         try:
-            entry = PE32()
-            entry.dwSize = ctypes.sizeof(PE32)
+            entry = _ProcessEntry32()
+            entry.dwSize = ctypes.sizeof(_ProcessEntry32)
             if not kernel32.Process32First(snap, ctypes.byref(entry)):
                 return None
             while True:
@@ -1325,6 +2035,61 @@ def _win_process_image_name(pid: int) -> str | None:
             kernel32.CloseHandle(snap)
     except Exception:
         return None
+
+
+def process_argv_matches_exact(pid: int, expected_argv: Sequence[str]) -> bool:
+    """Return True iff *pid*'s FULL command line is exactly *expected_argv*.
+
+    The strict identity check behind reclaiming a child this process's own
+    lineage spawned and then lost (a recorded pid surviving a supervisor
+    hard-kill): a recorded pid may have been recycled onto an unrelated
+    process, and :func:`process_matches`-style substring needles cannot tell
+    the two apart — partial argv matching against the process table is exactly
+    what once killed forwards operators had started themselves. So the whole
+    argv must match, element for element, and every failure answers False.
+
+    For a DESTRUCTIVE decision this check must be paired with a
+    :func:`process_start_time` pin recorded when the child was spawned: argv
+    equality alone cannot rule out a recycled pid running an identical
+    command line, and on macOS the comparison basis below makes equality
+    necessary but not sufficient for vector equality. The pair fails toward
+    "do not signal" on either mismatch.
+
+    Linux: ``/proc/<pid>/cmdline`` NUL-split and compared element-wise (an
+    empty cmdline — a zombie — never matches). macOS: ``ps -ww -o command=``
+    reports the argv space-joined, so the comparison is against
+    ``" ".join(expected_argv)``; exact only when no expected element contains
+    a space, which holds for the argv shapes this guards (option tokens and
+    validated host/target strings). Windows: always False — the raw
+    ``Win32_Process.CommandLine`` string (see :func:`process_command_line`)
+    carries shell quoting rather than an argv vector, so element-exact
+    equality is not verifiable there; the guard fails closed and callers must
+    not signal.
+    """
+    if type(pid) is not int or pid <= 1 or not expected_argv:
+        return False
+    try:
+        if sys.platform == "linux":
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            if not raw:
+                return False  # zombie / kernel thread: no argv to confirm
+            parts = raw.split(b"\0")
+            if parts and parts[-1] == b"":
+                parts.pop()  # trailing NUL terminator
+            return parts == [a.encode() for a in expected_argv]
+        if sys.platform == "darwin":
+            ps_bin = trusted_system_bin("ps")
+            if ps_bin is None:
+                return False
+            out = subprocess.check_output(
+                [ps_bin, "-ww", "-o", "command=", "-p", str(pid)],
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            return out.decode(errors="replace").strip() == " ".join(expected_argv)
+    except Exception:
+        return False
+    return False
 
 
 def listening_pid_tool() -> str:
@@ -1349,15 +2114,96 @@ def listening_pid_tool_available() -> bool:
     return trusted_system_bin(listening_pid_tool()) is not None
 
 
-def find_listening_pids(port: int) -> list[int]:
-    """Return PIDs with a LISTEN socket on TCP *port* (best-effort, deduped).
+class PortListener(NamedTuple):
+    """One LISTEN socket on a TCP port: the owning PID plus the local address
+    it bound, so callers can scope port ownership to the address they actually
+    probed instead of claiming every listener on the port."""
 
-    POSIX: ``lsof -ti TCP:<port> -sTCP:LISTEN``.
-    Windows: parse ``netstat -ano`` (no lsof; netstat ships in-box). Matches
-    rows whose local address ends in ``:<port>`` and whose state is LISTENING,
-    taking the PID from the last column. Returns ``[]`` on any failure (caller
-    treats "no PID found" as "nothing to stop"; use listening_pid_tool_available()
-    to tell a genuine empty result apart from the tool being absent).
+    pid: int
+    #: Normalized local host part, brackets stripped: ``"127.0.0.1"``,
+    #: ``"0.0.0.0"``, ``"::"``, ``"::1"``, a specific interface address, or
+    #: ``"*"`` (lsof prints the wildcard bind of either family as ``*``).
+    address: str
+    #: Address family: ``"4"``, ``"6"``, or ``""`` when the source did not say.
+    #: Load-bearing for wildcards — lsof spells both families ``*``, and only
+    #: the family tells a v4 wildcard apart from a possibly-v6-only one.
+    family: str = ""
+
+
+# Local addresses whose listener can receive a connect to ``127.0.0.1``: the v4
+# loopback itself, the v4 wildcard, lsof's family-agnostic wildcard ``*``, and
+# the v6 wildcard ``::`` (dual-stack sockets accept v4-mapped loopback; treating
+# it as non-covering would refuse adoption of a legitimately ``[::]``-bound
+# backend, which is the breaking direction). ``::1`` is deliberately absent: a
+# v6-loopback-only listener can never answer a probe addressed to 127.0.0.1.
+_LOOPBACK_COVERING_ADDRESSES = frozenset({"127.0.0.1", "0.0.0.0", "*", "::"})
+
+# Bound so a wedged lsof (stale mount, jammed process table) degrades to "no
+# listener found" instead of hanging every caller of the port->PID lookup; the
+# Windows netstat branch carries its own inline bound.
+_LSOF_TIMEOUT_SECS = 5
+
+
+def _normalize_local_address(address: str) -> str:
+    """Bare lowercase host part: brackets stripped, v4-mapped prefix removed."""
+    addr = address.strip().strip("[]").lower()
+    if addr.startswith("::ffff:"):
+        # v4-mapped form of a v4 address; compare the embedded v4 part.
+        addr = addr[len("::ffff:") :]
+    return addr
+
+
+def address_covers_loopback(address: str) -> bool:
+    """Whether a listener bound to *address* can receive a ``127.0.0.1`` connect.
+
+    Used to scope port ownership to the address a health probe actually talked
+    to: a listener on some other specific local address shares the port number
+    but was never the thing that answered the probe.
+    """
+    return _normalize_local_address(address) in _LOOPBACK_COVERING_ADDRESSES
+
+
+def loopback_owner_pids(listeners: list[PortListener]) -> list[int]:
+    """PIDs of the listener(s) a successful ``127.0.0.1:<port>`` connect reached.
+
+    Mirrors the kernel's most-specific-bind dispatch — the first non-empty
+    tier wins, and every PID within it is returned (pre-fork / multi-worker
+    backends legitimately share one listening socket):
+
+    1. Exact v4-loopback binds (``127.0.0.1``, incl. the v4-mapped spelling):
+       when one exists the kernel routes a loopback connect to it, so wildcard
+       listeners on the same port never saw the probe.
+    2. IPv4 wildcard binds: a v4 connect reaches the v4 wildcard socket in
+       preference to a dual-stack v6 one.
+    3. Remaining loopback-covering binds (the v6 wildcard, or one whose family
+       the source did not report): callers only ask after a successful
+       127.0.0.1 probe, so when nothing more specific exists, what is left
+       must have been the responder (a dual-stack socket).
+
+    Tier 2 is what keeps an unrelated ``IPV6_V6ONLY`` wildcard process from
+    being claimed alongside the real v4 owner sharing its port.
+    """
+    exact = [e for e in listeners if _normalize_local_address(e.address) == "127.0.0.1"]
+    if exact:
+        return list(dict.fromkeys(e.pid for e in exact))
+    covering = [e for e in listeners if address_covers_loopback(e.address)]
+    v4 = [e for e in covering if e.family == "4"]
+    if v4:
+        return list(dict.fromkeys(e.pid for e in v4))
+    return list(dict.fromkeys(e.pid for e in covering))
+
+
+def find_port_listeners(port: int) -> list[PortListener]:
+    """Return (pid, local address) for each LISTEN socket on TCP *port*.
+
+    Best-effort, deduped on (pid, address, family), never raises. POSIX asks
+    ``lsof -nP -iTCP:<port> -sTCP:LISTEN -Fptn`` (field output per socket:
+    ``p<pid>``, ``t<IPv4|IPv6>``, ``n<addr>:<port>``); Windows parses
+    ``netstat -ano`` (no lsof; netstat ships in-box), matching rows whose
+    local address ends in ``:<port>`` and whose state is LISTENING. Returns
+    ``[]`` on any failure (callers treat "no listener found" as "nothing to
+    stop"; use listening_pid_tool_available() to tell a genuine empty result
+    apart from the tool being absent).
     """
     if IS_POSIX:
         lsof_bin = trusted_system_bin("lsof")
@@ -1365,13 +2211,41 @@ def find_listening_pids(port: int) -> list[int]:
             return []
         try:
             out = subprocess.check_output(
-                [lsof_bin, "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+                # -n/-P keep addresses and ports numeric so the field parse
+                # below never sees a resolved host or service name; the t
+                # (type) field carries the family, without which the two
+                # wildcard binds are indistinguishable (both print ``*``).
+                [lsof_bin, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fptn"],
                 text=True,
                 stderr=subprocess.DEVNULL,
+                timeout=_LSOF_TIMEOUT_SECS,
             )
-        except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            # CalledProcessError included: lsof exits non-zero when nothing
+            # matches the filter, which is the ordinary "port is free" answer.
             return []
-        return list(dict.fromkeys(int(p) for p in out.split() if p.strip().isdigit()))
+        suffix = f":{port}"
+        listeners: list[PortListener] = []
+        seen: set[PortListener] = set()
+        cur_pid: int | None = None
+        cur_family = ""
+        for line in out.splitlines():
+            if not line:
+                continue
+            tag, value = line[0], line[1:]
+            if tag == "p":
+                cur_pid = int(value) if value.isdigit() else None
+                cur_family = ""
+            elif tag == "t":
+                cur_family = {"IPv4": "4", "IPv6": "6"}.get(value, "")
+            elif tag == "n" and cur_pid is not None and value.endswith(suffix):
+                # ``n127.0.0.1:8080`` / ``n*:8080`` / ``n[::1]:8080`` — strip
+                # the port suffix and the v6 brackets to the bare host part.
+                entry = PortListener(cur_pid, value[: -len(suffix)].strip("[]"), cur_family)
+                if entry not in seen:
+                    seen.add(entry)
+                    listeners.append(entry)
+        return listeners
     # Windows: netstat -ano. Lines look like:
     #   TCP    127.0.0.1:7777         0.0.0.0:0    LISTENING    17152   (IPv4)
     #   TCP    [::1]:7777             [::]:0       LISTENING    17152   (IPv6)
@@ -1403,7 +2277,8 @@ def find_listening_pids(port: int) -> list[int]:
     except (FileNotFoundError, subprocess.SubprocessError, OSError, ValueError):
         return []
     suffix = f":{port}"
-    pids: list[int] = []
+    listeners = []
+    seen = set()
     for line in out.splitlines():
         parts = line.split()
         # Expect: proto local foreign state pid.
@@ -1434,10 +2309,29 @@ def find_listening_pids(port: int) -> list[int]:
             continue
         pid_str = parts[-1]
         if pid_str.isdigit():
-            pids.append(int(pid_str))
-    # Dedup: a dual-stack listener appears in BOTH a TCP4 row (0.0.0.0:port)
-    # and a TCP6 row ([::]:port) under the same PID — collapse to one entry.
-    return list(dict.fromkeys(pids))
+            # The bracketed address form is what distinguishes v4 vs v6 on
+            # Windows netstat output (the proto column says "TCP" for both).
+            entry = PortListener(
+                int(pid_str),
+                local[: -len(suffix)].strip("[]"),
+                "6" if local.startswith("[") else "4",
+            )
+            if entry not in seen:
+                seen.add(entry)
+                listeners.append(entry)
+    return listeners
+
+
+def find_listening_pids(port: int) -> list[int]:
+    """Return PIDs with a LISTEN socket on TCP *port* (best-effort, deduped).
+
+    Address-agnostic accessor over :func:`find_port_listeners` for callers that
+    only care whether/which processes hold the port. A dual-stack listener
+    appears once per bound address (``0.0.0.0`` and ``::``) under the same PID —
+    collapsed to one entry here, first-seen order preserved. Same failure
+    contract: ``[]`` on any failure, never raises.
+    """
+    return list(dict.fromkeys(entry.pid for entry in find_port_listeners(port)))
 
 
 def process_command_line(pid: int) -> str:
@@ -1500,7 +2394,7 @@ def process_owner_uid(pid: int) -> int | None:
     must decide what to do with ``None`` explicitly rather than assume a match.
 
     Used to confirm that a pid a client is about to trust belongs to the calling
-    user (see ``cli_server._gateway_owns_port``), which is what makes pid
+    user (see ``port_resolution._gateway_owns_port``), which is what makes pid
     recycling into a *foreign* user's process non-exploitable.
     """
     try:
@@ -1561,6 +2455,36 @@ def pid_liveness(pid: int) -> str:
     return PID_ALIVE if pid_exists(pid) else PID_DEAD
 
 
+def pgroup_exists(pgid: int) -> bool:
+    """Return True iff any member of process GROUP ``pgid`` is alive (best-effort).
+
+    The tree-faithful liveness probe for a child spawned with
+    ``start_new_session=True``: the launcher's pid doubles as the group id and
+    ordinary descendants keep it after the launcher exits, so the group
+    outlives the launcher exactly as long as any member does. A descendant
+    that ``setsid()``s out of the group evades this probe precisely as it
+    evades ``kill_process_tree`` -- callers that must catch those use the
+    escaped-children reapers, not this.
+
+    POSIX: ``os.killpg(pgid, 0)`` -- conservative on EPERM (unsignalable
+    reads as alive). Windows: process groups in this sense do not exist and
+    ``kill_process_tree`` already walks the whole child tree via
+    ``taskkill /T``, so the group id (== the launcher pid) is probed as a
+    plain pid via :func:`pid_exists`.
+    """
+    if not IS_POSIX:
+        return pid_exists(pgid)
+    if pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists but we can't signal it
+    return True
+
+
 def pid_exists(pid: int) -> bool:
     """Return True iff ``pid`` currently exists (best-effort).
 
@@ -1610,6 +2534,150 @@ def pid_exists(pid: int) -> bool:
         return getattr(ctypes, "get_last_error", lambda: 0)() == 5  # ERROR_ACCESS_DENIED → exists
     except Exception:
         return False
+
+
+#: Seconds before the ``ps`` start-time probe is abandoned. Only the BSD leg
+#: spawns anything; Linux reads /proc and Windows calls the kernel directly.
+_START_TIME_PS_TIMEOUT = 2
+
+
+def process_start_time(pid: int) -> str | None:
+    """Stable identity for WHEN *pid* started, or ``None`` when unreadable.
+
+    An opaque token whose only contract is that it compares equal across gateway
+    generations on the same host while the PID still names the same process
+    object, and unequal once that PID has been recycled onto another. Units
+    differ per platform and are deliberately not normalised -- nothing ever
+    compares one host's value against another's, and no caller parses it.
+
+    Callers use it as a PID-reuse guard before signalling, so an unreadable
+    value must fail SAFE: ``None`` means "identity unconfirmed", which every
+    caller treats as "do not kill".
+
+    * **Linux** -- ``/proc/<pid>/stat`` field 22 (start time in clock ticks
+      since boot): monotonic, locale-independent, and far finer than 1s, so
+      same-second reuse cannot alias.
+    * **Windows** -- the process creation ``FILETIME`` (100-ns units), read
+      through a QUERY-ONLY handle. Terminate rights are deliberately NOT
+      requested: this value is what decides whether a kill may happen at all, so
+      demanding the right to kill in order to read it would refuse the guard for
+      exactly the processes a caller must be most careful about.
+    * **macOS / other POSIX** -- ``ps -o lstart=`` (1s resolution, locale/TZ
+      formatted). Coarser, so a format or resolution drift can only make the
+      guard decline to act, never act on the wrong process.
+    """
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            # The comm field can contain spaces and parens; split after the
+            # LAST ')' so a process named "(evil) 1 2 3" cannot shift the index.
+            return stat.rsplit(")", 1)[1].split()[19]
+        except (OSError, ValueError, IndexError):
+            return None
+    if IS_WINDOWS:
+        # Opened and closed through the shared seams so this READ and the
+        # identity-pinned TERMINATE below cannot drift in how they acquire or
+        # release the handle -- the difference between the two is the handle's
+        # LIFETIME, and that is easier to reason about with one acquisition site.
+        handle = _open_process_query_handle(pid)
+        if handle is None:
+            return None
+        try:
+            identity = _windows_process_handle_identity(handle)
+        finally:
+            _close_process_handle(handle)
+        # (pid, creation_time, exit_time) -- only the creation half is an
+        # identity; exit_time moves as the process dies.
+        return str(identity[1]) if identity is not None else None
+    ps_bin = trusted_system_bin("ps")
+    if ps_bin is None:
+        return None
+    try:
+        out = subprocess.check_output(
+            [ps_bin, "-o", "lstart=", "-p", str(pid)],
+            stderr=subprocess.DEVNULL,
+            timeout=_START_TIME_PS_TIMEOUT,
+        )
+        # STRICT decode. A lossy one would turn unreadable bytes into a
+        # non-empty string, so the caller would accept garbage as a confirmed
+        # identity -- and two different processes whose output both decoded to
+        # replacement characters would compare equal. Undecodable output means
+        # the probe cannot be trusted, which is the None case.
+        return out.decode().strip() or None
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return None
+
+
+#: (pid, token) cache for :func:`own_process_start_time`. Keyed by PID rather
+#: than a bare value so a forked child re-reads its OWN identity instead of
+#: inheriting the parent's — the OTEL SDK re-installs metric exporters in fork
+#: children via ``os.register_at_fork``, so children genuinely export under
+#: this token. Two threads racing the first read is benign: both compute the
+#: same immutable tuple for the same process.
+_OWN_START_TIME: tuple[int, str | None] | None = None
+
+
+def _linux_boot_id() -> str | None:
+    """The kernel's per-boot UUID, or ``None`` when unreadable."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _own_identity_token(pid: int) -> str | None:
+    """Reboot-unique start-time token for THIS process, or ``None``.
+
+    The aggregator DISABLES its value-drop reset heuristic for any stream that
+    carries a token, trusting one token = one OS process. A token that cannot
+    honor that contract is therefore worse than no token — an aliased coarse
+    token would merge two lifetimes AND mute the heuristic that catches the
+    merge — so every degraded read returns ``None`` (no identity field, legacy
+    heuristic applies) rather than a best-effort value:
+
+    * **Linux** — ``/proc`` start ticks count from BOOT, so a post-reboot
+      process can repeat an earlier boot's (PID, ticks) pair; metric shards
+      outlive boots. The kernel's per-boot UUID makes the pair reboot-unique;
+      without it, no token.
+    * **macOS** — ``proc_pidinfo`` reports the absolute start instant at
+      microsecond resolution, so a recycled PID cannot alias within the 1s
+      window the ``ps -o lstart=`` probe cannot see past. Without ``libproc``,
+      no token — the 1s probe is exactly such an aliasable coarse source.
+    * **Windows** — the creation ``FILETIME`` (100ns units since 1601) is
+      absolute, already reboot-unique and alias-proof.
+    * **Other POSIX** — only the 1s ``ps`` probe exists: no token.
+    """
+    if sys.platform == "linux":
+        ticks = process_start_time(pid)
+        boot = _linux_boot_id()
+        return f"{ticks}:{boot}" if ticks and boot else None
+    if sys.platform == "darwin":
+        return _darwin_process_start_microtime(pid)
+    if IS_WINDOWS:
+        return process_start_time(pid)
+    return None
+
+
+def own_process_start_time() -> str | None:
+    """This process's own start-time identity, read once and cached.
+
+    A module-scope cache of :func:`_own_identity_token` for the calling
+    process. The cache is the contract, not an optimisation: every reader
+    inside one process must observe the SAME token for the process lifetime,
+    so a metrics provider rebuilt in-process (telemetry off/on) stamps records
+    that stitch into one stream with those written before the rebuild — and a
+    read that degrades mid-process (a ``libproc`` load failing on one call)
+    must not flip the process between stamped and unstamped forms.
+
+    Fail soft: an unreadable or alias-prone platform answer is cached as
+    ``None`` for the process lifetime, so a consumer emits no identity at all
+    rather than an identity that flaps between absent and present.
+    """
+    global _OWN_START_TIME
+    pid = os.getpid()
+    if _OWN_START_TIME is None or _OWN_START_TIME[0] != pid:
+        _OWN_START_TIME = (pid, _own_identity_token(pid))
+    return _OWN_START_TIME[1]
 
 
 def process_thread_count(pid: int) -> int | None:
@@ -1868,6 +2936,125 @@ def kill_process_tree(pid: int, sig: int = SIGTERM) -> bool:
     return True
 
 
+def _open_process_query_handle(pid: int) -> int | None:
+    """Open a QUERY-ONLY Windows handle to *pid*, or ``None``.
+
+    Terminate rights are deliberately NOT requested: the callers use this handle
+    to decide whether a kill may happen at all, so demanding the right to kill in
+    order to read the identity would refuse the guard for exactly the processes a
+    caller must be most careful about.
+
+    Returns ``None`` on every non-Windows platform, and on any failure -- an
+    unopenable process is one whose identity cannot be confirmed, which every
+    caller must treat as "do not kill".
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    except Exception:
+        return None
+    return int(handle) if handle else None
+
+
+def _close_process_handle(handle: int) -> None:
+    """Release a handle from :func:`_open_process_query_handle`. Never raises."""
+    if not IS_WINDOWS or type(handle) is not int or handle <= 0:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+    except Exception:
+        logger.debug("CloseHandle failed for process handle %d", handle, exc_info=True)
+
+
+def kill_process_tree_pinned(pid: int, expected_start_time: str, sig: int = SIGTERM) -> bool:
+    """Kill *pid*'s tree only while its verified identity is PINNED OPEN.
+
+    :func:`kill_process_tree` addresses the target by PID, and on Windows it
+    does so from a separate ``taskkill`` process. A caller that merely read the
+    start time first has released every handle by then, so between the check and
+    the terminate the process can exit and Windows can recycle the PID onto an
+    unrelated process -- which ``taskkill /T /F /PID`` would then tear down with
+    its whole tree. The check is only as good as the window after it.
+
+    Windows keeps a process ID reserved for as long as ANY handle to the process
+    object remains open, so holding the query handle that verified the identity
+    across the terminate is what makes the PID still mean the same process when
+    ``taskkill`` resolves it. That is the guarantee this function adds, and the
+    only reason it exists.
+
+    Returns ``False`` -- WITHOUT invoking any kill -- when the handle cannot be
+    opened or the identity does not match *expected_start_time*. Callers must
+    treat that as "identity unconfirmed, do not reap", the same fail-safe the
+    start-time comparison already gives them. On a match it delegates to
+    :func:`kill_process_tree` and propagates its exceptions unchanged, so
+    ``except (ProcessLookupError, OSError)`` handlers keep firing as before.
+
+    POSIX is deliberately untouched: it delegates straight through, because
+    ``os.killpg`` is issued in-process by the same interpreter that did the
+    check and there is no handle to hold. The residual probe-to-signal window
+    there is the pre-existing one the callers already mitigate by re-confirming
+    identity before the destructive escalation.
+    """
+    if not IS_WINDOWS:
+        return kill_process_tree(pid, sig)
+    handle = _open_process_query_handle(pid)
+    if handle is None:
+        return False
+    try:
+        identity = _windows_process_handle_identity(handle)
+        # (pid, creation_time, exit_time) -- the creation half is the identity.
+        if identity is None or str(identity[1]) != expected_start_time:
+            return False
+        # The handle stays open for the whole call: taskkill resolves the PID
+        # while this process object is still referenced, so the PID cannot have
+        # been recycled onto a different process in between.
+        return kill_process_tree(pid, sig)
+    finally:
+        _close_process_handle(handle)
+
+
+def kill_pid_pinned(pid: int, expected_start_time: str, sig: int = SIGTERM) -> bool:
+    """Kill *pid* only while its verified identity is PINNED OPEN.
+
+    Single-process variant of :func:`kill_process_tree_pinned` — same Windows
+    guarantee (the query handle that verified the creation time stays open
+    across the terminate, so the PID ``taskkill`` resolves cannot have been
+    recycled between the check and the signal), delegating to :func:`kill_pid`
+    instead of tearing down the tree. Returns ``False`` — without signalling —
+    when the handle cannot be opened or the identity does not match; callers
+    treat that as "identity unconfirmed, do not kill". On a match it delegates
+    to :func:`kill_pid` and propagates its exceptions unchanged.
+
+    POSIX delegates straight through: ``os.kill`` is issued in-process by the
+    same interpreter that did the check and there is no handle to hold; the
+    residual probe-to-signal window there is the pre-existing one callers
+    mitigate by re-confirming identity before destructive escalation.
+    """
+    if not IS_WINDOWS:
+        return kill_pid(pid, sig)
+    handle = _open_process_query_handle(pid)
+    if handle is None:
+        return False
+    try:
+        identity = _windows_process_handle_identity(handle)
+        # (pid, creation_time, exit_time) -- the creation half is the identity.
+        if identity is None or str(identity[1]) != expected_start_time:
+            return False
+        # The handle stays open for the whole call: taskkill resolves the PID
+        # while this process object is still referenced, so the PID cannot have
+        # been recycled onto a different process in between.
+        return kill_pid(pid, sig)
+    finally:
+        _close_process_handle(handle)
+
+
 async def kill_pid_async(pid: int, sig: int = SIGTERM) -> bool:
     """Async variant of :func:`kill_pid` — offloads Windows ``taskkill`` off the loop.
 
@@ -1906,6 +3093,82 @@ async def kill_process_tree_async(pid: int, sig: int = SIGTERM) -> bool:
         return kill_process_tree(pid, sig)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(subprocess_executor(), kill_process_tree, pid, sig)
+
+
+#: Ceiling on waiting for a killed process tree. A descendant that ignores the
+#: signal must not turn cleanup into a hang while the caller is already
+#: handling a timeout or a cancellation — often on the shutdown path, where an
+#: unbounded reap would wedge the whole teardown.
+REAP_TIMEOUT_SECS: float = 10
+
+
+async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | None = None) -> None:
+    """Kill *proc* AND its descendants, then wait for it under a bound.
+
+    The shared cleanup for a PIPE-stdio child whose ``communicate()`` was
+    abandoned by ``asyncio.wait_for`` — used on BOTH the timeout and the
+    cancellation path. Cancellation matters as much as timeout: a gateway
+    shutdown cancels the owning task, and without this the child keeps
+    running after the process that started it is gone.
+
+    The whole TREE is signalled, not just the direct child. A spawned command
+    is often a shell line (``curl … | sh``, ``pip … | tee log``), so killing
+    only the shell leaves the pipeline members running and can leave
+    ``communicate()`` waiting on pipes those survivors still hold. A child
+    sharing the caller's own process group (spawned without
+    ``start_new_session``) has no tree of its own to signal — the group kill
+    is skipped for it and the pid-scoped ``kill()`` below covers it, instead
+    of tripping :func:`kill_process_tree`'s broadcast guard on every routine
+    timeout.
+
+    The reap goes through ``communicate()`` rather than ``wait()`` so the
+    pipes are drained: ``wait_for`` already cancelled the original
+    ``communicate()``, and a killed child blocked writing into a full pipe
+    would make a bare ``wait()`` hang the calling task forever. The reap is
+    bounded by *timeout* (default :data:`REAP_TIMEOUT_SECS`). Both the kill
+    and the reap are best-effort, since the caller is already handling a
+    timeout or a cancellation and must not have it masked by a cleanup error.
+
+    The whole sequence runs in a shielded inner task: a (repeat) cancellation
+    of the caller landing mid-cleanup must not abandon the kill or leave the
+    child un-reaped — the cancellation is absorbed until cleanup finishes and
+    then re-delivered once.
+    """
+
+    async def _cleanup() -> None:
+        same_group = False
+        if IS_POSIX:
+            with contextlib.suppress(Exception):
+                same_group = os.getpgid(proc.pid) == _OWN_PGID
+        if not same_group:
+            # Bare-name lookup resolves through this module's namespace at
+            # call time, so tests patching ``kiro_crew.platform_compat.
+            # kill_process_tree_async`` still intercept the tree kill.
+            with contextlib.suppress(Exception):
+                await kill_process_tree_async(proc.pid, SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.kill()
+        with contextlib.suppress(Exception, asyncio.TimeoutError):
+            await asyncio.wait_for(
+                proc.communicate(),
+                timeout=REAP_TIMEOUT_SECS if timeout is None else timeout,
+            )
+
+    cleanup = asyncio.ensure_future(_cleanup())
+    cancelled = False
+    while True:
+        try:
+            await asyncio.shield(cleanup)
+            break
+        except asyncio.CancelledError:
+            # Either the CALLER was (re-)cancelled while the shield kept the
+            # cleanup running, or the cleanup itself ended cancelled. Absorb
+            # until the cleanup has genuinely finished, then re-deliver.
+            cancelled = True
+            if cleanup.done():
+                break
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 async def descendant_termination_handles_async(
@@ -1989,6 +3252,7 @@ def rmtree_force(path: str | os.PathLike) -> bool:
     # still supports 3.9+, so pick by capability rather than by version number.
     kwarg = "onexc" if sys.version_info >= (3, 12) else "onerror"
     if kwarg == "onerror":  # pragma: no cover - exercised on Python < 3.12
+
         def _legacy(func: Any, target: str, exc_info: Any) -> None:
             _clear_readonly_and_retry(func, target, exc_info[1])
 
@@ -2105,6 +3369,22 @@ def unlink_link_or_junction(path: str | os.PathLike) -> None:
 _OWNER_RIGHTS_SID = "*S-1-3-4"
 
 
+# icacls inheritance flags for a DIRECTORY grant: (OI) object-inherit
+# propagates the ACE to files created inside, (CI) container-inherit propagates
+# it to subdirectories. Neither sets (IO), so the ACE also applies to the
+# directory itself and traversal is preserved.
+#
+# Without these flags a grant applies to the named object ALONE. That is
+# correct and complete for a file, and silently wrong for a directory: a file
+# created inside an "owner-only" directory would carry no explicit ACE at all
+# and fall back to whatever the creating process's token grants by default
+# (typically owner + SYSTEM + Administrators) — a default rather than the
+# guarantee the caller asked for. The flags are meaningless on a file, which is
+# why this is a directory-only rights prefix and not something
+# :func:`restrict_to_owner` can pass unconditionally.
+_ICACLS_DIR_INHERIT = "(OI)(CI)"
+
+
 # Success-only memo for _current_user_sid. NOT functools.lru_cache: lru_cache
 # would memoize a *failure* (None) permanently, so one transient whoami
 # timeout at first call (AV scan, system pressure) would poison every later
@@ -2144,12 +3424,6 @@ def _process_token_sid_unguarded(pid: int | None = None) -> str | None:
     permits ``OpenProcessToken``, and one a user always holds over their own
     processes without elevation.
     """
-
-    class _SidAndAttributes(ctypes.Structure):
-        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
-
-    class _TokenUser(ctypes.Structure):
-        _fields_ = [("User", _SidAndAttributes)]
 
     try:
         advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
@@ -2391,6 +3665,76 @@ def current_user_sid() -> str | None:
     return sid
 
 
+def is_token_elevated() -> bool | None:
+    """Whether this process runs with an ELEVATED token, or ``None`` if unknown.
+
+    Lives here rather than beside its one caller because this module already
+    owns "read this process's own access token" for the codebase (see
+    :func:`_process_token_sid_unguarded`), and a second copy of the
+    ``OpenProcessToken`` / ``GetTokenInformation`` prototype pair is plumbing
+    that drifts.
+
+    The tri-state return is deliberate and the two non-``True`` answers are not
+    interchangeable: ``False`` means the token was read and is not elevated,
+    while ``None`` means it could not be read at all. A caller that treats
+    elevation as disqualifying must refuse on ``None`` too, because "unknown"
+    is not "fine". Returns ``False`` on POSIX, where the concept does not exist
+    and the equivalent question is ``geteuid() == 0``.
+    """
+    if not IS_WINDOWS:
+        return False
+    TOKEN_QUERY = 0x0008
+    TOKEN_ELEVATION = 20
+    try:
+        # Per-line ignore is this module's own convention for the Windows-only
+        # ctypes surface (typeshed guards it, and CI type-checks on Linux).
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    except OSError:  # pragma: no cover - a Windows without advapi32
+        return None
+
+    # Same reason as _process_token_sid_unguarded: declare every prototype and
+    # pass ctypes instances, never bare Python ints.
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), wintypes.DWORD(TOKEN_QUERY), ctypes.byref(token)
+    ):
+        return None
+    try:
+        elevation = wintypes.DWORD()
+        returned = wintypes.DWORD()
+        ok = advapi32.GetTokenInformation(
+            token,
+            ctypes.c_int(TOKEN_ELEVATION),
+            ctypes.byref(elevation),
+            wintypes.DWORD(ctypes.sizeof(elevation)),
+            ctypes.byref(returned),
+        )
+        if not ok:
+            return None
+        return bool(elevation.value)
+    finally:
+        kernel32.CloseHandle(token)
+
+
 def make_owner_only_dir(path: str | os.PathLike) -> None:
     """Create *path* (with parents) and make it readable only by this user.
 
@@ -2403,9 +3747,16 @@ def make_owner_only_dir(path: str | os.PathLike) -> None:
 
     ``0o700`` and not :func:`restrict_to_owner` on POSIX: that helper applies
     ``0o600``, correct for a secret-bearing file and wrong for a directory,
-    which needs the execute bit to be traversable at all. Windows has no such
-    split (``icacls ... :F`` grants traverse with everything else), and there the
-    DACL is the only carrier of access, so the fail-loud helper is right.
+    which needs the execute bit to be traversable at all. On Windows the split
+    is the inverse of inert: ``restrict_to_owner``'s grants are not inheritable
+    (correct for a file, where the flags mean nothing), so routing a directory
+    through it left every file created inside on the creating token's default
+    DACL. Both platforms therefore go through
+    :func:`restrict_dir_to_owner`, the directory-shaped twin.
+
+    Only newly created children are covered. A file that already exists inside
+    the directory keeps its own DACL — see :func:`restrict_dir_to_owner` for
+    why a tightened parent does not fix one.
 
     Best-effort on the tightening step: the directory is still created, and the
     caller decides whether an un-tightened directory is fatal.
@@ -2413,10 +3764,7 @@ def make_owner_only_dir(path: str | os.PathLike) -> None:
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        if IS_WINDOWS:
-            restrict_to_owner(p)
-        else:
-            p.chmod(0o700)
+        restrict_dir_to_owner(p)
     except OSError:
         logger.warning("could not restrict directory %s to owner-only", p, exc_info=True)
 
@@ -2475,6 +3823,80 @@ def restrict_to_owner(path: str | os.PathLike) -> None:
     if IS_POSIX:
         os.chmod(path, 0o600)
         return
+    # Misuse guard: this helper is FILE-shaped. Its grants carry no (OI)(CI),
+    # so handing it a directory tightens the directory itself and leaves every
+    # file created inside on the creating token's default DACL -- the exact
+    # defect restrict_dir_to_owner exists to close. Warn rather than raise:
+    # the ACE still applies to the named object, so the lockdown is partial
+    # rather than absent, and turning a partial protection into a runtime
+    # OSError would be the worse outcome. The argv tests cannot see this from
+    # the call site, so the check lives here.
+    try:
+        if Path(path).is_dir():
+            # The path is deliberately NOT logged. In this codebase a path can
+            # itself be the secret -- mcp_gateway/apps.py notes that its spool
+            # FILENAMES are live capability tokens -- so naming it here would be
+            # clear-text logging of sensitive information (CodeQL flagged exactly
+            # that). logging already records module/function/lineno, which is
+            # what locates the offending caller.
+            logger.warning(
+                "restrict_to_owner was called on a directory; its grants are not "
+                "inheritable, so files created inside will not be owner-only. "
+                "Use restrict_dir_to_owner for a directory."
+            )
+    except OSError:
+        pass
+    _icacls_owner_only(path, inherit=False)
+
+
+def restrict_dir_to_owner(path: str | os.PathLike) -> None:
+    """Fail-loud owner-only lockdown of a DIRECTORY, inherited by its children.
+
+    The directory twin of :func:`restrict_to_owner`, and separate from it
+    because the two shapes genuinely differ on both platforms:
+
+    POSIX: ``0o700`` rather than ``0o600`` — a directory needs the execute bit
+    to be traversable at all, so the file helper's mode would make the
+    directory useless.
+
+    Windows: the grants carry ``(OI)(CI)`` so they propagate to files and
+    subdirectories created inside. ``restrict_to_owner``'s grants deliberately
+    do not, because those flags are meaningless on a file; applying the
+    file-shaped helper to a directory is what left every file created inside an
+    "owner-only" directory on the creating token's default DACL.
+
+    Note the limit: inheritance governs what gets CREATED from here on. A file
+    that already exists inside the directory keeps its own DACL, and Windows
+    grants *Bypass Traverse Checking* to Everyone by default, so a permissive
+    pre-existing file stays reachable through a tightened parent. Repairing an
+    existing install needs a per-file pass over the known names; this helper is
+    the guarantee for new files, not a retrofit.
+
+    Fail-loud like :func:`restrict_to_owner`: any failure raises ``OSError`` so
+    callers reach their warn-and-continue handlers.
+    """
+    if IS_POSIX:
+        # Semgrep's insecure-file-permissions rule reads 0o700 as "widely
+        # permissive" and recommends 0o644, which is backwards for a DIRECTORY
+        # holding secrets: 0o644 drops owner-execute (making the directory
+        # untraversable) and ADDS world-read -- the exact exposure this helper
+        # exists to close. 0o700 is the restrictive mode here, so the finding is
+        # suppressed on the line below. Same reasoning as cloud/launch_job.py.
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501
+        os.chmod(path, 0o700)
+        return
+    _icacls_owner_only(path, inherit=True)
+
+
+def _icacls_owner_only(path: str | os.PathLike, *, inherit: bool) -> None:
+    """Apply an owner-only DACL to *path* via icacls. Windows-only.
+
+    Shared by :func:`restrict_to_owner` (``inherit=False``, file shape) and
+    :func:`restrict_dir_to_owner` (``inherit=True``, directory shape). The only
+    difference between the two argv forms is the rights prefix, so they are one
+    function: an owner-only DACL that two call paths could drift apart on is
+    the defect this consolidation exists to prevent.
+    """
     icacls = shutil.which("icacls") or r"C:\Windows\System32\icacls.exe"
     # Resolve the invoking user's SID BEFORE building the argv. If whoami is
     # unavailable (missing from PATH under a stripped-down profile, subprocess
@@ -2489,19 +3911,21 @@ def restrict_to_owner(path: str | os.PathLike) -> None:
     user_sid = _current_user_sid()
     if user_sid is None:
         raise OSError(
-            "restrict_to_owner: cannot resolve current user SID via whoami; "
+            f"{'restrict_dir_to_owner' if inherit else 'restrict_to_owner'}: "
+            "cannot resolve current user SID via whoami; "
             "refusing to apply Owner-Rights-only DACL (would lock non-owner "
             f"users out of {path!s} — see _current_user_sid docstring)."
         )
+    rights = f"{_ICACLS_DIR_INHERIT}F" if inherit else "F"
     argv: list[str] = [
         icacls,
         os.fspath(path),
         "/inheritance:r",
         "/grant:r",
-        f"{_OWNER_RIGHTS_SID}:F",
+        f"{_OWNER_RIGHTS_SID}:{rights}",
     ]
     if user_sid != _OWNER_RIGHTS_SID:
-        argv += ["/grant:r", f"{user_sid}:F"]
+        argv += ["/grant:r", f"{user_sid}:{rights}"]
     try:
         r = subprocess.run(
             argv,
@@ -2609,11 +4033,18 @@ def find_python_interpreter(reject: Optional[Callable[[str], bool]] = None) -> s
         if _is_windows_store_python_stub(p):
             continue
         try:
+            # -I isolates the probe from the caller's environment: without it,
+            # ``site`` imports any ``sitecustomize.py`` found on the caller's
+            # PYTHONPATH at child startup, and that module can monkeypatch
+            # ``sys.version_info`` to steer WHICH interpreter this loop selects.
+            # Because -I implies -E (PYTHON* env vars ignored), the UTF-8 pin
+            # must ride the argv as ``-X utf8``, matching
+            # ``dep_sync._probe_interpreter``.
             out = subprocess.check_output(
-                [p, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                [p, "-I", "-X", "utf8", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
                 timeout=5,
-                text=True,
                 stderr=subprocess.DEVNULL,
+                **UTF8_TEXT,
             ).strip()
             major, _, minor = out.partition(".")
             if not (int(major) == 3 and int(minor) >= 10):
@@ -2632,36 +4063,136 @@ def find_python_interpreter(reject: Optional[Callable[[str], bool]] = None) -> s
 # Resource limits
 # ---------------------------------------------------------------------------
 
+#: ``task_info`` flavor selector for ``mach_task_basic_info``
+#: (``<mach/task_info.h>``). Chosen over the legacy ``TASK_BASIC_INFO`` because
+#: its sizes are 64-bit, so a footprint above 4 GiB is not truncated.
+_MACH_TASK_BASIC_INFO = 20
 
-def proc_rss_bytes() -> int:
-    """Return this process's resident set size in bytes, or 0 on failure.
 
-    POSIX: ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` (KiB on Linux, bytes
-    on macOS). Windows: ``GetProcessMemoryInfo().WorkingSetSize``.
+class _MachTimeValue(ctypes.Structure):
+    """``time_value_t`` (``<mach/time_value.h>``).
+
+    Never read; present only so the fields after it in
+    :class:`_MachTaskBasicInfo` land at the offsets the kernel writes them to.
     """
-    if IS_POSIX:
-        try:
 
-            ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            # Linux reports KiB; macOS reports bytes.
-            return ru_maxrss if sys.platform == "darwin" else ru_maxrss * 1024
-        except (ImportError, OSError, ValueError):
-            return 0
+    _fields_ = [("seconds", ctypes.c_int32), ("microseconds", ctypes.c_int32)]
+
+
+class _MachTaskBasicInfo(ctypes.Structure):
+    """``mach_task_basic_info`` (``<mach/task_info.h>``), in kernel order.
+
+    ``resident_size`` is the task's CURRENT resident footprint in bytes and
+    falls when pages are released; ``resident_size_max`` is the high-water mark
+    that never falls. Reading the wrong one of the two is exactly the bug this
+    layout exists to avoid, so both are named rather than indexed.
+
+    Module scope is load-bearing: ``ctypes.POINTER(T)`` memoises T in a
+    module-level dict inside ctypes that is never evicted, so declaring this
+    inside the probe would pin a fresh pair of type objects on every call — and
+    this probe is polled by the dashboard's system-metrics endpoint.
+    """
+
+    _fields_ = [
+        ("virtual_size", ctypes.c_uint64),
+        ("resident_size", ctypes.c_uint64),
+        ("resident_size_max", ctypes.c_uint64),
+        ("user_time", _MachTimeValue),
+        ("system_time", _MachTimeValue),
+        ("policy", ctypes.c_int),
+        ("suspend_count", ctypes.c_int),
+    ]
+
+
+#: ``task_info`` takes and returns a count in ``natural_t``-sized elements
+#: (``MACH_TASK_BASIC_INFO_COUNT``). Derived from the layout so it cannot go
+#: stale if a field is added above.
+_MACH_TASK_BASIC_INFO_COUNT = ctypes.sizeof(_MachTaskBasicInfo) // ctypes.sizeof(ctypes.c_int)
+
+
+def _scale_ru_maxrss(ru_maxrss: int) -> int:
+    """``ru_maxrss`` -> bytes. macOS reports bytes; Linux and other POSIX KiB.
+
+    The unit differs by platform with nothing in the value to tell them apart,
+    so every reader of ``ru_maxrss`` goes through here.
+    """
+    return ru_maxrss if sys.platform == "darwin" else ru_maxrss * 1024
+
+
+def _ru_maxrss_bytes() -> int | None:
+    """Peak (high-water) RSS in bytes from ``getrusage``, or None on failure.
+
+    POSIX only. This is a **peak**, not a live reading: ``ru_maxrss`` never
+    decreases for the life of the process.
+    """
     try:
+        return _scale_ru_maxrss(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (ImportError, OSError, ValueError, AttributeError):
+        return None
 
-        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):  # noqa: N801 — Windows struct
-            _fields_ = [
-                ("cb", wintypes.DWORD),
-                ("PageFaultCount", wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t),
-            ]
+
+def _linux_current_rss_bytes() -> int | None:
+    """Current RSS in bytes from ``/proc/self/statm``, or None if unreadable.
+
+    Field 1 of ``statm`` is the resident page count — the same quantity
+    ``/proc/self/status``'s ``VmRSS`` and ``ps -o rss=`` report, so the
+    dashboard's figure reconciles with what an operator measures by hand.
+    """
+    try:
+        fields = Path("/proc/self/statm").read_text().split()
+        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _macos_current_rss_bytes() -> int | None:
+    """Current RSS in bytes via Mach ``task_info``, or None on any failure.
+
+    ``proc_rss_bytes_for_pid`` has no ctypes-only route for an ARBITRARY pid
+    (it needs a task port it cannot obtain), but ``mach_task_self()`` hands out
+    a port for THIS task unconditionally, so the self-only reading below is
+    always available — no subprocess, which matters because the macOS app
+    sandbox can deny spawning ``ps``.
+
+    Returns ``resident_size`` (what ``ps -o rss=`` reports), not
+    ``phys_footprint``: every other platform branch here reports RSS, and the
+    payload field it feeds is named for RSS. Activity Monitor's "Memory" column
+    is the phys_footprint variant and will read somewhat differently; that is a
+    separate accounting question from the peak-vs-current bug.
+    """
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+    except OSError:
+        return None  # not macOS / libSystem unavailable
+    try:
+        libc.mach_task_self.restype = ctypes.c_uint
+        libc.task_info.restype = ctypes.c_int
+        libc.task_info.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.POINTER(_MachTaskBasicInfo),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        info = _MachTaskBasicInfo()
+        count = ctypes.c_uint(_MACH_TASK_BASIC_INFO_COUNT)
+        # mach_task_self() returns a port name owned by the task itself, not a
+        # fresh send right, so unlike mach_host_self() it must NOT be deallocated.
+        kern_return = libc.task_info(
+            libc.mach_task_self(),
+            _MACH_TASK_BASIC_INFO,
+            ctypes.byref(info),
+            ctypes.byref(count),
+        )
+    except (AttributeError, OSError, ValueError):
+        return None
+    if kern_return != 0:  # non-zero kern_return_t -> failure
+        return None
+    return int(info.resident_size)
+
+
+def _windows_memory_counters() -> "_ProcessMemoryCounters | None":
+    """psapi ``PROCESS_MEMORY_COUNTERS`` for this process, or None on failure."""
+    try:
 
         psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
@@ -2673,19 +4204,109 @@ def proc_rss_bytes() -> int:
         kernel32.GetCurrentProcess.restype = wintypes.HANDLE
         psapi.GetProcessMemoryInfo.argtypes = [
             wintypes.HANDLE,
-            ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+            ctypes.POINTER(_ProcessMemoryCounters),
             wintypes.DWORD,
         ]
         psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
-        counters = PROCESS_MEMORY_COUNTERS()
-        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(_ProcessMemoryCounters)
         if psapi.GetProcessMemoryInfo(
             kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
         ):
-            return int(counters.WorkingSetSize)
-        return 0
+            return counters
+        return None
     except Exception:
-        return 0
+        return None
+
+
+def proc_rss_bytes() -> int:
+    """Return this process's CURRENT resident set size in bytes, or 0 on failure.
+
+    "Current" is the contract, not an implementation detail: this feeds an
+    operator-facing live memory figure, so it must FALL when the gateway
+    releases memory and must reconcile with ``ps -o rss=``.
+
+    - Linux: ``/proc/self/statm`` resident pages.
+    - macOS: Mach ``task_info(MACH_TASK_BASIC_INFO).resident_size``.
+    - Windows: ``GetProcessMemoryInfo().WorkingSetSize``.
+    - Last resort on POSIX only: ``getrusage(RUSAGE_SELF).ru_maxrss``, which is
+      a **peak** that never decreases. It is here so an unreadable ``/proc`` or
+      an unavailable ``libSystem`` still yields an order-of-magnitude number
+      rather than 0, and it over-reports by construction — see
+      :func:`proc_peak_rss_bytes` for the peak as a deliberate reading.
+    """
+    if IS_POSIX:
+        current = (
+            _macos_current_rss_bytes() if sys.platform == "darwin" else _linux_current_rss_bytes()
+        )
+        if current is not None:
+            return current
+        return _ru_maxrss_bytes() or 0
+    counters = _windows_memory_counters()
+    return 0 if counters is None else int(counters.WorkingSetSize)
+
+
+def proc_peak_rss_bytes() -> int:
+    """Return this process's PEAK resident set size in bytes, or 0 on failure.
+
+    The high-water mark since the process started: it never decreases, which is
+    what makes it useful for diagnosing a transient spike that a live reading
+    has already forgotten — and useless as the live reading itself. POSIX reads
+    ``getrusage(RUSAGE_SELF).ru_maxrss``; Windows reads
+    ``GetProcessMemoryInfo().PeakWorkingSetSize``.
+    """
+    if IS_POSIX:
+        return _ru_maxrss_bytes() or 0
+    counters = _windows_memory_counters()
+    return 0 if counters is None else int(counters.PeakWorkingSetSize)
+
+
+# Per-process fd directories, in preference order: /proc/self/fd (Linux),
+# /dev/fd (macOS/BSD; also present on Linux as a symlink to the former).
+_FD_DIRS = ("/proc/self/fd", "/dev/fd")
+
+
+def count_open_fds() -> int | None:
+    """Return this process's open file descriptor count, or None if unavailable.
+
+    The one shared probe behind both the ``kirocrew.process.open_fds`` gauge
+    (``metrics/process_gauges.py``) and gatewayd's zombie-diagnostic
+    ``fd_count`` snapshot field, so the two figures cannot drift apart.
+
+    - POSIX: entry count of ``/proc/self/fd`` (Linux) or ``/dev/fd``
+      (macOS/BSD), minus one because enumerating the directory opens one fd
+      itself (the directory handle) — callers want the steady state.
+    - Windows: ``GetProcessHandleCount`` — kernel HANDLEs, not fds, so the
+      semantics are platform-dependent (callers document this). Returned raw:
+      the query opens no extra handle, so no correction applies.
+
+    Returns None when no probe works; each caller maps its own sentinel.
+    """
+    for fd_dir in _FD_DIRS:
+        try:
+            return max(0, len(os.listdir(fd_dir)) - 1)
+        except OSError:
+            continue
+    if not IS_WINDOWS:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        # argtypes/restype are load-bearing on 64-bit: without them ctypes
+        # defaults GetCurrentProcess's return to a 32-bit int and TRUNCATES the
+        # pseudo-handle (see _windows_memory_counters).
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessHandleCount.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetProcessHandleCount.restype = wintypes.BOOL
+        handle_count = wintypes.DWORD()
+        if kernel32.GetProcessHandleCount(kernel32.GetCurrentProcess(), ctypes.byref(handle_count)):
+            return int(handle_count.value)
+        return None
+    except Exception:
+        return None
 
 
 def proc_rss_bytes_for_pid(pid: int) -> int | None:
@@ -2709,21 +4330,6 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
         return None
     try:
 
-        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):  # noqa: N801 — Windows struct
-            _fields_ = [
-                ("cb", wintypes.DWORD),
-                ("PageFaultCount", wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t),
-            ]
-
-        _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000  # noqa: N806 — Windows constant
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
         kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -2732,7 +4338,7 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
         kernel32.CloseHandle.restype = wintypes.BOOL
         psapi.GetProcessMemoryInfo.argtypes = [
             wintypes.HANDLE,
-            ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+            ctypes.POINTER(_ProcessMemoryCounters),
             wintypes.DWORD,
         ]
         psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
@@ -2740,8 +4346,8 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
         if not handle:
             return None
         try:
-            counters = PROCESS_MEMORY_COUNTERS()
-            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            counters = _ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(_ProcessMemoryCounters)
             if psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
                 return int(counters.WorkingSetSize)
             return None
@@ -2749,6 +4355,61 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
             kernel32.CloseHandle(handle)
     except Exception:
         return None
+
+
+def proc_rss_tree_mb_for_pid(pid: int) -> float | None:
+    """Sum RSS (MiB) of *pid* and its LINEAGE-VALIDATED Windows descendants.
+
+    Windows-only; returns None on other platforms (callers keep their /proc or
+    ps route). The naive way to sum a Windows tree — walk Toolhelp's
+    ``th32ParentProcessID`` map — is unsafe for a kill/health decision: that
+    field is never cleared when a parent dies and Windows recycles PIDs
+    aggressively, so a raw walk sums unrelated subtrees rooted at a recycled
+    PID. This reuses :func:`descendant_termination_handles`, which validates
+    every parent->child edge against exact creation/exit times across two
+    snapshots, so only genuine descendants are counted. RSS that cannot be read
+    for a given descendant (another session / higher integrity) is skipped, but
+    the root itself always contributes, so the result is never a phantom-low
+    tree total attached to a recycled root.
+
+    Returns None if even the root's RSS is unavailable, matching the "unknown,
+    do not judge" contract the RSS staleness probe relies on.
+    """
+
+    if not IS_WINDOWS:
+        return None
+    if type(pid) is not int or pid <= 1:
+        return None
+    root_handle = _open_process_termination_handle(pid)
+    if root_handle is None:
+        # Cannot even anchor the root — fall back to the single-process read so a
+        # readable self still yields a number rather than a spurious None.
+        rss = proc_rss_bytes_for_pid(pid)
+        return None if rss is None else rss / (1024 * 1024)
+    descendants: dict[int, int] = {}
+    try:
+        identity = _windows_process_handle_identity(root_handle)
+        if identity is None or identity[0] != pid:
+            rss = proc_rss_bytes_for_pid(pid)
+            return None if rss is None else rss / (1024 * 1024)
+        try:
+            descendants = descendant_termination_handles(pid, root_handle=root_handle)
+        except Exception:
+            # Enumeration failed (transient snapshot race): measure the root
+            # alone rather than an unvalidated tree.
+            descendants = {}
+        total_bytes = 0
+        found = False
+        for member in (pid, *descendants):
+            member_rss = proc_rss_bytes_for_pid(member)
+            if member_rss is not None:
+                total_bytes += member_rss
+                found = True
+        return total_bytes / (1024 * 1024) if found else None
+    finally:
+        for handle in descendants.values():
+            close_process_handle(handle)
+        close_process_handle(root_handle)
 
 
 def proc_cpu_seconds() -> float:
@@ -2767,6 +4428,20 @@ def proc_cpu_seconds() -> float:
     try:
 
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # argtypes/restype are load-bearing on 64-bit: without them ctypes
+        # defaults GetCurrentProcess's return to a 32-bit int and truncates the
+        # pseudo-handle, so GetProcessTimes fails and this reads 0.0 (mirrors the
+        # proc_rss_bytes fix — same truncation, same cause).
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
         creation = wintypes.FILETIME()
         exit_ = wintypes.FILETIME()
         kernel = wintypes.FILETIME()
@@ -2808,22 +4483,9 @@ def system_memory() -> "tuple[int, int] | None":
         return None
     try:
 
-        class MEMORYSTATUSEX(ctypes.Structure):  # noqa: N801 — Windows struct
-            _fields_ = [
-                ("dwLength", wintypes.DWORD),
-                ("dwMemoryLoad", wintypes.DWORD),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        stat = MEMORYSTATUSEX()
-        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        stat = _MemoryStatusEx()
+        stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
         if kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
             return int(stat.ullTotalPhys), int(stat.ullAvailPhys)
         return None
@@ -2871,6 +4533,241 @@ def system_cpu_percent() -> "float | None":
         return min(100.0, max(0.0, round(busy / dtotal * 100.0, 1)))
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Available physical memory, on every platform
+#
+# "How much RAM can a new process take without pushing this machine into swap"
+# has a different answer, and a different interface, on each OS: Linux publishes
+# the number outright, macOS publishes page counters and leaves the composition
+# to the caller, Windows has a Win32 call. A caller that reads only one of them
+# does not get a conservative answer on the others -- it gets NO answer, which
+# is why this lives here rather than at each call site.
+# ---------------------------------------------------------------------------
+
+_MIB_BYTES = 1024 * 1024
+
+#: ``natural_t`` is 32-bit on macOS, including on Apple silicon.
+_NATURAL_T = ctypes.c_uint
+
+#: ``host_statistics64`` flavor selector for ``vm_statistics64_data_t``.
+_HOST_VM_INFO64 = 4
+
+
+class _VMStatistics64(ctypes.Structure):
+    """``vm_statistics64_data_t`` (``<mach/vm_statistics.h>``), in kernel order.
+
+    Declared in full even though few fields are read, so the element count handed
+    to ``host_statistics64`` is exact and the trailing fields land at the offsets
+    the kernel writes them to.
+
+    Module scope is load-bearing: ``ctypes.POINTER(T)`` memoises T in a
+    module-level dict inside ctypes that is never evicted, so declaring this
+    inside the probe would pin a fresh pair of type objects on every call.
+    """
+
+    _fields_ = [
+        ("free_count", _NATURAL_T),
+        ("active_count", _NATURAL_T),
+        ("inactive_count", _NATURAL_T),
+        ("wire_count", _NATURAL_T),
+        ("zero_fill_count", ctypes.c_uint64),
+        ("reactivations", ctypes.c_uint64),
+        ("pageins", ctypes.c_uint64),
+        ("pageouts", ctypes.c_uint64),
+        ("faults", ctypes.c_uint64),
+        ("cow_faults", ctypes.c_uint64),
+        ("lookups", ctypes.c_uint64),
+        ("hits", ctypes.c_uint64),
+        ("purges", ctypes.c_uint64),
+        ("purgeable_count", _NATURAL_T),
+        ("speculative_count", _NATURAL_T),
+        ("decompressions", ctypes.c_uint64),
+        ("compressions", ctypes.c_uint64),
+        ("swapins", ctypes.c_uint64),
+        ("swapouts", ctypes.c_uint64),
+        ("compressor_page_count", _NATURAL_T),
+        ("throttled_count", _NATURAL_T),
+        ("external_page_count", _NATURAL_T),
+        ("internal_page_count", _NATURAL_T),
+        ("total_uncompressed_pages_in_compressor", ctypes.c_uint64),
+    ]
+
+
+#: How many ``natural_t``-sized elements the kernel must report having filled
+#: before ``external_page_count`` holds anything. ``host_statistics64`` writes
+#: the count back, and an older kernel that predates the field leaves it zero --
+#: indistinguishable from "no file-backed pages" unless the count is checked.
+#: Derived from the layout so it cannot go stale if a field is added above.
+_EXTERNAL_PAGE_COUNT_ELEMENTS = (
+    _VMStatistics64.external_page_count.offset + _VMStatistics64.external_page_count.size
+) // ctypes.sizeof(ctypes.c_int)
+
+
+def macos_vm_statistics() -> "tuple[_VMStatistics64, int] | None":
+    """Mach ``host_statistics64(HOST_VM_INFO64)``, or ``None`` on any failure.
+
+    Returns the filled struct and the element count the kernel wrote back, which
+    a caller needs to know whether the trailing (later-revision) fields are
+    meaningful. macOS-only; returns ``None`` everywhere else.
+
+    Reads in-process through ``ctypes``/``libSystem`` -- **no subprocess**. That
+    is not merely faster: the macOS app sandbox can deny spawning ``vm_stat`` or
+    ``sysctl``, and this probe runs on the gateway event loop.
+    """
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+    except OSError:
+        return None  # not macOS / libSystem unavailable
+
+    try:
+        libc.mach_host_self.restype = ctypes.c_uint
+        libc.mach_task_self.restype = ctypes.c_uint
+        libc.mach_port_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        libc.host_statistics64.restype = ctypes.c_int
+        libc.host_statistics64.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.POINTER(_VMStatistics64),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        host_port = libc.mach_host_self()
+        try:
+            stats = _VMStatistics64()
+            count = ctypes.c_uint(ctypes.sizeof(_VMStatistics64) // ctypes.sizeof(ctypes.c_int))
+            kern_return = libc.host_statistics64(
+                host_port,
+                _HOST_VM_INFO64,
+                ctypes.byref(stats),
+                ctypes.byref(count),
+            )
+        finally:
+            # Release the send right from mach_host_self so the port reference is
+            # not leaked per probe. Guarded so a missing symbol still returns
+            # None cleanly below rather than raising out of a memory reading.
+            try:
+                libc.mach_port_deallocate(libc.mach_task_self(), host_port)
+            except (AttributeError, OSError, ValueError):
+                pass
+    except (AttributeError, OSError, ValueError):
+        return None
+    if kern_return != 0:  # non-zero kern_return_t -> failure
+        return None
+    return stats, int(count.value)
+
+
+def _macos_available_mib() -> int:
+    """RAM in MiB a new process can take on macOS without swapping, or 0.
+
+    macOS publishes no ``MemAvailable``; it publishes page counters, and which
+    ones count as available is a decision. Each term here is one:
+
+    * ``free_count`` ALREADY INCLUDES ``speculative_count`` -- Darwin's own
+      ``vm_stat`` prints ``free_count - speculative_count`` as its "Pages free"
+      line. Adding speculative on top double-counts it, which inflates the
+      reading on exactly the loaded machine where it must not.
+    * ``purgeable_count`` is volatile memory the kernel may drop outright, with
+      no I/O, so it is genuinely available.
+    * ``inactive_count`` is NOT all reclaimable: it mixes clean file-backed pages
+      with DIRTY ANONYMOUS pages that cannot be handed over without compressing
+      or swapping them. ``HOST_VM_INFO64`` publishes no inactive-AND-file
+      counter, so the intersection is not computable -- but
+      ``min(inactive, external_page_count)`` is an upper bound on the file-backed
+      share, and it is strictly tighter than ``inactive``. That tightening is
+      what stops a browser's gigabytes of inactive anonymous memory reading as
+      free.
+
+    Compressed pages are occupied, so the compressor counts are excluded.
+
+    ``0`` means UNKNOWN, and callers skip an unknown reading rather than treating
+    it as zero memory. A read that SUCCEEDED but computed nothing therefore
+    returns 0 too: a host with no free, purgeable or file-backed pages at all is
+    not a reading anyone should act on.
+    """
+    probe = macos_vm_statistics()
+    if probe is None:
+        return 0
+    stats, filled = probe
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return 0
+    if page_size <= 0:
+        return 0
+    inactive = int(stats.inactive_count)
+    if filled >= _EXTERNAL_PAGE_COUNT_ELEMENTS:
+        inactive = min(inactive, int(stats.external_page_count))
+    pages = int(stats.free_count) + int(stats.purgeable_count) + inactive
+    if pages <= 0:
+        return 0
+    # max(1, ...) only after the >0 check above, so a real but sub-MiB reading
+    # stays distinguishable from "unknown".
+    return max(1, pages * page_size // _MIB_BYTES)
+
+
+def _linux_available_mib() -> int:
+    """``MemAvailable`` in MiB, or 0 when ``/proc/meminfo`` cannot be read.
+
+    The kernel's own estimate of what a new allocation can use without swapping.
+    It counts reclaimable page cache, which ``MemFree`` and ``SC_AVPHYS_PAGES``
+    both omit -- on a host that has read any files those understate badly (they
+    match ``MemFree`` exactly, measured 43,574 MiB against ``MemAvailable``'s
+    74,768 MiB on the same idle host).
+    """
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                # "MemAvailable:   107374182 kB" -- the unit is always kB.
+                return int(line.split()[1]) * 1024 // _MIB_BYTES
+    except (OSError, IndexError, ValueError):
+        return 0
+    return 0
+
+
+def host_total_mib() -> int:
+    """Total physical RAM in MiB, or 0 when it cannot be determined.
+
+    POSIX ``sysconf`` first, then the Win32 reading -- the same order
+    ``sandbox._default_max_memory_mb`` uses, and for the same reason: ``os.sysconf``
+    does not EXIST on Windows, so a probe written against it alone does not return a
+    conservative number there, it returns nothing. Paired with
+    :func:`host_available_mib` so both halves of a memory budget answer on every
+    platform; a budget with only one of them silently stops bounding anything.
+    """
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return pages * page_size // _MIB_BYTES
+    except (AttributeError, OSError, ValueError):
+        pass
+    mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
+    return (mem[0] // _MIB_BYTES) if mem else 0
+
+
+def host_available_mib() -> int:
+    """RAM in MiB actually free for a new process right now, or 0 when unknown.
+
+    **MiB, not GiB, and the unit is load-bearing.** In GiB every reading under
+    1 GiB truncates to ``0``, which is also this function's "could not
+    determine" answer -- so on the starved host the reading exists to protect,
+    860 MiB free would read as "unknown" and the bound built on it would vanish.
+
+    ``0`` is returned only when the platform genuinely cannot be read, so a
+    caller can distinguish "no headroom" from "no reading" and fail open on the
+    latter.
+    """
+    if IS_LINUX:
+        return _linux_available_mib()
+    if IS_MACOS:
+        return _macos_available_mib()
+    if IS_WINDOWS:
+        mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
+        return (mem[1] // _MIB_BYTES) if mem else 0
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2922,3 +4819,289 @@ def raise_nofile_soft_limit(target: int) -> None:
             resource.setrlimit(resource.RLIMIT_NOFILE, (min(target, hard), hard))
     except (ValueError, OSError, ImportError):
         logger.debug("Could not raise RLIMIT_NOFILE", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Windows Job objects — the cgroup-v2-scope analogue
+# ---------------------------------------------------------------------------
+# On Linux, ``sandbox.cgroup_scope_argv`` bounds an agent subprocess AND all its
+# descendants as one cgroup (``TasksMax`` = fork-bomb ceiling, ``MemoryMax`` =
+# RSS-balloon ceiling). That wrapper is a no-op on Windows (there is no systemd)
+# and logs a one-time loud SECURITY warning, so Windows had NO fork-bomb and NO
+# memory ceiling on the agent tree at all.
+#
+# A Job object is the native equivalent: limits apply to every process in the
+# job, and descendants of a job member join the job automatically. Unlike the
+# cgroup path this cannot be expressed as an argv prefix — there is no wrapper
+# binary to prepend — so it is applied to an already-spawned pid instead. See the
+# race note in :func:`apply_job_limits` for why that pid must be SUSPENDED.
+_JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
+_JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000) is deliberately NOT set. It would
+# terminate the agent tree as soon as the last job handle closed, changing
+# process LIFECYCLE (a gateway exit would kill running agents) rather than merely
+# adding a resource ceiling. Omitting it also means the handle need not be held:
+# a job object stays alive while processes are assigned to it, so the limits keep
+# being enforced after CloseHandle. That makes this fire-and-forget, with no
+# handle registry and no teardown semantics to get wrong.
+_JOBOBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9  # JobObjectExtendedLimitInformation
+
+
+def apply_job_limits(pid: int, *, max_procs: int, max_memory_bytes: int) -> bool:
+    """Bound *pid* and its descendants with a Windows Job object.
+
+    The Windows analogue of ``sandbox.cgroup_scope_argv``:
+
+    ==============================  ====================================
+    cgroup v2                       Job object
+    ==============================  ====================================
+    ``TasksMax`` (fork bomb)        ``ActiveProcessLimit``
+    ``MemoryMax`` (RSS balloon)     ``JobMemoryLimit``
+    ==============================  ====================================
+
+    The memory row is a true equivalent; the process row is NOT one-for-one.
+    ``TasksMax`` counts tasks — every thread — while ``ActiveProcessLimit``
+    counts processes, so the same numeric budget is a LOOSER bound here: a
+    tree of N processes holds at least N tasks and usually many more. It still
+    bounds a fork bomb, which is the control's purpose, but do not read the two
+    limits as equal strictness, and do not "fix" the gap by scaling the number
+    without deciding what a process budget should be — the units differ, so
+    there is no arithmetic conversion between them.
+
+    Enforcement is by DENIAL, matching the cgroup tier's practical behavior:
+    once ``ActiveProcessLimit`` is reached the member's ``CreateProcess`` calls
+    fail with ``ERROR_NOT_ENOUGH_QUOTA``, and an allocation past
+    ``JobMemoryLimit`` fails, rather than the tree being killed outright.
+    Nothing about process lifetime changes (see the ``KILL_ON_JOB_CLOSE`` note
+    above).
+
+    Returns ``True`` when the limits were applied. Returns ``False`` — never
+    raises — on POSIX (where ``cgroup_scope_argv`` owns this), on a non-positive
+    limit, or on any Win32 failure; the caller treats that as "no ceiling
+    enforced" exactly as it already treats the cgroup probe failing.
+
+    Race-free ONLY when paired with :data:`CREATE_SUSPENDED`. Job membership
+    covers a member's FUTURE descendants but not ones it already spawned, so
+    assigning a *running* child leaves a window in which it could have forked
+    something that escapes the job. Callers therefore create the child with
+    ``creationflags |= CREATE_SUSPENDED`` — a suspended process has executed no
+    instructions and so provably has no descendants — call this, then
+    :func:`resume_process_main_thread`. That closes the window by construction
+    rather than merely making it small. This function still works on an
+    already-running pid (the ceiling then applies from that moment on); the
+    suspended handshake is what makes it airtight.
+    """
+    if IS_POSIX:
+        return False
+    if max_procs <= 0 or max_memory_bytes <= 0:
+        logger.debug(
+            "apply_job_limits: skipping non-positive limits (procs=%s, mem=%s)",
+            max_procs,
+            max_memory_bytes,
+        )
+        return False
+    job = None
+    proc_handle = None
+    kernel32 = None
+    # pragma: no cover below — the ctypes plumbing is Windows-only, and the
+    # Windows CI shards run with --no-cov (only the Ubuntu 3.12 shards measure
+    # coverage), so these statements are unmeasurable ANYWHERE rather than
+    # merely untested. Charging them to the denominator understates the file's
+    # real rate, the same reasoning setup.cfg records for the CI-deselected
+    # suites it omits. Everything above stays measured: the POSIX early-out is
+    # exercised by test_windows_job_limits.py's ungated inertness tests, and the
+    # Windows behavior itself is asserted against the live kernel there.
+    try:  # pragma: no cover
+        _PROCESS_SET_QUOTA = 0x0100  # noqa: N806 — Windows API constant
+        _PROCESS_TERMINATE = 0x0001  # noqa: N806 — AssignProcessToJobObject needs it
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        # Anonymous job (NULL name): nothing else can open it by name.
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            logger.warning(
+                "SECURITY: CreateJobObject failed (err=%s); fork-bomb / memory-DoS "
+                "ceilings are NOT enforced for pid %d",
+                _windows_last_error(),
+                pid,
+            )
+            return False
+
+        info = _JobObjectExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_ACTIVE_PROCESS | _JOB_OBJECT_LIMIT_JOB_MEMORY
+        )
+        info.BasicLimitInformation.ActiveProcessLimit = max_procs
+        info.JobMemoryLimit = max_memory_bytes
+        if not kernel32.SetInformationJobObject(
+            job,
+            _JOBOBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            logger.warning(
+                "SECURITY: SetInformationJobObject failed (err=%s); ceilings NOT "
+                "enforced for pid %d",
+                _windows_last_error(),
+                pid,
+            )
+            return False
+
+        proc_handle = kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+        if not proc_handle:
+            logger.warning(
+                "SECURITY: OpenProcess(SET_QUOTA|TERMINATE) failed for pid %d (err=%s); "
+                "ceilings NOT enforced",
+                pid,
+                _windows_last_error(),
+            )
+            return False
+        if not kernel32.AssignProcessToJobObject(job, proc_handle):
+            logger.warning(
+                "SECURITY: AssignProcessToJobObject failed for pid %d (err=%s); "
+                "ceilings NOT enforced",
+                pid,
+                _windows_last_error(),
+            )
+            return False
+        logger.info(
+            "Job object ceilings applied to pid %d (max_procs=%d, max_mem=%dMB)",
+            pid,
+            max_procs,
+            max_memory_bytes // (1024 * 1024),
+        )
+        return True
+    except Exception:
+        logger.warning("apply_job_limits failed for pid %s", pid, exc_info=True)
+        return False
+    finally:
+        # Safe to close BOTH handles: without KILL_ON_JOB_CLOSE the job object
+        # outlives our handle for as long as processes remain assigned, so the
+        # limits stay in force. Leaking these would be a per-spawn handle leak in
+        # a long-lived gateway.
+        for handle in (proc_handle, job):
+            if handle and kernel32 is not None:
+                try:
+                    kernel32.CloseHandle(handle)
+                except Exception:
+                    logger.debug("CloseHandle failed", exc_info=True)
+
+
+_TH32CS_SNAPTHREAD = 0x00000004
+_THREAD_SUSPEND_RESUME = 0x0002
+_INVALID_HANDLE_VALUE = -1
+# ResumeThread returns the thread's PREVIOUS suspend count, or (DWORD)-1 on
+# failure. Compared as an unsigned 32-bit value because the restype is DWORD.
+_RESUME_THREAD_FAILED = 0xFFFFFFFF
+
+
+def resume_process_main_thread(pid: int) -> bool:
+    """Resume every suspended thread of *pid*. Returns True iff one was resumed.
+
+    The other half of race-free Job object assignment. A child spawned with
+    :data:`CREATE_SUSPENDED` has executed no instructions, so
+    :func:`apply_job_limits` can put it in a job knowing no descendant escaped;
+    this then lets it run.
+
+    kernel32 has no ``ResumeProcess``, so the main thread has to be reached by
+    ID: snapshot the system thread list
+    (``CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)``), select entries whose
+    ``th32OwnerProcessID`` matches, and ``ResumeThread`` each. A freshly created
+    suspended process has exactly one thread, but every match is resumed rather
+    than only the first — resuming a thread that is not suspended is a harmless
+    no-op (its suspend count is already 0), whereas guessing wrong about which
+    thread is "main" would leave the process wedged forever.
+
+    Returns ``False`` — never raises — on POSIX (nothing is ever suspended there)
+    or on any Win32 failure. A ``False`` return is SERIOUS for the caller: the
+    child is alive but frozen, and the only safe response is to kill it rather
+    than let a suspended process masquerade as a running agent. See
+    ``acp.client.finish_suspended_spawn``, which implements that policy.
+    """
+    if IS_POSIX:
+        return False
+    snapshot = None
+    kernel32 = None
+    # Windows-only ctypes plumbing, unmeasurable on every runner — see the note
+    # in :func:`apply_job_limits`.
+    try:  # pragma: no cover
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+        kernel32.Thread32First.restype = wintypes.BOOL
+        kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+        kernel32.Thread32Next.restype = wintypes.BOOL
+        kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenThread.restype = wintypes.HANDLE
+        kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+        kernel32.ResumeThread.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+        if not snapshot or snapshot == _INVALID_HANDLE_VALUE:
+            logger.error(
+                "resume_process_main_thread: thread snapshot failed for pid %d (err=%s)",
+                pid,
+                _windows_last_error(),
+            )
+            return False
+        entry = _ThreadEntry32()
+        entry.dwSize = ctypes.sizeof(_ThreadEntry32)
+        resumed = 0
+        ok = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+        while ok:
+            if entry.th32OwnerProcessID == pid:
+                thread = kernel32.OpenThread(_THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                if thread:
+                    try:
+                        if kernel32.ResumeThread(thread) != _RESUME_THREAD_FAILED:
+                            resumed += 1
+                        else:
+                            logger.error(
+                                "ResumeThread failed for tid %d of pid %d (err=%s)",
+                                entry.th32ThreadID,
+                                pid,
+                                _windows_last_error(),
+                            )
+                    finally:
+                        kernel32.CloseHandle(thread)
+                else:
+                    logger.error(
+                        "OpenThread(SUSPEND_RESUME) failed for tid %d of pid %d (err=%s)",
+                        entry.th32ThreadID,
+                        pid,
+                        _windows_last_error(),
+                    )
+            # Thread32Next overwrites the entry, dwSize included, so it must be
+            # reset before every call or the next iteration fails.
+            entry.dwSize = ctypes.sizeof(_ThreadEntry32)
+            ok = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+        if not resumed:
+            logger.error("resume_process_main_thread: no threads resumed for pid %d", pid)
+        return resumed > 0
+    except Exception:
+        logger.error("resume_process_main_thread failed for pid %s", pid, exc_info=True)
+        return False
+    finally:
+        if snapshot and snapshot != _INVALID_HANDLE_VALUE and kernel32 is not None:
+            try:
+                kernel32.CloseHandle(snapshot)
+            except Exception:
+                logger.debug("CloseHandle(snapshot) failed", exc_info=True)

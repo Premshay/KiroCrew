@@ -27,19 +27,22 @@ Wire shape (per docs/reference/kiro-cli/acp.md):
 from __future__ import annotations
 
 import base64
-import io
 import logging
 import os
 import re
 from pathlib import Path
 
-from kiro_crew.hooks import safe_read_file_bytes
+from kiro_crew.hooks import is_unc_shape, safe_read_file_bytes, unc_probe_allowed
 
-try:
-    from PIL import Image, ImageOps
-    _HAS_PIL = True
-except ImportError:  # pragma: no cover - Pillow ships via qrcode[pil]/pdfplumber
-    _HAS_PIL = False
+# The budget constants and Pillow machinery live in the LEAF module
+# kiro_crew.imaging (shared with the gateway's tool-result rewrite, which must
+# not import the ACP package). The two constants are re-exported because this
+# module is where the prompt path's callers and tests historically found them.
+from kiro_crew.imaging import (  # noqa: F401 -- constants re-exported, see comment
+    MAX_IMAGE_B64_BYTES,
+    MAX_IMAGE_EDGE_PX,
+    downscale_image_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,30 +63,6 @@ IMAGE_MEDIA_TYPES: dict[str, str] = {
 #: unbounded image becomes an unbounded write. Matches the Slack producer cap so
 #: a file that passed ingestion is not silently dropped here.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-
-#: Longest-edge cap (px) enforced on every inlined image. Anthropic rejects the
-#: ENTIRE request when a many-image conversation (more than 20 images) carries
-#: any image whose width or height exceeds 2000px. Because kiro-cli replays the
-#: full message history to the model every turn, a single oversized image
-#: permanently wedges the session -- the offending block sits at a fixed history
-#: index and re-uploading a smaller copy cannot evict it. This builder is the
-#: one funnel every channel's images cross before reaching kiro-cli, so capping
-#: here protects all of them (dashboard upload/paste/screenshot, Slack, Discord)
-#: regardless of any best-effort client-side resize. 2000 is the hard limit
-#: itself: valid even past 20 images, yet it keeps more detail than the browser's
-#: 1568px pre-upload downscale, which only ever covers dashboard uploads.
-MAX_IMAGE_EDGE_PX = 2000
-
-#: mime -> Pillow save format for a re-encoded downscale. GIF collapses to a PNG
-#: first frame: vision models read frame 0 only (animation is invisible to them)
-#: and rescaling a palette image is lossy, so a lossless still is faithful.
-_PIL_SAVE_FORMAT: dict[str, str] = {
-    "image/png": "PNG",
-    "image/jpeg": "JPEG",
-    "image/webp": "WEBP",
-    "image/bmp": "BMP",
-    "image/gif": "PNG",
-}
 
 # Absolute paths ending in a supported raster suffix.
 #
@@ -130,76 +109,22 @@ _POSIX_PATH_RE = re.compile(
 # like `the path C:\docs\logo.png is an example` a candidate -- and on Linux a
 # file with that literal name can exist in the CWD, which would inline a file
 # the user only mentioned. Matching the host's own grammar keeps that impossible.
+#
+# The UNC alternative accepts both separators after the leading pair
+# (``\\host\share\...`` and ``//host/share/...``): the dashboard composer
+# serializes image attachments with forward slashes (a markdown destination
+# cannot carry raw backslashes -- CommonMark eats ``\`` before punctuation),
+# and Windows file APIs accept the forward-slash form verbatim. The leading
+# pair likewise accepts ``//``; ``(?<![\w:/])`` guards it from matching inside
+# a URL's ``://``.
 _WINDOWS_PATH_CHARS = r"[\w\\/.@ \t()\-]"
 _WINDOWS_PATH_RE = re.compile(
-    rf"(?<![\w:])((?:[A-Za-z]:[\\/]|\\\\[^\\/:*?\"<>|\r\n]+[\\/])"
+    rf"(?<![\w:])(?:(?<![\w:/]))((?:[A-Za-z]:[\\/]|[\\/]{{2}}[^\\/:*?\"<>|\r\n]+[\\/])"
     rf"{_WINDOWS_PATH_CHARS}+?\.{_SUFFIX_GROUP})",
     re.IGNORECASE,
 )
 
 _PATH_RE = _WINDOWS_PATH_RE if os.name == "nt" else _POSIX_PATH_RE
-
-
-def _downscale_within_limits(raw_bytes: bytes, mime: str, max_edge: int) -> tuple[bytes, str] | None:
-    """Downscale *raw_bytes* so its longest edge is <= *max_edge*, keeping aspect.
-
-    Returns ``(bytes, mime)`` -- the ORIGINAL pair when the image is already
-    within the cap, the downscaled pair otherwise. The mime can change
-    (``image/gif`` -> ``image/png``) because the re-encode picks a still format.
-
-    Returns ``None`` when the image is oversized (or its size is unknowable) but
-    a compliant copy could NOT be produced -- an undecodable file, or a Pillow
-    decompression-bomb rejection on a huge-but-small-bytes raster. The caller
-    must then NOT inline it: shipping the un-shrunk original is precisely the
-    >2000px payload that poisons the session, so a failure fails CLOSED (leave
-    the path as text) rather than open. Pillow is a guaranteed runtime dep; the
-    ``_HAS_PIL`` guard only keeps image support alive on a hand-stripped install
-    where dimensions cannot be verified at all.
-    """
-    if not _HAS_PIL or max_edge <= 0:
-        return raw_bytes, mime
-    try:
-        with Image.open(io.BytesIO(raw_bytes)) as img:
-            # Header read only -- no decompression -- so a within-cap image never
-            # pays for a decode and rides through byte-identical.
-            if max(img.width, img.height) <= max_edge:
-                return raw_bytes, mime
-            # Bake EXIF orientation into the pixels BEFORE resizing: the re-encode
-            # (PNG in particular) drops the orientation tag, so a phone photo
-            # would otherwise reach the model rotated.
-            oriented = ImageOps.exif_transpose(img) or img
-            # Palette frames upsample poorly; promote to RGBA so the resample
-            # interpolates real channels rather than palette indices.
-            src = oriented.convert("RGBA") if oriented.mode in ("P", "PA") else oriented
-            long_edge = max(src.width, src.height)
-            scale = max_edge / long_edge
-            new_size = (max(1, round(src.width * scale)), max(1, round(src.height * scale)))
-            resample = getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", 1))
-            resized = src.resize(new_size, resample)
-            fmt = _PIL_SAVE_FORMAT.get(mime, "PNG")
-            if fmt in ("JPEG", "BMP") and resized.mode not in ("RGB", "L"):
-                # JPEG/BMP carry no alpha channel; flatten before encoding.
-                resized = resized.convert("RGB")
-            buf = io.BytesIO()
-            if fmt == "JPEG":
-                resized.save(buf, format="JPEG", quality=90)
-            elif fmt == "WEBP":
-                # A source WEBP may be lossless; PIL defaults to lossy q80, so
-                # stay lossless to avoid re-encode artifacts on the downscale.
-                resized.save(buf, format="WEBP", lossless=True)
-            else:
-                resized.save(buf, format=fmt)
-            out_mime = "image/png" if mime == "image/gif" else mime
-            return buf.getvalue(), out_mime
-    except Exception:
-        # Fail CLOSED: an oversized image we could not shrink must not be inlined,
-        # or the original >2000px payload reaches the model and poisons the session.
-        logger.warning(
-            "acp prompt: could not downscale oversized image (mime=%s); leaving as path",
-            mime,
-            exc_info=True,
-        )
-        return None
 
 
 def build_prompt_blocks(
@@ -208,6 +133,7 @@ def build_prompt_blocks(
     allow_image: bool = True,
     max_image_bytes: int = MAX_IMAGE_BYTES,
     max_image_edge: int = MAX_IMAGE_EDGE_PX,
+    max_image_b64_bytes: int = MAX_IMAGE_B64_BYTES,
 ) -> list[dict]:
     """Return ACP prompt blocks for *message*.
 
@@ -224,7 +150,9 @@ def build_prompt_blocks(
     Inlined images are downscaled so their longest edge is at most
     ``max_image_edge`` px -- the server-side backstop for Anthropic's many-image
     dimension limit, applied for EVERY channel here regardless of any
-    client-side resize that was skipped or bypassed.
+    client-side resize that was skipped or bypassed -- and then shrunk further if
+    needed so the base64 payload stays within ``max_image_b64_bytes``, the
+    backend's per-image byte ceiling.
     """
     text = message
     images: list[dict] = []
@@ -234,6 +162,14 @@ def build_prompt_blocks(
         for match in _PATH_RE.finditer(message):
             raw = match.group(1).strip()
             if raw in seen:
+                continue
+            # UNC-shaped candidates name a HOST on Windows: gate them before
+            # any filesystem call, or is_file() below opens an SMB connection
+            # to attacker-controlled text. POSIX has no such semantics (a
+            # doubled leading slash is an ordinary local path), and _PATH_RE
+            # is platform-gated anyway. See kiro_crew.hooks.unc_probe_allowed.
+            if os.name == "nt" and is_unc_shape(raw) and not unc_probe_allowed(raw):
+                seen.add(raw)
                 continue
             path = Path(raw)
             suffix = path.suffix.lower()
@@ -265,14 +201,18 @@ def build_prompt_blocks(
                 # stays in the text; it is NOT inlined.
                 logger.warning("acp prompt: image read refused for %s", path.name)
                 continue
-            downscaled = _downscale_within_limits(raw_bytes, mime, max_image_edge)
+            downscaled = downscale_image_block(
+                raw_bytes, mime, max_edge=max_image_edge, max_b64_bytes=max_image_b64_bytes
+            )
             if downscaled is None:
-                # Oversized and un-shrinkable (decompression-bomb / undecodable):
-                # leave the path as text rather than inline a >2000px payload that
-                # would poison the session. A tool-capable agent can still open it.
+                # No compliant rendition (decompression-bomb / undecodable /
+                # truncated / over the decode-pixel ceiling / still over the
+                # encoded ceiling at the minimum edge): leave the path as text
+                # rather than inline a payload the backend rejects on this and
+                # every later turn. A tool-capable agent can still open it.
                 logger.warning(
-                    "acp prompt: image %s exceeds the dimension cap and could not be "
-                    "downscaled - sending path, not inline",
+                    "acp prompt: image %s could not be rendered within the "
+                    "dimension and encoded-size caps - sending path, not inline",
                     path.name,
                 )
                 continue

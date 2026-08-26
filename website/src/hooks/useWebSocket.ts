@@ -1,31 +1,89 @@
 import { useEffect, useRef, useCallback } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { isArtifactEditing } from '../utils/artifactEditGuard'
-import { useAppDispatch } from '../store'
+import { isReconcileNote } from '../lib/noteContract'
+import { useAppDispatch, useAppSelector } from '../store'
 import { store } from '../store'
 import { sseStatus, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, setChannelTrusted, sseSlotTitle, triggerRefresh, fetchSlots, markSlotUnread, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail } from '../store/dashboardSlice'
-import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, fetchNotifications } from '../store/notificationsSlice'
-import { MC_NOTIFICATION_EVENT, TURN_DONE_KIND, shouldChimeOnTurnDone, type McNotificationDetail } from './notificationEvent'
+import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, clearAllNotifications, fetchNotifications, markBootNotificationsFetched } from '../store/notificationsSlice'
+import { dispatchMcNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone } from './notificationEvent'
 import { emitThemeSound } from './themeSound'
-import { fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceBusy, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, interruptActiveTurn, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop } from '../store/chatSlice'
+import {
+  fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, setVoicePlaying, setVoiceBusy, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop, sseSideQueue, reconcileWorkflowRuns
+} from '../store/chatSlice'
+import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
+import { TAB_ID } from '../api/tabId'
 import { api } from '../api/client'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { nextSpeakableSpan, MIN_TTS_CHARS } from './sentenceCutter'
-import { markFirstToken, markFirstAudio } from '../utils/voiceTurnMetrics'
+import { markFirstAudio, markFirstToken } from '../utils/voiceTurnMetrics'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
-import type { StatusData, ChatSlot, Notification, PullRequestStatusBatch, TodoList } from '../types'
+import type { StatusData, ChatMessage, ChatSlot, ChatFolder, Notification, PullRequestStatusBatch, TodoList } from '../types'
 import { i18nT } from '../i18n/t'
 
 type LogCallback = ((data: { level: string; msg: string }) => void) | null
 
+/** How often a workflow row this tab still shows as `running` is re-checked
+ *  against `/api/workflows/runs`. Deliberately slow: a run lasts minutes, this
+ *  is a correctness backstop for a lost terminal frame rather than the progress
+ *  channel (that is the live event stream), and the tick makes no request at all
+ *  while no row is running. */
+const WORKFLOW_HEAL_MS = 15000
+
+type VoiceProgress = {
+  slot: string
+  messageId: string
+  spokenLen: number
+}
+
+function voiceMessageId(message: ChatMessage): string {
+  const clientId = message.meta?.clientTs
+  if (typeof clientId === 'string' && clientId) return clientId
+  if (message.ts) return message.ts
+  const serverId = message.meta?.mid
+  return typeof serverId === 'string' ? serverId : ''
+}
+
+/**
+ * Invalidate React Query caches for keys that previously relied on the
+ * `refreshTrigger` counter being part of their queryKey.  Calling
+ * `invalidateQueries` refetches **in-place** (keeping the cached data visible
+ * to the UI) instead of minting a brand-new cache entry with `undefined` data
+ * — which is what caused the flash-to-empty bug (#4132, #4179).
+ */
+function invalidateRefreshQueries(qc: QueryClient): void {
+  qc.invalidateQueries({ queryKey: ['cron-jobs'] })
+  qc.invalidateQueries({ queryKey: ['cron-history-all'] })
+  qc.invalidateQueries({ queryKey: ['spawn-list'] })
+  qc.invalidateQueries({ queryKey: ['sessions-context'] })
+  qc.invalidateQueries({ queryKey: ['sessions-usage'] })
+  qc.invalidateQueries({ queryKey: ['agents-installed'] })
+  qc.invalidateQueries({ queryKey: ['mcp-tools'] })
+  qc.invalidateQueries({ queryKey: ['kirocrew-agents'] })
+  qc.invalidateQueries({ queryKey: ['default-agent'] })
+  qc.invalidateQueries({ queryKey: ['workspaces'] })
+  qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+}
+
 /** Single multiplexed WebSocket replacing all SSE + polling connections. */
-/** Own-property `ask_id`s held in the pending-question map, in map order.
- *  Legacy cards (no ask_id) are excluded: they have no server-side record. */
+/** The server-side IDENTITY of a held card: a blocking ask's `ask_id`, or a
+ *  stateless card's server-minted `card_id`. Both kinds are listed by
+ *  `GET /api/ask-question/pending`, so both can be reconciled against it.
+ *
+ *  A card with neither (an entry built by a fixture, or delivered before the
+ *  server kept a record) has no identity to compare, and absence from the
+ *  snapshot says nothing about it — those are skipped rather than reported
+ *  stale. */
+export function identityOf(card: { ask_id?: string; serverCardId?: string } | undefined): string {
+  return card?.ask_id || card?.serverCardId || ''
+}
+
+/** Own-property card identities held in the pending-question map, in map order. */
 export function askIdsOf(
-  map: Record<string, { ask_id?: string } | undefined> | undefined,
+  map: Record<string, { ask_id?: string; serverCardId?: string } | undefined> | undefined,
 ): string[] {
   return Object.values(map ?? {})
-    .map((card) => card?.ask_id)
+    .map((card) => identityOf(card))
     .filter((id): id is string => !!id)
 }
 
@@ -52,10 +110,18 @@ export function resolvedSince(log: Map<string, number>, watermark: number): stri
  *  - An id that vanished locally during the fetch was resolved by a WS event, so
  *    the response's copy is already dead and must not be re-added — a
  *    resurrected card can only 404 on submit.
+ *
+ *  Both kinds of card go through this, keyed by `identityOf`: the server records
+ *  and lists stateless cards too, so a tab that was disconnected while its card
+ *  was retired or replaced must have it removed, not merely be denied a
+ *  duplicate. A card whose identity is absent from the snapshot is stale in
+ *  exactly the same sense for both kinds.
  */
-export function reconcileQuestions<T extends { ask_id: string; slot?: string; questions?: unknown[] }>(
-  before: Record<string, { ask_id?: string } | undefined> | undefined,
-  after: Record<string, { ask_id?: string } | undefined> | undefined,
+export function reconcileQuestions<
+  T extends { ask_id?: string; card_id?: string; slot?: string; questions?: unknown[] },
+>(
+  before: Record<string, { ask_id?: string; serverCardId?: string } | undefined> | undefined,
+  after: Record<string, { ask_id?: string; serverCardId?: string } | undefined> | undefined,
   pending: T[],
   resolvedDuringFetch: string[] = [],
 ): { drop: string[]; add: T[] } {
@@ -63,36 +129,70 @@ export function reconcileQuestions<T extends { ask_id: string; slot?: string; qu
   // Two independent sources, because neither alone is sufficient:
   //  - the before/after diff catches a card that WAS local and disappeared
   //    (including one this client resolved itself, with no WS event involved);
-  //  - the observed resolution log catches an ask_id this client never held, so
+  //  - the observed resolution log catches an identity this client never held, so
   //    there was nothing for the diff to notice. That is the case where the
   //    snapshot alone would resurrect a dead card.
   const dead = new Set([
     ...askIdsOf(before).filter((id) => !afterIds.has(id)),
     ...resolvedDuringFetch,
   ])
+  const beforeIds = new Set(askIdsOf(before))
+  /** True when *slot* now holds a DIFFERENT card that the snapshot cannot know
+   *  about — one that arrived while the request was in flight (its identity is
+   *  absent from `before`). The same ordering argument as the drop side, applied
+   *  to adds: one card renders per slot, so adding the snapshot's row would
+   *  replace a newer live card with a stale one. */
+  const arrivedDuringFetch = (slot: string | undefined, identity: string): boolean => {
+    if (!slot) return false
+    const held = identityOf(after?.[slot])
+    return !!held && held !== identity && !beforeIds.has(held)
+  }
   return {
     drop: staleAskIds(before, pending),
-    add: pending.filter((q) => !!q.slot && !!q.questions?.length && !dead.has(q.ask_id)),
+    add: pending.filter((q) => {
+      const identity = q.ask_id || q.card_id || ''
+      return (
+        !!q.slot &&
+        !!q.questions?.length &&
+        !dead.has(identity) &&
+        !arrivedDuringFetch(q.slot, identity)
+      )
+    }),
   }
 }
 
-/** Ask-ids held locally that the server no longer lists as pending.
+/** Card identities held locally that the server no longer lists as pending.
  *
  *  `question_card` and `question_card_resolved` are one-shot broadcasts, so a
  *  reload or reconnect can miss either one: a card that should be showing is
- *  absent, or one resolved while disconnected is still on screen. Reconnect
- *  therefore reconciles in both directions rather than only adding.
+ *  absent, or one retired while disconnected is still on screen. Reconnect
+ *  therefore reconciles in both directions rather than only adding — for a
+ *  stateless card as much as a blocking one, since keeping a retired or
+ *  superseded card would send its answer against a question the agent has
+ *  already moved past.
  *
- *  Legacy cards (no ask_id) are never reported stale: the server has no record
- *  of them, so their absence from the response says nothing about them.
+ *  A card with no identity at all is never reported stale: there is nothing to
+ *  compare, so its absence from the response says nothing about it.
  *  Exported so this is unit-testable without standing up a live socket.
  */
 export function staleAskIds(
-  current: Record<string, { ask_id?: string } | undefined> | undefined,
-  pending: { ask_id: string }[],
+  current: Record<string, { ask_id?: string; serverCardId?: string } | undefined> | undefined,
+  pending: { ask_id?: string; card_id?: string }[],
 ): string[] {
-  const live = new Set(pending.map((q) => q.ask_id))
+  const live = new Set(pending.map((q) => q.ask_id || q.card_id || '').filter(Boolean))
   return askIdsOf(current).filter((id) => !live.has(id))
+}
+
+/* Slot-focus intent signal (resume prefetch). The hook instance owns the
+   live socket, but split view needs to report pane focus from a component
+   tree that has no access to the hook's return value — so the sender is a
+   module-level indirection the hook binds while mounted. Before the hook
+   mounts (or after it unmounts) the emitter is a no-op: focus frames are a
+   best-effort optimization, never load-bearing. */
+let sendSlotFocusedImpl: (slot: string | null) => void = () => {}
+
+export function emitSlotFocused(slot: string | null): void {
+  sendSlotFocusedImpl(slot)
 }
 
 export function useWebSocket() {
@@ -107,10 +207,13 @@ export function useWebSocket() {
      with a sequence so trimming never shifts a watermark's meaning. */
   const resolvedAskIdsRef = useRef<Map<string, number>>(new Map())
   const resolvedSeqRef = useRef(0)
-  const recordResolvedAskId = useCallback((askId: string) => {
-    if (!askId) return
+  /** Log a RETIRED question identity — a blocking `ask_id` or a stateless
+   *  `card_id`, in one map because the snapshot add side asks the same question
+   *  of both: "was this retired while my request was in flight?" */
+  const recordRetiredId = useCallback((retiredId: string) => {
+    if (!retiredId) return
     const log = resolvedAskIdsRef.current
-    log.set(askId, ++resolvedSeqRef.current)
+    log.set(retiredId, ++resolvedSeqRef.current)
     if (log.size > 200) {
       // Drop the oldest entries; a reconcile only ever consults recent ones.
       const oldest = [...log.entries()].sort((a, b) => a[1] - b[1]).slice(0, log.size - 200)
@@ -125,26 +228,19 @@ export function useWebSocket() {
   const reconnectingRef = useRef(false)  // suppress markSlotUnread during reconnect catch-up
   const lastVersionRef = useRef<string | null>(null)
   const lastGitlabHostsGenRef = useRef<number | null>(null)
+  const lastSlotsRawRef = useRef<string | null>(null)
+  const lastSlotsArrayRef = useRef<ChatSlot[] | null>(null)
   const voiceQueueRef = useRef<string[]>([])
   const voicePlayingRef = useRef(false)
   const activeAudioRef = useRef<HTMLAudioElement | null>(null)
   const autoSpeakRef = useRef(false)
-  const spokenLenRef = useRef(0)  // chars already sent to TTS during streaming
-  // Whether the streaming path synthesized anything this turn. chat_segment
-  // resets spokenLenRef to 0, so the completion pass cannot tell "nothing
-  // spoken yet" (speak the whole reply) from "spoken, then segment-reset"
-  // (speaking from 0 repeats the entire reply) without this.
-  const spokeThisTurnRef = useRef(false)
+  // Speech offsets belong to one concrete message. A segment for another slot
+  // must not reset the active message, and a new post-tool segment must start
+  // from zero even while the previous message remains in the transcript.
+  const voiceProgressRef = useRef<VoiceProgress | null>(null)
   const voiceMutedRef = useRef(false)  // suppress incoming chunks after interrupt
   const synthChainRef = useRef<Promise<unknown>>(Promise.resolve())  // serialize TTS calls
-  // In-flight synthesis POSTs. Together with the queue and the playing flag
-  // this drives chat.voiceBusy — the queue alone goes empty in the window
-  // between requesting a sentence's synthesis and its voice_chunk arriving,
-  // and the hands-free hold must span that gap.
   const synthInFlightRef = useRef(0)
-  // Aborts every chained synthesis fetch on barge-in. One controller per
-  // speaking span: stopVoice() aborts and drops it; the next enqueue creates
-  // a fresh one.
   const synthAbortRef = useRef<AbortController | null>(null)
   const voiceBusyRef = useRef(false)
   // #1 streaming-chunk coalescing: accumulate per-slot chunk text and flush
@@ -157,47 +253,28 @@ export function useWebSocket() {
   const chunkRafRef = useRef<number | null>(null)
   const chunkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  /** Recompute chat.voiceBusy from the three pipeline stages; dispatch only on
-   *  a transition so per-chunk traffic doesn't spam the store. */
+  // Slot-recency coalescing: last ts seen per slot, flushed once per frame, plus
+  // whether the burst contained a SETTLING row (a prompt) — one settled event
+  // anywhere in the burst settles the flush, since the reducer's settled bump is
+  // additive rather than a toggle.
+  // Last-seen wins — the reducer is last-write-wins, so this is the burst's end state.
+  const slotActivityBufRef = useRef<Map<string, { ts: string; settled: boolean }>>(new Map())
+  const slotActivityFlushScheduledRef = useRef(false)
+  const slotActivityRafRef = useRef<number | null>(null)
+  const slotActivityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
   const updateVoiceBusy = useCallback(() => {
-    const busy = synthInFlightRef.current > 0
-      || voiceQueueRef.current.length > 0
-      || voicePlayingRef.current
+    const busy = synthInFlightRef.current > 0 || voiceQueueRef.current.length > 0 || voicePlayingRef.current
     if (busy !== voiceBusyRef.current) {
       voiceBusyRef.current = busy
       dispatch(setVoiceBusy(busy))
     }
   }, [dispatch])
 
-  /** Serialize one sentence's TTS synthesis onto the chain. Serialization is
-   *  the ordering guarantee: the gateway broadcasts a sentence's voice_chunk
-   *  before its POST resolves, so chaining the next POST behind the previous
-   *  response means chunks can never arrive out of order — while the CURRENT
-   *  sentence is still playing from the queue, i.e. the next one is
-   *  pre-fetched during playback, not after it. */
-  const enqueueSynth = useCallback((slot: string, text: string) => {
-    if (!synthAbortRef.current) synthAbortRef.current = new AbortController()
-    const signal = synthAbortRef.current.signal
-    synthInFlightRef.current += 1
-    updateVoiceBusy()
-    synthChainRef.current = synthChainRef.current
-      .then(() => signal.aborted ? undefined : api.voiceSynthesize(slot, text, { signal }))
-      .catch(() => {})
-      .finally(() => {
-        synthInFlightRef.current = Math.max(0, synthInFlightRef.current - 1)
-        updateVoiceBusy()
-      })
-  }, [updateVoiceBusy])
-
   const stopVoice = useCallback(() => {
     voiceMutedRef.current = true
-    // Cancel synthesis still in flight — barge-in must stop future sentences,
-    // not only the audio already queued. The aborted fetches settle through
-    // their own finally, which walks the in-flight count back down.
-    if (synthAbortRef.current) {
-      synthAbortRef.current.abort()
-      synthAbortRef.current = null
-    }
+    synthAbortRef.current?.abort()
+    synthAbortRef.current = null
     if (activeAudioRef.current) {
       activeAudioRef.current.pause()
       activeAudioRef.current = null
@@ -241,6 +318,43 @@ export function useWebSocket() {
     audio.play().then(markFirstAudio).catch(fail)
   }, [dispatch, updateVoiceBusy])
 
+  const voiceProgressFor = useCallback((slot: string, message: ChatMessage): VoiceProgress | null => {
+    const messageId = voiceMessageId(message)
+    if (!messageId) return null
+    const current = voiceProgressRef.current
+    if (!current || current.slot !== slot || current.messageId !== messageId) {
+      const next = { slot, messageId, spokenLen: 0 }
+      voiceProgressRef.current = next
+      voiceMutedRef.current = false
+      return next
+    }
+    return current
+  }, [])
+
+  const enqueueVoiceSynthesis = useCallback((slot: string, text: string) => {
+    if (!synthAbortRef.current) synthAbortRef.current = new AbortController()
+    const signal = synthAbortRef.current.signal
+    synthInFlightRef.current += 1
+    updateVoiceBusy()
+    synthChainRef.current = synthChainRef.current
+      .then(() => signal.aborted ? undefined : api.voiceSynthesize(slot, text, { signal }))
+      .catch(() => {})
+      .finally(() => {
+        synthInFlightRef.current = Math.max(0, synthInFlightRef.current - 1)
+        updateVoiceBusy()
+      })
+  }, [updateVoiceBusy])
+
+  const flushVoiceTail = useCallback((slot: string, message: ChatMessage) => {
+    const progress = voiceProgressFor(slot, message)
+    if (!progress) return
+    const remaining = message.content.slice(progress.spokenLen).trim()
+    // Mark the whole message consumed even when its tail is below the speech
+    // floor, so a later completion event cannot reconsider or repeat it.
+    progress.spokenLen = message.content.length
+    if (remaining.length >= MIN_TTS_CHARS) enqueueVoiceSynthesis(slot, remaining)
+  }, [enqueueVoiceSynthesis, voiceProgressFor])
+
   const playNextVoiceChunk = useCallback(() => {
     if (voicePlayingRef.current || voiceQueueRef.current.length === 0) return
     voicePlayingRef.current = true
@@ -266,8 +380,6 @@ export function useWebSocket() {
       playNextVoiceChunk()
     }
     audio.play().then(() => {
-      // Resolution of play() is the closest observable to sound reaching the
-      // speaker; a no-op unless an end-of-speech mark is pending.
       markFirstAudio()
     }).catch(() => {
       URL.revokeObjectURL(url)
@@ -368,18 +480,109 @@ export function useWebSocket() {
       // `before`/`after` cannot see it, because there was nothing to remove.
       const resolvedSeen = resolvedSeqRef.current
       const pending = await api.pendingQuestions()
+      // ONE reconcile for both kinds. The server records and lists stateless
+      // cards, so their absence from the snapshot is evidence in the same way a
+      // blocking ask's is: a tab that was disconnected while its card was retired
+      // or superseded must lose it, or submitting it answers a question the agent
+      // has already moved past.
       const { drop, add } = reconcileQuestions(
         before,
         store.getState().chat.pendingQuestions,
         pending,
         resolvedSince(resolvedAskIdsRef.current, resolvedSeen),
       )
-      for (const askId of drop) dispatch(resolveQuestionCard({ ask_id: askId }))
+      // Identity-keyed retirement: an entry is dropped by whichever id it holds.
+      const heldBefore = Object.values(before ?? {})
+      for (const id of drop) {
+        const wasBlocking = heldBefore.some((c) => c?.ask_id === id)
+        dispatch(resolveQuestionCard(wasBlocking ? { ask_id: id } : { card_id: id }))
+      }
       for (const q of add) {
-        dispatch(setQuestionCard({ slot: q.slot as string, ask_id: q.ask_id, questions: q.questions }))
+        // A stateless row carries `card_id`; a blocking one carries `ask_id`. The
+        // reducer coalesces a structurally identical re-delivery, so re-adding a
+        // card this tab already holds keeps the mounted component and the user's
+        // half-entered answer rather than churning it.
+        dispatch(setQuestionCard({
+          slot: q.slot as string,
+          ask_id: q.ask_id,
+          card_id: q.card_id,
+          questions: q.questions as Parameters<typeof setQuestionCard>[0]['questions'],
+        }))
       }
     } catch { /* ignore */ }
   }, [dispatch])
+
+  /** Reconcile chat workflow rows against the authority (`/api/workflows/runs`).
+   *
+   *  `workflow_run_event` is a one-shot broadcast with no replay, so a tab that
+   *  was closed, asleep, or disconnected when a run ended keeps a row spinning at
+   *  `running` for the rest of its life — and a run that started before the tab
+   *  opened has no row at all, because nothing else ever seeds this slice. This
+   *  read is the only thing that closes either gap.
+   *
+   *  Fails CLOSED: a rejected request, or a response without a `runs` array,
+   *  means "the authority could not be read" and never "there are no runs", so
+   *  nothing is dispatched. `api.workflowRuns` is called optionally because many
+   *  component tests mock the api client partially, where a newly-added method is
+   *  undefined. The merge itself is monotonic — see `reconcileWorkflowRuns`.
+   *
+   *  Routed through `queryClient.fetchQuery` so the three callers (connect,
+   *  visibility, heal tick) SHARE one in-flight request instead of racing
+   *  duplicate GETs when two of them land together — a visibility event landing
+   *  next to a tick is exactly the common case. `staleTime: 0` keeps it a real
+   *  read every time (a cached answer is the thing being corrected, so it must
+   *  never be served from cache), and the key is deliberately NOT the Workflows
+   *  tab's `['workflow-runs']`: that entry caches an unwrapped `RunSummary[]`
+   *  from the app's own base path, so sharing it would collide on shape. */
+  const syncWorkflowRuns = useCallback(async () => {
+    const read = api.workflowRuns
+    if (!read) return
+    try {
+      const out = await queryClient.fetchQuery({
+        queryKey: ['workflow-runs-reconcile'],
+        queryFn: () => read(),
+        staleTime: 0,
+        gcTime: 30_000,
+        retry: false,
+      })
+      const runs = out?.runs
+      if (!Array.isArray(runs)) return
+      dispatch(reconcileWorkflowRuns(runs))
+    } catch { /* unreadable authority — leave local state untouched */ }
+  }, [dispatch, queryClient])
+
+  /** True while ANY workflow row is stored as running. A boolean, so the hook
+   *  re-renders only when the last run ends or the first one starts — that flip
+   *  is what arms and disarms the heal timer below. */
+  const anyWorkflowRunning = useAppSelector(s =>
+    Object.values(s.chat.workflowRuns ?? {}).some(r => r?.status === 'running'),
+  )
+
+  /** Re-check a still-`running` row against the authority on a slow interval.
+   *
+   *  Connect-time reconcile covers every gap that COINCIDES with a reconnect,
+   *  which is the common one — but a frame can also be lost while the socket
+   *  stays open, and then nothing else would ever correct the row: the spinner is
+   *  driven purely by stored status, and the linger cleanup only arms once a
+   *  status is terminal. This makes the store eventually consistent with the
+   *  authority no matter how a frame went missing.
+   *
+   *  Armed ONLY while a row is actually showing as running, so an idle tab holds
+   *  no timer and issues no request; a hidden tab skips the tick (its rows are
+   *  off screen and its timers are throttled anyway) and heals the moment it is
+   *  looked at again. Lives here rather than in WorkflowProgressBar because the
+   *  sidebar's running indicator reads the same slice and a run belonging to a
+   *  non-active slot renders no bar at all — one timer heals every surface. */
+  useEffect(() => {
+    if (!anyWorkflowRunning) return
+    const heal = () => { if (!document.hidden) syncWorkflowRuns() }
+    const timer = setInterval(heal, WORKFLOW_HEAL_MS)
+    document.addEventListener('visibilitychange', heal)
+    return () => {
+      clearInterval(timer)
+      document.removeEventListener('visibilitychange', heal)
+    }
+  }, [anyWorkflowRunning, syncWorkflowRuns])
 
   /** Flush all buffered streaming chunks into the store: one batched dispatch
    *  per slot. Runs once per animation frame (see scheduleChunkFlush) and
@@ -408,19 +611,19 @@ export function useWebSocket() {
     // after the batched content has landed in the store. (Moved here from the
     // per-chunk path so it reads the post-dispatch streaming content.)
     if (dispatchedActive && autoSpeakRef.current && activeSlot) {
-      if (spokenLenRef.current === 0) voiceMutedRef.current = false
       const msgs = store.getState().chat.messages
       const streaming = [...msgs].reverse().find(m => m.role === 'streaming')
       if (streaming) {
-        const span = nextSpeakableSpan(streaming.content, spokenLenRef.current)
+        const progress = voiceProgressFor(activeSlot, streaming)
+        if (!progress) return
+        const span = nextSpeakableSpan(streaming.content, progress.spokenLen)
         if (span) {
-          spokenLenRef.current = span.nextSpokenLen
-          spokeThisTurnRef.current = true
-          enqueueSynth(activeSlot, span.text)
+          progress.spokenLen = span.nextSpokenLen
+          enqueueVoiceSynthesis(activeSlot, span.text)
         }
       }
     }
-  }, [dispatch, enqueueSynth])
+  }, [dispatch, enqueueVoiceSynthesis, voiceProgressFor])
 
   const scheduleChunkFlush = useCallback(() => {
     if (chunkFlushScheduledRef.current) return
@@ -428,6 +631,48 @@ export function useWebSocket() {
     if (typeof requestAnimationFrame === 'function') chunkRafRef.current = requestAnimationFrame(() => flushChunks())
     else chunkTimerRef.current = setTimeout(() => flushChunks(), 16)
   }, [flushChunks])
+
+  /** Flush buffered slot-recency bumps: one touchSlotActivity per slot, not per
+   *  event. Cancels any pending frame first, mirroring flushChunks. */
+  const flushSlotActivity = useCallback(() => {
+    if (slotActivityRafRef.current != null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(slotActivityRafRef.current)
+    if (slotActivityTimerRef.current != null) clearTimeout(slotActivityTimerRef.current)
+    slotActivityFlushScheduledRef.current = false
+    slotActivityRafRef.current = null
+    slotActivityTimerRef.current = null
+    const buf = slotActivityBufRef.current
+    if (buf.size === 0) return
+    // A frame firing during reconnect backoff must drop, not dispatch: the on-open
+    // refetch is authoritative. Unmount sets closingRef and still flushes deliberately.
+    const ws = wsRef.current
+    if (!closingRef.current && (!ws || ws.readyState !== WebSocket.OPEN)) { buf.clear(); return }
+    // Every buffered bump is dispatched: the "never move a timestamp backwards"
+    // rule lives in the reducer, which holds both fields. It has to be per-field —
+    // mid-turn `last_ts` runs ahead of `last_turn_ts`, so one shared check would
+    // drop a settling bump whose ts is older than the newest streamed row.
+    for (const [key, { ts, settled }] of buf) {
+      dispatch(touchSlotActivity({ key, ts, settled }))
+    }
+    buf.clear()
+  }, [dispatch])
+
+  const scheduleSlotActivityFlush = useCallback(() => {
+    if (slotActivityFlushScheduledRef.current) return
+    slotActivityFlushScheduledRef.current = true
+    if (typeof requestAnimationFrame === 'function') slotActivityRafRef.current = requestAnimationFrame(() => flushSlotActivity())
+    else slotActivityTimerRef.current = setTimeout(() => flushSlotActivity(), 16)
+  }, [flushSlotActivity])
+
+  /** Buffer one slot-recency bump for the next frame.
+   *  Keeps the NEWEST ts of the burst, and `settled` is sticky: one prompt
+   *  anywhere in a burst settles the flush, so the settling row surviving the
+   *  agent output it triggered does not depend on arrival order. */
+  const bufferSlotActivity = useCallback((slot: string, ts: string, settled: boolean) => {
+    const prev = slotActivityBufRef.current.get(slot)
+    const newest = prev && Date.parse(prev.ts) > Date.parse(ts) ? prev.ts : ts
+    slotActivityBufRef.current.set(slot, { ts: newest, settled: settled || !!prev?.settled })
+    scheduleSlotActivityFlush()
+  }, [scheduleSlotActivityFlush])
 
   const connect = useCallback(() => {
     // Guard against double-connect in StrictMode (dev) — if we already
@@ -446,6 +691,9 @@ export function useWebSocket() {
       // gateway, so after a restart an equal number can mean a different
       // allowlist. Clearing it makes the next generation frame refetch.
       lastGitlabHostsGenRef.current = null
+      // Forget the last raw slots frame too, so a reconnect whose first frame
+      // repeats the last one before it cannot swallow that first frame.
+      lastSlotsRawRef.current = null
       // Cache auto-speak preference
       api.voiceConfig().then(c => { autoSpeakRef.current = !!c.autoSpeak }).catch(() => {})
       if (wasConnectedRef.current) {
@@ -472,28 +720,99 @@ export function useWebSocket() {
         chunkTimerRef.current = null
         chunkFlushScheduledRef.current = false
         chunkBufRef.current.clear()  // drop pre-disconnect partial chunks; refreshSlot recovers state
+        // Same for pending recency bumps: the fetchSlots below carries authoritative last_ts.
+        if (slotActivityRafRef.current != null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(slotActivityRafRef.current)
+        if (slotActivityTimerRef.current != null) clearTimeout(slotActivityTimerRef.current)
+        slotActivityRafRef.current = null
+        slotActivityTimerRef.current = null
+        slotActivityFlushScheduledRef.current = false
+        slotActivityBufRef.current.clear()
         dispatch(sseConnected())
         dispatch(fetchSlots()).finally(() => { reconnectingRef.current = false })
+        // A summary regenerated while the socket was down pushed a
+        // `session_summary` event nobody received, and the panel does not poll,
+        // so without this the stale summary persists until the tab remounts.
+        // Invalidate every slot's summary (the key is per-slot and we cannot
+        // know which ones moved); react-query only refetches the observed ones.
+        queryClient.invalidateQueries({ queryKey: ['session-summary'] })
         seedGoalLoops()
         dispatch(fetchNotifications()).then(() => syncPendingApprovals())
       syncPendingQuestions()
+        // Same one-shot problem, different stream: a run that ENDED while the
+        // socket was down pushed a terminal `workflow_run_event` nobody received,
+        // and a run that STARTED while it was down has no row at all.
+        syncWorkflowRuns()
         // Re-fetch active slot messages to recover from missed chunks
         const active = store.getState().chat.activeSlot
         if (active) dispatch(refreshSlot(active))
+        // refreshSlot self-guards to the ACTIVE slot, but the queue event family
+        // (queue_push/cancel/edit/reorder) is broadcast fire-and-forget with no
+        // replay — a mutation that happened while the socket was down never
+        // reaches this client, so a pane co-rendered in the active slot's split
+        // keeps rendering the queue it held at the drop (#2348). Warm every
+        // OTHER live member of that persisted split: warmSlotCache is the
+        // sanctioned background hydration (self-guards against the active slot,
+        // writes only the per-slot caches and never the active `messages`,
+        // rebuilds queued rows from the server's canonical queue), so the
+        // re-hydration is authoritative and idempotent. Members are validated
+        // against live slots (the ChatPage.splitAnchorForActive pattern) so a
+        // stale layout naming a deleted session costs no 404. With no persisted
+        // split nothing is dispatched. The catch keeps a corrupt persisted
+        // layout from aborting the rest of reconnect setup (resubscribes and
+        // focus re-announce below).
+        if (active) {
+          try {
+            const liveKeys = new Set(store.getState().dashboard.slots.map(s => s.key))
+            for (const member of new Set(sessionSlots(loadLayout(anchorForSlot(active))))) {
+              if (member !== active && liveKeys.has(member)) dispatch(warmSlotCache(member))
+            }
+          } catch (err) {
+            console.warn('reconnect split-pane warm skipped', err)
+          }
+        }
         // Eagerly subscribe to subagent events so chunks arrive even when
         // Activity Panel isn't open — final result still comes via done event.
         dispatch(clearSubagentsForSnapshot())
         ws.send(JSON.stringify({ type: 'subscribe_subagents' }))
         subagentSubRef.current = true
         if (logCbRef.current) ws.send(JSON.stringify({ type: 'subscribe_logs' }))
+        // Re-announce focus: the server lost this socket's focus state with
+        // the old connection, and the store subscription only fires on change.
+        ws.send(JSON.stringify({ type: 'slot_focused', slot: active || null }))
         return
       }
       wasConnectedRef.current = true
       dispatch(sseConnected())
-      dispatch(fetchSlots())
       seedGoalLoops()
-      dispatch(fetchNotifications()).then(() => syncPendingApprovals())
+      // FIRST connect only: App's mount effect already dispatched fetchSlots,
+      // and this handler fires strictly after it, so repeating it here is a
+      // redundant round-trip at the worst possible moment. The reconnect branch
+      // above still refetches — there it recovers state missed while the socket
+      // was down. fetchNotifications is the opposite: THIS is its authoritative
+      // boot dispatch (#765). The snapshot must be taken after the socket is
+      // registered, or a notification created between an earlier snapshot and
+      // registration is pushed to nobody and stays invisible until a reconnect
+      // — so the mount effect no longer fetches; it only arms a fallback for a
+      // socket that never connects, and the mark below keeps that fallback
+      // from double-firing. syncPendingApprovals stays chained on the fetch
+      // settling, because fetchNotifications.fulfilled replaces membership and
+      // ordering wholesale and would wipe any approval notifications synced
+      // before it (its merge preserves local ack flags only, so it is no
+      // protection for a row the response does not carry).
+      // A fallback that already fired (connect took >5s) has a snapshot in
+      // flight; serialize behind it so the older response can never replace
+      // this (newer, post-registration) one after it lands.
+      const firedFallback = markBootNotificationsFetched()
+      ;(firedFallback
+        ? firedFallback.then(() => dispatch(fetchNotifications()))
+        : dispatch(fetchNotifications())
+      ).then(() => syncPendingApprovals())
       syncPendingQuestions()
+      // FIRST connect: seeds rows for runs already in flight (a reload, or a new
+      // tab on a session whose workflow is still going). The WS stream only
+      // carries events from here on, so without this such a run is invisible
+      // until its next phase event — and one that ends first never appears.
+      syncWorkflowRuns()
       // Eagerly subscribe to subagent events on first connect too.
       dispatch(clearSubagentsForSnapshot())
       ws.send(JSON.stringify({ type: 'subscribe_subagents' }))
@@ -505,6 +824,11 @@ export function useWebSocket() {
       // lines at all until an unrelated reconnect. The reconnect branch above
       // already does this; the two paths must stay symmetric.
       if (logCbRef.current) ws.send(JSON.stringify({ type: 'subscribe_logs' }))
+      // Announce the restored active slot so a resumable session prefetches
+      // while the user reads its transcript (resume prefetch).
+      ws.send(
+        JSON.stringify({ type: 'slot_focused', slot: store.getState().chat.activeSlot || null })
+      )
     }
 
     ws.onmessage = (e) => {
@@ -525,12 +849,61 @@ export function useWebSocket() {
             break
           }
           case 'slots': {
+            // An identical repeat carries identical values for every arm below, but
+            // only while no other writer (fetchSlots) has since replaced the list.
+            const raw = e.data as string
+            if (raw === lastSlotsRawRef.current
+                && store.getState().dashboard.slots === lastSlotsArrayRef.current) break
+            lastSlotsRawRef.current = raw
             dispatch(sseSlots(data as ChatSlot[]))
+            lastSlotsArrayRef.current = store.getState().dashboard.slots
             if (msg.yolo !== undefined) {
               dispatch(sseStatus({ yolo: msg.yolo } as StatusData))
             }
             if (msg.channelTrusted !== undefined) {
               dispatch(setChannelTrusted(msg.channelTrusted))
+            }
+            // Seed the ['chat-folders'] query cache from the folder tree carried
+            // on this frame so the sidebar groups sessions correctly on the FIRST
+            // paint. Sessions arrive on this WS frame the instant the socket
+            // connects; the folders otherwise come only from a separate HTTP GET,
+            // so without this the sidebar renders every session ungrouped (Unfiled)
+            // until that GET resolves, then visibly re-shuffles them into folders.
+            //
+            // Seed ONLY when the cache has no folder data yet (first paint). Two
+            // reasons this must not run on later frames, both from the shipped
+            // staleTime: Infinity on this query:
+            //   1. A `slots` frame fires on routine session activity, so a frame
+            //      landing inside an in-flight folder mutation's optimistic window
+            //      (collapse / reorder / rename / move) would overwrite the
+            //      optimistic cache value with backend state via a direct
+            //      setQueryData — which the mutation's cancelQueries cannot cancel
+            //      — snapping the folder back to its pre-action state until
+            //      onSettled refetches.
+            //   2. The WS payload omits per-folder `history_count` (the backend
+            //      computes it via a synchronous session scan that must not run on
+            //      this hot path). Seeding count-less data marks the query fresh,
+            //      so a mount-time query would skip GET /api/chat/folders and the
+            //      counts (the "hide when empty" filter's input) would never load.
+            // So seed the tree once, then invalidate to let the HTTP GET backfill
+            // counts; after the cache is populated, live frames leave it alone and
+            // folder create/rename/move propagate through their own mutation +
+            // invalidate path as before.
+            //
+            // Guard on `existing === undefined` (cache NEVER populated), NOT on
+            // `!existing || length === 0`: a user with genuinely zero folders has
+            // the HTTP GET cache the empty array `[]`, and `[].length === 0` would
+            // then re-match on EVERY subsequent slots frame — re-seeding `[]` and
+            // re-invalidating in a loop, hammering the session-scanning
+            // GET /api/chat/folders. `undefined` fires exactly once, on first paint.
+            if (Array.isArray(msg.folders)) {
+              const existing = queryClient.getQueryData<ChatFolder[]>(['chat-folders'])
+              if (existing === undefined) {
+                queryClient.setQueryData<ChatFolder[]>(['chat-folders'], msg.folders as ChatFolder[])
+                // Backfill history_count (omitted from the WS payload) — the seed
+                // marked the query fresh, so nudge the real GET to run.
+                queryClient.invalidateQueries({ queryKey: ['chat-folders'] })
+              }
             }
             // Refresh the cached GitLab-hosts allowlist when it may have changed.
             // The generation is PROCESS-local, so a gateway restart can hand out a
@@ -564,6 +937,32 @@ export function useWebSocket() {
           case 'slot_title':
             dispatch(sseSlotTitle(data as { key: string; title: string }))
             break
+          case 'session_summary': {
+            // A turn finished and the backend regenerated this session's intent
+            // summary. Invalidate so the panel picks it up immediately.
+            //
+            // This event is why the summary panel does not poll: the summary is
+            // deliberately a pull-friendly artifact — a panel on an interval
+            // would reward refreshing, which is the checking loop the feature
+            // exists to remove. Push-on-change gives freshness without it.
+            const key = (data as { key?: string }).key
+            if (key) {
+              queryClient.invalidateQueries({ queryKey: ['session-summary', key] })
+            }
+            break
+          }
+          case 'pins_changed': {
+            // A pin was created or deleted on another tab (or via the API).
+            // Invalidate only the affected slot's cache so the pin affordance
+            // and pin list stay in sync without a remount. The payload carries
+            // slot_key only — no pin content — so nothing sensitive crosses the
+            // WebSocket to any listener.
+            const slotKey = (data as { slot_key?: string }).slot_key
+            if (slotKey) {
+              queryClient.invalidateQueries({ queryKey: ['chat-pins', slotKey] })
+            }
+            break
+          }
           case 'artifact_update': {
             // Live artifact refresh: the backend broadcasts from the artifact
             // mutation funnel (create / content PATCH / revert / relocate /
@@ -614,12 +1013,7 @@ export function useWebSocket() {
             // RFC Phase 3: muted-channel (silenced) and passive notes are
             // feed-only — no sound.
             if (!n.silenced && n.priority !== 'passive') {
-              try {
-                const detail: McNotificationDetail = { kind: n.kind }
-                window.dispatchEvent(new CustomEvent(MC_NOTIFICATION_EVENT, { detail }))
-              } catch (err) {
-                console.warn('mc-notification listener error', err)
-              }
+              dispatchMcNotification(n.kind)
             }
             break
           }
@@ -629,8 +1023,18 @@ export function useWebSocket() {
           case 'notification_unack':
             dispatch(unackNotificationByTs(data.ts))
             break
+          case 'notifications_clear':
+            // Another view cleared the inbox; drop this view's copy so the
+            // bell badge (derived from items) converges to 0. Idempotent.
+            dispatch(clearAllNotifications())
+            break
           case 'approval': {
             queryClient.invalidateQueries({ queryKey: ['global-approvals'] })
+            // Approval-blocked chime: the agent is stuck until the user acts.
+            // Suppressed during reconnect catch-up (same policy as turn-done).
+            if (!reconnectingRef.current) {
+              dispatchMcNotification(APPROVAL_KIND)
+            }
             // Browser notification when tab not focused (permission must be granted via UI interaction elsewhere)
             if (typeof Notification !== 'undefined' && document.hidden && Notification.permission === 'granted') {
               // Android Chrome throws "Illegal constructor" for page-context
@@ -716,6 +1120,7 @@ export function useWebSocket() {
           case 'refresh': {
             const kinds: string[] = data.kinds || []
             dispatch(triggerRefresh())
+            invalidateRefreshQueries(queryClient)
             if (kinds.includes('history')) dispatch(fetchHistory(false))
             break
           }
@@ -733,20 +1138,29 @@ export function useWebSocket() {
           case 'chat_message':
             flushChunks()
             dispatch(sseChatMessage(data))
-            // Re-rank the sidebar recency tint the instant a session sees any message —
-            // user sends as well as agent output (assistant/tool) — matching last_ts (last
-            // message of any role), instead of waiting for the next full slots push. Fallback
-            // ts is computed here so the touchSlotActivity reducer stays pure (Redux contract).
-            if (data.slot && (data.role === 'user' || data.role === 'assistant' || data.role === 'tool_call' || data.role === 'tool_result')) {
-              dispatch(touchSlotActivity({ key: data.slot, ts: data.ts || new Date().toISOString() }))
+            // Re-rank the sidebar the instant a session sees a message, instead of waiting
+            // for the next full slots push. `last_ts` moves for agent output too (it feeds
+            // "last message" reads); the ORDERING key moves only for an inbound prompt —
+            // user or inject — so a running turn holds its position instead of shuffling the
+            // list on every tool call. Fallback ts is computed here so the touchSlotActivity
+            // reducer stays pure (Redux contract).
+            if (data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'assistant' || data.role === 'tool_call' || data.role === 'tool_result')) {
+              bufferSlotActivity(
+                data.slot,
+                data.ts || new Date().toISOString(),
+                data.role === 'user' || data.role === 'inject',
+              )
             }
             if (data.slot && data.slot !== store.getState().chat.activeSlot && !reconnectingRef.current) dispatch(markSlotUnread(data.slot))
             // Theme audio: an agent reply arriving is the `message-received`
             // trigger (no-op unless an L2 theme with that manifest sound is
             // active + unmuted). User/tool messages don't chime.
             if (data.role === 'assistant') emitThemeSound('message-received')
-            if (data.role === 'user' || data.role === 'inject' || data.role === 'subagent') { stopVoice(); spokenLenRef.current = 0; spokeThisTurnRef.current = false; synthChainRef.current = Promise.resolve() }
-            if (data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
+            // A note breadcrumb starts no turn, so no chat_done arrives to undo either
+            // effect: cutting speech would strand it and a thinking status would never clear.
+            const isPassiveNote = data.role === 'inject' && isReconcileNote(data.cls)
+            if (!isPassiveNote && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) { stopVoice(); voiceProgressRef.current = null; synthChainRef.current = Promise.resolve() }
+            if (!isPassiveNote && data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
               dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
             }
             break
@@ -766,6 +1180,12 @@ export function useWebSocket() {
             break
           case 'queue_push':
             dispatch(appendQueuedMessage(data))
+            // A send that lands behind a busy turn is still user input, so it
+            // settles the session's rank now rather than only when the queue pops
+            // — otherwise typing into a working session leaves it where it was.
+            if (data.slot) {
+              bufferSlotActivity(data.slot, (data as { ts?: string }).ts || new Date().toISOString(), true)
+            }
             break
           case 'steer_push':
             // Mid-turn steer echo: show the user's steered text inline in the
@@ -776,12 +1196,34 @@ export function useWebSocket() {
               slot: (data as { slot?: string }).slot || store.getState().chat.activeSlot || '',
               message: { role: 'user', content: (data as { content?: string }).content || '', cls: 'msg msg-u', meta: { steer: true }, ts: (data as { ts?: string }).ts },
             }))
+            // Steering is the other way to type into a busy session, so it
+            // settles the rank exactly like a queued send. The server appends a
+            // real `user` row for it, so the authoritative snapshot already
+            // agrees — this only avoids waiting for the next slots push.
+            if ((data as { slot?: string }).slot) {
+              bufferSlotActivity(
+                (data as { slot: string }).slot,
+                (data as { ts?: string }).ts || new Date().toISOString(),
+                true,
+              )
+            }
             break
           case 'queue_cancel':
             dispatch(cancelQueuedMessage(data))
+            // A cancelled queued message is an answer that never lands. The
+            // card was cleared optimistically when it was submitted, so without
+            // this the slot would keep reporting needs_input with nothing on
+            // screen to answer or dismiss. Re-syncing brings the card back from
+            // the server's own record — the question is genuinely unanswered
+            // again. Harmless when the cancelled message was not an answer: the
+            // snapshot then lists nothing for the slot and adds nothing.
+            syncPendingQuestions()
             break
           case 'queue_edit':
             dispatch(editQueuedMessage(data))
+            break
+          case 'queue_reorder':
+            dispatch(reorderQueuedMessages(data))
             break
           case 'chat_chunk': {
             // #1: buffer the chunk and flush once per frame (see flushChunks),
@@ -789,8 +1231,6 @@ export function useWebSocket() {
             // index maps — on every token.
             const cs = data.slot
             if (cs) {
-              // Latency mark: first streamed token after a voice end-of-speech
-              // (no-op without a pending mark — typed turns never mark).
               if (cs === store.getState().chat.activeSlot) markFirstToken()
               const buf = chunkBufRef.current
               let entry = buf.get(cs)
@@ -810,9 +1250,46 @@ export function useWebSocket() {
             break
           }
           case 'tool_call':
-            dispatch(sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true }))
+            // Re-broadcast BEFORE the store dispatches: ChatPage opens the Browser
+            // panel from this event, and a reducer that throws on a malformed
+            // payload must not also cost the panel its only signal.
+            window.dispatchEvent(new CustomEvent('kirocrew-tool-call', { detail: data }))
+            dispatch(sseToolActivity({ ...data as { slot: string; tool: string; kind: string; purpose: string; input_preview: string; is_shell?: boolean }, auto: (data as Record<string, unknown>).auto === true, tool_call_id: (data as Record<string, unknown>).tool_call_id as string | undefined, is_update: (data as Record<string, unknown>).is_update === true, is_shell: (data as Record<string, unknown>).is_shell === true }))
             if (data.slot) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'tool', text: sanitizeLlmOutput((data as Record<string, unknown>).purpose as string || data.tool), toolName: sanitizeLlmOutput(data.tool), ts: Date.now() }))
+              // A refinement (`is_update`) carries only the fields it refines,
+              // so merge it into the live status the way sseToolActivity merges
+              // the tool-log entry: an update that omits `purpose` must not
+              // replace the purpose the initial tool_call supplied with the raw
+              // command, and one that omits `tool` must not blank the title.
+              // Without this the session-list row of a running session flips
+              // from the agent's purpose to the literal command mid-call.
+              // Merging is gated on the tool_call_id matching, so when several
+              // tools run in parallel a refinement of one cannot inherit a
+              // sibling's purpose.
+              //
+              // `text` holds the PURPOSE ALONE and stays empty when the agent
+              // supplied none — the fallback to the tool title belongs to
+              // toolStatusLabel, which owns the label rule. Storing the title
+              // in `text` instead would make the two indistinguishable here,
+              // and a purpose-less call would then pin the initial stub title
+              // ("Terminal") for the whole call instead of advancing to the
+              // refined command.
+              const tcid = (data as Record<string, unknown>).tool_call_id as string | undefined
+              const isUpdate = (data as Record<string, unknown>).is_update === true
+              const purpose = sanitizeLlmOutput((data as Record<string, unknown>).purpose as string || '')
+              const toolName = sanitizeLlmOutput(data.tool || '')
+              const prev = store.getState().chat.slotStatusDetail[data.slot]
+              const mergeInto = isUpdate && tcid && prev?.kind === 'tool' && prev.toolCallId === tcid
+                ? prev
+                : undefined
+              dispatch(setSlotStatusDetail({
+                slot: data.slot,
+                kind: 'tool',
+                text: purpose || mergeInto?.text || '',
+                toolName: toolName || mergeInto?.toolName || '',
+                ...(tcid ? { toolCallId: tcid } : {}),
+                ts: Date.now(),
+              }))
             }
             // Note: do NOT dispatch sseChatMessage here. The backend persists the
             // tool message via slot.append and broadcasts it as 'chat_message'.
@@ -827,16 +1304,22 @@ export function useWebSocket() {
             dispatch(sseMcpAppRender(data as Parameters<typeof sseMcpAppRender>[0]))
             break
           case 'question_card':
-            dispatch(setQuestionCard(data as Parameters<typeof setQuestionCard>[0]))
+            // `fresh` marks a LIVE ask delivery: even if its payload repeats
+            // the identical question, it must get its own delivery identity
+            // (cardId) — unlike the reconnect re-sync above, which re-dispatches
+            // a still-pending card and must keep the existing entry.
+            dispatch(setQuestionCard({ ...(data as Parameters<typeof setQuestionCard>[0]), fresh: true }))
             break
           case 'question_card_resolved': {
-            const ask = data as { ask_id: string }
+            const ask = data as { ask_id?: string; card_id?: string }
             // Recorded independently of local state: a resolution can arrive for
             // a card this client never held (empty state, or the card only exists
             // in an in-flight rehydration snapshot), in which case the dispatch
             // below is a no-op and the reconcile would otherwise re-add a dead
-            // card. See recordResolvedAskId.
-            recordResolvedAskId(ask.ask_id)
+            // card. See recordRetiredId. Both identities land in the same log —
+            // a blocking ask's `ask_id` and a stateless card's `card_id` — so one
+            // watermark covers both kinds on the snapshot add side.
+            recordRetiredId(ask.ask_id || ask.card_id || '')
             dispatch(resolveQuestionCard(ask))
             break
           }
@@ -879,11 +1362,30 @@ export function useWebSocket() {
             }
             break
           }
-          case 'activity_event':
-            dispatch(sseActivityEvent(data as { slot: string; kind: string; text: string }))
+          case 'activity_event': {
+            const ev = data as { slot: string; kind: string; text: string; spawned?: boolean }
+            // A session was just created or resumed, which is the ONLY moment the
+            // backend learns what this account is entitled to run (it comes from
+            // session/new's advertised list). /api/models narrows its catalog to
+            // that set, so refetch it then — a cold gateway answered the first
+            // fetch from the unnarrowed catalog and, being a live 200, stopped
+            // the self-heal poll, leaving the picker offering models no turn can
+            // use for the rest of the page's life.
+            //
+            // Gated on `spawned`, not on the frame's presence: this frame is also
+            // emitted on warm turns, where nothing was respawned and the
+            // advertised list cannot have changed. /api/models SPAWNS
+            // `kiro chat --list-models`, so refetching per prompt would run a
+            // subprocess on every message. An absent flag is treated as "not
+            // spawned" so an unexpected emitter cannot reintroduce that.
+            if (ev.kind === 'session' && ev.spawned === true) {
+              queryClient.invalidateQueries({ queryKey: ['available-models'] })
+            }
+            dispatch(sseActivityEvent(ev))
             break
+          }
           case 'subagent_spawn':
-            dispatch(sseSubagentSpawn(data as { slot: string; id: string; task: string; agent: string }))
+            dispatch(sseSubagentSpawn(data as { slot: string; id: string; task: string; agent: string; model?: string }))
             break
           case 'subagent_queued':
             dispatch(sseSubagentQueued(data as { slot: string; queued: number }))
@@ -902,7 +1404,7 @@ export function useWebSocket() {
             dispatch(sseSubagentRetrying(data as { slot: string; id: string; attempt?: number }))
             break
           case 'subagent_done':
-            dispatch(sseSubagentDone(data as { slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; result?: string }))
+            dispatch(sseSubagentDone(data as { slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; result?: string }))
             break
           case 'app_reload':
             // App dev-mode live reload: the gateway watched a dev-flagged app's
@@ -910,7 +1412,7 @@ export function useWebSocket() {
             window.dispatchEvent(new CustomEvent('mc:app-reload', { detail: data as { app: string } }))
             break
           case 'subagent_snapshot':
-            dispatch(sseSubagentSnapshot(data as { id: string; slot: string; task: string; agent: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean }))
+            dispatch(sseSubagentSnapshot(data as { id: string; slot: string; task: string; agent: string; model?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean }))
             break
           case 'subagent_batch_update':
             // Scale plumbing: one coalesced ~1s frame replacing per-event
@@ -942,11 +1444,25 @@ export function useWebSocket() {
             dispatch(sseWorkflowEvent(data as { run_id: string; seq?: number; ts?: number; type: string; data?: Record<string, unknown> }))
             break
           case 'chat.side_result':
-            dispatch(sseSideResult(data as { slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; final?: boolean; is_error?: boolean }))
+            dispatch(sseSideResult(data as { slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; final?: boolean; is_error?: boolean; steer?: boolean }))
             break
+          case 'chat.side_queue': {
+            // `raw` marks content the LOCAL client typed; broadcast payloads are scrubbed by
+            // definition. Stripped rather than merely left out of the cast, so a future
+            // server-side field of the same name could never vouch for redacted text.
+            const { raw: _wireRaw, ...sideQueueFrame } = data as Record<string, unknown>
+            // An echo of THIS tab's own cancel, or of another tab's. Only the tab that
+            // cancelled takes the question back; every tab still drops the card. An absent
+            // origin releases, which keeps a lone frame (HTTP response lost) from losing it.
+            const frameOrigin = sideQueueFrame.origin_client
+            const foreignCancel = typeof frameOrigin === 'string' && frameOrigin !== TAB_ID
+            dispatch(sseSideQueue({
+              ...(sideQueueFrame as unknown as { slot: string; action: 'push' | 'edit' | 'cancel' | 'drain'; queue_id: string; content?: string; ts?: number; front?: boolean; steer_id?: string }),
+              ...(foreignCancel ? { suppressRelease: true } : {}),
+            }))
+            break
+          }
           case 'heartbeat':
-            // No-op: SessionStatus already ticks elapsed via setInterval.
-            // Dispatching here would reset ts and break slow-warning detection.
             break
           case 'context_usage':
             dispatch(sseContextUsage(data as { slot: string; pct: number; used_tokens?: number; window_tokens?: number; reset?: boolean }))
@@ -970,11 +1486,16 @@ export function useWebSocket() {
             }
             break
           }
-          case 'chat_segment':
+          case 'chat_segment': {
             flushChunks()
+            const segmentSlot = data.slot as string
+            if (autoSpeakRef.current && !voiceMutedRef.current && segmentSlot === store.getState().chat.activeSlot) {
+              const streaming = [...store.getState().chat.messages].reverse().find(m => m.role === 'streaming')
+              if (streaming) flushVoiceTail(segmentSlot, streaming)
+            }
             dispatch(sseChatMessage({ ...data, role: '_segment' }))
-            spokenLenRef.current = 0
             break
+          }
           case 'chat_status':
             if (data.slot && data.status) {
               dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: data.status, ts: Date.now() }))
@@ -986,6 +1507,14 @@ export function useWebSocket() {
           case 'chat_done':
             flushChunks()
             if (data.slot) chunkBufRef.current.delete(data.slot)
+            // Consume the tail while the streaming row still carries the same
+            // identity used by sentence-boundary progress tracking.
+            if (autoSpeakRef.current && !voiceMutedRef.current && data.slot === store.getState().chat.activeSlot) {
+              const msgs = store.getState().chat.messages
+              const last = [...msgs].reverse().find(m => m.role === 'streaming')
+                ?? [...msgs].reverse().find(m => m.role === 'assistant')
+              if (last) flushVoiceTail(data.slot, last)
+            }
             dispatch(sseChatMessage({ ...data, role: '_done' }))
             // Turn-complete chime: sound-only (no feed entry, no toast).
             // Plays on every real turn completion — active or background
@@ -996,12 +1525,7 @@ export function useWebSocket() {
               slot: data.slot,
               reconnecting: reconnectingRef.current,
             })) {
-              try {
-                const detail: McNotificationDetail = { kind: TURN_DONE_KIND }
-                window.dispatchEvent(new CustomEvent(MC_NOTIFICATION_EVENT, { detail }))
-              } catch (err) {
-                console.warn('mc-notification listener error', err)
-              }
+              dispatchMcNotification(TURN_DONE_KIND)
             }
             if (data.slot && data.slot !== store.getState().chat.activeSlot && !reconnectingRef.current) {
               dispatch(markSlotUnread(data.slot))
@@ -1029,23 +1553,7 @@ export function useWebSocket() {
               queryClient.invalidateQueries({ queryKey: ['pull-request-source'], refetchType })
               queryClient.invalidateQueries({ queryKey: ['pull-request-statuses'], refetchType })
             }
-            // Auto-speak: speak any remaining unspoken text from streaming
-            if (autoSpeakRef.current && !voiceMutedRef.current && data.slot === store.getState().chat.activeSlot) {
-              const msgs = store.getState().chat.messages
-              const last = [...msgs].reverse().find(m => m.role === 'assistant')
-              if (last) {
-                const remaining = last.content.slice(spokenLenRef.current).trim()
-                // spokenLen 0 after streaming spoke means chat_segment reset
-                // the counter — "remaining" would then be the whole reply,
-                // repeating everything already spoken.
-                const segmentReset = spokeThisTurnRef.current && spokenLenRef.current === 0
-                if (remaining.length >= MIN_TTS_CHARS && !segmentReset) {
-                  enqueueSynth(data.slot, remaining)
-                }
-              }
-              spokenLenRef.current = 0
-              spokeThisTurnRef.current = false
-            } else if (data.slot === store.getState().chat.activeSlot) {
+            if ((!autoSpeakRef.current || voiceMutedRef.current) && data.slot === store.getState().chat.activeSlot) {
               // Re-check config in case it changed
               api.voiceConfig().then(c => { autoSpeakRef.current = !!c.autoSpeak }).catch(() => {})
             }
@@ -1102,26 +1610,13 @@ export function useWebSocket() {
             if (b64) dispatch(setVoiceAudio(b64))
             break
           }
-          case 'voice_error': {
-            const voiceError = typeof data.error === 'string' && data.error.trim()
-              ? data.error
-              : i18nT('pages.chatPage.voice_synthesis_failed_check_voice_settings_and_try_again')
-            dispatch(addNotification({
-              ts: String(Date.now()),
-              kind: 'agent',
-              priority: 'critical',
-              title: i18nT('pages.chatPage.voice_playback_failed'),
-              body: voiceError,
-              ...(typeof data.slot === 'string' && data.slot ? { slot: data.slot } : {}),
-            } as Notification))
-            break
-          }
           case 'log':
             logCbRef.current?.(data)
             break
           case 'sessions_restarting':
             // Backend pushed session restart status (restarting/ready)
             dispatch(triggerRefresh())
+            invalidateRefreshQueries(queryClient)
             break
           case 'update_progress': {
             const prog = data as { step: string; detail: string }
@@ -1141,6 +1636,7 @@ export function useWebSocket() {
           case 'refine':
             // Handled by ProjectsPage via Redux
             dispatch(triggerRefresh())
+            invalidateRefreshQueries(queryClient)
             break
           case 'channel_message':
           case 'channel_agent_status':
@@ -1192,12 +1688,6 @@ export function useWebSocket() {
             queryClient.invalidateQueries({ queryKey: ['pull-request-checks', delta.url] })
             break
           }
-          case 'browser_frame':
-            // Live mirror frame (a screenshot the agent took, forwarded by the
-            // MCP proxy). Routed via a window event so the Browser panel
-            // (WebPreviewPanel via useBrowserFrame) can render without a Redux slice.
-            window.dispatchEvent(new CustomEvent('kirocrew-browser-frame', { detail: data }))
-            break
           case 'computer_use_frame':
             // Computer-use PiP frame — the downscaled JPEG the agent's own
             // computer_get_state call already captured, relayed by the gateway
@@ -1216,9 +1706,6 @@ export function useWebSocket() {
       // Stale WS (e.g. from StrictMode cleanup) — ignore entirely.
       if (wsRef.current !== ws) return
 
-      dispatch(interruptActiveTurn({
-        message: 'Connection to KiroCrew was interrupted. Reconnecting to recover this turn…',
-      }))
       dispatch(sseDisconnected())
       wsRef.current = null
 
@@ -1229,7 +1716,7 @@ export function useWebSocket() {
     }
 
     ws.onerror = () => { /* onclose will fire */ }
-  }, [dispatch, flushChunks, scheduleChunkFlush, playNextVoiceChunk, queryClient, stopVoice, enqueueSynth, updateVoiceBusy, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordResolvedAskId])
+  }, [dispatch, flushChunks, scheduleChunkFlush, bufferSlotActivity, playNextVoiceChunk, queryClient, stopVoice, updateVoiceBusy, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordRetiredId])
 
   /**
    * Force an immediate reconnect: cancels any pending backoff timer, closes
@@ -1277,18 +1764,49 @@ export function useWebSocket() {
     window.addEventListener('voice-stop', onVoiceStop)
     window.addEventListener('voice-config-changed', onVoiceConfigChanged)
     window.addEventListener('voice-play-url', onVoicePlayUrl)
+    // Slot-focus intent signal (resume prefetch). One shared sender for
+    // every focus source — Redux activeSlot changes (sidebar, keyboard,
+    // deep links, history), tab visibility, and split-view pane focus via
+    // emitSlotFocused — so the HTTP and WS notions of "focused" cannot
+    // drift. Best-effort: dropped silently while the socket is not OPEN.
+    const sendFocus = (slot: string | null) => {
+      const ws = wsRef.current
+      if (!ws || ws.readyState !== WebSocket.OPEN) return
+      ws.send(JSON.stringify({ type: 'slot_focused', slot }))
+    }
+    sendSlotFocusedImpl = sendFocus
+    let lastFocusSent: string | null = null
+    const unsubFocus = store.subscribe(() => {
+      const active = store.getState().chat.activeSlot
+      if (active === lastFocusSent) return  // store.subscribe fires on EVERY action
+      lastFocusSent = active
+      sendFocus(active)
+    })
+    const onVisibility = () => {
+      // Hidden → blur (cancels a pending prefetch server-side); visible →
+      // re-announce the active slot even if unchanged, since the server may
+      // have expired the previous prefetch while the tab was away.
+      sendFocus(document.hidden ? null : store.getState().chat.activeSlot)
+    }
+    document.addEventListener('visibilitychange', onVisibility)
     return () => {
       closingRef.current = true
       clearTimeout(reconnectTimerRef.current)
       if (chunkRafRef.current != null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(chunkRafRef.current)
       if (chunkTimerRef.current != null) clearTimeout(chunkTimerRef.current)
+      // Flush rather than drop: the store outlives the hook, so a pending bump would
+      // otherwise leave a stale sidebar tint. The flush also cancels the scheduled frame.
+      flushSlotActivity()
       wsRef.current?.close()
       wsRef.current = null
       window.removeEventListener('voice-stop', onVoiceStop)
       window.removeEventListener('voice-config-changed', onVoiceConfigChanged)
       window.removeEventListener('voice-play-url', onVoicePlayUrl)
+      document.removeEventListener('visibilitychange', onVisibility)
+      unsubFocus()
+      sendSlotFocusedImpl = () => {}
     }
-  }, [connect, playVoiceUrl, stopVoice])
+  }, [connect, playVoiceUrl, stopVoice, flushSlotActivity])
 
   /** Subscribe to log events — call with callback on mount, null on unmount. */
   const subscribeLogs = useCallback((cb: LogCallback) => {

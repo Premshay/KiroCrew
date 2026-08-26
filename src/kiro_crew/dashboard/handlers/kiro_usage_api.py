@@ -63,7 +63,8 @@ The HTTP call uses the Python standard library (``urllib``) rather than a
 third-party client, so this module adds no new dependency to the public repo.
 
 Security controls (fixed as acceptance criteria):
-  1. Endpoint is hardcoded to AWS prod — never config-derived.
+  1. Endpoint is a hardcoded AWS prod host from a region table keyed by the
+     whoami profile ARN — never config-derived.
   2. TLS verification is always on (default ``ssl`` context: cert chain +
      hostname).
   3. Redirects are disabled (see ``_NoRedirect``) so the token can never be
@@ -94,9 +95,16 @@ from kiro_crew import hooks
 
 logger = logging.getLogger(__name__)
 
-# RTS / CodeWhisperer runtime endpoint (prod, IAD) — hardcoded, never derived
-# from config or the token file (control 1).
-_RTS_ENDPOINT = "https://codewhisperer.us-east-1.amazonaws.com"
+# Commercial RTS hosts (control 1): literals in this file, never config-derived.
+# eu-central-1 is a different hostname, not a regional spelling of the
+# us-east-1 one — ``codewhisperer.eu-central-1.amazonaws.com`` does not resolve.
+# A missing ARN or a region outside this table falls back to us-east-1.
+_RTS_ENDPOINTS = {
+    "us-east-1": "https://codewhisperer.us-east-1.amazonaws.com",
+    "eu-central-1": "https://q.eu-central-1.amazonaws.com",
+}
+_DEFAULT_RTS_REGION = "us-east-1"
+_RTS_ENDPOINT = _RTS_ENDPOINTS[_DEFAULT_RTS_REGION]
 _SVC = "com.amazon.aws.codewhisperer.runtime.AmazonCodeWhispererService"
 _TARGET_GET_USAGE = f"{_SVC}.GetUsageLimits"
 _TARGET_LIST_PROFILES = f"{_SVC}.ListAvailableProfiles"
@@ -134,9 +142,33 @@ _JSON_TOKEN_READ_IDS = (
 # exactly this path.
 # ``~/.local/share`` is not a sensitive credential path, so this read is a direct
 # read-only sqlite open. auth_kv holds a JSON blob per key.
+#
+# The entries are deliberately UNGUARDED by ``sys.platform``: every candidate is
+# existence-checked before it is opened, so a path that cannot exist on the
+# running OS is inert, and a platform-independent module constant is what lets
+# tests patch the tuple without becoming host-dependent.
+#
+# The Windows entries are the fixed default locations, NOT resolved from
+# ``%LOCALAPPDATA%`` / ``%APPDATA%``. Membership here is a trust claim
+# (``from_cli_store=True``) that rests on agent file tools being unable to
+# write the store, and that fence (``_SENSITIVE_HOME_DIRS``) is home-anchored
+# at exactly these paths -- so an env-resolved location either equals an entry
+# or falls outside the fence and must not be trusted. A redirected profile
+# therefore keeps the text-scrape fallback rather than gaining a forgeable
+# trusted path; the same posture as the Linux entry, which does not follow
+# ``XDG_DATA_HOME`` redirection either.
+#
+# ``AppData/Local`` is where current kiro-cli actually writes on Windows (its
+# data dir resolves to the local, non-roaming app-data directory -- the same
+# resolver family that yields ``~/.local/share`` on Linux and
+# ``~/Library/Application Support`` on macOS, both matching the entries
+# above). ``AppData/Roaming`` is retained for layouts that used the roaming
+# location; a path that does not exist on the running host is inert.
 _CLI_SQLITE_DBS = (
     Path.home() / ".local" / "share" / "kiro-cli" / "data.sqlite3",
     Path.home() / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3",
+    Path.home() / "AppData" / "Local" / "kiro-cli" / "data.sqlite3",
+    Path.home() / "AppData" / "Roaming" / "kiro-cli" / "data.sqlite3",
 )
 
 # Auth stores belonging to OTHER products (amazon-q). Readable, and often the same
@@ -147,7 +179,7 @@ _OTHER_SQLITE_DBS = (
     Path.home() / ".local" / "share" / "amazon-q" / "data.sqlite3",
     Path.home() / "Library" / "Application Support" / "amazon-q" / "data.sqlite3",
 )
-_SQLITE_TOKEN_KEYS = ("kirocli:odic:token", "codewhisperer:odic:token")
+_SQLITE_TOKEN_KEYS = ("kirocli:odic:token", "codewhisperer:odic:token", "kirocli:social:token", "kirocli:external-idp:token")
 
 # SEL audit label for the SQLite live-token read. Not an allowlist entry (that
 # gate is for sensitive-path reads via safe_read_file_internal); this is only
@@ -158,6 +190,8 @@ _SQLITE_AUDIT_READ_ID = "kiro_usage_api.sqlite_token"
 # as a wild figure. Real plans are in the thousands; a million-credit ceiling is
 # comfortably above any real plan while still catching garbage.
 _MAX_CREDITS = 1_000_000.0
+_MAX_BONUS_GRANTS = 32
+_MAX_BONUS_NAME_CHARS = 100
 
 # Cap the RTS response body so an oversized or indefinitely-streamed response
 # cannot exhaust memory or tie up a shared subprocess worker. The usage JSON is
@@ -310,7 +344,7 @@ def _token_from_json(read_id: str, now: datetime) -> tuple[str, datetime] | None
         return None
     try:
         data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError, TypeError):
+    except (ValueError, TypeError):
         return None
     if not isinstance(data, dict):
         return None
@@ -358,7 +392,7 @@ def _token_from_sqlite(db: Path, now: datetime) -> tuple[str, datetime] | None:
                 continue
             try:
                 blob = json.loads(row[0])
-            except (json.JSONDecodeError, ValueError, TypeError):
+            except (ValueError, TypeError):
                 continue
             if not isinstance(blob, dict):
                 continue
@@ -468,17 +502,39 @@ def _load_bearer_token() -> str | None:
     return candidates[0].token if candidates else None
 
 
-def _post(token: str, target: str, payload: dict) -> _Resp:
+def _region_from_arn(arn: str | None) -> str:
+    """Return the CodeWhisperer region in ``arn``, or the commercial default.
+
+    Profile ARNs are ``arn:aws:codewhisperer:<region>:<account>:profile/<name>``.
+    A missing or malformed ARN, or a region not in :data:`_RTS_ENDPOINTS`,
+    falls back to us-east-1 so the request still goes to a known AWS prod host.
+    """
+    if not isinstance(arn, str) or not arn:
+        return _DEFAULT_RTS_REGION
+    parts = arn.split(":")
+    if len(parts) < 6 or parts[2] != "codewhisperer":
+        return _DEFAULT_RTS_REGION
+    region = parts[3]
+    return region if region in _RTS_ENDPOINTS else _DEFAULT_RTS_REGION
+
+
+def _rts_endpoint(arn: str | None = None) -> str:
+    """Hardcoded RTS host for ``arn``'s region (control 1)."""
+    return _RTS_ENDPOINTS[_region_from_arn(arn)]
+
+
+def _post(token: str, target: str, payload: dict, *, endpoint: str | None = None) -> _Resp:
     """POST an AWS-JSON request to the hardcoded RTS endpoint over urllib.
 
     TLS verification (control 2) and no-redirect (control 3) come from
     :func:`_build_opener`. A non-2xx HTTP *response* is returned as a ``_Resp``
     (requests parity — the caller branches on ``status_code``); only a
-    transport-level failure raises :class:`_RequestError`.
+    transport-level failure raises :class:`_RequestError`. ``endpoint`` selects
+    the regional host; omitted, it is the us-east-1 default.
     """
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        _RTS_ENDPOINT,
+        endpoint or _RTS_ENDPOINT,
         data=body,
         method="POST",
         headers={
@@ -520,7 +576,7 @@ def _read_capped(fp: object) -> str:
     return data.decode("utf-8", "replace")
 
 
-def _list_profile_arn(token: str) -> str | None:
+def _list_profile_arn(token: str, *, endpoint: str | None = None) -> str | None:
     """Return the account's profile ARN, or None for non-enterprise accounts.
 
     Enterprise/IdC accounts (KIRO POWER etc.) must pass ``profileArn`` to
@@ -539,7 +595,7 @@ def _list_profile_arn(token: str) -> str | None:
     if key in _PROFILE_ARN_CACHE:
         return _PROFILE_ARN_CACHE[key]
     try:
-        r = _post(token, _TARGET_LIST_PROFILES, {})
+        r = _post(token, _TARGET_LIST_PROFILES, {}, endpoint=endpoint)
     except _RequestError:
         return None
     if r.status_code != 200:
@@ -705,15 +761,17 @@ def _map_response(data: dict) -> dict | None:
         except (ValueError, OSError, OverflowError, TypeError):
             pass
 
-    # Best-effort bonus / free-trial pool. GetUsageLimits can carry a second
-    # breakdown entry (a promotional / welcome or free-trial pool) that is spent
+    # Best-effort bonus / free-trial pools. GetUsageLimits can carry additional
+    # breakdown entries (promotional / welcome or free-trial pools) that are spent
     # BEFORE the plan; kiro-cli's text output shows the same thing as a "Bonus
     # Credits" section. The exact resourceType label is not documented, so match
     # conservatively on known bonus-like markers and never treat the primary
     # CREDIT entry or an unrelated quota (e.g. TOKEN) as bonus. Emitted only when
     # a finite used+limit pair exists, mirroring the text-scrape fields so the
-    # dashboard never branches on source.
+    # dashboard never branches on source. Retain every bounded grant; the legacy
+    # scalar fields mirror the first one for older clients.
     _bonus_markers = ("FREE_TRIAL", "FREETRIAL", "TRIAL", "BONUS", "PROMO", "GIFT", "WELCOME")
+    bonus_credits: list[dict[str, object]] = []
     for b in breakdowns:
         if b is credit:
             continue
@@ -728,12 +786,24 @@ def _map_response(data: dict) -> dict | None:
             b_limit = _bounded(b.get("usageLimit"))
         if b_used is None or b_limit is None or b_limit <= 0:
             continue
-        result["bonus_used"] = b_used
-        result["bonus_limit"] = b_limit
         label = b.get("title") or b.get("displayName") or rtype.replace("_", " ").title()
-        if isinstance(label, str) and label:
-            result["bonus_label"] = label[:100]
-        break
+        if not isinstance(label, str) or not label or not label.isprintable():
+            continue
+        bonus_credits.append(
+            {
+                "name": label[:_MAX_BONUS_NAME_CHARS],
+                "used": b_used,
+                "total": b_limit,
+            }
+        )
+        if len(bonus_credits) >= _MAX_BONUS_GRANTS:
+            break
+    if bonus_credits:
+        result["bonus_credits"] = bonus_credits
+        first = bonus_credits[0]
+        result["bonus_used"] = first["used"]
+        result["bonus_limit"] = first["total"]
+        result["bonus_label"] = first["name"]
 
     return result
 
@@ -782,6 +852,10 @@ def fetch_usage_limits(expected_arn: str | None) -> dict | None:
     if not candidates:
         logger.debug("Kiro usage API: no live bearer token available")
         return None
+    # Resolve once from the whoami ARN so ListAvailableProfiles and
+    # GetUsageLimits hit the same regional host. Unknown/absent region stays
+    # on the us-east-1 default (control 1: the URL is still a file literal).
+    endpoint = _rts_endpoint(expected_arn)
     reason = "unknown"
     deadline = time.monotonic() + _TOTAL_DEADLINE_SECS
     for candidate in candidates:
@@ -803,7 +877,7 @@ def fetch_usage_limits(expected_arn: str | None) -> dict | None:
                     "kiro-cli's own auth store"
                 )
                 continue
-            arn = _list_profile_arn(token)
+            arn = _list_profile_arn(token, endpoint=endpoint)
             if expected_arn and (not arn or arn != expected_arn):
                 # ARN-anchored mode: not provably the signed-in account. Skip
                 # WITHOUT calling GetUsageLimits. A null ``arn`` is rejected rather
@@ -824,7 +898,7 @@ def fetch_usage_limits(expected_arn: str | None) -> dict | None:
             if arn:
                 payload["profileArn"] = arn
             try:
-                r = _post(token, _TARGET_GET_USAGE, payload)
+                r = _post(token, _TARGET_GET_USAGE, payload, endpoint=endpoint)
             except _RequestError as e:
                 reason = f"request failed: {type(e).__name__}"
                 logger.debug("Kiro usage API %s", reason)

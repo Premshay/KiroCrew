@@ -7,11 +7,12 @@
  * Order in this file = order in the rail (within each group). Add new
  * built-in surfaces here; do not add hardcoded badge logic to `App.tsx`.
  */
-import { MessageSquare, Bell, BookOpen, Component, CalendarDays, Settings, ClipboardCheck, LayoutGrid } from 'lucide-react'
+import { MessageSquare, Bell, BookOpen, Component, CalendarDays, Settings, ClipboardCheck, LayoutGrid, Webhook } from 'lucide-react'
 import { createSelector } from '@reduxjs/toolkit'
 import { KiroGhostMark } from '../components/KiroGhostMark'
-import { registerBuiltinSurface } from './registry'
+import { registerBuiltinSurface, surfaceMachineValue } from './registry'
 import { selectSubagentActivityCount } from '../store/chatSlice'
+import { PREVIEW_WEBHOOKS } from '../utils/previewFlags'
 import type { RootState } from '../store'
 
 // Memoized at the source so `selectAllSurfacesAttention`'s per-dispatch
@@ -33,10 +34,11 @@ registerBuiltinSurface({
   // Slot-bearing: default chat slots have surface === '' (or no mode set).
   slotMode: '',
   badgeLabel: 'unread conversations',
-  // Cross-page "agents are working" dot. Kept OUT of the unread badge on
-  // purpose: sub-agents in flight are not unread conversations, and folding
-  // them into that count would corrupt both the number and the tab-title
-  // attention sum.
+  // Expanded-rail activity stays separate from unread attention: sub-agents
+  // in flight are not unread conversations, and folding them into that count
+  // would corrupt both the number and the tab-title attention sum. The
+  // collapsed rail omits this context-poor signal; session rows identify the
+  // specific work when the user opens Sessions.
   activitySelector: selectSubagentActivityCount,
   activityLabel: 'subagents in flight',
 })
@@ -80,6 +82,39 @@ registerBuiltinSurface({
   labelKey: 'nav.schedule',
   icon: <CalendarDays size={16} />,
   group: 'Main',
+})
+
+// Inbound webhooks: token store, registered contexts, and run history for
+// POST /api/hooks/agent. Carries BOTH gates because they answer different
+// questions:
+//
+//   previewFlag    — WHETHER to advertise it at all. The page works but is not
+//                    polished enough to release, so nothing surfaces it until
+//                    the operator enables it in Developer > Feature Previews.
+//   hiddenFromNav  — WHERE it lives once advertised. It is operator
+//                    configuration touched once at setup, not a daily
+//                    destination, and a top-level rail slot overstated it next
+//                    to Sessions and Schedule, so it is reached from
+//                    Settings → Webhooks instead.
+//
+// Because `hiddenFromNav` already drops the surface from `getBuiltinSurfaces()`,
+// the rail and palette never see it and cannot apply the preview gate
+// themselves. The two places that DO surface it — the Settings tab
+// (`SettingsPage`) and the palette entry (`pagesProvider` EXTRA_PAGES) — read
+// PREVIEW_WEBHOOKS directly, so the Developer > Feature Previews toggle still controls
+// visibility end to end. Dropping `previewFlag` to release means dropping it in
+// those two readers and the PREVIEW_SURFACES row too.
+//
+// The route stays registered either way, so a bookmark still resolves.
+registerBuiltinSurface({
+  navId: 'webhooks',
+  route: '/webhooks',
+  label: surfaceMachineValue('Webhooks'),
+  labelKey: 'nav.webhooks',
+  icon: <Webhook size={16} />,
+  group: surfaceMachineValue('Main'),
+  previewFlag: PREVIEW_WEBHOOKS,
+  hiddenFromNav: true,
 })
 
 // ── Apps ───────────────────────────────────────────────────────────────────

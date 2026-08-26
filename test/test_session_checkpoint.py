@@ -67,22 +67,18 @@ class TestCheckpointDirectiveDispatch:
         assert schema["properties"]["main_items"]["maxItems"] == 4
         assert schema["properties"]["progress"]["additionalProperties"] is False
 
-    def test_persists_through_the_strict_internal_checkpoint_route(self, monkeypatch) -> None:
+    def test_emits_a_validated_checkpoint_directive_for_the_calling_session(self, monkeypatch) -> None:
         checkpoint = _checkpoint()
-        post = MagicMock(return_value={"ok": True})
-        monkeypatch.setattr(mcp_core, "_post", post)
         result = mcp_core._call_tool_inner("session_checkpoint", checkpoint)
-        assert result == "Checkpoint recorded for this session's Multiplex view."
-        post.assert_called_once_with(
-            "/api/session-checkpoint", checkpoint, require_strict_session=True
-        )
+        assert result.startswith("Checkpoint requested for this session.")
+        assert session_directive.decode(result, "session_checkpoint") == checkpoint
 
     def test_refuses_an_unverified_session_before_making_a_checkpoint_request(
         self, monkeypatch
     ) -> None:
         monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
-        result = mcp_core._post("/api/session-checkpoint", {}, require_strict_session=True)
-        assert result["code"] == "unverified_session"
+        result = mcp_core._call_tool_inner("maintenance_acknowledge", {})
+        assert result == "Error: maintenance_acknowledge requires a verified session identity."
 
     def test_rejects_invalid_progress_before_emitting_a_directive(self) -> None:
         with pytest.raises(ValidationError):
@@ -125,11 +121,9 @@ class TestCheckpointDirectiveDispatch:
         result = mcp_core._call_tool_inner("maintenance_acknowledge", {})
 
         assert result.startswith("Reset acknowledgement recorded")
-        post.assert_called_once_with(
-            "/api/session-maintenance",
-            {"action": "acknowledge"},
-            require_strict_session=True,
-        )
+        path, payload = post.call_args.args
+        assert (path, payload) == ("/api/session-maintenance", {"action": "acknowledge"})
+        assert post.call_args.kwargs["session_key"].startswith("dashboard:")
 
 
 class TestCheckpointSlotProjection:
@@ -428,8 +422,23 @@ class TestReturnHandoff:
         assert response.status == 200
         assert json.loads(response.text) == {"ok": True, "pending": 1}
         save.assert_awaited_once_with(state, slot, force=True)
-        assert drain_pending_context(slot).endswith("[End of background context]\n")
+        assert "[End of background context]\n" in drain_pending_context(slot)
         assert slot.session_timeline_payload()[-1]["text"] == "Human handoff delivered to the next turn."
+
+    def test_expired_handoff_records_non_delivery(self) -> None:
+        slot = _ChatSlot("loop")
+        slot._pending_context.append(
+            {
+                "content": "Resume.",
+                "source": "multiplex-return-handoff",
+                "returnHandoff": True,
+                "injectedAt": 0,
+                "maxAge": 1,
+            }
+        )
+
+        assert drain_pending_context(slot) == ""
+        assert slot.session_timeline_payload()[-1]["text"] == "Human handoff expired before delivery."
 
     @pytest.mark.asyncio
     async def test_refuses_a_handoff_when_the_loop_is_not_active(self, tmp_path, monkeypatch) -> None:

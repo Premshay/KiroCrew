@@ -38,8 +38,10 @@ from aiohttp import web
 from kiro_crew import hooks, platform_compat, security
 from kiro_crew.apps.builtins.md_notebook import git_ops
 from kiro_crew.apps.builtins.md_notebook import notes as notes_mod
-from kiro_crew.apps.proxy_auth import verify_proxy_request
+from kiro_crew.apps.proxy_auth import raw_request_target, verify_proxy_request
+from kiro_crew.atomic_write import atomic_write, replace_with_retry
 from kiro_crew.config.paths import config_dir
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform_compat import restrict_to_owner
 from kiro_crew.sel import sel
 
@@ -98,7 +100,27 @@ def _home() -> Path:
 
 
 def _vaults_json() -> Path:
-    return _home() / "vaults.json"
+    # The vault REGISTRY carries each vault's remoteUrl/gitDir, which the
+    # unattended auto-sync loop trusts as the `git push` target and its anti-tamper
+    # pins. Like the PAT and the sync settings it therefore MUST live under the
+    # protected crew data home, never under MD_NOTEBOOK_HOME — otherwise an
+    # operator's (or a prompt-injected agent's) MD_NOTEBOOK_HOME could relocate the
+    # registry outside is_sensitive_path()'s fence and repoint the push. The clone
+    # DATA (`_clone_root`) stays under _home(): it is bulk per-instance content, not
+    # an authorization surface. The _HOME test hook still applies for tmp isolation.
+    base = _HOME if _HOME is not None else _crew_data_home()
+    return base / "vaults.json"
+
+
+def _settings_json() -> Path:
+    # Like the PAT, the sync settings MUST live under the protected crew data
+    # home, never under MD_NOTEBOOK_HOME, so the `autoSync` bit — which authorizes
+    # the background loop's unattended `git push` — always sits behind
+    # is_sensitive_path()'s floor. Resolving via `_home()` would let an operator's
+    # MD_NOTEBOOK_HOME relocate it outside the fence, where an agent could flip it.
+    # The _HOME test hook still applies so tests keep their tmp isolation.
+    base = _HOME if _HOME is not None else _crew_data_home()
+    return base / "settings.json"
 
 
 def _pat_file() -> Path:
@@ -132,6 +154,8 @@ FEATURES = [
     "trashOpen",
     "knowledge",
     "pickFolder",
+    "settings",
+    "autoSyncLoop",
 ]
 
 # A write we made ourselves is ignored by change detection for this long, so
@@ -148,19 +172,37 @@ MTIME_TOLERANCE_MS = 1
 # A real mtime is never negative, so it can't collide with a genuine timestamp.
 _RECREATE_SENTINEL = -1
 
+#: Retry budget for a note save whose rename hit the Windows sharing-violation
+#: window. Mirrors ``atomic_write.replace_with_retry`` (10 x 50ms), whose window
+#: this is; the retry lives here rather than in the rename so each attempt can
+#: re-run the stale-write check first.
+_SAVE_MAX_ATTEMPTS = 10
+_SAVE_BACKOFF_SECONDS = 0.05
+
+# Auto-sync interval bounds, in minutes. These mirror DEFAULT_AUTO_SYNC_MINS /
+# MIN_AUTO_SYNC_MINS / MAX_AUTO_SYNC_MINS in
+# website/src/apps/md-notebook/constants.ts: the picker's range and the
+# scheduler's clamp must agree, or the UI would offer a value the backend then
+# silently rewrites.
+DEFAULT_AUTO_SYNC_MINS = 10
+# The floor is load-bearing rather than cosmetic: 0 would make the scheduler a
+# busy loop, pushing to the remote continuously.
+MIN_AUTO_SYNC_MINS = 1
+MAX_AUTO_SYNC_MINS = 1440
+
 # Per-note-path save locks. The save guard reads the mtime and then writes; two
 # concurrent saves of the same note (two tabs debounce-flushing from one
 # baseMtime) would otherwise BOTH pass the check before either replaces the
 # file, and the second write would silently destroy the first. Serializing the
 # check-and-write per canonical path makes the second save observe the first's
 # new mtime and surface an ESTALE conflict instead.
-_save_locks: dict[str, asyncio.Lock] = {}
+_save_locks: dict[str, LoopBoundLock] = {}
 
 
-def _save_lock(path: str) -> asyncio.Lock:
+def _save_lock(path: str) -> LoopBoundLock:
     lock = _save_locks.get(path)
     if lock is None:
-        lock = asyncio.Lock()
+        lock = LoopBoundLock()
         _save_locks[path] = lock
     return lock
 
@@ -181,7 +223,15 @@ async def _save_locks_for(*paths: str) -> "AsyncIterator[None]":
 # each read the vault list, mutate it, and write it back; without this lock two
 # concurrent mutations from separate tabs would both read the old list and the
 # last writer would discard the other's change (lost update).
-_vaults_lock = asyncio.Lock()
+_vaults_lock = LoopBoundLock()
+
+# Serializes every settings.json read-modify-write, for the same lost-update
+# reason as _vaults_lock — but with three writers rather than two: the settings
+# PUT, the manual sync handler, and the background loop, the last two both
+# stamping `lastSync`. Without it a sync landing during a settings save would
+# have its timestamp discarded by the save's atomic write, so the UI would report
+# notes as never synced when they had just been pushed.
+_settings_lock = LoopBoundLock()
 
 
 # Upper bound on the Untitled-N search when creating a note.
@@ -242,38 +292,105 @@ def _read_vaults_sync() -> list[dict[str, Any]]:
         return []
 
 
-def _atomic_write_text_sync(path: Path, content: str) -> None:
-    """Write via a sibling temp file and rename over the target.
+def _new_staged_note_path(path: Path) -> Path:
+    """Allocate the exact sibling path one note transaction will own."""
+    return path.with_name(git_ops.staged_temp_name(path.name))
 
-    `write_text` truncates first, so a failure partway — a full disk is the
-    realistic one — leaves the note truncated or half-written with no copy of
-    what was there. `os.replace` is atomic within a filesystem, and the temp file
-    is a sibling so it stays on the same one. The `.tmp` suffix keeps it out of
-    the `.md` scan.
+
+def _stage_note_text_sync(tmp: Path, content: str) -> None:
+    """Write *content* to the already-owned *tmp* path and fsync it.
+
+    `write_text` truncates first, so a failure partway -- a full disk is the
+    realistic one -- leaves the note truncated or half-written with no copy of
+    what was there. Staging into a sibling keeps the temp on the same filesystem,
+    so the later rename is atomic, and the `.tmp` suffix keeps it out of the
+    `.md` scan.
+
+    The temp is created ONCE per save and handed back to the caller, which
+    republishes THAT SAME path on every retry. Staging a fresh temp per attempt
+    would leave one orphan behind for each contended attempt whose cleanup unlink
+    also lost the race -- and because the retry ends in a 200, nothing would tell
+    the user to go and look.
+
+    The caller allocates the name and registers it with
+    `git_ops.inflight_temp` BEFORE entering this function. That ordering is part
+    of the contract: `open` makes the untracked file visible immediately, so a
+    concurrent Sync could otherwise discover and commit it while this function
+    was still writing. The caller keeps the registration through publish or
+    cleanup, making ownership cover every instant the temp can exist.
     """
-    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        # newline="" disables the platform newline translation that would
-        # otherwise rewrite the note's "\n" as "\r\n" on Windows, so a note's
-        # bytes are identical on every OS.
-        with open(tmp, "w", encoding="utf-8", newline="") as fh:
-            fh.write(content)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        # Never leave the temp behind to be mistaken for user content.
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+    # newline="" disables the platform newline translation that would
+    # otherwise rewrite the note's "\n" as "\r\n" on Windows, so a note's
+    # bytes are identical on every OS.
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(content)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _publish_staged_sync(tmp: Path, path: Path) -> None:
+    """Rename the staged temp over the note. A SINGLE attempt, on purpose.
+
+    Retrying here would be wrong: the save is guarded by an optimistic
+    concurrency check (`baseMtime` -> stat -> 409 ESTALE), and a retry inside the
+    rename extends the window between that check and the publish by the whole
+    retry budget, so an external edit landing in it would be silently
+    overwritten. The retry lives in `_save_note_contents`, which revalidates
+    before each attempt -- and republishes this same temp.
+
+    A successful rename consumes the temp, which is what keeps a 200 from ever
+    coexisting with a surviving temp this save owns.
+    """
+    os.replace(tmp, path)
+
+
+def _discard_staged_sync(tmp: Path) -> None:
+    """Best-effort removal of one EXACT temp this save owns.
+
+    Deliberately not a `glob` over sibling `<note>.*.tmp`: on the guarded path
+    the per-note lock is released across the backoff, so a concurrent save may
+    legitimately own a temp for the same note, and sweeping would destroy it.
+
+    Best-effort is safe to leave best-effort: the handle that refuses a rename
+    commonly refuses this unlink too. While the save is still running the temp
+    is registered with `git_ops.inflight_temp`, so `status()` keeps it out of a
+    commit; once the transaction ends an orphan becomes ordinary visible content
+    rather than a file silently withheld from the user's repository. Tidiness is
+    what is lost here, never correctness.
+    """
+    with contextlib.suppress(OSError):
+        os.unlink(tmp)
+
+
+def _atomic_write_text_sync(path: Path, content: str) -> None:
+    """Stage, publish, and clean up on failure -- the single-attempt whole.
+
+    Kept for callers that write a file with no freshness contract and no retry
+    (the settings store). The note save drives the two halves itself so it can
+    republish one temp across attempts.
+    """
+    tmp = _new_staged_note_path(path)
+    with git_ops.inflight_temp(tmp):
+        try:
+            _stage_note_text_sync(tmp, content)
+            _publish_staged_sync(tmp, path)
+        except BaseException:
+            _discard_staged_sync(tmp)
+            raise
 
 
 def _write_vaults_sync(vaults: list[dict[str, Any]]) -> None:
-    _home().mkdir(parents=True, exist_ok=True)
-    tmp = _vaults_json().with_name(f"vaults.json.{uuid.uuid4().hex}.tmp")
+    """Replace the vault registry, retrying the Windows rename window.
+
+    Same reason as the note writer above: this file is read back by every
+    later request, so a handle can be open on it when the rename lands.
+    """
+    target = _vaults_json()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f"vaults.json.{uuid.uuid4().hex}.tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(vaults, fh, indent=2)
-    os.replace(tmp, _vaults_json())
+    replace_with_retry(tmp, target)
 
 
 def _read_pat_sync() -> Optional[str]:
@@ -299,28 +416,17 @@ def _write_pat_sync(pat: str) -> None:
     # Write to an owner-only sibling temp, fsync, then atomically replace. A
     # direct O_TRUNC open would empty the existing token before the new bytes
     # land, so a failure partway (a full disk is the realistic one) would lose a
-    # valid credential. The temp is created 0600 so the token is never briefly
-    # world-readable. Written 0600 and never echoed back (only a boolean).
-    tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(pat)
-            fh.flush()
-            os.fsync(fh.fileno())
-        # os.chmod's 0600 is a no-op on Windows (it only toggles read-only),
-        # leaving the token readable by other accounts. restrict_to_owner
-        # applies an owner-only DACL there and chmod 0600 on POSIX. Do it on the
-        # temp BEFORE the replace so the final file is never briefly permissive.
-        try:
-            restrict_to_owner(tmp)
-        except OSError:
-            logger.warning("could not restrict Notes PAT file to owner-only", exc_info=True)
-        os.replace(tmp, target)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+    # valid credential.
+    #
+    # os.chmod's 0600 is a no-op on Windows (it only toggles read-only), leaving
+    # the token readable by other accounts. restrict_to_owner applies an
+    # owner-only DACL there and chmod 0600 on POSIX, and atomic_write applies it
+    # to the temp BEFORE any payload byte — narrower than the previous
+    # write-then-restrict here, which left the token in a parent-inherited-DACL
+    # file for the duration of the icacls subprocess. restrict_on_error="warn"
+    # keeps the original policy: a chmod failure warns rather than losing the
+    # credential. Written 0600 and never echoed back (only a boolean).
+    atomic_write(target, pat, fsync=True, restrict_to_owner=True, restrict_on_error="warn")
 
 
 async def read_vaults() -> list[dict[str, Any]]:
@@ -333,6 +439,123 @@ async def write_vaults(vaults: list[dict[str, Any]]) -> None:
 
 async def read_pat() -> Optional[str]:
     return await asyncio.to_thread(_read_pat_sync)
+
+
+# ---------------------------------------------------------------------------
+# App settings (auto-sync)
+# ---------------------------------------------------------------------------
+
+
+def _default_settings() -> dict[str, Any]:
+    """A fresh defaults dict.
+
+    ``autoSync`` defaults to False and that default is the app's authorization
+    boundary, not a taste call: enabling it is what lets this backend run
+    ``git push`` to a remote with nobody watching.
+    """
+    return {
+        "autoSync": False,
+        "autoSyncMins": DEFAULT_AUTO_SYNC_MINS,
+        "lastSync": {},
+    }
+
+
+def _coerce_auto_sync_mins(value: Any) -> Optional[int]:
+    """Clamp *value* into MIN..MAX minutes, or None if it is not an interval.
+
+    Out-of-range is CLAMPED rather than refused because the intent is
+    unambiguous — 0 means "as often as possible", 99999 means "rarely" — while a
+    non-integer carries no interval to clamp at all. Returning None rather than a
+    default lets each caller pick the right response to that: a read falls back
+    to the default (it has nobody to hand an error to), a write returns 400.
+
+    ``bool`` is excluded explicitly because ``isinstance(True, int)`` is True, and
+    a client sending ``true`` for a minute count is a bug to surface, not a
+    request for a one-minute interval.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return max(MIN_AUTO_SYNC_MINS, min(MAX_AUTO_SYNC_MINS, value))
+
+
+def _read_settings_sync() -> dict[str, Any]:
+    """Load settings, treating the file's SHAPE and its FIELDS as untrusted.
+
+    ``settings.json`` sits in the app's data directory, which the agent and the
+    user can both edit, so the document may be any JSON at all. A non-dict
+    document, a wrong-typed field, or an out-of-range interval degrades to that
+    field's default: this is the single read chokepoint, so no caller has to
+    re-check a type, and a corrupt settings file must not stop the app from
+    opening notes.
+
+    ``autoSync`` is the strictest of the three — only a real boolean enables it,
+    never a truthy string — because a garbled file must fail toward NOT pushing.
+    """
+    out = _default_settings()
+    try:
+        with open(_settings_json(), encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return out
+    except (OSError, json.JSONDecodeError):
+        logger.warning("md-notebook: unreadable settings, using defaults")
+        return out
+    if not isinstance(raw, dict):
+        return out
+    if isinstance(raw.get("autoSync"), bool):
+        out["autoSync"] = raw["autoSync"]
+    mins = _coerce_auto_sync_mins(raw.get("autoSyncMins"))
+    if mins is not None:
+        out["autoSyncMins"] = mins
+    stored_last = raw.get("lastSync")
+    if isinstance(stored_last, dict):
+        # Per-entry filtering, not whole-map rejection: one mangled timestamp
+        # must not cost the user every other vault's sync time. A bool passes
+        # isinstance(int) so it is excluded, and a negative epoch is not a time.
+        out["lastSync"] = {
+            str(vault_id): stamp
+            for vault_id, stamp in stored_last.items()
+            if isinstance(stamp, int) and not isinstance(stamp, bool) and stamp >= 0
+        }
+    return out
+
+
+def _write_settings_sync(settings: dict[str, Any]) -> None:
+    # Create the settings file's OWN parent, like the PAT write does — since
+    # settings.json now resolves under the crew data home (or the _HOME test
+    # hook), not under _home(), the two dirs diverge and mkdir'ing _home() would
+    # leave the settings dir absent and the write failing with ENOENT.
+    target = _settings_json()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text_sync(target, json.dumps(settings, indent=2))
+
+
+async def read_settings() -> dict[str, Any]:
+    return await asyncio.to_thread(_read_settings_sync)
+
+
+def synced_cleanly(result: dict[str, Any]) -> bool:
+    """Whether a ``git_ops.sync`` result has earned a ``lastSync`` stamp.
+
+    A conflicted run aborted its merge and pushed nothing, so stamping it would
+    tell the user their notes are backed up when they are still only local.
+    """
+    return not result.get("conflicts")
+
+
+async def record_last_sync(vault_id: str) -> int:
+    """Stamp *vault_id*'s last conflict-free sync and return it (epoch ms).
+
+    The backend is the ONLY writer of ``lastSync``, for both the manual and the
+    background trigger, so a client cannot claim a sync happened and the two
+    paths cannot disagree about when one did.
+    """
+    now = int(time.time() * 1000)
+    async with _settings_lock:
+        settings = await read_settings()
+        settings["lastSync"][vault_id] = now
+        await asyncio.to_thread(_write_settings_sync, settings)
+    return now
 
 
 # ---------------------------------------------------------------------------
@@ -727,9 +950,11 @@ async def rebuild_cache(vault: dict[str, Any]) -> dict[str, Any]:
             continue  # refused by the gate, or unreadable
         contents[rel] = text
     docs = [
-        notes_mod.SearchDoc(
-            path=p, title=notes_mod.note_title(p, c), content=c
-        )
+        # The boosted field carries the note's DISPLAY name (its filename), so a
+        # search hit in the rail reads the same as the same note in the tree. A
+        # frontmatter title stays findable through `content`, which includes the
+        # frontmatter block, just without the title boost.
+        notes_mod.SearchDoc(path=p, title=notes_mod.note_basename(p), content=c)
         for p, c in contents.items()
     ]
     cache = {
@@ -758,7 +983,7 @@ async def refresh_statuses(vault: dict[str, Any], cache: dict[str, Any]) -> None
 
 
 async def note_listing(vault: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every note with its title, timestamps and sync status."""
+    """Every note with its display name, timestamps and sync status."""
     root = await vault_path(vault)
     cache = await get_cache(vault)
     await refresh_statuses(vault, cache)
@@ -771,6 +996,8 @@ async def note_listing(vault: dict[str, Any]) -> list[dict[str, Any]]:
             st = await asyncio.to_thread(os.stat, abs_path)
         except OSError:
             continue
+        # Read only so the sensitive-path gate can filter: a `.md` symlink aimed at
+        # a credential store elsewhere on disk must not reach the listing at all.
         content = await read_note_text(abs_path)
         if content is None:
             continue  # refused by the gate, or unreadable
@@ -779,7 +1006,13 @@ async def note_listing(vault: dict[str, Any]) -> list[dict[str, Any]]:
         listing.append(
             {
                 "path": rel,
-                "title": notes_mod.note_title(rel, content),
+                # The filename, not a frontmatter `title`: this label is the note's
+                # identity everywhere the user acts on it -- the rail row, the editor
+                # header, the name-sort key, the rename field (which renames the FILE)
+                # and the delete confirmation -- and it matches Obsidian, whose file
+                # explorer lists filenames too. A frontmatter `title` is still a
+                # wikilink target; `note_title` is the key for that.
+                "title": notes_mod.note_basename(rel),
                 "modifiedAt": st.st_mtime * 1000,
                 "createdAt": created * 1000,
                 "syncStatus": cache["statuses"].get(prefix + rel, "synced"),
@@ -836,7 +1069,9 @@ async def proxy_auth_middleware(request: web.Request, handler: Callable) -> web.
     """
     if request.path == "/health":
         return await handler(request)
-    target = request.path + (f"?{request.query_string}" if request.query_string else "")
+    # Verify over the RAW request-target — the exact bytes the gateway signed;
+    # the decoded path + query_string diverge on percent-encodable characters.
+    target = raw_request_target(request)
     body = await request.read() if request.can_read_body else b""
     if not verify_proxy_request(
         request.headers.get("X-KiroCrew-Proxy", ""),
@@ -1111,6 +1346,95 @@ async def api_vault_knowledge(request: web.Request) -> web.Response:
     return web.json_response({"vault": target})
 
 
+async def api_settings_get(request: web.Request) -> web.Response:
+    return web.json_response({"settings": await read_settings()})
+
+
+async def api_settings_put(request: web.Request) -> web.Response:
+    """Merge-patch the app's own settings. Accepts only ``autoSync`` and
+    ``autoSyncMins``.
+
+    Two phases with nothing interleaved: every field is validated into a local
+    before any field is written, so a request carrying one bad value changes
+    NOTHING. That matters most for the pair here — a request that turned
+    ``autoSync`` on and then 400'd on a malformed interval would leave unattended
+    pushing enabled from a request the user was told had failed.
+
+    ``lastSync`` is server-owned and REFUSED rather than dropped: a client sending
+    one is trying to claim a sync happened, and ignoring it silently would let the
+    UI show a backup time nothing earned.
+
+    Unknown keys are dropped, so a stale or hostile client cannot grow the file
+    with arbitrary content.
+    """
+    body = await json_body(request)
+    if "lastSync" in body:
+        raise ApiError(
+            "lastSync is recorded by the server and cannot be set by a client",
+            400,
+            code="last_sync_read_only",
+        )
+
+    # PHASE 1 — validate into locals. Only `raise ApiError` below this line, never
+    # a write.
+    auto_sync: Optional[bool] = None
+    if "autoSync" in body:
+        if not isinstance(body["autoSync"], bool):
+            raise ApiError("autoSync must be a boolean", 400, code="invalid_auto_sync")
+        auto_sync = body["autoSync"]
+
+    auto_sync_mins: Optional[int] = None
+    if "autoSyncMins" in body:
+        auto_sync_mins = _coerce_auto_sync_mins(body["autoSyncMins"])
+        if auto_sync_mins is None:
+            raise ApiError(
+                "autoSyncMins must be a whole number of minutes between "
+                f"{MIN_AUTO_SYNC_MINS} and {MAX_AUTO_SYNC_MINS}",
+                400,
+                code="invalid_auto_sync_mins",
+            )
+
+    # PHASE 2 — apply. Nothing here can fail validation.
+    async with _settings_lock:
+        settings = await read_settings()
+        prev_auto_sync = settings["autoSync"]
+        # Writes apply in the order the server receives them, serialized by the
+        # settings lock. This lock IS the ordering authority: the client sends one
+        # write at a time (single-flight) carrying the full desired state, so a
+        # single tab cannot race itself, and across tabs the last write the server
+        # accepts wins — the only ordering a server can establish without a shared
+        # client clock. A revocation therefore always applies (nothing is ever
+        # dropped as "stale"), so auto-sync can never stay authorized against a
+        # user who turned it off.
+        # Enabling authorizes unattended `git push`; audit that BEFORE persisting
+        # it and fail closed (critical=True) so push is never authorized without a
+        # record. Run the SEL write in a thread — it flushes synchronously to disk,
+        # which must not block the event loop.
+        if auto_sync is True and prev_auto_sync is False:
+            await asyncio.to_thread(
+                sel().log_api_access,
+                caller="md-notebook",
+                operation="md_notebook.settings.autoSync",
+                outcome="enabled",
+                resources=f"autoSyncMins={auto_sync_mins if auto_sync_mins is not None else settings['autoSyncMins']}",
+                critical=True,
+            )
+        if auto_sync is not None:
+            settings["autoSync"] = auto_sync
+        if auto_sync_mins is not None:
+            settings["autoSyncMins"] = auto_sync_mins
+        await asyncio.to_thread(_write_settings_sync, settings)
+        if auto_sync is False and prev_auto_sync is True:
+            await asyncio.to_thread(
+                sel().log_api_access,
+                caller="md-notebook",
+                operation="md_notebook.settings.autoSync",
+                outcome="disabled",
+                resources=f"autoSyncMins={settings['autoSyncMins']}",
+            )
+    return web.json_response({"settings": settings})
+
+
 async def api_pat(request: web.Request) -> web.Response:
     """Set or clear the stored token: an empty value clears it."""
     body = await json_body(request)
@@ -1185,6 +1509,277 @@ async def api_note_read(request: web.Request) -> web.Response:
     )
 
 
+async def _assert_note_is_fresh(
+    abs_path: Path, rel: str, base_mtime: object
+) -> None:
+    """Raise 409 ESTALE if the note changed on disk since the client read it.
+
+    Split out of the save handler so the retry below can re-run it. It must be
+    cheap to repeat and must not mutate anything: it is the freshness half of a
+    check-and-write, and a retry that skipped it would publish against a file it
+    never revalidated.
+    """
+    if isinstance(base_mtime, (int, float)):
+        current: Optional[float] = None
+        try:
+            current = (await asyncio.to_thread(os.stat, abs_path)).st_mtime * 1000
+        except FileNotFoundError:
+            # A supplied baseMtime means the file existed when the client read
+            # it, so its absence now is an external deletion — a conflict, not
+            # a new file. Silently rewriting would resurrect a note the user
+            # deleted in Obsidian or via `git pull`.
+            #
+            # The conflict hands back the -1 sentinel as the new mtime; when
+            # the user chooses "keep mine" the client retries with
+            # baseMtime == -1, which is the one value that means "yes,
+            # recreate it" and falls through to the write below. Without this
+            # escape hatch the retry would hit this same branch forever and
+            # the edit could never be saved.
+            if base_mtime != _RECREATE_SENTINEL:
+                raise ApiError(
+                    "this note was deleted on disk since you opened it",
+                    409,
+                    code="ESTALE",
+                    mtime=_RECREATE_SENTINEL,
+                    disk="",
+                )
+        if current is not None and abs(current - base_mtime) > MTIME_TOLERANCE_MS:
+            # The conflict response hands this content back to the client, so
+            # it goes through the same gate as every other read: containment
+            # inside the vault says nothing about what the vault holds.
+            disk = await read_note_text(abs_path)
+            if disk is None:
+                raise ApiError(f"no such note: {rel}", 404, code="no_such_note")
+            raise ApiError(
+                "this note changed on disk since you opened it",
+                409,
+                code="ESTALE",
+                mtime=current,
+                disk=disk,
+            )
+
+
+async def _observed_note_mtime(abs_path: Path) -> Optional[float]:
+    """The note's current mtime in ms, or None when it does not exist."""
+    try:
+        return (await asyncio.to_thread(os.stat, abs_path)).st_mtime * 1000
+    except FileNotFoundError:
+        return None
+
+
+async def _assert_note_unchanged(
+    abs_path: Path, rel: str, observed: Optional[float]
+) -> None:
+    """Raise 409 ESTALE if the note moved off *observed* since it was sampled.
+
+    The tokenless counterpart to `_assert_note_is_fresh`. A save with no
+    ``baseMtime`` has no client-supplied baseline to revalidate against, so the
+    server takes its OWN: the state the save was about to overwrite, sampled
+    before the first publish attempt.
+
+    The note lock serializes API writers, but it says nothing about an editor
+    writing the file directly -- Obsidian, `git pull`, an external script. That
+    writer lands during the retry backoff, and without this check the next
+    attempt renames over an edit nobody revalidated, answering 200 for a save
+    that destroyed a newer one.
+
+    Only RETRIES consult it. The first attempt is what the caller asked for:
+    overwriting the state sampled here is the save, not a conflict.
+    """
+    current = await _observed_note_mtime(abs_path)
+    if current is None and observed is None:
+        return
+    if (
+        current is not None
+        and observed is not None
+        and abs(current - observed) <= MTIME_TOLERANCE_MS
+    ):
+        return
+    if current is None:
+        # Deleted under us mid-retry. Reported with the same -1 sentinel the
+        # guarded path uses, so the client's "keep mine" retry (baseMtime == -1)
+        # is the one escape hatch on both paths rather than two dialects.
+        raise ApiError(
+            "this note was deleted on disk while your save was retrying",
+            409,
+            code="ESTALE",
+            mtime=_RECREATE_SENTINEL,
+            disk="",
+        )
+    disk = await read_note_text(abs_path)
+    raise ApiError(
+        "this note changed on disk while your save was retrying",
+        409,
+        code="ESTALE",
+        mtime=current,
+        disk=disk if disk is not None else "",
+    )
+
+
+async def _publish_note_once(abs_path: Path, tmp: Path, attempt: int) -> bool:
+    """Publish the staged temp once. True on success, False to retry.
+
+    Takes the temp rather than the content: every attempt republishes the SAME
+    staged file, so a contended save can never leave a trail of orphaned temps
+    behind a 200.
+
+    Terminal failures are raised rather than reported: POSIX re-raises a
+    ``PermissionError`` immediately (there it means the caller genuinely cannot
+    write, and waiting changes nothing), and an exhausted budget propagates the
+    last one.
+    """
+    try:
+        await asyncio.to_thread(_publish_staged_sync, tmp, abs_path)
+        return True
+    except PermissionError:
+        if not platform_compat.IS_WINDOWS:
+            raise
+        if attempt == _SAVE_MAX_ATTEMPTS - 1:
+            raise
+        logger.debug(
+            "md-notebook: note rename contended at %s; retrying (%d/%d)",
+            abs_path,
+            attempt + 1,
+            _SAVE_MAX_ATTEMPTS,
+        )
+        return False
+
+
+async def _save_note_contents(
+    abs_path: Path, rel: str, content: str, base_mtime: object
+) -> None:
+    """Publish *content*, retrying a contended rename without losing a write.
+
+    The rename can fail on Windows with `PermissionError` while another handle is
+    open on the note -- routine for a vault the user also has open in an editor,
+    and for the search indexer and AV scanner. Losing the save there is the user
+    losing what they just typed, so the transient is retried.
+
+    What is retried is the CHECK-AND-WRITE, never the rename alone. Retrying
+    inside the rename would stretch the gap between the freshness check and the
+    publish across the whole backoff, and an edit completing in that gap would be
+    silently overwritten by the next attempt -- exactly what the `baseMtime`
+    guard exists to prevent.
+
+    **The lock policy depends on whether this save carries a freshness token**,
+    because that is what decides whether a writer in the gap can be DETECTED:
+
+    * ``baseMtime`` supplied -- the lock is released across the backoff. Another
+      writer landing in the gap is not a problem to exclude: the next attempt
+      re-runs the check, sees it, and answers 409. Releasing keeps a contended
+      save from blocking an external-conflict resolution behind it.
+
+    * no ``baseMtime`` (the API allows it, and the editor omits it when it has
+      not read an mtime) -- ``_assert_note_is_fresh`` is a no-op, so a writer in
+      the gap is INVISIBLE to every later attempt. Releasing the lock there let a
+      contended save resurrect itself over a later save that had already been
+      acknowledged with 200. The lock is therefore held across the backoff, which
+      preserves exactly the serialization the un-retried code had: a same-note
+      writer waits (at most the retry budget, ~450ms) rather than being
+      overwritten afterwards.
+
+      The lock orders API writers and nothing else, so it is only half the
+      answer. An editor writing the file directly -- Obsidian, ``git pull``, a
+      script -- never takes it, and republishing over that edit is undetectable
+      after the fact. So the tokenless path derives its OWN baseline
+      (``_observed_note_mtime`` before the first attempt) and revalidates
+      against it before every RETRY: the same 409 ESTALE the guarded path
+      answers, from a baseline the server sampled instead of one the client
+      supplied. The first attempt never consults it -- overwriting the sampled
+      state IS the save.
+
+    Holding it is a coroutine suspension, not a blocked event loop, and it is
+    per-note.
+
+    Budget mirrors `atomic_write.replace_with_retry`, whose window this is.
+    """
+    # ONE temp for the whole transaction, on either path. Staged before the
+    # first attempt and republished by every retry, so success consumes it and
+    # any exit path has exactly one file to discard. It carries
+    # `git_ops.staged_temp_name`'s shape for the whole of its life, so a Sync
+    # running during the backoff cannot stage it.
+    #
+    # WHERE it is staged differs, because the two paths serialize differently.
+    if isinstance(base_mtime, (int, float)):
+        # Guarded: the freshness check is what orders these saves, so staging
+        # outside the lock cannot reorder anything -- every attempt revalidates
+        # under the lock before it may publish.
+        #
+        # It runs BEFORE the directory is created, though. A save whose note and
+        # parent were deleted externally is already destined for 409, and
+        # `make_dirs` would put the parent back on the way to refusing: a request
+        # that changes nothing should not resurrect a directory the user removed.
+        # This costs one extra stat on the happy path and weakens nothing -- the
+        # per-attempt check under the lock is still the one that authorizes a
+        # publish.
+        await _assert_note_is_fresh(abs_path, rel, base_mtime)
+        await make_dirs(abs_path.parent)
+        tmp = _new_staged_note_path(abs_path)
+        # Register BEFORE staging: opening the temp is the first instant Sync
+        # can see it. Keep ownership through failure cleanup as well as publish,
+        # so there is no visible gap at either end of the transaction.
+        with git_ops.inflight_temp(tmp):
+            try:
+                await asyncio.to_thread(_stage_note_text_sync, tmp, content)
+                for attempt in range(_SAVE_MAX_ATTEMPTS):
+                    async with _save_lock(str(abs_path)):
+                        await _assert_note_is_fresh(abs_path, rel, base_mtime)
+                        if await _publish_note_once(abs_path, tmp, attempt):
+                            return
+                    # Outside the lock: a writer arriving here is one the next
+                    # attempt's check is meant to notice, so blocking it would
+                    # hide the conflict.
+                    await asyncio.sleep(_SAVE_BACKOFF_SECONDS)
+                return
+            except BaseException:
+                await asyncio.to_thread(_discard_staged_sync, tmp)
+                raise
+
+    # Tokenless: nothing can detect an interleaved writer, so ORDER is the only
+    # guarantee left -- and order has to cover the whole stage-and-publish
+    # transaction, not just the publish. Staging is the slow half (it writes the
+    # entire note), so staging outside the lock let a large save be overtaken:
+    # a later save could take the lock, publish, and answer 200 while the earlier
+    # one was still writing its temp, and the earlier one then published over it.
+    # Both answered 200; the later edit was gone.
+    async with _save_lock(str(abs_path)):
+        await make_dirs(abs_path.parent)
+        tmp = _new_staged_note_path(abs_path)
+        with git_ops.inflight_temp(tmp):
+            try:
+                # Registration precedes the worker-thread open and remains until
+                # cleanup completes, so Sync never sees an unowned temp even if
+                # staging itself is slow or fails partway.
+                await asyncio.to_thread(_stage_note_text_sync, tmp, content)
+                # The server's OWN baseline, standing in for the absent
+                # `baseMtime`: the state this save is about to overwrite.
+                # Sampled after staging (which writes the temp, never the note)
+                # and before the first attempt, so it describes exactly what
+                # attempt 1 would replace.
+                observed = await _observed_note_mtime(abs_path)
+                for attempt in range(_SAVE_MAX_ATTEMPTS):
+                    if attempt:
+                        # A RETRY, so the backoff has already elapsed. The lock
+                        # kept other API writers out of it, but an external
+                        # editor is not subject to the lock -- and republishing
+                        # over its edit is the one thing this path cannot
+                        # detect after the fact.
+                        await _assert_note_unchanged(abs_path, rel, observed)
+                    if await _publish_note_once(abs_path, tmp, attempt):
+                        return
+                    # Still inside the lock: with no token there is nothing to
+                    # detect an interleaved API write with, so ordering has to
+                    # be preserved.
+                    await asyncio.sleep(_SAVE_BACKOFF_SECONDS)
+            except BaseException:
+                # Every non-success exit -- staging failure, an exhausted
+                # budget, a POSIX refusal, cancellation -- discards the one temp
+                # this save owns BEFORE its registration is released. A 200
+                # never reaches here, because its rename consumed the temp.
+                await asyncio.to_thread(_discard_staged_sync, tmp)
+                raise
+
+
 async def api_note_save(request: web.Request) -> web.Response:
     vault = await require_vault(request)
     require_writable(vault)
@@ -1203,58 +1798,11 @@ async def api_note_save(request: web.Request) -> web.Response:
     if await asyncio.to_thread(platform_compat.is_link_or_junction, abs_path):
         raise ApiError("cannot save through a symlink", 400, code="note_is_symlink")
     base_mtime = body.get("baseMtime")
-    # Serialize the check-and-write for this note so two concurrent saves can't
-    # both pass the stale-write guard and silently clobber each other.
-    async with _save_lock(str(abs_path)):
-        # Optimistic concurrency: when the caller passes the mtime it read,
-        # refuse to write if the file changed underneath — otherwise an edit made
-        # outside the app (Obsidian, git pull) would be silently clobbered.
-        if isinstance(base_mtime, (int, float)):
-            current: Optional[float] = None
-            try:
-                current = (await asyncio.to_thread(os.stat, abs_path)).st_mtime * 1000
-            except FileNotFoundError:
-                # A supplied baseMtime means the file existed when the client read
-                # it, so its absence now is an external deletion — a conflict, not
-                # a new file. Silently rewriting would resurrect a note the user
-                # deleted in Obsidian or via `git pull`.
-                #
-                # The conflict hands back the -1 sentinel as the new mtime; when
-                # the user chooses "keep mine" the client retries with
-                # baseMtime == -1, which is the one value that means "yes,
-                # recreate it" and falls through to the write below. Without this
-                # escape hatch the retry would hit this same branch forever and
-                # the edit could never be saved.
-                if base_mtime != _RECREATE_SENTINEL:
-                    raise ApiError(
-                        "this note was deleted on disk since you opened it",
-                        409,
-                        code="ESTALE",
-                        mtime=_RECREATE_SENTINEL,
-                        disk="",
-                    )
-            if current is not None and abs(current - base_mtime) > MTIME_TOLERANCE_MS:
-                # The conflict response hands this content back to the client, so
-                # it goes through the same gate as every other read: containment
-                # inside the vault says nothing about what the vault holds.
-                disk = await read_note_text(abs_path)
-                if disk is None:
-                    raise ApiError(f"no such note: {rel}", 404, code="no_such_note")
-                raise ApiError(
-                    "this note changed on disk since you opened it",
-                    409,
-                    code="ESTALE",
-                    mtime=current,
-                    disk=disk,
-                )
-        await make_dirs(abs_path.parent)
-        await asyncio.to_thread(_atomic_write_text_sync, abs_path, content)
+    await _save_note_contents(abs_path, rel, content, base_mtime)
     mark_self_write(abs_path)
     cache = await get_cache(vault)
     cache["index"].update(
-        notes_mod.SearchDoc(
-            path=rel, title=notes_mod.note_title(rel, content), content=content
-        )
+        notes_mod.SearchDoc(path=rel, title=notes_mod.note_basename(rel), content=content)
     )
     # Backlinks are a whole-vault relation, so recompute them from disk.
     root = await vault_path(vault)
@@ -1495,7 +2043,12 @@ async def api_sync(request: web.Request) -> web.Response:
         local_only=bool(vault.get("localOnly")),
     )
     await rebuild_cache(vault)
-    return web.json_response({"result": result})
+    # Stamped here as well as in the background loop, so the backend is the single
+    # writer of `lastSync` for both trigger paths. Returned alongside the result
+    # so the UI shows the new time without a second round-trip. Null on a
+    # conflicted run — nothing reached the remote, so nothing is backed up.
+    last_sync = await record_last_sync(vault["id"]) if synced_cleanly(result) else None
+    return web.json_response({"result": result, "lastSync": last_sync})
 
 
 async def api_commit(request: web.Request) -> web.Response:
@@ -1661,6 +2214,8 @@ def create_app() -> web.Application:
     app.router.add_post("/api/vaults/attach", api_vault_attach)
     app.router.add_delete("/api/vaults", api_vault_forget)
     app.router.add_put("/api/vaults/knowledge", api_vault_knowledge)
+    app.router.add_get("/api/settings", api_settings_get)
+    app.router.add_put("/api/settings", api_settings_put)
     app.router.add_put("/api/pat", api_pat)
     app.router.add_get("/api/changes", api_changes)
     app.router.add_get("/api/notes", api_notes)
@@ -1675,6 +2230,14 @@ def create_app() -> web.Application:
     app.router.add_post("/api/trash/open", api_trash_open)
     app.router.add_get("/api/search", api_search)
     app.router.add_post("/api/pick-folder", api_pick_folder)
+    # Auto-sync runs in this backend process, not in the dashboard page, so the
+    # interval is honoured with no Notes tab open. Imported here rather than at
+    # module scope because `syncer` imports this module for the settings store and
+    # the vault helpers, and a module-level import in both directions is a cycle.
+    from kiro_crew.apps.builtins.md_notebook import syncer
+
+    app.on_startup.append(syncer.start_syncer)
+    app.on_cleanup.append(syncer.stop_syncer)
     return app
 
 

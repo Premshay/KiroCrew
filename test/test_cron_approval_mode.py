@@ -13,8 +13,20 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from kiro_crew.cron import CronJob, CronSchedule
 from kiro_crew.llm_helpers import ToolApprovalPolicy
+
+
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
 
 
 class TestCronApprovalModeField:
@@ -470,6 +482,7 @@ class TestCronSubagentInjection:
                 captured_done = kwargs["on_done"]
                 mgr = MagicMock()
                 mgr.running = []
+                mgr.queued_count_for = MagicMock(return_value=0)
                 return mgr
 
             mock_cls.side_effect = capture_mgr
@@ -587,6 +600,7 @@ class TestCronSubagentInjection:
 
         # .running is empty, but another subagent is mid-injection
         gw.subagent_mgr.running = []
+        gw.subagent_mgr.queued_count_for = MagicMock(return_value=0)
         gw._cron_injecting["cron:daily-prep"] = 1
 
         info = SubagentInfo(
@@ -729,7 +743,12 @@ class TestNoCronsFlag:
         from kiro_crew.slack.gateway import run_gateway
 
         cfg = MagicMock()
-        with patch("kiro_crew.slack.gateway.GatewayOrchestrator") as mock_cls:
+        with (
+            # The aggregate-cgroup-ceiling apply shells out to systemctl —
+            # a host-service mutation the rootdir guard refuses; stub it.
+            patch("kiro_crew.slack.gateway.ensure_agents_slice_limits", return_value=True),
+            patch("kiro_crew.slack.gateway.GatewayOrchestrator") as mock_cls,
+        ):
             mock_orch = MagicMock()
             mock_orch.run = AsyncMock()
             mock_cls.return_value = mock_orch
@@ -767,7 +786,7 @@ class TestNoCronsFlag:
         with patch.object(sys, "argv", ["kirocrew", "gateway", "--no-crons"]):
             from kiro_crew.cli import main
 
-            with patch("kiro_crew.cli._gateway", new_callable=AsyncMock) as mock_gw, patch(
+            with patch("kiro_crew.cli_server._gateway", new_callable=AsyncMock) as mock_gw, patch(
                 "kiro_crew.cli.asyncio"
             ) as mock_asyncio:
                 mock_asyncio.run = MagicMock()

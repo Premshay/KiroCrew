@@ -1,7 +1,10 @@
+import { Fragment, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Plus, X, Zap } from 'lucide-react'
 import type { ChatTag } from '../types'
+import { useImeGuard } from '../hooks/useImeGuard'
 import { api } from '../api/client'
+import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
 
 import { i18nT } from '../i18n/t'
 export interface TagManagerListProps {
@@ -36,7 +39,10 @@ export interface TagManagerListProps {
  */
 export default function TagManagerList({ mode, selectedIds = [], onToggleTag, createTestId = 'tag-create' }: TagManagerListProps) {
   const queryClient = useQueryClient()
+  const ime = useImeGuard()
   const { data: tags = [] } = useQuery<ChatTag[]>({ queryKey: ['chat-tags'], queryFn: () => api.chatTags() })
+  /** Tag id whose inline colour palette is expanded (manage mode only). */
+  const [openColorId, setOpenColorId] = useState<string | null>(null)
 
   const createTagMutation = useMutation({
     mutationFn: ({ name, color, status }: { name: string; color?: string; status?: boolean }) => api.createChatTag(name, color, status),
@@ -64,7 +70,8 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
           const on = mode === 'column-filter' && selectedIds.includes(t.id)
           const nextIds = on ? selectedIds.filter(x => x !== t.id) : [...selectedIds, t.id]
           return (
-            <div key={t.id} data-testid={`tag-row-${t.id}`} className={`group/tag flex items-center gap-1.5 px-1.5 py-1 rounded transition-all ${on ? 'bg-accent-subtle' : 'hover:bg-bg-hover'}`}>
+            <Fragment key={t.id}>
+            <div data-testid={`tag-row-${t.id}`} className={`group/tag flex items-center gap-1.5 px-1.5 py-1 rounded transition-all ${on ? 'bg-accent-subtle' : 'hover:bg-bg-hover'}`}>
               {mode === 'column-filter' ? (
                 /* Filter toggle — the colour swatch is the click target. role=checkbox
                  *  (not menuitemcheckbox) because the row lives in a form popover, not a
@@ -77,8 +84,16 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
                   {on && <span className="absolute inset-0 flex items-center justify-center" style={{ color: t.color === '#ffffff' ? '#000' : '#fff' }}><Check size={10} /></span>}
                 </button>
               ) : (
-                /* Manage mode — static colour chip, no filter semantics */
-                <span className="w-4 h-4 rounded-sm border border-border shrink-0" style={{ background: t.color }} aria-hidden />
+                /* Manage mode — the swatch is a button that expands an inline
+                 *  colour palette row beneath the tag (backend PATCH already
+                 *  supports recolor; this is its first UI surface). */
+                <button type="button" data-testid={`tag-color-${t.id}`}
+                  aria-expanded={openColorId === t.id}
+                  aria-label={i18nT('components.tagManagerList.change_color', { name: t.name })}
+                  title={i18nT('components.tagManagerList.change_color', { name: t.name })}
+                  className="w-4 h-4 rounded-sm border border-border shrink-0 cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                  style={{ background: t.color }}
+                  onClick={() => setOpenColorId(cur => (cur === t.id ? null : t.id))} />
               )}
               {/* Inline rename */}
               {/* key={t.name} remounts the uncontrolled input when the canonical
@@ -91,13 +106,21 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
                 data-testid={`tag-name-${t.id}`}
                 aria-label={i18nT('components.tagManagerList.rename_tag', { name: t.name })}
                 defaultValue={t.name}
-                className="flex-1 min-w-0 bg-transparent border-none outline-none text-[12px] text-text py-0 px-0.5 rounded focus:bg-bg-elevated focus:border focus:border-accent/50"
-                onBlur={e => { const v = e.target.value.trim(); if (!v) { e.target.value = t.name; return } if (v !== t.name) updateTagMutation.mutate({ id: t.id, body: { name: v } }) }}
+                className="flex-1 min-w-0 bg-transparent border-none outline-none text-[12px] text-text py-0 px-0.5 rounded focus-visible:bg-bg-elevated focus-visible:border focus-visible:border-accent/50"
+                {...ime.bindComposition<HTMLInputElement>({
+                  onBlur: e => { const v = e.target.value.trim(); if (!v) { e.target.value = t.name; return } if (v !== t.name) updateTagMutation.mutate({ id: t.id, body: { name: v } }) },
+                })}
                 onKeyDown={e => {
                   const el = e.currentTarget as HTMLInputElement
                   if (e.key !== 'Enter' && e.key !== 'Escape') return
-                  e.stopPropagation()
+                  // Escape restores the canonical name first, so its path can never
+                  // persist a draft. Enter commits through the focus move below (it
+                  // fires this input's onBlur), so a committing IME Enter — whose
+                  // candidate text is still intermediate — must not reach it. Rule 1:
+                  // single-line input, so the declined key is left unconsumed.
                   if (e.key === 'Escape') el.value = t.name
+                  else if (ime.isComposing(e)) return
+                  e.stopPropagation()
                   // Move focus to the row's first button (swatch in column-filter mode,
                   // status ⚡ in manage mode) instead of blur()ing to <body>. This still
                   // fires the input's onBlur (commit) but keeps focus inside the owning
@@ -125,6 +148,46 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
                 <X size={11} />
               </button>
             </div>
+            {/* Inline colour palette — expanded by the manage-mode swatch. Reuses
+              *  the folder palette so tags and folders speak one visual language.
+              *  Picking a colour PATCHes the tag and returns focus to the swatch
+              *  (the palette unmounts, so focus would otherwise fall to <body>). */}
+            {mode === 'manage' && openColorId === t.id && (
+              <div
+                role="group"
+                data-testid={`tag-palette-${t.id}`}
+                aria-label={i18nT('components.tagManagerList.change_color', { name: t.name })}
+                className="flex items-center gap-1 flex-wrap pl-7 pr-1.5 pb-1"
+                onKeyDown={e => {
+                  if (e.key !== 'Escape') return
+                  e.stopPropagation()
+                  setOpenColorId(null)
+                  document.querySelector<HTMLElement>(`[data-testid="tag-color-${t.id}"]`)?.focus()
+                }}
+              >
+                {FOLDER_COLOR_PALETTE.map(({ value, label }) => {
+                  const colorName = label()
+                  return (
+                    <button
+                      key={value}
+                      type="button"
+                      data-testid={`tag-color-${t.id}-${value.slice(1)}`}
+                      title={i18nT('components.tagManagerList.set_color_to_name', { name: colorName })}
+                      aria-label={i18nT('components.tagManagerList.set_color_to_name', { name: colorName })}
+                      aria-pressed={t.color === value}
+                      className={`w-4 h-4 rounded-full cursor-pointer border transition-transform hover:scale-110 outline-none focus-visible:ring-2 focus-visible:ring-accent ${t.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                      style={{ background: `color-mix(in srgb, ${value} 30%, var(--bg-elevated))`, borderColor: value }}
+                      onClick={() => {
+                        updateTagMutation.mutate({ id: t.id, body: { color: value } })
+                        setOpenColorId(null)
+                        document.querySelector<HTMLElement>(`[data-testid="tag-color-${t.id}"]`)?.focus()
+                      }}
+                    />
+                  )
+                })}
+              </div>
+            )}
+            </Fragment>
           )
         })}
       </div>
@@ -136,14 +199,16 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
           data-testid={createTestId}
           placeholder={i18nT('components.tagManagerList.new_tag')}
           className="flex-1 min-w-0 bg-transparent border-none outline-none text-[12px] text-text py-0 px-0.5 placeholder:text-muted/60"
+          {...ime.bindComposition()}
           onKeyDown={e => {
-            if (e.key === 'Enter') {
-              const el = e.currentTarget as HTMLInputElement
-              const v = el.value.trim()
-              if (!v) return
-              createTagMutation.mutate({ name: v })
-              el.value = ''
-            }
+            if (e.key !== 'Enter') return
+            // Rule 1: single-line input — the guard alone; emptiness stays outside.
+            if (ime.isComposing(e)) return
+            const el = e.currentTarget as HTMLInputElement
+            const v = el.value.trim()
+            if (!v) return
+            createTagMutation.mutate({ name: v })
+            el.value = ''
           }}
           onClick={e => e.stopPropagation()}
         />

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
+import { Virtuoso } from 'react-virtuoso'
 import {
   RefreshCw, Search, X, GitPullRequest, GitMerge, GitPullRequestClosed, GitPullRequestDraft,
   CheckCircle2, XCircle, CircleSlash, Loader2, FileDiff,
@@ -120,9 +121,9 @@ function ChecksDot({ state }: { state: PullRequest['checks_state'] }) {
  * the card text on every pointer move — see IssueList. */
 export default function PrList({ resizing = false }: { resizing?: boolean }) {
   const {
-    filteredPulls, sortedPulls, pullsLoading, pullsError,
+    filteredPulls, sortedPulls, pullsLoading, pullsError, pullsPartial,
     prStateFilter, colorByName,
-    selectedPull, setSelectedPull, refreshPulls, pullsRefreshing,
+    selectedPull, setSelectedPull, refreshPulls, pullsRefreshing, listDetail,
     prQuery, setPrQuery, pullsUpdatedAt, prPersonFilterActive, prSearchTruncatedAt,
     active, canWrite, checkedPulls, togglePullChecked, clearCheckedPulls,
   } = useIssueRadar()
@@ -215,7 +216,7 @@ export default function PrList({ resizing = false }: { resizing?: boolean }) {
                 {files > 0 && (
                   <span
                     className="inline-flex items-center gap-1"
-                    title={`${files} file${files === 1 ? '' : 's'} changed`}
+                    title={i18nT('apps.issueRadar.components.prList.file_changed', { count: files })}
                   >
                     <FileDiff size={11} />
                     {files}
@@ -239,7 +240,7 @@ export default function PrList({ resizing = false }: { resizing?: boolean }) {
 
   return (
     <section className="flex flex-col min-h-0 h-full">
-      <div className="px-2 pt-2 pb-1.5 flex-shrink-0">
+      <div className="px-4 pt-2 pb-1.5 flex-shrink-0">
         <div className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 transition-colors focus-within:border-accent">
           <Search size={14} className="flex-shrink-0 text-muted opacity-60" />
           <input
@@ -265,60 +266,84 @@ export default function PrList({ resizing = false }: { resizing?: boolean }) {
       <PrBulkBar />
 
       <div className="relative flex-1 min-h-0">
-        <div className="absolute inset-0 overflow-y-auto scrollbar-none px-2 pb-2 flex flex-col gap-2" style={{ scrollbarWidth: 'none' }}>
-          {pullsLoading && <ListSkeleton />}
-          {pullsError && <div className="px-1 py-2 text-[14px] text-danger">{pullsError.message}</div>}
-          {!pullsLoading && filteredPulls.length === 0 && (
+        {pullsLoading && (
+          <div className="absolute inset-0 overflow-y-auto scrollbar-none px-4 pb-2 flex flex-col gap-2" style={{ scrollbarWidth: 'none' }}>
+            <ListSkeleton />
+          </div>
+        )}
+        {pullsError && <div className="px-4 py-2 text-[14px] text-danger">{pullsError.message}</div>}
+        {!pullsLoading && filteredPulls.length === 0 && (
+          <div className="px-4 pb-2">
             <ListEmptyState searching={Boolean(prQuery.trim())} label={terms.changeRequestPluralTitle} />
-          )}
-          {animate ? (
-            <AnimatePresence initial={false} mode="popLayout">
-              {sortedPulls.map((pr) => (
-                <motion.div
-                  key={pr.number}
-                  // 'position' (not the default size+position): a size-animating
-                  // layout pass distorts the card's text with a scale transform
-                  // whenever the column rewraps. Off entirely mid-resize.
-                  layout={resizing ? false : 'position'}
-                  initial={{ opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, scale: 0.97 }}
-                  transition={{
-                    layout: { type: 'spring', stiffness: 550, damping: 40 },
-                    duration: 0.18,
-                    ease: [0.16, 1, 0.3, 1],
-                  }}
-                >
+          </div>
+        )}
+        {!pullsLoading && sortedPulls.length > 0 && (
+          animate ? (
+            // Small list: plain animated flow (see IssueList — deliberately not
+            // virtualized, AnimatePresence needs all siblings mounted; ANIM_CAP-bounded).
+            <div className="absolute inset-0 overflow-y-auto scrollbar-none px-4 pb-2 flex flex-col gap-2" style={{ scrollbarWidth: 'none' }}>
+              <AnimatePresence initial={false} mode="popLayout">
+                {sortedPulls.map((pr) => (
+                  <motion.div
+                    key={pr.number}
+                    // 'position' (not the default size+position): a size-animating
+                    // layout pass distorts the card's text with a scale transform
+                    // whenever the column rewraps. Off entirely mid-resize.
+                    layout={resizing ? false : 'position'}
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.97 }}
+                    transition={{
+                      layout: { type: 'spring', stiffness: 550, damping: 40 },
+                      duration: 0.18,
+                      ease: [0.16, 1, 0.3, 1],
+                    }}
+                  >
+                    {row(pr, (
+                      <button
+                        onClick={() => { setSelectedPull(pr.number); listDetail.openDetail() }}
+                        className={cardClass(selectedPull === pr.number)}
+                      >
+                        {cardInner(pr)}
+                      </button>
+                    ))}
+                  </motion.div>
+                ))}
+              </AnimatePresence>
+            </div>
+          ) : (
+            // Large list: virtualize so only visible rows are DOM nodes.
+            //
+            // Horizontal inset and row gap BOTH live on the row wrapper, never on
+            // the scroller — see the same block in `IssueList` for why: Virtuoso's
+            // viewport is absolutely positioned with `width:100%` and no `left`, so
+            // scroller padding-left is respected while the width is measured against
+            // the PADDING box, making every row 32px too wide and pushing its right
+            // edge off screen.
+            <Virtuoso
+              className="absolute inset-0 scrollbar-none"
+              style={{ scrollbarWidth: 'none' }}
+              data={sortedPulls}
+              computeItemKey={(_i, pr) => pr.number}
+              itemContent={(_i, pr) => (
+                <div className="px-4 pb-2">
                   {row(pr, (
                     <button
-                      onClick={() => setSelectedPull(pr.number)}
+                      onClick={() => { setSelectedPull(pr.number); listDetail.openDetail() }}
                       className={cardClass(selectedPull === pr.number)}
                     >
                       {cardInner(pr)}
                     </button>
                   ))}
-                </motion.div>
-              ))}
-            </AnimatePresence>
-          ) : (
-            sortedPulls.map((pr) => (
-              <div key={pr.number}>
-                {row(pr, (
-                  <button
-                    onClick={() => setSelectedPull(pr.number)}
-                    className={cardClass(selectedPull === pr.number)}
-                  >
-                    {cardInner(pr)}
-                  </button>
-                ))}
-              </div>
-            ))
-          )}
-        </div>
+                </div>
+              )}
+            />
+          )
+        )}
         <div className="pointer-events-none absolute bottom-0 left-0 right-0 h-8 bg-gradient-to-t from-bg to-transparent" />
       </div>
 
-      <div className="flex-shrink-0 flex items-center gap-2 px-3 pt-2 pb-4 text-[12px] text-muted">
+      <div className="flex-shrink-0 flex items-center gap-2 px-4 pt-2 pb-4 text-[12px] text-muted">
         <span title={
           prPersonFilterActive
             ? (prSearchTruncatedAt
@@ -331,9 +356,18 @@ export default function PrList({ resizing = false }: { resizing?: boolean }) {
           {i18nT('apps.issueRadar.components.prList.pr', { count: filteredPulls.length })}
           {prSearchTruncatedAt ? '+' : ''}
         </span>
+        {/* Cold-start: these are only the newest page (un-enriched) while the full
+            list loads behind them. Say so, so the count does not read as the whole
+            repo — the PR twin of IssueList's hint. */}
+        {pullsPartial && (
+          <span className="inline-flex items-center gap-1 text-muted opacity-70">
+            <RefreshCw size={11} className="animate-spin" />
+            {i18nT('apps.issueRadar.components.prList.loading_the_rest')}
+          </span>
+        )}
         <span className="ml-auto flex items-center gap-2">
           {lastUpdated && (
-            <span className="tabular-nums" title={i18nT('apps.issueRadar.components.prList.time_since_the_pr_list_was_last_fetched_from_git')}>
+            <span className="tabular-nums" title={i18nT('apps.issueRadar.components.prList.time_since_list_last_fetched_from', { label: terms.changeRequestShort, provider: terms.providerName })}>
               {i18nT('apps.issueRadar.components.prList.updated')} {lastUpdated}
             </span>
           )}

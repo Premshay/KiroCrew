@@ -7,12 +7,38 @@ export interface McNotificationDetail {
 }
 
 /**
+ * Fire the `mc-notification` DOM event for a sound `kind`. Centralizes the
+ * dispatch + defensive try/catch that three websocket call sites (feed, approval,
+ * turn-done) previously duplicated inline, so the `CustomEvent` wiring and its
+ * error handling live in one place. Swallows listener errors (a broken listener
+ * must not break WS handling) and logs once here.
+ */
+export function dispatchMcNotification(kind: string): void {
+  try {
+    const detail: McNotificationDetail = { kind }
+    window.dispatchEvent(new CustomEvent(MC_NOTIFICATION_EVENT, { detail }))
+  } catch (err) {
+    // Last-resort surface for a broken notification listener; no app logger on this DOM-event path.
+    // eslint-disable-next-line no-console
+    console.warn('mc-notification listener error', err)
+  }
+}
+
+/**
  * Sound kind for agent turn completion. Synthesized by the websocket layer on
  * `chat_done` — it never appears in the notification feed (no Redux entry, no
  * toast, no badge); it exists only so useNotificationSound can key a per-category
  * sound for "the agent finished replying".
  */
 export const TURN_DONE_KIND = 'turn' as const
+
+/**
+ * Sound kind for tool-approval prompts. Synthesized by the websocket layer on
+ * `approval` frames — the agent is blocked waiting for a user decision. Uses
+ * a distinct preset from turn-complete so the user can distinguish "needs my
+ * action" from "finished, no action needed" without looking.
+ */
+export const APPROVAL_KIND = 'approval' as const
 
 /**
  * Whether a finished turn warrants a chime. Policy: every real turn

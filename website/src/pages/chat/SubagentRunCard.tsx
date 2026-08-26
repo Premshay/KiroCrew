@@ -17,12 +17,13 @@ import { memo } from 'react'
 import { Bot, Loader2, CheckCircle2, AlertCircle, Clock, Square } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { openActivityToTab, selectSubagent } from '../../store/chatSlice'
+import { openActivityToTab, selectSubagent, switchSlot } from '../../store/chatSlice'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import type { ChatMessage, SubagentActivity } from '../../types'
 import { SPAWN_LAUNCH_MARKER } from './types'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 /** The `spawn_run` tool result opens with "Spawned N subagent(s)." followed by
  *  one indented "  <id> (<agent>): <task>" line per accepted agent (see the
  *  spawn_run handler in mcp_core.py). Matching the header identifies the call
@@ -149,7 +150,9 @@ const SubagentRunCard = memo(function SubagentRunCard({
   launch: SpawnRunLaunch
   slot: string
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const dispatch = useAppDispatch()
+  const activeSlot = useAppSelector(s => s.chat.activeSlot)
   const subagents = useAppSelector(s =>
     slot === s.chat.activeSlot ? s.chat.subagents : s.chat.slotActivity[slot]?.subagents ?? EMPTY_SUBAGENTS,
   )
@@ -183,7 +186,7 @@ const SubagentRunCard = memo(function SubagentRunCard({
   const fullyObservable = launch.ids.length >= total && counts.unknown === 0
 
   const label = counts.running > 0
-    ? `${counts.running} agent${counts.running === 1 ? '' : 's'} running`
+    ? i18nT('pages.chat.subagentRunCard.agent_running', { count: counts.running })
     // `chat.subagentQueued` is keyed by SLOT, not by launch, so the queued
     // branch must sit BELOW settled: otherwise a second wave queueing behind
     // the cap makes this (already finished) card report the other wave's queue.
@@ -194,15 +197,23 @@ const SubagentRunCard = memo(function SubagentRunCard({
       // "1 of 3 agents finished" would pin a permanently false statement in
       // scrollback, since the unobservable members can never be tallied.
       ? settled >= total && fullyObservable
-        ? `${total} agent${total === 1 ? '' : 's'} finished`
-        : `${total} agent${total === 1 ? '' : 's'} launched`
+        ? i18nT('pages.chat.subagentRunCard.agent_finished', { count: total })
+        : i18nT('pages.chat.subagentRunCard.agent_launched', { count: total })
       : queued > 0
         // Whole wave still behind the cap: "0 agents running" is technically
         // true and useless — name what is actually happening.
-        ? `${queued} agent${queued === 1 ? '' : 's'} queued`
-        : `${total} agent${total === 1 ? '' : 's'}`
+        ? i18nT('pages.chat.subagentRunCard.agent_queued', { count: queued })
+        : i18nT('pages.chat.subagentRunCard.agent', { count: total })
 
   const open = () => {
+    // The Subagents panel is mounted for `activeSlot`, and split view
+    // deliberately never moves `activeSlot` with pane focus. Opening from a
+    // background pane therefore has to make THIS card's session active first,
+    // or the panel that opens belongs to a different session and typically
+    // reads "No subagents running" — the card's own label promising otherwise.
+    // Safe inside split view: the auto-enter effect is gated on splitMode being
+    // off, so switching does not reseed or leave the grid.
+    if (slot && slot !== activeSlot) dispatch(switchSlot(slot))
     // Deep-link to the first agent of THIS wave so the panel lands on the
     // transcript the card refers to, not whatever was last selected.
     const first = launch.ids.find(id => subagents[id])
@@ -212,66 +223,69 @@ const SubagentRunCard = memo(function SubagentRunCard({
 
   const idPreview = sanitizeLlmOutput(launch.ids.slice(0, 4).join(' · '))
 
+  // Row geometry -- the px-4 gutter and the --mc-content-width clamp -- belongs to
+  // the HOST row wrapper, never to this card. ChatPage wraps every renderMessage
+  // result, and the shared registries wrap this card through ctx.row. Re-applying
+  // it here nested one clamp inside another and inset the card by a second full
+  // gutter, so it sat 20px right of every sibling row and 40px narrower.
   return (
-    <div className="px-5 mx-auto w-full py-0.5" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-      <button
-        type="button"
-        onClick={open}
-        title={i18nT('pages.chat.subagentRunCard.open_in_the_subagents_panel')}
-        data-testid="subagent-run-card"
-        className="pi-morph group w-full text-left rounded-md bg-accent/10 border border-accent/20 hover:bg-accent/15 hover:border-accent/40 transition-colors px-3 py-2 flex items-start gap-2"
-      >
-        <span className="shrink-0 mt-0.5">
-          {counts.running > 0
-            ? <Loader2 size={15} className="text-accent animate-spin" />
-            : counts.failed > 0
-              ? <AlertCircle size={15} className="text-danger" />
-              : settled > 0
-                ? <CheckCircle2 size={15} className="text-green-500" />
-                : queued > 0
-                  ? <Clock size={15} className="text-muted" />
-                  : <Bot size={15} className="text-accent/70" />}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <Bot size={12} className="text-accent/70 shrink-0" aria-hidden />
-            <span className="truncate text-[13px] font-medium text-text-strong">{label}</span>
-            {queued > 0 && settled === 0 && (
-              <span
-                className="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-muted/15 border border-border text-muted"
-                data-testid="subagent-card-queued"
-                title={i18nT('pages.chat.subagentRunCard.waiting_to_start_queued_behind_the_concurrency_l')}
-              >
-                <Clock size={10} aria-hidden /> {queued} {i18nT('pages.chat.subagentRunCard.waiting')}
-              </span>
-            )}
-            {counts.done > 0 && (
-              <span className="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-ok-subtle border border-ok/20 text-ok">
-                <CheckCircle2 size={10} aria-hidden /> {counts.done}
-              </span>
-            )}
-            {counts.failed > 0 && (
-              <span className="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-danger-subtle border border-danger/20 text-danger">
-                <AlertCircle size={10} aria-hidden /> {counts.failed}
-              </span>
-            )}
-            {counts.stopped > 0 && (
-              <span className="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-muted/15 border border-border text-muted">
-                <Square size={10} aria-hidden /> {counts.stopped}
-              </span>
-            )}
-          </div>
-          <div className="text-[10px] text-muted font-mono truncate mt-0.5">
-            {idPreview ? `${idPreview}${launch.ids.length > 4 ? ` +${launch.ids.length - 4}` : ''} · ` : ''}
-            {i18nT('pages.chat.subagentRunCard.open_subagents_panel')}
-          </div>
+    <button
+      type="button"
+      onClick={open}
+      title={i18nT('pages.chat.subagentRunCard.open_in_the_subagents_panel')}
+      data-testid="subagent-run-card"
+      className="pi-morph group w-full text-left rounded-md bg-accent/10 ring-1 ring-inset forced-colors:border ring-accent/20 hover:bg-accent/15 hover:ring-accent/40 transition px-3 py-2 flex items-start gap-2"
+    >
+      <span className="shrink-0 mt-0.5">
+        {counts.running > 0
+          ? <Loader2 size={15} className="text-accent animate-spin" />
+          : counts.failed > 0
+            ? <AlertCircle size={15} className="text-danger" />
+            : settled > 0
+              ? <CheckCircle2 size={15} className="text-green-500" />
+              : queued > 0
+                ? <Clock size={15} className="text-muted" />
+                : <Bot size={15} className="text-accent/70" />}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 flex-wrap">
+          <Bot size={12} className="text-accent/70 shrink-0" aria-hidden />
+          <span className="truncate text-[13px] leading-5 font-medium text-text-strong">{label}</span>
+          {queued > 0 && settled === 0 && (
+            <span
+              className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-muted/15 border border-border text-muted"
+              data-testid="subagent-card-queued"
+              title={i18nT('pages.chat.subagentRunCard.waiting_to_start_queued_behind_the_concurrency_l')}
+            >
+              <Clock size={10} aria-hidden /> {queued} {i18nT('pages.chat.subagentRunCard.waiting')}
+            </span>
+          )}
+          {counts.done > 0 && (
+            <span className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-ok-subtle border border-ok/20 text-ok">
+              <CheckCircle2 size={10} aria-hidden /> {counts.done}
+            </span>
+          )}
+          {counts.failed > 0 && (
+            <span className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-danger-subtle border border-danger/20 text-danger">
+              <AlertCircle size={10} aria-hidden /> {counts.failed}
+            </span>
+          )}
+          {counts.stopped > 0 && (
+            <span className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-muted/15 border border-border text-muted">
+              <Square size={10} aria-hidden /> {counts.stopped}
+            </span>
+          )}
         </div>
-        <PanelRightSolid
-          size={14}
-          className="text-muted shrink-0 mt-0.5 opacity-60 group-hover:opacity-100 transition-opacity"
-        />
-      </button>
-    </div>
+        <div className="text-[10px] leading-4 text-muted font-mono truncate mt-1">
+          {idPreview ? `${idPreview}${launch.ids.length > 4 ? ` +${launch.ids.length - 4}` : ''} · ` : ''}
+          {i18nT('pages.chat.subagentRunCard.open_subagents_panel')}
+        </div>
+      </div>
+      <PanelRightSolid
+        size={14}
+        className="text-muted shrink-0 mt-0.5 opacity-60 group-hover:opacity-100 transition-opacity"
+      />
+    </button>
   )
 })
 

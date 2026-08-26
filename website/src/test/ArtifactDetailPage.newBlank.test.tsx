@@ -24,6 +24,14 @@ import { markJustCreatedBlank, __resetJustCreatedBlank } from '../lib/blankHando
 import { beginArtifactWrite, __resetArtifactWrites } from '../lib/artifactWrites'
 import type { Artifact } from '../types'
 
+// The sandboxed frame mints its document URL through the api client. The
+// automock resolves every method to `undefined`, which the component cannot
+// await — without this stub the frame throws instead of rendering.
+beforeEach(() => {
+  vi.mocked(api.sandboxDocUrl).mockResolvedValue({ url: '/sandbox-doc/test/tok' })
+})
+
+
 vi.mock('../api/client')
 vi.mock('../pages/ChatPage', () => ({
   default: () => <div data-testid="chat-page" />,
@@ -191,7 +199,9 @@ describe('ArtifactDetailPage — a freshly created blank document', () => {
       fireEvent.keyDown(input, { key: 'Enter' })
     }],
     ['picked a type', async () => {
-      fireEvent.change(screen.getByLabelText('Document type'), { target: { value: 'text' } })
+      // SimpleSelect wraps a Radix Select: open the trigger, then click the row.
+      fireEvent.click(screen.getByLabelText('Document type'))
+      fireEvent.click(await screen.findByRole('option', { name: 'text' }))
     }],
     ['tagged it', async () => {
       fireEvent.click(screen.getByRole('button', { name: /Add a tag/i }))
@@ -366,9 +376,10 @@ describe('ArtifactDetailPage — a freshly created blank document', () => {
     // Markdown and text accept the same bytes, so this cannot be auto-detected:
     // "# Notes" is a heading in one and a literal hash in the other.
     renderPage({ blank: false })
-    const select = await screen.findByLabelText('Document type')
-    expect((select as HTMLSelectElement).value).toBe('markdown')
-    fireEvent.change(select, { target: { value: 'text' } })
+    const trigger = await screen.findByLabelText('Document type')
+    expect(trigger).toHaveTextContent('markdown')
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole('option', { name: 'text' }))
     await waitFor(() => {
       expect(vi.mocked(api).updateArtifact).toHaveBeenCalledWith('untitled', { kind: 'text' })
     })
@@ -376,8 +387,10 @@ describe('ArtifactDetailPage — a freshly created blank document', () => {
 
   it('offers only the types that keep an editor', async () => {
     renderPage({ blank: false })
-    const select = await screen.findByLabelText('Document type')
-    const offered = Array.from(select.querySelectorAll('option')).map(o => o.getAttribute('value'))
+    // The rows exist only while the popup is open, and Radix rows carry no value
+    // attribute — the visible label is the option value here either way.
+    fireEvent.click(await screen.findByLabelText('Document type'))
+    const offered = (await screen.findAllByRole('option')).map(o => o.textContent?.trim())
     expect(offered).toEqual(['markdown', 'text', 'json', 'svg'])
     // widget / html render in a sandboxed iframe with no editor.
     expect(offered).not.toContain('widget')

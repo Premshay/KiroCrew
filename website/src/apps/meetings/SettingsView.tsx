@@ -10,6 +10,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, ArrowRight, CalendarClock, ListChecks, Plus, Trash2 } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
+import SimpleSelect from '../../components/SimpleSelect'
 import {
   Badge,
   Btn,
@@ -18,7 +19,6 @@ import {
   EmptyState,
   Input,
   PageHeader,
-  Select,
   SendBtn,
   Toggle,
 } from '../../components/ui'
@@ -29,6 +29,7 @@ import {
   type ConfigResponse,
   type MeetingsConfig,
 } from './api'
+import { useImeGuard } from '../../hooks/useImeGuard'
 
 interface Props {
   onBack: () => void
@@ -36,8 +37,12 @@ interface Props {
 }
 
 export default function SettingsView({ onBack, notify }: Props) {
+  const ime = useImeGuard()
   const queryClient = useQueryClient()
-  const configQuery = useQuery({ queryKey: ['meetings', 'config'], queryFn: meetingsApi.config })
+  // `patch()` builds a full-replace PUT from this cache, so a backgrounded tab
+  // with stale cache would silently revert settings changed from another tab.
+  // Finite staleTime lets focus-refetch fire here (global default is Infinity).
+  const configQuery = useQuery({ queryKey: ['meetings', 'config'], queryFn: meetingsApi.config, staleTime: 30_000 })
   const dictionaryQuery = useQuery({
     queryKey: ['meetings', 'dictionary'],
     queryFn: meetingsApi.dictionary,
@@ -164,7 +169,7 @@ export default function SettingsView({ onBack, notify }: Props) {
           </Btn>
         }
       />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         <Card>
           <CardTitle>
             <ListChecks className="lucide-inline" />
@@ -173,17 +178,14 @@ export default function SettingsView({ onBack, notify }: Props) {
           <p className="text-[13px] text-muted mb-3">
             {i18nT('apps.meetings.settings.taskProviderHelp')}
           </p>
-          <Select
+          <SimpleSelect
+            options={taskProviders.map(row => row.id)}
+            optionLabels={taskProviders.map(row => row.label)}
             value={config?.task_provider ?? ''}
             aria-label={i18nT('apps.meetings.settings.taskProviderTitle')}
-            onChange={e => patch({ task_provider: e.target.value })}
-          >
-            {taskProviders.map(row => (
-              <option key={row.id} value={row.id}>
-                {row.label}
-              </option>
-            ))}
-          </Select>
+            onChange={value => patch({ task_provider: value })}
+            style={{ maxWidth: 280 }}
+          />
         </Card>
 
         <Card>
@@ -195,24 +197,21 @@ export default function SettingsView({ onBack, notify }: Props) {
             {i18nT('apps.meetings.settings.calendarHelp')}
           </p>
           <div className="flex items-center gap-2 flex-wrap">
-            <Select
+            <SimpleSelect
+              options={calendarProviders.map(row => row.id)}
+              optionLabels={calendarProviders.map(row => row.label)}
               value={config?.calendar.provider ?? ''}
               aria-label={i18nT('apps.meetings.settings.calendarProviderLabel')}
-              onChange={e =>
+              onChange={value =>
                 patch(latest => ({
                   // Function form for the same reason as `updateAgent`: `calendar` is
                   // a nested object, so the field we are NOT changing has to come
                   // from the latest config rather than the render snapshot.
-                  calendar: { ...latest.calendar, provider: e.target.value },
+                  calendar: { ...latest.calendar, provider: value },
                 }))
               }
-            >
-              {calendarProviders.map(row => (
-                <option key={row.id} value={row.id}>
-                  {row.label}
-                </option>
-              ))}
-            </Select>
+              style={{ minWidth: 180 }}
+            />
             {activeCalendar?.requires_source && (
               <>
                 <Input
@@ -320,9 +319,7 @@ export default function SettingsView({ onBack, notify }: Props) {
               className="w-48"
               placeholder={i18nT('apps.meetings.settings.correctPlaceholder')}
               aria-label={i18nT('apps.meetings.settings.correctLabel')}
-              onKeyDown={e => {
-                if (e.key === 'Enter') submitTerm()
-              }}
+              {...ime.bindEnter({ onEnter: submitTerm })}
             />
             <SendBtn onClick={submitTerm} aria-label={i18nT('apps.meetings.settings.addTerm')}>
               <Plus className="lucide-inline" />

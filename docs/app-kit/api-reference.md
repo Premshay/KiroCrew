@@ -45,6 +45,196 @@ paths your `app.json` declares. The host injects auth automatically.
 
 For the full hook list see [getting-started.md](getting-started.md#app-sdk-hooks).
 
+## Chat Marker Protocol
+
+An agent encodes UI affordances inline in the prose it streams. A surface that renders a transcript
+has to interpret them, because the backend deliberately leaves the complete marker in the stream for
+a frontend consumer to extract:
+
+| Marker | Meaning |
+|---|---|
+| `[OPTIONS: a \| b]` | follow-up choices, several may be picked |
+| `[OPTION: a \| b]` | follow-up choices, one only |
+| `[STEERING steer-<id>: …]` | the agent acknowledging a mid-turn steer |
+
+Two failure modes matter, and both are the consumer's responsibility. Render the text unparsed and
+the user reads machine syntax. Strip the marker without offering the choices and the user's options
+are **deleted** — worse than leaving them visible, because the text is gone too.
+
+The parsers live in one React-free module so every surface reads the protocol from the same place:
+
+```
+website/src/app-sdk/protocol/
+  optionMarker.ts   the marker pattern (in-tree only) + stripPartialOptionMarker
+  options.ts        parseOptions, deriveFollowUpOptions
+  steering.ts       extractSteeringAcks
+```
+
+### Using it from an app
+
+Apps resolve `@kirocrew/app-sdk` through the host import map, the same way they get the hooks:
+
+```tsx
+import { parseOptions, extractSteeringAcks, deriveFollowUpOptions } from '@kirocrew/app-sdk'
+import type { ChatMessage, ParsedOptions } from '@kirocrew/app-sdk'
+
+function AgentTurn({ message }: { message: ChatMessage }) {
+  // Strip the steer acknowledgement first, then the option marker: the text you render is
+  // whatever is left, and the pieces you pulled out become your own affordances.
+  const { cleaned, acks } = extractSteeringAcks(message.content ?? '')
+  const { text, options, multi }: ParsedOptions = parseOptions(cleaned)
+
+  return (
+    <>
+      <p>{text}</p>
+      {acks.map(a => <SteeredChip key={a} summary={a} />)}
+      {options.length > 0 && <MyChoiceButtons options={options} multi={multi} />}
+    </>
+  )
+}
+```
+
+To decide whether choices still apply to the *conversation* rather than to one message, use
+`deriveFollowUpOptions(messages, isStreaming)`. It walks back to the most recent real assistant turn
+and returns none while streaming, after a user reply, or after a queued send — so stale buttons do
+not linger:
+
+```tsx
+const { followUpOptions } = deriveFollowUpOptions(messages, running)
+```
+
+The module imports no React and no dashboard component, so it is also usable from a worker, a test,
+or a non-React renderer.
+
+### Using it from a core dashboard page
+
+A page inside `website/src/` imports the same barrel by relative path — there is no second
+implementation and no dashboard-only variant:
+
+```tsx
+import { parseOptions, stripPartialOptionMarker } from '../../app-sdk/protocol'
+```
+
+`stripPartialOptionMarker` exists for the streaming case: mid-stream the text can end with a
+half-arrived `[OPTIONS: …` that the full-marker regex cannot match yet, and showing it would let raw
+syntax type itself out in front of the user. Apply it to the parsed text while a turn is streaming.
+
+The regex itself is **not** part of the app surface. It carries the global-flag `lastIndex` state, so
+handing it out lets an app's `.test()` call make this module's own scan start mid-string and miss the
+marker — the exact failure the module exists to prevent. Apps get functions; the pattern stays in-tree.
+
+### Exports
+
+| Export | Kind | Purpose |
+|---|---|---|
+| `parseOptions(content)` | function | split prose from choices; returns `ParsedOptions` |
+| `deriveFollowUpOptions(messages, isStreaming)` | function | the choices that still apply to the conversation |
+| `extractSteeringAcks(content)` | function | pull `[STEERING …]` out, returning `{ cleaned, acks }` |
+| `stripPartialOptionMarker(text)` | function | hide a half-streamed marker |
+| `ParsedOptions` | type | `{ text, options, multi, isPlan }` |
+| `FollowUpDerivation` | type | `{ followUpOptions, followUpIsPlan }` |
+| `ChatMessage` | type | the message shape `deriveFollowUpOptions` consumes |
+
+The module must stay free of React and of anything under `pages/` or `components/`: a parser that
+lives in a component is only available to surfaces that render that component, which is what made a
+transcript print raw marker text. `website/src/test/chatProtocolBoundary.test.ts` asserts that, and
+also that no other non-test source defines the markers a second time.
+
+## Chat Transcript Rendering
+
+`ChatMessageList` renders a transcript. Which component draws a given row is a **registry** keyed by
+the message's `role`, so you add a row type or replace one instead of forking the list.
+
+```jsx
+import { ChatMessageList } from '@kirocrew/app-sdk'
+
+<ChatMessageList messages={messages} running={running} />
+```
+
+That renders the built-in rows. To change one, pass `renderers`.
+
+### Adding a row the transcript does not draw
+
+Four roles are deliberately undrawn — `thinking`, `system`, `done` and `queued` — because the
+dashboard shows them through other affordances. `file` is undrawn too. Claim one and it is yours:
+
+```jsx
+const renderers = [{
+  id: 'queued-card',
+  roles: ['queued'],
+  render: (m, ctx) => ctx.row(<div className="queued">{m.content}</div>),
+}]
+
+<ChatMessageList messages={messages} running={running} renderers={renderers} />
+```
+
+### Limitation: two roles are grouped before your entry is consulted
+
+`thinking` and `permission` (exported as `GROUPED_ROLES`, a frozen array) are assembled into one
+collapsible "worked through N steps" group **before** rows are resolved. An entry claiming either is
+still consulted, but it renders **inside** that group, and the group keeps its own summary and
+approval affordance — so you cannot yet use the registry to replace the built-in approval UI with
+your own. Substituting the group itself is not an extension point today — tracked in #2940.
+
+### Replacing a built-in row
+
+Reuse the built-in's `id`:
+
+```jsx
+const renderers = [{
+  id: 'error',                       // replaces the built-in error row
+  roles: ['error'],
+  render: (m, ctx) => ctx.row(<MyErrorCard text={m.content} />),
+}]
+```
+
+Import `defaultMessageRenderers` if you need to read what the built-ins do, and `resolveRenderer` /
+`mergeRenderers` if you are composing a registry yourself rather than handing one to
+`ChatMessageList`.
+
+### What a renderer is handed
+
+| Field | Purpose |
+|---|---|
+| `index`, `messages` | position and the whole transcript, for a row that must look ahead |
+| `running` | whether the session is producing output |
+| `key` | the row's stable React key |
+| `wrapper(children, isUser)` | bubble layout; `isUser` right-aligns |
+| `row(children, tight)` | full-width layout for cards, pills and banners |
+| `onFileOpen` | open a path, when the host supports it |
+| `autoDeniedIds` | tool calls a policy or hook blocked |
+| `renderTool` | the host's tool row, if it passed one |
+
+Two rules the registry relies on:
+
+- **Shape beats role.** Resolution is first-match, and your entries sit between the two built-ins
+  recognised by message *shape* — a stop event and a sub-agent completion, which claim `'*'` and gate
+  on a `match` predicate — and the role-keyed ones. This matters because a stop event reaches the
+  transcript as role `system`, which is also a role you are invited to claim: were a role claim
+  allowed to outrank a `kind` check, claiming `system` would swallow the stop card and pressing Stop
+  would draw your row instead. A role claim cannot know about `kind`, so it does not outrank one.
+  Replacing a shape-matched row is still possible and stays explicit — reuse its `id`.
+- **Returning `null` is different from not claiming a role.** An entry that exists and draws nothing
+  says "no row by design"; no entry at all says "nothing handles this". Both look identical on
+  screen, so `website/src/test/messageRenderers.test.ts` pins which is which.
+
+### Exports
+
+| Export | Kind | Purpose |
+|---|---|---|
+| `ChatMessageList` | component | the transcript |
+| `defaultMessageRenderers` | value | the built-in registry, in resolution order |
+| `mergeRenderers(extra)` | function | shape-matched defaults, then host entries, then the rest |
+| `resolveRenderer(message, renderers)` | function | first entry that claims the message |
+| `ToolCallPill` | component | the store-free tool row the default registry uses |
+| `GROUPED_ROLES` | value | frozen array of the roles grouped before per-row resolution (see the limitation above) |
+| `MessageRenderer` | type | `{ id, roles, match?, render }` |
+| `MessageRenderContext` | type | what `render` is handed |
+
+The registry takes no store and no router dependency, and reads live state only through the context
+it is handed — an app runs outside the dashboard's React root and has no store to select from. A row
+that genuinely needs live app state is supplied by the host as an entry.
+
 ## Gateway API Surface
 
 The sections below document the canonical Gateway API surface as exposed by the
@@ -123,6 +313,100 @@ WebSocket event types: `chat_chunk`, `chat_done`, `chat_message`, `chat_error`,
 | `removeCron(id)` | `Promise<void>` | Delete a cron job |
 | `pauseCron(id)` | `Promise<void>` | Pause without deleting |
 | `resumeCron(id)` | `Promise<void>` | Resume a paused job |
+
+#### Watching something without paying for a model call (`kiro_crew.irq`)
+
+> **Provisional surface.** `kiro_crew.irq` has exactly one probe today
+> (`pr_watch`). The ~15 sibling pollers this abstraction was derived from
+> cannot migrate onto it yet, so a second real consumer has not yet tested the
+> contract. Treat the shapes below as subject to change until one has: build on
+> them, but expect `Observation` / `Tick` to gain fields, and pin the Kiro Crew
+> version your app was tested against.
+
+An app that needs to keep an eye on an external thing — a deploy, a ticket, a
+queue depth — should not schedule an **agent** cron to go look. That spends a
+full model turn per check, and on a quiet subject every one of those turns says
+"nothing changed".
+
+Schedule a **script** cron instead and build it on `kiro_crew.irq`, the
+interrupt controller. The script runs in a subprocess with no model call at
+all; a quiet tick is free. Only an unexpected observation raises a wake, and the
+wake is delivered into the session that armed the cron as a real agent turn.
+Full design: `docs/system-specs/features/agent-interrupt-controller.md`.
+
+You write the two things that are your domain knowledge — what to poll, and
+what counts as an anomaly — and the module owns masking (so one condition wakes
+once), coalescing (so several anomalies arrive as one wake), epoch resets (so a
+re-triggered subject forgets stale alerts), atomic per-watch state, and a
+consecutive-error backstop (so a broken probe says so instead of skipping
+quietly forever). Those are the four things a hand-rolled poller gets wrong,
+and each failure looks like success.
+
+```python
+import json
+
+from kiro_crew.irq import Observation, Probe, Severity, Tick, run
+
+
+class DeployProbe(Probe):
+    def identity(self, ctx):
+        """Return (subject_kind, subject_id); raise ValueError to self-remove."""
+        self.env = (json.loads(ctx.message or "{}") or {}).get("env") or ""
+        if not self.env:
+            raise ValueError('needs {"env": "..."}')
+        return ("deploy", self.env)
+
+    def observe(self, ctx):
+        """One bounded call per tick. Never raise Skip/Report/Done."""
+        status = read_deploy_status(self.env)
+        if status is None:
+            return Tick(fetch_ok=False)          # the kernel owns the backstop
+        if status.finished:
+            return Tick(epoch=status.id, observations=[
+                Observation("done", Severity.TERMINAL, f"{self.env} deployed."),
+            ])
+        obs = []
+        if status.rolled_back:
+            # Nothing improves by waiting -> NMI bypasses coalescing.
+            obs.append(Observation("rollback", Severity.NMI,
+                                   f"{self.env} rolled back."))
+        for stage in status.failed_stages:
+            obs.append(Observation(f"stage:{stage}", Severity.WAKE,
+                                   f"{self.env}: stage {stage} failed."))
+        return Tick(epoch=status.id, observations=obs,
+                    pending=status.running_stages)
+
+
+def watch(ctx):                                   # cron entry point
+    run(ctx, DeployProbe())
+```
+
+Register it with `addCron(name, { script: "<crons dir>/your_probe.py:watch",
+every: 300, timeout: 120, message: JSON.stringify({ env: "prod" }) })`. Cron
+scripts must live under the config directory's `crons/`, and the cron must be
+armed **from the session that should receive the wake** — the cron system
+captures the calling session at creation time.
+
+Rules:
+
+- **Never raise `Skip` / `Report` / `Done`.** Return data; the kernel decides.
+  It is the only place a verdict is raised.
+- A failed observation returns `Tick(fetch_ok=False)`, never an empty `Tick` —
+  an empty tick reads as "nothing is wrong".
+- Use `Severity.NMI` only for what genuinely cannot improve by waiting. Using
+  it to mean "important" defeats coalescing.
+- Supply an `epoch` when the subject has an identity token. Without one there
+  are no resets, so a re-triggered subject inherits the previous run's masks.
+- Filter out conditions the operator already knows about (a check red on the
+  base branch, a known-degraded dependency) in your own `observe()` — do not
+  return them. An earlier revision carried an `expected=True` flag for this; it
+  was removed because nothing read the state it recorded.
+- Keep `observe()` to one bounded call. This half must stay fast and cheap.
+- `coalesce_secs=0` turns coalescing off — pass it to `run()`, or return it from
+  your probe's `tuning()` when it should come from the cron message. Do that when
+  you would rather be woken early than woken once: coalescing costs at least one
+  cron interval of latency, because a window cannot open and fire within the
+  same tick.
 
 ### Lessons
 
@@ -217,6 +501,26 @@ Silent background context for LLM — content appears in the next user-initiated
 | `pendingContextCount` | `number` | Number of buffered context entries |
 
 Options: `{ source?: string, ephemeral?: boolean, maxAge?: number }`
+
+**Constraints** (400 on violation):
+- `source`: ≤64 chars, no control characters or newlines; whitespace-trimmed (a padded label and its bare form share one per-source cap bucket)
+- `maxAge`: must be a finite positive number (rejects boolean, NaN, Infinity, ≤0); omit or pass null for no expiry
+- `content`: must be a non-empty string, ≤40,000 chars
+
+**Ownership** (404 on refusal; applies to app callers — a dashboard caller is unrestricted):
+- An app may only target a slot it owns, and a slot carrying no app scope is refused as well.
+- Owning the slot is not sufficient: an app is refused when the slot's session is linked elsewhere — a cron result or workflow injection holding that binding — because both writes land in the linked session, so slot ownership alone would otherwise reach a conversation the app has no claim on.
+- Every refusal returns the same body as a genuinely missing slot, so no response an unauthorized caller can reach distinguishes "not yours" from "does not exist". The specific reason is recorded in the security-event log instead.
+
+### Notes
+
+`POST /api/chat/slots/{slot}/note` drops a short declarative line into a chat that is both visible in the transcript immediately and known to the agent on the user's next message — without firing an LLM turn. Context injection alone is silent; a transcript append alone is invisible to the model, because a live provider forwards only the new user message. The note endpoint does both writes against one slot.
+
+Body: `{ content, source?, maxAge?, ephemeral? }`. A note always does both writes -- there is no visible-only or context-only mode. The visible line is appended as `role: "inject"` with `cls: "reconcile-note"`, and its content is redacted (credentials, exfiltration URLs) before it reaches the transcript. `maxAge` defaults to 24h for the context half when the key is omitted, so a note nobody follows up on expires instead of attaching to an unrelated message later. An explicit null means no expiry, the same as it does on `/context` — the two endpoints share the field and do not give it opposite meanings. The same `source`/`maxAge`/`content` constraints above apply.
+
+Returns `{ ok, appended, visibleDeferred, deliveryConditional, contextSkipped, pending }`. When the source's per-source context cap is full the request is **not** rejected: the visible line is still written and `contextSkipped` is true, because the cap protects the context queue rather than the transcript. If a turn is already running the note is held until that turn ends -- `appended` is false and `visibleDeferred` is true -- so that it lands on the next turn rather than the one it was written during. Ordering is preserved, and `deliveryConditional` is true whenever a note is held -- because a hold is delivered only if the slot still routes to the SAME session when the turn ends. An unbound slot can acquire a foreign binding while the note waits (a cron result or workflow injection claims an empty `linked_session_key` with no running gate), and both the transcript path and the next turn's session resolve that binding at flush time rather than at the POST. When that happens BOTH halves of the note are dropped rather than retargeted, because writing them would surface content authorized for one conversation inside another; the drop is recorded in the security-event log. So a 200 with `visibleDeferred: true` promises ordering against the running turn, not that the note will certainly be written. `pending` counts held entries as well as queued ones.
+
+**A 200 means "accepted for this gateway lifetime", not durable delivery.** Both halves of a note live in memory only -- the held visible line and the queued context, the latter exactly as `/context`'s queue has always behaved -- so a gateway restart between the acknowledgement and the next turn drops them. A caller that needs a note to survive a restart must re-post it; `visibleDeferred: true` promises ordering against the running turn, not persistence.
 
 ### Proxy Authentication (Server-side)
 

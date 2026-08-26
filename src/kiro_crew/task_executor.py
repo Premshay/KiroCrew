@@ -18,6 +18,7 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, fire_tool_hooks, get_global_hook_store
 from kiro_crew.llm_helpers import provider_last_turn_usage, stream_and_collect_json
+from kiro_crew.messaging.link import telemetry_channel_of
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -334,6 +335,7 @@ async def execute_task(
                     is_new,
                     session_key,
                     agent=agent or None,
+                    project=str(work_dir) if work_dir else None,
                     provider_type=KiroCrewConfig.load().agent.provider,
                 )
             else:
@@ -551,7 +553,7 @@ async def execute_task(
                     "",
                     _complete_event,
                     provider=_usage_cfg.agent.provider,
-                    surface="task_runner",
+                    surface=telemetry_channel_of(session_key),
                     agent=read_effective_agent(client) or agent or "",
                     context_used=_used,
                     context_window=_window,
@@ -559,7 +561,7 @@ async def execute_task(
                     model_source=client,
                 )
             except Exception:
-                logger.debug("usage row (task_runner) persist failed", exc_info=True)
+                logger.debug("usage row (taskrunner) persist failed", exc_info=True)
 
         except AcpProcessDied:
             recoveries += 1
@@ -607,7 +609,7 @@ async def execute_task(
             )
             try:
                 await client.compact()
-                compact_result = await client.wait_for_compaction(timeout=120)
+                compact_result = await client.wait_for_compaction()
                 if compact_result.get("type") == "completed":
                     logger.info("Task %d: compaction succeeded", task.index)
                 else:
@@ -795,20 +797,21 @@ async def build_task_prompt(run: Project, task: Task, attempt: int, work_dir: Pa
 
 
 async def check_context(session_key: str, sessions: "SessionManager") -> None:
-    """Compact the session if context usage is high."""
+    """Compact the session if context usage is high.
+
+    Routed through :meth:`SessionManager.compact_if_needed` — the same shared
+    path gateway compaction uses — so the task runner inherits concurrent-
+    trigger dedup, the failure/ineffective cooldown, turn-semaphore exclusion,
+    the still-critical post-compaction reset, and skills-index reinjection,
+    instead of bypassing them all with a direct ``provider.compact()``
+    (#4686). A ``"busy"`` decline (a turn holds the semaphore) is final for
+    this check: never fall back to a direct compact — the next check retries
+    once the turn drains.
+    """
     try:
-        async with sessions._lock:
-            sess = sessions._sessions.get(session_key)
-        if not sess:
-            return
-        pct = sess.provider.context_usage_pct()
-        if pct >= sessions._cfg.session.autocompact_pct:
-            logger.info("TaskRunner: context at %.0f%%, compacting", pct)
-            await sess.provider.compact()
-            new_pct = sess.provider.context_usage_pct()
-            if new_pct >= 95:
-                logger.warning("TaskRunner: still at %.0f%% after compact, resetting", new_pct)
-                await sessions.reset(session_key)
+        outcome = await sessions.compact_if_needed(session_key)
+        if outcome not in ("absent", "below_threshold"):
+            logger.info("TaskRunner: context check for %s — %s", session_key, outcome)
     except Exception:
         logger.debug("Context check failed", exc_info=True)
 
@@ -887,7 +890,7 @@ async def self_review(
                 "",
                 provider_last_turn_usage(client),
                 provider=_rv_cfg.agent.provider,
-                surface="task_runner",
+                surface=telemetry_channel_of(review_key),
                 agent=read_effective_agent(client) or agent or "",
                 context_used=_used,
                 context_window=_window,

@@ -1,29 +1,20 @@
-"""CLI setup subcommand — interactive credential and config wizard."""
+"""CLI setup subcommand — interactive config wizard (channel credentials are opt-in)."""
 
 from __future__ import annotations
 
 import json
 import os
 import platform
-import re
 import shutil
 import socket
 import subprocess
 import sys
-from importlib.resources import files as _pkg_files
 from pathlib import Path
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-from kiro_crew import platform_compat
+from kiro_crew import platform_compat, slack_manifest
 from kiro_crew.acp.client import KIRO_CLI_BIN
-from kiro_crew.browser.setup import (
-    ensure_playwright_installed,
-    generate_playwright_config,
-    is_playwright_installed,
-    refresh_storage_state,
-    register_playwright_proxy,
-)
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cli_chat import _ensure_default_agent_in_config
 from kiro_crew.conductor_skill import generate_conductor_skill
 from kiro_crew.config import KiroCrewConfig
@@ -39,8 +30,9 @@ from kiro_crew.config.loader import (
     env_path,
     write_config_atomically,
 )
-from kiro_crew.constants import DATA_WARNING
+from kiro_crew.constants import DATA_WARNING, MIN_NODE_MAJOR
 from kiro_crew.sandbox import unavailable_kind
+from kiro_crew.secrets.migrate import _env_lock_path
 from kiro_crew.sel import sel
 from kiro_crew.skills import SkillsLoader
 
@@ -69,26 +61,21 @@ def _manifest(alias: str | None = None, output: str | None = None, url: bool = F
     """Render slack-manifest.yaml with the user's alias substituted."""
 
     alias = alias or _get_alias()
-    if not re.fullmatch(r"[a-zA-Z0-9_-]+", alias):
+    if not slack_manifest.valid_alias(alias):
         print(
-            "❌ Invalid alias — must be alphanumeric, hyphens, or underscores only.",
+            "❌ Invalid alias — must be alphanumeric, hyphens, or underscores only, "
+            f"at most {slack_manifest.ALIAS_MAX} characters.",
             file=sys.stderr,
         )
         sys.exit(1)
     try:
-        template_text = (
-            _pkg_files("kiro_crew").joinpath("slack-manifest.yaml").read_text(encoding="utf-8")
-        )
+        rendered = slack_manifest.render(alias)
     except FileNotFoundError:
         print("❌ Cannot find slack-manifest.yaml", file=sys.stderr)
         sys.exit(1)
-    rendered = template_text.replace("{{ALIAS}}", alias)
     if url:
-        # Strip comment lines to shorten the URL
-        lines = [ln for ln in rendered.splitlines() if not ln.lstrip().startswith("#")]
-        encoded = quote("\n".join(lines).strip() + "\n", safe="")
         print("\n🔗 Click to create your Slack app:\n")
-        print(f"https://api.slack.com/apps?new_app=1&manifest_yaml={encoded}\n")
+        print(f"{slack_manifest.deep_link(alias)}\n")
     elif output:
         out = Path(output)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +140,7 @@ def _ensure_prerequisites() -> bool:
     # npm packages, e.g. the Playwright browser MCP).
     if not shutil.which("node"):
         _header()
-        print("  ⚠️  node not found on PATH — install Node.js >= 16 from https://nodejs.org\n")
+        print(f"  ⚠️  node not found on PATH — install Node.js >= {MIN_NODE_MAJOR} from https://nodejs.org\n")
 
     # kiro-cli is the agent backend. Note its absence so the user can install it.
     if not shutil.which(KIRO_CLI_BIN):
@@ -254,8 +241,38 @@ def _setup_electron() -> None:
     print("     Launch via Spotlight (⌘+Space → KiroCrew) or Finder → ~/Applications")
 
 
-def _setup(agent_only: bool = False, electron_only: bool = False, clean: bool = False) -> None:
+def _setup(
+    agent_only: bool = False,
+    electron_only: bool = False,
+    clean: bool = False,
+    slack: bool = False,
+    whatsapp: bool = False,
+) -> None:
     """Install agent config and optionally configure credentials."""
+    try:
+        _setup_impl(
+            agent_only=agent_only,
+            electron_only=electron_only,
+            clean=clean,
+            slack=slack,
+            whatsapp=whatsapp,
+        )
+    except _SetupAborted as exc:
+        # A closed/piped stdin mid-wizard. One clean line instead of a stack
+        # trace at whichever prompt hit it first — every guarded prompt raises,
+        # so the exit point is deterministic. Bare `input()` calls still exist
+        # in some steps and traceback the old way; converting them all is a
+        # sweep for its own change.
+        print(f"\n⏭  Setup aborted: {exc}. Re-run interactively to finish.")
+
+
+def _setup_impl(
+    agent_only: bool = False,
+    electron_only: bool = False,
+    clean: bool = False,
+    slack: bool = False,
+    whatsapp: bool = False,
+) -> None:
     from kiro_crew.agent import install_agent  # circular import: agent imports cli
     from kiro_crew.cli import _project_dir_file  # circular import: cli -> cli_setup -> cli
 
@@ -293,7 +310,11 @@ def _setup(agent_only: bool = False, electron_only: bool = False, clean: bool = 
     from kiro_crew.agent import ensure_kirocrew_on_path
     from kiro_crew.mcp_cleanup import clean_stale_managed_mcp
 
-    shim = ensure_kirocrew_on_path()
+    # `claim_existing`: this is the explicit setup path, so the user has named
+    # THIS install as the one they want `kirocrew` to mean. Gateway startup
+    # deliberately does not, so a background start never takes the command away
+    # from a working install (see ensure_kirocrew_on_path).
+    shim = ensure_kirocrew_on_path(claim_existing=True)
     if shim:
         print(f"  ✅ Linked kirocrew on PATH: {shim}")
     removed_mcp = clean_stale_managed_mcp()
@@ -323,14 +344,40 @@ def _setup(agent_only: bool = False, electron_only: bool = False, clean: bool = 
     _setup_sandbox_consent()
 
     if agent_only:
+        # --agent-only returns before the channel steps below, so an explicit
+        # channel flag has nothing to act on. Say so instead of dropping it
+        # silently, and name each flag the caller actually passed.
+        requested = (("--slack", slack), ("--whatsapp", whatsapp))
+        for flag in [name for name, on in requested if on]:
+            print(
+                f"\n  ⚠️  {flag} is ignored with --agent-only. Run "
+                f"'kirocrew setup {flag}' for its guided setup."
+            )
         print("\n👻 Done! Try: kirocrew gateway")
         return
 
-    # 3. Slack credentials
-    _setup_slack_tokens()
+    # 3. Messaging channels (optional, configured after setup by default).
+    #    Channel prompts run only on explicit opt-in (`kirocrew setup --slack`,
+    #    `kirocrew setup --whatsapp`); the dashboard and CLI need no channel
+    #    credentials, and every channel (Slack, Discord, Telegram, Teams, Webex,
+    #    WeCom, WeChat, WhatsApp, iMessage) can be connected later from the
+    #    dashboard or its setup guide.
+    if slack or whatsapp:
+        if slack:
+            _setup_slack_tokens()
 
-    # 3b. Slash command name
-    _setup_slash_command()
+            # 3b. Slash command name (Slack-only concept)
+            _setup_slash_command()
+        if whatsapp:
+            _setup_whatsapp()
+    else:
+        print("── Messaging Channels ──\n")
+        print("  The dashboard works without any messaging credentials.")
+        print("  Connect Slack, Discord, Telegram, Teams, Webex, WeCom, WeChat,")
+        print("  WhatsApp, or iMessage (macOS only)")
+        print("  later from the dashboard (Settings → Channels) or run")
+        print("  'kirocrew setup --slack' or 'kirocrew setup --whatsapp' for a")
+        print("  guided setup.\n")
 
     # 4. Timezone
     _setup_timezone()
@@ -339,35 +386,6 @@ def _setup(agent_only: bool = False, electron_only: bool = False, clean: bool = 
     _maybe_setup_dashboard_url()
 
     _maybe_setup_custom_domain()
-
-    # ── Browser (Playwright MCP) ──
-    print("\n── Browser (Playwright MCP) ──")
-
-    if is_playwright_installed():
-        print("  Playwright MCP already installed")
-    else:
-        print("  Installing Playwright MCP...")
-        try:
-            ensure_playwright_installed()
-            print("  Playwright MCP installed")
-        except Exception as exc:
-            print(f"  Playwright install failed: {exc}")
-            print("  Browser features will be unavailable until Playwright is installed")
-
-    # Always regenerate config and register proxy in mcp.json (preserve extension mode)
-    try:
-        generate_playwright_config()
-        refresh_storage_state()
-        # register_playwright_proxy owns the shared mcp.json lock, the
-        # user-entry guard, and the create-when-absent path — the patch
-        # primitives have none of those.
-        _, status = register_playwright_proxy()
-        if status == "kept-user-entry":
-            print("  Kept your existing playwright-mcp entry in mcp.json (left untouched)")
-        else:
-            print("  Browser proxy registered in mcp.json")
-    except Exception:
-        pass  # Non-fatal: browser still works without pre-loaded cookies
 
     # 6. Desktop app (macOS only)
     if platform.system() == "Darwin":
@@ -436,7 +454,10 @@ def _setup_workspace_dir() -> None:
     print("── Workspace Directory ──\n")
     print("  LLM sessions and task output are stored in a workspace directory.")
     print(f"  {label}: {default}\n")
-    answer = input(f"  Workspace path [{default}]: ").strip()
+    # EOF (piped / closed stdin) keeps the default rather than raising a
+    # traceback out of the wizard — this step runs FIRST, so a bare input() here
+    # made `kirocrew setup < /dev/null` fail before any later guard could help.
+    answer = _input_or_skip(f"  Workspace path [{default}]: ") or ""
     chosen = default if answer.lower() in ("", "y", "yes") else Path(answer).expanduser()
     try:
         chosen.mkdir(parents=True, exist_ok=True)
@@ -485,17 +506,141 @@ def _setup_slack_tokens() -> None:
         print("  ⚠️  Missing tokens — Slack integration will be disabled.\n")
         return
 
-    # Preserve any extra keys already in .env
-    existing[CRED_SLACK_APP_TOKEN] = app_token
-    existing[CRED_SLACK_BOT_TOKEN] = bot_token
-    if owner_id:
-        existing[CRED_OWNER_ID] = owner_id
-
+    # Serialize the read-modify-write against every OTHER .env writer (the
+    # `kirocrew secrets import` migrator, the WeChat/Weixin QR handler, and the
+    # dashboard channel-credential handlers) on the SAME advisory lock, derived
+    # from the shared helper. Without this, a concurrent importer commit (its
+    # final CAS + atomic_write) could interleave with this write and clobber the
+    # freshly-typed Slack tokens. The prompts above run OUTSIDE the lock (they
+    # can block on the user for minutes); the lock wraps only the short
+    # re-read → merge → atomic-rename critical section, and we RE-READ .env
+    # fresh under the lock so we merge onto the latest on-disk state rather than
+    # the possibly-stale snapshot read before the prompts.
     cred_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"{k}={v}" for k, v in existing.items()]
-    cred_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    cred_path.chmod(0o600)
+    lock_path = _env_lock_path(cred_path)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    if not platform_compat.try_acquire_lock(lock_fd, exclusive=True):
+        os.close(lock_fd)
+        print(
+            "  ⚠️  .env is locked by another process (a secrets import or "
+            "credential save is in progress); tokens not saved. Retry once the "
+            "other operation finishes.\n",
+            file=sys.stderr,
+        )
+        return
+    try:
+        # Re-read fresh under the lock, then merge the just-collected tokens on
+        # top so a concurrent write that landed during the prompts is preserved.
+        merged: dict[str, str] = {}
+        if cred_path.exists():
+            for line in cred_path.read_text(encoding="utf-8").splitlines():
+                if "=" in line and not line.startswith("#"):
+                    k, _, v = line.partition("=")
+                    merged[k.strip()] = v.strip()
+        merged[CRED_SLACK_APP_TOKEN] = app_token
+        merged[CRED_SLACK_BOT_TOKEN] = bot_token
+        if owner_id:
+            merged[CRED_OWNER_ID] = owner_id
+        lines = [f"{k}={v}" for k, v in merged.items()]
+        # atomic_write with restrict_to_owner, not write_text + chmod(0o600): a
+        # bare chmod is a silent no-op for Windows ACLs, and applying any lockdown
+        # only AFTER the tokens are on disk leaves them readable through the
+        # directory's inherited DACL in the failure window. The helper locks its
+        # unique temp file down before any content reaches it and renames only on
+        # success, so the tokens never exist under a wider mode and a failure
+        # leaves the previous .env untouched. restrict_on_error="warn" matches the
+        # .env doctrine (enforce the lockdown, log a warning if it fails) and the
+        # dashboard credential writers: an ACL-refusing host still completes the
+        # wizard instead of aborting after the user typed their tokens.
+        atomic_write(
+            cred_path,
+            "\n".join(lines) + "\n",
+            restrict_to_owner=True,
+            restrict_on_error="warn",
+        )
+    finally:
+        platform_compat.release_lock(lock_fd)
+        os.close(lock_fd)
     print(f"  ✅ Credentials saved to {cred_path}\n")
+
+
+def _setup_whatsapp() -> None:
+    """Guided WhatsApp opt-in: report the prerequisites, then enable the channel.
+
+    There is no token to collect: WhatsApp pairs as a linked device on the
+    operator's own account, and pairing is a QR scan served by the RUNNING gateway.
+    So this step's whole job is the three things an operator cannot discover from
+    anywhere else: that automating a personal account carries a ban risk, whether
+    the optional wheel the channel needs is installed, and that enabling the
+    channel is a config flag separate from pairing it.
+
+    ``neonize_available()`` is a ``find_spec`` check, so nothing here imports
+    neonize or opens the session store: the wizard reports on the credential's
+    path, never through it.
+    """
+    from kiro_crew.config.paths import data_home
+    from kiro_crew.whatsapp.client import (
+        MISSING_EXTRA_HINT,
+        default_db_path,
+        neonize_available,
+    )
+
+    print("── WhatsApp ──\n")
+    print("  WhatsApp links as a device on your OWN account. There is no bot")
+    print("  identity, so the agent sends as you.")
+    print("  Automating a personal account is against WhatsApp's Terms of Service")
+    print("  and carries a small risk of the linked number being banned. Keep")
+    print("  volumes personal-scale.\n")
+
+    if neonize_available():
+        print("  ✅ The 'whatsapp' dependency extra is installed")
+    else:
+        print("  ⚠️  The 'whatsapp' extra is NOT installed, so the channel cannot start")
+        print(f"     {MISSING_EXTRA_HINT}")
+
+    store = default_db_path(data_home())
+    if store.exists():
+        print(f"  ✅ A paired session store already exists: {store}")
+    else:
+        print("  ℹ️  Not paired yet. Pairing is a QR scan from the dashboard:")
+        print("     Settings → Channels → WhatsApp, with the gateway running.")
+    print()
+
+    answer = _input_or_skip("  Enable the WhatsApp channel? [y/N]: ")
+    if not answer or answer.lower() not in ("y", "yes"):
+        print("  ⏭  Left disabled. Enable it later from Settings → Channels.\n")
+        return
+
+    cfg_file = config_path()
+    cfg: dict = {}
+    if cfg_file.exists():
+        try:
+            loaded = json.loads(cfg_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"  ⚠️  Could not read {cfg_file}: {exc}\n")
+            return
+        # A top-level non-object is not something this step may repair: writing our
+        # own object over it would destroy whatever the operator meant. Mirrors
+        # _setup_sandbox_consent.
+        if not isinstance(loaded, dict):
+            print(f"  ⚠️  {cfg_file} does not contain a JSON object; skipping.\n")
+            return
+        cfg = loaded
+    if not isinstance(cfg.get("whatsapp"), dict):
+        if "whatsapp" in cfg:
+            print("  ⚠️  'whatsapp' section is not an object; leaving config untouched.\n")
+            return
+        cfg["whatsapp"] = {}
+    cfg["whatsapp"]["enabled"] = True
+    try:
+        write_config_atomically(cfg_file, cfg)
+    except OSError as exc:
+        print(f"  ⚠️  Could not write {cfg_file}: {exc}")
+        print("     Nothing was enabled. Enable it from Settings → Channels instead.\n")
+        return
+    print("  ✅ Recorded: whatsapp.enabled = true")
+    print("     Next: start the gateway, then scan the QR from")
+    print("     Settings → Channels → WhatsApp.\n")
 
 
 _CUSTOM_DOMAIN = "kirocrew.localhost"
@@ -549,20 +694,33 @@ def _detect_system_timezone() -> str:
     return ""
 
 
-def _input_or_skip(prompt: str) -> str | None:
-    """``input(prompt).strip()``, returning ``None`` on EOF instead of crashing.
+class _SetupAborted(Exception):
+    """Raised when stdin is closed mid-wizard.
 
-    A closed/piped stdin (non-interactive setup, or a Windows console quirk)
-    makes bare ``input()`` raise ``EOFError``. The timezone step's retry loop is
-    only entered on a validation failure, so a Windows user who mistyped a zone
-    once — the common case, since detection used to yield nothing there — hit an
-    uncaught traceback. Callers treat ``None`` as "skip this step".
+    The wizard is a sequential chain of interactive prompts; if stdin closes at
+    ANY prompt, every subsequent bare ``input()`` would traceback. Callers use
+    ``_input_or_skip`` for guarded prompts (workspace, slash-command, timezone);
+    the top-level ``_setup`` catches this and exits cleanly, so a
+    ``kirocrew setup < /dev/null`` — or a Windows console quirk that closes
+    stdin — surfaces one clean message instead of a stack trace.
+    """
+
+
+def _input_or_skip(prompt: str) -> str | None:
+    """``input(prompt).strip()``, or raise ``_SetupAborted`` on EOF.
+
+    Returns ``None`` when the user hit Enter with no input, which callers treat
+    as "keep the default / skip this step". A closed/piped stdin is a different
+    condition and must not be silently coerced to ``""`` (that used to admit an
+    empty default and cascade the failure into the NEXT step's bare
+    ``input()``) — see ``_SetupAborted``.
     """
 
     try:
-        return input(prompt).strip()
-    except EOFError:
-        return None
+        answer = input(prompt).strip()
+    except EOFError as exc:
+        raise _SetupAborted("stdin closed; setup cannot continue") from exc
+    return answer or None
 
 
 def _setup_slash_command() -> None:
@@ -578,7 +736,8 @@ def _setup_slash_command() -> None:
 
     print("── Slash Command ──\n")
     current = cfg.get("slack", {}).get("command", "kirocrew")
-    raw = input(f"  Slash command name [{current}]: ").strip()
+    # EOF keeps the current value (same reasoning as the workspace step).
+    raw = _input_or_skip(f"  Slash command name [{current}]: ") or ""
     if raw:
         raw = raw.lstrip("/").strip()
     if not raw:
@@ -649,8 +808,9 @@ def _setup_sandbox_consent() -> None:
         # Kiro Crew rather than disabling it. Neither warrants this opt-in.
         return
     # A prompt nobody can see is a hang, not consent: `kirocrew update` runs
-    # setup with its output captured while stdin is still inherited, so an
-    # invisible question would block until that path's timeout aborts the update.
+    # setup with its output captured and stdin on DEVNULL, so a question asked
+    # there is invisible and reads EOF. This guard keeps the decision at a real
+    # terminal rather than letting a non-interactive run answer it.
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("  ⚠️  No sandbox backend on this host, so agent subprocesses are")
         print("     refused. Run `kirocrew setup` from a terminal to decide, or set")

@@ -1,9 +1,9 @@
 # Frontend conventions
 
-Shared components, accessibility, security, data fetching, animation, styling,
-typography, and how a builtin app gets discovered. Page structure is in
-[page-layout](page-layout.md); color and CSS-var rules are in
-[theming-contract](theming-contract.md); user-facing strings are in
+Shared components, accessibility, security, data fetching, live-collection
+identity, animation, styling, typography, and how a builtin app gets discovered.
+Page structure is in [page-layout](page-layout.md); color and CSS-var rules are
+in [theming-contract](theming-contract.md); user-facing strings are in
 [i18n-catalog](i18n-catalog.md).
 
 ## Shared components
@@ -115,6 +115,17 @@ Add a new protocol to `ALLOWED_PROTOCOLS` in that file, and only there. Each
 addition widens what a model-authored or user-pasted link can launch on the host,
 so treat it as a security change, not a formatting one.
 
+One deliberate, key-scoped exception exists: a Windows absolute path
+(`WINDOWS_ABS_PATH_RE` — drive letter or UNC) is passed through **for image
+`src` only**, because `defaultUrlTransform` parses `C:` as an unknown scheme and
+would blank the sender's own uploaded image (issue #3497). The invariant that
+makes it safe: `ImgWithFallback` routes every local path to the same-origin
+`/api/file-raw` endpoint, so the raw filesystem path never reaches the DOM, and
+the shape (single letter + separator) cannot express `javascript:`/`data:`
+payloads. Widening that regex or its key scope is a security change — the same
+constant also decides which paths are treated as local file reads, so the two
+decisions must stay on the one exported copy in `urlTransform.ts`.
+
 ## Data fetching
 
 Always React Query (`useQuery` / `useMutation`) for server state. Do NOT use
@@ -142,6 +153,58 @@ slices:
 
 Server data belongs in React Query, not in a slice. Reach for Redux only when the
 state is shell-wide and not a cached server read.
+
+## Live-updating collections: merge, don't replace
+
+A slice holding a collection the server re-broadcasts **in full** must merge the
+incoming list into the one it already holds, never assign it. Assigning hands
+every row a new object reference on every frame, so one row's change invalidates
+every selector over the collection, every `useMemo` keyed on the array, and every
+memoized child — and inside a Framer `LayoutGroup` it re-measures the entire list.
+The symptom is a collection that visibly reloads when one member changed, which
+reads as a bug rather than as an update. Broadcasts are coalesced server-side but
+not suppressed (slots at 200ms), so an active session delivers several full lists
+per second and the effect is continuous rather than incidental.
+
+What a merge has to hold:
+
+- **Membership and order come from the incoming list.** The server stays
+  authoritative on both; only per-row identity is carried across.
+- **Reuse a row only when it is structurally equal**, so no consumer can read
+  stale content off a kept reference.
+- **Leave the array itself alone when nothing moved.** This is the half that
+  pays: an equal-but-new array still reruns every downstream filter and sort.
+- **Compare field-agnostically and independently of key order.** A comparator
+  that enumerates the type's fields stops seeing a newly added one and pins a
+  stale row — a correctness bug, where a redundant re-render is only a cost. A
+  serialization compare calls a locally patched row unequal forever, because an
+  in-place patch can append a key the server payload spells earlier. Use the
+  shared `jsonEqual` (`utils/structuralEqual.ts`) rather than writing a second
+  comparator — it already holds both properties, and a private copy is a second
+  set of guarantees to keep in sync.
+
+`applySlots` in `dashboardSlice.ts` is the reference implementation, driving both
+authoritative writers (`sseSlots` and the `fetchSlots` refetch);
+`dashboardSlice.slotIdentity.test.ts` pins the contract. Reusing an Immer draft
+row inside a freshly assigned array is safe — a draft found in the assigned value
+is finalized within the same scope, so an untouched row resolves back to its base
+object and keeps its identity.
+
+This is a convention for new and touched code, not a description of the current
+store. Two dashboard collections still assign wholesale and are known gaps rather
+than counterexamples: `sseSubagentStatus` rebuilds its `agents` array every frame,
+and `sseStatus` replaces `state.status` as a whole object that several panels
+subscribe to entirely. Converting them is worthwhile but is its own change —
+`state.status` in particular needs its consumers narrowed first, or the merge buys
+nothing.
+
+Two habits belong to the same concern:
+
+- **Subscribe narrowly.** A selector returning a whole map re-renders its
+  component on any write to any member; pass `shallowEqual` when the component
+  only reads members out of it, as the sidebar does for `slotStatusDetail`.
+- **Don't re-rank a list on mid-turn activity.** An ordering key should move on
+  settled events only, or rows swap under the pointer while several sessions work.
 
 ## Animations
 

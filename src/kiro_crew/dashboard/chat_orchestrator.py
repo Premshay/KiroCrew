@@ -14,6 +14,7 @@ from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.context_management import OrchestrationTracker
 from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.dashboard.turn_dispatch import _bounded_turn
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import SecurityEvent, sel
@@ -21,14 +22,15 @@ from kiro_crew.sel import SecurityEvent, sel
 logger = logging.getLogger(__name__)
 
 
-def _build_stage_context(
+async def _build_stage_context(
     slot: "_ChatSlot",
     tracker: "OrchestrationTracker",
     stage_idx: int,
 ) -> str:
     """Build a focused context message for a single stage.
 
-    *stage_idx* is 0-based.
+    *stage_idx* is 0-based. Async because inlining the previous stages' results
+    reads them off disk, which must not block the event loop the stage runs on.
     """
     titles = getattr(slot, "_stage_titles", [])
     goal = getattr(slot, "_plan_goal", "")
@@ -41,7 +43,7 @@ def _build_stage_context(
     parts.append(tracker.status_summary(stage_idx, total, titles))
 
     # Previous stage result paths (LLM can read details via file tools)
-    prev_paths = _previous_result_paths(tracker, stage_idx)
+    prev_paths = await _previous_result_paths(tracker, stage_idx)
     if prev_paths:
         parts.append(f"## Previous Stage Results\n{prev_paths}")
 
@@ -61,17 +63,16 @@ def _build_stage_context(
     return "\n\n".join(parts)
 
 
-def _previous_result_paths(
-    tracker: "OrchestrationTracker",
-    current_idx: int,
-) -> str:
-    """Return compacted previous stage results with paths for full details."""
+def _read_previous_results(recorded: list[tuple[int, str]]) -> str:
+    """Read each recorded stage result and compact it. Blocking.
+
+    Split out so the reads can be handed to a worker thread as a unit. It takes
+    an already-materialised ``(stage_num, path)`` list rather than the tracker,
+    so nothing the event loop mutates is reachable from the worker.
+    """
     _max_per_stage = 2000
     parts: list[str] = []
-    for stage_num in range(1, current_idx + 1):
-        path_str = tracker._stage_results.get(stage_num)
-        if not path_str:
-            continue
+    for stage_num, path_str in recorded:
         p = Path(path_str)
         content = ""
         if p.exists() and not is_sensitive_path(str(p)):
@@ -100,6 +101,29 @@ def _previous_result_paths(
         else:
             parts.append(f"{header}\nFull result: `{path_str}`")
     return "\n\n".join(parts)
+
+
+async def _previous_result_paths(
+    tracker: "OrchestrationTracker",
+    current_idx: int,
+) -> str:
+    """Return compacted previous stage results with paths for full details.
+
+    Stage N inlines every earlier stage's result, so the read count grows with
+    the plan and lands at each stage boundary. ``_stage_loop`` is async, so those
+    reads are offloaded; the path list is snapshotted here first because
+    ``tracker._stage_results`` is mutated on the loop by ``record_stage_result``
+    as stages finish.
+    """
+    recorded: list[tuple[int, str]] = []
+    for stage_num in range(1, current_idx + 1):
+        path_str = tracker._stage_results.get(stage_num)
+        if path_str:
+            recorded.append((stage_num, path_str))
+    if not recorded:
+        # The first stage has nothing to inline; skip the worker hop entirely.
+        return ""
+    return await asyncio.to_thread(_read_previous_results, recorded)
 
 
 def _capture_stage_result(
@@ -137,6 +161,50 @@ def _capture_stage_result(
     return str(path)
 
 
+def _completion_excerpts(result_paths: tuple[tuple[int, str], ...]) -> dict[int, str]:
+    """Read captured stage results and return one summary excerpt per stage.
+
+    Runs on a worker thread, so it takes an already-snapshotted sequence of
+    ``(stage number, path)`` pairs rather than the live tracker: nothing mutable
+    crosses the boundary in either direction. A stage whose result cannot be read
+    is simply absent from the mapping, which is what makes the caller fall back
+    to a plain "done" line for it.
+    """
+    excerpts: dict[int, str] = {}
+    for stage_num, path_str in result_paths:
+        try:
+            text = safe_read_file(path_str).strip()
+        except (OSError, PermissionError):
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("───"):
+                excerpts[stage_num] = line[:120]
+                break
+    return excerpts
+
+
+def _orchestration_stopped(slot: "_ChatSlot", tracker: OrchestrationTracker) -> bool:
+    """True when the stage loop must not advance the plan any further.
+
+    Two independent channels revoke a run, and they do not mean the same thing:
+
+    * ``slot._stopping`` — session/ACP teardown. The slot itself is going away,
+      so nothing on it may keep running.
+    * ``tracker.stopped`` — the user revoked approval to keep ORCHESTRATING, via
+      the plan Cancel control (``api_chat_plan_action``) or an orchestrator stop
+      word. The slot stays alive and usable; only the plan ends.
+
+    A plan cancel sets the second and deliberately not the first, so an
+    advancement gate reading one flag observes only half the cancels. Every gate
+    below therefore reads both. The inverse fix — having Cancel set
+    ``slot._stopping`` — would hand a plan cancel the teardown semantics that
+    flag carries for paths outside this loop, which is not what the user asked
+    for by cancelling a plan.
+    """
+    return bool(slot._stopping) or bool(tracker.stopped)
+
+
 async def _stage_loop(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -164,7 +232,11 @@ async def _stage_loop(
 
     logger.info(
         "Stage loop start: slot=%s total=%d start_idx=%d auto_run=%s titles=%s",
-        slot.key, total, start_idx, auto_run, titles,
+        slot.key,
+        total,
+        start_idx,
+        auto_run,
+        titles,
     )
 
     _paused = False
@@ -185,7 +257,7 @@ async def _stage_loop(
     slot._in_stage_execution = True
     try:
         for stage_idx in range(start_idx, total):
-            if slot._stopping:
+            if _orchestration_stopped(slot, tracker):
                 break
 
             stage_num = stage_idx + 1  # 1-based for display
@@ -197,7 +269,9 @@ async def _stage_loop(
             if stage_idx >= slot._plan_stage_count:
                 logger.warning(
                     "Stage loop clamp for slot %s: stage_idx=%d >= plan_stage_count=%d; stopping",
-                    slot.key, stage_idx, slot._plan_stage_count,
+                    slot.key,
+                    stage_idx,
+                    slot._plan_stage_count,
                 )
                 break
 
@@ -242,7 +316,7 @@ async def _stage_loop(
             )
 
             # Build focused context and execute
-            context = _build_stage_context(slot, tracker, stage_idx)
+            context = await _build_stage_context(slot, tracker, stage_idx)
             context, _ = redact_exfiltration_urls(context)
             context, _ = redact_credentials(context)
             sel().log(
@@ -262,14 +336,91 @@ async def _stage_loop(
             # Inject as hidden user message and run LLM turn
             logger.info(
                 "Stage %d/%d: context=%d chars, messages=%d",
-                stage_num, total, len(context), len(slot.messages),
+                stage_num,
+                total,
+                len(context),
+                len(slot.messages),
             )
+            # NOT flushed here: a stage turn is automatic (`auto-go`), and a held
+            # note is owed to the next USER turn, so feeding it to a stage would
+            # spend it on a turn nobody asked for. The loop-exit flush below is
+            # the delivery point -- it sits in this function's `finally`, where
+            # `slot.task` is this loop's own task, so it fires on the completed,
+            # paused and cancelled paths alike.
             slot.append("user", context, "msg msg-u auto-go")
             try:
-                await _run_chat(state, slot, context)
+                # `_bounded_turn`, NOT `asyncio.wait_for`. `_run_chat` CATCHES
+                # CancelledError (it flushes the partial assistant output and
+                # returns), so wait_for would absorb its own deadline: the inner
+                # task completes "normally", wait_for hands back a value instead
+                # of raising, and a half-finished stage would advance as if it
+                # had succeeded. `_bounded_turn` records that its own timer
+                # fired and raises on that observed fact, so a swallowed
+                # cancellation still surfaces. See its docstring in
+                # turn_dispatch.py -- it exists for exactly this trap.
+                #
+                # A falsy stage_timeout_seconds means "disabled" everywhere else
+                # in the tracker, so skip the ceiling entirely rather than
+                # passing 0, which would cut every stage instantly.
+                _turn_timeout = tracker.stage_timeout_seconds
+                if _turn_timeout:
+                    await _bounded_turn(
+                        _run_chat(
+                            state,
+                            slot,
+                            context,
+                            _directive_user_origin=False,
+                        ),
+                        _turn_timeout,
+                    )
+                else:
+                    await _run_chat(
+                        state,
+                        slot,
+                        context,
+                        _directive_user_origin=False,
+                    )
+            except (asyncio.TimeoutError, TimeoutError):
+                # `_bounded_turn` raises builtin TimeoutError; on 3.10
+                # asyncio.TimeoutError is a DIFFERENT class, so catch both (the
+                # convention already used by _run_pending_synthesis).
+                logger.error(
+                    "Stage %d exceeded its %ds ceiling for slot %s",
+                    stage_num,
+                    tracker.stage_timeout_seconds,
+                    slot.key,
+                )
+                _timeout_msg = (
+                    f"⏱️ Stage {stage_num} timed out after {tracker.timeout_human}. "
+                    "Auto-run stopped."
+                )
+                slot._auto_run = False
+                slot.append("assistant", _timeout_msg, "msg msg-a")
+                state.broadcast_ws(
+                    "chat_append",
+                    {"slot": slot.key, "html": _timeout_msg, "cls": "msg msg-a"},
+                )
+                sel().log(
+                    SecurityEvent(
+                        event_id=uuid.uuid4().hex,
+                        timestamp=datetime.now(tz=timezone.utc).isoformat(),
+                        event_type="auto_run_timeout",
+                        caller_identity=f"dashboard:{slot.key}",
+                        agent=getattr(slot, "agent", ""),
+                        source="dashboard",
+                        operation="stage_turn_ceiling",
+                        outcome="stopped",
+                        resources=f"slot={slot.key},stage={stage_num}",
+                    )
+                )
+                break
             except Exception:
-                logger.exception("_run_chat failed during stage %d for slot %s", stage_num, slot.key)
-                _err_msg = f"❌ Stage {stage_num} failed due to an internal error. Auto-run stopped."
+                logger.exception(
+                    "_run_chat failed during stage %d for slot %s", stage_num, slot.key
+                )
+                _err_msg = (
+                    f"❌ Stage {stage_num} failed due to an internal error. Auto-run stopped."
+                )
                 slot._auto_run = False
                 slot.append("assistant", _err_msg, "msg msg-a")
                 state.broadcast_ws(
@@ -291,22 +442,35 @@ async def _stage_loop(
                 )
                 break
 
-            if slot._stopping:
+            if _orchestration_stopped(slot, tracker):
                 break
 
             # Wait for pending subagents spawned during this stage
             _sa_rounds = 0
+            # Dynamic poll cap. Each poll sleeps 2s, so `stage_timeout // 4`
+            # rounds ≈ half the stage timeout in wall-clock, hard-capped at 450
+            # rounds (15 min). This replaces a fixed 150 (5 min), which was far
+            # shorter than a subagent's own 30-min budget and abandoned
+            # legitimate long-running analysis agents mid-flight.
+            # A falsy stage timeout means "disabled", so fall back to the 15-min
+            # ceiling rather than 0 (which would skip the wait entirely).
+            # Worst case per stage is therefore turn-timeout + subagent-wait;
+            # the total-plan watchdog (separate follow-up) bounds the run.
+            if tracker.stage_timeout_seconds:
+                _sa_max_rounds = min(tracker.stage_timeout_seconds // 4, 450)
+            else:
+                _sa_max_rounds = 450
             session_key = f"dashboard:{slot.key}"
             if state.subagents is None:
                 # Fail-closed: subagent manager missing — stop auto-run
                 logger.warning(
                     "Stage %d: subagents manager is None for slot %s"
                     " — stopping auto-run (fail-closed)",
-                    stage_num, slot.key,
+                    stage_num,
+                    slot.key,
                 )
                 _fc_msg = (
-                    f"⚠️ Stage {stage_num}: subagent manager unavailable. "
-                    "Auto-run stopped."
+                    f"⚠️ Stage {stage_num}: subagent manager unavailable. " "Auto-run stopped."
                 )
                 slot._auto_run = False
                 slot.append("assistant", _fc_msg, "msg msg-a")
@@ -336,12 +500,10 @@ async def _stage_loop(
                     logger.warning(
                         "Stage %d: running_agents_for returned None for slot %s"
                         " — stopping auto-run (fail-closed)",
-                        stage_num, slot.key,
+                        stage_num,
+                        slot.key,
                     )
-                    _fc_msg = (
-                        f"⚠️ Stage {stage_num}: subagent check failed. "
-                        "Auto-run stopped."
-                    )
+                    _fc_msg = f"⚠️ Stage {stage_num}: subagent check failed. " "Auto-run stopped."
                     slot._auto_run = False
                     slot.append("assistant", _fc_msg, "msg msg-a")
                     state.broadcast_ws(
@@ -369,8 +531,8 @@ async def _stage_loop(
                 )
                 while (
                     _pending
-                    and _sa_rounds < 150
-                    and not slot._stopping
+                    and _sa_rounds < _sa_max_rounds
+                    and not _orchestration_stopped(slot, tracker)
                 ):
                     _sa_rounds += 1
                     await asyncio.sleep(2)
@@ -379,13 +541,17 @@ async def _stage_loop(
                     if _pending and _sa_rounds % 10 == 0:
                         state.broadcast_ws(
                             "chat_status",
-                            {"slot": slot.key, "status": f"Waiting for {len(_pending)} subagent(s)..."},
+                            {
+                                "slot": slot.key,
+                                "status": f"Waiting for {len(_pending)} subagent(s)...",
+                            },
                         )
                     if _pending is None:
                         logger.warning(
                             "Stage %d: running_agents_for returned None during"
                             " polling for slot %s — stopping auto-run",
-                            stage_num, slot.key,
+                            stage_num,
+                            slot.key,
                         )
                         slot._auto_run = False
                         break
@@ -414,14 +580,20 @@ async def _stage_loop(
                     )
                 )
                 break
-            if _sa_rounds >= 150:
+            if _sa_rounds >= _sa_max_rounds:
+                _wait_secs = _sa_rounds * 2
                 logger.warning(
-                    "Stage %d: subagent wait exhausted after %ds for slot %s",
-                    stage_num, _sa_rounds * 2, slot.key,
+                    "Stage %d: subagent wait exhausted after %ds (%d rounds, cap %d) for slot %s",
+                    stage_num,
+                    _wait_secs,
+                    _sa_rounds,
+                    _sa_max_rounds,
+                    slot.key,
                 )
                 slot._auto_run = False
                 _sa_msg = (
-                    f"⚠️ Stage {stage_num}: subagent wait exhausted after 5 minutes. "
+                    f"⚠️ Stage {stage_num}: subagent wait exhausted after "
+                    f"{_wait_secs // 60} minutes. "
                     "Auto-run stopped — some results may be incomplete."
                 )
                 slot.append("assistant", _sa_msg, "msg msg-a")
@@ -444,7 +616,7 @@ async def _stage_loop(
                 )
                 break
 
-            if slot._stopping:
+            if _orchestration_stopped(slot, tracker):
                 break
 
             # Capture result to disk
@@ -452,14 +624,20 @@ async def _stage_loop(
                 result_path = _capture_stage_result(slot, stage_num)
                 tracker.record_stage_result(stage_num, result_path)
             except OSError:
-                logger.warning("Failed to capture stage %d result to disk", stage_num, exc_info=True)
+                logger.warning(
+                    "Failed to capture stage %d result to disk", stage_num, exc_info=True
+                )
 
             # Gate: if not auto_run, wait for user approval
             if not auto_run:
                 # Emit completion message — user must click Go for next stage
                 if stage_idx + 1 < total:
                     next_title = titles[stage_idx + 1] if stage_idx + 1 < len(titles) else ""
-                    next_label = f"Stage {stage_idx + 2}: {next_title}" if next_title else f"Stage {stage_idx + 2}"
+                    next_label = (
+                        f"Stage {stage_idx + 2}: {next_title}"
+                        if next_title
+                        else f"Stage {stage_idx + 2}"
+                    )
                     done_msg = (
                         f"✅ Stage {stage_num} complete. Click **Go** to proceed to {next_label}."
                         "\n\n[OPTION: Go | Go All | Cancel]"
@@ -477,23 +655,25 @@ async def _stage_loop(
             # for loop completed without break — all stages done
             if not slot._stopping and start_idx < total:
                 slot._auto_run = False
+                # Snapshot the result paths on the loop thread — `_stage_results`
+                # is live orchestration state the loop mutates — then read the
+                # files on a worker: one read per completed stage, all of them
+                # landing at once on the gateway's single event loop.
+                _captured: list[tuple[int, str]] = []
+                for s_idx in range(total):
+                    _path = tracker._stage_results.get(s_idx + 1)
+                    if _path:
+                        _captured.append((s_idx + 1, _path))
+                # Nothing captured means nothing to read: skip the worker hop.
+                excerpts: dict[int, str] = {}
+                if _captured:
+                    excerpts = await asyncio.to_thread(_completion_excerpts, tuple(_captured))
                 # Build execution summary from captured stage results
                 summary_lines = [f"✅ All {total} stages complete."]
                 for s_idx in range(total):
                     s_num = s_idx + 1
                     s_title = titles[s_idx] if s_idx < len(titles) else ""
-                    result_path = tracker._stage_results.get(s_num)
-                    excerpt = ""
-                    if result_path:
-                        try:
-                            text = safe_read_file(result_path).strip()
-                            for line in text.splitlines():
-                                line = line.strip()
-                                if line and not line.startswith("───"):
-                                    excerpt = line[:120]
-                                    break
-                        except (OSError, PermissionError):
-                            pass
+                    excerpt = excerpts.get(s_num, "")
                     label = f"Stage {s_num}: {s_title}" if s_title else f"Stage {s_num}"
                     if excerpt:
                         summary_lines.append(f"  {label} — {excerpt}")
@@ -533,7 +713,11 @@ async def _stage_loop(
         slot._in_stage_execution = False
         logger.info(
             "Stage loop end: slot=%s current_stage=%s/%s stopping=%s auto_run=%s",
-            slot.key, tracker.current_stage, total, slot._stopping, slot._auto_run,
+            slot.key,
+            tracker.current_stage,
+            total,
+            slot._stopping,
+            slot._auto_run,
         )
         # Hand off any messages the user queued while the plan ran (held via the
         # _in_stage_execution gate in _start_next_queued_turn — now cleared above).
@@ -549,6 +733,29 @@ async def _stage_loop(
         # task owns slot.task and will drain the queue + emit chat_done itself, so
         # we must not start a second turn or clobber/idle-close over it.
         _next_started = False
+        # Before _start_next_queued_turn, not after: a held note's context half
+        # drains into that successor, so flushing later would let the note shape
+        # a turn its visible line appears below. Skipped while a turn runs, since
+        # that turn drains AFTER its task is assigned and would consume a note
+        # written after it began; it flushes at its own completion instead.
+        # ``slot.running`` cannot express that: inside this finally it names THIS
+        # loop's own task, so defer only to a live task that is someone else's.
+        _note_owner = slot.task
+        if _note_owner is None or _note_owner is asyncio.current_task() or _note_owner.done():
+            try:
+                slot.flush_deferred_notes()
+            except Exception:
+                # Worst-placed of the flush seams: this is a ``finally``, so a raise
+                # here both skips the rest of it -- the queued-work handoff, the
+                # done row, chat_done, and clearing slot.task, leaving the slot
+                # wedged with its spinner up -- AND replaces any exception the loop
+                # was already unwinding, hiding the original failure. Held notes are
+                # delivered by the next seam instead.
+                logger.warning(
+                    "Stage loop: held-note delivery failed at exit for slot %s",
+                    slot.key,
+                    exc_info=True,
+                )
         if (
             not _cancelled
             and not slot.running
@@ -609,7 +816,7 @@ async def api_chat_plan_action(request: web.Request) -> web.Response:
         slot._auto_run = False
         if state.subagents:
             session_key = f"dashboard:{slot.key}"
-            for a in (state.subagents.running_agents_for(session_key) or []):
+            for a in state.subagents.running_agents_for(session_key) or []:
                 t = state.subagents._tasks.get(a["id"])
                 if t and not t.done():
                     t.cancel()
@@ -623,7 +830,19 @@ async def api_chat_plan_action(request: web.Request) -> web.Response:
 
     # Go or Go All — use Python-controlled stage loop
     if slot.running:
-        slot.queue_append("Go")
+        # circular import: session_control imports this package's modules at module level.
+        from kiro_crew.dashboard.session_control import containment_meta
+
+        # Provenance follows the CALLER — the same request-identity split as
+        # api_chat and the manual continue. A human clicking Go on their own
+        # busy session must not lose the approval if they link the session
+        # before the drain; an app relaying a plan action never gains the
+        # authenticated-human flag.
+        slot.queue_append(
+            "Go",
+            meta=containment_meta(state, slot),
+            directive_user_origin=not bool(request.get("app", "")),
+        )
         return web.json_response({"ok": True, "queued": True})
 
     is_auto = action == "go all"

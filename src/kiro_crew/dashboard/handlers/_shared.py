@@ -7,8 +7,9 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
+import aiohttp
 from aiohttp import web
 
 from kiro_crew.agent_discovery import (
@@ -18,14 +19,39 @@ from kiro_crew.agent_discovery import (
 )
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.security import is_sensitive_path
+from kiro_crew.dashboard.state import VALID_MEMORY_MODES, DashboardState
+from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.messaging.privacy_mode import hydrate as _hydrate_conv_flags
+from kiro_crew.messaging.privacy_mode import is_incognito as is_thread_incognito
+from kiro_crew.messaging.privacy_mode import is_temporary as is_thread_temporary
+from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.skill_trust import is_project_trusted as _is_project_trusted
 from kiro_crew.skills import skills_dir
 
 if TYPE_CHECKING:
     from kiro_crew.platform.interfaces import CapabilityManager
 
 logger = logging.getLogger(__name__)
+
+
+def _redact_memory_field(val: object) -> object:
+    """Redact credentials and exfiltration URLs from a memory field.
+
+    Lives here (not in ``memory.py``) so handlers that ``memory.py`` itself
+    imports from -- e.g. ``cron.py`` -- can share the chain without an import
+    cycle.
+    """
+    if isinstance(val, (bytes, memoryview)):
+        return None
+    if isinstance(val, str):
+        val, _ = redact_exfiltration_urls(val)
+        val, _ = redact_credentials(val)
+        return val
+    if isinstance(val, list):
+        return [_redact_memory_field(item) for item in val]
+    if isinstance(val, dict):
+        return {k: _redact_memory_field(v) for k, v in val.items()}
+    return val
 
 
 # Shared body cap for the small JSON-object endpoints that must bound the
@@ -75,6 +101,147 @@ async def read_bounded_json(
             {"error": "body must be a JSON object", "code": "body_not_object"}, status=400
         )
     return body, None
+
+
+# Chunk size for draining an OUTBOUND HTTP response to EOF. Matches the
+# bounded-read shape in ``mcp_providers.official._fetch_json``: large enough
+# that a typical body arrives in a handful of iterations, small enough that
+# the over-cap check fires long before an oversized body is buffered whole.
+_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
+
+
+async def read_capped_response(resp: "aiohttp.ClientResponse", cap: int) -> bytes:
+    """Read *resp*'s body to EOF, returning at most ``cap + 1`` bytes.
+
+    A single ``StreamReader.read(n)`` resolves as soon as ANY bytes are
+    buffered -- on a chunked response (no Content-Length) that is the first
+    buffered chunk, so the caller silently works on a truncated body. This
+    drains ``iter_chunked`` chunks until EOF, enforcing the cap against the
+    ACCUMULATED total: reading stops as soon as the total exceeds *cap*, so a
+    hostile oversized body is refused mid-stream rather than buffered whole.
+    The return is clamped to ``cap + 1`` bytes so callers keep the established
+    over-cap sentinel (``len(body) > cap`` means "exceeded the cap"), while a
+    body of exactly *cap* bytes is still delivered complete.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(_RESPONSE_READ_CHUNK_BYTES):
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > cap:
+            break
+    return b"".join(chunks)[: cap + 1]
+
+
+def _audit_admission(surface: str, resource: str, allowed: bool, error: str = "") -> None:
+    """Record an external-access verdict in the security event log.
+
+    BOTH outcomes are logged, not just denials. An admission is the security-
+    relevant event here: "this deployment queried a public registry" and "this
+    deployment provisioned cloud infrastructure" are exactly what an operator who
+    restricted these surfaces needs to be able to prove afterwards, and a log that
+    only carries denials cannot answer whether the permitted path was ever taken.
+
+    Raises on failure — deliberately NOT best-effort, unlike most SEL call sites.
+    An access grant that cannot be recorded is an unaccountable grant, so the
+    caller converts a failed audit into a denial rather than proceeding unlogged.
+
+    ``critical=True`` is what makes that possible. The default path QUEUES the
+    event and swallows a write failure internally, so an exception handler around
+    this call would never fire and the "fail closed" claim would be empty; the
+    critical path writes synchronously and raises on a filesystem failure.
+    """
+    from kiro_crew.sel import sel as _sel  # circular import: sel imports config
+
+    _sel().log_api_access(
+        caller="system",
+        operation=f"external_access:{surface}",
+        outcome="allowed" if allowed else "denied",
+        source="agent",
+        resources=resource,
+        error=error,
+        critical=True,
+    )
+
+
+def _admits(surface: str, resource: str, probe: "Callable[[], bool]") -> bool:
+    """Ask the composed policy one admission question, audited either way.
+
+    Denies on a transient adapter failure rather than admitting. The only way to
+    reach that fallback is for a COMPOSED policy to raise — a managed deployment
+    whose intent was to restrict something — so admitting there would hand back
+    the exact access the operator disabled. The public default cannot raise, so an
+    ordinary install is unaffected, and ``PlatformCompositionError`` still
+    propagates per the CPP fail-closed invariant.
+
+    A FAILED AUDIT ALSO DENIES. If the verdict cannot be written to the security
+    event log — an unwritable or corrupt SEL key — then proceeding would grant
+    external access with no accountability record, which is the one thing this
+    seam exists to make provable. Denying is the conservative direction: the
+    operator loses a registry browser or a deploy button and gets a logged error,
+    rather than silently gaining unaudited egress.
+
+    SYNCHRONOUS BY DESIGN, and callers on the event loop must run it in a worker
+    thread. SEL initialization can shell out (``icacls`` on a fresh Windows
+    gateway), so calling this inline from a coroutine would stall every request.
+    """
+    from kiro_crew.platform.context import safe_context_call
+
+    failed: list[str] = []
+
+    def _fallback() -> bool:
+        failed.append("policy_error")
+        return False
+
+    allowed = safe_context_call(
+        probe,
+        fallback_factory=_fallback,
+        log_message=f"external-access check failed for {surface} {resource!r}; denying",
+    )
+    try:
+        _audit_admission(surface, resource, allowed, error="policy_error" if failed else "")
+    except Exception:
+        logger.error(
+            "external-access verdict for %s %r could not be audited; denying",
+            surface,
+            resource,
+            exc_info=True,
+        )
+        return False
+    return allowed
+
+
+def admits_registry(kind: str, name: str, api_base: str) -> bool:
+    """Whether the composed platform admits an external discovery registry.
+
+    The single call point for the registry half of the ``external_access`` seam, so
+    both catalogs ask the question identically instead of each re-deriving the
+    fail-closed idiom — the reason ``safe_context_call`` is centralized is that a
+    hand-rolled ``except Exception`` at a call site silently swallows
+    ``PlatformCompositionError``.
+    """
+    from kiro_crew.platform.context import current_context
+
+    return _admits(
+        f"registry:{kind}",
+        api_base,
+        lambda: current_context().external_access.admits_registry(kind, name, api_base),
+    )
+
+
+def admits_cloud_deployment(target: str = "aws") -> bool:
+    """Whether the composed platform admits provisioning in a cloud account.
+
+    Consulted by the deploy surface: a denied deployment reports itself disabled
+    and refuses every mutating request.
+    """
+    from kiro_crew.platform.context import current_context
+
+    return _admits(
+        "cloud_deployment",
+        target,
+        lambda: current_context().external_access.admits_cloud_deployment(target),
+    )
 
 
 def _capability_manager() -> "CapabilityManager":
@@ -172,19 +339,182 @@ def _edition_skill_roots() -> list[Path]:
     return [Path(r) for r in roots]
 
 
-def _resolve_aim_skill_path(name: str) -> Path | None:
-    """Find SKILL.md for an edition-contributed skill by leaf name.
+def _canonical_skill_roots() -> list[Path]:
+    """Skill roots the CORE owns and keys under its own prefixes.
 
-    Iterates the edition skill roots (``McpToolingProvider.extra_skills()``)
-    instead of globbing an edition home-dir tree directly. Within each root a
-    skill lives at
-    either ``<root>/<pkg>/<name>/SKILL.md`` or ``<root>/<name>/SKILL.md``; the
-    first match (roots in seam order) wins.
+    ``extra_skills()`` legitimately advertises some of these — the data home and
+    ``~/.kiro/skills`` — so the loader indexes them. They must not ALSO be
+    searched or keyed as ``package/``, or one file gets two identities and a
+    ``package/<name>`` request can be answered with the user's own editable skill.
+
+    State-free on purpose, so every consumer gets the exclusion by default;
+    ``<project>/.kiro/skills`` needs a chat slot and is added by the caller that
+    has one.
     """
+    out: list[Path] = [Path.home() / ".kiro" / "skills", skills_dir()]
+    try:
+        # ``resolve()``, not just ``expanduser()``: a RELATIVE extra_paths entry
+        # would otherwise key the catalog by a relative root, and the persisted
+        # ``skill://`` URI would then resolve against whatever cwd the next
+        # kiro-cli session starts in — silently loading a different skill, or
+        # none. A skill root must be a stable absolute location.
+        out.extend(Path(p).expanduser().resolve() for p in KiroCrewConfig.load().skills.extra_paths)
+    except Exception:
+        logger.debug("failed to load extra skill paths from config", exc_info=True)
+    return out
+
+
+def _resolved_set(paths: Iterable[Path]) -> set[Path]:
+    """Resolved forms of *paths*, skipping any that cannot be resolved.
+
+    ``Path.resolve()`` raises ``RuntimeError`` (not ``OSError``) on a symlink
+    loop, so both are caught: an unresolvable root simply does not participate in
+    identity comparisons.
+    """
+    out: set[Path] = set()
+    for p in paths:
+        try:
+            out.add(p.resolve())
+        except (OSError, RuntimeError):
+            continue
+    return out
+
+
+def _edition_package_roots(canonical: set[Path] | None = None) -> list[Path]:
+    """Edition roots that are genuinely ``package/`` territory.
+
+    The single source of truth for "which advertised roots are package roots",
+    shared by key enumeration and path resolution — if those two disagree, the
+    catalog offers a key the resolver refuses, or worse resolves to a file the
+    catalog never listed.
+
+    An unresolvable root is KEPT: it cannot be compared for identity, and
+    dropping it would silently remove a root that is otherwise served.
+    """
+    owned = set(canonical) if canonical is not None else _resolved_set(_canonical_skill_roots())
+    out: list[Path] = []
     for root in _edition_skill_roots():
-        for pattern in (f"*/{name}/SKILL.md", f"{name}/SKILL.md"):
-            for p in root.glob(pattern):
-                return p
+        try:
+            resolved = root.resolve()
+        except (OSError, RuntimeError):
+            out.append(root)
+            continue
+        if resolved in owned:
+            continue
+        owned.add(resolved)
+        out.append(root)
+    return out
+
+
+def _dedupe_resolved(paths: list[Path]) -> list[Path]:
+    """Collapse paths that resolve to the same file, preserving order.
+
+    One skill is routinely reachable through two roots — an edition may advertise
+    both a directory and a symlink into it — and that is NOT an ambiguity. Only
+    distinct FILES are.
+
+    ``Path.resolve()`` raises ``RuntimeError`` (not ``OSError``) on a symlink
+    loop, and a looping ``SKILL.md`` is yielded by ``glob`` because a literal
+    pattern matches the dirent without following it. Catching only ``OSError``
+    would turn that into a 500 on a browser-triggered request, so an
+    unresolvable path is skipped instead: it cannot be read anyway.
+    """
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for p in paths:
+        try:
+            key = p.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _resolve_package_skill_path(name: str, canonical: set[Path] | None = None) -> Path | None:
+    """Find SKILL.md for an edition-contributed skill by its key remainder.
+
+    Searched over the ``package/`` territory of the edition skill roots
+    (:func:`_edition_package_roots`) — NOT every advertised root. A root the core
+    already keys as ``kiro-user/`` or unprefixed is excluded, so a
+    ``package/<name>`` request can never be answered with the user's own editable
+    skill; *canonical* lets a caller that knows the active project add
+    ``<project>/.kiro/skills`` to that exclusion.
+
+    Two layouts are supported, in precedence order:
+
+    1. ``<root>/<name>/SKILL.md`` — *name* is the path relative to the root, which
+       is how a row keyed ``package/<rel>`` addresses its file.
+    2. ``<root>/<pkg>/<name>/SKILL.md`` — *name* is a leaf under some package
+       directory, for an edition that keys rows by leaf.
+
+    An exact relative-path hit wins over a nested leaf hit. Within a tier, two
+    DISTINCT files matching is a genuine ambiguity — the same relative path
+    bundled by two packages, which this key grammar cannot tell apart — so it
+    returns ``None`` and logs instead of picking one. Serving an arbitrary one of
+    the two looks completely successful and shows the wrong skill's content,
+    which is the failure mode worth being loud about.
+    """
+    exact: list[Path] = []
+    nested: list[Path] = []
+    for root in _edition_package_roots(canonical):
+        exact.extend(root.glob(f"{name}/SKILL.md"))
+        nested.extend(root.glob(f"*/{name}/SKILL.md"))
+    for tier, label in ((exact, "relative path"), (nested, "leaf name")):
+        candidates = _dedupe_resolved(tier)
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            logger.warning(
+                "edition skill %r matches %d distinct files by %s (%s); refusing "
+                "to guess — the package/<path> key cannot address more than one",
+                name,
+                len(candidates),
+                label,
+                ", ".join(sorted(str(p) for p in candidates)),
+            )
+            return None
+    return None
+
+
+def active_project_state(state: DashboardState, session_key: str = "") -> tuple[Path | None, str]:
+    """Resolve the workspace project AND why it is absent when it is.
+
+    Returns ``(project, state)`` where *state* is one of:
+
+    * ``"set"`` — *project* is a real directory and workspace-scoped resources
+      resolve against it;
+    * ``"none"`` — no open chat slot names a project at all;
+    * ``"ambiguous"`` — two or more slots name DIFFERENT projects and
+      *session_key* did not single one out, so there is no defensible answer.
+
+    :func:`active_project_dir` collapses the last two to ``None``, which is the
+    right call for a resolver but not for a UI: "you have no project" and "your
+    open chats disagree" need different words and different remedies, and a
+    caller that cannot tell them apart has to guess. Callers that only need the
+    path should keep using :func:`active_project_dir`.
+    """
+    project = _resolve_active_project(state, session_key)
+    if project is not None:
+        return project, "set"
+    slots = getattr(state, "_slots", {}) or {}
+    distinct = {str(p) for p in (_slot_project(s) for s in slots.values()) if p is not None}
+    return None, "ambiguous" if len(distinct) > 1 else "none"
+
+
+def _slot_project(slot: Any) -> Path | None:
+    """The project a chat slot is bound to, if any.
+
+    ``project_dir`` is accepted alongside ``project`` for slot-like objects that
+    expose that name instead.
+    """
+    pd = getattr(slot, "project", None) or getattr(slot, "project_dir", None)
+    if isinstance(pd, Path):
+        return pd
+    if isinstance(pd, str) and pd:
+        return Path(pd)
     return None
 
 
@@ -208,28 +538,57 @@ def active_project_dir(state: DashboardState, session_key: str = "") -> Path | N
     there is no defensible "active" project for a settings page, and silently
     picking the first-inserted slot would create, overwrite or delete files in
     the wrong project.  Failing closed makes the caller surface the ambiguity
-    instead.
+    instead — :func:`active_project_state` reports which of the two "no answer"
+    cases produced the ``None``.
+
+    Step 2 is what makes this the WRONG helper for a per-chat resource. It
+    answers for a chat that has no project of its own, so a caller that must
+    agree with what one chat will actually load — the skills catalog, and the
+    consent grant that admits those skills — would resolve a directory that chat
+    is not bound to. Those callers use :func:`requesting_slot_project` instead.
+    Reach for this one only when the resource really is global.
+    """
+    return _resolve_active_project(state, session_key)
+
+
+def requesting_slot_project(state: DashboardState, session_key: str = "") -> Path | None:
+    """The project bound to THIS chat slot, with no cross-slot fallback.
+
+    :func:`active_project_dir` answers "which project should a global surface
+    act on", and falls back to the single project shared by the open slots.
+    This answers the narrower question the skills loader asks: "which project
+    is THIS chat bound to". ``SkillsLoader`` resolves project skills from
+    ``_ChatSlot.project`` verbatim, so a caller that must agree with what the
+    loader will actually load -- the catalog, and the consent grant that admits
+    it -- has to ask the same question, not the broader one.
+
+    Returns ``None`` when this slot has no project, which is a meaningful
+    answer: there is no directory for this chat to list, trust, or load from.
     """
     slots = getattr(state, "_slots", {}) or {}
-
-    def _project_of(slot: Any) -> Path | None:
-        pd = getattr(slot, "project", None) or getattr(slot, "project_dir", None)
-        if isinstance(pd, Path):
-            return pd
-        if isinstance(pd, str) and pd:
-            return Path(pd)
+    if not session_key:
         return None
+    slot_name = session_key.split(":", 1)[-1] if ":" in session_key else session_key
+    slot = slots.get(slot_name)
+    if slot is None:
+        return None
+    return _slot_project(slot)
+
+
+def _resolve_active_project(state: DashboardState, session_key: str) -> Path | None:
+    """The three-step resolution shared by the two public accessors."""
+    slots = getattr(state, "_slots", {}) or {}
 
     if session_key:
         slot_name = session_key.split(":", 1)[-1] if ":" in session_key else session_key
         slot = slots.get(slot_name)
         if slot is not None:
-            scoped = _project_of(slot)
+            scoped = _slot_project(slot)
             if scoped is not None:
                 return scoped
     distinct: dict[str, Path] = {}
     for slot in slots.values():
-        proj = _project_of(slot)
+        proj = _slot_project(slot)
         if proj is not None:
             distinct[str(proj)] = proj
     if len(distinct) == 1:
@@ -315,15 +674,17 @@ def list_kiro_skills(project_dir: Path | None = None) -> list[dict[str, Any]]:
             if not skill_md.is_file():
                 continue
             desc, always = _parse_skill_description(skill_md)
-            out.append({
-                "key": f"{source}/{entry.name}",
-                "name": entry.name,
-                "description": desc,
-                "path": str(skill_md),
-                "dir": str(entry),
-                "always": always,
-                "source": source,
-            })
+            out.append(
+                {
+                    "key": f"{source}/{entry.name}",
+                    "name": entry.name,
+                    "description": desc,
+                    "path": str(skill_md),
+                    "dir": str(entry),
+                    "always": always,
+                    "source": source,
+                }
+            )
     return out
 
 
@@ -408,9 +769,7 @@ def _agents_loading_skill(
     """Return names of agents whose pre-expanded globs match *skill_md*."""
     target = str(skill_md)
     return [
-        name
-        for name, globs in expanded_agents
-        if any(fnmatch.fnmatch(target, g) for g in globs)
+        name for name, globs in expanded_agents if any(fnmatch.fnmatch(target, g) for g in globs)
     ]
 
 
@@ -507,10 +866,10 @@ def collect_skills_blocking(
     This is the synchronous core behind ``GET /api/skills``. It performs
     every filesystem-heavy step in one call so the caller can offload the
     whole thing to a thread via ``run_in_executor``. ``list_skills()`` (os.walk +
-    per-file frontmatter reads) and ``list_kiro_skills()`` (per-skill resolve +
-    read) are filesystem-heavy enough to stall the event loop past the
-    loop-stall watchdog on large catalogs, so they run in the thread too rather
-    than inline.
+    per-file frontmatter reads), ``list_kiro_skills()`` (per-skill resolve +
+    read), and the confined project catalog are filesystem-heavy enough to
+    stall the event loop past the loop-stall watchdog on large catalogs, so
+    they run in the thread too rather than inline.
 
     Steps, in the same order the handler used inline:
 
@@ -518,7 +877,8 @@ def collect_skills_blocking(
     2. ``package_skills`` — edition/package skills already fetched (structured
        rows) from ``CapabilityManager.list_skills()``; the manager owns their
        parsing, so nothing is parsed here.
-    3. ``list_kiro_skills(project_dir)`` — open-standard kiro-cli skills.
+    3. Global open-standard kiro-cli skills plus project rows from the loader's
+       confined no-follow catalog.
     4. ``annotate_skills_with_agents(...)`` — ``loaded_by_agents`` per skill.
 
     The capability-manager fetch is intentionally NOT done here (it is async);
@@ -529,7 +889,34 @@ def collect_skills_blocking(
         s.setdefault("source", "kirocrew")
     _warn_skills_outside_roots(package_skills)
     result.extend(package_skills)
-    result.extend(list_kiro_skills(project_dir))
+    # The legacy scanner is valid for the operator-owned global Kiro directory,
+    # but it resolves and reads project link targets before containment can be
+    # checked. Never pass the project to it: pre-consent project rows must come
+    # from the loader's confined no-follow enumeration below.
+    workspace_rows = list_kiro_skills()
+    if project_dir is not None:
+        # A workspace row is LISTABLE without consent but only USABLE with it:
+        # $token expansion and context injection both resolve through
+        # SkillsLoader, which gates the project root on the operator's grant.
+        # Marking the row lets the picker offer that consent instead of handing
+        # back a token that silently expands to nothing.
+        trusted = _is_project_trusted(project_dir)
+
+        # The loader's containment-only catalog IS the definition of what
+        # consent could make loadable. It intentionally bypasses trust
+        # enforcement so genuine untrusted rows remain visible, while its
+        # confined no-follow read keeps linked targets untouched.
+        try:
+            project_rows = skills_loader.catalog_project_skills(project_dir)
+        except Exception:  # noqa: BLE001 — a listing must not die on enumeration
+            logger.warning("skills catalog: enumeration failed; listing no workspace rows")
+            project_rows = []
+        for row in project_rows:
+            row["key"] = f"kiro-workspace/{row.get('key', '')}"
+            row["source"] = "kiro-workspace"
+            row["trusted"] = trusted
+        workspace_rows.extend(project_rows)
+    result.extend(workspace_rows)
     annotate_skills_with_agents(result)
     return result
 
@@ -585,15 +972,20 @@ SKILL_TREE_MAX_ENTRIES = 500
 SKILL_FILE_MAX_BYTES = 1_048_576  # 1 MiB
 
 
-def _resolve_skill_root(name: str, state: DashboardState) -> Path | None:
+def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "") -> Path | None:
     """Return the absolute skill directory for *name*, or None.
 
     Accepts the same nested-name scheme used by the existing skill API:
     - ``foo`` → ``~/.kiro/crew/skills/foo``
     - ``utils/tiny-url`` → ``~/.kiro/crew/skills/utils/tiny-url``
-    - ``package/<skill>`` → resolved via _resolve_aim_skill_path() lookup
+    - ``package/<skill>`` → resolved via _resolve_package_skill_path() lookup
     - ``kiro-user/<skill>`` → ``~/.kiro/skills/<skill>``
     - ``kiro-workspace/<skill>`` → ``<project>/.kiro/skills/<skill>``
+
+    *session_key* scopes ``kiro-workspace/`` to the requesting chat slot's
+    project. Without it, resolution falls back to the single project shared by
+    every slot — and fails closed to ``None`` when open slots disagree, since
+    guessing could read the wrong checkout (#2457).
 
     The returned path is always under one of the allowed roots — paths
     that try to escape via ``..`` or symlinks are rejected.
@@ -605,16 +997,27 @@ def _resolve_skill_root(name: str, state: DashboardState) -> Path | None:
         root = Path.home() / ".kiro" / "skills"
     elif name.startswith("kiro-workspace/"):
         rel = name[len("kiro-workspace/") :]
-        # We cannot reliably resolve project dir here — gate this to
-        # paths under any active slot's project directory.
-        proj = active_project_dir(state)
+        # NOT trust-gated, deliberately: reading a SKILL.md is how the operator
+        # decides whether to grant trust in the first place, so requiring the
+        # grant to view the file would make the consent decision blind. The
+        # boundary that matters -- an unconsented project skill never reaching the
+        # agent's context -- is enforced in SkillsLoader. Uses the permissive
+        # resolver so the documented keyless single-project fallback and the
+        # #2457 two-project behaviour stay as they are.
+        proj = active_project_dir(state, session_key)
         if proj is None:
             return None
         root = proj / ".kiro" / "skills"
     elif name.startswith("package/"):
-        # Locate via existing helper (sync version).
-        aim_name = name[len("package/") :]
-        path = _resolve_aim_skill_path(aim_name)
+        # Locate via existing helper (sync version). The active project's
+        # ``.kiro/skills`` joins the canonical exclusion here because this caller
+        # is the one that knows the chat slot.
+        pkg_rel = name[len("package/") :]
+        canonical = _resolved_set(_canonical_skill_roots())
+        proj = active_project_dir(state, session_key)
+        if proj is not None:
+            canonical |= _resolved_set([proj / ".kiro" / "skills"])
+        path = _resolve_package_skill_path(pkg_rel, canonical)
         if not path:
             return None
         candidate = path.parent
@@ -624,7 +1027,7 @@ def _resolve_skill_root(name: str, state: DashboardState) -> Path | None:
             resolved = candidate.resolve(strict=True)
         except OSError:
             return None
-        # Re-check the *resolved* target — a symlink within the AIM path could
+        # Re-check the *resolved* target — a symlink within the package path could
         # point at a sensitive location that the unresolved check missed
         # (consistent with the kirocrew/kiro branches below).
         if is_sensitive_path(str(resolved)):
@@ -672,7 +1075,7 @@ def _resolve_skill_root(name: str, state: DashboardState) -> Path | None:
         return None
     # Containment + symlink policy.  Skills can be nested under category
     # directories (``utils/multi-badger`` → ``<root>/utils/multi-badger``),
-    # and a skill directory itself may be a symlink (AIM ``--local`` installs
+    # and a skill directory itself may be a symlink (an edition may install
     # symlink ``~/.kiro/skills/<name>`` to ``~/.agents/skills/<name>``).  We
     # therefore require the candidate's *parent* directory to resolve to a
     # location at or under the trusted root — which permits the leaf to be a
@@ -705,32 +1108,28 @@ MAX_AGENT_SKILLS = 100
 _GLOB_CHARS = ("*", "?", "[")
 
 
-def _skill_key_roots(state: DashboardState) -> list[tuple[str, Path]]:
+def _skill_key_roots(state: DashboardState, session_key: str = "") -> list[tuple[str, Path]]:
     """``(key_prefix, root)`` pairs for every location skills are keyed from.
 
     Mirrors :func:`_resolve_skill_root`'s roots, in the same precedence order,
     so an enumerated key names the same directory that function would resolve.
     Roots that cannot exist in this deployment (no active project dir, no
-    edition roots) are omitted.
+    edition roots) are omitted. *session_key* scopes the ``kiro-workspace/``
+    root to the requesting chat slot's project, exactly as
+    :func:`_resolve_skill_root` does — the two MUST agree or an enumerated key
+    would not resolve (#2457).
     """
     out: list[tuple[str, Path]] = [("kiro-user/", Path.home() / ".kiro" / "skills")]
-    proj = active_project_dir(state)
+    proj = active_project_dir(state, session_key)
     if proj is not None:
         out.append(("kiro-workspace/", proj / ".kiro" / "skills"))
-    out.append(("", skills_dir()))
-    try:
-        # ``resolve()``, not just ``expanduser()``: a RELATIVE extra_paths entry
-        # would otherwise key the catalog by a relative root, and the persisted
-        # ``skill://`` URI would then resolve against whatever cwd the next
-        # kiro-cli session starts in — silently loading a different skill, or
-        # none. A skill root must be a stable absolute location.
-        out.extend(
-            ("", Path(p).expanduser().resolve())
-            for p in KiroCrewConfig.load().skills.extra_paths
-        )
-    except Exception:
-        logger.debug("failed to load extra skill paths from config", exc_info=True)
-    out.extend(("package/", r) for r in _edition_skill_roots())
+    out.extend(("", root) for root in _canonical_skill_roots()[1:])
+    # ``package/`` covers only the edition roots the core does not already key
+    # above — via the same helper the resolver uses, so enumeration and
+    # resolution cannot drift apart. A key the catalog offers must be one the
+    # resolver accepts, and vice versa.
+    canonical = _resolved_set(root for _prefix, root in out)
+    out.extend(("package/", root) for root in _edition_package_roots(canonical))
     return out
 
 
@@ -752,7 +1151,7 @@ def _collect_skills_under(
 
     Containment mirrors :func:`_resolve_skill_root`: a candidate's *parent* must
     resolve at or under the trusted root, which permits the skill directory
-    itself to be a symlink (AIM ``--local`` installs symlink
+    itself to be a symlink (an edition may install a skill by symlinking
     ``~/.kiro/skills/<name>`` to elsewhere) while still rejecting a symlinked
     *intermediate* directory that would let ``a/b`` escape the tree. Sensitive
     paths are rejected before and after symlink resolution.
@@ -788,7 +1187,7 @@ def _collect_skills_under(
             _collect_skills_under(entry, root, root_resolved, prefix, out, depth - 1)
 
 
-def enumerate_skill_catalog(state: DashboardState) -> dict[str, Path]:
+def enumerate_skill_catalog(state: DashboardState, session_key: str = "") -> dict[str, Path]:
     """Map every discoverable catalog key to its ``SKILL.md`` path.
 
     Built by **enumerating** the skill roots, never by joining a caller-supplied
@@ -800,12 +1199,17 @@ def enumerate_skill_catalog(state: DashboardState) -> dict[str, Path]:
     validate-then-join — it also removes the tainted-path dataflow that
     validate-then-join leaves for static analysis to flag.
 
+    *session_key* only selects which project's ``kiro-workspace/`` root joins
+    the walk (see :func:`_skill_key_roots`); it never widens the enumeration
+    property above. Results are computed per call — nothing is cached — so a
+    per-session root cannot leak into another session's catalog.
+
     It is additionally the single source of truth for BOTH directions of the
     key <-> URI mapping, so they cannot disagree: a mapping written against a
     symlinked skill directory inverts back to the same key it was written from.
     """
     catalog: dict[str, Path] = {}
-    for prefix, root in _skill_key_roots(state):
+    for prefix, root in _skill_key_roots(state, session_key):
         if is_sensitive_path(str(root)) or not root.is_dir():
             continue
         try:
@@ -834,6 +1238,7 @@ def skill_key_for_uri(
     agent_path: Path,
     state: DashboardState,
     catalog: dict[str, Path] | None = None,
+    session_key: str = "",
 ) -> str | None:
     """Invert a ``skill://`` resource URI back to a catalog key, or ``None``.
 
@@ -850,7 +1255,7 @@ def skill_key_for_uri(
     expanded = expand_skill_uri(uri, agent_path)
     if not expanded:
         return None
-    entries = catalog if catalog is not None else enumerate_skill_catalog(state)
+    entries = catalog if catalog is not None else enumerate_skill_catalog(state, session_key)
     wanted = Path(expanded)
     for key, path in entries.items():
         if path == wanted:
@@ -871,7 +1276,10 @@ def skill_key_for_uri(
 
 
 def skill_uri_for_key(
-    key: str, state: DashboardState, catalog: dict[str, Path] | None = None
+    key: str,
+    state: DashboardState,
+    catalog: dict[str, Path] | None = None,
+    session_key: str = "",
 ) -> str | None:
     """Resolve a catalog key to the ``skill://`` URI for its ``SKILL.md``.
 
@@ -882,7 +1290,7 @@ def skill_uri_for_key(
 
     Pass *catalog* to reuse one walk across many keys.
     """
-    entries = catalog if catalog is not None else enumerate_skill_catalog(state)
+    entries = catalog if catalog is not None else enumerate_skill_catalog(state, session_key)
     skill_md = entries.get(key)
     if skill_md is None:
         return None
@@ -890,7 +1298,7 @@ def skill_uri_for_key(
 
 
 def agent_skill_views(
-    data: dict[str, Any], agent_path: Path, state: DashboardState
+    data: dict[str, Any], agent_path: Path, state: DashboardState, session_key: str = ""
 ) -> tuple[list[str], list[str]]:
     """``(catalog_keys, unmanaged_uris)`` for *data*, from ONE catalog walk.
 
@@ -902,7 +1310,7 @@ def agent_skill_views(
     Filesystem-heavy (it enumerates the skill roots) — callers on the asyncio
     event loop MUST run this off the loop.
     """
-    catalog = enumerate_skill_catalog(state)
+    catalog = enumerate_skill_catalog(state, session_key)
     keys: list[str] = []
     unmanaged: list[str] = []
     seen: set[str] = set()
@@ -917,7 +1325,7 @@ def agent_skill_views(
 
 
 def agent_skill_keys(
-    data: dict[str, Any], agent_path: Path, state: DashboardState
+    data: dict[str, Any], agent_path: Path, state: DashboardState, session_key: str = ""
 ) -> list[str]:
     """Catalog keys for the skills *data* maps, de-duplicated, order-preserving.
 
@@ -925,11 +1333,11 @@ def agent_skill_keys(
     Templates editor owns and can rewrite. Wildcard / hand-authored URIs are
     excluded here and reported separately by :func:`agent_unmanaged_skill_uris`.
     """
-    return agent_skill_views(data, agent_path, state)[0]
+    return agent_skill_views(data, agent_path, state, session_key)[0]
 
 
 def agent_unmanaged_skill_uris(
-    data: dict[str, Any], agent_path: Path, state: DashboardState
+    data: dict[str, Any], agent_path: Path, state: DashboardState, session_key: str = ""
 ) -> list[str]:
     """``skill://`` URIs that the catalog editor cannot express, in order.
 
@@ -937,7 +1345,7 @@ def agent_unmanaged_skill_uris(
     the UI and preserved on every write so editing an agent through the dashboard
     never silently drops a hand-authored mapping.
     """
-    return agent_skill_views(data, agent_path, state)[1]
+    return agent_skill_views(data, agent_path, state, session_key)[1]
 
 
 def apply_skill_mapping(
@@ -945,6 +1353,7 @@ def apply_skill_mapping(
     agent_path: Path,
     state: DashboardState,
     keys: list[str],
+    session_key: str = "",
 ) -> tuple[list[str], list[str]]:
     """Rewrite *data*'s ``skill://`` resources to *keys*, in place.
 
@@ -966,7 +1375,7 @@ def apply_skill_mapping(
     # One enumeration for the whole write: every key resolved and every existing
     # URI inverted against the SAME snapshot, so a concurrent skill add/remove
     # cannot make the two halves disagree mid-request.
-    catalog = enumerate_skill_catalog(state)
+    catalog = enumerate_skill_catalog(state, session_key)
     for key in keys:
         if key in seen:
             continue
@@ -1106,11 +1515,32 @@ def _is_restricted_session(state: DashboardState, request: "Any") -> bool:
     slot = state._slots.get(slot_name)
     if slot and slot.is_restricted:
         return True
-    if sk.startswith("slack:"):
-        from kiro_crew.slack.handler import is_thread_incognito, is_thread_temporary
-
+    if is_channel_session_key(sk):
+        # Restore the DURABLE flags before consulting the in-memory maps. The
+        # privacy trackers are process-local and are only populated by
+        # ``privacy_mode.hydrate`` on an INBOUND channel message, so a turn that
+        # no inbound message drove — a cron with session="origin", a
+        # webhook-resumed session, a monitor/autonudge re-injection, a subagent —
+        # reaches this gate with empty maps after a gateway restart even though
+        # the user's !incognito is on disk. Calling the canonical restore (rather
+        # than reading the SessionMap directly) keeps one source of truth and
+        # self-heals the process-local view. Idempotent and allocation-free for
+        # unflagged keys.
+        #
+        # Namespace-agnostic on purpose. A ``startswith("slack:")`` test made this
+        # branch structurally unreachable for every other channel, so a
+        # ``telegram:{agent}:direct:{user}`` session the user marked incognito
+        # could never enter it and the ~30 dashboard mutations gated on this
+        # predicate stayed open for it.
+        _hydrate_conv_flags(state.sessions, sk)
         if is_thread_temporary(sk) or is_thread_incognito(sk):
             return True
+    # NOTE: deliberately no disk fallback for an absent slot. This predicate is
+    # a SYNC helper with ~49 call sites reachable from async handlers, so reading
+    # the persisted mode here would put blocking file I/O on the event loop
+    # (AUTOSDE ``no-blocking-call-on-event-loop``). The archived-session recovery
+    # is done off-loop instead, by the one caller that needs it —
+    # ``api_lessons_create`` — via ``_probe_persisted_session``.
     return False
 
 
@@ -1123,42 +1553,41 @@ def _blocks_reads_session(state: DashboardState, request: "Any") -> bool:
     slot = state._slots.get(slot_name)
     if slot and slot.blocks_reads:
         return True
-    if sk.startswith("slack:"):
-        from kiro_crew.slack.handler import is_thread_temporary
-
+    if is_channel_session_key(sk):
+        # Same durable-flag restore, and the same namespace-agnostic reach, as
+        # _is_restricted_session: a temporary conversation whose flags this
+        # process never hydrated must not serve reads, on any channel.
+        _hydrate_conv_flags(state.sessions, sk)
         if is_thread_temporary(sk):
             return True
+    # NOTE: deliberately no disk fallback for an absent slot. This predicate is
+    # a SYNC helper with ~49 call sites reachable from async handlers, so reading
+    # the persisted mode here would put blocking file I/O on the event loop
+    # (AUTOSDE ``no-blocking-call-on-event-loop``). The archived-session recovery
+    # is done off-loop instead, by the one caller that needs it —
+    # ``api_lessons_create`` — via ``_probe_persisted_session``.
     return False
 
 
-def _session_has_persisted_history(slot_name: str) -> bool:
-    """Return True iff the slot has a JSONL file in the data home's sessions/.
+# Byte ceiling for the session-metadata head read. The metadata line is a small
+# JSON object (a few hundred bytes); 64 KiB is generous headroom while keeping an
+# enormous or adversarial first line from being pulled into memory.
+_METADATA_HEAD_MAX_BYTES = 64 * 1024
 
-    This is a positive signal that the session was previously established
-    as non-ephemeral: ephemeral (incognito/temporary) sessions never write
-    to disk, so a persisted JSONL can only come from a real user session.
 
-    Used by ``api_lessons_create`` to distinguish between:
+def _persisted_session_paths(slot_name: str) -> list["Path"]:
+    """Every existing session transcript that *slot_name* could name.
 
-    * A legitimate MCP subprocess whose in-memory slot was evicted by the
-      idle-sweep loop (``session.py``'s 30-minute timeout). The subprocess
-      still holds the original ``KIROCREW_SESSION_KEY`` env var, so it
-      keeps sending the same ``X-Session-Key``, but ``state._slots`` has
-      moved on. Without this check such calls return HTTP 400 ``unknown
-      session`` even though the user is actively typing in the thread.
-
-    * A forged or stale key from a context that never had a real session
-      backing it — which should continue to be rejected.
-
-    Only checks existence, not contents. Authentication of the caller is
-    still enforced by the ``X-Internal-Secret`` middleware upstream; this
-    check only governs the *ephemeral vs non-ephemeral* distinction.
+    Returns more than one entry only when the key is genuinely ambiguous — see
+    :func:`_probe_persisted_session`, which treats that as unknown rather than
+    picking a winner.
     """
     if (
         not slot_name
         or "/" in slot_name
         or "\\" in slot_name
         or "\x00" in slot_name
+        or ":" in slot_name
         or slot_name.startswith(".")
     ):
         # Defence-in-depth against path traversal; ``KIROCREW_SESSION_KEY``
@@ -1168,10 +1597,19 @@ def _session_has_persisted_history(slot_name: str) -> bool:
         # (Windows) path separators, null bytes that can truncate C-level
         # path parsing, and leading dots that could target hidden
         # per-directory files outside the intended session namespace.
-        return False
+        #
+        # The colon is rejected for Windows, where it is not an ordinary
+        # character: ``WindowsPath("…/sessions") / "D:foo.jsonl"`` evaluates to
+        # ``D:foo.jsonl`` — a DRIVE-RELATIVE path that silently escapes the
+        # sessions directory entirely (verified; POSIX joins it literally and is
+        # unaffected). It also spells an NTFS alternate data stream
+        # (``file:stream``). A dashboard slot key never contains a colon: the
+        # transport prefix is stripped by the caller before this point, and
+        # ``_normalize_slot_key`` folds the key to ``[\\w\\-.]`` anyway.
+        return []
     sess_dir = config_dir() / "sessions"
     if not sess_dir.exists():
-        return False
+        return []
     # Match the resolution order used by slack/interactions.py when
     # linking Slack threads to existing sessions: bare stem first, then
     # the ``dashboard_`` prefix fallback for dashboard slots. Cron sessions
@@ -1180,14 +1618,153 @@ def _session_has_persisted_history(slot_name: str) -> bool:
     # dashboard slot ``dashboard:cron-{id}`` writes ``dashboard_cron-{id}.jsonl``.
     # Probe those too so an idle-evicted cron session is recognised rather
     # than misclassified as forged.
-    if (sess_dir / f"{slot_name}.jsonl").exists():
-        return True
-    if not slot_name.startswith("dashboard_") and (
-        sess_dir / f"dashboard_{slot_name}.jsonl"
-    ).exists():
-        return True
-    if (sess_dir / f"cron_{slot_name}.jsonl").exists():
-        return True
-    if (sess_dir / f"dashboard_cron-{slot_name}.jsonl").exists():
-        return True
-    return False
+    candidates = [sess_dir / f"{slot_name}.jsonl"]
+    if not slot_name.startswith("dashboard_"):
+        candidates.append(sess_dir / f"dashboard_{slot_name}.jsonl")
+    candidates.append(sess_dir / f"cron_{slot_name}.jsonl")
+    candidates.append(sess_dir / f"dashboard_cron-{slot_name}.jsonl")
+    return [p for p in candidates if p.exists()]
+
+
+def _persisted_session_path(slot_name: str) -> "Path | None":
+    """First existing transcript for *slot_name*, or None.
+
+    Existence only. When more than one candidate exists the answer is still
+    "yes, a session exists" — which is all the establish-vs-forged check needs.
+    Anything making an AUTHORIZATION decision must use
+    :func:`_probe_persisted_session`, which refuses to guess between them.
+    """
+    matches = _persisted_session_paths(slot_name)
+    return matches[0] if matches else None
+
+
+def _session_has_persisted_history(slot_name: str) -> bool:
+    """Return True iff the slot has a JSONL file in the data home's sessions/.
+
+    A positive signal that the session was previously **established** — i.e.
+    that the key belongs to a real session rather than being forged or stale.
+    It says nothing about the session's ``memory_mode``: every mode writes its
+    transcript to disk (``_save_slot_to_history`` has no ``memory_mode`` gate,
+    by design, so incognito/temporary tabs still survive a reload). Callers
+    gating *memory writes* must therefore consult
+    :func:`_persisted_session_memory_mode` as well — file existence alone is
+    not evidence that writes are permitted.
+
+    Used by ``api_lessons_create`` (in ``handlers/cron.py``) to distinguish
+    between:
+
+    * A legitimate MCP subprocess whose in-memory slot was evicted by the
+      idle-sweep loop (``session.py``'s 30-minute timeout) or archived by a
+      tab close. The subprocess still holds the original
+      ``KIROCREW_SESSION_KEY`` env var, so it keeps sending the same
+      ``X-Session-Key``, but ``state._slots`` has moved on. Without this
+      check such calls return HTTP 400 ``unknown session`` even though the
+      user is actively typing in the thread.
+
+    * A forged or stale key from a context that never had a real session
+      backing it — which should continue to be rejected.
+
+    Only checks existence, not contents. Authentication of the caller is
+    still enforced by the ``X-Internal-Secret`` middleware upstream; this
+    check only governs the *established vs forged* distinction.
+    """
+    return _persisted_session_path(slot_name) is not None
+
+
+def _persisted_session_memory_mode(slot_name: str) -> str | None:
+    """Return the ``memory_mode`` recorded in *slot_name*'s session metadata.
+
+    Three distinct outcomes, and the distinction IS the security property:
+
+    * ``"persistent"`` / ``"incognito"`` / ``"temporary"`` — read from the
+      metadata line. A metadata line that parses but carries no ``memory_mode``
+      is reported as ``"persistent"``: the field postdates the feature, so a
+      valid header without it is genuinely a legacy persistent session.
+    * ``None`` — **unknown**. No file, or no parseable metadata object as the
+      first line. Callers gating memory writes MUST deny on ``None`` rather
+      than treat it as persistent. Denying is safe: ``ConversationLog.append``
+      writes the metadata line when it creates the file, before any message is
+      appended, so a session file whose first line is not metadata was not
+      produced by a normal session and is no evidence that writes are allowed.
+
+    This is the recovery path for a session whose in-memory state is gone but
+    whose transcript is still on disk. Both in-memory signals a restricted
+    session normally carries are dropped when a tab is archived
+    (``api_chat_slot_close`` removes the slot from ``state._slots`` *and*
+    discards its key from ``state._restricted_keys``), while the transcript —
+    including its ``memory_mode`` marker — persists. Without reading that
+    marker back, an archived incognito session whose MCP subprocess is still
+    alive presents as an ordinary established session and its memory writes
+    are allowed.
+
+    Only the FIRST line is consulted, and only ``_METADATA_HEAD_MAX_BYTES`` of
+    it: a later ``_type: metadata`` object is message content, not the header,
+    and must not be able to redefine the mode. Byte-bounding keeps an enormous
+    or adversarial first line from pinning memory.
+
+    Blocking file I/O — call from a worker thread, never on the event loop
+    (AUTOSDE ``no-blocking-call-on-event-loop``); prefer
+    :func:`_probe_persisted_session`. Deliberately uncached: a cache would need
+    invalidation on every mode change and could itself go stale, which is the
+    exact failure class this closes.
+    """
+    path = _persisted_session_path(slot_name)
+    if path is None:
+        return None
+    return _read_memory_mode(path)
+
+
+def _read_memory_mode(path: "Path") -> str | None:
+    """Read the ``memory_mode`` out of *path*'s metadata line. See above."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(_METADATA_HEAD_MAX_BYTES)
+    except OSError:
+        return None
+    first, _sep, _rest = head.partition(b"\n")
+    try:
+        d = json.loads(first.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or d.get("_type") != "metadata":
+        return None
+    mode = d.get("memory_mode")
+    if mode is None:
+        # Valid header, field absent -> legacy persistent session.
+        return "persistent"
+    if not isinstance(mode, str):
+        return None
+    # Allowlist, not normalize-and-hope: an unrecognised value must read as
+    # unknown so the caller fails closed. Case/whitespace matter because the
+    # comparison downstream is set membership — `"incognito "` would lower() to
+    # itself, miss INCOGNITO_MEMORY_MODES, and be treated as unrestricted. The
+    # API validates this field on the way in, but a hand-edited or partially
+    # written transcript is not bound by that.
+    normalized = mode.strip().lower()
+    if normalized not in VALID_MEMORY_MODES:
+        return None
+    return normalized
+
+
+def _probe_persisted_session(slot_name: str) -> tuple[bool, str | None]:
+    """``(file_exists, memory_mode_or_None)`` for *slot_name*.
+
+    Refuses to guess when the key is **ambiguous**. ``slot_name`` reaches this
+    function with its transport namespace already stripped
+    (``sk.split(":", 1)[-1]``), so one stem can match several real transcripts —
+    e.g. a legacy Slack thread at ``<ts>.jsonl`` and an archived dashboard slot
+    named after that same ts at ``dashboard_<ts>.jsonl``. Taking the first
+    candidate would let a *persistent* file answer for an *incognito* session and
+    permit the write. Existence stays true (a session really does exist), but the
+    mode is reported as ``None`` = unknown, which the caller denies on.
+
+    Blocking I/O: hand this to a worker thread from an async caller
+    (``await asyncio.to_thread(_probe_persisted_session, slot_name)``). It is a
+    single composed call so one thread hop covers the whole probe.
+    """
+    matches = _persisted_session_paths(slot_name)
+    if not matches:
+        return False, None
+    if len(matches) > 1:
+        return True, None
+    return True, _read_memory_mode(matches[0])

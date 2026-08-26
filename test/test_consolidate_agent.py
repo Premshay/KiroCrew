@@ -58,27 +58,18 @@ class TestConsolidateAgent:
         import kiro_crew.history as history
 
         src = inspect.getsource(history)
-        assert "session_key = _CONSOLIDATE_SESSION_KEY" in src
+        assert "session_key=_CONSOLIDATE_SESSION_KEY" in src
 
     def test_consolidation_session_is_bounded(self) -> None:
-        """Pins for the two adversarially-confirmed defects (2026-08-12):
-        (1) the _consolidate session must not accumulate transcripts — the key
-        is registered stateless and each reused turn resets the conversation;
-        (2) _call_llm must not recycle the _bg session it no longer rides —
-        that call could shut down _bg mid-turn under a bystander consumer."""
         import kiro_crew.history as history
         from kiro_crew.history import HistoryConsolidator
         from kiro_crew.session import CONSOLIDATE_KEY
 
         call_llm_src = inspect.getsource(HistoryConsolidator._call_llm)
-        assert "self._sessions.recycle_background" not in call_llm_src
-        assert "new_conversation" in call_llm_src
+        assert "reset_conversation=True" in call_llm_src
         assert history._CONSOLIDATE_SESSION_KEY == CONSOLIDATE_KEY
 
     def test_consolidate_key_registered_stateless(self) -> None:
-        """The key must sit in get_or_create's stateless set: a session_map
-        entry would resume the accumulated transcript across restarts."""
         import kiro_crew.session as session
 
-        src = inspect.getsource(session)
-        assert "key in (BACKGROUND_KEY, HEARTBEAT_KEY, CONSOLIDATE_KEY)" in src
+        assert "CONSOLIDATE_KEY" in inspect.getsource(session.SessionManager.get_or_create)

@@ -1121,14 +1121,45 @@ defense-in-depth on top of it, not the boundary. Two tests pin both halves: the 
 are denied, and the `chr()`/two-step forms are the acknowledged gap.
 The STDIN forms are the same escape with no operand at all: `python -` and a bare interpreter
 read the program from stdin, so `python - <<'PY' … PY` and `echo '…' | python -` reach the CLI
-with the payload nowhere in argv. When that program text is visible on the command line — a
-heredoc body (later tokens) or a pipe producer (earlier tokens) — the import is matched across
-the whole frame and denied; when it is not (a file redirect, a bare `python -` fed by an unseen
-producer) there is nothing to match and the residual is noted rather than claimed as covered.
-`_python_reads_stdin` is precise (it consumes operand-flags and heredoc tags) so `python
-script.py`, `python -c …`, and `cat kiro_crew_notes.txt | python -` do not trip it, and the
-inline-program scan bails at the interpreter's first positional so the ReDoS-resistance budget
-still holds on spam input. Found in review (GPT 5.6).
+with the payload nowhere in argv. When that program text is visible on the command line the
+import is matched in the tokens that actually CARRY it, and nowhere else in the frame. The
+carriers are enumerated from the shell grammar rather than by example: a heredoc body
+(`<<TAG` / `<<-TAG`), a here-string operand (`<<<WORD`, whose word IS the program), a redirected
+file (`<WORD`), a process substitution (`< <(cmd)`, whose command text spans tokens to its
+closing paren), and a pipe producer. A redirection may appear ANYWHERE in a simple command, the
+program name included, so the whole frame is walked in ONE pass and a redirect glued to a word is
+classified from its first `<` onward — `<<'PY' python -`, `<prog.py python3 -`, `python3<<<'…'`
+and `<<EOF python - … EOF` (marker and body straddling the program name) are all ordinary bash
+reaching the identical mint. Only redirect OPERANDS are yielded, so a neighbouring command's
+ordinary argument is still never program text. `<&N` carries no text on the
+command line and is a stated residual. A heredoc's body ends at the LAST token equal to its
+tag: bash closes a heredoc only on a line holding the delimiter ALONE, and line structure does
+not survive tokenizing, so a body line that merely CONTAINS the word (`# EOF`, an ordinary
+comment) closed it early and left the real payload unscanned. A redirect OPERAND that opens a
+substitution (`$( )`, `<( )`, `${ }`, backticks) is one shell WORD whose text carries
+whitespace, so it too spans tokens — to the LAST matching closer, because `normalize_shell_command`
+strips quoting before this code runs, so a quoted delimiter is indistinguishable from a real one
+and balancing the count is not decidable. `_python_reads_stdin` consumes redirect operands
+through the same helper, so the detector and the carrier scope agree on where an operand ends;
+it also now answers True for `python < prog.py`, which does read its program from that file.
+Scanning the whole frame was a false-positive source: a frame is not split on a newline, so a
+neighbouring command naming the package in a FILE PATH (`isort src/kiro_crew/mcp_core.py`
+followed by any harmless heredoc) read as a mint with no `token` word present (#2660). The pipe
+is detected as a CHARACTER left of or glued into the interpreter token, not as a standalone `|`
+word: the tokenizer splits on whitespace only, so `echo '…'|python -` hands the operator over
+glued to a neighbour and `_program_basename` resolves the program from the last control-operator
+segment. Any pipe to the left qualifies the whole left side — a deliberate over-block, since a
+missed producer is a bypass while an extra token is a visible refusal. When the program text is
+NOT on the command line (a bare `python -` fed by an unseen producer, or a file written earlier
+and then redirected in) there is nothing to match and the residual is noted rather than claimed
+as covered — the same residual the written-then-run script form already has.
+`_python_reads_stdin` is precise (it consumes operand-flags and skips a heredoc's marker, body
+and closing tag, and a here-string's operand, read off the raw token because the operand
+normaliser strips a redirection to the empty string; a heredoc's closing tag ENDS the command,
+so a following `echo ok` is not read as this interpreter's script) so `python script.py`,
+`python -c …`, and `cat kiro_crew_notes.txt | python -`
+do not trip it, and the inline-program scan bails at the interpreter's first positional so the
+ReDoS-resistance budget still holds on spam input. Found in review (GPT 5.6).
 
 **There is deliberately NO migration from `config.json`, and adding one is the trap.** An
 interim revision had `migrate_from_config_if_needed`: on first read, if no keystone file
@@ -1913,9 +1944,11 @@ this is the one output a human is expected to forward by hand.
 
 ### Subprocess spawn
 
-`github_issues._run_gh` is the app's only subprocess spawn and is routed through
+`github_issues._run_gh` is the provider layer's GitHub spawn (the app also spawns
+`git` for ledger sync and `gh` for the rotation login — see "Windows
+compatibility" below) and is routed through
 **`sandboxed_spawn_argv`** (OS filesystem isolation + credential-scrubbed env) with
-a kernel resource ceiling from `resource_limit_preexec`. The repo, label set, and
+a kernel resource ceiling from `create_subprocess_limited`. The repo, label set, and
 comment body all come from agent-influenceable config, and `gh` reads the target
 repo's own config on the way — so this is an agent-influenced spawn in the sense
 `test/test_spawn_audit.py` polices, and it is routed rather than allowlisted.
@@ -2439,18 +2472,20 @@ upstream of this app:
   looking card.
 - `CollapsibleToolGroup` rendered its approval buttons only when **collapsed** —
   but a group with a live pending approval auto-expands, so the one turn waiting on
-  the user was the one turn they could not answer. Pinned by
+  the user was the one turn they could not answer. Fixed in #5487: the approval
+  row (preview + buttons) now renders in both disclosure states. Pinned by
   `website/src/test/collapsibleToolGroupApproval.test.tsx`.
 - A **failed** approval rendered as "Approved". `submitDecision` optimistically flips the
   card and relies on the promise `onApprove` returns to reject so its catch can roll that
   back — but `ChatEmbed.handleApprove` called `approveMutation.mutate()`, which returns
   `void` and swallows the rejection. So on a failed POST the card claimed success, the
   buttons vanished, and the agent stayed parked on a decision that never reached it: silent
-  every time, with no way to retry. `mutateAsync` is now RETURNED, and the whole chain
-  forwards it (`ChatMessageList`'s intermediate arrow included, or the rejection dies in the
-  middle). The `onApprove` prop type widened to `void | Promise<unknown>` to say so. Two
-  tests: a rejecting handler must leave the card answerable, a resolving one must not roll
-  back — the first fails against the old fire-and-forget shape. Found in review.
+  every time, with no way to retry. **This rollback wiring is NOT in the tree**: `ChatEmbed`
+  still calls `approveMutation.mutate(...)` and `ChatMessageListProps.onApprove` is typed
+  `=> void`, so the rejection dies at the type boundary and the rollback cannot fire on the
+  one mount that renders the row. The fix (return `mutateAsync`, widen the prop type to
+  `void | Promise<unknown>`, pin with a rejecting-handler test) is tracked separately —
+  see #5524.
 
 Layout: the embed scrolls via `h-full` + an inner `flex-1 overflow-y-auto`, so an
 ancestor MUST bound its height (`IncidentChat` owns a fixed-height flex column with
@@ -2858,13 +2893,14 @@ looking through.
 This app is portable, and the three places that could break it are pinned by tests rather
 than left to review:
 
-- **`preexec_fn` must come from `resource_limit_preexec()`.** Both external-binary spawns
-  (`git` for ledger sync, `gh` for the rotation login) pass it. The shim returns `None`
-  off POSIX, which is what makes them portable — `preexec_fn` is unsupported on Windows
-  and passing *any* callable, even a no-op, raises `ValueError`. A hand-rolled
-  `preexec_fn=lambda: ...` would work locally and fail on every Windows spawn; the test
-  asserts the shim appears on each `preexec_fn=` line (verified by temporarily swapping in
-  a raw lambda and watching it fail).
+- **Resource limits come from the shim wrappers, not a raw `preexec_fn`.** Both
+  external-binary spawns (`git` for ledger sync, `gh` for the rotation login) route
+  through `create_subprocess_limited` / `run_limited`, which deliver the resource caps
+  after `exec` via the spawn shim and fall back to `resource_limit_preexec()` only on a
+  host with no usable shim. That fallback returns `None` off POSIX, which is what makes
+  the spawns portable — `preexec_fn` is unsupported on Windows and passing *any*
+  callable, even a no-op, raises `ValueError`. A hand-rolled `preexec_fn=lambda: ...`
+  would work locally and fail on every Windows spawn.
 - **No raw POSIX process calls** (`os.killpg`, `os.getpgid`, `os.getuid`, `fcntl.`,
   `signal.SIGKILL`), no `/bin/sh`, no `shell=True`, no hardcoded `/tmp`.
 - **Timezone lookup degrades to UTC.** `rotation.yaml` may name an IANA zone, and Windows
@@ -2908,21 +2944,23 @@ review time, not to simulate the platform.
   install, which is the only path that reaches end users. The cron prompts
   reference `~/.kiro/crew/skills/ops-mission-control/sops/<name>.md` accordingly.
 
-  **Every SOP carries the auth recipe, not just SKILL.md.** The SKILL and all six SOPs
+  **Every SOP names the credentialed tool, not a token recipe.** The SKILL and all six SOPs
   told the agent to call HTTP endpoints and never said how to authenticate. An
   unattended `rotation-check` run therefore improvised: it hardcoded a port belonging to
   a different gateway, collected `{"error": "Token required"}` **65 times**, spent **41
   tool calls** hunting for a token the cron runner *deliberately destroys* before the
   first tool call, and hit the 1800s cron timeout without ever reaching the API. That
-  reads to an operator as "the app is broken" when the fix was six lines of docs.
+  reads to an operator as "the app is broken".
 
-  The recipe derives base URL and token from one `kirocrew token` call and passes
-  `?token=`. It is repeated in each SOP because a cron agent may read **only** its own
-  SOP. Three tests guard it: every SOP mentions `kirocrew token` and `?token=`; no auth
-  code block contains a literal `host:port` (a hardcoded port was the original failure —
-  and this test caught one I had just written myself); and the block passes `bash -n`,
-  because `${URL%%\?*}` is easy to mangle in markdown and an unparseable snippet sends
-  the agent straight back to improvising.
+  A token recipe cannot fix this — the builtin security rules block agents from minting
+  gateway tokens, by design. Agent access goes through the `ops_mission_control_api`
+  MCP tool instead: the MCP server process holds the gateway's internal secret and
+  forwards only a frozen (method, path) allowlist; the agent never sees a credential
+  (the `issue_radar_record_investigation` precedent). Each SOP names the tool and its
+  paths because a cron agent may read **only** its own SOP. Tests pin the three planes
+  to one surface: the allowlist in `validation.py`, the schema rejecting off-surface
+  calls, and the gateway's mixed-internal path set admitting exactly the allowlisted
+  routes — see `tests/test_agent_api_tool.py`.
 
   **The SOP→route contract scanner had silently narrowed to 4 of 10 endpoints.** It
   filtered lines on a literal `GATEWAY/api/apps/...` prefix, so rewriting the SOPs to

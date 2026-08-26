@@ -19,7 +19,11 @@ const DropdownMenuContent = React.forwardRef<
       sideOffset={sideOffset}
       className={cn(
         'z-[9999] min-w-[8rem] overflow-hidden rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
-        'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
+        // Entry animation only. Radix suspends unmount until an exit animation
+        // finishes, and the still-mounted dismissable layer consumes the next
+        // pointer-down — so an exit animation makes a re-click on the trigger a
+        // no-op for the animation's whole duration.
+        'data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95',
         'data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2',
         className
       )}
@@ -45,6 +49,28 @@ const DropdownMenuItem = React.forwardRef<
   />
 ))
 DropdownMenuItem.displayName = DropdownMenuPrimitive.Item.displayName
+
+/**
+ * A menu row that reports WHICH option is currently in effect. Screen readers
+ * announce a `menuitemradio` as checked/unchecked, which a plain item cannot
+ * convey — so a menu that stands in for a set of mutually exclusive
+ * destinations (a switcher) must use this rather than styling alone.
+ */
+const DropdownMenuRadioItem = React.forwardRef<
+  React.ComponentRef<typeof DropdownMenuPrimitive.RadioItem>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.RadioItem>
+>(({ className, ...props }, ref) => (
+  <DropdownMenuPrimitive.RadioItem
+    ref={ref}
+    className={cn(
+      'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-none transition-colors',
+      'focus:bg-bg-hover data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
+      className
+    )}
+    {...props}
+  />
+))
+DropdownMenuRadioItem.displayName = DropdownMenuPrimitive.RadioItem.displayName
 
 const DropdownMenuSeparator = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.Separator>,
@@ -98,7 +124,7 @@ const DropdownMenuSubContent = React.forwardRef<
       ref={ref}
       className={cn(
         'z-[9999] min-w-[8rem] overflow-hidden rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
-        'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
+        'data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95',
         className
       )}
       {...props}
@@ -120,4 +146,5 @@ export {
   DropdownMenuSubTrigger,
   DropdownMenuSubContent,
   DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
 }

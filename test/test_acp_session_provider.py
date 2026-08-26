@@ -8,6 +8,7 @@ import pytest
 
 from kiro_crew.acp.client import AcpProcessDied
 from kiro_crew.acp.runtime import AcpRuntimeDead
+from kiro_crew.acp.session_handle import WatchdogSettings
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import AcpEvent, AcpPromptStats
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
@@ -37,12 +38,17 @@ def _make_handle(
     return handle
 
 
-def _make_runtime(alive: bool = True) -> MagicMock:
-    """Create a mock AcpRuntime."""
+def _make_runtime(alive: bool = True, acp_backend: str = "") -> MagicMock:
+    """Create a mock AcpRuntime.
+
+    ``acp_backend`` mirrors the real constructor's default (kiro), because the
+    provider's ``backend`` delegates to it rather than returning a constant.
+    """
     runtime = MagicMock()
     runtime.is_alive.return_value = alive
     runtime._process = MagicMock(returncode=None if alive else 1)
     runtime._last_activity = 0.0
+    runtime.acp_backend = acp_backend
     return runtime
 
 
@@ -60,6 +66,22 @@ class TestAcpSessionProviderBasic:
         runtime = _make_runtime()
         provider = AcpSessionProvider(handle, runtime)
         assert provider.context_usage_pct() == 55.5
+
+    def test_context_usage_unknown_is_false_while_pct_is_measured(self):
+        handle = _make_handle(context_pct=55.5)
+        runtime = _make_runtime()
+        provider = AcpSessionProvider(handle, runtime)
+        assert provider.context_usage_unknown() is False
+
+    def test_context_usage_unknown_after_in_place_compaction(self):
+        """A compaction zeroes the percentage; the adapter must pass "unknown"
+        through so a threshold consumer does not read the session as brand new."""
+        handle = _make_handle(context_pct=91.0)
+        handle.last_prompt_stats.reset_after_compaction()
+        runtime = _make_runtime()
+        provider = AcpSessionProvider(handle, runtime)
+        assert provider.context_usage_pct() == 0.0
+        assert provider.context_usage_unknown() is True
 
     def test_context_window_tokens(self):
         handle = _make_handle(context_window=128000)
@@ -216,23 +238,56 @@ class TestAcpSessionProviderStream:
         assert collected[2].kind == EVENT_COMPLETE
 
     @pytest.mark.asyncio
-    async def test_stream_command_delegates_to_stream(self):
+    async def test_stream_command_routes_through_handle_stream_command(self):
+        """Slash commands go through the handle's NATIVE commands/execute path,
+        never through prompt() — a prompt round-trip would hand the command to
+        the model, which summarizes kiro-cli's output instead of returning it
+        (issue #4972)."""
         handle = _make_handle()
-        events = [AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")]
+        events = [
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="13 tools"),
+            AcpEvent(kind=EVENT_COMPLETE, stop_reason=""),
+        ]
+        seen_commands: list[str] = []
 
-        async def mock_prompt(msg):
+        async def mock_stream_command(command):
+            seen_commands.append(command)
             for e in events:
                 yield e
 
+        async def mock_prompt(msg):  # pragma: no cover — must never run
+            raise AssertionError("stream_command must not route through prompt()")
+            yield  # make it a generator
+
+        handle.stream_command = mock_stream_command
         handle.prompt = mock_prompt
         runtime = _make_runtime()
         provider = AcpSessionProvider(handle, runtime)
 
-        collected = []
-        async for event in provider.stream_command("/help"):
-            collected.append(event)
+        collected = [e async for e in provider.stream_command("/tools")]
 
-        assert len(collected) == 1
+        assert seen_commands == ["/tools"]
+        assert [e.kind for e in collected] == [EVENT_TEXT_CHUNK, EVENT_COMPLETE]
+        assert collected[0].text == "13 tools"
+
+    @pytest.mark.asyncio
+    async def test_stream_command_translates_runtime_dead(self):
+        """Runtime death mid-command stays inside the AcpError hierarchy
+        (AcpProcessDied), mirroring stream()'s translation."""
+
+        async def dead_stream_command(command):
+            raise AcpRuntimeDead("runtime died")
+            yield  # make it a generator
+
+        handle = _make_handle()
+        handle.stream_command = dead_stream_command
+        runtime = _make_runtime()
+        runtime.saw_not_logged_in = lambda: False
+        provider = AcpSessionProvider(handle, runtime)
+
+        with pytest.raises(AcpProcessDied):
+            async for _ in provider.stream_command("/tools"):
+                pass
 
 
 class TestAcpSessionProviderToolApproval:
@@ -397,11 +452,24 @@ class TestAcpSessionProviderClientCompat:
     """Tests for the AcpClient-compatible API surface."""
 
     def test_backend_is_empty_for_kiro(self):
-        """backend property returns empty string (kiro, not claude)."""
+        """backend reports empty string for a kiro runtime (not claude)."""
         handle = _make_handle()
         runtime = _make_runtime()
         provider = AcpSessionProvider(handle, runtime)
         assert provider.backend == ""
+
+    def test_backend_reports_the_runtimes_backend(self):
+        """Delegated, not constant.
+
+        This provider replaces the placeholder AcpClient on
+        ``AcpProvider._client`` once startup finishes, so it is the only place
+        a started provider's backend can still be read. Returning kiro
+        unconditionally would persist every KAS session under the kiro label.
+        """
+        handle = _make_handle()
+        runtime = _make_runtime(acp_backend="kas")
+        provider = AcpSessionProvider(handle, runtime)
+        assert provider.backend == "kas"
 
     def test_mcp_gateway_socket_is_mirrored_from_runtime(self):
         handle = _make_handle()
@@ -644,6 +712,42 @@ class TestAcpSessionProviderRound4Parity:
         assert provider._session_key == "dashboard:slot9"
         assert provider._channel_id == "chan-7"
         assert runtime._last_activity > 0.0
+
+    def test_rekey_rebinds_watchdog_to_claiming_crew(self):
+        """The claiming session's canonical crew identity travels with the
+        claim: rekey rebinds the live handle's watchdog snapshot AND updates
+        the runtime default so later sessions (new_conversation) inherit the
+        claimed crew, not the pool's spawn state."""
+        handle = _make_handle()
+        runtime = _make_runtime()
+        provider = AcpSessionProvider(handle, runtime)
+        wd = WatchdogSettings(tool_stall_suspect_secs=123.0)
+        provider.rekey("dashboard:slot9", "chan-7", crew_agent="pr-reviewer", watchdog=wd)
+        handle.rebind_watchdog.assert_called_once_with("pr-reviewer", settings=wd)
+        assert runtime._crew_agent == "pr-reviewer"
+        # An identity-less claim still rebinds (to the globals): a recycled
+        # runtime must not carry a previous crew's windows. Without a
+        # pre-resolved snapshot the rebind loads synchronously (settings=None).
+        provider.rekey("dashboard:slot3", None)
+        handle.rebind_watchdog.assert_called_with("", settings=None)
+        assert runtime._crew_agent == ""
+
+    def test_rekey_resets_context_state(self):
+        """#2932 -- the handoff must drop the previous session's context state
+        (mirror of AcpClient.rekey): _make_handle seeds pct=42/5000/200000, so
+        a leak here would hand those numbers to the claiming session and let
+        check_context_usage compact its empty conversation."""
+        handle = _make_handle()
+        runtime = _make_runtime()
+        provider = AcpSessionProvider(handle, runtime)
+        assert handle.last_prompt_stats.context_pct == 42.0  # seeded stale state
+        provider.rekey("dashboard:slot9", "chan-7")
+        stats = handle.last_prompt_stats
+        assert stats.context_pct == 0.0
+        assert stats.context_used_tokens == 0
+        assert stats.context_window_tokens == 0
+        assert stats.context_tokens_from_usage is False
+        assert stats.context_pct_unknown is False
 
     def test_agent_reads_from_runtime(self):
         """#5 -- session.py session-info introspection reads
@@ -1060,6 +1164,15 @@ class TestLivePathModelEntitlement:
         await provider.set_model("claude-opus-4.8")
 
         handle.set_model.assert_awaited_once_with("claude-opus-4.8")
+
+    @pytest.mark.asyncio
+    async def test_config_option_base_model_is_admitted_over_combined_wire_models(self):
+        provider, handle = self._provider(["gpt-5.6-sol[low]", "gpt-5.6-sol[high]"])
+        handle.config_options = [{"id": "model", "options": [{"value": "gpt-5.6-sol"}]}]
+
+        await provider.set_model("gpt-5.6-sol")
+
+        handle.set_model.assert_awaited_once_with("gpt-5.6-sol")
 
     @pytest.mark.asyncio
     async def test_unknown_advertised_set_still_applied(self):

@@ -37,7 +37,7 @@ Pocket replay: speaker click → POST /api/voice/replay → one-time GET URL
 
 ## Streaming Auto-Speak Flow
 
-1. User sends a message; `spokenLenRef` resets to 0
+1. User sends a message; `voiceProgressRef` clears its prior message identity
 2. Backend streams `chat_chunk` events via WebSocket
 3. Frontend accumulates text in a `streaming` message in Redux
 4. On each chunk flush, `sentenceCutter.ts` scans for sentence boundaries:
@@ -49,7 +49,7 @@ Pocket replay: speaker click → POST /api/voice/replay → one-time GET URL
 5. New complete sentences (≥ `MIN_TTS_CHARS`, 10 chars) are sent to `POST /api/voice/synthesize`
 6. Backend calls Polly per sentence, broadcasts `voice_chunk` (base64 MP3) via WS
 7. Frontend decodes chunks into blob URLs, queues them, plays sequentially
-8. On `chat_done`, any remaining unspoken tail text is synthesized
+8. On `chat_segment` or `chat_done`, any remaining unspoken tail text is synthesized before finalization
 9. `voice_complete` event carries the stitched full MP3 for replay
 
 ## Interrupt Mechanism
@@ -65,7 +65,7 @@ hands-free reply (barge-in) — triggers an interrupt:
    element, clears the queue, and sets `voiceMutedRef = true`
 4. Incoming `voice_chunk` events from the old response are dropped while muted
 5. `chat_done` for the old response skips remaining-text synthesis when muted
-6. When the new response's first sentence is detected (`spokenLenRef === 0`), `voiceMutedRef` resets to `false`
+6. When a new response message identity is observed, `voiceMutedRef` resets to `false`
 
 The DOM event pattern avoids prop drilling between `ChatPage` (where send lives) and `useWebSocket` (where audio state lives, called from `App.tsx`).
 
@@ -133,6 +133,29 @@ etc.). To use a specific profile, set `aws_profile` in the config:
 }
 ```
 
+### Sandbox requirement
+
+Both synthesis paths spawn a subprocess (`aws polly synthesize-speech` /
+`piper`), and both route it through `sandbox.wrap_argv(mode="standard")` because
+the argv carries LLM-derived text. `wrap_argv` **fail-closes** where the host
+offers no OS sandbox backend — every Windows host, and Linux without user
+namespaces — so on those hosts synthesis returns `None` until the operator sets
+`agent.sandbox_allow_unsandboxed_exec` in `config.json`.
+
+That refusal arrives as the typed `SandboxUnavailableError` and is caught ahead
+of the generic handler in both `_synthesize_polly` and `_synthesize_piper`. The
+generic handler logs "Polly synthesis error" / "piper synthesis error" with a
+stack trace, which misreads as an AWS-credential or piper-model fault and sends
+the operator to the wrong place.
+
+Both handlers log `exc.kind` plus **`str(exc)`** — the remedy prose the sandbox
+layer selected — and never compose their own remedy text. Only `kind ==
+"no_backend"` names the `agent.sandbox_allow_unsandboxed_exec` opt-in;
+`"transient"` means momentary resource pressure where the caller must *not*
+advise disabling the sandbox, and `"foreign_sandbox"` means this host's sandbox
+works and the fix is a kiro-cli setting. A hardcoded remedy would give the wrong
+instruction for two of the three kinds.
+
 ### API
 
 - `GET /api/voice/config` — returns current settings + `autoSpeak` flag
@@ -143,7 +166,11 @@ etc.). To use a specific profile, set `aws_profile` in the config:
 - `GET /api/voice/voices` — list available Polly voices via `aws polly
   describe-voices` (respects `aws_profile`/`region`), cached in-process for 1
   hour. Each entry: `{ id, name, language, languageCode, gender, engines }`,
-  sorted by `languageCode` then `name`
+  sorted by `languageCode` then `name`. If the `aws` CLI is not resolvable on
+  the gateway's PATH (it is optional — the default Piper provider doesn't
+  need it), the endpoint returns `{ "voices": [] }` with a 200 instead of
+  erroring; the empty result is not cached, so the list recovers once `aws`
+  becomes available
 
 ## Content Filtering for Speech
 
@@ -174,9 +201,12 @@ placeholders so listeners know content exists without hearing raw syntax.
 When the assistant calls a tool mid-response, the backend emits a `chat_segment`
 event that finalizes the current streaming message and starts a new one.
 
-The frontend resets `spokenLenRef` to 0 on `chat_segment` so the new segment's
-text is spoken from the beginning. Without this reset, the offset from segment 1
-would cause segment 2 to be skipped until its length exceeded the old offset.
+The frontend keys `voiceProgressRef` by `{slot, messageId}`. Before
+`chat_segment` finalizes the current streaming message, it synthesizes any
+unspoken tail of at least 10 characters and marks that message consumed. The
+next segment receives a new message identity and therefore starts at offset 0.
+This also prevents a background slot's segment event from resetting speech
+progress for the active slot.
 
 ## Synthesize Serialization
 
@@ -214,7 +244,7 @@ async pipeline: markdown strip → SSML → Polly → Slack file upload.
 | `voicePlayingRef` | `boolean` | True while an Audio element is playing |
 | `activeAudioRef` | `HTMLAudioElement` | Currently playing audio (for pause on interrupt) |
 | `autoSpeakRef` | `boolean` | Cached auto-speak preference from server |
-| `spokenLenRef` | `number` | Character offset of text already sent to TTS |
+| `voiceProgressRef` | `{ slot, messageId, spokenLen }` | Message-scoped character offset already sent to TTS |
 | `voiceMutedRef` | `boolean` | Suppresses incoming voice chunks after interrupt |
 | `synthChainRef` | `Promise` | Serializes synthesize calls to prevent out-of-order audio |
 | `synthInFlightRef` | `number` | In-flight synthesize POST count (feeds `voiceBusy`) |

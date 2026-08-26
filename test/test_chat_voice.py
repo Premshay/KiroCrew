@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -294,6 +296,8 @@ class TestVoiceConfig:
         assert streaming_called is False  # Polly path NOT used for Piper
         kinds = [c.args[0] for c in state.broadcast_ws.call_args_list]
         assert "voice_chunk" in kinds and "voice_complete" in kinds
+        payloads = [c.args[1] for c in state.broadcast_ws.call_args_list]
+        assert all(payload["audioMime"] == "audio/wav" for payload in payloads)
 
     @pytest.mark.asyncio
     async def test_put_config_invalid_json(self, tmp_path, monkeypatch):
@@ -372,13 +376,151 @@ class TestVoiceSynthesize:
         assert call_args[0][1]["slot"] == "s1"
 
 
+class TestVoiceReplay:
+    @pytest.mark.asyncio
+    async def test_replay_uses_legacy_path_for_non_pocket_provider(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", MagicMock(provider="piper"))
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            response = await client.post("/api/voice/replay", json={"slot": "s1", "text": "hello"})
+            assert response.status == 200
+            assert await response.json() == {"mode": "legacy"}
+
+    @pytest.mark.asyncio
+    async def test_pocket_replay_streams_one_time_ogg_url(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice._vc",
+            MagicMock(
+                provider="pocket", default_voice="michael", piper_binary="/bin/piper",
+                piper_model="/models/pocket.onnx", piper_model_config="", piper_length_scale=1.0,
+            ),
+        )
+
+        async def stream(*args, **kwargs):
+            assert args == ("hello",)
+            assert kwargs["voice_id"] == "michael"
+            yield b"OggSfirst"
+            yield b"second"
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.stream_pocket_speech", stream)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            created = await client.post("/api/voice/replay", json={"slot": "s1", "text": "hello"})
+            assert created.status == 200
+            body = await created.json()
+            assert body["mode"] == "stream"
+            assert "audio" not in body
+
+            replay = await client.get(body["url"])
+            assert replay.status == 200
+            assert replay.headers["Content-Type"].startswith("audio/ogg")
+            assert await replay.read() == b"OggSfirstsecond"
+
+            expired = await client.get(body["url"])
+            assert expired.status == 404
+
+    @pytest.mark.asyncio
+    async def test_pocket_replay_closes_generator_after_client_disconnect(self, monkeypatch):
+        from kiro_crew.dashboard import chat_voice
+
+        closed = asyncio.Event()
+
+        async def stream(*args, **kwargs):
+            try:
+                yield b"OggSfirst"
+                yield b"second"
+            finally:
+                closed.set()
+
+        class DisconnectingResponse:
+            def __init__(self, **kwargs):
+                self.headers = kwargs["headers"]
+
+            async def prepare(self, request):
+                return None
+
+            async def write(self, chunk):
+                if chunk == b"second":
+                    raise ConnectionError("client disconnected")
+
+            async def write_eof(self):
+                raise AssertionError("a disconnected stream must not write EOF")
+
+        monkeypatch.setattr(chat_voice, "stream_pocket_speech", stream)
+        monkeypatch.setattr(chat_voice.web, "StreamResponse", DisconnectingResponse)
+        chat_voice._pocket_replay_jobs["one-time"] = chat_voice._PocketReplayJob(
+            text="hello",
+            voice_id="michael",
+            piper_binary="/bin/piper",
+            piper_model="/models/pocket.onnx",
+            piper_model_config="",
+            length_scale=1.0,
+            expires_at=time.monotonic() + 60,
+        )
+
+        response = await chat_voice.api_voice_replay_stream(
+            MagicMock(match_info={"job_id": "one-time"})
+        )
+
+        assert isinstance(response, DisconnectingResponse)
+        assert closed.is_set()
+
+
+def _consent_to_polly(*, profile: str, region: str) -> None:
+    """Record operator consent for Polly under one profile+region pair."""
+    from kiro_crew import aws_consent
+
+    aws_consent.record_grant(
+        aws_consent.SERVICE_POLLY,
+        profile=profile,
+        region=region,
+        account="111122223333",
+        arn="arn:aws:iam::111122223333:user/test",
+        granted_at="2026-08-21T00:00:00+00:00",
+    )
+
+
 class TestVoiceVoices:
+    @pytest.fixture(autouse=True)
+    def _polly_consented(self, tmp_path_factory, monkeypatch):
+        """Consent for Polly under the default profile+region, throwaway home.
+
+        The voice catalogue is an ``aws polly describe-voices`` call, so it is
+        gated like every other billable Polly request. Cases that assert the
+        REFUSAL live in ``test_aws_consent.py``; these cases are about the
+        catalogue's own success and error handling, so they consent first.
+
+        Exactly ONE grant exists per service (a grant records the profile+region
+        it was given for), so a case using a different pair records its own --
+        see ``test_voices_returns_list``.
+        """
+        home = tmp_path_factory.mktemp("voices-consent-home")
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        from kiro_crew.config.loader import config_dir
+
+        config_dir().mkdir(parents=True, exist_ok=True)
+        _consent_to_polly(profile="", region="")
+        # The gate also verifies the LIVE account, which would spawn the AWS CLI
+        # behind this class's `resolve_polly_cli` stub. These cases are about
+        # the catalogue, so return a matching identity.
+        from kiro_crew import aws_consent
+
+        async def _probe(_profile, _region, *, use_cache=True):
+            return aws_consent.Identity(ok=True, account="111122223333")
+
+        monkeypatch.setattr(aws_consent, "probe_identity", _probe)
+
     @pytest.mark.asyncio
     async def test_voices_returns_list(self, tmp_path, monkeypatch):
         """Test successful voice listing."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        mock_vc = MagicMock(aws_profile="polly", region="us-east-1")
+        mock_vc = MagicMock(provider="polly", aws_profile="polly", region="us-east-1")
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        # This case uses a NON-default profile+region, and a grant is keyed on
+        # both, so the class fixture's grant does not cover it.
+        _consent_to_polly(profile="polly", region="us-east-1")
         # Reset cache
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache", None)
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache_ts", 0)
@@ -400,6 +542,9 @@ class TestVoiceVoices:
             return proc
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", mock_exec)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/local/bin/aws"
+        )
 
         from kiro_crew.dashboard.chat_voice import api_voice_voices
         app = web.Application()
@@ -419,7 +564,7 @@ class TestVoiceVoices:
         """Test that cached voices are returned without subprocess call."""
         import time
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        mock_vc = MagicMock(aws_profile="", region="")
+        mock_vc = MagicMock(provider="polly", aws_profile="", region="")
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cached = [
             {"id": "Ruth", "name": "Ruth", "language": "English",
@@ -443,7 +588,7 @@ class TestVoiceVoices:
     async def test_voices_cli_failure(self, tmp_path, monkeypatch):
         """Test error handling when aws cli fails."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        mock_vc = MagicMock(aws_profile="", region="")
+        mock_vc = MagicMock(provider="polly", aws_profile="", region="")
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache", None)
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache_ts", 0)
@@ -458,6 +603,9 @@ class TestVoiceVoices:
             return proc
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", mock_exec)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/local/bin/aws"
+        )
 
         from kiro_crew.dashboard.chat_voice import api_voice_voices
         app = web.Application()
@@ -473,25 +621,26 @@ class TestVoiceVoices:
         """Test timeout handling."""
         import asyncio
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        mock_vc = MagicMock(aws_profile="", region="")
+        mock_vc = MagicMock(provider="polly", aws_profile="", region="")
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache", None)
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache_ts", 0)
 
         async def mock_exec(*args, **kwargs):
             proc = MagicMock()
-
-            async def comm():
-                raise asyncio.TimeoutError()
-            proc.communicate = comm
+            # First await (under wait_for) times out; the second (the reap
+            # after kill) drains the pipes and returns.
+            proc.communicate = AsyncMock(
+                side_effect=[asyncio.TimeoutError(), (b"", b"")]
+            )
             proc.kill = MagicMock()
-
-            async def _wait():
-                return 0
-            proc.wait = _wait
+            proc.wait = AsyncMock()
             return proc
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", mock_exec)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/local/bin/aws"
+        )
 
         from kiro_crew.dashboard.chat_voice import api_voice_voices
         app = web.Application()
@@ -502,58 +651,108 @@ class TestVoiceVoices:
             resp = await client.get("/api/voice/voices")
             assert resp.status == 504
 
-
-class TestVoiceReplay:
     @pytest.mark.asyncio
-    async def test_replay_uses_legacy_path_for_non_pocket_provider(self, tmp_path, monkeypatch):
+    async def test_voices_timeout_reaps_child_via_communicate_not_wait(
+        self, tmp_path, monkeypatch
+    ):
+        """After a timeout kills the describe-voices child, the cleanup must
+        call ``communicate()`` -- not ``wait()`` -- so that PIPE buffers are
+        drained. A child blocked writing to a full stderr PIPE would hang the
+        request handler if only ``wait()`` were used (#5975)."""
+        import asyncio
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_voice._vc", MagicMock(provider="piper")
-        )
-        state = _make_state(tmp_path)
-        async with TestClient(TestServer(_make_voice_app(state))) as client:
-            response = await client.post(
-                "/api/voice/replay", json={"slot": "s1", "text": "hello"}
-            )
-            assert response.status == 200
-            assert await response.json() == {"mode": "legacy"}
+        mock_vc = MagicMock(provider="polly", aws_profile="", region="")
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache", None)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache_ts", 0)
 
-    @pytest.mark.asyncio
-    async def test_pocket_replay_streams_one_time_ogg_url(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=[asyncio.TimeoutError(), (b"", b"")])
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+
+        async def mock_exec(*args, **kwargs):
+            return proc
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", mock_exec)
         monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_voice._vc",
-            MagicMock(
-                provider="pocket",
-                default_voice="michael",
-                piper_binary="/bin/piper",
-                piper_model="/models/pocket.onnx",
-                piper_model_config="",
-                piper_length_scale=1.0,
-            ),
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/local/bin/aws"
         )
 
-        async def stream(*args, **kwargs):
-            assert args == ("hello",)
-            assert kwargs["voice_id"] == "michael"
-            yield b"OggSfirst"
-            yield b"second"
+        from kiro_crew.dashboard.chat_voice import api_voice_voices
+        app = web.Application()
+        app["state"] = _make_state(tmp_path)
+        app.router.add_get("/api/voice/voices", api_voice_voices)
 
-        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.stream_pocket_speech", stream)
-        state = _make_state(tmp_path)
-        async with TestClient(TestServer(_make_voice_app(state))) as client:
-            created = await client.post(
-                "/api/voice/replay", json={"slot": "s1", "text": "hello"}
-            )
-            assert created.status == 200
-            body = await created.json()
-            assert body["mode"] == "stream"
-            assert "audio" not in body
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/voice/voices")
+            assert resp.status == 504
 
-            replay = await client.get(body["url"])
-            assert replay.status == 200
-            assert replay.headers["Content-Type"].startswith("audio/ogg")
-            assert await replay.read() == b"OggSfirstsecond"
+        proc.kill.assert_called_once()
+        # The critical pin: reap via communicate(), not wait(). The handler
+        # awaits communicate once under wait_for; the reap must award a
+        # SECOND await, and wait() must never be touched. (A bare
+        # ``communicate.assert_awaited()`` would pass even against a
+        # wait()-based reap, so it must be this count/not_awaited shape.)
+        assert proc.communicate.await_count == 2
+        proc.wait.assert_not_awaited()
 
-            expired = await client.get(body["url"])
-            assert expired.status == 404
+    @pytest.mark.asyncio
+    async def test_voices_aws_not_found(self, tmp_path, monkeypatch):
+        """aws CLI absent from PATH → 200 with empty list, no subprocess spawn."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(provider="polly", aws_profile="", region="")
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache", None)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache_ts", 0)
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: None)
+        spawn = AsyncMock()
+        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+
+        from kiro_crew.dashboard.chat_voice import api_voice_voices
+        app = web.Application()
+        app["state"] = _make_state(tmp_path)
+        app.router.add_get("/api/voice/voices", api_voice_voices)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/voice/voices")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {"voices": []}
+        spawn.assert_not_called()
+        # The empty result must NOT be cached — the list should recover
+        # as soon as `aws` becomes resolvable.
+        from kiro_crew.dashboard import chat_voice
+        assert chat_voice._voices_cache is None
+
+    @pytest.mark.asyncio
+    async def test_voices_exec_file_not_found(self, tmp_path, monkeypatch):
+        """which() succeeds but the exec itself raises FileNotFoundError
+        (binary removed in between, or a script with a missing interpreter)
+        → same graceful empty-list degrade, no 500."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(provider="polly", aws_profile="", region="")
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache", None)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache_ts", 0)
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/local/bin/aws"
+        )
+
+        async def mock_exec(*args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "aws")
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", mock_exec)
+
+        from kiro_crew.dashboard.chat_voice import api_voice_voices
+        app = web.Application()
+        app["state"] = _make_state(tmp_path)
+        app.router.add_get("/api/voice/voices", api_voice_voices)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/voice/voices")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {"voices": []}

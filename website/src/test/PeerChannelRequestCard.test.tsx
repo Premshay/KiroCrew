@@ -34,7 +34,7 @@ describe('PeerChannelRequestCard', () => {
     expect(parsePeerChannelRequest('[Peer channel request]\nA named peer requested your attention.')).toBeNull()
   })
 
-  it('names the sender while keeping the exact peer body folded by default', async () => {
+  it('uses neutral labels while keeping the exact peer body folded by default', async () => {
     const parsed = parsePeerChannelRequest(REQUEST)!
     const user = userEvent.setup()
     render(<PeerChannelRequestCard parsed={parsed} />)
@@ -53,5 +53,14 @@ describe('PeerChannelRequestCard', () => {
       'The cache identity patch is ready for review.',
     )
     expect(screen.queryByText('Review this peer channel message and respond only')).toBeNull()
+  })
+
+  it('labels an interrupt request as urgent without exposing its delivery mode', () => {
+    const parsed = parsePeerChannelRequest(REQUEST.replace('Delivery: next_turn', 'Delivery: interrupt'))!
+    render(<PeerChannelRequestCard parsed={parsed} />)
+
+    const toggle = screen.getByTestId('peer-channel-request-toggle')
+    expect(toggle).toHaveTextContent('Urgent')
+    expect(toggle).not.toHaveTextContent('interrupt')
   })
 })

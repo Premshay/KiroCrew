@@ -36,7 +36,6 @@ platform where the transport is newest, and would do it while CI stayed green.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 import sys
@@ -83,9 +82,30 @@ def _init_frame(req_id: int) -> str:
 
 
 async def _spawn_stub(
-    *, socket_path: Path, server: str, agent: str, work_dir: Path, home: Path
+    *,
+    socket_path: Path,
+    server: str,
+    agent: str,
+    work_dir: Path,
+    home: Path,
+    poolable: bool = True,
+    session_key: str = "",
 ) -> asyncio.subprocess.Process:
-    """Launch a REAL stub process, exactly as the rewriter's overlay would."""
+    """Launch a REAL stub process, exactly as the rewriter's overlay would.
+
+    ``poolable`` mirrors the flag the rewriter passes: set, the backend may be
+    shared with other connections carrying the same PoolKey; unset, this
+    connection gets its own.
+
+    ``session_key`` is what the stub puts in its Register frame, and therefore
+    what gatewayd injects as the caller block. Empty means the stub registers
+    without an identity -- a state gatewayd handles by forwarding ``caller=None``.
+    """
+    env = {**_clean_env(), "KIROCREW_HOME": str(home)}
+    if session_key:
+        env["KIROCREW_SESSION_KEY"] = session_key
+    else:
+        env.pop("KIROCREW_SESSION_KEY", None)
     return await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
@@ -98,13 +118,14 @@ async def _spawn_stub(
         "--socket", str(socket_path),
         "--sandbox-mode", "off",
         "--approval-mode", "auto",
+        *(["--poolable"] if poolable else []),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         # KIROCREW_HOME redirects the stub's fallback audit log into the test's
         # own tree, so a degradation is observable instead of landing in the
         # developer's real home.
-        env={**_clean_env(), "KIROCREW_HOME": str(home)},
+        env=env,
     )
 
 
@@ -116,6 +137,28 @@ def _clean_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k != "KIROCREW_CHANNEL_ID"}
 
 
+async def _drive_frame(proc: asyncio.subprocess.Process, frame: str, req_id: int) -> dict:
+    """Write one arbitrary JSON-RPC frame through the stub and read its reply."""
+    assert proc.stdin is not None and proc.stdout is not None
+    stdin, stdout = proc.stdin, proc.stdout
+    stdin.write(frame.encode("utf-8"))
+    await stdin.drain()
+
+    async def _read_reply() -> dict:
+        while True:
+            line = await stdout.readline()
+            if not line:
+                raise AssertionError("stub closed stdout before replying")
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") == req_id:
+                return msg
+
+    return await asyncio.wait_for(_read_reply(), timeout=_REPLY_TIMEOUT)
+
+
 async def _drive_initialize(proc: asyncio.subprocess.Process, req_id: int) -> dict:
     """Write one ``initialize`` through the stub and return the parsed reply.
 
@@ -124,28 +167,23 @@ async def _drive_initialize(proc: asyncio.subprocess.Process, req_id: int) -> di
     the reply back also proves the whole chain (stub -> gateway -> backend ->
     stub) carried it, not merely that a process appeared.
     """
-    assert proc.stdin is not None and proc.stdout is not None
-    # Bound to locals so the None-narrowing survives into the closure below;
-    # mypy does not carry an outer narrowing across a nested function.
-    stdin, stdout = proc.stdin, proc.stdout
-    stdin.write(_init_frame(req_id).encode("utf-8"))
-    await stdin.drain()
+    return await _drive_frame(proc, _init_frame(req_id), req_id)
 
-    async def _read_reply() -> dict:
-        while True:
-            line = await stdout.readline()
-            if not line:
-                raise AssertionError(
-                    "stub closed stdout before replying to initialize"
-                )
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # non-JSON diagnostics are not part of the protocol
-            if msg.get("id") == req_id:
-                return msg
 
-    return await asyncio.wait_for(_read_reply(), timeout=_REPLY_TIMEOUT)
+async def _drive_tool_call(proc: asyncio.subprocess.Process, req_id: int) -> dict:
+    """Write one ``tools/call`` through the stub.
+
+    ``initialize`` carries no caller block (gatewayd injects on forwarded
+    requests, and the handshake is cached across stubs), so proving injection
+    needs a per-turn frame.
+    """
+    frame = json.dumps({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "method": "tools/call",
+        "params": {"name": "noop", "arguments": {}},
+    }) + "\n"
+    return await _drive_frame(proc, frame, req_id)
 
 
 async def _reap(procs: list[asyncio.subprocess.Process]) -> None:
@@ -175,6 +213,97 @@ def _launch_count(log: Path) -> int:
     if not log.exists():
         return 0
     return len([ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()])
+
+
+def _observed_callers(log: Path) -> list[str]:
+    """The session key each ``tools/call`` reached the backend carrying."""
+    if not log.exists():
+        return []
+    return log.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.asyncio
+async def test_two_stubs_on_one_backend_are_told_apart(tmp_path: Path, short_sock_dir) -> None:
+    """Each session's calls reach the SHARED backend carrying its own identity.
+
+    The unit tests around ``kirocrew-cron`` prove the server CONSUMES the caller
+    block. They cannot prove gatewayd SENDS one, which is the half that was
+    broken: ``backend.py`` strips any stub-supplied block from every forwarded
+    request and re-injects its own only when the backend advertised
+    ``kirocrew.caller-identity`` -- and that capability is parsed off a REAL
+    ``initialize`` response, a step the in-process stub seam every other gateway
+    test uses does not go through.
+
+    So this drives two real stubs with different session keys onto one pooled
+    backend and reads back what the backend was actually handed. Counting
+    backends (the sibling test) says they shared a process; this says the shared
+    process could still tell them apart.
+    """
+    endpoint_root = short_sock_dir
+    sock = endpoint_root / "gw.sock"
+    work_dir = tmp_path / "ws"
+    work_dir.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    launch_log = tmp_path / "launches.txt"
+    caller_log = tmp_path / "callers.txt"
+
+    def _resolver(_key: object) -> tuple[str, list[str], dict[str, str], str]:
+        return (
+            sys.executable,
+            [str(_FAKE_SERVER), str(launch_log), str(caller_log)],
+            {},
+            str(work_dir),
+        )
+
+    stop = asyncio.Event()
+    daemon = asyncio.create_task(
+        gw.run_gatewayd(
+            socket_path=sock,
+            max_backends=8,
+            idle_timeout_secs=300,
+            stop_event=stop,
+            target_resolver=_resolver,
+            prewarm_count=0,
+        )
+    )
+    procs: list[asyncio.subprocess.Process] = []
+    try:
+        for _ in range(100):
+            if transport.endpoint_exists(sock):
+                break
+            await asyncio.sleep(0.05)
+        assert transport.endpoint_exists(sock), "gatewayd never bound its endpoint"
+
+        keys = ["dashboard:alice", "dashboard:bob"]
+        for i, key in enumerate(keys):
+            proc = await _spawn_stub(
+                socket_path=sock, server="fake", agent="probe",
+                work_dir=work_dir, home=home, session_key=key,
+            )
+            procs.append(proc)
+            reply = await _drive_initialize(proc, req_id=i + 1)
+            assert "result" in reply, f"stub {key} got no initialize result: {reply}"
+            reply = await _drive_tool_call(proc, req_id=100 + i)
+            assert "result" in reply, f"stub {key} got no tools/call result: {reply}"
+
+        assert _launch_count(launch_log) == 1, (
+            "the two stubs did not share a backend, so this run says nothing "
+            "about telling co-tenants apart"
+        )
+
+        observed = _observed_callers(caller_log)
+        assert observed == keys, (
+            f"the shared backend saw {observed!r}, expected {keys!r}. An empty "
+            "string means nothing injected a caller block -- the backend cannot "
+            "tell its co-tenants apart and every session-scoped path in it "
+            "silently falls back to unattached behaviour. Two identical values "
+            "would mean worse: one session's identity applied to another's call."
+        )
+    finally:
+        await _reap(procs)
+        stop.set()
+        await asyncio.wait_for(daemon, timeout=30)
 
 
 @pytest.mark.asyncio
@@ -268,33 +397,117 @@ async def test_real_stubs_sharing_a_key_share_one_backend(tmp_path: Path, short_
             daemon.cancel()
 
 
+@pytest.mark.asyncio
+async def test_real_stubs_without_poolable_get_their_own_backend(
+    tmp_path: Path, short_sock_dir
+) -> None:
+    """The decoupling assertion: a stub exists either way, sharing does not.
+
+    3 real stubs, one identical PoolKey, none declared poolable -> 3 MCP server
+    processes. Two things have to hold at once, and only asserting both
+    distinguishes a real decoupling from either failure mode:
+
+    * 3 backends, not 1 -- opting out of pooling really means opting out. One
+      backend here would be the silent cross-session sharing the PoolKey has no
+      dimension to prevent.
+    * no stub degraded to per-session exec -- the stub IS in the path, which is
+      what gives the connection an address for an MCP Apps callback. 3 backends
+      with 3 fallbacks would be the old behaviour wearing this test's result.
+    """
+    endpoint_root = short_sock_dir
+    sock = endpoint_root / "gw.sock"
+    work_dir = tmp_path / "ws"
+    work_dir.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    launch_log = tmp_path / "launches.txt"
+
+    def _resolver(_key: object) -> tuple[str, list[str], dict[str, str], str]:
+        return (sys.executable, [str(_FAKE_SERVER), str(launch_log)], {}, str(work_dir))
+
+    stop = asyncio.Event()
+    daemon = asyncio.create_task(
+        gw.run_gatewayd(
+            socket_path=sock,
+            # Deliberately smaller than the number of private backends: they are
+            # outside this budget, so a cap of 1 must not throttle or reject
+            # them. A shared-budget implementation fails here.
+            max_backends=1,
+            idle_timeout_secs=300,
+            stop_event=stop,
+            target_resolver=_resolver,
+            prewarm_count=0,
+        )
+    )
+    procs: list[asyncio.subprocess.Process] = []
+    try:
+        for _ in range(100):
+            if transport.endpoint_exists(sock):
+                break
+            await asyncio.sleep(0.05)
+        assert transport.endpoint_exists(sock), "gatewayd never bound its endpoint"
+
+        for i in range(3):
+            proc = await _spawn_stub(
+                socket_path=sock, server="fake", agent="probe",
+                work_dir=work_dir, home=home, poolable=False,
+            )
+            procs.append(proc)
+            reply = await _drive_initialize(proc, req_id=i + 1)
+            assert "result" in reply, f"stub {i} got no initialize result: {reply}"
+
+        assert _launch_count(launch_log) == 3, (
+            f"3 non-poolable stubs sharing one PoolKey produced "
+            f"{_launch_count(launch_log)} backends, expected 3 — they were "
+            "collapsed onto a shared backend, which is the silent cross-session "
+            "sharing this path exists to avoid."
+        )
+
+        fallback = home / "logs" / "stub_fallback.jsonl"
+        assert not fallback.exists(), (
+            "a non-poolable stub degraded to per-session exec instead of going "
+            f"through the gateway, so it has no callback address: "
+            f"{fallback.read_text()}"
+        )
+    finally:
+        await _reap(procs)
+        stop.set()
+        try:
+            await asyncio.wait_for(daemon, timeout=30)
+        except asyncio.TimeoutError:  # pragma: no cover - daemon shutdown hang
+            daemon.cancel()
+
+
 def _windows_collect_ignore() -> list[str]:
-    """Extract ``collect_ignore`` from conftest's SOURCE, not its runtime state.
+    """Read the Windows exclusion list from its DATA FILE, not conftest's runtime state.
 
     Importing conftest and reading the attribute looks equivalent and is not:
     the list is assigned inside ``if platform_compat.IS_WINDOWS:``, so on the
     Linux matrix -- the only place this guard runs -- the attribute does not
     exist at all and ``getattr(..., [])`` silently yields an empty set. Every
     membership assertion against it then passes vacuously, which is precisely
-    the class of false pass this guard exists to prevent. Reading the literal
-    out of the source is platform-independent.
+    the class of false pass this guard exists to prevent. Reading the file is
+    platform-independent.
+
+    The names used to be string literals inside conftest and were extracted by
+    parsing its AST. They now live in ``windows-collect-ignore.txt`` because a
+    second reader needs them: naming a file explicitly on the pytest command
+    line bypasses ``collect_ignore``, so the CI reduced-scope selector
+    (``scripts/ci-surface-tests.py``) has to apply the same exclusion itself.
+    Reading that file keeps this guard pointed at the real source of truth --
+    an AST walk over conftest now finds no literals and would go blind.
     """
-    tree = ast.parse(Path(__file__).with_name("conftest.py").read_text(encoding="utf-8"))
-    found: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if not any(
-            isinstance(t, ast.Name) and t.id == "collect_ignore" for t in node.targets
-        ):
-            continue
-        if isinstance(node.value, (ast.List, ast.Tuple)):
-            found += [
-                el.value for el in node.value.elts
-                if isinstance(el, ast.Constant) and isinstance(el.value, str)
-            ]
+    listfile = Path(__file__).with_name("windows-collect-ignore.txt")
+    found = [
+        name
+        for name in (
+            ln.split("#", 1)[0].strip()
+            for ln in listfile.read_text(encoding="utf-8").splitlines()
+        )
+        if name
+    ]
     assert found, (
-        "could not find any collect_ignore string literals in conftest.py — this "
+        f"could not read any excluded filenames from {listfile.name} — this "
         "guard has gone blind and would pass no matter what was excluded"
     )
     return found
@@ -332,3 +545,24 @@ def test_pool_integ_is_never_silently_skipped_on_windows() -> None:
         assert not offenders, (
             f"pooling assertions were added to the Windows skip list: {offenders}"
         )
+
+
+@pytest.mark.asyncio
+async def test_backends_hosting_stub_covers_exclusive() -> None:
+    """The stub lookup must cover exclusive (private) backends too: a
+    private stub rekeys like a pooled one, and omitting it would leave the
+    previous caller's subscriptions routing to the new owner."""
+    from kiro_crew.mcp_gateway.pool import BackendPool
+
+    class _Stub:
+        def __init__(self, inboxes: dict) -> None:
+            self._stub_inboxes = inboxes
+
+    pool = BackendPool(max_backends=4)
+    pooled = _Stub({"s-pooled": object()})
+    private = _Stub({"s-private": object()})
+    pool._backends["d1"] = pooled  # type: ignore[assignment]
+    pool._exclusive["d2"] = private  # type: ignore[assignment]
+    assert pool.backends_hosting_stub("s-pooled") == [pooled]
+    assert pool.backends_hosting_stub("s-private") == [private]
+    assert pool.backends_hosting_stub("s-none") == []

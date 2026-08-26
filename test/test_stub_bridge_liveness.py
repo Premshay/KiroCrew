@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +21,8 @@ from kiro_crew.mcp_gateway.stub import (
     BridgeLivenessFailure,
     run_bridge,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Pin to one xdist worker (requires --dist loadgroup) alongside the other
 # mcp_gateway suites.
@@ -139,7 +142,7 @@ async def test_slow_call_not_killed_when_pongs_arrive() -> None:
                 if isinstance(msg, dict) and msg.get("type") == _BRIDGE_PING_TYPE:
                     pong = json.dumps({"type": _BRIDGE_PONG_TYPE}) + "\n"
                     self._feed.feed_data(pong.encode())
-            except (json.JSONDecodeError, ValueError):
+            except ValueError:
                 pass
 
         async def drain(self) -> None:
@@ -348,7 +351,7 @@ def _safe_json_get_type(data: bytes) -> str:
         msg = json.loads(data)
         if isinstance(msg, dict):
             return msg.get("type", "")
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         pass
     return ""
 
@@ -374,11 +377,15 @@ class TestLivenessIsNegotiated:
         ].default is False
 
     def test_gatewayd_advertises_the_capability(self) -> None:
-        """The stub's gate is only reachable if the daemon actually offers it."""
-        from pathlib import Path
+        """The stub's gate is only reachable if the daemon actually offers it.
 
-        src = Path("src/kiro_crew/mcp_gateway/gatewayd.py").read_text(encoding="utf-8")
-        assert '"capabilities": ["ensure_backend", "bridge_ping"]' in src
+        Asserted against the advertised set rather than gatewayd's source text:
+        a grep for one literal breaks whenever an unrelated capability is added,
+        and passes if the list is built but never sent.
+        """
+        from kiro_crew.mcp_gateway.gatewayd import REGISTERED_CAPABILITIES
+
+        assert "bridge_ping" in REGISTERED_CAPABILITIES
 
     def test_liveness_path_does_not_exec(self) -> None:
         """The degrade path must fail fast, not exec a fresh server.
@@ -389,9 +396,7 @@ class TestLivenessIsNegotiated:
         session's tools are lost either way, and exec would additionally discard
         the socket a future reconnect could reuse.
         """
-        from pathlib import Path
-
-        src = Path("src/kiro_crew/mcp_gateway/stub.py").read_text(encoding="utf-8")
+        src = (_REPO_ROOT / "src/kiro_crew/mcp_gateway/stub.py").read_text(encoding="utf-8")
         marker = "if liveness_failure is not None:"
         assert marker in src
         tail = src[src.index(marker):]

@@ -39,12 +39,75 @@ isolates the agent, and stacking a second sandbox would break it.
 
 Set via `kirocrew config set agent.sandbox auto`.
 
+## ACP Backend
+
+`agent.acp_backend` selects which ACP agent Kiro Crew drives. `agent.provider`
+stays `acp` either way — the backend is a choice *within* ACP, not a different
+provider.
+
+| Value | Agent | Status |
+|-------|-------|--------|
+| `""` (default) | kiro-cli | full support |
+| `kas` | kiro-agent (KAS) | runs chat; some surfaces still missing |
+
+**What works on `kas`:** normal chat — your configured agent, its prompt, its tool
+allowlist, and session resume. The context-usage percentage meter, compaction
+(summarization) status, and agent-switch echoes are wired: KAS reports these as
+`session/update` discriminants (`session_info_update` with a `context_usage` /
+`turn_completion` / `summarization_*` kind, and `current_mode_update`) rather than
+the separate `_kiro.dev/*` methods kiro-cli uses, and Kiro Crew maps them back to
+the same displays.
+
+**What does not, yet:**
+
+- Native subagent progress reporting (subagents run; their live progress does not
+  surface in the UI).
+- Slash commands: KAS advertises them (`available_commands_update`), but Kiro Crew
+  surfaces no available-commands UI for any backend (kiro-cli's
+  `_kiro.dev/commands/available` is likewise unconsumed), and slash-command
+  *execution* is not wired.
+- Auto-approve (`allowedTools`) is not carried over, so KAS applies its own
+  default approval policy.
+- `spawn_continue` works for runs started with an explicit keep, but not for
+  opportunistically-retained shared subagents.
+- Model selection is unverified: KAS advertises no model list on an
+  unauthenticated session, and Kiro Crew only sends a model the session
+  advertised, so a session may simply run KAS's own default model.
+
+**Signals with no KAS analog** (documented so they are not mistaken for gaps):
+KAS has no `clear/status` notification, and its MCP methods (`_kiro/mcp/status`,
+`_kiro/mcp/toggle`) are request-side only — it emits no MCP server-init
+notification for Kiro Crew to surface. A resumable-session existence probe would
+use KAS's `_kiro/session/list` (which returns the full `sessions[]` to search by
+id); that is deferred to the session-lifecycle work, not the display path.
+
+
+**KAS gets its token from kiro-cli.** Kiro Crew launches KAS with
+`--auth=acp-callback`, so KAS keeps no credential of its own: whenever it needs
+an access token it calls back over ACP (`_kiro/auth/getAccessToken`) and Kiro
+Crew answers by shelling out to `kiro-cli chat _ get-kas-token`, which
+resolves-and-refreshes the token. The refresh token never leaves kiro-cli's own
+store, and this process only ever holds a short-lived access token in transit —
+never cached, never logged. This works on any machine where `kiro-cli login` has
+succeeded; a machine that is not signed in gets an auth error on the first
+prompt (the session still starts cleanly). Sign in with kiro-cli before
+switching.
+
+It also needs a KAS bundle already extracted on the machine by kiro-cli; set
+`KIROCREW_KAS_NODE` / `KIROCREW_KAS_SCRIPT` to point elsewhere.
+
+An unrecognized value logs a warning and falls back to the default backend, so a
+typo costs you a line in the log rather than a gateway that will not start.
+
+Set via `kirocrew config set agent.acp_backend kas`.
+
 ## Key Settings
 
 ```json
 {
   "agent": {
     "provider": "acp",
+    "acp_backend": "",
     "approval_mode": "auto",
     "model": "auto",
     "reasoning_effort": "",
@@ -62,7 +125,7 @@ Set via `kirocrew config set agent.sandbox auto`.
   },
   "session": {
     "timeout_secs": 3600,
-    "autocompact_pct": 90.0,
+    "autocompact_pct": 70.0,
     "pool_size": 0,
     "pool_agent": "",
     "pool_ttl_secs": 1800
@@ -71,6 +134,7 @@ Set via `kirocrew config set agent.sandbox auto`.
     "url": "",
     "restore_sessions": false,
     "restore_window_minutes": 30,
+    "qr_session_until_restart": true,
     "merge_queued_messages": false,
     "mcp_probe_timeout_secs": 15
   },
@@ -96,14 +160,15 @@ Set via `kirocrew config set agent.sandbox auto`.
     "history_max_days": 365
   },
   "skills": {
-    "max_triggered": 3
+    "max_triggered": 0
   },
   "knowledge": {
-    "auto_ingest_artifacts": true,
-    "auto_add_documents": true,
-    "auto_register_project_docs": true,
+    "auto_ingest_artifacts": false,
+    "auto_add_documents": false,
+    "auto_register_project_docs": false,
     "auto_ingest_artifact_kinds": ["markdown", "text", "html", "json"],
     "auto_ingest_chunk_budget": 150,
+    "folder_ingest_chunk_budget": 300,
     "dedup_every_n_sweeps": 12
   },
   "auto_update": true,
@@ -133,14 +198,14 @@ Set via `kirocrew config set agent.sandbox auto`.
 | `agent.spawn_min_memory_gb` | Minimum available memory (GB) to spawn a subagent (0 disables the check) | `4.0` |
 | `agent.completion_keep` | Which end of the subagent transcript to keep in the completion event injected into the parent session: `"head"`, `"tail"`, or `"both"` (head + middle marker + tail) | `"head"` |
 | `agent.completion_keep_chars` | Max characters retained in the completion event after applying `completion_keep`. `0` disables truncation. The full transcript stays on disk (see `subagent_result_ttl_secs`) | `3000` |
-| `agent.subagent_result_ttl_secs` | How long a delivered subagent's `result.txt` is retained before the reaper prunes it, so the parent can read the full transcript on demand instead of re-running the subagent | `3600` (1h) |
+| `agent.subagent_result_ttl_secs` | How long a delivered subagent's `result.txt` is retained before the reaper prunes it, so the parent can read the full transcript on demand instead of re-running the subagent. Measured from the moment the completion reaches the parent, not from when the run finished | `3600` (1h) |
 
 ### Session
 
 | Key | Description | Default |
 |-----|-------------|---------|
 | `session.timeout_secs` | Idle session timeout in seconds (0 disables the idle sweep) | `3600` (60 min) |
-| `session.autocompact_pct` | Context usage percentage at which auto-compaction triggers (5-90) | `90.0` |
+| `session.autocompact_pct` | Context usage percentage at which auto-compaction triggers (5-90). Lower compacts sooner and keeps per-turn cost down; higher retains more conversation before rewriting it. Applies to new installs: an existing `config.json` keeps its stored value | `70.0` |
 | `session.pool_size` | Number of pre-spawned kiro-cli processes kept ready for instant session start. 0 disables | `0` |
 | `session.pool_agent` | Agent for warm-pool processes. Empty uses `agent.default_agent` | `""` |
 | `session.pool_ttl_secs` | Max age in seconds for pooled processes, discarded at claim time. 0 disables | `1800` |
@@ -154,6 +219,7 @@ Set via `kirocrew config set agent.sandbox auto`.
 | `dashboard.url` | Dashboard URL for remote access | `""` (localhost only) |
 | `dashboard.restore_sessions` | Restore sessions on restart | `false` |
 | `dashboard.restore_window_minutes` | Minutes after restart within which sessions can be restored | `30` |
+| `dashboard.qr_session_until_restart` | Keep a phone signed in for as long as the gateway process runs. Ordinary idling no longer signs it out; a gateway restart does, and so does going 30 days untouched (the refresh credential's lifetime, renewed on each visit). Turn off for a timed session that expires on a clock whether or not the gateway is still running. | `true` |
 | `dashboard.merge_queued_messages` | Concatenate follow-up messages while the agent is busy | `false` |
 | `dashboard.mcp_probe_timeout_secs` | Seconds to wait for an MCP server handshake during a probe (5-120) | `15` |
 
@@ -172,15 +238,52 @@ Only the owner (`KIROCREW_OWNER_ID`) is authorized to interact over Slack.
 Multi-user access and open channels are refused regardless of what these lists
 contain, so treat them as bookkeeping rather than an access grant.
 
+Other channels (Discord, Telegram, Teams, Webex, WeCom, WeChat) are configured
+from the dashboard — see each channel's doc for keys and credentials.
+
 ### Speech-to-text
 
 | Key | Description | Default |
 |-----|-------------|---------|
 | `stt.enabled` | Enable voice-memo transcription | `true` |
-| `stt.provider` | `"whisper"` (local), `"mlx"` (local, Apple silicon), or `"transcribe"` (AWS, needs the `voice` extra) | `"whisper"` |
+| `stt.provider` | `"whisper"` (local), `"mlx"` (local, Apple silicon), `"parakeet"` (local, Apple silicon, NVIDIA Parakeet), `"apple"` (local, macOS 26+), or `"transcribe"` (AWS, needs the `voice` extra) | `"whisper"` |
+| `stt.parakeet_model` | Hugging Face repo for the parakeet-mlx model (parakeet provider only) | `"mlx-community/parakeet-tdt-0.6b-v3"` |
 | `stt.streaming` | Stream partial transcripts live into the dashboard input. Transcribe provider only | `false` |
 | `stt.transcribe_region` | AWS region for the Transcribe API (transcribe provider only) | `"us-east-1"` |
 | `stt.language_code` | Language for speech recognition, e.g. `en-US`, `fr-FR` | `"en-US"` |
+
+### Paid AWS services need an explicit confirmation
+
+Two providers reach a **paid** AWS service: `voice_reply.provider: "polly"`
+(text-to-speech) and `stt.provider: "transcribe"` (speech-to-text). Selecting
+one is not enough to start spending — neither sends a request until you confirm
+it in **Settings > Voice**, and the confirmation names the AWS account it
+resolves to first.
+
+Three things worth knowing:
+
+- **An empty profile is not "no account".** With `aws_profile` /
+  `transcribe_profile` unset, nothing is passed to the provider and its own
+  default credential chain resolves — environment variables, the shared config's
+  `default` profile, or container/instance metadata. The confirmation shows you
+  which account that turns out to be.
+- **A confirmation is tied to the profile, region and account it was given for.**
+  Changing the profile or region asks again, and the live account is re-checked
+  before each call: if the profile is later repointed at a different AWS account,
+  the call is refused and the confirmation withdrawn.
+- **The check needs to be able to run.** If the account cannot be resolved, the
+  call is refused rather than allowed, so an outage withholds a paid request
+  instead of risking an unconfirmed charge.
+
+The record lives in `aws_service_consent.json` in the data home rather than in
+`config.json`, because it is an authorization rather than a preference: it is on
+the read+write keystone floor, so an agent can neither read it nor grant itself
+permission to spend. The authenticated dashboard is the only writer — there is
+deliberately no CLI verb, because a terminal command that records a grant on
+request is a grant an automated caller can take.
+
+Both local defaults (`piper` for TTS, `whisper` for STT) need no AWS account and
+no confirmation.
 
 ### Memory and embeddings
 
@@ -198,6 +301,7 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.semantic_confidence_threshold` | Minimum similarity score for a semantic search result | `0.8` |
 | `memory.episodic_max_results` | Max episodic memories injected per session | `8` |
 | `memory.episodic_max_count` | Max total episodic memories stored | `10000` |
+| `memory.decay_rates` | Per-tag episodic recency decay rates, per day (score factor `exp(-rate * days_old)`). Keys are memory tags (case-insensitive); the reserved `default` key replaces the built-in `0.03` for memories matching no configured tag. A memory carrying several configured tags uses the slowest (smallest) rate, so a broad tag can never age out a long-retention one. `0` never ages out of retrieval ranking; `1` falls out of retrieval within about a day. Ranking only: `episodic_max_count` cap eviction (lowest importance, then oldest) still applies regardless of decay rate. Values are clamped to `0..10`; non-numeric values are ignored with a logged warning. Example: `{"legal_precedents": 0.0, "trading_data": 1.0}` | `{}` |
 | `memory.history_idle_hours` | Hours of inactivity before history consolidation | `3.0` |
 | `memory.history_max_days` | Days of history to retain before pruning | `365` |
 
@@ -205,18 +309,19 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `skills.max_triggered` | Maximum skills loaded per message (at least 1) | `3` |
+| `skills.max_triggered` | Maximum skills loaded per message (>=0) | `0` |
 | `skills.lazy_load` | Inject only a usage-ranked top-K of on-demand skills at session start and leave the long tail discoverable via search, so a large skills set cannot crowd out memory and lessons | `false` |
 
 ### Knowledge Library
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `knowledge.auto_ingest_artifacts` | Auto-ingest content-bearing local artifacts into the Knowledge Library as a searchable "Artifacts" source, kept in sync and removed when the artifact is deleted (see [Knowledge Library](knowledge-library-how-it-works.md)) | `true` |
+| `knowledge.auto_ingest_artifacts` | Auto-ingest content-bearing local artifacts into the Knowledge Library as a searchable "Artifacts" source, kept in sync and removed when the artifact is deleted (see [Knowledge Library](knowledge-library-how-it-works.md)). Opt-in: enabling it backfills the artifacts you already have | `false` |
 | `knowledge.auto_ingest_artifact_kinds` | Artifact kinds eligible for auto-ingest. `widget` is excluded as UI rather than a document; `svg` is excluded because the file reader has no support for it | `["markdown", "text", "html", "json"]` |
-| `knowledge.auto_add_documents` | Let the agent add documents it reads while working to the Knowledge Library (one aggregate "Auto-added" source). The agent fetches the content with its own tools under your approval; Kiro Crew fetches nothing, so `doc_ingest_hosts` does not apply. Renamed from `auto_ingest_doc_links`, which is still accepted on read | `true` |
-| `knowledge.auto_register_project_docs` | Register the documents of each project you work in as a Knowledge source automatically. Documents only (`.md`/`.pdf`/`.docx`/`.org` above a size floor, excluding agent instructions, generated files and repository boilerplate) — never source code | `true` |
-| `knowledge.auto_ingest_chunk_budget` | Chunks an automatically-registered source may ingest per watcher sweep. Each chunk is one LLM extraction call, so this bounds the cost; newest documents land first and the rest follow on later sweeps. 0 removes the bound. Folders you add by hand are never budgeted | `150` |
+| `knowledge.auto_add_documents` | Let the agent add documents it reads while working to the Knowledge Library (one aggregate "Auto-added" source). The agent fetches the content with its own tools under your approval; Kiro Crew fetches nothing, so `doc_ingest_hosts` does not apply. Renamed from `auto_ingest_doc_links`, which is still accepted on read | `false` |
+| `knowledge.auto_register_project_docs` | Register the documents of each project you work in as a Knowledge source automatically. Documents only (`.md`/`.pdf`/`.docx`/`.org` above a size floor, excluding agent instructions, generated files and repository boilerplate) — never source code. Opt-in: once on it applies to every project you open, with no per-project confirmation | `false` |
+| `knowledge.auto_ingest_chunk_budget` | Chunks an automatically-registered source may ingest per watcher sweep. Each chunk is one LLM extraction call, so this bounds the cost; newest documents land first and the rest follow on later sweeps. 0 removes the bound | `150` |
+| `knowledge.folder_ingest_chunk_budget` | Chunks a folder you add by hand may ingest per watcher sweep, including the first scan started by confirming the source. Nothing is skipped — newest files land first and the rest continue on later sweeps — so this paces spend rather than limiting what is ingested. Higher than the auto-ingest budget because you asked for the folder explicitly. 0 removes the bound; a per-source `chunk_budget` property overrides it for one folder | `300` |
 | `knowledge.dedup_every_n_sweeps` | Run a full duplicate-collapsing pass every Nth watcher sweep (the per-write gate only catches byte-identical documents). 0 disables | `12` |
 | `knowledge.auto_discover_folder` | Watch for a documents folder inside the active workspace and register it as a Knowledge source automatically, so files dropped there become searchable without adding the source by hand. The folder is never created for you, and deleting or pausing the auto-added source persists so it does not reappear on the next sweep. Off by default because ingestion spends LLM extraction on every supported file | `false` |
 | `knowledge.auto_discover_dirname` | Folder name inside the workspace that auto-discovery looks for. A single path segment: separators and traversal are rejected so the source cannot be redirected outside the workspace. Avoid `knowledge`, which is where the Library's own store lives and always exists | `"knowledge-docs"` |
@@ -254,7 +359,8 @@ A per-job `timezone` on a cron job wins over this global value.
 
 ## Credentials
 
-`~/.kiro/crew/.env` holds the Slack tokens and owner ID:
+`~/.kiro/crew/.env` holds messaging-channel credentials and the owner ID. For
+Slack:
 
 ```
 SLACK_APP_TOKEN=xapp-...

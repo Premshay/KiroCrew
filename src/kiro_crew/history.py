@@ -1,6 +1,6 @@
 """Persistent conversation history — JSONL per session + LLM consolidation.
 
-Session files: ~/.kirocrew/sessions/{safe_key}.jsonl
+Session files: ~/.kiro/crew/sessions/{safe_key}.jsonl
 Each entry tracks provenance (source_thread, source_user) for citation.
 Files auto-rotate at 512KB, keeping last 200 lines.
 """
@@ -20,37 +20,31 @@ import time as _time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Container, Iterator
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.frontmatter import SKILL_UPDATE, frontmatter_value
 from kiro_crew.llm_helpers import (
     ToolApprovalPolicy,
+    background_turn,
     parse_llm_json,
     stream_and_collect,
     stream_and_collect_json,
 )
-from kiro_crew.messaging.link import legacy_key
+from kiro_crew.messaging.link import canonical_key, legacy_key
 from kiro_crew.preview_text import strip_markdown_preview
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
-from kiro_crew.session import BACKGROUND_KEY, CONSOLIDATE_KEY
+from kiro_crew.session import CONSOLIDATE_KEY
 from kiro_crew.skills import AUTO_SKILL_MAX_PROCEDURE_CHARS, AutoSkillProvenance
-
-# Consolidation's dedicated session key (defined next to its stateless
-# registration in session.py). Separate from BACKGROUND_KEY because
-# get_or_create binds an agent identity only at cold-start: the shared ``_bg``
-# session is created at gateway startup as kirocrew-lite, so any agent passed
-# for the ``_bg`` key afterwards is silently ignored. Consolidation needs its
-# kirocrew-consolidate identity to reach the provider factory (and the engine
-# map behind it), which requires a key whose cold-start it owns.
-_CONSOLIDATE_SESSION_KEY = CONSOLIDATE_KEY
 from kiro_crew.skills_dedupe import (
     VERDICT_DUP,
     VERDICT_NEW,
@@ -64,6 +58,8 @@ from kiro_crew.vector_memory_constants import (
     _MAX_SEMANTIC_PER_CONSOLIDATION,
 )
 
+_CONSOLIDATE_SESSION_KEY = CONSOLIDATE_KEY
+
 if TYPE_CHECKING:
     from kiro_crew.learn import LessonStore
     from kiro_crew.memory import MemoryStore
@@ -76,72 +72,41 @@ logger = logging.getLogger(__name__)
 SESSIONS_DIR_NAME = "sessions"
 ARCHIVE_DIR_NAME = "archive"
 ARCHIVE_RETENTION_DAYS = 7
+
+# Separates a transcript's stem from an archive segment's timestamp. NOT a dot,
+# because session keys legitimately contain dots (a Slack thread_ts), which would
+# make a right-most-dot parse attribute a segment to the wrong session.
+ARCHIVE_SEGMENT_DELIMITER = "__"
 _CONSOLIDATION_THRESHOLD = 30  # preferences/projects update threshold (messages)
-# Backlog at which the frequent pass ALSO writes history, rather than waiting for
-# the idle gap that is otherwise the only trigger advancing ``last_consolidated``.
-# A session that never goes idle never reaches that path: the largest observed one
-# ran ~2 days without a single 3h gap while producing 6,645 messages, and the
-# frequent pass ran throughout — so the system looked healthy while writing no
-# history at all (2026-08-07 to 08-13). Sized well above
-# ``_CONSOLIDATION_THRESHOLD`` so ordinary sessions still consolidate on idle
-# exactly as they do today; this is a safety net, not a replacement for it.
-_HISTORY_LAG_THRESHOLD = 300  # unconsolidated messages
-# Automatic consolidation is background maintenance. A failed attempt waits
-# before re-entering its provider so a transient fault cannot crowd out
-# foreground work with repeated self-contained prompts.
-_AUTO_CONSOLIDATION_RETRY_DELAY_S = 15 * 60
-_AUTO_CONSOLIDATION_BUSY_RETRY_DELAY_S = 60
-_AUTO_CONSOLIDATION_UNAVAILABLE_RETRY_DELAY_S = 5 * 60
-_AUTO_RETRY_AFTER_FIELD = "consolidation_retry_after"
-_AUTO_RETRY_ATTEMPTS_FIELD = "consolidation_retry_attempts"
-_AUTO_RETRY_REASON_FIELD = "consolidation_retry_reason"
-# Consolidation produces a short structured record. A healthy local large-context
-# seat completes that work well inside this deadline; retaining a stuck ACP turn
-# would otherwise hold the dedicated worker indefinitely and block the queue.
+# A continuously active session never reaches the idle-only history path.  This
+# durable-offset threshold is its safety net; preferences can keep updating
+# without silently leaving the transcript unprocessed forever.
+_HISTORY_LAG_THRESHOLD = 300
+# A consolidation turn produces a compact structured record. Bound a stalled
+# provider so its dedicated background session cannot block later maintenance.
 _CONSOLIDATION_TURN_TIMEOUT_S = 3 * 60
 _CONSOLIDATION_CANCEL_ACK_TIMEOUT_S = 5.0
+_CONSOLIDATION_LANE_BUSY_RETRY_S = 60.0
+_CONSOLIDATION_NO_LANE_RETRY_S = 5 * 60.0
 # The consolidator cannot know a provider's tokenizer or hidden system prompt.
 # This conservative character window leaves room for provider-supplied context
 # while preserving message boundaries.
 _CONSOLIDATION_CHUNK_MAX_CHARS = 64 * 1024
-# Skill detection judges a wider window than the incremental history tail: a
-# reusable procedure usually spans the whole session, not just the slice since
-# the last consolidation, so a tail-only view systematically misses skills in
-# any session consolidated more than once. Bound the window so pathologically
-# long sessions stay cost-safe.
-_SKILL_DETECTION_WINDOW = 200
-
-
-class _DirectConsolidationDeferred(Exception):
-    """A local fleet refusal that should be retried without consuming a turn."""
-
-    def __init__(self, detail: str, retry_after_s: float) -> None:
-        super().__init__(detail)
-        self.retry_after_s = retry_after_s
-
-
-_direct_consolidation_defer: contextvars.ContextVar[_DirectConsolidationDeferred | None] = (
-    contextvars.ContextVar("direct_consolidation_defer", default=None)
-)
 
 
 def _post_consolidation_request(
-    endpoint: str,
-    model: str,
-    auth_token: str,
-    prompt: str,
-    timeout: float,
+    endpoint: str, model: str, auth_token: str, prompt: str, timeout: float
 ) -> dict:
     """Submit one Anthropic-compatible, non-streaming consolidation request."""
     payload = json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-        }
+        {"model": model, "messages": [{"role": "user", "content": prompt}]}
     ).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
+        # Consolidation is maintenance on Nexus's shared local fleet. It may
+        # run only on an idle compatible lane, so it cannot queue behind or
+        # evict an interactive turn.
         "X-Fleet-Require-Idle": "true",
     }
     if auth_token:
@@ -154,26 +119,27 @@ def _post_consolidation_request(
         if exc.code != 503:
             raise
         try:
-            payload = json.loads(exc.read().decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
+            refusal = json.loads(exc.read().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
             raise
-        if not isinstance(payload, dict) or payload.get("code") not in {
-            "fleet_lane_busy",
-            "fleet_no_available_lane",
-        }:
+        if not isinstance(refusal, dict):
             raise
-        default_delay = (
-            _AUTO_CONSOLIDATION_BUSY_RETRY_DELAY_S
-            if payload["code"] == "fleet_lane_busy"
-            else _AUTO_CONSOLIDATION_UNAVAILABLE_RETRY_DELAY_S
+        code = refusal.get("code")
+        if code not in {"fleet_lane_busy", "fleet_no_available_lane"}:
+            raise
+        default_retry = (
+            _CONSOLIDATION_LANE_BUSY_RETRY_S
+            if code == "fleet_lane_busy"
+            else _CONSOLIDATION_NO_LANE_RETRY_S
         )
         try:
-            retry_after_s = float(exc.headers.get("Retry-After", default_delay))
+            retry_after_s = float(exc.headers.get("Retry-After", default_retry))
         except (TypeError, ValueError):
-            retry_after_s = default_delay
-        raise _DirectConsolidationDeferred(
-            str(payload.get("error") or payload["code"]), retry_after_s
-        ) from exc
+            retry_after_s = default_retry
+        if not math.isfinite(retry_after_s) or retry_after_s <= 0:
+            retry_after_s = default_retry
+        detail = str(refusal.get("error") or code)
+        raise _ConsolidationLaneUnavailable(detail, retry_after_s) from exc
     if not isinstance(decoded, dict):
         raise ValueError("consolidation endpoint returned a non-object JSON response")
     return decoded
@@ -195,31 +161,10 @@ def _consolidation_response_text(response: dict) -> str:
 
 @dataclass(frozen=True)
 class ConsolidationOutcome:
-    """What a consolidation attempt actually did.
+    """The observable result of one requested history consolidation.
 
-    Exists because the three outcomes were indistinguishable to callers: a
-    swallowed LLM failure, a deliberate skip and a real consolidation all
-    returned ``None``, so the CLI reported ``done`` for every one of them. That
-    produced two false completion reports during the 2026-08-13 backlog run and
-    made a reverted offset look identical to a sensitive-session skip.
-
-    ``status`` is one of:
-
-    ``consolidated``
-        History was written and the offset advanced from ``old_offset`` to
-        ``new_offset``.
-    ``skipped``
-        Deliberately not consolidated — ``detail`` says why. Not an error.
-    ``failed``
-        Attempted and did not complete; ``detail`` carries the reason.
-    ``deferred``
-        The local fleet was unavailable or occupied before a model request was
-        sent. ``retry_after_s`` states when automatic maintenance may retry.
-    ``empty``
-        Nothing unconsolidated to do.
-
-    ``complete`` is false when a successful history pass committed one bounded
-    transcript slice and work remains for a later background pass.
+    ``complete`` is false when a bounded history pass committed only the first
+    message-aligned chunk and leaves the durable offset ready for the next one.
     """
 
     status: str
@@ -227,32 +172,259 @@ class ConsolidationOutcome:
     old_offset: int = 0
     new_offset: int = 0
     complete: bool = True
-    retry_after_s: float = 0.0
 
     @property
     def failed(self) -> bool:
         return self.status == "failed"
 
     @property
-    def deferred(self) -> bool:
-        return self.status == "deferred"
+    def completed(self) -> bool:
+        return self.status == "consolidated"
 
     def describe(self) -> str:
-        """One-line human summary, for the CLI and run logs."""
         if self.status == "consolidated":
             suffix = "" if self.complete else " (partial)"
             return f"consolidated {self.old_offset} → {self.new_offset}{suffix}"
-        if self.status == "empty":
-            return "nothing to consolidate"
-        if self.status == "deferred":
-            return f"deferred: {self.detail}" if self.detail else "deferred"
-        return f"{self.status}: {self.detail}" if self.detail else self.status
+        if self.detail:
+            return f"{self.status}: {self.detail}"
+        return self.status
+
+
+# Returned by _consolidate when its retry-eligibility gate refuses the span.
+# Distinct from None (a pass that ran, or found nothing to do) so callers'
+# done-callbacks can tell a refusal from a completed pass: a refusal must not
+# advance their bookkeeping (offsets, throttles) as if the window had been
+# processed, and raising instead would log a routine backoff as a task failure.
+class _ConsolidationRefusedSentinel:
+    __slots__ = ()
+
+
+_CONSOLIDATION_REFUSED = _ConsolidationRefusedSentinel()
+# Persistent retry accounting for history consolidation. A pass spends a billed
+# LLM turn BEFORE it can write the durable "consolidated" marker, so any failure
+# in between leaves the span unconsolidated — and every entry point (the 60s
+# idle sweep, session-expiry sweeps, the dashboard trigger) then re-spends that
+# turn, forever, because the only thing suppressing a repeat is an in-memory
+# throttle that a failure skips and a restart forgets. Attempts are therefore
+# counted in the transcript's metadata line (durable, per span) and gated behind
+# exponential backoff up to a hard cap. At the cap the span is abandoned with
+# the marker written anyway: losing one memory pass costs one summary, while
+# retrying forever costs an LLM turn per heartbeat tick indefinitely.
+_CONSOLIDATION_MAX_ATTEMPTS = 5
+_CONSOLIDATION_BACKOFF_BASE_SECS = 900.0  # 15 min, doubling per failed attempt
+_CONSOLIDATION_BACKOFF_MAX_SECS = 86400.0  # 24 h ceiling on a single wait
+# Every metadata field the accounting owns, so the marker's success path can drop
+# the whole set in one place and a rebuilding writer can name it as foreign.
+_CONSOLIDATION_META_KEYS: frozenset[str] = frozenset(
+    {
+        "consolidation_attempts",
+        "consolidation_retry_at",
+        "consolidation_env_failures",
+        "consolidation_attempts_generation",
+        "consolidation_attempts_offset",
+        "consolidation_attempts_count",
+    }
+)
+
+
+class AttemptedSpan(NamedTuple):
+    """The span identity a consolidation turn actually covered.
+
+    All three fields come from ONE atomic
+    :meth:`ConversationLog.snapshot_for_consolidation` taken BEFORE the turn:
+    where the span starts (*generation*, *offset*) and how far it reaches
+    (*total*). They travel together because the accounting's whole guarantee is
+    that a charged attempt is stamped with the span it measured — mixing a
+    snapshot value with one re-read after the turn stamps content that was never
+    attempted, and the cap then either outlives its span (stranding messages
+    forever) or releases early (re-billing indefinitely).
+
+    Re-reading the metadata line at failure time is the specific mistake this
+    type exists to prevent. A rotation or a marker-resetting rewrite DURING the
+    turn moves all three, so a post-turn read stamps the counter with the NEW
+    span's identity while the count it carries was charged against the old one.
+    At the cap that leaves the post-rotation messages capped without ever having
+    been attempted, and because their generation and offset already match the
+    stamp no later append can release them.
+    """
+
+    #: Transcript message total the turn covered — the snapshot's total, not the
+    #: file's size afterwards. Named ``total`` rather than ``count`` because a
+    #: ``NamedTuple`` field called ``count`` would shadow ``tuple.count``.
+    total: int
+    #: ``rotation_generation`` at the snapshot.
+    generation: int
+    #: ``last_consolidated`` at the snapshot — where the attempted span begins.
+    offset: int
+
+
+# Skill detection judges a wider window than the incremental history tail: a
+# reusable procedure usually spans the whole session, not just the slice since
+# the last consolidation, so a tail-only view systematically misses skills in
+# any session consolidated more than once. Bound the window so pathologically
+# long sessions stay cost-safe.
+_SKILL_DETECTION_WINDOW = 200
+
+# The keys :meth:`ConversationLog.compact` is authoritative for; every other field
+# on the metadata line is another layer's and is carried through.
+_COMPACT_OWNED_META_KEYS: frozenset[str] = frozenset(
+    {"_type", "created_at", "last_consolidated", "compacted_at"}
+)
+
+# The keys the dashboard's slot save is authoritative for. It reconstructs the
+# line from the slot's in-memory state, so for THESE absence is meaningful (a
+# cleared title, an un-pinned slot, a reopened tab) — hence they are named here
+# and not preserved, while everything else survives the save.
+SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
+    {
+        "_type",
+        "created_at",
+        "last_consolidated",
+        "closed",
+        "closed_at",
+        "memory_mode",
+        "title",
+        "agent",
+        "model",
+        "reasoning_effort",
+        "mode",
+        "workspace",
+        "project",
+        "folder_id",
+        "app",
+        "artifact",
+        "pinned",
+        "color_index",
+        "color_hex",
+        "color_theme",
+        "tags",
+        "forked_from",
+        "linked_session_key",
+        "tab_id",
+    }
+)
+
+
+def carry_unowned_metadata(
+    rebuilt: dict,
+    existing: dict,
+    owned: Container[str],
+) -> dict:
+    """Carry every pre-existing metadata field the rebuilding writer does not own.
+
+    A writer that reconstructs a transcript's metadata line from its own state
+    (the dashboard slot save, :meth:`ConversationLog.compact`) is authoritative
+    ONLY for the keys it writes: for those, absence is meaningful and must erase
+    (clearing a title, un-pinning, reopening a closed tab). For every OTHER key
+    absence means "not mine to know about", so reconstructing the subset silently
+    deletes another layer's durable state.
+
+    Enumerating the foreign keys to preserve instead is the failure mode this
+    replaces: each new field has to be added to every rebuilder, and the one that
+    is missed loses data with no error — the rotation generation and the
+    consolidation retry accounting were both erased that way. So *owned* names the
+    writer's OWN keys and everything else is carried through verbatim, making
+    preservation the default and erasure the deliberate act.
+
+    Preservation is unconditional, INCLUDING the consolidation retry accounting
+    (:data:`_CONSOLIDATION_META_KEYS`), because a rebuild is not evidence about
+    content: a slot flush re-serializes the same window, and a compaction archives
+    turns the budget has already measured without introducing any the LLM has not
+    seen — erasing the accounting there resets a live backoff and resumes billed
+    retries.
+
+    A save that genuinely EDITS the conversation is distinguished by the content
+    identity it writes, not by what this helper drops: the dashboard rewrite path
+    advances ``rotation_generation``, which releases the budget through the span
+    identity the accounting is stamped with (see :class:`AttemptedSpan` and
+    :meth:`ConversationLog._attempts_describe_current_span`) and invalidates any
+    in-flight attempt's marker write. Keeping that in ONE counter is what makes an
+    edit and a rotation behave identically; a second, parallel drop-the-keys valve
+    here would additionally discard the armed backoff deadline, handing a session
+    whose consolidation keeps failing a free billed turn on every user edit.
+
+    Returns *rebuilt*, mutated in place.
+    """
+    for meta_key, value in existing.items():
+        if meta_key in owned or meta_key in rebuilt:
+            continue
+        rebuilt[meta_key] = value
+    return rebuilt
 
 
 def _fmt_message(m: dict) -> str:
     """Render one transcript message for a consolidation / skill-detection prompt."""
     tools = f" [tools: {', '.join(m['tools'])}]" if m.get("tools") else ""
     return f"[{m.get('ts', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}"
+
+
+# Normalized placeholder bodies a model emits instead of a real file body.
+# Compared after lowercasing and stripping surrounding whitespace/punctuation,
+# so e.g. "Unchanged.", "(no changes)" and "N/A" all normalize into this set.
+_PLACEHOLDER_BODIES = frozenset(
+    {
+        "unchanged",
+        "no change",
+        "no changes",
+        "no change needed",
+        "no changes needed",
+        "no changes required",
+        "no update",
+        "no updates",
+        "no update needed",
+        "no updates needed",
+        "nothing changed",
+        "nothing to update",
+        "nothing to change",
+        "none",
+        "n/a",
+        "na",
+        "empty",
+        "same",
+        "same as before",
+        "as before",
+        "see above",
+        "content unchanged",
+        "file unchanged",
+    }
+)
+
+
+def _is_plausible_memory_file(content: str, header: str) -> bool:
+    """Gate a consolidation ``*_update`` value before it overwrites a memory file.
+
+    The consolidation prompt asks for the COMPLETE updated file, but a model
+    sometimes answers with a protocol word instead — the literal string
+    ``unchanged``, ``(empty)``, ``no changes needed`` and similar. Writing that
+    placeholder destroys the file, and because the next consolidation prompt
+    embeds the file's current content verbatim, the placeholder then reads as a
+    valid example body and gets echoed into the other memory file on every
+    subsequent pass — a self-reinforcing loop that keeps both files destroyed
+    until a human rebuilds them.
+
+    Two gates:
+
+    1. The first line must be exactly the markdown header the prompt mandates
+       (not merely a prefix — ``# User Preferences (unchanged)`` is not a file).
+    2. The body below the header must not normalize into a known placeholder
+       word/phrase. Markdown emphasis wrapping (``**unchanged**``,
+       ``_unchanged_``, ``~~unchanged~~``) is stripped before the comparison so
+       a decorated placeholder cannot bypass the set. An EMPTY body after the
+       exact header is accepted: it is the legitimate COMPLETE file when the
+       last entry is deleted (e.g. the final project goes inactive), and
+       rejecting it would pin the stale entry in persistent memory forever.
+       There is deliberately no size floor either — a legitimate memory file
+       can be a single tiny bullet (``- Vim``), and rejecting it here would
+       silently lose the learned preference while the consolidation marker
+       advances past it.
+    """
+    first_line, _, body = content.strip().partition("\n")
+    if first_line.strip() != header:
+        return False
+    normalized = body.strip().lower().strip(" \t\"'`*_~.,!()[]")
+    if normalized in _PLACEHOLDER_BODIES:
+        return False
+    return True
 
 
 def _consolidation_chunk(messages: list[dict]) -> list[dict]:
@@ -298,6 +470,27 @@ _SESSION_KEEP_LINES = 200
 # don't.
 _FLOCK_ACQUIRE_TIMEOUT_S = 10.0
 _FLOCK_POLL_INTERVAL_S = 0.05
+
+
+class _ConsolidationNotDispatched(Exception):
+    """A consolidation prompt never reached the provider.
+
+    Distinguishes "we could not send the turn" (no session manager; kiro-cli
+    missing, not logged in, or failing to start) from "the turn ran and returned
+    nothing useful". Only the latter costs money, so only the latter may consume
+    the attempt budget that abandons a span — charging an unsent turn would let a
+    broken host mark messages consolidated that no LLM has ever read. Raised
+    rather than reported as a flag beside the result so a caller cannot silently
+    drop the distinction.
+    """
+
+
+class _ConsolidationLaneUnavailable(_ConsolidationNotDispatched):
+    """The local fleet declined maintenance before a model turn was sent."""
+
+    def __init__(self, detail: str, retry_after_s: float) -> None:
+        super().__init__(detail)
+        self.retry_after_s = retry_after_s
 
 
 class HistoryLockTimeout(TimeoutError):
@@ -410,6 +603,19 @@ _ON_LOOP_TRUTHY = frozenset({"1", "true", "yes", "on"})
 _ON_LOOP_FALSY = frozenset({"0", "false", "no", "off"})
 
 
+def on_loop_persist_strict() -> bool:
+    """Public alias of :func:`_on_loop_persist_strict` for other modules.
+
+    The strictness knob (``KIROCREW_STRICT_ON_LOOP_PERSIST`` /
+    ``KIROCREW_DEV_MODE``) governs the on-loop persistence discipline for every
+    store, not just this module's conversation log; consumers that enforce the
+    same offload rule on their own SQLite databases (e.g. the auto_research
+    campaigns DB) read the shared setting through this alias instead of
+    importing a private name.
+    """
+    return _on_loop_persist_strict()
+
+
 def _check_on_loop_persist_discipline(key: str) -> None:
     """Enforce (strict) or diagnose (production) an on-loop ``_locked`` entry.
 
@@ -504,8 +710,14 @@ def append_if_absent_off_loop(
     content: str,
     *,
     agent: str | None = None,
-) -> None:
+    cls: str = "",
+    mid: str | None = None,
+) -> Any:
     """Idempotent, loop-safe variant of :func:`append_off_loop`.
+
+    Returns the executor future for the scheduled write, or None when the write
+    already happened inline (no running loop). A caller holding the ONLY durable
+    copy of something must await that future: scheduling is not durability.
 
     Routes :meth:`ConversationLog.append_if_absent` — which atomically skips a
     message already persisted under the same session lock — off the event loop
@@ -520,7 +732,7 @@ def append_if_absent_off_loop(
     """
 
     def _do() -> None:
-        conversation_log.append_if_absent(key, role, content, agent=agent)
+        conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls, mid=mid)
 
     try:
         loop = asyncio.get_running_loop()
@@ -535,7 +747,7 @@ def append_if_absent_off_loop(
                 key,
                 exc_info=True,
             )
-        return
+        return None
 
     def _report(fut: "asyncio.Future[None]") -> None:
         exc = fut.exception()
@@ -546,7 +758,12 @@ def append_if_absent_off_loop(
                 exc,
             )
 
-    loop.run_in_executor(None, _do).add_done_callback(_report)
+    fut = loop.run_in_executor(None, _do)
+    fut.add_done_callback(_report)
+    # Hand the future BACK: a caller holding the only durable copy awaits this
+    # to turn "scheduled" into "on disk". Dropping it here made the barrier a
+    # no-op on every running-loop path, i.e. every real gateway path.
+    return fut
 
 
 def update_metadata_off_loop(
@@ -609,14 +826,713 @@ def update_metadata_off_loop(
 
 
 SEARCH_MIN_CHARS = 2  # shortest query string that triggers backend search
+SEARCH_MAX_TOKENS = 12  # distinct REQUIRED needles per query — see parse_search_query
+_SEARCH_MAX_SCORING_EXTRAS = 12  # distinct scoring-only needles (CJK bigrams) per query
 _TITLE_BOOST = 10  # field-boost multiplier for title matches in search_sessions
+_PHRASE_BOOST = 4  # extra weight per exact whole-query hit in a multi-word search
 _SEARCH_SCAN_WINDOW = 500  # cap files scanned per search to bound I/O
+# Recency boost bounds for search_sessions: a session modified now scores
+# ×(1 + _RECENCY_MAX_BOOST); the extra weight halves every
+# _RECENCY_HALF_WEIGHT_DAYS of age and decays toward ×1.0 — never a penalty
+# that could bury an old exact match, only a bounded tiebreaker toward
+# recent work. 1.5 is sized to the canonical complaint: a year-old session
+# matching TWICE must lose to today's session matching once (2 hits × ~1.11
+# aged boost ≈ 2.2 < 1 hit × 2.5 fresh ceiling), while a decisively better
+# old match (3+ hits) still wins — a 1.0 ceiling left the stated 2:1 case
+# unfixed.
+_RECENCY_MAX_BOOST = 1.5
+_RECENCY_HALF_WEIGHT_DAYS = 30.0
+# Weight of a single CJK character needle that came from a longer run. Individual
+# han/kana/hangul characters are extremely common (a function character like "的"
+# can appear hundreds of times in one transcript), so counting them at full weight
+# would let character noise drown out the bigram adjacency signal that actually
+# ranks CJK results. They still gate the AND match at full strength — the weight
+# only dampens their contribution to the relevance score.
+_CJK_CHAR_WEIGHT = 0.25
+# Weight of one forge-reference spelling hit contributed for RANKING a bare
+# number query ("4411"). Such a query keeps its plain substring needle, so
+# recall is untouched — the spellings only move the session that actually
+# references pull request 4411 above one that happens to contain those digits
+# inside a run id. Sized like _PHRASE_BOOST: strong enough that a single real
+# reference outranks incidental digit noise, not so strong that a session
+# repeating the digits many times can never win.
+_FORGE_REF_WEIGHT = 4.0
+# Forge expansions per query. Each one costs one substring scan of every scanned
+# session PER SPELLING it carries — up to eight for a reference the query named,
+# and up to thirteen for a bare number's ranking needle, which carries both
+# families. Three expansions therefore top out around 39 substring scans per
+# field over the scan window, each a single C-level ``str.count`` against
+# already-folded, memoized text — which is why the cap stays at three rather
+# than shrinking as the spelling sets grew: a query naming three references
+# ("compare #1 #2 #3") is legitimate, and the scans it costs are not the
+# expensive part of a search. A fourth forge-shaped token degrades to a plain
+# needle.
+_SEARCH_MAX_FORGE_REFS = 3
+
+
+def _is_cjk_char(ch: str) -> bool:
+    """True for characters that written Chinese/Japanese/Korean does not space-separate.
+
+    Whitespace tokenization silently degrades for these scripts — a whole CJK
+    clause arrives as ONE "token" — so :func:`parse_search_query` segments runs
+    of them instead. The ranges cover the Han ideograph blocks (unified,
+    extension A, the astral extensions, compatibility) and the kana blocks:
+    Chinese and Japanese are written without spaces, which is the named defect.
+    Deliberately NOT Hangul — modern Korean IS space-separated, so its words
+    already arrive as ordinary whitespace tokens and the substring rule serves
+    them; segmenting them would change Korean ranking to fix a failure nobody
+    has reported. Likewise not full-width forms, punctuation, or symbols.
+    """
+    cp = ord(ch)
+    return (
+        0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+        or 0x3400 <= cp <= 0x4DBF  # CJK Extension A
+        or 0x20000 <= cp <= 0x2EBEF  # CJK Extensions B..F (astral)
+        or 0xF900 <= cp <= 0xFAFF  # CJK Compatibility Ideographs
+        or 0x3040 <= cp <= 0x30FF  # Hiragana + Katakana
+        or 0x31F0 <= cp <= 0x31FF  # Katakana Phonetic Extensions
+    )
+
+
+class SearchNeedle(NamedTuple):
+    """One substring a session search scans for.
+
+    ``required=True`` needles form the AND gate — a session missing one (in
+    both title and content) is disqualified. ``required=False`` needles only
+    contribute to the relevance score. ``weight`` scales each occurrence's
+    contribution to that score.
+
+    ``alts`` are ALTERNATIVE SPELLINGS of the same reference: the needle is
+    satisfied by ``text`` or by any alt, and occurrences of every spelling
+    count toward the score. That is a bounded OR *inside* one needle, not an OR
+    over the query — it exists because one forge reference has several written
+    forms (``#4411`` and ``…/pull/4411`` name the same pull request), and a
+    transcript may carry any of them.
+
+    ``digit_bounded`` rejects a match that sits inside a LONGER number, on
+    either side — so ``4411`` matches ``PR 4411.`` but not ``#44110`` and not
+    the run id ``1544110293``. Only meaningful for a spelling made of digits or
+    ending in one.
+
+    ``adjacency`` marks a needle as ADJACENCY EVIDENCE (a CJK bigram) — the only
+    kind the adjacency floor in :meth:`ConversationLog.search_sessions` counts.
+    Scoring-only needles that are not adjacency evidence (the forge spellings
+    added for ranking a bare number) therefore cannot arm that floor, which
+    would otherwise turn a ranking hint into a hidden gate.
+    """
+
+    text: str
+    weight: float
+    required: bool
+    alts: tuple[str, ...] = ()
+    digit_bounded: bool = False
+    adjacency: bool = False
+
+
+def count_needle(needle: SearchNeedle, folded_text: str) -> int:
+    """Occurrences of any of *needle*'s spellings in *folded_text*.
+
+    The single counter every matcher and ranker shares, so the alternation and
+    the digit boundary cannot be honored by one caller and dropped by another.
+    *folded_text* must already be casefolded (needle spellings are).
+
+    An ordinary needle (no alts, unbounded) costs exactly one :meth:`str.count`,
+    the same as before spellings existed — the scan cost that
+    :func:`parse_search_query`'s needle caps are sized against. A needle with
+    alts costs one scan per spelling, which is why forge expansions carry their
+    own cap.
+    """
+    if not folded_text:
+        return 0
+    total = 0
+    for text in (needle.text, *needle.alts):
+        if not text:
+            continue
+        if not needle.digit_bounded:
+            total += folded_text.count(text)
+            continue
+        # Non-overlapping scan, matching str.count, skipping a hit that sits
+        # inside a longer number (``4411`` in ``1544110293``, ``#4411`` in
+        # ``#44110``). The LEFT guard applies only to a spelling that starts with
+        # a digit: for a delimited spelling the character before it says nothing
+        # about the number's length, and demanding a non-digit there would refuse
+        # ``#4411`` inside ``owner/repo2#4411`` — a repository whose name ends in
+        # a digit, matched against the very reference the query named.
+        left_bounded = text[0].isdigit()
+        start = 0
+        while True:
+            found = folded_text.find(text, start)
+            if found < 0:
+                break
+            end = found + len(text)
+            before_ok = (
+                not left_bounded or found == 0 or not folded_text[found - 1].isdigit()
+            )
+            after_ok = end >= len(folded_text) or not folded_text[end].isdigit()
+            if before_ok and after_ok:
+                total += 1
+            start = end
+    return total
+
+
+def _script_runs(token: str) -> Iterator[tuple[str, bool]]:
+    """Yield ``(run, is_cjk)`` maximal same-script runs of *token*, in order."""
+    start = 0
+    cur = _is_cjk_char(token[0])
+    for i in range(1, len(token)):
+        nxt = _is_cjk_char(token[i])
+        if nxt != cur:
+            yield token[start:i], cur
+            start, cur = i, nxt
+    yield token[start:], cur
+
+
+# Words that only NAME a reference type in front of its number ("PR 4411",
+# "merge request !12"). They are dropped from the gate when they introduce a
+# number, because they are not part of the reference: requiring the literal
+# "pr" would disqualify the very transcripts this expansion exists to find —
+# one that names the pull request only by URL never contains those letters.
+_FORGE_MR_WORDS = frozenset({"mr", "merge-request", "merge_request", "mergerequest"})
+# "merge" and "request" name no type on their own: "merge 1234" and "requests 12"
+# are ordinary prose, and treating either as a reference would drop the word from
+# the gate and pull in every session mentioning that number. They qualify only
+# TOGETHER ("merge request 12"), which does name GitLab's type.
+_FORGE_REQUEST_WORDS = frozenset({"request", "requests"})
+_FORGE_CHAIN_ONLY_WORDS = _FORGE_REQUEST_WORDS | frozenset({"merge"})
+# Words that DO name a type by themselves, so one of them in the lead-in run is
+# what makes a following number a reference.
+_FORGE_TYPE_WORDS = (
+    frozenset({"pr", "prs", "pull", "pulls", "pull-request", "pull_request", "pullrequest"})
+    | frozenset({"issue", "issues"})
+    | _FORGE_MR_WORDS
+)
+# The full lead-in vocabulary: type words plus the chain-only members, which must
+# be droppable and visible to the family test even though neither names a type.
+_FORGE_REF_WORDS = _FORGE_TYPE_WORDS | _FORGE_CHAIN_ONLY_WORDS
+
+
+def _lead_names_merge_request(lead: tuple[str, ...]) -> bool:
+    """True when the words introducing a number name a GitLab merge request.
+
+    Either an unambiguous word ("MR 12", "merge_request 12") or the two-word
+    form "merge request 12".
+    """
+    if any(word in _FORGE_MR_WORDS for word in lead):
+        return True
+    return "merge" in lead and any(word in _FORGE_REQUEST_WORDS for word in lead)
+
+
+def _lead_names_a_type(lead: tuple[str, ...]) -> bool:
+    """True when the lead-in run actually names a forge type.
+
+    A run of chain-only words does not: "requests 12" is prose about requests,
+    not a reference to item 12, and reading it as one would drop "requests" from
+    the gate and admit every session mentioning ``#12``.
+    """
+    return any(word in _FORGE_TYPE_WORDS for word in lead) or _lead_names_merge_request(lead)
+
+
+# Punctuation a reference collects from surrounding prose ("(#4411)," / "PR
+# #4411."). Stripped before the shapes below are tried, and only from the edges,
+# so the token's own delimiters survive. '!' is NOT in the leading set: it is
+# GitLab's merge-request sigil, not decoration.
+_FORGE_LEAD_PUNCT = "([{<\"'“‘"
+_FORGE_TRAIL_PUNCT = ")]}>,.;:?\"'”’"
+# A path-shaped reference, with or without a scheme/host: ``pull/4411``,
+# ``https://github.com/o/r/pull/4411/files``, ``…/-/merge_requests/12``.
+_FORGE_URL_RE = re.compile(
+    r"^(?:\S*/)?(?P<kind>pull|pulls|merge_requests|merge-requests|issues)"
+    r"/(?P<number>\d{1,9})(?:/\S*)?$"
+)
+# The owner/repo slug inside such a URL, used only for ranking.
+_FORGE_URL_REPO_RE = re.compile(
+    r"^(?:https?://)?[^/\s]+\.[^/\s]+"
+    r"/(?P<repo>[a-z0-9._-]+(?:/[a-z0-9._-]+)+?)"
+    r"(?:/-)?/(?:pull|pulls|merge_requests|merge-requests|issues)/\d"
+)
+# A sigil reference: ``#4411``, ``!12``, ``owner/repo#4411``, ``pr#4411``.
+_FORGE_SIGIL_RE = re.compile(
+    r"^(?:(?P<repo>[a-z0-9._-]+(?:/[a-z0-9._-]+)+)|(?P<word>pr|mr|pull|issue))?"
+    r"(?P<sigil>[#!])(?P<number>\d{1,9})$"
+)
+# A glued word+number reference: ``pr4411``, ``pr-4411``, ``mr-12``.
+_FORGE_WORD_NUM_RE = re.compile(r"^(?P<word>pr|mr|pull|issue)-?(?P<number>\d{1,9})$")
+
+
+class _ForgeRef(NamedTuple):
+    """A forge item (pull request / merge request / issue) named by a query.
+
+    ``bare`` records that the QUERY spelled the number with no sigil ("PR 4411",
+    "issue 42", "pr4411"). That decides whether plain digits are one of the
+    item's spellings — see :func:`_forge_spellings`.
+
+    """
+
+    number: str
+    merge_request: bool
+    repo: str | None
+    bare: bool = False
+
+
+def _forge_spellings(ref: _ForgeRef) -> tuple[str, tuple[str, ...]]:
+    """Return ``(canonical, alts)`` — how *ref* can be written in a transcript.
+
+    The families are kept apart because the sigils are not interchangeable:
+    GitHub draws pull requests and issues from ONE number sequence (``#4411``,
+    ``/pull/4411`` and ``/issues/4411`` are the same item), while GitLab numbers
+    merge requests separately from issues, which is why it spells them ``!12``
+    and ``#12``. For a SIGIL query that separation is a guarantee — ``!12`` never
+    matches ``#12``, a different object. A sigil-free query ("merge request 12")
+    also carries the bare digits, which a ``#12`` mention satisfies, so there the
+    separation governs ranking rather than exclusion.
+
+    Path spellings carry no leading slash so they match both ``/pull/4411`` in a
+    URL and a bare ``pull/4411`` written on its own.
+
+    The prose spellings ("pr 4411", "pull request 4411", "pr4411") are included
+    because a transcript often names the item in words rather than with a sigil,
+    and a query that typed the sigil should still find it. They match as plain
+    substrings, so a glued form can hit inside a longer word (``expr4411``
+    satisfies ``pr4411``). That is deliberate: this module matches every other
+    needle as a substring — ``cont`` hits ``contention`` — and adding word
+    boundaries for some spellings and not others would make the rule harder to
+    predict than the false positive it avoids, which ranks last anyway on a
+    single hit. The digit boundary still bounds the numeric side.
+
+    A bare digit spelling is a substring of its own sigil and glued spellings, so
+    one mention of ``#4411`` counts twice inside a bare reference's needle. That
+    only lifts the relevance score of a session that really does reference the
+    item, and never gates.
+
+    Plain digits are a spelling only for a ``bare`` reference, and that
+    asymmetry is deliberate. A query that typed no sigil ("issue 42") is looking
+    for the number as written, so the digits belong; a query that typed one
+    ("#4411", a PR URL) was explicit, and admitting bare digits there would make
+    ``!12`` match every session that mentions a standalone 12 — ordinary prose
+    (a count, a date, a version).
+
+    Recall relative to the plain substring gate this replaces does not rest on
+    the list being exhaustive by inspection — three shapes slipped past that
+    reasoning — but on a property test that drives every shape the parser
+    accepts against a transcript quoting it verbatim. Concretely: a sigil shape
+    contains its own canonical spelling (``owner/repo2#4411`` contains
+    ``#4411``), a path or URL shape contains a path spelling, and a glued or
+    two-token shape contains the bare digits. The one session the expansion can
+    still drop is one whose only claim to the old match was the digits sitting
+    INSIDE a longer number ("4411" within run id 1544110293) — and excluding that
+    is the point of the digit boundary, since such a session never referenced
+    the item.
+    """
+    number = ref.number
+    bare = (number,) if ref.bare else ()
+    if ref.merge_request:
+        return (
+            f"!{number}",
+            (
+                f"merge_requests/{number}",
+                f"merge-requests/{number}",
+                f"mr {number}",
+                f"merge request {number}",
+                f"mr{number}",
+                *bare,
+            ),
+        )
+    return (
+        f"#{number}",
+        (
+            f"pull/{number}",
+            f"pulls/{number}",
+            f"issues/{number}",
+            f"pr {number}",
+            f"pull request {number}",
+            f"pr{number}",
+            *bare,
+        ),
+    )
+
+
+def _forge_lead_in(parts: list[str], index: int) -> tuple[str, ...]:
+    """The contiguous run of reference-vocabulary words before ``parts[index]``.
+
+    Raw material for :func:`_forge_type_suffix`, which decides how much of the
+    run is actually part of the reference.
+    """
+    back = index - 1
+    while back >= 0 and parts[back] in _FORGE_REF_WORDS:
+        back -= 1
+    return tuple(parts[back + 1 : index])
+
+
+def _forge_type_suffix(lead: tuple[str, ...]) -> tuple[str, ...]:
+    """The part of *lead* that names the reference's type — its SHORTEST naming suffix.
+
+    Only the words adjacent to the number belong to the reference; anything
+    before them is the user's own search term. "merge issue 42" is a query about
+    ``merge`` AND issue 42, so the reference is ``issue 42`` and ``merge`` stays
+    in the gate — taking the whole run would drop it and return every session
+    mentioning #42.
+
+    SHORTEST, not longest: a longer suffix can still contain a type word without
+    that word being the head of the phrase ("merge issue" would qualify on
+    ``issue`` alone and swallow ``merge``). The shortest naming suffix is the
+    complete type phrase and no more — which still admits the two-word forms,
+    since neither "request" nor "merge" names a type by itself and only
+    ("merge", "request") together qualify.
+
+    Returns ``()`` when no suffix names a type, i.e. the number is not a
+    reference at all.
+
+    Two known limitations, accepted rather than special-cased. A chain-only word
+    wedged BETWEEN the type word and the number ("issue merge 42") is swallowed,
+    because the shortest naming suffix is ``("issue", "merge")``; the mirror case
+    ("merge issue 42") is handled. And because the gate is keyed by term text, a
+    query repeating a suffix word as its own search term ("pull the pull request
+    12") loses that term when the suffix is dropped. Both need a query nobody
+    writes, both only widen the result set, and closing them means keying the
+    gate by token position rather than by text — a redesign of the needle map,
+    not a fix here.
+    """
+    for size in range(1, len(lead) + 1):
+        suffix = lead[len(lead) - size :]
+        if _lead_names_a_type(suffix):
+            return suffix
+    return ()
+
+
+def _parse_forge_ref(token: str, lead: tuple[str, ...]) -> _ForgeRef | None:
+    """Parse *token* as a forge reference, or return ``None``.
+
+    *token* is one casefolded whitespace-separated term; *lead* is the run of
+    type-naming words before it (:func:`_forge_lead_in`), which is what makes
+    the two-token form ("PR 4411", "merge request 12") a reference rather than a
+    bare number, and which names the family when the token itself does not. A
+    bare number with no such lead-in is NOT a reference — treating every number
+    in a query as one would rewrite ordinary numeric content search (ports,
+    error codes, dates).
+    """
+    token = token.lstrip(_FORGE_LEAD_PUNCT).rstrip(_FORGE_TRAIL_PUNCT)
+    if not token:
+        return None
+    url = _FORGE_URL_RE.match(token)
+    if url:
+        repo_match = _FORGE_URL_REPO_RE.match(token)
+        return _ForgeRef(
+            url.group("number"),
+            url.group("kind").startswith("merge"),
+            repo_match.group("repo") if repo_match else None,
+        )
+    sigil = _FORGE_SIGIL_RE.match(token)
+    if sigil:
+        # The TYPED sigil decides the family, not the word before it: "#" names
+        # the shared pull/issue sequence and "!" names GitLab's merge requests,
+        # so letting a word override the sigil produced a reference ("mr#12")
+        # none of whose spellings was the string the user typed.
+        return _ForgeRef(
+            sigil.group("number"),
+            sigil.group("sigil") == "!",
+            sigil.group("repo"),
+        )
+    glued = _FORGE_WORD_NUM_RE.match(token)
+    if glued:
+        return _ForgeRef(
+            glued.group("number"),
+            glued.group("word") in _FORGE_MR_WORDS,
+            None,
+            bare=True,
+        )
+    if token.isdigit() and len(token) <= 9:
+        suffix = _forge_type_suffix(lead)
+        if suffix:
+            return _ForgeRef(token, _lead_names_merge_request(suffix), None, bare=True)
+    return None
+
+
+def parse_search_query(query: str) -> tuple[list[SearchNeedle], str, bool]:
+    """Return ``(needles, phrase, adjacency_floor)`` for a search *query*, casefolded.
+
+    ``phrase`` is the whole normalized query. ``needles`` are derived from the
+    DISTINCT whitespace-separated terms in first-seen order; every caller that
+    matches (:meth:`ConversationLog.search_sessions`) or locates
+    (:func:`snippet_needles` for the snippet builders) query text derives from
+    this one parse so the halves of a query cannot drift apart.
+
+    Non-CJK terms become one required, weight-1.0 needle each — the classic
+    substring-AND behavior (``"cont"`` hits ``"contention"``). A run of CJK
+    characters cannot keep that rule: CJK text is written without spaces, so
+    requiring the run verbatim demands the user's exact sentence and a
+    multi-word query like ``"修复内存泄漏"`` would only ever match transcripts
+    containing that literal string. Each CJK run therefore expands to:
+
+    * its individual characters as REQUIRED needles at :data:`_CJK_CHAR_WEIGHT`
+      — maximal recall, since a document discussing all the query's words
+      contains all of its characters regardless of word order; and
+    * its overlapping character bigrams as ADJACENCY needles at weight 1.0 —
+      the standard dictionary-free CJK adjacency signal. They are not
+      individually required, but when a query carries any, a session must hit
+      AT LEAST ONE to qualify (see :meth:`ConversationLog.search_sessions`):
+      individual han/kana characters are so common that a pure character
+      scatter is noise, so the adjacency floor keeps the character gate's
+      recall (words apart still match — each word IS a bigram hit) without
+      letting scatter-only sessions fill the result page. Each occurrence also
+      scores, so documents keeping more of the query adjacent rank higher.
+      A single-character run stays one required, weight-1.0 needle: it IS the
+      whole term.
+
+    Precision moves from the gate into the ranking, which is the module's
+    existing philosophy for the substring-prefix looseness on ASCII terms.
+
+    A term that names a FORGE ITEM — a pull request, merge request or issue —
+    becomes ONE required needle carrying every spelling of that item instead of
+    the literal term (see :func:`_parse_forge_ref`). ``#4411``, ``pr 4411``,
+    ``pull/4411``, a full PR URL and ``owner/repo#4411`` therefore all find the
+    same sessions, whichever form each transcript happens to use, and the
+    spellings are digit-bounded so ``#4411`` never matches ``#44110``. A naming
+    word that introduces a number ("PR 4411") is dropped from the gate: it is
+    not part of the reference, and requiring the letters "pr" would disqualify a
+    transcript that names the pull request only by URL. When the query spelled
+    the number with no sigil, plain digits stay one of the spellings, so the
+    expansion keeps the recall of the literal AND it replaces — the one session
+    it can drop is a session whose digits merely sat inside a longer number,
+    which is what the digit boundary is for. Only a run of words that actually
+    NAMES a type makes a following number a reference: "requests 12" and
+    "merge 1234" stay literal terms, since dropping such a word from the gate
+    would trade a real term for every session mentioning that number. A BARE
+    number with no naming word at all is not a reference either: it keeps its
+    plain substring needle, so numeric content search is unchanged, and gains
+    the spellings as scoring-only needles, so the session that actually
+    references pull request 4411 outranks one that merely contains those digits
+    inside a run id.
+
+    Bounds (both exist because **every needle costs one full scan** of a
+    session's text): required needles cap at :data:`SEARCH_MAX_TOKENS` and
+    scoring extras at :data:`_SEARCH_MAX_SCORING_EXTRAS`. Deduplication is free
+    correctness — a repeated term cannot change an AND match. Truncation in
+    EITHER set makes the query only LOOSER — fewer required terms, and a
+    truncated adjacency set additionally WAIVES the adjacency floor (the third
+    tuple element comes back ``False``), because enforcing "at least one bigram
+    hit" against a partial bigram set would EXCLUDE a session that matches only
+    a dropped bigram — turning a cost cap into a hidden gate for exactly the
+    long spaceless queries this parse exists to serve. Looser can admit extra
+    results but never hide a session that would have matched — the safe
+    direction when the alternative is a keystroke-driven search stalling for
+    seconds.
+
+    A whitespace-only query yields ``([], "", False)``; callers treat that as
+    "matches nothing" rather than "matches everything".
+    """
+    parts = query.casefold().split()
+    if not parts:
+        return ([], "", False)
+    phrase = " ".join(parts)
+    required: dict[str, SearchNeedle] = {}
+    extras: dict[str, SearchNeedle] = {}
+    ranking: dict[str, SearchNeedle] = {}
+    forge_budget = _SEARCH_MAX_FORGE_REFS
+    # One ledger keyed by the item's canonical spelling, so a slot is charged per
+    # ITEM rather than per needle. "#4411 4411" names one pull request twice — as
+    # a required reference and as a bare number's ranking hint — and charging
+    # both spent a phantom slot that could push a later distinct reference past
+    # the cap. Keyed rather than counted so the order the two forms appear in
+    # cannot change the outcome.
+    charged: set[str] = set()
+    for index, part in enumerate(parts):
+        lead = _forge_lead_in(parts, index)
+        ref = _parse_forge_ref(part, lead)
+        if ref is not None:
+            canonical, alts = _forge_spellings(ref)
+            if canonical in required:
+                # The item is already gated, but this occurrence still carries
+                # information: its own naming words must leave the gate, and a
+                # sigil-free spelling contributes the bare digits the first
+                # occurrence may not have had. Skipping outright let
+                # "#42 issue 42" keep `issue` required AND lose the bare-digit
+                # spelling — narrowing a query that named the item twice, which
+                # the loosen-only contract forbids.
+                for word in _forge_type_suffix(lead):
+                    required.pop(word, None)
+                if ref.bare:
+                    seen = required[canonical]
+                    if ref.number not in seen.alts:
+                        required[canonical] = seen._replace(alts=(*seen.alts, ref.number))
+                continue
+            if canonical not in charged and not forge_budget:
+                ref = None
+        if ref is not None:
+            if canonical not in charged:
+                charged.add(canonical)
+                forge_budget -= 1
+            # The words that NAME the reference's type are not part of the search
+            # text, and requiring them would disqualify a transcript that names
+            # the item only by URL — one that never spells the letters "pr". Only
+            # that naming suffix is dropped: in "merge issue 42" the reference is
+            # "issue 42" and `merge` is the user's own term, so popping the whole
+            # run would return every session mentioning #42.
+            for word in _forge_type_suffix(lead):
+                required.pop(word, None)
+            required.setdefault(canonical, SearchNeedle(canonical, 1.0, True, alts, True))
+            if ref.repo:
+                # Ranking only: the repo slug appears in a URL mention but not in
+                # a prose "#4411" one, so requiring it would hide real hits. It
+                # breaks the tie between the same number in two repos.
+                ranking.setdefault(ref.repo, SearchNeedle(ref.repo, 1.0, False))
+            continue
+        if part.isdigit() and len(part) <= 9:
+            gh_text, gh_alts = _forge_spellings(_ForgeRef(part, False, None))
+            # Charged against the shared ledger, so a number already gated as a
+            # reference does not spend a second slot on a hint the dedup below
+            # will discard anyway. This branch deliberately does NOT `continue` —
+            # the plain digit needle added below is what keeps numeric content
+            # search working, and it belongs in the gate whether or not the hint
+            # fits in the budget.
+            if gh_text not in charged and forge_budget:
+                charged.add(gh_text)
+                forge_budget -= 1
+                mr_text, mr_alts = _forge_spellings(_ForgeRef(part, True, None))
+                # Every sigil spelling of the number, both families: these only
+                # score, so a wrong-family hit costs a little rank rather than
+                # admitting a wrong object into the results.
+                spellings = tuple(
+                    dict.fromkeys(
+                        s for s in (gh_text, *gh_alts, mr_text, *mr_alts) if s != part
+                    )
+                )
+                ranking[gh_text] = SearchNeedle(
+                    spellings[0], _FORGE_REF_WEIGHT, False, spellings[1:], True
+                )
+        for run, is_cjk in _script_runs(part):
+            if not is_cjk or len(run) == 1:
+                required.setdefault(run, SearchNeedle(run, 1.0, True))
+                continue
+            for ch in run:
+                required.setdefault(ch, SearchNeedle(ch, _CJK_CHAR_WEIGHT, True))
+            for i in range(len(run) - 1):
+                bigram = run[i : i + 2]
+                extras.setdefault(bigram, SearchNeedle(bigram, 1.0, False, adjacency=True))
+    # A spelling that is already REQUIRED must not also score as a ranking hint:
+    # a query naming the same item twice ("#4411 4411") would count its hits
+    # twice over.
+    for text in [t for t in ranking if t in required]:
+        del ranking[text]
+    needles = list(required.values())[:SEARCH_MAX_TOKENS]
+    needles.extend(list(extras.values())[:_SEARCH_MAX_SCORING_EXTRAS])
+    needles.extend(ranking.values())
+    adjacency_floor = 0 < len(extras) <= _SEARCH_MAX_SCORING_EXTRAS
+    return (needles, phrase, adjacency_floor)
+
+
+def snippet_needles(query: str) -> list[str]:
+    """Return *query*'s needles ordered for snippet centering, phrase first.
+
+    The snippet builders try needles in order and center the excerpt on the
+    first hit, so ordering is a display-quality decision: the exact phrase is
+    the most meaningful anchor, then full-weight needles (whole terms and CJK
+    bigrams) in first-seen order — preserving the pre-CJK behavior for ASCII
+    queries, where a predictable first-typed-term fallback is part of the
+    contract — and down-weighted lone CJK characters last, the anchor of last
+    resort. Returns ``[]`` for a whitespace-only query.
+
+    A forge-reference needle contributes every spelling it carries, right after
+    its canonical form: the transcript that matched may name the item any of
+    those ways, and centering the snippet on the mention is the whole point.
+    """
+    needles, phrase, _ = parse_search_query(query)
+    if not needles:
+        return []
+    # Stable sort on weight only: within a weight class the parse's insertion
+    # order (required terms first-seen, then bigrams) is the display order.
+    ordered = sorted(needles, key=lambda n: -n.weight)
+    out: list[str] = []
+    for text in (phrase, *(t for n in ordered for t in (n.text, *n.alts))):
+        if text not in out:
+            out.append(text)
+    return out
+
+
+def needles_match_text(
+    needles: list[SearchNeedle], folded_text: str, adjacency_floor: bool = True
+) -> bool:
+    """True when *folded_text* satisfies the query gate that *needles* encode.
+
+    The single-string form of :meth:`ConversationLog.search_sessions`' match
+    rule, for callers that filter one text field (e.g. Discord session
+    resume's title-only fallback) and must not grow a second spelling of
+    tokenization: every REQUIRED needle must appear as a substring, and when
+    the query carries adjacency (bigram) needles at least one must hit — the
+    same adjacency floor that keeps character scatter out of content search.
+    Pass :func:`parse_search_query`'s ``adjacency_floor`` element: it is
+    ``False`` when the bigram set was truncated, which WAIVES the floor here
+    exactly as in ``search_sessions`` (a partial bigram set cannot prove
+    "no adjacency anywhere"). *folded_text* must already be casefolded
+    (needle texts are).
+
+    Satisfaction is per NEEDLE, not per literal: a needle carrying alternative
+    spellings (a forge reference) is satisfied by any one of them, via the
+    shared :func:`count_needle`.
+    """
+    if not needles:
+        return False
+    adjacency_hit = False
+    has_adjacency = False
+    for needle in needles:
+        if needle.required:
+            if not count_needle(needle, folded_text):
+                return False
+        elif needle.adjacency:
+            has_adjacency = True
+            if count_needle(needle, folded_text):
+                adjacency_hit = True
+    return adjacency_hit or not has_adjacency or not adjacency_floor
+
+
+# Hard ceilings on the memory the two search memos may hold, in real retained
+# bytes as reported by ``str.__sizeof__`` — NOT in characters.
+#
+# ``len()`` is the wrong unit and dangerously so: CPython stores a ``str`` in the
+# narrowest width its contents allow, so one character is 1 byte for latin-1, 2
+# for the BMP, and 4 for astral planes. A ceiling of 160 MB counted in characters
+# retains 168 MB of ASCII, 336 MB of CJK, or 671 MB of emoji — and CJK is the
+# ordinary case for a non-English corpus, not a pathological one. The sizers
+# therefore call ``__sizeof__`` per string, and the snippet memo also charges for
+# its list container.
+#
+# Why bytes and not an entry count: a session is read up to
+# ``_SESSION_MAX_BYTES`` (2 MB), so ``_SEARCH_SCAN_WINDOW`` entries is anywhere
+# from a few MB to ~1 GB depending on the corpus. An entry count therefore
+# bounds nothing that matters; it only *looked* safe because real sessions are
+# small (a 171 MB / 230-session corpus folds to ~8 MB).
+#
+# The two are separate rather than one shared pool so a corpus that blows the
+# snippet budget cannot starve the fold, which is the one that keeps matching
+# off the critical path. Their sum is the ceiling to reason about.
+_SEARCH_FOLD_BUDGET_BYTES = 96 * 1024 * 1024
+_SEARCH_SNIPPET_BUDGET_BYTES = 64 * 1024 * 1024
 
 # Canonical set of memory_mode values that mark a session private — never
 # searchable/listable/summarizable. Single source of truth shared by the MCP
 # history tools (mcp_core) and the dashboard session handlers so the exclusion
 # can't silently diverge between surfaces.
 INCOGNITO_MEMORY_MODES = frozenset({"incognito", "temporary"})
+
+
+def is_incognito_transcript(memory_mode: object) -> bool:
+    """True when *memory_mode* marks a transcript private (incognito/temporary).
+
+    The single shared predicate for :data:`INCOGNITO_MEMORY_MODES` membership,
+    so the normalization cannot drift between the surfaces that must agree on
+    what "private" means (history scans, MCP history tools, dashboard session
+    handlers, Discord resume, summary/folder/channel-slot derivations).
+
+    Normalization is ``str()`` + ``lower()`` — exactly what the call sites
+    apply: ``None``/absent reads as persistent (not private), and comparison is
+    case-insensitive because the set holds lowercase members while a
+    hand-edited transcript header is not bound by the API's validation.
+    Whitespace is deliberately NOT stripped and unrecognized values read as
+    not-private: callers that must fail closed on an unreadable or junk header
+    (e.g. the restricted-session write gate) resolve the mode through an
+    allowlist first and deny on ``None`` before this membership test applies.
+    """
+    return str(memory_mode or "").lower() in INCOGNITO_MEMORY_MODES
+
 
 # The fields that record where a message came from: the session key it arrived
 # on (``source_thread``, e.g. ``slack:1785861252.833429``) and the platform user
@@ -653,35 +1569,9 @@ def _safe_mtime(path: Path) -> float | None:
         return None
 
 
-def _cache_identity(st: os.stat_result) -> tuple[float, float, int]:
-    """Cache-invalidation identity for a session file: mtime, ctime and inode.
-
-    **mtime alone is not sufficient, because a writer here deliberately lies
-    about it.** :func:`_restore_mtime` puts the previous mtime back after
-    ``mark_consolidated`` and other housekeeping rewrites, so the file's mtime
-    stays fixed across a real content change — by design, to keep consolidation
-    from floating stale sessions to the top of ``list_sessions``. Any cache keyed
-    on mtime therefore serves pre-write content indefinitely: on 2026-08-13 a
-    consolidation offset committed by the CLI was read back as its stale value
-    and written over, which is what let a 6,645-message backlog accumulate.
-
-    ``st_ctime`` is the structural tell: it is the inode-change time, and
-    ``os.utime`` updates it as a *side effect* of setting mtime, with no syscall
-    to move it backwards. The very call that creates the lie stamps the evidence.
-
-    ``st_ino`` is carried too rather than relying on ctime alone, because on
-    Windows ``st_ctime`` is the *creation* time — it does not move on rewrite,
-    and NTFS tunnelling can even preserve it across the rename that
-    :func:`~kiro_crew.atomic_write.atomic_write` performs. Every write here goes
-    through that temp-file-plus-replace, so the inode changes even when both
-    timestamps are held still. Inode numbers alone would be weaker in turn: ext4
-    reuses freed inodes, so a recycled number could in principle collide.
-
-    Reproduced directly (temp file, ``os.replace``, then ``os.utime`` to restore
-    mtime exactly as ``mark_consolidated`` does): mtime did NOT move, while
-    ctime, inode and size all did.
-    """
-    return (st.st_mtime, st.st_ctime, st.st_ino)
+def _cache_identity(stat: os.stat_result) -> tuple[float, float, int]:
+    """Return the file identity that survives an mtime-preserving rewrite."""
+    return (stat.st_mtime, stat.st_ctime, stat.st_ino)
 
 
 def _restore_mtime(path: Path, prev_mtime: float | None) -> None:
@@ -741,11 +1631,11 @@ def _archive_lines(
     )
     payload = header + "".join(lines)
     # Atomic exclusive-create to avoid TOCTOU clobber when two archives land in the same second.
-    # Use '__' delimiter so keys containing dots (e.g. Slack thread_ts) don't confuse rfind('.') parsing.
     for n in itertools.count():
         if n > 1000:
             raise RuntimeError(f"Failed to create archive file after {n} attempts")
-        candidate = adir / f"{safekey}__{stamp}{f'-{n}' if n else ''}.jsonl"
+        suffix = f"-{n}" if n else ""
+        candidate = adir / f"{safekey}{ARCHIVE_SEGMENT_DELIMITER}{stamp}{suffix}.jsonl"
         try:
             with candidate.open("x", encoding="utf-8") as f:
                 f.write(payload)
@@ -787,7 +1677,6 @@ def _cleanup_old_archives(retention_days: int | None = None, base: Path | None =
     entirely — the user manages archive deletion manually.
     """
     global _last_cleanup
-    import time as _time
 
     # Explicit negative disables cleanup immediately (no config read needed).
     if retention_days is not None and retention_days < 0:
@@ -801,8 +1690,7 @@ def _cleanup_old_archives(retention_days: int | None = None, base: Path | None =
     # Past the throttle window: stamp _last_cleanup NOW, before resolving
     # retention. Otherwise a config-resolved "disabled" (negative) would return
     # without updating the window, so every subsequent archive write would
-    # re-run the expensive KiroCrewConfig.load() — reintroducing the
-    # regression for the disabled case.
+    # re-run the expensive KiroCrewConfig.load().
     _last_cleanup = now
     # Resolve retention from config if not given, honoring a config-resolved
     # negative as the disable signal too.
@@ -833,10 +1721,12 @@ def transcript_sort_key(ts: str) -> tuple[int, float]:
     Shared by every path that has to put two independently written streams of
     transcript lines into one chronological order.
 
-    Timestamps in one transcript are not written in one format. The dashboard
-    path stores offset-aware values; the channel path stores
-    ``datetime.now().isoformat()``, which is local and naive. Comparing those as
-    STRINGS orders them by their text, so on any host that is not UTC a naive
+    Timestamps in one transcript are not guaranteed to share one format. Both
+    the dashboard and the channel path now write offset-aware values (message
+    rows via :func:`monotonic_transcript_ts`, metadata via
+    :func:`metadata_now_iso`), but transcripts written by older builds still
+    hold naive ``datetime.now().isoformat()`` rows. Comparing those as STRINGS
+    orders them by their text, so on any host that is not UTC a naive
     ``10:00:00`` sorts before an aware ``09:30:00+00:00`` that actually happened
     later — and this merge deletes the source file afterwards, so the wrong order
     is what survives.
@@ -865,6 +1755,26 @@ def _parse_transcript_ts(ts: str) -> datetime | None:
         return datetime.fromisoformat(ts.strip().replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
+
+
+def metadata_now_iso() -> str:
+    """Offset-aware ISO-8601 stamp for a transcript metadata timestamp.
+
+    A transcript's metadata line carries absolute-instant fields --
+    ``created_at``, ``updated_at``, ``compacted_at``, ``rotated_at`` -- that are
+    read back as points in time, not wall clocks: the dashboard renders a
+    session's ``created_at`` as a local-time timestamp, and
+    :func:`transcript_sort_key` orders lines against it. A bare
+    ``datetime.now().isoformat()`` records naive local wall-clock with no
+    offset, so a reader (the browser, or a merge running on another host) has no
+    way to know which timezone produced it -- the dashboard then renders it
+    verbatim, showing a Slack/channel session's creation time in UTC instead of
+    the viewer's local zone (issue #1948). Resolving to an absolute instant with
+    ``astimezone()`` records the offset, matching the message-row convention in
+    :func:`monotonic_transcript_ts` so both the metadata line and the rows below
+    it speak the same, unambiguous format.
+    """
+    return datetime.now().astimezone().isoformat()
 
 
 def monotonic_transcript_ts(previous: str | None, now: datetime) -> str:
@@ -915,6 +1825,72 @@ def _safe_key(key: str) -> str:
     return re.sub(r"[^\w\-.]", "_", key)
 
 
+def transcript_stem(key: str) -> str:
+    """The canonical filename stem *key*'s transcript and archive segments share.
+
+    Exported so callers that account for or reclaim a session's disk usage can
+    pair a session key with its files without re-deriving the sanitization. A
+    second copy of that rule would drift the moment this one changed, and the
+    failure is silent and destructive: the pairing misses, and a caller deleting
+    "the session" removes one half and leaves the other behind.
+
+    Prefer :func:`transcript_stems` when the answer feeds a decision about which
+    files belong to a session — a Slack thread predating the canonical
+    ``slack:<ts>`` key still logs under its bare thread_ts stem, and this function
+    alone would not find it.
+    """
+    return _safe_key(key)
+
+
+_TAB_ID_INDEX_STEM_PREFIX = "dashboard_chat-"
+_TAB_ID_INDEX_GLOB = f"{_TAB_ID_INDEX_STEM_PREFIX}*.jsonl"
+
+
+def _index_key_for_stem(stem: str) -> str:
+    """The key form :attr:`ConversationLog._tab_id_index` stores for *stem*.
+
+    One derivation shared by the index builder (which starts from a filename)
+    and the in-place updater (which starts from a session key), because a second
+    copy would drift the moment either side changed and the failure is silent:
+    the two spellings stop matching, so an updater's lookup misses an entry that
+    is really there.
+    """
+    return stem.replace("_", ":", 1)
+
+
+def can_hold_tab_id_index_entry(key: str) -> bool:
+    """True when *key*'s transcript is one :meth:`_rebuild_tab_id_index` scans.
+
+    The index is built by globbing :data:`_TAB_ID_INDEX_GLOB`, so a transcript
+    whose stem does not match can never appear in it -- a channel-keyed session
+    (``slack:<ts>`` and friends) writes ``slack_<ts>.jsonl``, which the glob
+    never returns. Saving such a transcript therefore cannot add, remove or
+    change any index entry, which is what makes a no-op the correct response to
+    one rather than an invalidation.
+    """
+    return transcript_stem(key).startswith(_TAB_ID_INDEX_STEM_PREFIX)
+
+
+def transcript_stems(key: str) -> tuple[str, ...]:
+    """Every filename stem *key*'s transcript could occupy, canonical first.
+
+    :meth:`ConversationLog._path` falls back to the pre-migration bare
+    ``thread_ts`` filename for Slack threads that predate the canonical session
+    key, so one session key can legitimately resolve to either name. A caller that
+    only knew the canonical stem would treat the legacy transcript as belonging to
+    no session — and therefore as reclaimable while the session is still
+    resumable. Returning both keeps that decision correct without duplicating the
+    fallback rule.
+    """
+    stems = [_safe_key(key)]
+    bare = legacy_key(key)
+    if bare is not None:
+        legacy = _safe_key(bare)
+        if legacy not in stems:
+            stems.append(legacy)
+    return tuple(stems)
+
+
 def _redact_at_write_boundary(role: str, content: str) -> str:
     """Redact model-authored *content* on its way into a transcript.
 
@@ -935,13 +1911,56 @@ def _redact_at_write_boundary(role: str, content: str) -> str:
     return content
 
 
+def latest_transcript_ts(*candidates: str | None) -> str | None:
+    """The latest of several candidate predecessor timestamps, or ``None``.
+
+    A writer can have more than one row to order itself against, and the two
+    writers of a session transcript learn about predecessors differently:
+    :meth:`ConversationLog.append` reads the authoritative file tail under the
+    cross-process flock, while the dashboard's ``_ChatSlot.append`` runs on the
+    event loop and may only consult in-process state (a ``stat`` plus a file read
+    per append is what ``AUTOSDE.yaml``'s ``no-blocking-call-on-event-loop`` rule
+    forbids). The slot therefore floors on the later of its in-memory window tail
+    and the last on-disk tail it was told about at the previous save.
+
+    Comparison goes through :func:`transcript_sort_key`, never string ordering:
+    rows carry two stored formats (aware and naive isoformat), so ``"a" > "b"``
+    on the raw strings compares different domains and can pick the earlier row.
+
+    An UNPARSEABLE candidate is skipped rather than ranked. ``transcript_sort_key``
+    deliberately buckets a value it cannot parse *after* every real instant, so
+    that a corrupt line displays at the end of a transcript rather than in the
+    middle of the conversation. That is right for sorting and wrong for a floor:
+    ranked, one malformed ``ts`` would win here, and
+    :func:`monotonic_transcript_ts` ignores a previous value it cannot parse — so
+    a single corrupt row on disk would silently switch the whole ordering
+    guarantee off and let the next row tie its predecessor again.
+
+    ``None`` and empty candidates are ignored too, so a caller can pass a value it
+    does not have yet without branching. Returns ``None`` when nothing usable was
+    supplied — which correctly means "no floor", not "floor of zero".
+    """
+    best: str | None = None
+    best_key: tuple[int, float] | None = None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        key = transcript_sort_key(candidate)
+        if key[0] != 0:
+            # Unparseable: see the docstring. Not a usable floor.
+            continue
+        if best_key is None or key > best_key:
+            best, best_key = candidate, key
+    return best
+
+
 #: Default upper bound on the number of distinct session keys held in the
-#: in-memory transcript / metadata caches.  The previous implementation used
-#: plain ``dict`` caches that grew one entry per session key touched and never
-#: evicted — on a gateway serving thousands of sessions the parsed message
-#: lists (each up to ~200 messages / 2 MB of source JSONL) accumulated in RAM
-#: for the lifetime of the process.  A bounded LRU keeps hot sessions resident
-#: while giving the working set a deterministic ceiling.
+#: in-memory transcript / metadata caches.  Unbounded ``dict`` caches grow one
+#: entry per session key touched and never evict — on a gateway serving
+#: thousands of sessions the parsed message lists (each up to ~200 messages /
+#: 2 MB of source JSONL) accumulate in RAM for the lifetime of the process.  A
+#: bounded LRU keeps hot sessions resident while giving the working set a
+#: deterministic ceiling.
 _TRANSCRIPT_CACHE_MAX = 256
 
 # Metadata reads retry briefly before reporting "no metadata": on Windows a
@@ -1042,6 +2061,163 @@ class _LRUCache(Generic[_V]):
             self._data.clear()
 
 
+class _SearchTextCache(Generic[_V]):
+    """Byte-budgeted memo for the two derived corpora ``search_sessions`` needs.
+
+    Distinct from :class:`_LRUCache` because the access pattern is different in
+    the one way that decides an eviction policy. A search walks
+    ``_SEARCH_SCAN_WINDOW`` sessions **in the same recency order every query**,
+    so the working set is cyclic. Under LRU a cyclic scan larger than the cache
+    evicts each entry exactly one step before its next read: the hit rate does
+    not degrade, it collapses to zero, and it does so for the users with the
+    most sessions — the ones the memo exists for. ``_folded_cache`` was sized
+    ``max(cache_max, _SEARCH_SCAN_WINDOW)`` for precisely that reason.
+
+    An entry *count* is the wrong bound to carry that guarantee, though: 500
+    entries is 37 MB on one corpus and could be far more on another, because a
+    session is read up to ``_SESSION_MAX_BYTES``. The bound here is therefore
+    **bytes**, which is what actually has to fit in the gateway's RSS.
+
+    A byte budget reintroduces the cliff, so eviction is replaced by
+    **admission control**: when a new entry would exceed the budget it is simply
+    not stored, and the entries already held are kept. For a cyclic scan that
+    turns 0% into (whatever fraction fits)% — and because ``search_sessions``
+    walks most-recent-first, the fraction that stays cached is the most recently
+    active sessions, which is the half worth keeping. Existing entries are still
+    replaced in place on a content change (same key, new value), so a session
+    that is being written to never gets stuck on a stale value.
+
+    ``max_bytes <= 0`` disables the bound (behaves like a plain dict).
+
+    Thread safety mirrors :class:`_LRUCache`: one lock, every method atomic, no
+    method calls another locked method.
+    """
+
+    def __init__(self, max_bytes: int, sizer: Callable[[_V], int], label: str = "") -> None:
+        self._max_bytes = max_bytes
+        self._sizer = sizer
+        self._label = label
+        self._data: dict[str, _V] = {}
+        self._bytes = 0
+        self._admitted = 0
+        self._refused = 0
+        self._refused_since_prune = 0
+        self._warned = False
+        self._lock = threading.Lock()
+
+    def get(self, key: str, default: _V | None = None) -> _V | None:
+        with self._lock:
+            return self._data.get(key, default)
+
+    def __setitem__(self, key: str, value: _V) -> None:
+        cost = self._sizer(value)
+        with self._lock:
+            previous = self._data.get(key)
+            if previous is not None:
+                # Replacement, not growth: release the old cost first so a
+                # session that keeps being appended to cannot inflate the
+                # accounting or be refused admission for its own new value.
+                self._bytes -= self._sizer(previous)
+                del self._data[key]
+            if self._max_bytes > 0 and self._bytes + cost > self._max_bytes:
+                self._refused += 1
+                self._refused_since_prune += 1
+                warn = not self._warned
+                self._warned = True
+                if warn:
+                    # Say it once, at the moment the ceiling starts binding.
+                    # Without this the degradation is observable only under a
+                    # debugger, which makes "diagnosable" an empty claim.
+                    logger.warning(
+                        "search memo %s hit its %d MB ceiling (%d entries, %d "
+                        "admitted); sessions past it fall back to re-reading "
+                        "their file, so warm search will be slower on this "
+                        "corpus",
+                        self._label or "cache",
+                        self._max_bytes // (1024 * 1024),
+                        len(self._data),
+                        self._admitted,
+                    )
+                return
+            self._data[key] = value
+            self._bytes += cost
+            self._admitted += 1
+
+    def pop(self, key: str, default: _V | None = None) -> _V | None:
+        with self._lock:
+            if key in self._data:
+                value = self._data.pop(key)
+                self._bytes -= self._sizer(value)
+                return value
+            return default
+
+    def retain(self, live_keys: Container[str]) -> int:
+        """Drop every entry whose key is not in *live_keys*; return how many.
+
+        The release valve that keeps admission control from becoming a one-way
+        ratchet. Without it, a cache that fills freezes on whatever it happened
+        to hold first: entries that have since aged out of the scan window keep
+        their budget forever (only invalidation or a stat failure pops them),
+        while every newly created session is refused — so the newest and most
+        searched sessions become exactly the cold ones, and warm latency
+        regresses over process lifetime until a restart.
+
+        Safe against the LRU cliff this class exists to avoid, because it only
+        drops entries a search can no longer reach: ``search_sessions`` walks the
+        ``_SEARCH_SCAN_WINDOW`` most recent sessions, so anything outside that
+        window is dead weight by construction rather than an entry one step from
+        its next read.
+
+        Called only under pressure (see ``refused_since_prune``) so an
+        uncontended cache never pays for the scan.
+        """
+        with self._lock:
+            doomed = [k for k in self._data if k not in live_keys]
+            for k in doomed:
+                self._bytes -= self._sizer(self._data.pop(k))
+            self._refused_since_prune = 0
+            return len(doomed)
+
+    def refused_since_prune(self) -> int:
+        """Admissions turned away since the last :meth:`retain`.
+
+        Nonzero means the budget is binding right now, which is the signal to
+        spend a prune. Distinct from the cumulative ``refused`` in
+        :meth:`stats`, which never resets so it stays useful for diagnosis.
+        """
+        with self._lock:
+            return self._refused_since_prune
+
+    def __contains__(self, key: object) -> bool:
+        with self._lock:
+            return key in self._data
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+            self._bytes = 0
+
+    def stats(self) -> dict[str, int]:
+        """Observability for the budget: how full it is and what it turned away.
+
+        ``refused`` rising while ``entries`` is flat is the signal that the
+        budget is smaller than the working set, i.e. that searches on this
+        corpus are paying the cold cost for the sessions that did not fit.
+        """
+        with self._lock:
+            return {
+                "entries": len(self._data),
+                "bytes": self._bytes,
+                "max_bytes": self._max_bytes,
+                "admitted": self._admitted,
+                "refused": self._refused,
+            }
+
+
 class ConversationLog:
     """Append-only JSONL conversation store with provenance and rotation."""
 
@@ -1073,6 +2249,48 @@ class ConversationLog:
     _flock_state: dict[str, list[int]] = {}
     _flock_guard = threading.Lock()
 
+    # Monotonic count of cross-process flock RELEASES per lock_key, bumped
+    # under ``_flock_guard`` when a deferred release actually retires a held
+    # flock. Part of the unlocked-fill publish witness
+    # (:meth:`_flock_hold_witness`): "held now" at two instants does not prove
+    # the hold was CONTINUOUS — the flock could have been released and
+    # re-acquired between them with an external process's write in the gap,
+    # and ``os.open`` can recycle the fd number, so the fd alone cannot prove
+    # continuity either. An unchanged (fd, epoch) pair can: the epoch moves on
+    # every release, so equal pairs mean the same unbroken hold. Same growth
+    # class as ``_flock_state``.
+    _flock_epochs: dict[str, int] = {}
+
+    # Per-key invalidation generation, bumped by ``_invalidate_cache`` BEFORE
+    # it drops entries. The mtime guard alone cannot protect a cache FILL:
+    # housekeeping rewrites (compaction / rotation / metadata edits /
+    # mark_consolidated) restore the pre-write mtime via ``_restore_mtime``,
+    # so a fill that stats the file before such a rewrite and publishes after
+    # its invalidation would park pre-rewrite data under an mtime the file
+    # still has — undetectable for the life of the process. Fill paths
+    # snapshot the generation before their stat and publish only while it is
+    # unmoved (``_publish_if_current`` for the mtime-keyed memos; the unlocked
+    # ``_msg_cache`` fallback in ``_read_messages`` checks it inline alongside
+    # the flock-hold witness), discarding the fill otherwise. Class-level for
+    # the same reason
+    # ``_file_locks`` is: the writer whose lock hold forces a reader onto the
+    # unlocked fill may live on a DIFFERENT ``ConversationLog`` instance over
+    # the same directory, and its bump must be visible to that reader's
+    # snapshot. Keyed by ``(transcript dir, sanitized filename stem)`` — pure
+    # string math, so a snapshot costs no I/O, the dir component keeps
+    # distinct ``base_dir``s from sharing counters, and the stem (see
+    # ``_cache_gen``) makes the logical-key and ``path.stem`` spellings of one
+    # session share one counter. ``_cache_gens_guard`` is always innermost:
+    # taken under ``_file_lock`` (every writer invalidates while holding it),
+    # never the reverse, and never across I/O — so no read path waits on a
+    # writer's file operations. Grows one small int per (dir, spelling) ever
+    # invalidated in this process — a session can occupy up to two buckets
+    # (a legacy bare Slack stem plus its canonical spelling) — the same
+    # growth class as ``_file_locks``, and entries are never evicted because
+    # a missing entry must always mean "generation 0", not "forgotten bump".
+    _cache_gens: dict[tuple[str, str], int] = {}
+    _cache_gens_guard = threading.Lock()
+
     def __init__(
         self,
         base_dir: Path | None = None,
@@ -1080,15 +2298,17 @@ class ConversationLog:
         cache_max: int = _TRANSCRIPT_CACHE_MAX,
     ):
         self._dir = base_dir or _sessions_dir()
-        # Bounded, mtime-keyed LRU caches (key → (mtime, payload)). Bounded so
+        # Bounded identity-keyed LRU caches. Bounded so
         # a long-lived gateway touching thousands of sessions cannot grow the
         # parsed-transcript working set without limit. Eviction is
         # least-recently-used and deterministic; writes invalidate per-key via
         # _invalidate_cache so a stale entry can never outlive a file change.
-        self._msg_cache: _LRUCache[tuple[tuple[float, float, int], list[dict]]] = _LRUCache(
-            cache_max
-        )
-        self._meta_cache: _LRUCache[tuple[tuple[float, float, int], dict]] = _LRUCache(cache_max)
+        self._msg_cache: _LRUCache[tuple[tuple[float, float, int], int, list[dict]]] = _LRUCache(cache_max)
+        #: ``(mtime, gen, meta)`` — like the search memos, entries record the
+        #: invalidation generation and a warm hit requires both fields to
+        #: match, so a preserved-mtime metadata edit through another
+        #: instance (whose pops cannot reach this cache) still unhits.
+        self._meta_cache: _LRUCache[tuple[tuple[float, float, int], int, dict]] = _LRUCache(cache_max)
         #: Bounded, mtime-keyed LRU of formatted ``recent()`` windows keyed by
         #: (key, max_messages, roles). The tail-read fast path intentionally
         #: never warms ``_msg_cache`` (it returns a partial view), so a session
@@ -1097,8 +2317,54 @@ class ConversationLog:
         #: call. This memoizes the formatted window; the stored mtime guards
         #: staleness (an append bumps the file mtime, so the entry is
         #: recomputed on the next call). Own ``_LRUCache`` → own internal lock.
-        self._recent_cache: _LRUCache[tuple[tuple[float, float, int], list[dict]]] = _LRUCache(
-            cache_max
+        self._recent_cache: _LRUCache[tuple[tuple[float, float, int], int, list[dict]]] = _LRUCache(cache_max)
+        #: Bounded memo of ``(mtime, gen, doc_chars, casefolded_blob)`` per
+        #: session, consumed only by :meth:`search_sessions`. ``gen`` is the
+        #: invalidation generation (:meth:`_cache_gen`) the entry was folded
+        #: under; a hit requires BOTH the mtime and the generation to match,
+        #: because ``_invalidate_cache``'s pops reach only their own
+        #: instance's caches while a preserved-mtime rewrite can be performed
+        #: through a different ``ConversationLog`` instance over the same
+        #: directory — the generation bump is what unhits such an entry where
+        #: the instance-local pop cannot.
+        #:
+        #: Folding is the dominant cost of a search: the substring count itself
+        #: is cheap, but ``str.casefold`` over a whole corpus is not, and it
+        #: holds the GIL for its full duration — so re-folding per query stalls
+        #: the event loop even when the search runs in a worker thread. The
+        #: corpus does not change between the keystrokes of one search, so the
+        #: fold is memoized here and each query pays only the count.
+        #:
+        #: Bounded by BYTES, not entries — see ``_SEARCH_FOLD_BUDGET_BYTES``. The
+        #: previous ``max(cache_max, _SEARCH_SCAN_WINDOW)`` entry bound existed to
+        #: stop an LRU from collapsing to a zero hit rate against the cyclic scan
+        #: order; :class:`_SearchTextCache` keeps that guarantee by refusing
+        #: admission instead of evicting, so the sessions that fit stay cached
+        #: and the bound is now a real memory ceiling rather than a proxy for one.
+        self._folded_cache: _SearchTextCache[tuple[tuple[float, float, int], int, int, str]] = _SearchTextCache(
+            _SEARCH_FOLD_BUDGET_BYTES, lambda v: v[3].__sizeof__(), "fold"
+        )
+        #: session key → (mtime, gen, raw message texts) for snippet extraction.
+        #:
+        #: The fold above answers "does this session match"; this answers "show me
+        #: the line". Without it every returned row re-opened its file and
+        #: re-parsed JSONL until the first hit, which profiling showed to be 92%
+        #: of a warm query (55% in ``json.raw_decode`` alone, ~7.2k parses per
+        #: query on a 230-session corpus). The cost is not the match count but how
+        #: deep the first hit sits, which is why a 21-hit query measured 189 ms
+        #: while a 50-hit query measured 81 ms.
+        #:
+        #: Filled by :meth:`_build_folded`, which already materializes exactly
+        #: this list to build the fold — so the second corpus costs one extra
+        #: reference, never an extra read. Raw (not folded) because the snippet is
+        #: displayed to the user; the fold cannot be reused for it. Carries the
+        #: same generation field as ``_folded_cache`` above, for the same
+        #: cross-instance reason: both memos are derived from the messages, so
+        #: they go stale at exactly the same moment.
+        self._snippet_cache: _SearchTextCache[tuple[tuple[float, float, int], int, list[str]]] = _SearchTextCache(
+            _SEARCH_SNIPPET_BUDGET_BYTES,
+            lambda v: v[2].__sizeof__() + sum(t.__sizeof__() for t in v[2]),
+            "snippet",
         )
         #: tab_id → [session keys] chain index. ``None`` means "stale, rebuild
         #: on next chained read"; a dict is an authoritative snapshot. Rebuilt
@@ -1109,6 +2375,32 @@ class ConversationLog:
         #: event loop may mark it stale — an unsynchronized rebuild/read/clear
         #: produced a transient empty index or ``AttributeError``.
         self._tab_id_index: dict[str, list[str]] | None = None
+        #: session key → (mtime, tab_id) memo feeding the rebuild above.
+        #: Deliberately an unbounded plain dict, NOT an _LRUCache: the rebuild is
+        #: a cyclic scan over every dashboard file, and a bounded cache under a
+        #: cyclic scan larger than the bound has a 0% hit rate (see
+        #: _SearchTextCache's docstring). Values are 12-char ids, so 1k sessions
+        #: is tens of KB.
+        #:
+        #: TWO guards, and neither is sufficient alone. The explicit pop in
+        #: _invalidate_cache covers writes THROUGH this class from THIS instance:
+        #: those restore the pre-write mtime (_restore_mtime), so a stamp alone
+        #: would not see them. The stamp covers rewrites that never reach that
+        #: pop -- a hand-edited tab_id, or a write through ANOTHER instance,
+        #: whose pop lands on its own memo and leaves ours intact.
+        #:
+        #: The stamp is (st_mtime_ns, st_size, st_ino), all from one stat. Size
+        #: rides along because timestamp granularity is coarse (worse on
+        #: Windows). ns rather than float seconds, and st_ino as well, because
+        #: another instance's equal-length tab_id rewrite preserves mtime and
+        #: size both -- see the cross-instance test.
+        self._tab_id_by_key: dict[str, tuple[tuple[int, int, int], str]] = {}
+        #: Bumped by _invalidate_cache. The rebuild samples it before reading a
+        #: file's metadata and declines to memoize if it moved, so a store cannot
+        #: land after a concurrent writer's pop and resurrect a stale id.
+        #: _invalidate_cache deliberately does not take self._lock, so the
+        #: rebuild cannot exclude it.
+        self._tab_id_generation = 0
         #: Coarse instance lock protecting the lazily-built ``_tab_id_index``
         #: rebuild/read/clear. The message/metadata/recent LRUs are each
         #: internally locked; this guards the shared mutable state that lives
@@ -1307,6 +2599,34 @@ class ConversationLog:
                     # its own fd under the guard, so a reuse cancels it.
                     self._schedule_flock_release(key, lock_key, state[0])
 
+    @contextlib.contextmanager
+    def atomic_appends(self, key: str) -> Iterator[None]:
+        """Group several appends to one session into ONE indivisible write.
+
+        :meth:`append` locks per ROW, so two callers each writing a
+        user+assistant PAIR can interleave into ``user_A, user_B, assistant_A,
+        assistant_B`` -- a transcript whose turns no longer pair up, and which no
+        timestamp ordering can repair because every row's ``ts`` is correct.
+
+        The hazard is specific to concurrent writers. A caller running ON the
+        event loop could not hit it: ``save_conversation_turn`` never awaits
+        between its two appends, so the single-threaded loop made the pair
+        effectively atomic. It appears exactly when a caller does the right thing
+        and moves the write OFF the loop, because two worker threads then run
+        those pairs concurrently. So this is the companion any multi-append
+        caller needs alongside the offload, not an optional extra.
+
+        ``_locked`` is reentrant for the same key on the same thread, so the
+        per-row locks inside ``append`` reuse the lock held here rather than
+        deadlocking on it.
+
+        Enter this OFF the event loop. It takes the same acquire path as
+        ``append``, which fails fast with :class:`HistoryLockTimeout` on a
+        running loop rather than blocking it.
+        """
+        with self._locked(key):
+            yield
+
     def _schedule_flock_release(self, key: str, lock_key: str, fd: int) -> None:
         """Release+close *fd* off the loop iff the entry is still idle.
 
@@ -1333,6 +2653,13 @@ class ConversationLog:
                     if st is None or st[0] != fd or st[1] != 0:
                         return  # reused or replaced — leave the flock in place
                     ConversationLog._flock_state.pop(lock_key, None)
+                    # The hold is over: advance the release epoch so an
+                    # unlocked fill's witness (:meth:`_flock_hold_witness`)
+                    # spanning this release can no longer claim a continuous
+                    # hold, even if a re-acquire lands on a recycled fd number.
+                    ConversationLog._flock_epochs[lock_key] = (
+                        ConversationLog._flock_epochs.get(lock_key, 0) + 1
+                    )
                 try:
                     platform_compat.release_lock(fd)
                 finally:
@@ -1393,22 +2720,163 @@ class ConversationLog:
             return None
         summary = data.get("summary")
         sig = self.session_mtime(key)
-        if sig is not None and data.get("sig") == sig and isinstance(summary, str):
+        if (
+            sig is not None
+            and data.get("sig") == sig
+            and data.get("gen", 0) == self.rotation_generation(key)
+            and isinstance(summary, str)
+        ):
             return summary
         return None
 
-    def set_cached_summary(self, key: str, summary: str, sig: float) -> None:
+    def set_cached_summary(
+        self, key: str, summary: str, sig: float, generation: int | None = None
+    ) -> None:
         """Persist a derived one-line *summary* to the sidecar cache.
 
         Keyed by the session file's mtime *sig* so a later append invalidates
         it. Atomic and side-effect-free with respect to the session JSONL —
         no read-modify-write, hence no data-loss race with a concurrent
         :meth:`append`.
+
+        *generation* is :meth:`rotation_generation` captured at the same moment
+        as *sig*, and must come from the caller for the same reason *sig* does:
+        summary generation holds no lock while the model call is in flight, and
+        a rewrite landing in that window preserves the mtime while advancing the
+        generation. Reading the generation HERE would stamp the new content's
+        identity onto the old summary and bless it as fresh — the exact
+        staleness the generation was added to catch. ``None`` reads it at write
+        time, which is only safe when no snapshot preceded the call.
         """
         atomic_write(
             self._summary_cache_path(key),
-            json.dumps({"sig": sig, "summary": summary}),
+            json.dumps(
+                {
+                    "sig": sig,
+                    "gen": (
+                        self.rotation_generation(key)
+                        if generation is None
+                        else generation
+                    ),
+                    "summary": summary,
+                }
+            ),
         )
+
+    def _intent_summary_cache_path(self, key: str) -> Path:
+        """Sidecar path for a session's cached intent-structured summary.
+
+        Deliberately a different file from :meth:`_summary_cache_path`: the
+        one-line summary and the intent summary have independent writers and
+        independent triggers, and sharing one file would reintroduce the
+        read-modify-write race the sidecar design exists to avoid.
+        """
+        return self._dir / ".intents" / f"{_safe_key(key)}.json"
+
+    def get_cached_intent_summary(self, key: str) -> dict | None:
+        """Return the cached intent summary payload for *key* if still valid.
+
+        Same mtime-signature contract as :meth:`get_cached_summary`: any real
+        append advances the session file's mtime and invalidates the cache,
+        while metadata-only rewrites preserve it. Returns the whole payload so
+        the caller can read ``generated_at`` for display.
+        """
+        try:
+            raw = self._intent_summary_cache_path(key).read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("intents"), list):
+            return None
+        sig = self.session_mtime(key)
+        if sig is None or data.get("sig") != sig:
+            return None
+        if data.get("gen", 0) != self.rotation_generation(key):
+            return None
+        return data
+
+    def read_intent_summary(self, key: str) -> tuple[dict | None, bool]:
+        """Return ``(payload, stale)`` for a session's intent summary.
+
+        Unlike :meth:`get_cached_intent_summary`, this does not discard a
+        payload whose signature no longer matches — it reports it as stale
+        instead. The panel prefers showing the last known summary marked as
+        out of date over showing nothing, because an empty panel reads as
+        "this feature is broken" while a stale one reads as "not regenerated
+        yet", which is the truth.
+        """
+        try:
+            raw = self._intent_summary_cache_path(key).read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return None, False
+        if not isinstance(data, dict) or not isinstance(data.get("intents"), list):
+            return None, False
+        sig = self.session_mtime(key)
+        fresh = (
+            sig is not None
+            and data.get("sig") == sig
+            and data.get("gen", 0) == self.rotation_generation(key)
+        )
+        return data, not fresh
+
+    def set_cached_intent_summary(
+        self, key: str, payload: dict, sig: float, generation: int | None = None
+    ) -> bool:
+        """Persist a derived intent summary *payload* to its sidecar cache.
+
+        Writes only the sidecar, never the session JSONL, so generating a
+        summary cannot clobber the transcript or advance its mtime (which would
+        both invalidate every other derived cache and reorder ``list_sessions``).
+
+        The write happens under ``_locked`` and only if the transcript still
+        exists with the *same* signature the generation started from. Generation
+        holds no lock while the model call is in flight (it can take tens of
+        seconds), so a permanent :meth:`delete_session` can complete in that
+        window -- removing the transcript AND this sidecar. An unconditional
+        write here would then recreate the sidecar, resurrecting deleted
+        conversation data after the user was told it was gone. The sig equality
+        check also drops a summary that a mid-generation append has already made
+        stale, rather than storing it as the latest word.
+
+        Returns True when the payload was written, False when it was refused
+        (transcript deleted or changed, or the lock could not be acquired).
+        Callers run this off the event loop (``asyncio.to_thread``) because
+        ``_locked`` blocks.
+        """
+        try:
+            with self._locked(key):
+                if _safe_mtime(self._path(key)) != sig:
+                    return False
+                current_generation = self.rotation_generation(key)
+                if generation is not None and current_generation != generation:
+                    # A rewrite landed while the model call was in flight. It
+                    # PRESERVED the mtime, so the check above cannot see it —
+                    # the generation is the only signal that the summary now
+                    # describes replaced content. Refuse for the same reason a
+                    # changed mtime is refused: storing it would record a known
+                    # stale payload as the latest word.
+                    return False
+                atomic_write(
+                    self._intent_summary_cache_path(key),
+                    json.dumps(
+                        {
+                            **payload,
+                            "sig": sig,
+                            "gen": (
+                                current_generation
+                                if generation is None
+                                else generation
+                            ),
+                        }
+                    ),
+                )
+                return True
+        except HistoryLockTimeout:
+            logger.warning(
+                "set_cached_intent_summary: lock timeout, not writing key=%s", key
+            )
+            return False
 
     def append(
         self,
@@ -1420,8 +2888,27 @@ class ConversationLog:
         source_user: str | None = None,
         agent: str | None = None,
         tab_id: str | None = None,
+        cls: str = "",
+        mid: str | None = None,
     ) -> None:
         """Append a message with optional provenance to the session log.
+
+        *cls* persists the message's presentation class. The in-memory slot
+        carries one (``_ChatSlot.append``) but this durable copy had nowhere to
+        put it, so any class-borne distinction silently vanished the moment a
+        session's rows had to be replayed from disk after a restart.
+
+        *mid* persists the row's delivery identity as ``meta.mid`` — the SAME
+        field shape the dashboard slot save writes
+        (``chat_persistence._build_message_entry`` copies the window row's
+        ``meta`` dict to disk). A dual-writer that reflects a message in the
+        in-memory slot (``_ChatSlot.append``, which mints the id) AND persists
+        it here must pass that minted id, so both copies carry one identity and
+        the bounded-read reconciliation (``_append_unflushed_tail``'s
+        ``meta.mid`` walk) recognises the durable copy instead of treating the
+        window copy as still owed. Optional: a row appended without one carries
+        no ``meta`` at all, which is what pre-id transcripts hold — readers keep
+        their id-less fallback for exactly those rows.
 
         If the session file does not yet exist, it will be created with an
         initial metadata line.  When *agent* is supplied, the agent name is
@@ -1443,7 +2930,7 @@ class ConversationLog:
                 self._dir.mkdir(parents=True, exist_ok=True)
                 meta: dict = {
                     "_type": "metadata",
-                    "created_at": datetime.now().isoformat(),
+                    "created_at": metadata_now_iso(),
                     "last_consolidated": 0,
                 }
                 if agent:
@@ -1456,6 +2943,7 @@ class ConversationLog:
             msg: dict = {
                 "role": role,
                 "content": _redact_at_write_boundary(role, content),
+                **({"cls": cls} if cls else {}),
                 # Strictly after the row already on disk, so the pair written by
                 # one turn stays ordered on a host whose clock cannot separate
                 # them (see monotonic_transcript_ts). Consulting the file here is
@@ -1480,6 +2968,14 @@ class ConversationLog:
                 msg["source_thread"] = source_thread
             if source_user:
                 msg["source_user"] = source_user
+            if isinstance(mid, str) and mid:
+                # ``meta`` holding ``mid`` is the identity shape every reader of
+                # this file already matches on (the slot save writes it, the
+                # bounded-read walk consumes it); a second spelling would be
+                # invisible to both. Only a non-empty ``str`` counts, matching
+                # the read side — persisting any other shape would store an id
+                # the reader is structurally unable to honour.
+                msg["meta"] = {"mid": mid}
 
             # Session transcripts are intentionally local plaintext JSONL (the
             # documented storage format), not a credential/secret store.
@@ -1496,8 +2992,10 @@ class ConversationLog:
             if created_with_tab_id:
                 self.invalidate_tab_id_cache()
 
-            # Rotate if file exceeds size limit
-            self._maybe_rotate(path)
+            # Rotate if file exceeds size limit. Pass the logical key so the
+            # rotation's invalidation reaches every cache-key spelling; the
+            # file stem alone cannot recover it (sanitization is lossy).
+            self._maybe_rotate(path, key)
 
     def append_if_absent(
         self,
@@ -1507,11 +3005,15 @@ class ConversationLog:
         *,
         agent: str | None = None,
         tab_id: str | None = None,
+        cls: str = "",
+        mid: str | None = None,
     ) -> bool:
         """Append a message only if an identical one is not already persisted.
 
-        Returns ``True`` if the message was written, ``False`` if a message
-        with the same ``(role, content)`` already exists on disk.
+        Returns ``True`` if the message was written, ``False`` if it is already
+        on disk — judged by ``(role, content)`` when the caller supplies no
+        *mid*, and by ``(role, content)`` plus the SAME ``meta.mid`` when it
+        does (see below).
 
         The disk check and the append run together under ``_locked`` so they
         are ATOMIC against a concurrent writer of the same session file — in
@@ -1525,7 +3027,19 @@ class ConversationLog:
         agent turns. This is the workflow-result / cron-result double-append
         race: the read-modify-write must be one locked critical section, not a
         separate unlocked existence check followed by a later append.
+
+        What counts as "already persisted" depends on whether the caller holds
+        an identity. Without *mid*, any row with the same ``(role, content)``
+        does — body equality is all an id-less writer can check. WITH *mid*,
+        only a body-equal row carrying the SAME ``meta.mid`` does: that row is
+        this very message, landed by the slot save or an earlier attempt of
+        this write. A body-equal row under another id (or none) is a DIFFERENT
+        occurrence that happens to repeat the text — an id-carrying twin of an
+        earlier injection, or a pre-id legacy row — and skipping on it would
+        drop THIS occurrence's only durable copy: the in-memory window is lost
+        on restart, so nothing would replay the newer message.
         """
+        supplied_mid = mid if isinstance(mid, str) and mid else None
         with self._locked(key):
             if self._path(key).exists():
                 # Compare against the form ``append`` actually stores: the
@@ -1534,19 +3048,26 @@ class ConversationLog:
                 # that contained a credential and would append it twice.
                 persisted = _redact_at_write_boundary(role, content)
                 for m in self._read_messages(key):
-                    if m.get("role") == role and m.get("content") == persisted:
+                    if m.get("role") != role or m.get("content") != persisted:
+                        continue
+                    if supplied_mid is None:
+                        return False
+                    m_meta = m.get("meta")
+                    if isinstance(m_meta, dict) and m_meta.get("mid") == supplied_mid:
                         return False
             # Reentrant: ``append`` re-enters ``_locked`` for the same key on
             # this thread (RLock + refcounted flock), so the write stays inside
-            # the critical section we already hold.
-            self.append(key, role, content, agent=agent, tab_id=tab_id)
+            # the critical section we already hold. The skip paths above leave
+            # the persisted rows untouched — an id is never retrofitted onto a
+            # row already on disk.
+            self.append(key, role, content, agent=agent, tab_id=tab_id, cls=cls, mid=mid)
             return True
 
     def recent(
         self,
         key: str,
         max_messages: int = 20,
-        roles: set[str] | None = None,
+        roles: AbstractSet[str] | None = None,
         *,
         exclude_last_n: int = 0,
     ) -> list[dict]:
@@ -1583,7 +3104,7 @@ class ConversationLog:
         self,
         key: str,
         max_messages: int = 20,
-        roles: set[str] | None = None,
+        roles: AbstractSet[str] | None = None,
         *,
         exclude_last_n: int = 0,
     ) -> list[dict]:
@@ -1632,14 +3153,23 @@ class ConversationLog:
         return messages[offset:], len(messages)
 
     def rotation_generation(self, key: str) -> int:
-        """Return the session's rotation generation counter.
+        """Return the session's content-identity counter for *key*.
 
-        Incremented by :meth:`_maybe_rotate` on every rotation. A consolidator
-        snapshots this alongside the message offset before its (slow) LLM call
-        and passes it back to :meth:`mark_consolidated`, which resets the offset
-        whenever the generation changed — closing the rotation-during-await race
-        for ANY retained count, not just files that shrank below the offset.
-        Absent field (legacy metadata / never rotated) reads as ``0``.
+        Advanced by every write that makes the transcript's messages a DIFFERENT
+        body of content than a consolidation may have snapshotted: a rotation
+        (:meth:`_maybe_rotate`), a dashboard rewrite save (regenerate / rewind /
+        fork), and a channel transcript merge. A consolidator snapshots it
+        alongside the message offset before its (slow) LLM call and passes it back
+        to :meth:`mark_consolidated`, which refuses to apply the offset whenever
+        the generation changed — closing the change-during-await race for ANY
+        retained count, including an edit that leaves the count untouched. It is
+        also the span identity the retry accounting is stamped against
+        (:meth:`_attempts_describe_current_span`), so the same bump releases a
+        budget charged against the superseded content.
+
+        Named for the rotation that first needed it; the field is now the general
+        content-identity counter. Absent field (legacy metadata / never advanced)
+        reads as ``0``.
         """
         return int(self._read_metadata(key).get("rotation_generation", 0) or 0)
 
@@ -1677,22 +3207,31 @@ class ConversationLog:
         *offset* is an absolute message index captured by the caller BEFORE a
         (potentially slow) LLM consolidation call. *generation* is the rotation
         generation counter (:meth:`rotation_generation`) captured at the same
-        moment. If a rotation fired while the consolidator awaited the LLM, the
-        file was truncated to its newest messages, ``last_consolidated`` reset
-        to 0, and the generation bumped — so the caller's *offset* is in the
-        stale PRE-rotation numbering: every surviving index shifted by the
-        number of dropped lines, so applying it would silently mark
-        never-consolidated retained messages as already processed.
+        moment. It advances on anything that changes the content under a
+        consolidation in flight, and each case makes the caller's *offset*
+        meaningless in a different way:
+
+        * A **rotation** truncated the file to its newest messages and reset
+          ``last_consolidated`` to 0, so every surviving index shifted by the
+          number of dropped lines and applying the offset would mark
+          never-consolidated retained messages as processed.
+        * A **transcript edit** (the dashboard regenerate / rewind / fork save)
+          replaced the live window's tail with content this turn never read. The
+          message count, the marker and the extent can all be unchanged, so the
+          offset still *looks* applicable — and applying it would mark the
+          REPLACEMENT tail consolidated without ever extracting it.
+
+        Both are silent memory loss, and the generation is what distinguishes
+        them from a turn whose span is still intact.
 
         Detection uses two independent signals:
 
         1. **Generation change** (primary, when *generation* is supplied):
-           any rotation between snapshot and write bumps the counter, so a
-           mismatch resets ``last_consolidated`` to 0 regardless of how many
-           messages the rotation retained. This closes the case a pure
-           offset-vs-count heuristic misses — a rotation that keeps >= *offset*
-           messages leaves ``offset <= msg_count`` true yet has still shifted
-           every index.
+           anything that changes the content between snapshot and write bumps the
+           counter, so a mismatch resets ``last_consolidated`` to 0. This closes
+           both cases a pure offset-vs-count heuristic misses — a rotation that
+           keeps >= *offset* messages, and an edit that keeps the count identical,
+           each leave ``offset <= msg_count`` true.
         2. **Offset exceeds current count** (fallback, always): the file shrank
            below the captured offset (rotation truncated it). Retained if
            *generation* is unavailable (legacy callers) or as defense-in-depth.
@@ -1720,20 +3259,25 @@ class ConversationLog:
             msg_count = sum(1 for ln in lines[1:] if ln.strip())
             current_generation = int(meta.get("rotation_generation", 0) or 0)
             if generation is not None and current_generation != generation:
-                # PRIMARY signal: a rotation fired between the caller's snapshot
-                # and now (the generation counter advanced). The offset is in
-                # the stale PRE-rotation numbering — every surviving index has
-                # shifted by the number of dropped lines — so it cannot be
-                # applied regardless of how many messages the rotation retained.
-                # A rotation that kept >= *offset* messages leaves
-                # ``offset <= msg_count`` true and would sail past the count
-                # heuristic below, silently marking never-consolidated retained
-                # messages as done. Reset to 0 and reconsolidate the retained
-                # tail (harmless, idempotent) rather than risk that loss.
+                # PRIMARY signal: the content under this consolidation changed
+                # between the caller's snapshot and now (the generation counter
+                # advanced) — a rotation, or a dashboard rewrite that swapped the
+                # live window's tail. Either way the offset cannot be applied.
+                # After a rotation it is in the stale PRE-rotation numbering
+                # (every surviving index shifted by the number of dropped lines);
+                # after an edit the numbering still fits but the messages it would
+                # mark are the REPLACEMENT tail, which no turn has read. Neither
+                # is caught by the count heuristic below: a rotation that kept
+                # >= *offset* messages and an edit that kept the count identical
+                # both leave ``offset <= msg_count`` true, and marking either
+                # would drop never-consolidated content from memory/history
+                # extraction. Reset to 0 and reconsolidate the current tail
+                # (harmless, idempotent) rather than risk that loss.
                 logger.warning(
                     "mark_consolidated: rotation generation changed %s->%d for "
-                    "%s (rotation during consolidation); resetting "
-                    "last_consolidated to 0 to avoid skipping retained messages",
+                    "%s (rotation or transcript edit during consolidation); "
+                    "resetting last_consolidated to 0 to avoid marking content "
+                    "no consolidation turn read",
                     generation,
                     current_generation,
                     key,
@@ -1764,7 +3308,23 @@ class ConversationLog:
             else:
                 safe_offset = offset
             meta["last_consolidated"] = safe_offset
-            meta["updated_at"] = datetime.now().isoformat()
+            meta["updated_at"] = metadata_now_iso()
+            # The marker is the success signal for the retry accounting written
+            # by record_consolidation_failure: once a span is marked, its failed
+            # attempts and backoff deadline describe a span that no longer
+            # exists, and leaving them behind would charge the NEXT span for this
+            # one's failures. Dropped in the same locked write so no window
+            # exists where the marker is applied but the budget is not released.
+            #
+            # Only when the offset was actually APPLIED, though. Both branches
+            # above reset to 0 without advancing anything, so the span is still
+            # unconsolidated — and the abandon-at-cap path calls this method
+            # precisely to stop spending on it. Clearing the accounting there
+            # would hand a capped span a fresh budget every time a rotation
+            # raced the marker write, so the cap would never actually hold.
+            if safe_offset == offset:
+                for _acct_key in _CONSOLIDATION_META_KEYS:
+                    meta.pop(_acct_key, None)
             lines[0] = json.dumps(meta) + "\n"
             # Reduce lock hold for this one-line metadata rewrite: skip the
             # fsync (fsync=False). ``last_consolidated`` is recoverable
@@ -1776,13 +3336,306 @@ class ConversationLog:
             # (see _restore_mtime). Otherwise consolidation floats stale sessions
             # to the top of list_sessions on every gateway restart.
             _restore_mtime(path, prev_mtime)
-        self._invalidate_cache(key)
+            # Invalidate while still holding the lock. Outside it there is a
+            # window where the file is already rewritten with its mtime
+            # restored but the generation has not moved, so a concurrent fold /
+            # snippet / metadata read passes both the mtime and the generation
+            # guard and memoizes pre-rewrite data. Every other preserved-mtime
+            # writer already invalidates inside its locked section;
+            # _invalidate_cache is pure in-memory work, so this adds no I/O
+            # under the cross-process flock.
+            self._invalidate_cache(key)
 
     def unconsolidated_count(self, key: str) -> int:
         """Count messages not yet processed by the consolidator."""
         messages = self._read_messages(key)
         offset = self._read_metadata(key).get("last_consolidated", 0)
         return max(0, len(messages) - offset)
+
+    def consolidation_counts(self, key: str) -> tuple[int, int]:
+        """Return ``(total_messages, unconsolidated)`` from a SINGLE read.
+
+        The consolidator's entry points need both: the unconsolidated count to
+        decide there is anything to do, and the total as the extent
+        :meth:`consolidation_retry_state` compares the charged span against. Both
+        come from one ``_read_messages`` call so the eligibility check costs no
+        additional transcript read on the event loop.
+        """
+        messages = self._read_messages(key)
+        offset = self._read_metadata(key).get("last_consolidated", 0)
+        try:
+            offset = int(offset or 0)
+        except (TypeError, ValueError, OverflowError):
+            offset = 0
+        return len(messages), max(0, len(messages) - offset)
+
+    def consolidation_retry_state(
+        self, key: str, message_count: int | None = None
+    ) -> tuple[int, float]:
+        """Return ``(failed_attempts, next_eligible_at)`` for *key*.
+
+        Both live on the metadata line beside ``last_consolidated``, so the
+        accounting shares the marker's lifetime: it survives a gateway restart
+        (the consolidator's own throttle is in-memory only) and is cleared by
+        :meth:`mark_consolidated` when the span finally lands. ``(0, 0.0)`` means
+        no failed attempt is on record — the common case — so callers can treat a
+        missing entry as "eligible now".
+
+        Read UNCACHED. The accounting is cross-process (a gateway sweep, the CLI,
+        a subagent all record failures for the same session), and every writer of
+        these fields restores the file's pre-write mtime so housekeeping does not
+        reorder ``list_sessions``. The metadata cache is keyed on mtime, so a warm
+        entry survives another process's write byte-for-byte and would serve a
+        stale attempt count — bypassing the backoff on the read path and, on the
+        read-increment-write path, overwriting the other process's durable count
+        with a lower one. Dropping the entry first costs one first-line read.
+
+        Metadata is caller-supplied JSON, so every conversion is defensive:
+        ``1e309`` parses to ``inf`` and ``int(inf)`` raises ``OverflowError``
+        (which would surface as a 500 from the manual trigger or break the idle
+        sweep), while a ``NaN`` deadline makes every ``now >= retry_at``
+        comparison false and disables consolidation for the session forever.
+        Non-finite and unconvertible values therefore reset to the eligible zero
+        state rather than propagating.
+        """
+        self._meta_cache.pop(key, None)
+        meta = self._read_metadata(key)
+        try:
+            attempts = int(meta.get("consolidation_attempts", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            attempts = 0
+        try:
+            retry_at = float(meta.get("consolidation_retry_at", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            retry_at = 0.0
+        if not math.isfinite(retry_at):
+            retry_at = 0.0
+        if attempts and not self._attempts_describe_current_span(meta, message_count):
+            # The counter belongs to a span that no longer exists: a rotation
+            # archived those messages (generation bumped), a rewrite reset the
+            # marker they started from, or the transcript has grown past the
+            # extent that was charged. The cap ABANDONS a span, so carrying a
+            # capped count onto different content would silence consolidation for
+            # this session permanently — every message written after that point
+            # would stay ineligible forever. The new span gets a fresh budget.
+            #
+            # The deadline is deliberately kept: a fresh budget is not a free
+            # immediate turn, so a session that keeps failing still waits out the
+            # backoff already armed (4 h at the cap) rather than re-billing the
+            # instant one more message lands.
+            attempts = 0
+        return max(0, attempts), retry_at
+
+    def _attempts_describe_current_span(
+        self, meta: dict, message_count: int | None
+    ) -> bool:
+        """True when the recorded attempts belong to the span in front of us now.
+
+        A span is identified by where it starts AND how far it reaches: the
+        ``(rotation_generation, last_consolidated)`` pair it was charged against
+        plus the message count that was actually attempted. While a span keeps
+        failing none of the three move — the marker is only advanced on success —
+        so the cap holds across attempts. Anything that changes the CONTENT under
+        the counter moves one of them: a rotation and a dashboard rewrite
+        (regenerate / rewind / fork) both advance the generation, a rewrite that
+        cannot apply a stale offset resets the marker, and new messages push the
+        transcript past the extent that was attempted.
+
+        The generation is what covers the edit that moves nothing else. A
+        regenerate replaces the assistant tail with a reply the failing turns
+        never saw and lands at the same message count, the same marker and the
+        same extent, so without the bump a capped budget would sit over brand-new
+        content and refuse it forever.
+
+        The extent matters because the cap is what ABANDONS a span, and it is only
+        reachable from :meth:`HistoryConsolidator.retry_eligible` when the
+        abandon-marker write itself failed. Without it, that one transient write
+        failure would refuse the session forever: appended messages leave the
+        generation and marker untouched, so every entry point would keep rejecting
+        a transcript that is no longer the one that failed, and the session's
+        history would never be consolidated again.
+
+        *message_count* is the transcript's CURRENT total, supplied by the caller.
+        It is never read from disk here: this predicate runs inside
+        ``retry_eligible`` on the gateway event loop, and a synchronous full-file
+        read there stalls every other gateway task on a large transcript. Callers
+        that already hold a count pass it (see :meth:`consolidation_counts`);
+        ``None`` means "no count available", which skips the extent test and keeps
+        the cap — the conservative direction, since the alternative is spending a
+        billed turn on an unverified premise.
+
+        Growth is compared with ``>`` rather than ``!=`` on purpose. A count that
+        SHRANK is a rotation or compaction, which already moves the generation or
+        the marker; treating a shrink as new content on its own would hand a
+        budget to a span with nothing added to it.
+
+        Unstamped accounting (written before a given field existed) is treated as
+        belonging to the current span, so an unknown provenance keeps the cap
+        rather than granting an unbounded supply of billed retries.
+
+        The stamp this compares against is the ATTEMPTED span, captured before the
+        turn (see :class:`AttemptedSpan`), which is what makes all three tests
+        meaningful: if the stamp were re-read after the turn it would describe the
+        transcript in front of us by construction, and every test here would
+        trivially match.
+        """
+        for meta_key, span_key in (
+            ("rotation_generation", "consolidation_attempts_generation"),
+            ("last_consolidated", "consolidation_attempts_offset"),
+        ):
+            if span_key not in meta:
+                continue
+            try:
+                if int(meta.get(span_key, 0) or 0) != int(meta.get(meta_key, 0) or 0):
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                # Unreadable stamp — fall back to keeping the cap.
+                continue
+        if message_count is not None and "consolidation_attempts_count" in meta:
+            try:
+                attempted = int(meta.get("consolidation_attempts_count", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return True
+            if message_count > attempted:
+                return False
+        return True
+
+    def _current_span_fields(self, span: AttemptedSpan) -> dict:
+        """The span-identity stamp to store beside a freshly charged attempt.
+
+        Every field comes from *span* — the consolidation's own pre-turn snapshot
+        (see :class:`AttemptedSpan`) — and NOTHING is re-read from the metadata
+        line here. The stamp must describe the span the turn actually attempted,
+        and the metadata line at failure time describes the transcript as it is
+        *now*, which a rotation or a marker-resetting rewrite during the turn has
+        already changed.
+        The clamps are the only normalization: *span* is typed, and its values come
+        from a snapshot's own ``len()``/generation reads, so there is nothing to
+        coerce — but a negative offset or count would be nonsense to stamp.
+        """
+        return {
+            "consolidation_attempts_generation": span.generation,
+            "consolidation_attempts_offset": max(0, span.offset),
+            "consolidation_attempts_count": max(0, span.total),
+        }
+
+    def record_consolidation_failure(
+        self,
+        key: str,
+        base_secs: float,
+        max_secs: float,
+        span: AttemptedSpan,
+        now: float | None = None,
+    ) -> tuple[int, float]:
+        """Durably count one failed consolidation attempt for *key*.
+
+        *span* is the identity of what the failing turn actually attempted, taken
+        from the pre-turn snapshot (see :class:`AttemptedSpan`). It serves twice:
+        as the stamp written beside the counter, and as the span the existing
+        counter is compared against — so a turn that attempted a DIFFERENT span
+        starts a fresh budget while one attempting the same span increments toward
+        the cap. Nothing about the span is re-read from the file here, so a
+        rotation or rewrite that landed during the turn cannot relabel this charge
+        as belonging to content it never measured.
+
+        Returns the new ``(attempts, next_eligible_at)``. The wait doubles per
+        attempt from *base_secs*, capped at *max_secs*, so a persistently broken
+        span costs a geometrically shrinking number of billed LLM turns instead
+        of one per heartbeat tick.
+
+        The read-increment-write runs under a single :meth:`_locked` hold: two
+        processes consolidating the same session (gateway sweep and CLI) would
+        otherwise both read the same count and write the same value, letting the
+        span consume unbounded attempts while the counter sits still. The read
+        inside is uncached for the same reason (see
+        :meth:`consolidation_retry_state`) — an mtime-preserving write by the
+        other process is invisible to a warm cache.
+
+        Returns ``(0, 0.0)`` without writing when the session's transcript is gone
+        (deleted while the consolidation was in flight): ``_update_metadata_locked``
+        upserts, so writing would resurrect the session as an empty metadata-only
+        file. Blocking file IO — call it off the event loop.
+        """
+        stamp = _time.time() if now is None else now
+        with self._locked(key):
+            if not self._path(key).exists():
+                # The session was deleted while this consolidation was in flight.
+                # _update_metadata_locked upserts, so writing here would recreate
+                # the transcript as a metadata-only file — resurrecting a deleted
+                # session as empty history in list_sessions. Nothing to account
+                # for: the span it described is gone.
+                logger.info(
+                    "Skipping consolidation retry accounting for %s: session deleted",
+                    key,
+                )
+                return 0, 0.0
+            attempts = self.consolidation_retry_state(key, span.total)[0] + 1
+            # The exponent comes from caller-supplied metadata, so clamp it before
+            # shifting: an absurd stored count would otherwise make ``2 ** n``
+            # allocate a huge int (or raise) instead of returning a wait. The
+            # backoff saturates at *max_secs* far below the clamp, so no reachable
+            # attempt count is affected.
+            retry_at = stamp + min(max_secs, base_secs * (2 ** min(attempts - 1, 64)))
+            self._update_metadata_locked(
+                key,
+                {
+                    "consolidation_attempts": attempts,
+                    "consolidation_retry_at": retry_at,
+                    # Bind the count to the span it was charged against — where it
+                    # starts and how far it reaches — so a rotation, a rewrite, or
+                    # a grown transcript cannot leave a capped counter sitting over
+                    # content it never measured (see
+                    # _attempts_describe_current_span). Every field comes from the
+                    # pre-turn snapshot, never from the file as it stands now, and
+                    # is written in the SAME locked update as the counter, so no
+                    # window exists where the count is charged but its span is
+                    # unidentified or misidentified.
+                    **self._current_span_fields(span),
+                },
+            )
+        return attempts, retry_at
+
+    def record_consolidation_environment_failure(
+        self,
+        key: str,
+        base_secs: float,
+        max_secs: float,
+        now: float | None = None,
+    ) -> tuple[int, float]:
+        """Arm the backoff for a consolidation that never reached the provider.
+
+        Counted separately from :meth:`record_consolidation_failure` because the
+        two failures have different costs. A spent turn costs money, so its
+        counter feeds a hard abandon cap. A pre-dispatch failure — no session
+        manager, or kiro-cli failing to start — costs nothing, so it must never
+        abandon a span: doing so would write the durable marker over messages no
+        LLM has ever read. It still needs a deadline, or a permanently broken host
+        re-attempts on every 60s heartbeat tick forever, so the count drives the
+        same widening wait up to *max_secs* and then holds there.
+
+        Returns the new ``(environment_failures, next_eligible_at)``. Same single
+        locked read-increment-write and same deleted-session guard as the billed
+        path. Blocking file IO — call it off the event loop.
+        """
+        stamp = _time.time() if now is None else now
+        with self._locked(key):
+            if not self._path(key).exists():
+                return 0, 0.0
+            meta = self._read_metadata(key)
+            try:
+                failures = int(meta.get("consolidation_env_failures", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                failures = 0
+            failures = max(0, failures) + 1
+            retry_at = stamp + min(max_secs, base_secs * (2 ** min(failures - 1, 64)))
+            self._update_metadata_locked(
+                key,
+                {
+                    "consolidation_env_failures": failures,
+                    "consolidation_retry_at": retry_at,
+                },
+            )
+        return failures, retry_at
 
     def load_transcript(self, key: str) -> str:
         """Load full session as formatted text for LLM summarization."""
@@ -1824,6 +3677,13 @@ class ConversationLog:
         # Deduplicate stacked dashboard_ prefixes by canonical key, keeping newer
         by_canon: dict[str, dict] = {}
         for path in self._dir.glob("*.jsonl"):
+            key = path.stem
+            # Snapshot the invalidation generation BEFORE the stat: the
+            # first-line fill below publishes under this stat's mtime, and a
+            # housekeeping rewrite restores the pre-write mtime
+            # (``_restore_mtime``), so only the generation can prove the
+            # stat → read → publish window stayed write-free for this key.
+            gen = self._cache_gen(key)
             try:
                 stat = path.stat()
             except OSError:
@@ -1831,17 +3691,19 @@ class ConversationLog:
             # Skip symlinks — these are handoff aliases pointing to the real session
             if path.is_symlink():
                 continue
-            key = path.stem
             meta: dict = {
                 "key": key,
                 "modified": stat.st_mtime,
                 "created": datetime.fromtimestamp(stat.st_mtime).isoformat(),
             }
             # Try metadata cache first (populated by _read_metadata calls)
-            ident = _cache_identity(stat)
             cached_meta = self._meta_cache.get(key)
-            if cached_meta and cached_meta[0] == ident:
-                d = cached_meta[1]
+            if (
+                cached_meta
+                and cached_meta[0] == _cache_identity(stat)
+                and cached_meta[1] == self._cache_gen(key)
+            ):
+                d = cached_meta[2]
                 if d.get("created_at"):
                     meta["created"] = d["created_at"]
                 if d.get("title"):
@@ -1868,7 +3730,12 @@ class ConversationLog:
                             meta["memory_mode"] = d.get("memory_mode", "persistent")
                             if d.get("folder_id"):
                                 meta["folder_id"] = d["folder_id"]
-                            self._meta_cache[key] = (ident, d)
+                            # Guarded publish — discard the fill if a write
+                            # invalidated this key inside the stat → read
+                            # window (see the generation snapshot above).
+                            self._publish_if_current(
+                                self._meta_cache, key, (_cache_identity(stat), gen, d), key=key, gen=gen
+                            )
                 except Exception:
                     pass
             # Ensure memory_mode is always present (old sessions lack it)
@@ -1876,8 +3743,12 @@ class ConversationLog:
             # Extract first user message as title fallback
             if "title" not in meta:
                 msg_cached = self._msg_cache.get(key)
-                if msg_cached and msg_cached[0] == ident:
-                    for m in msg_cached[1]:
+                if (
+                    msg_cached
+                    and msg_cached[0] == _cache_identity(stat)
+                    and msg_cached[1] == self._cache_gen(key)
+                ):
+                    for m in msg_cached[2]:
                         if m.get("role") == "user" and m.get("content"):
                             meta["title"] = m["content"][:80]
                             break
@@ -1930,86 +3801,450 @@ class ConversationLog:
     def search_sessions(self, query: str, limit: int = 50) -> list[dict]:
         """Return session metadata for files whose message content matches *query*.
 
-        Case-insensitive substring match over each message's ``content``
-        field using full Unicode case folding via :meth:`str.casefold`
-        (so e.g. German ``ß`` folds to ``ss``).  Matching only on parsed
-        ``content`` avoids false positives from JSON structural elements
-        (e.g. the word ``"user"`` matching every ``"role": "user"`` line).
+        This is the ONE ranking every transcript-search consumer shares — the
+        dashboard history filter, the ``search_chat_history`` MCP tool, and
+        Discord session resume — so the recency weighting and CJK adjacency
+        floor below apply to all of them by design: "the best match for this
+        query" should not depend on which surface asked.
+
+        The query is parsed by :func:`parse_search_query` into needles, and a
+        session matches only when **every** REQUIRED needle appears somewhere in
+        its title or content — an AND over the whole document, not a single
+        whole-query substring. That is what makes a natural multi-word query
+        work: ``"ack contention hypotheses"`` finds a session discussing all
+        three, which a whole-phrase match missed because those exact words never
+        sit adjacent. A single-token query is unchanged by this — one token IS
+        the phrase. CJK terms gate on their individual characters (CJK text has
+        no spaces to split on, so the run itself would demand the user's exact
+        sentence), rank on their character bigrams, and require at least one
+        bigram hit (the adjacency floor) — see :func:`parse_search_query` for
+        the recall/precision split.
+
+        A term naming a forge item (``#4411``, ``pr 4411``, ``pull/4411``, a PR
+        URL, ``owner/repo#4411``) gates on ANY spelling of that item rather than
+        on the literal term, so the session that discussed the pull request is
+        found whichever form its transcript used. A bare number additionally
+        RANKS on those spellings while still gating on the plain digits.
+
+        Each needle is matched case-insensitively as a SUBSTRING (so ``"cont"``
+        hits ``"contention"``, which keeps search-as-you-type responsive) using
+        full Unicode case folding via :meth:`str.casefold` (so e.g. German ``ß``
+        folds to ``ss``).  Matching only on parsed ``content`` avoids false
+        positives from JSON structural elements (e.g. the word ``"user"``
+        matching every ``"role": "user"`` line).
 
         Ranking (higher is better)::
 
-            score = (title_matches * _TITLE_BOOST)
-                  + (content_matches / sqrt(1 + doc_chars / 1024))
+            score = ((title_hits * _TITLE_BOOST)
+                  + (content_hits / sqrt(1 + doc_chars / 1024))) * recency
+
+        where ``*_hits`` sum the per-needle weighted counts, plus
+        ``_PHRASE_BOOST`` per occurrence of the exact whole query when it
+        carries more than a single needle. The phrase bonus rewards adjacency:
+        at comparable term frequency, the session containing the words TOGETHER
+        as typed ranks above one that merely mentions them far apart.  It is
+        deliberately a bonus and not an override — a session repeating one term
+        far more often still wins on raw term frequency, exactly as it already
+        did for a single-token query.  (Saturating term frequency, BM25-style,
+        would change that; it would also re-rank every existing single-token
+        query, so it is out of scope here.)
+
+        ``recency`` is a bounded multiplicative boost — ``1 +
+        _RECENCY_MAX_BOOST / (1 + age_days / _RECENCY_HALF_WEIGHT_DAYS)`` — so
+        at comparable relevance today's session outranks last year's, while a
+        decisively better old match still wins (the boost tops out at ×2.5 and
+        never drops below ×1).
 
         Title matches get a strong field boost - titles are short and
         intentional, so a hit there is strong evidence.  Content matches
         are normalized by a sqrt length factor so a long session with a
         casual mention doesn't outrank a short, focused one.  (Simpler
         than BM25's ``(1-b) + b*(dl/avgdl)`` because we avoid the
-        two-pass scan needed for corpus stats.)  Sessions with zero
-        matches are dropped.  Ties break by recency (existing
+        two-pass scan needed for corpus stats.)  Sessions missing any
+        required needle are dropped.  Ties break by recency (existing
         ``list_sessions`` order - newest first).  Caps results at *limit*.
         Only the ``_SEARCH_SCAN_WINDOW`` most recent files are scored, so
         I/O stays bounded even with hundreds of sessions.
         """
         if not query or limit <= 0 or not self._dir.exists():
             return []
-        needle = query.casefold()
-        scored: list[tuple[float, int, dict]] = []  # (score, -rank, meta)
-        for rank, meta in enumerate(self.list_sessions()[:_SEARCH_SCAN_WINDOW]):
-            content_hits = 0
-            doc_chars = 0
-            texts: list[str] = []
-            # Pull parsed messages from the mtime-keyed cache (_read_messages)
-            # rather than re-opening + re-parsing the file here. The snippet
-            # path (search_chat_history) already reads each matched key via the
-            # same cache, so this collapses the prior two-parses-per-query into
-            # one. Content semantics are unchanged: only string ``content``
-            # fields are counted, in file order, so the \x00-join hit count and
-            # the doc_chars length normalizer stay identical to the previous
-            # inline scan. _read_messages is OSError-safe and returns [] for a
-            # missing/unreadable file, so it also subsumes the old try/except.
-            for obj in self._read_messages(meta["key"]):
-                raw = obj.get("content") if isinstance(obj, dict) else None
-                text = raw if isinstance(raw, str) else ""
-                if text:
-                    doc_chars += len(text)
-                    texts.append(text)
-            # Casefold + count once per file instead of per line: a 200-line
-            # session produces one temporary casefolded string instead of 200,
-            # bounding GC pressure under rapid-fire search keystrokes.  The
-            # ``\x00`` separator can't appear in user queries, so cross-line
-            # false matches are impossible.
-            if texts:
-                content_hits = "\x00".join(texts).casefold().count(needle)
-            title_hits = (meta.get("title") or "").casefold().count(needle)
-            if not title_hits and not content_hits:
+        needles, phrase, adjacency_floor = parse_search_query(query)
+        if not needles:
+            # Whitespace-only query: no needles to require, so nothing can match.
+            # Returning [] keeps this from degenerating into "match everything",
+            # and skips reading every session file to reach that conclusion.
+            return []
+        required = [n for n in needles if n.required]
+        # True when the phrase carries more than the single needle does, so an
+        # exact-phrase bonus is meaningful. Not a token-count test: dedup
+        # collapses "a a" to one needle while its phrase is still two words, and
+        # a single CJK term expands to several needles while the phrase is what
+        # rewards its characters appearing together.
+        multi = [n.text for n in required] != [phrase]
+        now = _time.time()
+        # (score, -rank, meta, needs_snippet)
+        scored: list[tuple[float, int, dict, bool]] = []
+        window = self.list_sessions()[:_SEARCH_SCAN_WINDOW]
+        self._prune_search_memos({m["key"] for m in window})
+        for rank, meta in enumerate(window):
+            doc_chars, folded = self._folded_content(meta["key"])
+            title_folded = (meta.get("title") or "").casefold()
+            content_hits = 0.0
+            title_hits = 0.0
+            adjacency_hits = 0
+            disqualified = False
+            for needle in needles:
+                in_content = count_needle(needle, folded)
+                in_title = count_needle(needle, title_folded)
+                if needle.required and not in_content and not in_title:
+                    # AND semantics: one absent required needle disqualifies the
+                    # session, so stop counting the rest.
+                    disqualified = True
+                    break
+                if needle.adjacency:
+                    adjacency_hits += in_content + in_title
+                content_hits += in_content * needle.weight
+                title_hits += in_title * needle.weight
+            if disqualified or (not content_hits and not title_hits):
                 continue
+            if adjacency_floor and not adjacency_hits:
+                # Adjacency floor: a CJK query whose characters ALL appear but
+                # never once adjacently (no bigram hit anywhere) is a character
+                # scatter, not a word hit. Individual han/kana characters are
+                # common enough that ranking alone cannot keep such noise off a
+                # result page whose real hits number fewer than *limit* — so
+                # scatter-only sessions are excluded, not merely down-ranked. A
+                # document containing the query's words apart still qualifies:
+                # each word is itself a bigram hit. The parse WAIVES the floor
+                # (adjacency_floor=False) when its bigram set was truncated —
+                # judging "no adjacency anywhere" against a partial set would
+                # hide long-query matches (see parse_search_query).
+                continue
+            if multi:
+                # Reward the words appearing together, in order, as typed.
+                if folded:
+                    content_hits += folded.count(phrase) * _PHRASE_BOOST
+                title_hits += title_folded.count(phrase) * _PHRASE_BOOST
             length_norm = math.sqrt(1 + doc_chars / 1024)
             score = title_hits * _TITLE_BOOST + content_hits / length_norm
-            # Match-centered content snippet (why the session surfaced when the
-            # title doesn't contain the query). Best-effort, display-only.
-            snippet = ""
-            if content_hits and texts:
-                joined = " ".join(texts)
-                # casefold() to match the hit detection above — .lower() misses
-                # matches casefold finds (ß→ss, İ), yielding an empty snippet
-                # despite content_hits > 0. casefold can shift offsets slightly
-                # (length changes); acceptable for a display-only best-effort
-                # window.
-                pos = joined.casefold().find(query.casefold())
-                if pos >= 0:
-                    start = max(0, pos - 40)
-                    end = min(len(joined), pos + len(query) + 100)
-                    frag = " ".join(joined[start:end].split())
-                    snippet = (
-                        ("…" if start > 0 else "") + frag + ("…" if end < len(joined) else "")
-                    )[:200]
-            out_meta = {**meta, "snippet": snippet} if snippet else meta
+            # Recency boost: multiplicative and bounded to (1.0, 2.5], so a
+            # fresh session with comparable relevance outranks a stale one, but
+            # an old session with a decisively better match still wins — the
+            # boost can at most double a score, never zero one out. Halves its
+            # extra weight every _RECENCY_HALF_WEIGHT_DAYS of age.
+            age_days = max(0.0, now - meta.get("modified", 0.0)) / 86400
+            score *= 1.0 + _RECENCY_MAX_BOOST / (1.0 + age_days / _RECENCY_HALF_WEIGHT_DAYS)
             # Negate rank so a smaller (newer) rank wins ties after score desc sort.
-            scored.append((score, -rank, out_meta))
+            scored.append((score, -rank, meta, content_hits > 0))
         scored.sort(reverse=True)
-        return [meta for _, _, meta in scored[:limit]]
+
+        # Snippets are attached AFTER the sort+slice, so the cost is proportional
+        # to the rows actually returned rather than to every session that
+        # matched. A snippet cannot come from the folded cache (it needs the
+        # original text, so offsets line up), so building one per match put a
+        # full re-read back on the hot path — dominating the query once the fold
+        # itself was memoized.
+        out: list[dict] = []
+        for _score, _rank, meta, needs_snippet in scored[:limit]:
+            snippet = self._content_snippet(meta["key"], query) if needs_snippet else ""
+            out.append({**meta, "snippet": snippet} if snippet else meta)
+        return out
+
+    def _folded_content(self, key: str) -> tuple[int, str]:
+        """Return ``(doc_chars, casefolded_content)`` for *key*, memoized by
+        mtime plus invalidation generation.
+
+        ``doc_chars`` counts the ORIGINAL (unfolded) characters, because it
+        feeds the length normalizer in :meth:`search_sessions` and folding can
+        change a string's length (``ß`` -> ``ss``).
+
+        The folded blob joins the messages' string ``content`` fields in file
+        order with ``\\x00``. That separator cannot appear in a user query, so
+        it prevents a match spanning two messages while still allowing one
+        ``count`` call over the whole session instead of one per message.
+
+        Returns ``(0, "")`` for a missing/unreadable file or a session with no
+        textual content. A read failure is deliberately NOT cached — see below.
+        """
+        path = self._path(key)
+        try:
+            ident = _cache_identity(path.stat())
+        except OSError:
+            self._folded_cache.pop(key, None)
+            self._snippet_cache.pop(key, None)
+            return (0, "")
+        cached = self._folded_cache.get(key)
+        # The hit wants the LATEST generation (a moved counter means a write
+        # landed, so a miss is the correct answer), so it is read at check
+        # time rather than snapshotted earlier — matching ``_snippet_texts``.
+        if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
+            return (cached[2], cached[3])
+        # Cold: serialize against this key's writers for the whole
+        # stat -> read -> store sequence.
+        #
+        # The mtime guard cannot protect this window, because the housekeeping
+        # rewrites deliberately RESTORE the pre-write mtime (``_restore_mtime``,
+        # so compaction does not reorder ``list_sessions``). A fold that started
+        # before such a rewrite and stored after its ``_invalidate_cache`` would
+        # sit in the cache holding pre-rewrite text under a mtime the file still
+        # has — undetectable, so the newly saved messages would be missing from
+        # every later search for the life of the process.
+        #
+        # ``_file_lock`` is the same process-wide, path-keyed RLock every writer
+        # takes first in ``_locked`` — shared across every ``ConversationLog``
+        # instance over this file — so holding it here orders this fold against
+        # append / rewrite / metadata edits for this key, whichever instance
+        # performs them. It is acquired ONLY on the miss path: a warm search
+        # never contends, and two threads racing the same cold key fold once
+        # (the re-check below). What the lock CANNOT fix is invalidation reach:
+        # a writer's ``_invalidate_cache`` pops only its own instance's caches,
+        # so an entry already sitting warm in THIS instance survives a rewrite
+        # performed through a different instance, mtime restored and all. That
+        # is why entries carry the generation and the warm-hit checks above and
+        # below require it to match.
+        with self._file_lock(key):
+            # Snapshot the fill baseline under the lock and BEFORE the stat:
+            # the mtime that stat returns can survive a housekeeping rewrite
+            # (``_restore_mtime``), so only an unmoved generation can prove the
+            # stat → read → publish window stayed write-free. A writer that ran
+            # between the lock-free probe and the acquire already bumped the
+            # counter, and the fold below is ordered AFTER it, so its result is
+            # current for this newer generation.
+            gen = self._cache_gen(key)
+            try:
+                ident = _cache_identity(path.stat())
+            except OSError:
+                self._folded_cache.pop(key, None)
+                self._snippet_cache.pop(key, None)
+                return (0, "")
+            cached = self._folded_cache.get(key)
+            if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
+                return (cached[2], cached[3])
+            built = self._build_folded(key, ident, gen)
+            if built is None:
+                # The read failed rather than finding no content. Caching that
+                # would be keyed by an mtime the file still has, so a session
+                # made transiently unopenable (fd exhaustion, or a Windows
+                # indexer / AV holding a just-written file — the same window
+                # ``_METADATA_READ_ATTEMPTS`` exists for) would stay
+                # unsearchable until something wrote to it again. Fail open:
+                # report empty for this query and retry on the next one.
+                return (0, "")
+            self._publish_if_current(
+                self._folded_cache, key, (ident, gen, built[0], built[1]), key=key, gen=gen
+            )
+            return built
+
+    def _prune_search_memos(self, live_keys: set[str]) -> None:
+        """Free budget held by sessions that have left the scan window.
+
+        Only runs for a memo that is currently refusing admissions, so an
+        uncontended cache never pays the scan. Entries outside *live_keys* are
+        unreachable by any future search (it walks only the
+        ``_SEARCH_SCAN_WINDOW`` most recent sessions), so dropping them cannot
+        cost a hit — which is what makes this safe where an LRU eviction would
+        not be.
+
+        Called before the walk, so a refusal raised *during* a walk is released
+        on the NEXT query rather than that one: the prune needs the scan window,
+        which the walk computes. The lag is one query (~20 ms for a keystroke
+        caller) and self-clearing; what it prevents is budget staying pinned by
+        aged-out sessions for the life of the process.
+        """
+        for cache in (self._folded_cache, self._snippet_cache):
+            if cache.refused_since_prune():
+                cache.retain(live_keys)
+
+    def _build_folded(
+        self, key: str, identity: tuple[float, float, int], gen: int
+    ) -> tuple[int, str] | None:
+        """Parse *key* and fold its content — the cache-miss half of
+        :meth:`_folded_content`.
+
+        Returns ``None`` when the file could not be read, which the caller must
+        distinguish from ``(0, "")`` (a session with no textual content): the
+        former must not be cached.
+
+        Reads the file via :meth:`_iter_message_texts` rather than going through
+        :meth:`_read_messages`, for two reasons.
+
+        Memory: that method memoizes the PARSED message dicts, and a search
+        touches every session in the scan window, so routing the fold through it
+        pins the whole corpus's parsed form in gateway RSS as a side effect of
+        searching. On a 136 MB / 125-session corpus that is ~330 MB of parsed
+        dicts versus ~37 MB for the folded strings this actually needs.
+
+        Correctness: ``_msg_cache`` is filled by callers that do not hold this
+        key's write lock, so an entry can be a pre-rewrite parse stored under a
+        restored (unchanged) mtime. Folding from it would launder that staleness
+        into the search cache, which the caller's lock cannot prevent. Reading
+        the file makes the fold a function of the file alone.
+
+        The caller holds ``_file_lock``, which orders this read against writers
+        in THIS process — the lock table is class-level and path-keyed, so that
+        includes writers using other ``ConversationLog`` instances. A writer in
+        another process holds only the cross-process flock, so it can still
+        interleave; if it bumps the mtime, the caller's pre-read stat leaves the
+        cached mtime older than the file's and the next access re-folds. A
+        cross-process PRESERVED-mtime rewrite, however, is caught by neither
+        the lock nor the generation (the counter lives in this process) — a
+        known residual gap shared with every memo in this class. *gen* is the
+        invalidation-generation snapshot the caller took alongside its stat;
+        the snippet store below publishes under it and records it in the entry,
+        which is what lets a warm hit notice an in-process rewrite performed
+        through a different instance (whose ``_invalidate_cache`` pops only its
+        own instance's caches).
+
+        Separated from :meth:`_folded_content` so the memoization is observable:
+        a caller (or a test) can count how often the expensive fold actually
+        runs, independent of how many queries were served.
+        """
+        texts: list[str] = []
+        try:
+            texts = list(self._iter_message_texts(key))
+        except OSError:
+            return None
+        if not texts:
+            return (0, "")
+        # Hand the same list to the snippet memo. The caller has already stat'ed
+        # under ``_file_lock`` and passes that mtime and its generation
+        # snapshot, so both memos are keyed by one observation of the file and
+        # cannot disagree about which revision they hold. Storing here is why
+        # the second corpus costs no extra read. The publish guard here is
+        # generation-stamp hygiene: the lock already orders this store against
+        # in-process writers, so its job is refusing to stamp an entry with an
+        # already-superseded generation — the recorded generation is what the
+        # warm-hit checks compare against.
+        self._publish_if_current(
+            self._snippet_cache, key, (identity, gen, texts), key=key, gen=gen
+        )
+        return (sum(len(t) for t in texts), "\x00".join(texts).casefold())
+
+    def _iter_message_texts(self, key: str) -> Iterator[str]:
+        """Yield each message's non-empty string ``content`` from *key*'s file.
+
+        One definition of "what counts as searchable text in a session file",
+        shared by the fold and the snippet so their skip rules cannot drift apart
+        as the on-disk format evolves. Yields in file order; skips blank lines,
+        unparseable lines, non-object lines, and the metadata header.
+
+        A generator rather than a list so a caller can stop early — closing it
+        closes the file — which is what lets :meth:`_content_snippet` read only as
+        far as its first match. Propagates ``OSError``: callers distinguish "could
+        not read" from "no text", and that distinction is load-bearing (a read
+        failure must not be cached).
+        """
+        with open(self._path(key), encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(data, dict) or data.get("_type") == "metadata":
+                    continue
+                content = data.get("content")
+                if isinstance(content, str) and content:
+                    yield content
+
+    #: Characters of context kept before / after a snippet's match.
+    _SNIPPET_LEAD = 40
+    _SNIPPET_TRAIL = 100
+    #: Hard cap on a returned snippet.
+    _SNIPPET_MAX = 200
+
+    def _snippet_texts(self, key: str) -> Iterator[str]:
+        """Yield *key*'s message texts for snippet extraction, memo first.
+
+        Prefers ``_snippet_cache`` — filled by :meth:`_build_folded` from the same
+        read that produced the fold — and falls back to re-reading the file.
+
+        The memo is validated against the file's current mtime AND the current
+        invalidation generation (:meth:`_cache_gen`), so it degrades to the
+        file read rather than serving a stale snippet. The mtime alone cannot
+        catch a preserved-mtime rewrite performed through a DIFFERENT
+        ``ConversationLog`` instance (its ``_invalidate_cache`` pops only its
+        own instance's caches); the generation clause is what unhits such an
+        entry. Both checks are cheap relative to the parse they avoid, and
+        unlike the fold this path does NOT need ``_file_lock``: a snippet is
+        display-only, so the worst case for a preserved-mtime rewrite racing
+        here is one stale preview line, not a session that stops matching. The
+        fold — which decides whether a row appears at all — keeps the lock.
+
+        Falls back for four reasons, all of which must stay non-fatal: the entry
+        was refused admission by the byte budget, the fold cached ``(0, "")`` for
+        a session with no text and so stored nothing, the file changed since
+        the fold, or the entry's generation was superseded by a write.
+        Propagates ``OSError`` from the fallback read, which
+        :meth:`_content_snippet` already treats as "no snippet".
+        """
+        cached = self._snippet_cache.get(key)
+        if cached is not None:
+            try:
+                ident_now = _cache_identity(self._path(key).stat())
+                if cached[0] == ident_now and cached[1] == self._cache_gen(key):
+                    return iter(cached[2])
+            except OSError:
+                # Let the fallback read raise the OSError the caller handles,
+                # rather than deciding here what a vanished file means.
+                pass
+        return self._iter_message_texts(key)
+
+    def _content_snippet(self, key: str, query: str) -> str:
+        """Return a match-centered window of *key*'s content around *query*.
+
+        Streams the file and stops at the FIRST matching message, so a query that
+        hits early reads only as far as the hit — rather than parsing the whole
+        transcript, which on the largest sessions dominated the query. Sharing
+        :meth:`_iter_message_texts` with the fold (instead of reading the file
+        directly) also keeps search from pinning a parsed transcript in
+        ``_msg_cache`` for every row it returns, and keeps the two halves of a
+        query agreeing on what counts as searchable text.
+
+        The window is confined to the matching message, which keeps a snippet from
+        reading as one sentence when it actually spans two — consistent with
+        :meth:`_folded_content`, where the ``\\x00`` join stops a match from
+        bridging messages in the first place.
+
+        Display-only and best effort: ``casefold`` is used for the search so it
+        agrees with the hit detection in :meth:`search_sessions` (``.lower()``
+        misses matches ``casefold`` finds, e.g. ``ß`` / ``İ``, which would yield
+        an empty snippet despite a nonzero hit count), but folding can change a
+        string's length, so the window may be off by a character or two.
+
+        For a multi-word query the exact phrase is tried first and each needle
+        is tried as a fallback (via :func:`snippet_needles`, highest-signal
+        first), mirroring :meth:`search_sessions`' AND-over-needles matching —
+        otherwise every session that matched on scattered words would come back
+        with no snippet at all. Needles are tried per message, so the first
+        MESSAGE containing any of them wins rather than the best needle overall;
+        that preserves the streaming early-exit above, and this string is
+        display-only.
+
+        Returns ``''`` when no needle is locatable in any single message, or
+        when the file cannot be read (display-only — never raises at the caller).
+        """
+        needles = snippet_needles(query)
+        if not needles:
+            return ""
+        try:
+            for text in self._snippet_texts(key):
+                folded = text.casefold()
+                for needle in needles:
+                    pos = folded.find(needle)
+                    if pos < 0:
+                        continue
+                    start = max(0, pos - self._SNIPPET_LEAD)
+                    end = min(len(text), pos + len(needle) + self._SNIPPET_TRAIL)
+                    frag = " ".join(text[start:end].split())
+                    prefix = "…" if start > 0 else ""
+                    suffix = "…" if end < len(text) else ""
+                    return (prefix + frag + suffix)[: self._SNIPPET_MAX]
+        except OSError:
+            return ""
+        return ""
 
     def recent_from_source(
         self, source_prefix: str, exclude_key: str = "", max_messages: int = 20
@@ -2047,11 +4282,10 @@ class ConversationLog:
                     for _, line in zip(range(5), f):
                         try:
                             d = json.loads(line.strip())
-                        except (json.JSONDecodeError, ValueError):
+                        except ValueError:
                             continue
-                        if d.get("_type") == "metadata" and d.get("memory_mode") in (
-                            "incognito",
-                            "temporary",
+                        if d.get("_type") == "metadata" and is_incognito_transcript(
+                            d.get("memory_mode")
                         ):
                             is_restricted = True
                             break
@@ -2117,18 +4351,102 @@ class ConversationLog:
 
         Caller MUST hold ``self._lock`` — this replaces the shared
         ``_tab_id_index`` mapping.
+
+        Each file's tab_id is memoized in ``_tab_id_by_key`` under a
+        ``(st_mtime_ns, st_size, st_ino)`` stamp, so a file unchanged since the last rebuild
+        costs a ``stat`` instead of an ``open`` + ``readline`` + ``json.loads``.
+        A rebuild still runs on the first chained read, and whenever
+        ``note_tab_id`` falls back to invalidating instead of updating one entry
+        in place (no tab_id, an already-stale index, or a tab_id whose first
+        file this save just created), so the memo pays for itself on those.
+        Before that in-place update landed, ``append`` invalidated the index
+        unconditionally and one sent message re-read every session file on the
+        event loop.
+
+        TWO guards, because neither is sufficient alone. A write THROUGH this
+        class from THIS instance restores the pre-write mtime (see
+        :func:`_restore_mtime`, which exists so housekeeping does not reorder
+        ``list_sessions``), so the stamp cannot see it — ``_invalidate_cache``
+        pops the memo instead, on the line after the restore. Anything that
+        never reaches that pop is the stamp's job: a write AROUND the class, and
+        a write through ANOTHER instance of this class, whose pop lands on its
+        own memo and leaves ours untouched. That last case is why the stamp
+        carries ``st_mtime_ns`` and ``st_ino`` and not just ``(mtime, size)`` —
+        an equal-length ``tab_id`` rewrite preserves both mtime and size. Either
+        guard alone would keep serving a stale tab_id and silently drop that
+        session from its chain — the same vanished-history failure the removed
+        ``[]`` sentinel used to cause.
         """
         index: dict[str, list[str]] = {}
-        for path in sorted(self._dir.glob("dashboard_chat-*.jsonl")):
+        for path in sorted(self._dir.glob(_TAB_ID_INDEX_GLOB)):
+            # Both derivations come from main's shared helpers rather than being
+            # respelled here: ``key`` feeds the memo AND the index append below,
+            # and ``note_tab_id`` looks entries up through the same helper, so a
+            # second copy would drift and its lookup would silently miss an
+            # entry that is really present.
+            key = _index_key_for_stem(path.stem)
             try:
-                with path.open(encoding="utf-8") as f:
-                    first_line = f.readline()
-                m = json.loads(first_line)
-                tid = m.get("tab_id")
-                if tid:
-                    index.setdefault(tid, []).append(path.stem.replace("_", ":", 1))
-            except Exception:
+                st = path.stat()
+            except OSError:
                 continue
+            # Three terms, all off the one stat above, because the pop below
+            # only ever reaches the memo of the instance that did the writing:
+            # another instance's write restores the mtime AND leaves the size
+            # identical (a tab_id is fixed-length), so mtime+size alone serve a
+            # stale id. mtime_ns rather than mtime because _restore_mtime puts
+            # the time back through a float, which cannot carry ns; st_ino moves
+            # too, since a metadata rewrite is atomic_write (temp + os.replace),
+            # and it holds even if _restore_mtime later becomes ns-exact.
+            stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+            cached = self._tab_id_by_key.get(key)
+            if cached is not None and cached[0] == stamp:
+                tid = cached[1]
+            else:
+                # Sample the generation BEFORE the read: if a writer pops this key
+                # while we are reading, the value we got is already stale and must
+                # not be memoized. stamp is also the pre-read one, so a write that
+                # lands mid-read leaves a value that fails the guard next time.
+                generation = self._tab_id_generation
+                # We are on the MISS path, so this file changed since we
+                # memoized it -- or we never memoized it at all. _meta_cache is
+                # keyed on float mtime ALONE, which is strictly weaker than our
+                # stamp: a rewrite that restores the mtime and keeps the size
+                # compares EQUAL there and hands back the pre-write line, so
+                # widening the stamp alone would still serve a stale tab_id from
+                # this second layer. Pop UNCONDITIONALLY, because the cold-memo
+                # case is the dangerous one: get_metadata and the consolidation
+                # counters warm _meta_cache without ever touching this memo, and
+                # a stale line served there gets memoized below under the NEW,
+                # correct-looking stamp -- after which the warm path never
+                # re-reads it and the session stays off its chain for good.
+                # Costs one reread for a file warm here but cold in the memo; the
+                # warm path (stamp hit) returns above, so the win is unaffected.
+                self._meta_cache.pop(key, None)
+                try:
+                    meta, readable = self._read_metadata_status(key)
+                except Exception:
+                    continue
+                # _read_metadata_status, NOT _read_metadata: the latter drops the
+                # readability flag, so a transient failure (an AV scanner holding
+                # a freshly appended file, where stat succeeds but open does not)
+                # arrives as {} and would be memoized below as a definitive "no
+                # tab_id" against an unchanged stamp -- dropping the session from
+                # its chain until its next write. Retry on the next rebuild.
+                if not readable:
+                    continue
+                raw = meta.get("tab_id")
+                # "" memoizes "no tab_id at this stamp". Without it a session
+                # lacking one is re-read every rebuild and re-enters _meta_cache,
+                # evicting what other code paths in this process warmed (it is
+                # per-instance, not process-shared). A non-str tab_id reaches
+                # here only from corrupt metadata (and unhashable would abort the
+                # rebuild), so it folds into the same sentinel.
+                tid = raw if isinstance(raw, str) else ""
+                if self._tab_id_generation == generation:
+                    self._tab_id_by_key[key] = (stamp, tid)
+            if not tid:
+                continue
+            index.setdefault(tid, []).append(key)
         self._tab_id_index = index
 
     def invalidate_tab_id_cache(self) -> None:
@@ -2143,6 +4461,59 @@ class ConversationLog:
         """
         with self._lock:
             self._tab_id_index = None
+
+    def note_tab_id(self, key: str, tab_id: str | None) -> None:
+        """Register *key* under *tab_id* in place, keeping the chain index warm.
+
+        A content-only save never changes the tab_id -> keys mapping, so the
+        blanket :meth:`invalidate_tab_id_cache` the slot-save path used to call
+        threw the whole index away, and the next chained read then re-globbed
+        the session directory and re-opened every ``dashboard_chat-*.jsonl`` in
+        it to rebuild a mapping that had not changed. Updating the single
+        affected entry keeps that rescan off the read path.
+
+        A key whose transcript the rebuild never scans returns immediately
+        without invalidating -- see :func:`can_hold_tab_id_index_entry`. Such a
+        save cannot change the mapping at all, so invalidating on one would
+        throw the warm index away for nothing, and a channel-keyed session
+        flushes often enough that it would restore the very per-save rescan
+        this method exists to remove.
+
+        Three further cases deliberately fall back to the slow-but-correct path
+        instead of appending:
+
+        * no *tab_id* -- there is nothing to index against, so invalidate and
+          keep the previous unconditional behaviour for that case;
+        * a stale index (``None``) -- leave it stale, because the next chained
+          read rebuilds it authoritatively and a rebuild is what makes it
+          trustworthy;
+        * a *tab_id* carrying no keys -- this save may have just created that
+          tab_id's FIRST file, which a previously-built index predates.
+          Appending here would forge a one-key entry that reads as
+          authoritative and hides every sibling key. The test is ``not keys``
+          rather than ``keys is None`` so an empty-list value can never slip
+          through into that append.
+
+        Caller must not hold ``self._lock``; this takes it. The slot-save path
+        already calls ``invalidate_tab_id_cache`` (which takes the same lock)
+        from inside ``_locked(history_key)``, so this adds no new lock ordering.
+        """
+        if not can_hold_tab_id_index_entry(key):
+            return
+        if not tab_id:
+            self.invalidate_tab_id_cache()
+            return
+        with self._lock:
+            index = self._tab_id_index
+            if index is None:
+                return
+            keys = index.get(tab_id)
+            if not keys:
+                self.invalidate_tab_id_cache()
+                return
+            chained = _index_key_for_stem(transcript_stem(key))
+            if chained not in keys:
+                keys.append(chained)
 
     def delete_session(self, key: str) -> bool:
         """Delete a session file. Returns True if a file was removed.
@@ -2175,6 +4546,10 @@ class ConversationLog:
                 # safe, and a failure here must not fail the primary delete.
                 try:
                     self._summary_cache_path(key).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                try:
+                    self._intent_summary_cache_path(key).unlink(missing_ok=True)
                 except OSError:
                     pass
         except HistoryLockTimeout:
@@ -2216,6 +4591,39 @@ class ConversationLog:
         if "tab_id" in fields:
             self.invalidate_tab_id_cache()
 
+    def update_metadata_if(
+        self, key: str, fields: dict, guard: Callable[[dict], bool]
+    ) -> bool:
+        """Merge *fields* only if *guard* still accepts the on-disk metadata.
+
+        ``guard`` is evaluated INSIDE the cross-process lock, against the record
+        as it stands at write time. That is the difference from
+        :meth:`update_metadata`: a caller that decided to write based on a
+        snapshot taken earlier cannot land that write over a change another
+        writer made in the meantime, because the decision is re-made here rather
+        than trusted from before the lock was acquired. Taking the lock can
+        itself mean waiting, so "checked, then wrote" is not the same as "checked
+        at the moment of writing".
+
+        Returns whether the merge was applied, so a caller can tell a skipped
+        write from a completed one and avoid applying it in memory.
+
+        Fails CLOSED on an unreadable record. ``_read_metadata`` cannot tell
+        "genuinely empty" from "could not be read", and an empty dict satisfies
+        most guards — so consulting it would let a failed read look like a blank
+        record and authorise a write over a placement that is actually there.
+        """
+        with self._locked(key):
+            meta, readable = self._read_metadata_status(key)
+            if not readable:
+                return False
+            if not guard(meta):
+                return False
+            self._update_metadata_locked(key, fields)
+        if "tab_id" in fields:
+            self.invalidate_tab_id_cache()
+        return True
+
     def _update_metadata_locked(self, key: str, fields: dict) -> None:
         """Merge *fields* into the session's metadata line and persist.
 
@@ -2247,7 +4655,7 @@ class ConversationLog:
             self._dir.mkdir(parents=True, exist_ok=True)
             meta = {
                 "_type": "metadata",
-                "created_at": datetime.now().isoformat(),
+                "created_at": metadata_now_iso(),
                 "last_consolidated": 0,
             }
             lines = [""]  # placeholder; replaced below
@@ -2344,7 +4752,12 @@ class ConversationLog:
             lines[0] = json.dumps(meta) + "\n"
             atomic_write(path, "".join(lines), fsync=False)
             _restore_mtime(path, prev_mtime)
-        self._invalidate_cache(key)
+            # Invalidate while still holding the lock — same reasoning as
+            # mark_consolidated: outside it there is a window where the file
+            # is rewritten with its mtime restored but the generation has not
+            # moved, so a concurrent metadata read passes both guards and
+            # memoizes the pre-rewrite view.
+            self._invalidate_cache(key)
 
     def _read_messages(self, key: str) -> list[dict]:
         """Read all non-metadata entries from a session JSONL file.
@@ -2363,30 +4776,266 @@ class ConversationLog:
             keeps that invariant explicit.
         """
         path = self._path(key)
-        if not path.exists():
-            self._msg_cache.pop(key, None)
-            return []
+        # ── Warm path: LOCK-FREE, byte-for-byte the pre-fix behaviour ────────
+        # A hit whose stored mtime still matches the file is served with no
+        # lock at all. This matters beyond speed: ``_read_messages`` is reached
+        # ON the event loop (``api_session_detail``, and ``restore_open_slots_
+        # async`` which stays on-loop deliberately — see
+        # ``_pause_for_transient_retry``), while a WRITER holds this same RLock
+        # across its cross-process flock wait (up to ``_FLOCK_ACQUIRE_TIMEOUT_S``
+        # in ``_locked``). Taking the lock on every read would therefore let a
+        # writer stall the sole loop — chat, WebSockets and the liveness
+        # heartbeat — which is the ``no-blocking-call-on-event-loop`` hazard.
+        # The mtime guard alone is NOT sufficient even for a hit: `_invalidate_
+        # cache`'s pops reach only THIS instance's caches, while a preserved-
+        # mtime rewrite can be performed through another ConversationLog
+        # instance over the same directory. Every entry therefore carries the
+        # generation it was published under, and a hit requires BOTH the mtime
+        # and the generation to match — the process-wide bump is what makes a
+        # cross-instance rewrite visible where the instance-local pop cannot
+        # be. The generation read is pure in-memory work (no I/O), so the hit
+        # still never waits on a writer's file operations.
         try:
             ident = _cache_identity(path.stat())
         except OSError:
+            ident = None
+        if ident is not None:
+            cached = self._msg_cache.get(key)
+            if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
+                return cached[2]
+        # ── Cold path: serialize the FILL against this key's writers ─────────
+        # The mtime guard cannot protect the fill window, because housekeeping
+        # rewrites deliberately RESTORE the pre-write mtime (``_restore_mtime``,
+        # so compaction does not reorder ``list_sessions``). A parse that
+        # started before such a rewrite and published after its
+        # ``_invalidate_cache`` would sit in the cache holding pre-rewrite
+        # messages under an mtime the file still has — undetectable, so the
+        # dashboard, session resume and the history tools would serve removed
+        # or replaced messages for the life of the process (issue #1835).
+        #
+        # ``_file_lock`` is the same in-process RLock every writer takes first
+        # in ``_locked``, so holding it across stat → read → publish orders the
+        # fill against append / rewrite / metadata edits for this key. Miss-only
+        # acquisition, plus the re-stat + re-check ``_read_messages_locked``
+        # already does at the top of its retry loop, is exactly the
+        # double-checked shape ``_folded_content`` uses for this identical race.
+        #
+        # An UNLOCKED fill (the bounded-acquire fallback) has no lock ordering,
+        # so its publish is gated on two witnesses covering the two writer
+        # classes. LOCAL writers (threads of this process) all invalidate
+        # through ``_invalidate_cache``, so the invalidation generation
+        # witnesses them: the snapshot below precedes the fill's stat, and an
+        # unmoved generation at publish time proves the window was free of
+        # local preserved-mtime rewrites (``_restore_mtime`` puts back an
+        # mtime the guard alone could never distrust). EXTERNAL writers
+        # (subagents, crons, the CLI — other processes) bump a generation in
+        # THEIR process, invisible here; what excludes them is the
+        # cross-process flock: ``_flock_hold_witness`` proves OUR process held
+        # it continuously across the window, during which an external writer
+        # cannot touch the file. Both witnesses passing makes the parse safe
+        # to keep — sparing the next reader a full re-parse of a potentially
+        # multi-MB transcript. Either failing (including a local writer still
+        # WAITING on an external holder's flock, when the file is externally
+        # rewritable) serves the parse to this caller but never publishes it,
+        # leaving the file the only source of truth.
+        gen = self._cache_gen(key)
+        witness = self._flock_hold_witness(key)
+        with self._cache_fill_lock(key) as locked:
+            messages = self._read_messages_locked(
+                key, gen=None if locked else gen, flock_witness=witness
+            )
+            if not locked and (
+                gen != self._cache_gen(key)
+                or witness is None
+                or witness != self._flock_hold_witness(key)
+            ):
+                # A witness broke between the publish pre-check inside
+                # ``_read_messages_locked`` and here; the entry just stored may
+                # hold a pre-rewrite parse. Popping can at worst remove a
+                # FRESHER entry a concurrent fill published in the same window,
+                # which only costs one re-read — never a stale answer.
+                self._msg_cache.pop(key, None)
+            return messages
+
+    @contextlib.contextmanager
+    def _cache_fill_lock(self, key: str) -> Iterator[bool]:
+        """Best-effort hold of *key*'s writer RLock around a cache FILL.
+
+        Yields ``True`` when the lock is held, ``False`` when it was skipped.
+
+        The acquire is bounded on BOTH paths, because a read must never be able
+        to wait without an upper bound: ON a running loop exactly ONE
+        non-blocking attempt (never sleep/poll the sole event loop, the same
+        discipline ``_locked`` applies to its flock), and off the loop a wait
+        capped at ``_FLOCK_ACQUIRE_TIMEOUT_S`` — the same ceiling a writer's
+        cross-process acquire uses, so the read path's worst case is bounded by
+        the writer's.
+
+        A failed acquire fills WITHOUT the lock. Degrading is safe in a way it
+        is not for a writer: an unlocked fill can at worst lose the race this
+        lock exists to close, i.e. fall back to the pre-fix behaviour for that
+        one read, whereas an unlocked WRITE could clobber a concurrent rewrite.
+        A stalled reader is the strictly worse outcome (on the loop the
+        LoopStallWatchdog kills the gateway; off it, a wedged holder would hang
+        the caller forever), so we take the rare stale read instead.
+
+        Reentrant by construction: a writer that reaches ``_read_messages``
+        while already inside ``_locked`` on this thread re-acquires the RLock it
+        owns, bounded attempt included.
+        """
+        lock = self._file_lock(key)
+        on_loop = True
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            held = lock.acquire(blocking=False)
+        else:
+            held = lock.acquire(timeout=_FLOCK_ACQUIRE_TIMEOUT_S)
+        if not held:
+            logger.debug(
+                "history: writer lock for %s still busy (%s); filling the "
+                "message cache unlocked rather than waiting unbounded",
+                key,
+                "event loop, single non-blocking attempt" if on_loop else "off-loop deadline",
+            )
+        try:
+            yield held
+        finally:
+            if held:
+                lock.release()
+
+    def _read_messages_locked(
+        self,
+        key: str,
+        *,
+        gen: int | None,
+        flock_witness: tuple[int, int] | None,
+    ) -> list[dict]:
+        """The cache-miss half of :meth:`_read_messages`.
+
+        Called under :meth:`_cache_fill_lock` (best-effort — see there). The
+        stat + cache check at the top of the retry loop is what makes the
+        caller's locking *double-checked*: two threads racing the same cold key
+        parse once, and a rewrite that landed between the caller's lock-free
+        probe and the acquire is seen here rather than overwritten.
+
+        *gen* is ``None`` when the caller holds the writer lock (the publish is
+        ordered against writers, so it is unconditionally safe and
+        *flock_witness* is ignored). For an UNLOCKED fill *gen* is the
+        invalidation generation and *flock_witness* the
+        :meth:`_flock_hold_witness` snapshot, both taken by the caller BEFORE
+        this method's stat: the publish happens only while the generation is
+        still unmoved (no LOCAL preserved-mtime rewrite landed inside the
+        window) AND the witness still proves a continuous cross-process flock
+        hold (no EXTERNAL process could have written inside it). Either
+        failing means the parse in hand may predate a rewrite the mtime can
+        never reveal, so it is served but not cached.
+        """
+        path = self._path(key)
+        if not path.exists():
+            self._msg_cache.pop(key, None)
             return []
-        cached = self._msg_cache.get(key)
-        if cached and cached[0] == ident:
-            return cached[1]
-        messages: list[dict] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        # Retry transient read failures rather than reporting an empty session.
+        # This method is on the open-tab restore path
+        # (``read_messages_chained`` -> ``_rehydrate_slot_from_history``); on
+        # Windows a just-written transcript can be briefly unopenable while an
+        # indexer or AV scanner holds it (``ERROR_SHARING_VIOLATION`` ->
+        # ``PermissionError``, an ``OSError`` subclass). An unhandled OSError
+        # here propagates out of rehydrate and DROPS the tab, which is the
+        # intermittent ``restored == N-1`` (``assert 7 == 8``) failure on the
+        # Windows CI line. Mirror the retry ``_read_metadata`` already uses so
+        # the tab keeps its full history instead of vanishing. The old bare
+        # ``except OSError: return []`` on the stat silently yielded a
+        # history-less tab on the same fault; retrying first recovers it.
+        for attempt in range(_METADATA_READ_ATTEMPTS):
             try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if data.get("_type") == "metadata":
-                continue
-            messages.append(data)
-        self._msg_cache[key] = (ident, messages)
-        return messages
+                ident = _cache_identity(path.stat())
+                cached = self._msg_cache.get(key)
+                if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
+                    return cached[2]
+                with open(path, encoding="utf-8") as fh:
+                    raw = fh.read()
+            except FileNotFoundError:
+                # The transcript was deleted AFTER the exists() check above -- a
+                # concurrent delete_session racing this read. That is NOT a
+                # transient lock (retrying cannot bring the file back), and the
+                # correct answer is an empty read: it matches the exists()-miss
+                # branch above and the pre-PR stat() OSError branch. Letting it
+                # fall through to the generic OSError arm below -- which now
+                # re-raises on exhaustion -- would turn a benign race into an
+                # HTTP 500 in a caller like api_session_detail that reaches
+                # read_messages after its own exists() check (GPT review, PR
+                # #2052). Return [] immediately, dropping any stale cache entry;
+                # do not spend the retry budget on a file that is gone.
+                self._msg_cache.pop(key, None)
+                return []
+            except OSError:
+                if attempt + 1 < _METADATA_READ_ATTEMPTS:
+                    self._pause_for_transient_retry()
+                    continue
+                # Out of retries. Do NOT swallow to [] here. A persistent read
+                # failure is indistinguishable from a genuinely empty session,
+                # and on the restore path _rehydrate_slot_from_history would then
+                # register an EMPTY slot -- which restore_recent_sessions dedupes
+                # by key and skips, stranding the tab history-less for the whole
+                # session (GPT review, PR #2052). Re-raise instead so rehydrate
+                # rolls back its partial slot and the tab is DROPPED rather than
+                # registered empty -- recoverable on a later restore pass, most
+                # reliably the next restart once the holder has released the file
+                # (the same-startup restore_recent_sessions fallback only recovers
+                # it if the file is readable by then). That matches the
+                # "drop, don't register empty" outcome _read_metadata reaches by
+                # returning {} on exhaustion. It is also the pre-retry behaviour:
+                # the old unwrapped read_text() propagated this OSError with no
+                # retry, so callers already tolerate it -- the loop above just
+                # absorbs the transient case first.
+                logger.warning(
+                    "history: could not read messages for %s after %d attempts; "
+                    "re-raising so restore can retry",
+                    key,
+                    _METADATA_READ_ATTEMPTS,
+                    exc_info=True,
+                )
+                raise
+            messages: list[dict] = []
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("_type") == "metadata":
+                    continue
+                messages.append(data)
+            # Each entry records the generation it was published under, so a
+            # LATER invalidation this instance's pops cannot reach (a rewrite
+            # performed through another ConversationLog instance) still
+            # unhits it: the bump is process-wide even though the pop is not.
+            # An unlocked fill stores its pre-stat snapshot — if a bump lands
+            # between the pre-check below and the store, the entry is born
+            # already-stale and no hit site will ever serve it. A locked fill
+            # records the generation read at publish time, which is stable
+            # ENOUGH rather than strictly stable: every preserved-mtime WRITE
+            # is serialized under the lock this fill holds, so the content in
+            # hand is at least as new as any write a concurrent bump belongs
+            # to. An invalidator that bumps after releasing the lock
+            # (mark_consolidated, clear_closed) can only make the recorded
+            # generation LAG the content — a lagging entry misses and costs
+            # one re-parse; a stale hit would require the recorded generation
+            # to LEAD the content, which no caller can produce.
+            entry_gen = self._cache_gen(key) if gen is None else gen
+            if gen is None or (
+                gen == self._cache_gen(key)
+                and flock_witness is not None
+                and flock_witness == self._flock_hold_witness(key)
+            ):
+                self._msg_cache[key] = (ident, entry_gen, messages)
+            return messages
+        return []
 
     #: Starting tail window (bytes) for :meth:`_read_tail_messages`. Sized to
     #: comfortably cover a few dozen JSONL message lines in one read; grown
@@ -2401,7 +5050,7 @@ class ConversationLog:
     _TAIL_MAX_GROWTHS = 6
 
     def _recent_via_tail(
-        self, key: str, max_messages: int, roles: set[str] | None
+        self, key: str, max_messages: int, roles: AbstractSet[str] | None
     ) -> list[dict] | None:
         """Return the formatted recent window via a tail read, or None to defer.
 
@@ -2417,29 +5066,45 @@ class ConversationLog:
         O(1) from memory on subsequent turns instead of re-opening and
         re-parsing the file tail on every call. The mtime guard makes the
         memo self-invalidating: an :meth:`append` bumps the file mtime, so the
-        stale entry misses and is recomputed. A fresh list of fresh dicts is
+        stale entry misses and is recomputed. Preserved-mtime rewrites are
+        covered by :meth:`_invalidate_cache`'s pops for THIS instance only —
+        unlike ``_msg_cache``, the metadata memo, and the search memos, this
+        memo's hit does not consult the invalidation generation, so a
+        preserved-mtime rewrite performed through another
+        :class:`ConversationLog` instance is a known residual gap here (the
+        last one of its class), accepted
+        because the window is a bounded recent view rather than the
+        authoritative transcript. A fresh list of fresh dicts is
         returned each call so callers can freely mutate the result without
         corrupting the shared entry.
         """
         path = self._path(key)
+        # Snapshot the invalidation generation BEFORE the stat: the mtime this
+        # stat returns can survive a housekeeping rewrite (``_restore_mtime``),
+        # so only the generation can prove the window stayed write-free.
+        gen = self._cache_gen(key)
         try:
             ident = _cache_identity(path.stat())
         except OSError:
             return None  # missing/unreadable → let the full path return []
         cached = self._msg_cache.get(key)
-        if cached and cached[0] == ident:
+        if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
             return None  # fresh full cache → full path is a cheap O(1) hit
         rc_key = self._recent_cache_key(key, max_messages, roles)
         rc = self._recent_cache.get(rc_key)
-        if rc is not None and rc[0] == ident:
-            return [dict(m) for m in rc[1]]  # memo hit — no disk I/O
+        if rc is not None and rc[0] == ident and rc[1] == self._cache_gen(key):
+            return [dict(m) for m in rc[2]]  # memo hit — no disk I/O
         tail = self._read_tail_messages(path, max_messages, roles)
         formatted = [{"role": m["role"], "content": m["content"]} for m in tail]
-        self._recent_cache[rc_key] = (ident, formatted)
+        # Guarded publish: a rewrite that restored the mtime while we read the
+        # tail would otherwise park this pre-rewrite window under an mtime the
+        # file still has — and this memo feeds recent(), the per-turn model
+        # context path, so the staleness would be served every turn.
+        self._publish_if_current(self._recent_cache, rc_key, (ident, gen, formatted), key=key, gen=gen)
         return [dict(m) for m in formatted]
 
     @staticmethod
-    def _recent_cache_key(key: str, max_messages: int, roles: set[str] | None) -> str:
+    def _recent_cache_key(key: str, max_messages: int, roles: AbstractSet[str] | None) -> str:
         """Build a stable ``_recent_cache`` key from the recent() parameters.
 
         ``\\x00`` cannot appear in a session key, so it is an unambiguous field
@@ -2450,7 +5115,7 @@ class ConversationLog:
         return f"{key}\x00{max_messages}\x00{roles_part}"
 
     def _read_tail_messages(
-        self, path: Path, max_messages: int, roles: set[str] | None
+        self, path: Path, max_messages: int, roles: AbstractSet[str] | None
     ) -> list[dict]:
         """Read the last *max_messages* messages by seeking to the file tail.
 
@@ -2532,16 +5197,191 @@ class ConversationLog:
         ts = tail[-1].get("ts")
         return ts if isinstance(ts, str) and ts else None
 
+    def last_row_ts(self, key: str) -> str | None:
+        """The ``ts`` of the last persisted message row for *key*, or ``None``.
+
+        The public form of :meth:`_last_row_ts`: it takes :meth:`_locked` itself,
+        so a caller outside this class gets a read that no concurrent append can
+        tear. Ordering derived from it survives a restart, because the value is a
+        field of the persisted row rather than a count of what a process happens
+        to hold in memory.
+
+        BLOCKING. It performs file I/O, so an async caller must run it off the
+        event loop (``asyncio.to_thread``).
+        """
+        with self._locked(key):
+            return self._last_row_ts(key)
+
+    @staticmethod
+    def _cache_key_identities(key: str) -> tuple[str, ...]:
+        """Every cache-key spelling that can refer to *key*'s session.
+
+        One session is addressable by its logical key, its sanitized filename
+        stem, and — for Slack threads — the pre-migration bare ``thread_ts``
+        in either role. The closure must be BIDIRECTIONAL: a writer told only
+        the bare legacy spelling (e.g. rotation deriving it from the file
+        name) must still reach the canonical spelling readers use, or its
+        invalidation is invisible to them. Pure string math, no I/O.
+        """
+        idents = dict.fromkeys((key, *transcript_stems(key)))
+        canon = canonical_key(key)
+        if canon != key:
+            idents.update(dict.fromkeys((canon, *transcript_stems(canon))))
+        return tuple(idents)
+
+    def _flock_hold_witness(self, key: str) -> tuple[int, int] | None:
+        """Proof-of-hold snapshot of OUR cross-process flock for *key*'s file.
+
+        Returns ``(fd, release_epoch)`` when this process currently holds the
+        sidecar flock (``_flock_state.held == 1``), else ``None``. An unlocked
+        fill snapshots this before its stat and compares at publish time: an
+        equal pair proves the flock was held by this process CONTINUOUSLY
+        across the fill window, so no EXTERNAL process can have written the
+        file in that window — external writers block on the flock, and they
+        are the one writer class the in-process invalidation generation cannot
+        witness (their ``_invalidate_cache`` runs in their process, not ours).
+        Local writers write freely under our hold, and every local
+        preserved-mtime rewrite bumps the generation, so the generation check
+        covers them. ``None`` — including a local writer still WAITING on an
+        external process's flock — means the window cannot be proven
+        external-write-free and the fill must not publish.
+        """
+        lock_key = str(self._path(key))
+        with ConversationLog._flock_guard:
+            state = ConversationLog._flock_state.get(lock_key)
+            if state is None or state[2] != 1:
+                return None
+            return (state[0], ConversationLog._flock_epochs.get(lock_key, 0))
+
+    def _cache_gen(self, key: str) -> int:
+        """Current invalidation generation for *key* (0 if never invalidated).
+
+        Read under ``(transcript dir, sanitized filename stem)`` in the
+        process-wide table, because one session file is reachable under more
+        than one cache-key spelling AND from more than one
+        :class:`ConversationLog` instance: rotation invalidates under
+        ``path.stem`` while every other caller passes the logical session key
+        (``_safe_key`` maps both onto the same stem), and the writer whose
+        lock hold forces a reader onto the unlocked fill may be a different
+        instance over the same directory. Without this normalization a
+        writer's bump would be invisible to a fill running under another
+        spelling or instance — the exact blindness this counter exists to
+        remove. Pure string math: no stat, so snapshotting a generation costs
+        a fill no I/O.
+        """
+        gen_key = (str(self._dir), _safe_key(key))
+        with ConversationLog._cache_gens_guard:
+            return ConversationLog._cache_gens.get(gen_key, 0)
+
+    def _bump_cache_gen(self, key: str, idents: tuple[str, ...]) -> None:
+        """Advance *key*'s generation so in-flight cache fills discard themselves.
+
+        Bumps every identity in *idents* — the caller passes
+        :meth:`_cache_key_identities`, precomputed so
+        :meth:`_invalidate_cache` derives the closure once for its bump and
+        its pops — so a writer that only knows one spelling (a stem-keyed
+        caller knows the file stem; most callers know the logical key) still
+        moves the bucket every fill reads, including the canonical spelling of
+        a legacy bare ``thread_ts``. The identity computation stays outside
+        the guard so it holds nothing but the dict increments themselves.
+        """
+        base = str(self._dir)
+        gen_keys = [(base, _safe_key(ident)) for ident in idents]
+        with ConversationLog._cache_gens_guard:
+            for gen_key in dict.fromkeys(gen_keys):
+                ConversationLog._cache_gens[gen_key] = (
+                    ConversationLog._cache_gens.get(gen_key, 0) + 1
+                )
+
+    def _publish_if_current(
+        self,
+        cache: _LRUCache[_V] | _SearchTextCache[_V],
+        entry_key: str,
+        value: _V,
+        *,
+        key: str,
+        gen: int,
+    ) -> None:
+        """Publish *value* to *cache* only if *key*'s generation is still *gen*.
+
+        *key*/*gen* are keyword-only because *entry_key* and *key* are both
+        strings and coincide at most call sites; swapping them where they
+        differ would silently check a generation nothing ever bumps, turning
+        the guard into a permanent no-op that no type checker could see.
+
+        *gen* is the generation the caller snapshotted BEFORE its stat, so a
+        moved generation proves a write landed inside the stat → read → publish
+        window and the parse in hand may predate it. The check-store-recheck
+        shape closes every interleaving with :meth:`_invalidate_cache` (which
+        bumps before it pops):
+
+        - invalidation completes before the store → the pre-check sees the
+          moved generation and skips the publish;
+        - invalidation's bump lands between the pre-check and the store → the
+          re-check sees it and pops the entry this call just published;
+        - the store completes before the bump → the invalidation's own pop
+          removes it.
+
+        The pop can at worst remove a FRESHER entry a concurrent fill published
+        in the same window; that only costs the next reader one re-read, never
+        a stale answer. Discarding (rather than retrying) keeps the read path
+        free of any wait on writers — several fill paths run on the event loop.
+        """
+        if gen != self._cache_gen(key):
+            return
+        cache[entry_key] = value
+        if gen != self._cache_gen(key):
+            cache.pop(entry_key, None)
+
     def _invalidate_cache(self, key: str) -> None:
         """Invalidate caches for a key after a write operation."""
-        self._msg_cache.pop(key, None)
-        self._meta_cache.pop(key, None)
-        # Also drop any memoized recent() windows for this key. Necessary
-        # because housekeeping rewrites (mark_consolidated/update_metadata/
-        # rewrite_session/rotation) restore the pre-write mtime via
-        # _restore_mtime, so the recent cache's mtime guard alone would let a
-        # stale window survive a content change.
-        self._recent_cache.pop_prefix(f"{key}\x00")
+        idents = self._cache_key_identities(key)
+        # Bump BEFORE dropping entries: a fill publishing between a pop and a
+        # later bump would pass its generation re-check and resurrect the entry
+        # just dropped. Bump-first means any fill that stores after a pop here
+        # must re-check against the already-moved generation and discard.
+        self._bump_cache_gen(key, idents)
+        # Drop entries under EVERY spelling this session's cache keys can take
+        # (:meth:`_cache_key_identities`), because the writer and the reader do
+        # not always use the same one: rotation derives its key from the file
+        # name (``path.stem``) while readers cache under the logical session
+        # key. The bump above only guards fills still IN FLIGHT; an entry that
+        # was already published can only be removed by these pops, so the pops
+        # must be exactly as wide as the bump — popping one spelling while
+        # bumping them all would leave an alias-keyed entry holding pre-rewrite
+        # data under a restored mtime, unreachable by any guard. Over-popping
+        # costs at most one re-read; under-popping is permanent staleness.
+        for ident in idents:
+            self._msg_cache.pop(ident, None)
+            self._meta_cache.pop(ident, None)
+            # The tab_id memo's mtime guard cannot see a write that goes through
+            # this class, because those restore the pre-write mtime. This pop is
+            # what does -- under every spelling, for the same reason as the rest:
+            # the rebuild keys its memo off the sanitized filename stem, so a
+            # single-spelling pop would leave an alias-keyed memo serving a stale
+            # tab_id under the restored mtime.
+            self._tab_id_by_key.pop(ident, None)
+            # The folded search blob is derived from the messages, so it goes
+            # stale exactly when they do. Its own mtime guard is not enough
+            # here: the housekeeping rewrites below restore the pre-write
+            # mtime.
+            self._folded_cache.pop(ident, None)
+            # Same reasoning for the snippet source: it is the raw form of
+            # what the fold is derived from, so it goes stale at exactly the
+            # same moment. Its own mtime check would miss the preserved-mtime
+            # rewrites below, and a missed invalidation here shows the user a
+            # preview line quoting text that is no longer in the session.
+            self._snippet_cache.pop(ident, None)
+            # Also drop any memoized recent() windows for this key. Necessary
+            # because housekeeping rewrites (mark_consolidated/update_metadata/
+            # rewrite_session/rotation) restore the pre-write mtime via
+            # _restore_mtime, so the recent cache's mtime guard alone would let
+            # a stale window survive a content change.
+            self._recent_cache.pop_prefix(f"{ident}\x00")
+        # Sampled by the rebuild before it reads a file's metadata, so a store
+        # cannot land after the pops above and resurrect a stale id. Bumped once
+        # per invalidation: it is a single counter, not per-identity.
+        self._tab_id_generation += 1
 
     #: Bytes read from the end of a session file for the last-message preview.
     #: One tail block comfortably covers several trailing JSONL lines without
@@ -2624,32 +5464,86 @@ class ConversationLog:
         """Return session metadata for *key*."""
         return self._read_metadata(key)
 
+    def get_metadata_status(self, key: str) -> tuple[dict, bool]:
+        """Return ``(metadata, readable)`` for *key*.
+
+        ``readable`` is ``False`` only when the transcript exists but its
+        metadata line could not be read after
+        :data:`_METADATA_READ_ATTEMPTS` attempts. Every other empty result --
+        no transcript at all, an empty first line, an undecodable one -- is a
+        genuine answer and reports ``True``.
+
+        :meth:`get_metadata` cannot express that difference: it returns ``{}``
+        for both, and a caller that reads ``{}`` as "this session was never
+        persisted" will discard live state. Use this instead of
+        :meth:`get_metadata` wherever an empty result triggers something
+        destructive.
+        """
+        return self._read_metadata_status(key)
+
+    def _pause_for_transient_retry(self) -> None:
+        """Pause briefly before retrying a transient read, but ONLY off the loop.
+
+        Shared by :meth:`_read_metadata` and :meth:`_read_messages`. Both are
+        reached ON the event loop by ``restore_open_slots_async`` (which keeps
+        the whole restore on the loop deliberately: creating a slot broadcasts
+        through ``asyncio.Queue.put_nowait`` / ``Event.set``, neither
+        thread-safe). A kernel sleep there stops ``_loop_heartbeat`` from petting
+        the LoopStallWatchdog -- whose ``exit_after`` timer then kills the
+        gateway, the exact crash-loop the async restore exists to prevent. So
+        sleep only when NOT on a running loop; on the loop the retry is
+        immediate (a stat plus an open -- cheap enough to be worth taking).
+        """
+        on_loop = True
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_loop = False
+        if not on_loop:
+            _time.sleep(_METADATA_READ_RETRY_SECS)
+
     def _read_metadata(self, key: str) -> dict:
         """Read the metadata line (first line) from a session JSONL file.
 
+        Thin wrapper over :meth:`_read_metadata_status` that drops the
+        readability flag, so the many callers for whom "empty" and "unreadable"
+        are equivalent keep a plain ``dict`` return.
+        """
+        return self._read_metadata_status(key)[0]
+
+    def _read_metadata_status(self, key: str) -> tuple[dict, bool]:
+        """Read the metadata line, reporting whether the read itself succeeded.
+
         Uses mtime-based caching to avoid re-reading unchanged files.
 
-        Returns ``{}`` for a session that genuinely has no metadata. A caller
-        cannot distinguish that from a transient read failure, and at least one
-        does something destructive with the answer: the open-tab restore treats
-        ``{}`` as "never persisted" and silently drops the tab. So absorb the
-        transient case HERE rather than reporting it as absence -- retry a few
-        times, and if it still fails, say so at warning level instead of
-        returning a confident empty dict. Windows makes this more than
-        theoretical: a freshly written file can be briefly unopenable while an
-        indexer or AV scanner holds it (``ERROR_SHARING_VIOLATION``), which
-        surfaces as ``PermissionError`` -- an ``OSError`` subclass.
+        Returns ``({}, True)`` for a session that genuinely has no metadata and
+        ``({}, False)`` when the file exists but could not be read after
+        retries. The retry absorbs the common transient case; the flag exists
+        because absorbing it is not always possible, and at least one caller
+        does something destructive with a confident empty answer: the open-tab
+        restore treats ``{}`` as "never persisted" and drops the tab. Windows
+        makes this more than theoretical: a freshly written file can be briefly
+        unopenable while an indexer or AV scanner holds it
+        (``ERROR_SHARING_VIOLATION``), which surfaces as ``PermissionError`` --
+        an ``OSError`` subclass.
         """
         path = self._path(key)
         if not path.exists():
             self._meta_cache.pop(key, None)
-            return {}
+            return {}, True
         for attempt in range(_METADATA_READ_ATTEMPTS):
+            # Snapshot the invalidation generation BEFORE the stat (fresh per
+            # attempt — each retry is its own stat → read → publish window).
+            # The mtime alone cannot guard the fill: a housekeeping rewrite
+            # restores the pre-write mtime (``_restore_mtime``), so a fill that
+            # spans one would publish pre-rewrite metadata under an mtime the
+            # file still has.
+            gen = self._cache_gen(key)
             try:
                 ident = _cache_identity(path.stat())
                 cached = self._meta_cache.get(key)
-                if cached and cached[0] == ident:
-                    return cached[1]
+                if cached and cached[0] == ident and cached[1] == self._cache_gen(key):
+                    return cached[2], True
                 # Read ONLY the first line. The previous form slurped the entire
                 # file via read_text() and then threw all but the first line away
                 # — on a 26 MB transcript that is ~10ms and ~26 MB of transient
@@ -2661,27 +5555,8 @@ class ConversationLog:
                     first = fh.readline().strip()
             except OSError:
                 if attempt + 1 < _METADATA_READ_ATTEMPTS:
-                    # Pause before retrying ONLY off the event loop. This path is
-                    # reached ON it: ``restore_open_slots_async`` keeps the whole
-                    # restore on the loop deliberately (creating a slot broadcasts
-                    # through ``asyncio.Queue.put_nowait`` / ``Event.set``, neither
-                    # thread-safe), and a kernel sleep there stops
-                    # ``_loop_heartbeat`` from petting the LoopStallWatchdog --
-                    # whose ``exit_after`` timer then kills the gateway. That
-                    # crash-loop is the exact thing the async restore exists to
-                    # prevent, so it must not be reintroduced here. Same probe as
-                    # the cross-process lock acquire above.
-                    on_loop = True
-                    try:
-                        asyncio.get_running_loop()
-                    except RuntimeError:
-                        on_loop = False
-                    if not on_loop:
-                        _time.sleep(_METADATA_READ_RETRY_SECS)
-                    # On the loop the retry is immediate instead. It costs a stat
-                    # plus an open, so it is cheap enough to be worth taking, and
-                    # losing it only yields the same ``{}`` this returned before
-                    # any retry existed -- never worse than the old behaviour.
+                    # Pause before retrying (off-loop only -- see the helper).
+                    self._pause_for_transient_retry()
                     continue
                 # Out of retries. Distinguish this from "no metadata" in the log
                 # so a dropped tab is traceable to its cause instead of looking
@@ -2693,17 +5568,32 @@ class ConversationLog:
                     _METADATA_READ_ATTEMPTS,
                     exc_info=True,
                 )
-                return {}
+                return {}, False
             if not first:
-                return {}
+                return {}, True
             try:
                 data = json.loads(first)
-                meta = data if data.get("_type") == "metadata" else {}
+                # ``isinstance`` guard, not just the _type check: a first line
+                # that is valid JSON but not an OBJECT (``null``, a list, a bare
+                # string, a number) would make ``.get`` raise AttributeError
+                # rather than JSONDecodeError. That is a corrupt metadata line
+                # exactly like an undecodable one, so report it the same way --
+                # an empty dict that IS a genuine answer -- instead of throwing a
+                # non-OSError out of a read that callers treat as total.
+                meta = (
+                    data
+                    if isinstance(data, dict) and data.get("_type") == "metadata"
+                    else {}
+                )
             except json.JSONDecodeError:
                 meta = {}
-            self._meta_cache[key] = (ident, meta)
-            return meta
-        return {}
+            # Guarded publish — discard the fill if a write invalidated this
+            # key inside the stat → read window (see the generation snapshot
+            # at the top of the loop). The metadata itself is still returned:
+            # it was true at read time; only the memo must not outlive it.
+            self._publish_if_current(self._meta_cache, key, (ident, gen, meta), key=key, gen=gen)
+            return meta, True
+        return {}, True
 
     def sliding_window(self, key: str, keep_recent: int = 5) -> tuple[list[dict], list[dict]]:
         """Split messages into (older, recent) for compaction.
@@ -2743,7 +5633,7 @@ class ConversationLog:
                     continue
                 try:
                     normalized = json.dumps(json.loads(ln), sort_keys=True)
-                except (json.JSONDecodeError, ValueError):
+                except ValueError:
                     dropped.append(ln)  # corrupted line → archive it
                     continue
                 if normalized not in kept_serialized:
@@ -2752,21 +5642,19 @@ class ConversationLog:
                 _archive_lines(key, dropped, reason="compact", base=self._dir)
             except Exception:
                 logger.warning("Failed to archive dropped lines for %s", key, exc_info=True)
-        # Preserve select fields from original metadata
+        # Rebuild only the fields compaction owns; everything else on the metadata
+        # line belongs to another layer (the rotation generation an in-flight
+        # consolidation checks, its retry accounting, the slot's title/agent/pin)
+        # and is carried through verbatim. Enumerating what to keep is how those
+        # fields got dropped in the first place.
         orig_meta = self.get_metadata(key) or {}
         meta = {
             "_type": "metadata",
-            "created_at": orig_meta.get("created_at", datetime.now().isoformat()),
+            "created_at": orig_meta.get("created_at", metadata_now_iso()),
             "last_consolidated": orig_meta.get("last_consolidated", 0),
-            "compacted_at": datetime.now().isoformat(),
+            "compacted_at": metadata_now_iso(),
         }
-        # Carry the rotation generation forward so a compaction (which is NOT a
-        # rotation) doesn't reset it to 0 and spuriously trip the generation
-        # mismatch in mark_consolidated for an in-flight consolidation.
-        if orig_meta.get("rotation_generation"):
-            meta["rotation_generation"] = orig_meta["rotation_generation"]
-        if orig_meta.get("memory_mode"):
-            meta["memory_mode"] = orig_meta["memory_mode"]
+        carry_unowned_metadata(meta, orig_meta, _COMPACT_OWNED_META_KEYS)
         lines = [json.dumps(meta) + "\n"]
         for m in messages:
             lines.append(json.dumps(m) + "\n")
@@ -2774,8 +5662,13 @@ class ConversationLog:
         _restore_mtime(path, prev_mtime)
         self._invalidate_cache(key)
 
-    def _maybe_rotate(self, path: Path) -> None:
+    def _maybe_rotate(self, path: Path, key: str) -> None:
         """Rotate a session file that exceeds the byte limit.
+
+        *key* is the logical session key, required because the cache
+        invalidation below cannot recover it from the file stem: the
+        sanitization is lossy (``slack:<ts>`` and ``slack_<ts>`` share one
+        stem) and cache entries live under the spelling the caller used.
 
         Keeps the metadata line plus at most ``_SESSION_KEEP_LINES`` trailing
         messages. When a file is oversized because of a handful of very large
@@ -2784,6 +5677,12 @@ class ConversationLog:
         of returning early. Previously the ``len(lines) <= _SESSION_KEEP_LINES``
         guard let such a file grow without bound (a session of a few multi-MB
         messages would never rotate), defeating the size cap entirely.
+
+        *key* is the LOGICAL session key (the spelling readers cache under),
+        not the filename stem: the rotation rewrite restores the pre-write
+        mtime, so its ``_invalidate_cache`` must pop the reader's actual cache
+        entry — ``path.stem`` is sanitized and cannot be mapped back to the
+        logical spelling at this end.
 
         Callers hold the per-session lock (this is invoked from ``append`` under
         ``_locked``); it does not acquire the lock itself.
@@ -2839,7 +5738,7 @@ class ConversationLog:
             try:
                 meta = json.loads(meta_line)
                 meta["last_consolidated"] = 0
-                meta["rotated_at"] = datetime.now().isoformat()
+                meta["rotated_at"] = metadata_now_iso()
                 meta["rotation_generation"] = int(meta.get("rotation_generation", 0) or 0) + 1
                 meta_line = json.dumps(meta) + "\n"
             except json.JSONDecodeError:
@@ -2848,9 +5747,11 @@ class ConversationLog:
         content = meta_line + "".join(kept)
         atomic_write(path, content)
         _restore_mtime(path, prev_mtime)
-        # Invalidate cache — offsets changed
-        safe = path.stem
-        self._invalidate_cache(safe)
+        # Invalidate cache — offsets changed. Under the LOGICAL key: readers
+        # cache under that spelling, and this rewrite restored the pre-write
+        # mtime, so a missed pop here would leave their entry permanently
+        # stale (the identity closure in _invalidate_cache covers the stem).
+        self._invalidate_cache(key)
         logger.info(
             "Rotated session file %s (%d → %d lines)",
             path.name,
@@ -2893,16 +5794,22 @@ _TOOL_ROLES: frozenset[str] = frozenset({"tool", "tool_call", "tool_result"})
 
 
 def _frontmatter_value(text: str | None, key: str) -> str:
-    """Return a single-line frontmatter value from a SKILL.md body, or ""."""
+    """Return *key*'s frontmatter value from a SKILL.md body, or "".
+
+    Values resolve the way ``SkillsLoader._parse_frontmatter`` resolves them:
+    only a column-0 key is a field, and a bare block-scalar indicator
+    (``>``/``|``, optionally chomped) folds the indented lines that follow.
+    The auto-skill update path carries the live skill's ``description`` and
+    ``triggers`` through this reader into a staged candidate that overwrites
+    the live skill on approval — reading the indicator verbatim would collapse
+    a block-scalar description to ``""`` and inject a bogus ``>`` trigger on
+    that round-trip. The grammar (plus the leading-whitespace opener
+    tolerance, verbatim plain values, and first-duplicate-wins lookup) is
+    pinned as ``frontmatter.SKILL_UPDATE``.
+    """
     if not text:
         return ""
-    m = re.match(r"^\s*---\n(.*?)\n---", text, re.DOTALL)
-    if not m:
-        return ""
-    for ln in m.group(1).split("\n"):
-        if ":" in ln and ln.split(":", 1)[0].strip() == key:
-            return ln.split(":", 1)[1].strip()
-    return ""
+    return frontmatter_value(text, key, SKILL_UPDATE)
 
 
 def _merge_trigger_lists(live: str, candidate: str, *, cap: int = 12) -> str:
@@ -2937,7 +5844,9 @@ def _strip_skill_frontmatter(text: str | None) -> str:
     A skill body read off disk carries its frontmatter header; only the prose
     below it may be fed to (or accepted from) the update-merge turn, because
     ``stage_skill_candidate`` re-emits frontmatter of its own. Text without a
-    leading block is returned unchanged (stripped).
+    leading block is returned unchanged (stripped). A fence LOCATOR, not a
+    field parser — deliberately outside ``kiro_crew.frontmatter``; editing
+    its grammar means revisiting ``_frontmatter_value``'s dialect too.
     """
     if not text:
         return ""
@@ -3117,14 +6026,10 @@ class HistoryConsolidator:
         # Track last activity per session for idle-based history consolidation
         self._last_activity: dict[str, float] = {}
         self._history_consolidated: dict[str, float] = {}  # key → last history consolidation time
-        self._auto_retry_after: dict[str, float] = {}
         self._direct_request_lock = asyncio.Lock()
         # Separate offset for prefs-only consolidation (doesn't advance main offset)
         self._prefs_offset: dict[str, int] = {}
-        # Reason the last LLM call failed, so _consolidate can report WHY rather
-        # than only that nothing happened. Read immediately after the awaited
-        # call returns falsy, within the per-key _running guard.
-        self._last_llm_error: str = ""
+        self._last_llm_error = ""
         # Session length at the last skill-detection pass, so an unchanged
         # (rotation_generation, message_count) at the last skill-detection
         # pass, so an unchanged session isn't re-judged on every history
@@ -3132,81 +6037,175 @@ class HistoryConsolidator:
         # swaps the window's content) still forces a fresh pass.
         self._last_skillgen_marker: dict[str, tuple[int, int]] = {}
 
-    def _retry_after(self, key: str) -> float:
-        """Return the durable automatic-retry deadline for a session."""
-        cached = self._auto_retry_after.get(key, 0.0)
-        raw = self._log.get_metadata(key).get(_AUTO_RETRY_AFTER_FIELD, 0.0)
+    def retry_eligible(
+        self, key: str, now: float | None = None, message_count: int | None = None
+    ) -> bool:
+        """True when *key* may spend a billed consolidation turn right now.
+
+        Every automatic entry point consults this so a span whose consolidation
+        keeps failing backs off instead of re-billing an LLM turn on each sweep,
+        and _consolidate() itself enforces it as the final gate, so an entry
+        point without a pre-check of its own still cannot bypass the backoff.
+        A span at :data:`_CONSOLIDATION_MAX_ATTEMPTS` is refused: the abandon path
+        normally writes the marker (which also clears the accounting), so reaching
+        here at the cap means even that write failed, and refusing keeps a broken
+        span from spending forever.
+
+        That refusal covers the SPAN, not the session. The cap is scoped to the
+        content it measured, so a rotation or new messages release it with a fresh
+        bounded budget (see
+        :meth:`ConversationLog._attempts_describe_current_span`) — otherwise one
+        transient marker-write failure would stop this session from ever
+        consolidating again.
+
+        Costs one metadata-line read and NO transcript read: this runs on the
+        gateway event loop (heartbeat sweep, expiry, dashboard trigger), where a
+        synchronous full-file read would stall every other gateway task on a large
+        transcript. *message_count* is the transcript's current total, which every
+        automatic caller already holds from its own
+        :meth:`ConversationLog.consolidation_counts` call; omitting it skips the
+        extent test and keeps the cap.
+        """
+        attempts, retry_at = self._log.consolidation_retry_state(key, message_count)
+        if attempts >= _CONSOLIDATION_MAX_ATTEMPTS:
+            return False
+        return (_time.time() if now is None else now) >= retry_at
+
+    async def _note_failed_attempt(
+        self, key: str, span: AttemptedSpan, reason: str
+    ) -> None:
+        """Charge one attempt for a billed turn that never reached the marker.
+
+        Called only once the prompt has actually reached the provider, so a
+        pre-dispatch failure (no session manager, kiro-cli failing to start) and a
+        cheap pre-call failure (snapshot, metadata read) both keep their free
+        retry. At the attempt cap the durable marker is written anyway and the span
+        is abandoned with a warning: the alternative is re-billing this failure
+        indefinitely.
+
+        *span* is the pre-turn snapshot identity (see :class:`AttemptedSpan`), used
+        both to stamp the charge and to place the abandon marker — the same values
+        for both, so the marker cannot be written for a span other than the one the
+        cap was reached on.
+        """
         try:
-            persisted = float(raw or 0.0)
-        except (TypeError, ValueError):
-            persisted = 0.0
-        return max(cached, persisted)
-
-    def _is_running(self, key: str) -> bool:
-        """Treat a dashboard key and its JSONL-safe spelling as one session."""
-        safe_key = _safe_key(key)
-        return any(_safe_key(active_key) == safe_key for active_key in self._running)
-
-    def _persist_retry_state(self, key: str, fields: dict) -> None:
-        """Write retry bookkeeping off the event loop without delaying chat."""
-
-        async def _write() -> None:
-            try:
-                await asyncio.to_thread(self._log.update_metadata, key, fields)
-            except Exception:
-                logger.warning(
-                    "History consolidation retry state write failed for %s", key, exc_info=True
-                )
-
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            self._log.update_metadata(key, fields)
+            attempts, retry_at = await asyncio.to_thread(
+                self._log.record_consolidation_failure,
+                key,
+                _CONSOLIDATION_BACKOFF_BASE_SECS,
+                _CONSOLIDATION_BACKOFF_MAX_SECS,
+                span,
+            )
+        except Exception:
+            # Without a persisted count the sweep cannot back off, so say so
+            # loudly — but never let bookkeeping mask the original failure.
+            logger.warning(
+                "Could not persist consolidation retry state for %s", key, exc_info=True
+            )
             return
-        task = asyncio.create_task(_write())
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-
-    def _clear_auto_retry(self, key: str) -> None:
-        """Clear both the process cache and the restart-safe retry metadata."""
-        self._auto_retry_after.pop(key, None)
-        self._persist_retry_state(
+        if attempts < 1:
+            # The session was deleted mid-consolidation, so nothing was recorded
+            # and there is no span left to abandon.
+            return
+        if attempts < _CONSOLIDATION_MAX_ATTEMPTS:
+            logger.warning(
+                "Consolidation attempt %d/%d failed for %s (%s); "
+                "next attempt in %.0fs",
+                attempts,
+                _CONSOLIDATION_MAX_ATTEMPTS,
+                key,
+                reason,
+                max(0.0, retry_at - _time.time()),
+            )
+            return
+        logger.warning(
+            "Abandoning consolidation for %s after %d failed attempts (%s): "
+            "marking %d messages consolidated WITHOUT a memory pass, so this "
+            "span's history/preferences/lessons are not extracted",
             key,
-            {
-                _AUTO_RETRY_AFTER_FIELD: 0.0,
-                _AUTO_RETRY_ATTEMPTS_FIELD: 0,
-                _AUTO_RETRY_REASON_FIELD: "",
-            },
+            attempts,
+            reason,
+            span.total,
+        )
+        try:
+            await asyncio.to_thread(
+                self._log.mark_consolidated, key, span.total, span.generation
+            )
+        except Exception:
+            # The count stays at the cap, so retry_eligible() keeps refusing —
+            # the span stops spending even though the marker is missing.
+            logger.warning(
+                "Could not mark abandoned consolidation for %s", key, exc_info=True
+            )
+
+    async def _note_environment_failure(
+        self,
+        key: str,
+        reason: str,
+        *,
+        base_secs: float = _CONSOLIDATION_BACKOFF_BASE_SECS,
+        max_secs: float = _CONSOLIDATION_BACKOFF_MAX_SECS,
+    ) -> None:
+        """Arm the backoff for a consolidation that never reached the provider.
+
+        Deliberately does NOT touch the attempt cap. A pre-dispatch failure spends
+        nothing, so abandoning the span over one would write the durable marker
+        over messages no LLM has ever read — losing a memory pass to a broken
+        kiro-cli install rather than to a genuinely unprocessable span. The
+        environment counter only widens the retry interval, so a permanently broken
+        host settles at the backoff ceiling instead of re-attempting every tick.
+        """
+        try:
+            failures, retry_at = await asyncio.to_thread(
+                self._log.record_consolidation_environment_failure,
+                key,
+                base_secs,
+                max_secs,
+            )
+        except Exception:
+            logger.warning(
+                "Could not persist consolidation environment backoff for %s",
+                key,
+                exc_info=True,
+            )
+            return
+        if failures < 1:
+            return
+        logger.warning(
+            "Consolidation for %s could not reach the LLM (%s; environment "
+            "failure #%d, nothing billed); retrying in %.0fs without consuming "
+            "the attempt budget",
+            key,
+            reason,
+            failures,
+            max(0.0, retry_at - _time.time()),
         )
 
     def maybe_consolidate(self, key: str) -> None:
-        """Fire consolidation on message volume: preferences/projects always,
-        history too once the unconsolidated backlog is large enough.
-
-        Without the history arm, ``last_consolidated`` advances only on the idle
-        path, so a session that is continuously active never has its history
-        written at all — the failure this method's lag trigger exists to prevent.
-        """
+        """Fire memory consolidation for volume, including a large history backlog."""
         if not self._auto_consolidation_enabled:
             return
         self._last_activity[key] = _time.time()
-        if self._is_running(key):
-            return
-        if _time.time() < self._retry_after(key):
+        if key in self._running:
             return
         total = len(self._log._read_messages(key))
         prefs_off = self._prefs_offset.get(key, 0)
-        # Backlog against the DURABLE offset, not the in-memory prefs offset:
-        # only the former tracks what history extraction has actually consumed,
-        # and it is an absolute message index (``messages[offset:]``).
         history_lag = self._log.unconsolidated_count(key)
         include_history = history_lag >= _HISTORY_LAG_THRESHOLD
         if not include_history and total - prefs_off < _CONSOLIDATION_THRESHOLD:
             return
+        # Cheap pre-check mirroring the other automatic entry points. This
+        # runs on every user turn, so during a backoff window every message
+        # past the threshold would otherwise schedule a task whose snapshot
+        # takes the per-file lock (the same one appends contend on) and reads
+        # the transcript, only to be refused by the gate inside _consolidate().
+        # retry_eligible costs one metadata-line read and no transcript read;
+        # the inner gate remains the enforcement backstop.
+        if not self.retry_eligible(key, message_count=total):
+            return
         if include_history:
             logger.info(
-                "Consolidating history for %s on backlog (%d unconsolidated >= %d); "
-                "the idle trigger has not fired for this session",
+                "Consolidating history for %s on backlog (%d unconsolidated >= %d)",
                 key,
                 history_lag,
                 _HISTORY_LAG_THRESHOLD,
@@ -3222,99 +6221,63 @@ class HistoryConsolidator:
             wrote_history: bool = include_history,
         ) -> None:
             self._tasks.discard(fut)
-            if fut.cancelled():
-                return
-            if exc := fut.exception():
-                self._defer_auto_consolidation(
-                    k, ConsolidationOutcome("failed", detail=str(exc) or exc.__class__.__name__)
-                )
-                return
-            outcome = fut.result()
-            if outcome.failed or outcome.deferred:
-                self._defer_auto_consolidation(k, outcome)
-                return
-            self._clear_auto_retry(k)
-            if outcome.status in {"consolidated", "skipped"}:
+            if not fut.cancelled() and fut.exception() is None:
+                outcome = fut.result()
+                if not outcome.completed:
+                    return
                 self._prefs_offset[k] = off
-                if wrote_history and outcome.status == "consolidated" and outcome.complete:
-                    # Stamp the idle path's clock too, so a lag-triggered write
-                    # is not immediately followed by an idle-triggered one over
-                    # the few messages that arrived since.
+                if wrote_history and outcome.complete:
                     self._history_consolidated[k] = _time.time()
 
         t.add_done_callback(_on_done)
 
-    def _schedule_auto_history_consolidation(self, key: str, started_at: float) -> None:
-        """Start one retryable history pass and persist its terminal retry state."""
-        self._running.add(key)
-        task = asyncio.create_task(self._consolidate(key, include_history=True))
-        self._tasks.add(task)
-
-        def _on_done(
-            future: asyncio.Task,  # type: ignore[type-arg]
-            session_key: str = key,
-            started: float = started_at,
-        ) -> None:
-            self._tasks.discard(future)
-            if future.cancelled():
-                return
-            if exc := future.exception():
-                self._defer_auto_consolidation(
-                    session_key,
-                    ConsolidationOutcome("failed", detail=str(exc) or exc.__class__.__name__),
-                )
-                return
-            outcome = future.result()
-            if outcome.failed or outcome.deferred:
-                self._defer_auto_consolidation(session_key, outcome)
-                return
-            self._clear_auto_retry(session_key)
-            if outcome.status == "consolidated" and outcome.complete:
-                self._history_consolidated[session_key] = started
-
-        task.add_done_callback(_on_done)
-
     def check_idle_sessions(self) -> None:
-        """Check idle sessions and durable closed-session retries for history work."""
+        """Check all tracked sessions for idle-based history consolidation."""
         if not self._auto_consolidation_enabled:
             return
         now = _time.time()
-        scheduled: set[str] = set()
         for key, last in list(self._last_activity.items()):
+            if now - last < self._history_idle_secs:
+                continue
+            total, unconsolidated = self._log.consolidation_counts(key)
             if (
-                now - last < self._history_idle_secs
-                or self._log.unconsolidated_count(key) < 1
+                unconsolidated < 1
                 or now - self._history_consolidated.get(key, 0) < self._history_idle_secs
-                or self._is_running(key)
-                or now < self._retry_after(key)
+                or key in self._running
+                # Durable backoff, checked last so it only costs a metadata read
+                # once the cheap conditions pass. The in-memory throttle above is
+                # set only when the task ends without an exception and is lost on
+                # restart, so it alone cannot stop a repeatedly failing span from
+                # re-billing an LLM turn every tick. *total* comes from the read
+                # above, so the check adds no transcript read on the loop.
+                or not self.retry_eligible(key, now, message_count=total)
             ):
                 continue
-            self._schedule_auto_history_consolidation(key, now)
-            scheduled.add(_safe_key(key))
+            self._running.add(key)
+            captured_now = now
+            t = asyncio.create_task(self._consolidate(key, include_history=True))
+            self._tasks.add(t)
 
-        # A gateway restart clears ``_last_activity``. Closed sessions retain
-        # their retry deadline in metadata so the regular idle sweep can resume
-        # deferred maintenance rather than forgetting it until another event.
-        for session in self._log.list_sessions():
-            key = session.get("key")
-            metadata = self._log.get_metadata(key) if isinstance(key, str) else {}
-            if (
-                not isinstance(key, str)
-                or _safe_key(key) in scheduled
-                or not metadata.get("closed")
-                or self._is_running(key)
-                or self._retry_after(key) > now
-                or self._log.unconsolidated_count(key) < 1
-            ):
-                continue
-            self._schedule_auto_history_consolidation(key, now)
+            def _on_idle_done(
+                fut: asyncio.Task,  # type: ignore[type-arg]
+                k: str = key,
+                ts: float = captured_now,
+            ) -> None:
+                self._tasks.discard(fut)
+            if not fut.cancelled() and fut.exception() is None:
+                outcome = fut.result()
+                if outcome.completed and outcome.complete:
+                    self._history_consolidated[k] = ts
+
+            t.add_done_callback(_on_idle_done)
 
     def consolidate_session(self, key: str) -> None:
         """Trigger history consolidation for *key* (fire-and-forget).
 
         Used by session-end hooks (dashboard close, Slack end, idle expiry)
         and the ``kirocrew consolidate`` CLI command.  Skips if the session
-        is already being consolidated or has no unconsolidated messages.
+        is already being consolidated, has no unconsolidated messages, or is
+        inside the durable consolidation retry backoff.
 
         Safety: skill detection (_run_skill_detection) re-checks
         _session_touched_sensitive() over its window before proposing anything,
@@ -3322,11 +6285,20 @@ class HistoryConsolidator:
         """
         if not self._auto_consolidation_enabled:
             return
-        if self._is_running(key):
+        if key in self._running:
             return
-        if _time.time() < self._retry_after(key):
+        total, unconsolidated = self._log.consolidation_counts(key)
+        if unconsolidated < 1:
             return
-        if self._log.unconsolidated_count(key) < 1:
+        # This path consults no time-based throttle at all — every session expiry
+        # for the same key fires a fresh consolidation — so the durable backoff
+        # stands between a repeatedly failing span and one billed LLM turn per
+        # expiry. Checked here (as well as inside _consolidate()) so the skip is
+        # logged before a task is ever scheduled.
+        if not self.retry_eligible(key, message_count=total):
+            logger.info(
+                "consolidate_session skipped for %s: consolidation retry backoff", key
+            )
             return
         # Short-circuit sensitive sessions before scheduling a task
         messages = self._log._read_messages(key)
@@ -3348,78 +6320,52 @@ class HistoryConsolidator:
             exc = fut.exception()
             if exc is None:
                 outcome = fut.result()
-                if outcome.failed or outcome.deferred:
-                    self._defer_auto_consolidation(k, outcome)
-                    return
-                self._clear_auto_retry(k)
-                if outcome.status == "consolidated" and outcome.complete:
+                if outcome.completed and outcome.complete:
                     self._history_consolidated[k] = _time.time()
             else:
                 logger.warning("consolidate_session failed for %s: %s", k, exc)
-                self._defer_auto_consolidation(
-                    k, ConsolidationOutcome("failed", detail=str(exc) or exc.__class__.__name__)
-                )
 
         t.add_done_callback(_on_done)
 
-    def _defer_auto_consolidation(self, key: str, outcome: ConsolidationOutcome) -> None:
-        delay_s = outcome.retry_after_s or _AUTO_CONSOLIDATION_RETRY_DELAY_S
-        retry_at = _time.time() + delay_s
-        self._auto_retry_after[key] = retry_at
-        metadata = self._log.get_metadata(key)
-        try:
-            attempts = int(metadata.get(_AUTO_RETRY_ATTEMPTS_FIELD, 0) or 0) + 1
-        except (TypeError, ValueError):
-            attempts = 1
-        self._persist_retry_state(
-            key,
-            {
-                _AUTO_RETRY_AFTER_FIELD: retry_at,
-                _AUTO_RETRY_ATTEMPTS_FIELD: attempts,
-                _AUTO_RETRY_REASON_FIELD: outcome.detail[:300],
-            },
-        )
-        logger.warning(
-            "History consolidation deferred for %s after %s; next automatic attempt in %ds",
-            key,
-            outcome.describe(),
-            delay_s,
-        )
-
     async def consolidate_now(self, key: str) -> ConsolidationOutcome:
-        """Consolidate a session synchronously (blocking), reporting the outcome.
+        """Consolidate a session synchronously and report its durable result.
 
         Unlike consolidate_session() which is fire-and-forget, this awaits
-        completion. Used by the CLI command, which needs to distinguish a real
-        consolidation from a skip and from a failure — all three used to return
-        ``None`` and print as success.
+        completion. Used by the CLI command.
 
-        Safety: defense-in-depth — also checked inside _consolidate().
+        Safety: defense-in-depth — the consolidation retry backoff is also
+        checked inside _consolidate(), and _run_skill_detection() re-checks
+        the sensitive-session guard over its own window.
         """
-        offset = self._log.get_metadata(key).get("last_consolidated", 0) or 0
+        old_offset = int(self._log.get_metadata(key).get("last_consolidated", 0) or 0)
         if self._log.unconsolidated_count(key) < 1:
-            return ConsolidationOutcome("empty", old_offset=offset, new_offset=offset)
+            return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
         messages = self._log._read_messages(key)
         if _session_touched_sensitive(messages):
             logger.info("consolidate_now skipped for %s: sensitive session", key)
             return ConsolidationOutcome(
-                "skipped", detail="sensitive", old_offset=offset, new_offset=offset
+                "skipped", detail="sensitive session", old_offset=old_offset, new_offset=old_offset
             )
         return await self._consolidate(key, include_history=True)
 
-    async def _consolidate(self, key: str, include_history: bool = True) -> ConsolidationOutcome:
-        """Run LLM consolidation for a session and report what it did.
-
-        Fire-and-forget callers ignore the return; the CLI depends on it, since
-        a swallowed LLM failure and a real consolidation were otherwise
-        indistinguishable.
-        """
+    async def _consolidate(
+        self, key: str, include_history: bool = True
+    ) -> ConsolidationOutcome:
+        """Run LLM consolidation and return an outcome without hiding failures."""
         # Capture the gateway loop so the thread-offloaded _process_auto_skills
         # can schedule the async dedupe judge back onto it.
         self._event_loop = asyncio.get_running_loop()
-        defer_token = _direct_consolidation_defer.set(None)
-        old_offset = self._log.get_metadata(key).get("last_consolidated", 0) or 0
-        self._last_llm_error = ""
+        # Flipped once the prompt actually reaches the provider, which is what
+        # makes a failure expensive: everything before that point is free to
+        # retry, everything after costs a turn that produced nothing durable.
+        billed = False
+        total = 0
+        generation_at_snapshot = 0
+        old_offset = int(self._log.get_metadata(key).get("last_consolidated", 0) or 0)
+        # The span identity any failure charge is stamped with. Rebuilt from the
+        # snapshot below; the zero value only ever reaches a charge if the snapshot
+        # itself raised, and that path is not billed.
+        attempted = AttemptedSpan(0, 0, 0)
         try:
             # Atomically snapshot the unconsolidated tail, the total message
             # count (the absolute offset handed to mark_consolidated below), and
@@ -3438,10 +6384,51 @@ class HistoryConsolidator:
             ) = await asyncio.to_thread(self._log.snapshot_for_consolidation, key)
             if not unconsolidated:
                 return ConsolidationOutcome("empty", old_offset=old_offset, new_offset=old_offset)
-
+            # Retry-eligibility choke point: every entry point funnels through
+            # this function, so a span inside its durable backoff is refused
+            # here — before anything that can bill a provider turn — even if a
+            # caller carries no pre-check of its own (a future entry point, or
+            # a pre-check that raced the backoff being recorded). Callers keep
+            # their cheaper pre-checks as scheduling short-circuits and UX (the
+            # idle sweep's per-tick skip, maybe_consolidate's per-turn skip,
+            # the dashboard trigger's 429); this gate is the enforcement that
+            # holds when a new entry point forgets one. The count comes
+            # from the atomic snapshot above — the same consistent read the
+            # rest of this function uses — and retry_eligible costs one
+            # metadata-line read, so no second transcript read lands on the
+            # event loop. The refusal returns a sentinel rather than raising:
+            # the finally block still releases self._running and the callers'
+            # done-callbacks run normally (so the key is never stranded), while
+            # the sentinel lets those callbacks tell a refusal from a completed
+            # pass and leave their bookkeeping untouched.
+            if not self.retry_eligible(key, message_count=total):
+                logger.info(
+                    "_consolidate refused for %s: consolidation retry backoff", key
+                )
+                return ConsolidationOutcome(
+                    "skipped",
+                    detail="consolidation retry backoff",
+                    old_offset=old_offset,
+                    new_offset=old_offset,
+                )
+            # Freeze the whole span identity from that one snapshot. The offset is
+            # derived rather than returned because the snapshot slices at it
+            # (``messages[offset:]``), so the subtraction is exact and comes from
+            # the same lock hold — no second read that a concurrent rotation could
+            # land between. A failure charge stamped with these values describes
+            # what the turn attempted even if the file changed underneath it.
+            attempted = AttemptedSpan(
+                total=total,
+                generation=generation_at_snapshot,
+                offset=total - len(unconsolidated),
+            )
+            old_offset = attempted.offset
             if include_history:
                 chunk = _consolidation_chunk(unconsolidated)
                 if not chunk:
+                    await self._note_environment_failure(
+                        key, "one transcript message exceeds the automatic consolidation window"
+                    )
                     return ConsolidationOutcome(
                         "failed",
                         detail="one transcript message exceeds the automatic consolidation window",
@@ -3500,11 +6487,34 @@ class HistoryConsolidator:
             # Structured memory extraction (when vector store is available)
             has_vector = self._vector_store is not None
             if has_vector and self._vector_store is not None:
-                current_semantic = self._vector_store.get_all_semantic()
+                # Offload: the fetch serializes on the store's _db_lock (#1947),
+                # and this coroutine runs on the gateway event loop — a worker
+                # holding the lock (backfill's FAISS rebuild, reconcile's bulk
+                # UPDATEs) would otherwise block the whole loop here.
+                current_semantic = await asyncio.to_thread(self._vector_store.get_all_semantic)
+
+                def _prompt_value(e: dict) -> object:
+                    # A lesson row stores a mapping; the consolidation model
+                    # should read the rule prose, not a JSON envelope whose
+                    # field names dilute the instruction it is weighing.
+                    if str(e.get("key", "")).startswith("lesson."):
+                        from kiro_crew.vector_memory import _lesson_display_text
+
+                        try:
+                            decoded = json.loads(e["value_json"])
+                        except Exception:
+                            return e["value_json"]
+                        return _lesson_display_text(decoded) or e["value_json"]
+                    return e["value_json"]
+
                 semantic_json = (
                     json.dumps(
                         [
-                            {k: e[k] for k in ("key", "value_json", "confidence")}
+                            {
+                                "key": e["key"],
+                                "value_json": _prompt_value(e),
+                                "confidence": e["confidence"],
+                            }
                             for e in current_semantic
                         ],
                         indent=1,
@@ -3541,15 +6551,22 @@ class HistoryConsolidator:
             # Markdown memory (backward compat when not migrated)
             if not self._migrated:
                 keys.append(
-                    '"preferences_update": The COMPLETE updated preferences file. '
-                    "Merge duplicates, keep only newest if contradicted, remove stale "
-                    "one-off observations. Keep '# User Preferences' header. "
-                    "Return existing content exactly if nothing changed."
+                    '"preferences_update": The COMPLETE updated preferences file, '
+                    "included ONLY if the file needs changes. Merge duplicates, keep "
+                    "only newest if contradicted, remove stale one-off observations. "
+                    "Keep '# User Preferences' header. If nothing changed, OMIT this "
+                    "key entirely — never echo the file back and never answer with a "
+                    "placeholder word like 'unchanged': the value overwrites the file, "
+                    "so when present it must be the full file body."
                 )
                 keys.append(
-                    '"projects_update": The COMPLETE updated projects file. '
-                    "Only active projects, remove stale entries, update facts. "
-                    "Keep '# Active Projects' header. Return existing if unchanged."
+                    '"projects_update": The COMPLETE updated projects file, included '
+                    "ONLY if the file needs changes. Only active projects, remove "
+                    "stale entries, update facts. Keep '# Active Projects' header. "
+                    "If nothing changed, OMIT this key entirely — never echo the file "
+                    "back and never answer with a placeholder word like 'unchanged': "
+                    "the value overwrites the file, so when present it must be the "
+                    "full file body."
                 )
 
             if include_history:
@@ -3576,14 +6593,6 @@ class HistoryConsolidator:
                 "You are a memory consolidation agent. Process this conversation "
                 f"and return a JSON object with these keys:\n\n{numbered}",
             ]
-            previous_entry = meta.get("consolidation_last_history_entry", "")
-            if include_history and isinstance(previous_entry, str) and previous_entry.strip():
-                prompt_parts.append(
-                    "\n\n## Previous History Entry For This Session\n"
-                    + previous_entry.strip()
-                    + "\n\nDo not repeat facts from that entry unless this conversation "
-                    "changes their outcome. Record only the new decision, result, or blocker."
-                )
             if has_vector:
                 prompt_parts.append(f"\n\n## Current Semantic Memory\n{semantic_json}")
             if not self._migrated:
@@ -3593,20 +6602,44 @@ class HistoryConsolidator:
             prompt_parts.append("\n\nRespond with ONLY valid JSON, no markdown fences.")
             prompt = "".join(prompt_parts)
 
-            result = await self._call_llm(prompt)
+            try:
+                result = await self._call_llm(prompt)
+            except _ConsolidationNotDispatched as exc:
+                # Nothing was sent, so nothing was billed. Charging this to the
+                # attempt cap would let a handful of environment failures abandon
+                # the span — writing the durable marker over messages no LLM has
+                # ever read, which is the exact false-abandonment this accounting
+                # exists to prevent. Arm the backoff only, so a broken host retries
+                # on a widening interval instead of on every 60s tick.
+                if include_history:
+                    if isinstance(exc, _ConsolidationLaneUnavailable):
+                        await self._note_environment_failure(
+                            key,
+                            str(exc),
+                            base_secs=exc.retry_after_s,
+                            max_secs=exc.retry_after_s,
+                        )
+                    else:
+                        await self._note_environment_failure(key, str(exc))
+                return ConsolidationOutcome(
+                    "failed", detail=str(exc), old_offset=old_offset, new_offset=old_offset
+                )
+            billed = True
             if not result:
-                deferred = _direct_consolidation_defer.get()
-                if deferred is not None:
-                    return ConsolidationOutcome(
-                        "deferred",
-                        detail=str(deferred),
-                        old_offset=old_offset,
-                        new_offset=old_offset,
-                        retry_after_s=deferred.retry_after_s,
+                failure_detail = self._last_llm_error or "empty LLM result"
+                # The turn reached the provider and produced nothing usable, so it
+                # was spent while the marker below stays unwritten. Returning
+                # silently would look like success to the done-callbacks, setting
+                # the in-memory throttle while the durable count still says
+                # unconsolidated: the span re-bills a full turn every idle window,
+                # and immediately after every restart. Charge the attempt.
+                if include_history:
+                    await self._note_failed_attempt(
+                        key, attempted, failure_detail
                     )
                 return ConsolidationOutcome(
                     "failed",
-                    detail=self._last_llm_error or "LLM returned no usable result",
+                    detail=failure_detail,
                     old_offset=old_offset,
                     new_offset=old_offset,
                 )
@@ -3618,11 +6651,6 @@ class HistoryConsolidator:
                 # asyncio.create_task). Running it inline would let cross-process
                 # lock contention stall the whole gateway loop.
                 await run_in_embed_pool(memory.append_history, entry)
-                await asyncio.to_thread(
-                    self._log.update_metadata,
-                    key,
-                    {"consolidation_last_history_entry": entry.strip()},
-                )
                 logger.info("Consolidated %d messages for %s", len(chunk), key)
 
             # Structured memory writes (Phase 2/3). Offloaded to a worker thread:
@@ -3633,15 +6661,60 @@ class HistoryConsolidator:
             if self._vector_store:
                 await run_in_embed_pool(self._write_structured_memory, result, key)
 
-            # Markdown writes (backward compat — skip if migrated)
+            # Markdown writes (backward compat — skip if migrated). Each value
+            # replaces the whole file, so a non-file answer (e.g. the literal
+            # word "unchanged") must be discarded, not written: once written it
+            # re-enters the next prompt as the file's current content and primes
+            # every later pass to repeat it (see _is_plausible_memory_file).
             if not self._migrated:
                 if prefs := result.get("preferences_update"):
-                    if prefs.strip() != current_prefs.strip():
-                        memory.write_preferences(prefs)
+                    if not _is_plausible_memory_file(prefs, "# User Preferences"):
+                        logger.warning(
+                            "Discarding implausible preferences_update from "
+                            "consolidation (missing '# User Preferences' header "
+                            "or placeholder body; %d chars)",
+                            len(prefs),
+                        )
+                    elif prefs.strip() != current_prefs.strip():
+                        # Offloaded like append_history above (blocking file
+                        # I/O on the event loop thread). expected_baseline is
+                        # the compare-and-swap guard: this whole-file result
+                        # was merged from current_prefs, read BEFORE the
+                        # minutes-long LLM call — if a dashboard Save landed
+                        # in that window, writing would silently revert it,
+                        # so the store skips the stale write instead.
+                        wrote = await run_in_embed_pool(
+                            lambda: memory.write_preferences(
+                                prefs, expected_baseline=current_prefs
+                            )
+                        )
+                        if not wrote:
+                            logger.info(
+                                "Consolidated preferences for %s discarded: file "
+                                "changed during consolidation",
+                                key,
+                            )
 
                 if projects := result.get("projects_update"):
-                    if projects.strip() != current_projects.strip():
-                        memory.write_projects(projects)
+                    if not _is_plausible_memory_file(projects, "# Active Projects"):
+                        logger.warning(
+                            "Discarding implausible projects_update from "
+                            "consolidation (missing '# Active Projects' header "
+                            "or placeholder body; %d chars)",
+                            len(projects),
+                        )
+                    elif projects.strip() != current_projects.strip():
+                        wrote = await run_in_embed_pool(
+                            lambda: memory.write_projects(
+                                projects, expected_baseline=current_projects
+                            )
+                        )
+                        if not wrote:
+                            logger.info(
+                                "Consolidated projects for %s discarded: file "
+                                "changed during consolidation",
+                                key,
+                            )
 
             # Lesson extraction: _save_lessons calls write_lesson which embeds
             # each rule (+ up to 5 lazy backfills) via blocking urllib to Ollama.
@@ -3699,31 +6772,28 @@ class HistoryConsolidator:
                     processed_offset,
                     generation_at_snapshot,
                 )
-                # Report the offset that was actually committed, not the one we
-                # asked for: mark_consolidated resets to 0 when a rotation fired
-                # between snapshot and write, and a caller told "consolidated
-                # 0 → 6724" when the file says 0 is exactly the false report
-                # this outcome type exists to prevent.
-                committed = self._log.get_metadata(key).get("last_consolidated", 0) or 0
-                return ConsolidationOutcome(
-                    "consolidated",
-                    old_offset=old_offset,
-                    new_offset=committed,
-                    complete=complete and committed == total,
-                )
-            return ConsolidationOutcome(
-                "skipped",
-                detail="preferences/projects pass only, history not requested",
-                old_offset=old_offset,
-                new_offset=old_offset,
-            )
 
         except Exception:
             logger.exception("Consolidation failed for %s", key)
+            # Anything raised between the LLM call and mark_consolidated (memory
+            # writes, lesson writes, the marker write itself) re-raises, so the
+            # idle sweep's done-callback never sets its throttle and all of its
+            # skip conditions are false again on the next 60s tick. Charging the
+            # attempt here is what converts that tight loop into backoff.
+            if billed and include_history:
+                await self._note_failed_attempt(
+                    key, attempted, "exception after the LLM call"
+                )
             raise
         finally:
-            _direct_consolidation_defer.reset(defer_token)
             self._running.discard(key)
+        new_offset = int(self._log.get_metadata(key).get("last_consolidated", 0) or 0)
+        return ConsolidationOutcome(
+            "consolidated",
+            old_offset=old_offset,
+            new_offset=new_offset,
+            complete=complete and new_offset == total,
+        )
 
     async def _run_skill_detection(self, key: str) -> None:
         """Detect a reusable skill from the FULL session (bounded window).
@@ -3744,6 +6814,17 @@ class HistoryConsolidator:
         been appended since the last pass, yet still forces a fresh pass after a
         transcript rotation (which swaps the window's content); genuine repeats
         are still caught by the dedupe verdict in ``_process_auto_skills``.
+
+        The prompt gates on RECURRENCE, not effort. A session can be long,
+        difficult, and rich in tool calls while still being one-off — a single
+        bug's fix, a one-time audit of one component, a probe answering a
+        question that is now answered — and the tool-call floor
+        (``auto_min_tool_calls``) cannot tell those apart from a repeatable
+        method. So the prompt makes the model name the future session and the
+        DIFFERENT target that would reuse the procedure, and return null when
+        the only honest answer reuses this session's own artifact. It also
+        prefers null under uncertainty: an unreusable candidate is not free,
+        because it spends the human's review attention on every later proposal.
         """
         if self._skills_loader is None:
             return
@@ -3786,24 +6867,37 @@ class HistoryConsolidator:
             )
         skill_keys = [
             '"new_skill": Object or null. Return an object ONLY if this '
-            "session contained a non-trivial reusable multi-step procedure "
-            "that future sessions would benefit from (e.g. debugging a "
-            "specific class of error, running a multi-command sequence, "
-            "a research synthesis flow). The procedure may be demonstrated by "
-            "only PART of the excerpt below — you do NOT need to cover the whole "
-            "session, just capture the one reusable procedure it contains. Shape: "
+            "session demonstrated a procedure that will RECUR — one a future "
+            "session, working on a DIFFERENT target, would run again "
+            "substantially unchanged (e.g. a repeatable debugging method for a "
+            "class of error, a fixed command/API sequence, a verification "
+            "technique). The procedure may be demonstrated by only PART of the "
+            "excerpt below — you do NOT need to cover the whole session. "
+            "Shape: "
             '{"slug": "<kebab-case-4-to-60-chars>", '
             '"description": "<=150 chars, starts with verb>", '
             '"triggers": "<3-8 comma-separated keywords/phrases>", '
             '"procedure_md": "<concise markdown body with '
             "## When to use / ## Steps / ## Gotchas sections, "
             '<=8000 chars>"' + scripts_field + "}. "
-            "Return null if the session was trivial, a single-shot answer, "
-            "a one-off failure with no reusable takeaway, or involved "
-            "sensitive paths. When a session plausibly contains a procedure "
-            "a future session could reuse, lean toward returning it — every "
-            "candidate is staged for human approval before it can activate, "
-            "so a borderline proposal is cheap while a miss is lost for good. "
+            "## The recurrence test (apply BEFORE returning an object)\n"
+            "Name the future session that would load this skill and the "
+            "DIFFERENT target it would run against. If the only honest answer "
+            "reuses this session's specific artifact — this bug, this file, "
+            "this component, this one question — the procedure does not recur "
+            "and you MUST return null. Effort is not evidence of recurrence: a "
+            "long, many-step, genuinely difficult session is still one-off if "
+            "its steps were chosen for one target.\n"
+            "Return null for: a task done once and now finished (a specific "
+            "bug's fix, a one-time audit/trace of one component, a migration, "
+            "a probe run to answer a question that is now answered); a design "
+            "or planning discussion; a narrative of what happened in this "
+            "session; a procedure whose steps only make sense against the "
+            "exact artifact at hand; a trivial or single-shot answer; a "
+            "one-off failure with no reusable takeaway; anything touching "
+            "sensitive paths. Prefer null when uncertain — an unreusable "
+            "candidate costs the user review effort on every future proposal, "
+            "so silence is cheaper than a plausible-looking one-off. "
             "Do NOT include absolute paths, credentials, tokens, or user PII "
             "in the procedure body."
         ]
@@ -3828,13 +6922,29 @@ class HistoryConsolidator:
             + conversation
             + "\n\nRespond with ONLY valid JSON, no markdown fences."
         )
-        result = await self._call_llm(prompt)
+        try:
+            result = await self._call_llm(prompt)
+        except _ConsolidationNotDispatched:
+            # Skill detection is best-effort and owns no retry accounting, so an
+            # unreachable provider is simply no detection this pass. The marker
+            # below is still recorded, matching the existing failed-turn path.
+            result = None
         # Record the (generation, count) marker regardless of outcome so an
         # unchanged session isn't re-evaluated on every subsequent
         # consolidation, but a rotation still forces a fresh pass.
         self._last_skillgen_marker[key] = marker
         if not result:
             return
+        # Log the verdict, not just the proposals. The prompt's default is null,
+        # so silence is the common outcome, and the staging log in
+        # ``_process_auto_skills`` only fires when a candidate is produced --
+        # which would leave the queue showing the false-POSITIVE rate while the
+        # false-negative rate had no signal at all.
+        logger.debug(
+            "Skill detection verdict for %s: %s",
+            key,
+            "candidate proposed" if result.get("new_skill") else "no recurring procedure",
+        )
         # _event_loop was captured by our caller (_consolidate) so the
         # thread-offloaded dedupe judge can marshal back onto the gateway loop.
         await asyncio.to_thread(self._process_auto_skills, result, key)
@@ -3904,6 +7014,8 @@ class HistoryConsolidator:
         if isinstance(semantic_items, list):
             written = 0
             deleted = 0
+            skipped = 0
+            refused = 0
             for item in semantic_items[:_MAX_SEMANTIC_PER_CONSOLIDATION]:
                 if not isinstance(item, dict) or "key" not in item:
                     continue
@@ -3912,20 +7024,43 @@ class HistoryConsolidator:
                     if self._vector_store.delete_semantic(item["key"], source):
                         deleted += 1
                     continue
+                if "value" not in item or item["value"] is None:
+                    # Counted and logged here because this path returns before set_semantic, so
+                    # the VALUE_EMPTY reject event never fires for the omission that motivated it.
+                    skipped += 1
+                    logger.warning(
+                        "Semantic consolidation skipped %r: item carries no value", item["key"]
+                    )
+                    continue
                 conf = float(item.get("confidence", 0.5))
                 # Confidence 1.0 means user explicitly stated it — escalate source
                 # so it can overwrite previous user_explicit entries
                 item_source = "user_explicit" if conf >= 1.0 else source
                 err = self._vector_store.set_semantic(
                     key=item["key"],
-                    value=item.get("value"),
+                    value=item["value"],
                     confidence=conf,
                     source=item_source,
                 )
                 if err is None:
                     written += 1
-            if written or deleted:
-                logger.info("Semantic consolidation: %d written, %d deleted", written, deleted)
+                else:
+                    # Counted apart from `skipped`: several reject causes reach here and only
+                    # VALUE_EMPTY is a missing value, so a shared label names the wrong cause.
+                    reject_code, _reason = err
+                    refused += 1
+                    logger.warning(
+                        "Semantic consolidation refused %r: %s", item["key"], reject_code.value
+                    )
+            if written or deleted or skipped or refused:
+                logger.info(
+                    "Semantic consolidation: %d written, %d deleted, %d skipped (no value), "
+                    "%d refused",
+                    written,
+                    deleted,
+                    skipped,
+                    refused,
+                )
 
         # Episodic entries
         episodic_items = result.get("episodic")
@@ -4020,34 +7155,24 @@ class HistoryConsolidator:
         if not self._sessions:
             return ""
         try:
-            client, _new, _resumed = await self._sessions.get_or_create(
-                BACKGROUND_KEY, agent="kirocrew-lite"
-            )
-            text = await stream_and_collect(
-                client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
-            )
+            async with background_turn(
+                self._sessions, task="skill_dedupe", agent="kirocrew-lite"
+            ) as client:
+                text = await stream_and_collect(
+                    client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
+                )
             return text or ""
         except Exception:
             logger.debug("Skill dedupe judge failed", exc_info=True)
             return ""
-        finally:
-            # get_or_create ACQUIRES the per-session semaphore — the caller MUST
-            # release it (mirror _call_llm), else the shared _bg session is held
-            # forever and the next consolidation turn deadlocks waiting for it.
-            try:
-                self._sessions.release(BACKGROUND_KEY)
-                await self._sessions.recycle_background()
-            except Exception:
-                logger.debug("Skill dedupe judge session release failed", exc_info=True)
 
     async def _merge_skill_update(
         self, live_body: str, description: str, triggers: str, procedure_md: str
     ) -> "str | None":
         """Merge an existing live skill body with a new candidate into ONE
         updated markdown body — a single text turn on the shared background
-        session. Mirrors ``_dedupe_judge`` exactly (get_or_create / REJECT_ALL /
-        finally-release + recycle). Fail-open (returns ``None`` on any error) so
-        the caller can fall back to a plain replacement proposal."""
+        session. Mirrors ``_dedupe_judge`` exactly. Fail-open (returns ``None`` on
+        any error) so the caller can fall back to a plain replacement proposal."""
         if not self._sessions:
             return None
         prompt = (
@@ -4064,25 +7189,16 @@ class HistoryConsolidator:
             f"NEW requirement — procedure:\n{procedure_md}\n"
         )
         try:
-            client, _new, _resumed = await self._sessions.get_or_create(
-                BACKGROUND_KEY, agent="kirocrew-lite"
-            )
-            text = await stream_and_collect(
-                client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
-            )
+            async with background_turn(
+                self._sessions, task="skill_merge", agent="kirocrew-lite"
+            ) as client:
+                text = await stream_and_collect(
+                    client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
+                )
             return text or None
         except Exception:
             logger.debug("Skill update merge failed", exc_info=True)
             return None
-        finally:
-            # get_or_create ACQUIRES the per-session semaphore — the caller MUST
-            # release it (mirror _dedupe_judge), else the shared _bg session is
-            # held forever and the next consolidation turn deadlocks.
-            try:
-                self._sessions.release(BACKGROUND_KEY)
-                await self._sessions.recycle_background()
-            except Exception:
-                logger.debug("Skill update merge session release failed", exc_info=True)
 
     def _stage_skill_update(
         self,
@@ -4531,61 +7647,61 @@ class HistoryConsolidator:
                 )
 
     async def _call_llm(self, prompt: str) -> dict | None:
-        """Call LLM for consolidation via a dedicated consolidation session.
+        """Call LLM for consolidation via a dedicated session.
 
-        Returns parsed JSON dict or None on failure.
+        Returns the parsed JSON dict, or ``None`` when the turn reached the
+        provider but produced nothing usable (a failed or unparsable answer).
+
+        Raises :class:`_ConsolidationNotDispatched` when the prompt never reached
+        the provider at all — no session manager, or the background session could
+        not be acquired because kiro-cli is missing, not logged in, or failing to
+        start. That case is signalled separately rather than folded into ``None``
+        because the two cost different things: a spent turn costs money and must
+        consume the caller's retry budget, while a prompt that was never sent costs
+        nothing and must not, or a broken host would abandon spans it never read.
+        An exception (rather than a flag beside the result) is used so a caller
+        cannot silently drop the distinction.
+
+        Once ``stream_and_collect_json`` is entered the prompt counts as sent: a
+        failure inside it may still have been billed, so it returns ``None`` and is
+        charged rather than risk an unbounded retry loop over real spend.
         """
+        self._last_llm_error = ""
         if self._consolidation_endpoint:
             return await self._call_direct_endpoint(prompt)
-
         if not self._sessions:
             logger.warning("LLM consolidation skipped — no session manager")
-            return None
+            raise _ConsolidationNotDispatched("no session manager")
 
-        # A DEDICATED key, not BACKGROUND_KEY: get_or_create only binds the
-        # agent identity at cold-start, and the shared ``_bg`` session is
-        # cold-started once at gateway startup as BACKGROUND_AGENT
-        # (kirocrew-lite) — so under ``_bg`` the kirocrew-consolidate identity
-        # below never reached the provider factory and consolidation kept
-        # riding lite's small-context routing (verified 2026-08-11: the
-        # rerouting change produced zero factory traffic under the new
-        # identity). An own key also stops consolidation's minutes-long turn
-        # from queueing behind — or blocking — ``_bg``'s subsecond micro-jobs.
-        session_key = _CONSOLIDATE_SESSION_KEY
-        # Timing instrumentation: measure both the wait to acquire the
-        # consolidation session and the LLM turn itself. Logged at DEBUG:
+        # The key must be unique: a session binds its agent at cold start, and
+        # the shared background key is already initialized as kirocrew-lite.
+        # It also prevents long consolidation turns from queueing behind short
+        # title and metadata jobs.
+        # Timing instrumentation measures the dedicated-session wait and turn.
         # silent in normal operation, surfaced only when log_level is raised
         # to investigate a consolidation stall.
         t_start = _time.monotonic()
-        try:
-            # kirocrew-consolidate, NOT kirocrew-lite: consolidation feeds an
-            # entire session tail into one prompt, a payload class of its own.
-            # On the shared lite identity it inherited lite's cheap small-
-            # context routing and every attempt was rejected as oversized
-            # (observed 2026-08-11: 4/4 failures on a 32k lane while lite's
-            # titles succeeded). The dedicated identity lets the engine map
-            # route consolidation to a large-context seat by itself.
-            client, _is_new, _resumed = await self._sessions.get_or_create(
-                session_key, agent=self._consolidation_agent
-            )
-            # Reset the conversation before every reused turn: each
-            # consolidation is self-contained (the prompt carries the whole
-            # tail), so a prior turn's transcript adds only input-token cost —
-            # and unbounded, it re-creates the oversized-rejection failure on
-            # the large lane within days (adversarial review, 2026-08-12).
-            # Done while holding the session semaphore, so no other consumer's
-            # turn can be reset mid-flight. A failed reset degrades to the
-            # accumulating behavior for one turn, so it warns rather than
-            # aborts.
-            if not _is_new and hasattr(client, "new_conversation"):
-                try:
-                    await client.new_conversation()
-                except Exception:
-                    logger.warning(
-                        "Consolidation session reset failed — this turn reuses "
-                        "the prior transcript",
-                        exc_info=True,
+        async with contextlib.AsyncExitStack() as stack:
+            try:
+                client = await stack.enter_async_context(
+                    background_turn(
+                        self._sessions,
+                        task="consolidation",
+                        agent=self._consolidation_agent,
+                        session_key=_CONSOLIDATE_SESSION_KEY,
+                        reset_conversation=True,
                     )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Consolidation could not acquire the background session "
+                    "after %.1fs — nothing was sent",
+                    _time.monotonic() - t_start,
+                    exc_info=True,
+                )
+                raise _ConsolidationNotDispatched(
+                    "background session unavailable"
+                ) from exc
             t_acquired = _time.monotonic()
             wait_s = t_acquired - t_start
             # Reject all tools: this is a text/JSON-only generation turn. kiro
@@ -4600,6 +7716,7 @@ class HistoryConsolidator:
                     prompt,
                     approval_policy=ToolApprovalPolicy.REJECT_ALL,
                     retry_transient=False,
+                    model_fallback=True,
                 )
             )
             try:
@@ -4616,7 +7733,8 @@ class HistoryConsolidator:
                 )
                 try:
                     await self._sessions.cancel_current(
-                        session_key, wait_ack_timeout=_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S
+                        _CONSOLIDATE_SESSION_KEY,
+                        wait_ack_timeout=_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S,
                     )
                 except Exception:
                     logger.warning("Consolidation turn cancel failed", exc_info=True)
@@ -4629,17 +7747,21 @@ class HistoryConsolidator:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await turn_task
                 except asyncio.CancelledError:
-                    # ``shield`` lets a cancellation from the dedicated turn
-                    # arrive here without cancelling this maintenance task.
-                    # Preserve an external cancellation of the consolidator.
                     if not turn_task.cancelled():
                         raise
                 except Exception:
                     pass
                 try:
-                    await self._sessions.remove(session_key)
+                    await self._sessions.remove(_CONSOLIDATE_SESSION_KEY)
                 except Exception:
                     logger.warning("Consolidation session retirement failed", exc_info=True)
+                return None
+            except Exception:
+                logger.warning(
+                    "LLM consolidation turn failed after %.1fs",
+                    _time.monotonic() - t_start,
+                    exc_info=True,
+                )
                 return None
             turn_s = _time.monotonic() - t_acquired
             logger.debug(
@@ -4650,50 +7772,23 @@ class HistoryConsolidator:
                 result is not None,
             )
             return result
-        except Exception as exc:
-            # Keep the reason, not just the log line. This exception is
-            # swallowed so one bad session cannot abort a batch, which is right
-            # — but it left every caller unable to tell a failure from a success,
-            # and the CLI printed "done" for both. ``_consolidate`` reads this to
-            # build a truthful ConsolidationOutcome.
-            detail = str(exc).strip() or exc.__class__.__name__
-            detail, _ = redact_exfiltration_urls(detail)
-            detail, _ = redact_credentials(detail)
-            self._last_llm_error = detail[:300]
-            logger.warning(
-                "LLM consolidation call failed after %.1fs",
-                _time.monotonic() - t_start,
-                exc_info=True,
-            )
-            return None
-        finally:
-            # Release ONLY — no recycle_background() here. That call was the
-            # _bg session's bounding mechanism from when consolidation rode
-            # the _bg key; after the move to _consolidate it bounded nothing
-            # for this session while being able to shut down _bg mid-turn
-            # under a bystander consumer (dedupe judge, skill merge, titles),
-            # since this caller no longer holds _bg's semaphore. _bg's own
-            # consumers recycle it after their turns; _consolidate is bounded
-            # by the per-turn new_conversation() reset above plus its
-            # stateless key (no session_map persistence).
-            self._sessions.release(session_key)
+        # Reached only if the exit stack suppresses an exception. The prompt was
+        # already sent by then, so the turn may have been billed: report it as a
+        # spent-but-unusable result rather than a non-dispatch, which would hand
+        # the caller a free retry it has not earned.
+        return None
 
     async def _call_direct_endpoint(self, prompt: str) -> dict | None:
-        """Run one configured local-router request without a coding-agent session."""
+        """Run one configured local-router request without an ACP session."""
         if not self._consolidation_model:
             self._last_llm_error = (
-                "direct consolidation endpoint requires " "KIROCREW_CONSOLIDATION_MODEL"
+                "direct consolidation endpoint requires KIROCREW_CONSOLIDATION_MODEL"
             )
             logger.warning("%s", self._last_llm_error)
             return None
         if self._direct_request_lock.locked():
-            deferred = _DirectConsolidationDeferred(
-                "another local consolidation is using the fleet lane",
-                _AUTO_CONSOLIDATION_BUSY_RETRY_DELAY_S,
-            )
-            _direct_consolidation_defer.set(deferred)
-            self._last_llm_error = str(deferred)
-            logger.info("Direct consolidation deferred: %s", deferred)
+            self._last_llm_error = "another direct consolidation request is already in progress"
+            logger.info("Direct consolidation not admitted: %s", self._last_llm_error)
             return None
         endpoint = f"{self._consolidation_endpoint}/v1/messages"
         try:
@@ -4709,19 +7804,17 @@ class HistoryConsolidator:
                     ),
                     timeout=_CONSOLIDATION_TURN_TIMEOUT_S,
                 )
-        except _DirectConsolidationDeferred as exc:
-            _direct_consolidation_defer.set(exc)
-            self._last_llm_error = str(exc)
-            logger.info("Direct consolidation deferred: %s", exc)
-            return None
         except asyncio.TimeoutError:
             self._last_llm_error = (
                 f"consolidation endpoint timed out after {_CONSOLIDATION_TURN_TIMEOUT_S:.0f}s"
             )
             logger.warning("%s", self._last_llm_error)
             return None
+        except _ConsolidationLaneUnavailable:
+            raise
         except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
-            detail = str(exc).strip() or exc.__class__.__name__
+            detail, _ = redact_credentials(str(exc).strip() or exc.__class__.__name__)
+            detail, _ = redact_exfiltration_urls(detail)
             self._last_llm_error = detail[:300]
             logger.warning("Direct consolidation endpoint failed: %s", self._last_llm_error)
             return None

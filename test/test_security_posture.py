@@ -387,13 +387,23 @@ class TestEndpoint:
         A `hasattr(handlers, ...)` check passes even if the
         `app.router.add_get("/api/security/posture", ...)` line is deleted — which
         would ship a 404 with the whole suite green.
+
+        The registration lives in the route table under ``dashboard/routes/``, so
+        both that package and ``server`` are scanned and the assertion holds
+        wherever the route sits.
         """
+        import importlib
         import inspect
 
-        from kiro_crew.dashboard import handlers, server
+        from kiro_crew.dashboard import handlers
+        from kiro_crew.dashboard import routes as routes_pkg
+        from kiro_crew.dashboard import server
 
         assert hasattr(handlers, "api_security_posture")
-        src = inspect.getsource(server)
+        src = inspect.getsource(server) + "".join(
+            inspect.getsource(importlib.import_module(f"kiro_crew.dashboard.routes.{name}"))
+            for name in routes_pkg.REGISTRAR_NAMES
+        )
         assert '"/api/security/posture"' in src
         assert "handlers.api_security_posture" in src
 
@@ -582,8 +592,11 @@ class TestOmissionDetection:
             "telegram:1": "telegram",
             "wecom:1": "wecom",
             "weixin:1": "weixin",
+            "whatsapp:1": "whatsapp",
+            "feishu:1": "feishu",
             "webex:1": "webex",
             "teams:1": "teams",
+            "imessage:1": "imessage",
             "C123:456.789": "slack",
         }
         for key, expected in probes.items():
@@ -639,7 +652,7 @@ class TestOmissionDetection:
         src = inspect.getsource(token_auth)
         for marker in (
             "hmac.new",  # HMAC-SHA256 signature
-            "bind_ip",  # IP pinning
+            "bind_peer",  # session pinning (peer-keyed: ip:<addr> / ts:… identity)
             "try_consume",  # single-use link nonce
             "MAX_SESSION_TTL_SECS",  # bounded session lifetime
             "revocation_gen",  # revocation generation
@@ -681,9 +694,23 @@ class TestRedactionSinkRegistry:
         # Wrappers that run BOTH scanners internally, so a sink using one is fully
         # covered: StreamRedactor (rolling dual-pass), redact() (the dual-pass
         # helper), redact_and_truncate() (redact-then-slice, so a credential cannot
-        # straddle the truncation boundary), and redact_via_context() (routes to
-        # CredentialPolicy.redact, whose Default delegates to security.redact).
-        dual_pass = ("StreamRedactor", "redact(", "redact_tree", "redact_and_truncate", "redact_via_context")
+        # straddle the truncation boundary), redact_via_context() (routes to
+        # CredentialPolicy.redact, whose Default delegates to security.redact), and
+        # display_safe() (redact_for_display with the exfil+credential redactor,
+        # then the mention defang).
+        dual_pass = (
+            "StreamRedactor",
+            "redact(",
+            "redact_tree",
+            "redact_and_truncate",
+            "redact_via_context",
+            "display_safe",
+            # redact_mcp_error runs redact_exfiltration_urls THEN redact_credentials
+            # (mcp_discovery.py) and then scrubs the exact configured header values
+            # the generic scanners cannot know about — strictly more than either
+            # scanner alone, so a sink using it is fully covered.
+            "redact_mcp_error",
+        )
         for label, module, detail in security_posture._REDACTION_SINKS:
             text = (pkg / module).read_text(encoding="utf-8")
             full = any(w in text for w in dual_pass) or (
@@ -714,6 +741,7 @@ class TestRedactionSinkRegistry:
             "streamredactor": "StreamRedactor",
             "redact_and_truncate": "redact_and_truncate",
             "redact_via_context": "redact_via_context",
+            "display_safe": "display_safe",
             "exfiltration-url scanning only": "redact_exfiltration_urls",
         }
         for label, module, detail in security_posture._REDACTION_SINKS:

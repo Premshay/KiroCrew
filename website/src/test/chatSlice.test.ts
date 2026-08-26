@@ -25,21 +25,28 @@ import reducer, {
   sseSubagentChunk,
   sseSubagentTool,
   sseSubagentDone,
+  sseSubagentSnapshot,
   sseToolActivity,
   sseToolResult,
   sseActivityEvent,
   sseChatMessageUpdate,
   sseContextUsage,
   toggleActivity,
+  openActivityPanel,
+  openActivityToTab,
+  switchSlot,
   resolveByApprovalId,
   sseSideResult,
   sideClose,
   appendQueuedMessage,
   editQueuedMessage,
+  reorderQueuedMessages,
   cancelQueuedMessage,
   selectSlotSubagentsActive,
   selectSlotPendingSpawnApprovals,
+  selectSlotPendingApproval,
   selectComposerBusy,
+  confirmOptimisticSend,
 } from '../store/chatSlice'
 import './mockApiClient'
 
@@ -449,6 +456,131 @@ describe('switchSlot.pending', () => {
     expect(tail.content).toBe('partial repl')
     expect(state.messages.filter(m => m.role === 'streaming')).toHaveLength(1)
   })
+  it('fulfilled keeps the existing array when the fetched history is identical', () => {
+    const bCache: ChatMessage[] = [
+      { role: 'user', content: 'question', cls: '' },
+      { role: 'assistant', content: 'the latest reply', cls: 'msg msg-a' },
+    ]
+    let state = { ...initial, activeSlot: 'A',
+      messages: [{ role: 'user' as const, content: 'A msg', cls: '' }],
+      slotMessages: { 'B': bCache } }
+    state = reducer(state, { type: 'chat/switchSlot/pending', meta: { arg: 'B', requestId: 'r1', requestStatus: 'pending' } })
+    // Positive control: pending restores the cached array BY REFERENCE, so the
+    // assertion below can tell a preserved array from a re-created one.
+    expect(state.messages).toBe(bCache)
+    state = reducer(state, {
+      type: 'chat/switchSlot/fulfilled',
+      meta: { arg: 'B', requestId: 'r1', requestStatus: 'fulfilled' },
+      payload: { key: 'B', messages: [
+        { role: 'user', content: 'question', cls: '' },
+        { role: 'assistant', content: 'the latest reply', cls: 'msg msg-a' },
+      ], running: false, stopping: false, hasMore: false, total: 2, queue: [] },
+    })
+    expect(state.messages).toBe(bCache)
+    expect(state.slotLoading).toBe(false)
+  })
+
+  it('fulfilled replaces the array when the fetched history appends a message', () => {
+    const bCache: ChatMessage[] = [
+      { role: 'user', content: 'question', cls: '' },
+      { role: 'assistant', content: 'the latest reply', cls: 'msg msg-a' },
+    ]
+    let state = { ...initial, activeSlot: 'A',
+      messages: [{ role: 'user' as const, content: 'A msg', cls: '' }],
+      slotMessages: { 'B': bCache } }
+    state = reducer(state, { type: 'chat/switchSlot/pending', meta: { arg: 'B', requestId: 'r1', requestStatus: 'pending' } })
+    state = reducer(state, {
+      type: 'chat/switchSlot/fulfilled',
+      meta: { arg: 'B', requestId: 'r1', requestStatus: 'fulfilled' },
+      payload: { key: 'B', messages: [
+        { role: 'user', content: 'question', cls: '' },
+        { role: 'assistant', content: 'the latest reply', cls: 'msg msg-a' },
+        { role: 'user', content: 'follow-up', cls: '' },
+      ], running: false, stopping: false, hasMore: false, total: 3, queue: [] },
+    })
+    expect(state.messages).not.toBe(bCache)
+    expect(state.messages).toHaveLength(3)
+    expect(state.messages[2].content).toBe('follow-up')
+  })
+
+  it('fulfilled replaces the array when a message body changed', () => {
+    const bCache: ChatMessage[] = [
+      { role: 'user', content: 'question', cls: '' },
+      { role: 'assistant', content: 'the latest reply', cls: 'msg msg-a' },
+    ]
+    let state = { ...initial, activeSlot: 'A',
+      messages: [{ role: 'user' as const, content: 'A msg', cls: '' }],
+      slotMessages: { 'B': bCache } }
+    state = reducer(state, { type: 'chat/switchSlot/pending', meta: { arg: 'B', requestId: 'r1', requestStatus: 'pending' } })
+    // Same shape, one differing body — the guard must not mask a real change.
+    state = reducer(state, {
+      type: 'chat/switchSlot/fulfilled',
+      meta: { arg: 'B', requestId: 'r1', requestStatus: 'fulfilled' },
+      payload: { key: 'B', messages: [
+        { role: 'user', content: 'question (edited)', cls: '' },
+        { role: 'assistant', content: 'the latest reply', cls: 'msg msg-a' },
+      ], running: false, stopping: false, hasMore: false, total: 2, queue: [] },
+    })
+    expect(state.messages).not.toBe(bCache)
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[0].content).toBe('question (edited)')
+  })
+
+  it('fulfilled populates messages when the slot had no cache', () => {
+    let state = { ...initial, activeSlot: 'A',
+      messages: [{ role: 'user' as const, content: 'A msg', cls: '' }] }
+    state = reducer(state, { type: 'chat/switchSlot/pending', meta: { arg: 'B', requestId: 'r1', requestStatus: 'pending' } })
+    expect(state.messages).toEqual([])
+    state = reducer(state, {
+      type: 'chat/switchSlot/fulfilled',
+      meta: { arg: 'B', requestId: 'r1', requestStatus: 'fulfilled' },
+      payload: { key: 'B', messages: [{ role: 'user', content: 'B msg', cls: '' }], running: false, stopping: false, hasMore: false, total: 1, queue: [] },
+    })
+    expect(state.messages).toHaveLength(1)
+    expect(state.messages[0].content).toBe('B msg')
+  })
+
+  it('fulfilled still appends the in-flight streaming tail past the guard', () => {
+    const bCache: ChatMessage[] = [{ role: 'user', content: 'question', cls: '' }]
+    let state = { ...initial, activeSlot: 'A',
+      messages: [{ role: 'user' as const, content: 'A msg', cls: '' }],
+      slotMessages: { 'B': bCache } }
+    state = reducer(state, { type: 'chat/switchSlot/pending', meta: { arg: 'B', requestId: 'r1', requestStatus: 'pending' } })
+    state = reducer(state, sseChatMessage({ slot: 'B', role: 'chunk', content: 'live text' }))
+    expect(state.messages[state.messages.length - 1].role).toBe('streaming')
+    // Server history is behind the live stream: the WS branch must still win.
+    state = reducer(state, {
+      type: 'chat/switchSlot/fulfilled',
+      meta: { arg: 'B', requestId: 'r1', requestStatus: 'fulfilled' },
+      payload: { key: 'B', messages: [
+        { role: 'user', content: 'question', cls: '' },
+        { role: 'assistant', content: 'older reply', cls: 'msg msg-a' },
+      ], running: true, stopping: false, hasMore: false, total: 2, queue: [] },
+    })
+    expect(state.messages).toHaveLength(3)
+    expect(state.messages[state.messages.length - 1].role).toBe('streaming')
+    expect(state.messages[state.messages.length - 1].content).toBe('live text')
+    expect(state.messages.filter(m => m.role === 'streaming')).toHaveLength(1)
+  })
+
+  it('fulfilled still adopts the stale-permission sweep past the guard', () => {
+    const bCache: ChatMessage[] = [{ role: 'permission', content: 'approve?', cls: '', meta: { tool: 'x' } }]
+    let state = { ...initial, activeSlot: 'A',
+      messages: [{ role: 'user' as const, content: 'A msg', cls: '' }],
+      slotMessages: { 'B': bCache } }
+    state = reducer(state, { type: 'chat/switchSlot/pending', meta: { arg: 'B', requestId: 'r1', requestStatus: 'pending' } })
+    expect(state.messages[0].meta?.resolved).toBeUndefined()
+    // The sweep marks the fetched row resolved, so the guard must see a
+    // difference in meta and adopt the fetched history rather than keep ours.
+    state = reducer(state, {
+      type: 'chat/switchSlot/fulfilled',
+      meta: { arg: 'B', requestId: 'r1', requestStatus: 'fulfilled' },
+      payload: { key: 'B', messages: [{ role: 'permission', content: 'approve?', cls: '', meta: { tool: 'x' } }], running: false, stopping: false, hasMore: false, total: 1, queue: [] },
+    })
+    expect(state.messages).not.toBe(bCache)
+    expect(state.messages[0].meta?.resolved).toBe('stale')
+  })
+
   it('pending restores cached messages instantly without loading', () => {
     let state = { ...initial, activeSlot: 'A',
       messages: [{ role: 'user' as const, content: 'A msg', cls: '' }],
@@ -738,6 +870,287 @@ describe('sseChatMessage', () => {
     expect(state.messages).toHaveLength(1)
     expect(state.messages[0].role).toBe('permission')
   })
+
+  it('reconciles user echo (with mid) even when assistant frames arrived first (#2845)', () => {
+    // Race condition: user sends a message, agent starts streaming before the
+    // server echoes the user frame with its mid. The reconcile uses the
+    // client-generated sendId to correlate the echo with its optimistic bubble.
+    let state = withSlot
+    // 1. Optimistic user bubble via appendMessage (like ChatPage send handler).
+    state = reducer(state, appendMessage({ role: 'user', content: 'deploy to prod', cls: '', ts: '2026-08-11T09:59:59.000000+00:00', meta: { sendId: 's-test-123' } }))
+    expect(state.messages).toHaveLength(1)
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+    expect(state.messages[0].meta?.sendId).toBe('s-test-123')
+
+    // 2. Agent starts streaming before the user echo arrives.
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'Starting deployment...' }))
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[1].role).toBe('streaming')
+
+    // 3. Server echoes the user frame WITH mid AND the same sendId.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'deploy to prod',
+      ts: '2026-08-11T10:00:00.000000+00:00', meta: { mid: 'm-user-1', sendId: 's-test-123' },
+    }))
+
+    // Should NOT duplicate the user message — still 2 messages total.
+    expect(state.messages).toHaveLength(2)
+    // The original user bubble now has the mid from the server echo.
+    expect(state.messages[0].role).toBe('user')
+    expect(state.messages[0].content).toBe('deploy to prod')
+    expect(state.messages[0].meta?.mid).toBe('m-user-1')
+    expect(state.messages[0].ts).toBe('2026-08-11T10:00:00.000000+00:00')
+    // Optimistic marker cleared after reconcile.
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('reconciles user echo even when tool frames intervene (#2845)', () => {
+    let state = withSlot
+    // 1. Optimistic user bubble via appendMessage.
+    state = reducer(state, appendMessage({ role: 'user', content: 'fix the bug', cls: '', ts: '2026-08-11T10:00:59.000000+00:00', meta: { sendId: 's-test-456' } }))
+    // 2. Tool frame arrives (agent called a tool before echo).
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'tool', content: '🔧 bash' }))
+    // 3. Streaming starts.
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'Reading...' }))
+    expect(state.messages).toHaveLength(3)
+
+    // 4. Server echo with mid and sendId.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'fix the bug',
+      ts: '2026-08-11T10:01:00.000000+00:00', meta: { mid: 'm-user-2', sendId: 's-test-456' },
+    }))
+
+    // No duplicate — still 3.
+    expect(state.messages).toHaveLength(3)
+    expect(state.messages[0].role).toBe('user')
+    expect(state.messages[0].meta?.mid).toBe('m-user-2')
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('does not reconcile a message with different sendId even if content matches (#2845)', () => {
+    let state = withSlot
+    // Optimistic bubble with one sendId.
+    state = reducer(state, appendMessage({ role: 'user', content: 'yes', cls: '', ts: '2026-08-11T10:00:00.000000+00:00', meta: { sendId: 's-mine' } }))
+
+    // A distinct channel message with same content but a DIFFERENT sendId
+    // (or no sendId) — must NOT be consumed.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'yes',
+      ts: '2026-08-11T10:00:01.000000+00:00', meta: { mid: 'm-channel', sendId: 's-other' },
+    }))
+
+    // Both messages kept — different sendIds mean different sends.
+    expect(state.messages.filter(m => m.role === 'user')).toHaveLength(2)
+    // Original optimistic bubble still has its sendId and is still optimistic.
+    expect(state.messages[0].meta?.sendId).toBe('s-mine')
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+  })
+
+  it('does not reconcile channel messages that lack sendId', () => {
+    let state = withSlot
+    // Optimistic bubble.
+    state = reducer(state, appendMessage({ role: 'user', content: 'hello', cls: '', ts: '2026-08-11T10:00:00.000000+00:00', meta: { sendId: 's-abc' } }))
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'working...' }))
+
+    // Channel message with same content but no sendId.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'hello',
+      ts: '2026-08-11T10:00:02.000000+00:00', meta: { mid: 'm-chan' },
+    }))
+
+    // Not reconciled — pushed as new.
+    expect(state.messages.filter(m => m.role === 'user')).toHaveLength(2)
+  })
+
+  it('does not reconcile into a steered user message', () => {
+    let state = withSlot
+    // A steered user message (meta.steer = true) — these have their own
+    // reconcile path and lifecycle; the regular echo must not touch them.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'steer instruction',
+      meta: { steer: true, mid: 'm-steer-1' },
+    }))
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'following steer...' }))
+    expect(state.messages).toHaveLength(2)
+
+    // A regular echo arrives with same content — should push as new, not
+    // mutate the steered bubble.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'steer instruction',
+      ts: '2026-08-11T09:04:00.000000+00:00', meta: { mid: 'm-new-user' },
+    }))
+    expect(state.messages).toHaveLength(3)
+    // The steered bubble is untouched.
+    expect(state.messages[0].meta?.steer).toBe(true)
+    expect(state.messages[0].meta?.mid).toBe('m-steer-1')
+  })
+})
+
+describe('sseChatMessage — pipelined sends reconcile (#3898)', () => {
+  const initial = reducer(undefined, { type: '@@INIT' })
+  const withSlot = { ...initial, activeSlot: 'slot-1' }
+
+  it('reconciles echo for first message when second was sent before echo arrived', () => {
+    let state = withSlot
+    // User sends message A, then message B in quick succession (pipelined).
+    state = reducer(state, appendMessage({ role: 'user', content: 'first', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-first' } }))
+    state = reducer(state, appendMessage({ role: 'user', content: 'second', cls: '', ts: '2026-08-16T10:00:01.000Z', meta: { sendId: 's-second' } }))
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+    expect(state.messages[1].meta?.optimistic).toBe(true)
+
+    // Echo for message A arrives — must find it past message B.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'first',
+      ts: '2026-08-16T10:00:00.100Z', meta: { mid: 'm-first', sendId: 's-first' },
+    }))
+
+    // Should NOT duplicate — still 2 messages.
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[0].meta?.mid).toBe('m-first')
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+    // sendId stripped after reconcile
+    expect(state.messages[0].meta?.sendId).toBeUndefined()
+    // Second message still optimistic
+    expect(state.messages[1].meta?.optimistic).toBe(true)
+    expect(state.messages[1].meta?.sendId).toBe('s-second')
+  })
+
+  it('reconciles echo for second message after first was already reconciled', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'first', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-first' } }))
+    state = reducer(state, appendMessage({ role: 'user', content: 'second', cls: '', ts: '2026-08-16T10:00:01.000Z', meta: { sendId: 's-second' } }))
+
+    // Reconcile first
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'first',
+      ts: '2026-08-16T10:00:00.100Z', meta: { mid: 'm-first', sendId: 's-first' },
+    }))
+    // Reconcile second
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'second',
+      ts: '2026-08-16T10:00:01.100Z', meta: { mid: 'm-second', sendId: 's-second' },
+    }))
+
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[0].meta?.mid).toBe('m-first')
+    expect(state.messages[1].meta?.mid).toBe('m-second')
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+    expect(state.messages[1].meta?.optimistic).toBeUndefined()
+    expect(state.messages[0].meta?.sendId).toBeUndefined()
+    expect(state.messages[1].meta?.sendId).toBeUndefined()
+  })
+
+  it('reconciles pipelined sends even with streaming frames interleaved', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'msg-a', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-a' } }))
+    // Streaming from first turn starts
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'Thinking...' }))
+    // User sends second message (new turn)
+    state = reducer(state, appendMessage({ role: 'user', content: 'msg-b', cls: '', ts: '2026-08-16T10:00:02.000Z', meta: { sendId: 's-b' } }))
+    expect(state.messages.filter(m => m.role === 'user')).toHaveLength(2)
+
+    // Echo for msg-a arrives
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'msg-a',
+      ts: '2026-08-16T10:00:00.050Z', meta: { mid: 'm-a', sendId: 's-a' },
+    }))
+
+    // Should reconcile without duplication
+    const userMsgs = state.messages.filter(m => m.role === 'user')
+    expect(userMsgs).toHaveLength(2)
+    expect(userMsgs[0].meta?.mid).toBe('m-a')
+    expect(userMsgs[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('strips sendId from meta after successful reconcile', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'hello', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-hello' } }))
+    expect(state.messages[0].meta?.sendId).toBe('s-hello')
+
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'hello',
+      ts: '2026-08-16T10:00:00.100Z', meta: { mid: 'm-hello', sendId: 's-hello' },
+    }))
+
+    // sendId stripped — it was a wire-only correlation ID
+    expect(state.messages[0].meta?.sendId).toBeUndefined()
+    expect(state.messages[0].meta?.mid).toBe('m-hello')
+  })
+
+  it('records no wall-clock timestamp on an optimistic bubble', () => {
+    // The bubble carries `optimistic` (the reconcile scan's marker, load-bearing
+    // for #3898) and nothing else. A per-send `optimisticTs` used to ride along
+    // to drive a 30s "may not have been delivered" notice: the send path already
+    // reports a real failure with its own error bubble and restores the
+    // composer, so that notice could only appear once the server had ACCEPTED
+    // the message, asserting as uncertain the one thing least likely to be true.
+    // It also persisted into the durable transcript and was never cleaned up.
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'pending', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-x' } }))
+
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+    expect(state.messages[0].meta?.optimisticTs).toBeUndefined()
+    expect(state.messages[0].meta?.stale).toBeUndefined()
+  })
+})
+
+/* #4131: the ONLY confirmation the dashboard composer ever receives is its own
+ * HTTP response. `DashboardState.append` suppresses the `chat_message` user echo
+ * for every dashboard send by design (`broadcast_user=False`, because the
+ * composer already rendered the bubble), so a surface that waits for the echo
+ * waits forever — which is why this reducer exists and why the 30s wall-clock
+ * sweep it replaced flagged every message the user sent, not just lost ones. */
+describe('confirmOptimisticSend — the send response retires the pending state', () => {
+  const initial = reducer(undefined, { type: '@@INIT' })
+  const withSlot = { ...initial, activeSlot: 'slot-1' }
+
+  it('retires the pending flag on the matching send and KEEPS its sendId', () => {
+    let state = reducer(withSlot, appendMessage({
+      role: 'user', content: 'ship it', cls: '', ts: '2026-08-16T10:00:00.000Z',
+      meta: { sendId: 's-confirm-1' },
+    }))
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-confirm-1' }))
+
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+    // sendId SURVIVES: a channel-linked slot can still deliver a late echo, and
+    // reconcileOptimisticEcho needs the id to update this row in place rather
+    // than push a duplicate bubble.
+    expect(state.messages[0].meta?.sendId).toBe('s-confirm-1')
+  })
+
+  it('confirms only the matching send, leaving a sibling in-flight bubble pending', () => {
+    let state = reducer(withSlot, appendMessage({ role: 'user', content: 'first', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-a' } }))
+    state = reducer(state, appendMessage({ role: 'user', content: 'second', cls: '', ts: '2026-08-16T10:00:01.000Z', meta: { sendId: 's-b' } }))
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-b' }))
+
+    expect(state.messages[0].meta?.optimistic).toBe(true)   // 's-a' still in flight
+    expect(state.messages[1].meta?.optimistic).toBeUndefined()
+  })
+
+  it('confirms a background slot bubble in slotMessages (split-view pane)', () => {
+    let state = reducer(withSlot, appendSlotMessage({
+      slot: 'pane-9',
+      message: { role: 'user', content: 'pane send', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-pane' } } as ChatMessage,
+    }))
+    expect(state.slotMessages['pane-9'][0].meta?.optimistic).toBe(true)
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'pane-9', sendId: 's-pane' }))
+
+    expect(state.slotMessages['pane-9'][0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('is a no-op for an unknown sendId (a busy-slot send appended no bubble)', () => {
+    let state = reducer(withSlot, appendMessage({ role: 'user', content: 'mine', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-mine' } }))
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-someone-else' }))
+
+    expect(state.messages).toHaveLength(1)
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+  })
 })
 
 describe('sseChatMessage — _segment handling', () => {
@@ -856,6 +1269,35 @@ describe('subagent reducers', () => {
     expect(state.subagents['a1'].task).toBe('search code')
   })
 
+  it('sseSubagentSpawn carries the resolved model, and later frames never blank a known model (#3582)', () => {
+    // Spawn stamps the served model.
+    let state = reducer(withSlot, sseSubagentSpawn({ slot: 'slot-1', id: 'a1', task: 't', agent: 'kirocrew', model: 'claude-opus-4.8' }))
+    expect(state.subagents['a1'].model).toBe('claude-opus-4.8')
+    // A tool frame (no model field) must not clobber it.
+    state = reducer(state, sseSubagentTool({ slot: 'slot-1', id: 'a1', tool: 'grep' }))
+    expect(state.subagents['a1'].model).toBe('claude-opus-4.8')
+    // The done frame is authoritative and may refine it (CC path resolved late).
+    state = reducer(state, sseSubagentDone({ slot: 'slot-1', id: 'a1', elapsed: 1, outcome: 'completed', model: 'claude-opus-4.7' }))
+    expect(state.subagents['a1'].model).toBe('claude-opus-4.7')
+    // A done frame WITHOUT a model must not blank a known one.
+    let s2 = reducer(withSlot, sseSubagentSpawn({ slot: 'slot-1', id: 'a2', task: 't', agent: 'kirocrew', model: 'gpt-5.6-sol' }))
+    s2 = reducer(s2, sseSubagentDone({ slot: 'slot-1', id: 'a2', elapsed: 1, outcome: 'completed' }))
+    expect(s2.subagents['a2'].model).toBe('gpt-5.6-sol')
+  })
+
+  it('sseSubagentSpawn defaults model to empty when the frame omits it', () => {
+    const state = reducer(withSlot, sseSubagentSpawn({ slot: 'slot-1', id: 'a1', task: 't', agent: '' }))
+    expect(state.subagents['a1'].model).toBe('')
+  })
+
+  it('sseSubagentSnapshot restores the model on reconnect', () => {
+    const state = reducer(withSlot, sseSubagentSnapshot({
+      id: 'a1', slot: 'slot-1', task: 't', agent: 'kirocrew', model: 'claude-opus-4.8',
+      streaming: '', last_tool: '', started: 1,
+    }))
+    expect(state.subagents['a1'].model).toBe('claude-opus-4.8')
+  })
+
   it('sseSubagentSpawn preserves existing streaming text from pending', () => {
     let state = reducer(withSlot, sseSubagentPending({ slot: 'slot-1', id: 'a1', task: 'task', approval_id: 'spawn:a1' }))
     state = reducer(state, sseSubagentSpawn({ slot: 'slot-1', id: 'a1', task: 'task', agent: 'kirocrew' }))
@@ -955,6 +1397,25 @@ describe('activity viewer reducers', () => {
     const state = reducer(initial, toggleActivity())
     expect(state.activityOpen).toBe(true)
     expect(reducer(state, toggleActivity()).activityOpen).toBe(false)
+  })
+
+  it('counts a view request only when one is actually made', () => {
+    // The counter is what tells the side panel's tab strip "focus this view".
+    // A chat switch restores the incoming chat's cached activityTab, and that
+    // restore must NOT read as a request — otherwise reopening a chat drags
+    // focus off the tab the user left it on.
+    expect(initial.activityTabRequest).toBe(0)
+    const requested = reducer(withSlot, openActivityToTab('subagents'))
+    expect(requested.activityTabRequest).toBe(1)
+    // Same view asked for twice is two requests: the user may have clicked away
+    // in the strip in between, and the second ask must still pull focus back.
+    expect(reducer(requested, openActivityToTab('subagents')).activityTabRequest).toBe(2)
+
+    const switched = reducer(requested, switchSlot.pending('req-1', 'slot-2'))
+    expect(switched.activityTab).toBe('changes')
+    expect(switched.activityTabRequest).toBe(1)
+    // Opening the panel without naming a view is not a request either.
+    expect(reducer(switched, openActivityPanel()).activityTabRequest).toBe(1)
   })
 
   it('sseToolActivity adds to toolLog', () => {
@@ -1159,7 +1620,6 @@ describe('permission cls parsing and approval resolution', () => {
   })
 })
 
-
 describe('forkSlot thunk', () => {
   it('calls api.forkChatSlot and dispatches addSlotOptimistic on ok response', async () => {
     const { server } = await import('../../integration/mocks/server')
@@ -1257,6 +1717,35 @@ describe('slotHistory — session navigation stack', () => {
     expect(state.activeSlot).toBe('new-slot')
   })
 
+  it('createSlot.fulfilled starts the new chat with the side panel CLOSED', () => {
+    // The panel is open on the chat being left. A brand-new slot has no cached
+    // activity bucket, so it must land closed — the same `?? false` every other
+    // slot-entry path applies. Leaking the flag also left it unpersisted under
+    // the new slot's key, so a reload silently closed the panel again.
+    let state = { ...initial, activeSlot: 'A', activityOpen: true }
+    state = reducer(state, {
+      type: 'chat/createSlot/fulfilled',
+      meta: { arg: undefined, requestId: 'r1', requestStatus: 'fulfilled' as const, originActiveSlot: 'A' },
+      payload: { key: 'new-slot' },
+    })
+    expect(state.activityOpen).toBe(false)
+    // The chat being left keeps its own open state in its bucket.
+    expect(state.slotActivity['A']?.activityOpen).toBe(true)
+  })
+
+  it('createSlot.fulfilled leaves the panel alone when the user switched away', () => {
+    // Switched-away guard: the create must not touch the view at all, panel
+    // state included.
+    let state = { ...initial, activeSlot: 'B', activityOpen: true }
+    state = reducer(state, {
+      type: 'chat/createSlot/fulfilled',
+      meta: { arg: undefined, requestId: 'r1', requestStatus: 'fulfilled' as const, originActiveSlot: 'A' },
+      payload: { key: 'new-slot' },
+    })
+    expect(state.activeSlot).toBe('B')
+    expect(state.activityOpen).toBe(true)
+  })
+
   it('deleteSlot.fulfilled cleans deleted key from history', () => {
     let state = { ...initial, activeSlot: 'C', slotHistory: ['A', 'B'] }
     state = reducer(state, {
@@ -1265,6 +1754,34 @@ describe('slotHistory — session navigation stack', () => {
       payload: 'B',
     })
     expect(state.slotHistory).toEqual(['A'])
+  })
+
+  it('resumeFromHistory.fulfilled with a non-chat surface keeps the history row and the active slot (#3624)', () => {
+    // The wire resume succeeded, but ChatPage cannot display the surface.
+    // Consuming the row while the sidebar's notice says "can't be opened"
+    // reads as data loss, and switching activeSlot to an undisplayable slot
+    // is the silent bounce itself -- the reducer must not mutate at all.
+    const before = { ...initial, activeSlot: 'A', history: [{ key: 'dash-1', title: 'Ops', messages: 3 }], historyOffset: 1, slotHistory: ['Z'] }
+    const after = reducer(before, {
+      type: 'chat/resumeFromHistory/fulfilled',
+      meta: { arg: { key: 'dash-1', title: 'Ops' }, requestId: 'r1', requestStatus: 'fulfilled' as const },
+      payload: { ok: true, key: 'dash-1', surface: 'dashboard', messages: [], hasMore: false, total: 0 },
+    })
+    expect(after.history).toEqual(before.history)
+    expect(after.activeSlot).toBe('A')
+    expect(after.historyOffset).toBe(1)
+    expect(after.slotHistory).toEqual(['Z'])
+  })
+
+  it('resumeFromHistory.fulfilled with a chat-page surface still consumes the row and switches', () => {
+    let state = { ...initial, activeSlot: 'A', history: [{ key: 'H', title: 'old', messages: 1 }] }
+    state = reducer(state, {
+      type: 'chat/resumeFromHistory/fulfilled',
+      meta: { arg: { key: 'H', title: 'old' }, requestId: 'r1', requestStatus: 'fulfilled' as const },
+      payload: { ok: true, key: 'H', surface: 'orchestrator', messages: [], hasMore: false, total: 0 },
+    })
+    expect(state.history).toEqual([])
+    expect(state.activeSlot).toBe('H')
   })
 
   it('resumeFromHistory.fulfilled pushes activeSlot onto history', () => {
@@ -1673,12 +2190,81 @@ describe('sseThinkingChunk (model reasoning)', () => {
     state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'answer', seq: 0 }))
     expect(state.messages.filter(m => m.role === 'thinking')).toHaveLength(0)
   })
+
+  it('opens a NEW block for each reasoning burst across tool calls', () => {
+    let state = reducer(active, sseThinkingChunk({ slot: 'chat-1', content: 'burst one' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: 't1' } }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'burst two' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 fs_read', meta: { tool_call_id: 't2' } }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'burst three' }))
+    const thinking = state.messages.filter(m => m.role === 'thinking')
+    expect(thinking.map(m => m.content)).toEqual(['burst one', 'burst two', 'burst three'])
+    // emission order preserved: each burst sits next to the step it explains
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'tool', 'thinking'])
+  })
+
+  it('splices a post-tool burst ABOVE the turn\u2019s still-open streaming row', () => {
+    let state = reducer(active, sseThinkingChunk({ slot: 'chat-1', content: 'burst one' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'partial answer', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: 't1' } }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'burst two' }))
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'streaming'])
+    // the turn's text keeps accumulating into that same row, below both blocks
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: ' plus more', seq: 1 }))
+    expect(state.messages.filter(m => m.role === 'streaming')).toHaveLength(1)
+    expect(state.messages.filter(m => m.role === 'thinking')).toHaveLength(2)
+  })
+
+  it('keeps one burst when an out-of-band row lands below the open answer', () => {
+    // An approval row / queued bubble / stop event is pushed BELOW the turn's
+    // open streaming row, so the array tail is not the end of the turn.
+    // Measuring from `length` would split this one burst in two and drop the
+    // second half beneath the answer it explains.
+    let state = reducer(active, sseThinkingChunk({ slot: 'chat-1', content: 'first ' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'answer so far', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'error', content: '⟳ Connection lost' }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'second' }))
+    const thinking = state.messages.filter(m => m.role === 'thinking')
+    expect(thinking).toHaveLength(1)
+    expect(thinking[0].content).toBe('first second')
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'streaming', 'error'])
+  })
+
+  it('closes the burst when an approval pushes the tool call below the open answer', () => {
+    // The `tool` branch steps back over a trailing `streaming` row but not over
+    // an approval row, so an approval-gated call lands BELOW the text. The rows
+    // are then out of emission order and "above the open text row" is no longer
+    // "after the last tool" — the post-tool burst must still not be folded into
+    // the pre-tool block.
+    let state = reducer(active, sseThinkingChunk({ slot: 'chat-1', content: 'why the tool' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'pre-tool text', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'permission', content: 'approve?' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 shell', meta: { tool_call_id: 't1' } }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'what the tool returned' }))
+
+    const thinking = state.messages.filter(m => m.role === 'thinking')
+    expect(thinking.map(m => m.content)).toEqual(['why the tool', 'what the tool returned'])
+    // the new burst lands after the tool it followed, not merged into the first
+    expect(state.messages[state.messages.length - 1].role).toBe('thinking')
+  })
+
+  it('keeps one burst when a queued bubble interrupts it before any text', () => {
+    // The user types while the model is still reasoning, so a `queued` row is
+    // appended before the first chunk. It interrupts the burst without ending
+    // it — the reasoning that follows is the same burst, not a second block.
+    let state = reducer(active, sseThinkingChunk({ slot: 'chat-1', content: 'still ' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'queued', content: 'and also check X' }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'thinking' }))
+    const thinking = state.messages.filter(m => m.role === 'thinking')
+    expect(thinking).toHaveLength(1)
+    expect(thinking[0].content).toBe('still thinking')
+  })
 })
 
 describe('thinking survives refreshSlot (client-only reasoning)', () => {
   const base = reducer(undefined, { type: '@@INIT' })
 
-  const refreshPayload = (key: string, messages: { role: string; content: string; cls?: string; ts?: string }[]) => ({
+  const refreshPayload = (key: string, messages: { role: string; content: string; cls?: string; ts?: string; meta?: Record<string, unknown> }[]) => ({
     key, messages, running: false, hasMore: false, total: messages.length, stopping: false,
   })
 
@@ -1714,6 +2300,90 @@ describe('thinking survives refreshSlot (client-only reasoning)', () => {
     const payload = refreshPayload('chat-1', [{ role: 'assistant', content: 'Answer', cls: 'msg msg-a' }])
     state = reducer(state, refreshSlot.fulfilled(payload, 'r1', 'chat-1'))
     state = reducer(state, refreshSlot.fulfilled(payload, 'r2', 'chat-1'))
+    expect(state.messages.filter(m => m.role === 'thinking')).toHaveLength(1)
+  })
+
+  it('rebuilds the burst order of a multi-tool turn from tool ids (#4218)', () => {
+    // Reasoning is client-only, so the refresh rebuilds the array from server
+    // history that has never seen a thinking row. The position is recoverable
+    // anyway: each burst is followed by its own tool row, whose server-minted
+    // `tool_call_id` persists into history, so the post-refresh order must equal
+    // the live order exactly. Anchoring on answer CONTENT instead cannot do this
+    // — a reason-then-tool turn flushes no text at the tool boundary, so history
+    // holds one assistant row for every burst and all but one were parked below
+    // the answer.
+    let state = reducer(base, setActiveSlot('chat-1'))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'why t1' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: 't1' } }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'why t2' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'The answer', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: '_done', content: '' }))
+    // live: each burst above the step it explains
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'assistant'])
+
+    const payload = refreshPayload('chat-1', [
+      { role: 'tool', content: '🔧 grep', cls: '', meta: { tool_call_id: 't1' } },
+      { role: 'assistant', content: 'The answer', cls: 'msg msg-a' },
+    ])
+    state = reducer(state, refreshSlot.fulfilled(payload, 'r1', 'chat-1'))
+
+    expect(state.messages.filter(m => m.role === 'thinking').map(m => m.content))
+      .toEqual(['why t1', 'why t2'])
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'assistant'])
+
+    // Idempotent: a second refresh must not re-park or duplicate a block.
+    state = reducer(state, refreshSlot.fulfilled(payload, 'r2', 'chat-1'))
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'assistant'])
+  })
+
+  it('keeps every burst in place as the tool count grows (#4218)', () => {
+    // Severity scaled with burst count before the fix: only one block could
+    // anchor, so a turn that reasons before each of 10 calls left 9 stacked
+    // below the answer. Drive the count that was reported in the wild.
+    const N = 10
+    let state = reducer(base, setActiveSlot('chat-1'))
+    for (let n = 1; n <= N; n++) {
+      state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: `why t${n}` }))
+      state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: `t${n}` } }))
+    }
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'Done', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: '_done', content: '' }))
+    const live = state.messages.map(m => m.role)
+
+    const history = []
+    for (let n = 1; n <= N; n++) {
+      history.push({ role: 'tool', content: '🔧 grep', cls: '', meta: { tool_call_id: `t${n}` } })
+    }
+    history.push({ role: 'assistant', content: 'Done', cls: 'msg msg-a' })
+    state = reducer(state, refreshSlot.fulfilled(refreshPayload('chat-1', history), 'r1', 'chat-1'))
+
+    expect(state.messages.map(m => m.role)).toEqual(live)
+    expect(state.messages.filter(m => m.role === 'thinking').map(m => m.content))
+      .toEqual(Array.from({ length: N }, (_, i) => `why t${i + 1}`))
+    // No tail stack: nothing reasoning-shaped after the answer.
+    expect(state.messages[state.messages.length - 1].role).toBe('assistant')
+  })
+
+  it('anchors on the earlier row of an auto-approved tool pair (#4218)', () => {
+    // An auto-approved call persists TWO tool rows sharing one tool_call_id
+    // (🔧 pre-approval + ✅ post-approval). The block reasoned its way TO the
+    // call, so it belongs above the first of the pair, not between them.
+    let state = reducer(base, setActiveSlot('chat-1'))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'why t1' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: 't1' } }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'The answer', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: '_done', content: '' }))
+
+    state = reducer(state, refreshSlot.fulfilled(
+      refreshPayload('chat-1', [
+        { role: 'tool', content: '🔧 grep', cls: '', meta: { tool_call_id: 't1' } },
+        { role: 'tool', content: '✅ grep', cls: '', meta: { tool_call_id: 't1' } },
+        { role: 'assistant', content: 'The answer', cls: 'msg msg-a' },
+      ]),
+      'r1', 'chat-1',
+    ))
+
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'tool', 'assistant'])
     expect(state.messages.filter(m => m.role === 'thinking')).toHaveLength(1)
   })
 })
@@ -1765,6 +2435,66 @@ describe('warmSlotCache (background cache warm)', () => {
     const state0 = reducer(initial, setActiveSlot('chat-1'))
     const state = reducer(state0, warmSlotCache.fulfilled(null, 'w1', 'chat-1'))
     expect(state.slotMessages).toEqual(state0.slotMessages)
+  })
+})
+
+describe('queue reorder reducer', () => {
+  const initial = reducer(undefined, { type: '@@INIT' })
+  const withQueued3 = () => {
+    let state = reducer(initial, setActiveSlot('chat-1'))
+    state = reducer(state, appendQueuedMessage({ slot: 'chat-1', content: 'first', ts: 't1', queue_id: 'q1' }))
+    state = reducer(state, appendQueuedMessage({ slot: 'chat-1', content: 'second', ts: 't2', queue_id: 'q2' }))
+    state = reducer(state, appendQueuedMessage({ slot: 'chat-1', content: 'third', ts: 't3', queue_id: 'q3' }))
+    return state
+  }
+  const queuedIds = (state: ReturnType<typeof reducer>) =>
+    state.messages.filter(m => m.role === 'queued').map(m => m.meta?.queueId)
+
+  it('reorders queued messages to the given id sequence', () => {
+    let state = withQueued3()
+    state = reducer(state, reorderQueuedMessages({ slot: 'chat-1', order: ['q3', 'q1', 'q2'] }))
+    expect(queuedIds(state)).toEqual(['q3', 'q1', 'q2'])
+    expect(state.messages.filter(m => m.role === 'queued').map(m => m.content)).toEqual(['third', 'first', 'second'])
+  })
+
+  it('keeps ids missing from the order after the ordered ones (backend semantics)', () => {
+    let state = withQueued3()
+    state = reducer(state, reorderQueuedMessages({ slot: 'chat-1', order: ['q2'] }))
+    expect(queuedIds(state)).toEqual(['q2', 'q1', 'q3'])
+  })
+
+  it('ignores unknown ids in the order', () => {
+    let state = withQueued3()
+    state = reducer(state, reorderQueuedMessages({ slot: 'chat-1', order: ['ghost', 'q2', 'q1', 'q3'] }))
+    expect(queuedIds(state)).toEqual(['q2', 'q1', 'q3'])
+  })
+
+  it('does not move non-queued messages: queued slots are re-filled in place', () => {
+    let state = reducer(initial, setActiveSlot('chat-1'))
+    state = reducer(state, appendMessage({ role: 'user', content: 'hello', cls: 'msg msg-u' }))
+    state = reducer(state, appendQueuedMessage({ slot: 'chat-1', content: 'first', ts: 't1', queue_id: 'q1' }))
+    state = reducer(state, appendQueuedMessage({ slot: 'chat-1', content: 'second', ts: 't2', queue_id: 'q2' }))
+    const before = state.messages.map(m => m.role)
+    state = reducer(state, reorderQueuedMessages({ slot: 'chat-1', order: ['q2', 'q1'] }))
+    expect(state.messages.map(m => m.role)).toEqual(before)
+    expect(queuedIds(state)).toEqual(['q2', 'q1'])
+    expect(state.messages[0].content).toBe('hello')
+  })
+
+  it('is a no-op with fewer than two queued messages', () => {
+    let state = reducer(initial, setActiveSlot('chat-1'))
+    state = reducer(state, appendQueuedMessage({ slot: 'chat-1', content: 'only', ts: 't1', queue_id: 'q1' }))
+    const before = state.messages
+    state = reducer(state, reorderQueuedMessages({ slot: 'chat-1', order: ['q1'] }))
+    expect(state.messages).toEqual(before)
+  })
+
+  it('targets slotMessages for a non-active slot', () => {
+    let state = reducer(initial, setActiveSlot('chat-1'))
+    state = reducer(state, appendQueuedMessage({ slot: 'chat-2', content: 'a', ts: 't1', queue_id: 'qa' }))
+    state = reducer(state, appendQueuedMessage({ slot: 'chat-2', content: 'b', ts: 't2', queue_id: 'qb' }))
+    state = reducer(state, reorderQueuedMessages({ slot: 'chat-2', order: ['qb', 'qa'] }))
+    expect((state.slotMessages['chat-2'] || []).filter(m => m.role === 'queued').map(m => m.meta?.queueId)).toEqual(['qb', 'qa'])
   })
 })
 
@@ -2049,5 +2779,126 @@ describe('selectSlotPendingSpawnApprovals', () => {
     const pending = selectSlotPendingSpawnApprovals(wrap(state), 'bg-slot')
     expect(pending).toHaveLength(1)
     expect(pending[0].id).toBe('a2')
+  })
+})
+
+describe('steer does not deadlock pending approval (#1667)', () => {
+  const slot = 'slot-1'
+  const initial = reducer(undefined, { type: '@@INIT' })
+  const wrap = (chat: ReturnType<typeof reducer>) => ({ chat }) as never
+
+  // Builds a state with an active slot, a pending permission row, and a toolLog entry.
+  const withPendingApproval = () => {
+    let state = { ...initial, activeSlot: slot }
+    // Inject a permission row (active-slot path via sseChatMessage)
+    const cls = JSON.stringify({ request_id: 'req-1', tool_input: 'rm -rf /', is_read_only: '' })
+    state = reducer(state, sseChatMessage({ slot, role: 'permission', content: 'approve rm?', cls }))
+    // Add a tool activity entry so toolLog is non-empty
+    state = reducer(state, sseToolActivity({ slot, tool: 'bash', kind: 'write', purpose: 'delete', input_preview: 'rm -rf' }))
+    return state
+  }
+
+  describe('sseChatMessage (active-slot path)', () => {
+    it('steered user message does NOT auto-resolve pending permission rows', () => {
+      let state = withPendingApproval()
+      expect(state.messages.find(m => m.role === 'permission')?.meta?.resolved).toBeUndefined()
+      state = reducer(state, sseChatMessage({ slot, role: 'user', content: 'also check /tmp', meta: { steer: true } }))
+      // Permission must remain unresolved
+      expect(state.messages.find(m => m.role === 'permission')?.meta?.resolved).toBeUndefined()
+    })
+
+    it('steered user message does NOT clear the toolLog', () => {
+      let state = withPendingApproval()
+      expect(state.toolLog.length).toBeGreaterThan(0)
+      state = reducer(state, sseChatMessage({ slot, role: 'user', content: 'also check /tmp', meta: { steer: true } }))
+      expect(state.toolLog.length).toBeGreaterThan(0)
+    })
+
+    it('normal user message STILL auto-resolves pending permissions (existing behavior)', () => {
+      let state = withPendingApproval()
+      state = reducer(state, sseChatMessage({ slot, role: 'user', content: 'new turn' }))
+      expect(state.messages.find(m => m.role === 'permission')?.meta?.resolved).toBe('rejected')
+    })
+
+    it('normal user message STILL clears the toolLog (existing behavior)', () => {
+      let state = withPendingApproval()
+      state = reducer(state, sseChatMessage({ slot, role: 'user', content: 'new turn' }))
+      expect(state.toolLog).toHaveLength(0)
+    })
+  })
+
+  describe('applyNonActiveFrame (background-slot path)', () => {
+    const bgSlot = 'bg-slot'
+
+    const withBgPendingApproval = () => {
+      // Active slot is different from bgSlot so bgSlot hits applyNonActiveFrame
+      let state = { ...initial, activeSlot: slot }
+      const cls = JSON.stringify({ request_id: 'req-bg', tool_input: 'drop db', is_read_only: '' })
+      state = reducer(state, sseChatMessage({ slot: bgSlot, role: 'permission', content: 'approve drop?', cls }))
+      return state
+    }
+
+    it('steered user message does NOT auto-resolve permission rows in background slot', () => {
+      let state = withBgPendingApproval()
+      const bgMsgs = () => state.slotMessages[bgSlot] ?? []
+      expect(bgMsgs().find(m => m.role === 'permission')?.meta?.resolved).toBeUndefined()
+      state = reducer(state, sseChatMessage({ slot: bgSlot, role: 'user', content: 'steer correction', meta: { steer: true } }))
+      expect(bgMsgs().find(m => m.role === 'permission')?.meta?.resolved).toBeUndefined()
+    })
+
+    it('steered user message does NOT clear the background slot toolLog', () => {
+      let state = withBgPendingApproval()
+      // Add a tool log entry in the background slot
+      state = reducer(state, sseToolActivity({ slot: bgSlot, tool: 'grep', kind: 'read', purpose: '', input_preview: '' }))
+      expect(state.slotActivity[bgSlot]?.toolLog.length).toBeGreaterThan(0)
+      state = reducer(state, sseChatMessage({ slot: bgSlot, role: 'user', content: 'steer', meta: { steer: true } }))
+      expect(state.slotActivity[bgSlot]?.toolLog.length).toBeGreaterThan(0)
+    })
+
+    it('normal user message STILL auto-resolves permissions in background slot', () => {
+      let state = withBgPendingApproval()
+      state = reducer(state, sseChatMessage({ slot: bgSlot, role: 'user', content: 'new turn' }))
+      const bgMsgs = state.slotMessages[bgSlot] ?? []
+      expect(bgMsgs.find(m => m.role === 'permission')?.meta?.resolved).toBe('rejected')
+    })
+
+    it('normal user message STILL clears the background slot toolLog', () => {
+      let state = withBgPendingApproval()
+      state = reducer(state, sseToolActivity({ slot: bgSlot, tool: 'grep', kind: 'read', purpose: '', input_preview: '' }))
+      expect(state.slotActivity[bgSlot]?.toolLog.length).toBeGreaterThan(0)
+      state = reducer(state, sseChatMessage({ slot: bgSlot, role: 'user', content: 'new turn' }))
+      expect(state.slotActivity[bgSlot]?.toolLog).toHaveLength(0)
+    })
+  })
+
+  describe('selectSlotPendingApproval ignores steered user messages', () => {
+    it('returns the pending approval even after a steered user message is appended', () => {
+      let state = withPendingApproval()
+      // Selector should find the permission row
+      expect(selectSlotPendingApproval(wrap(state), slot)).not.toBeNull()
+      expect(selectSlotPendingApproval(wrap(state), slot)?.meta?.approval_id).toBe('req-1')
+      // Append a steered user message
+      state = reducer(state, sseChatMessage({ slot, role: 'user', content: 'also try X', meta: { steer: true } }))
+      // Selector must STILL find the pending permission
+      expect(selectSlotPendingApproval(wrap(state), slot)).not.toBeNull()
+      expect(selectSlotPendingApproval(wrap(state), slot)?.meta?.approval_id).toBe('req-1')
+    })
+
+    it('a normal user message hides the pending approval (existing behavior)', () => {
+      let state = withPendingApproval()
+      expect(selectSlotPendingApproval(wrap(state), slot)).not.toBeNull()
+      state = reducer(state, sseChatMessage({ slot, role: 'user', content: 'new turn' }))
+      // The permission gets resolved AND is now before the last user msg
+      expect(selectSlotPendingApproval(wrap(state), slot)).toBeNull()
+    })
+
+    it('works with appendSlotMessage (optimistic steer bubble)', () => {
+      let state = withPendingApproval()
+      expect(selectSlotPendingApproval(wrap(state), slot)).not.toBeNull()
+      state = reducer(state, appendSlotMessage({ slot, message: { role: 'user', content: 'steer text', cls: 'msg msg-u', meta: { steer: true, optimistic: true } } }))
+      // Approval must still be visible
+      expect(selectSlotPendingApproval(wrap(state), slot)).not.toBeNull()
+      expect(selectSlotPendingApproval(wrap(state), slot)?.meta?.approval_id).toBe('req-1')
+    })
   })
 })

@@ -313,10 +313,10 @@ first, cached process-wide:
 1. `uv.find_uv_bin()` — the wheel's own locator (the normal `pip` case). It raises
    `UvNotFound`, a `FileNotFoundError` subclass, on an odd repackaging;
 2. the **frozen-bundle location** — `sys._MEIPASS` and `dirname(sys.executable)`,
-   joined with `uv` + `sysconfig`'s `EXE`. This is the DMG/Electron path:
-   PyInstaller's bundle has no scripts dir and no site-packages, so the wheel's
-   locator cannot find anything there, and `packaging/kirocrew-backend.spec` stages
-   the binary at the bundle root instead;
+   joined with `uv` + `sysconfig`'s `EXE`. A frozen one-folder bundle has no
+   scripts dir and no site-packages, so the wheel's locator cannot find anything
+   there and the binary is staged at the bundle root instead. Inert on the
+   current desktop bundle, which ships a real interpreter tree the locator walks;
 3. `shutil.which("uv")` — a user's own, possibly newer, uv still works;
 4. `None`, which fails provisioning with a message naming **only** `uv` (the old
    check said "`git` and `uv` must both be installed and on PATH" even when only
@@ -706,9 +706,11 @@ sensitive-path check and the governance ceiling — would never be reached.
   user-sized tree; one blocking call here would freeze every chat session on the
   gateway (AUTOSDE `no-blocking-call-on-event-loop`).
 - **Spawn hardening.** Every engine and `uv` invocation goes through
-  `sandboxed_spawn_argv` + `cgroup_scope_argv` + `resource_limit_preexec` — the
+  `sandboxed_spawn_argv` + `cgroup_scope_argv` + `run_limited` — the
   same OS sandbox, credential-scrubbed environment and resource ceiling the rest of
-  the codebase applies. Argv is fixed; the only variable parts are the resolved
+  the codebase applies, with the resource limits delivered after `exec` by the
+  spawn shim rather than in a fork child. Argv is fixed; the only variable parts
+  are the resolved
   `uv` path and paths already contained by `paths.py`. `PYTHONPATH` is cleared so
   the engine venv's pinned native dependencies win. `argv[0]` is always absolute,
   so nothing depends on the scrubbed env's `PATH`.
@@ -803,6 +805,16 @@ sensitive-path check and the governance ceiling — would never be reached.
   predicates are required — `is_sensitive_path` covers the directory and its
   descendants, `path_contains_sensitive` covers a root (bare `~`) that would make
   every deck a sibling of `.ssh`/`.aws`.
+- **An embedded NUL is refused by an EXPLICIT check on the raw string**, not by
+  catching `Path.resolve()`. `resolve()` raises `ValueError` for a NUL on POSIX,
+  but on Windows `ntpath` does the work in pure Python and never reaches the OS
+  for a non-existent path, so it returns successfully — the `try/except` alone let
+  the value through and `iterdir`/`mkdir` were the first calls to raise, one layer
+  past the refusal. Accepting it wedges the app: the endpoint answers 200 and every
+  later `GET /config` and deck route 500s out of `deck_root()`, including the
+  settings page needed to correct it. The check is on the raw string because
+  expansion can neither introduce nor remove a NUL. Pinned by
+  `test_pptx_maker_routes.py::TestConfigRoutes::test_put_refuses_a_path_that_cannot_be_resolved`.
 
 ## Frontend
 

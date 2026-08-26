@@ -75,9 +75,8 @@ device.
 
 Set **Language** in the Speech-to-Text card before recording. Kiro Crew passes
 that choice to Whisper, so Hebrew uses `he` rather than being guessed as
-English. On Nexus, English dictation can use the resident Moonshine fast path;
-non-English input uses multilingual Whisper and may take a little longer to
-start.
+English. Whisper uses this explicit language value instead of relying on
+automatic language detection.
 
 ### MLX provider (Apple Silicon GPU)
 
@@ -98,6 +97,48 @@ status badge stays "not installed".
 `mlx-whisper` is installed out-of-band via `pipx` rather than as a package
 dependency because the `mlx` wheel is arm64-only; Kiro Crew invokes the
 `mlx_whisper` CLI as a subprocess, exactly like the `whisper` provider.
+
+### CPU threads (many-core hosts)
+
+Kiro Crew derives the Whisper subprocess's thread count from the host: **half the
+available cores**, capped at 16. To control it yourself, set `OMP_NUM_THREADS` or
+`OPENBLAS_NUM_THREADS` — if either is set, Kiro Crew leaves both alone and your
+value is used as-is. The count comes from `sched_getaffinity` where available, so
+a CPU-restricted container gets its real budget rather than the whole machine's.
+
+Why not use every core: Whisper decodes one output step at a time, and each step
+is a small matmul that ends in a thread barrier. Wide thread pools therefore cost
+latency per step instead of buying throughput, and on a host that is doing other
+work — a Kiro Crew host runs the gateway and agent sessions alongside — the
+workers get time-sliced, so each barrier waits on threads the scheduler has not
+run yet.
+
+Measured on a 32-vCPU Graviton3 host with an 11-second clip, 16 threads beat 31
+(`base` 4.9s vs 7.3s, `turbo` 20.8s vs 26.9s), and restricted to 16 cores with
+`taskset`, 8 threads beat 16 (5s vs 7s). The headroom buys predictability more
+than raw speed: 8 threads measured 4.9–5.0s across repeats, while taking all 32
+ranged 8.1–68.4s depending on how busy the machine was.
+
+### Parakeet provider (Apple Silicon GPU)
+
+On Apple Silicon Macs, the `parakeet` provider runs NVIDIA's
+[Parakeet](https://github.com/senstella/parakeet-mlx) ASR models on the Metal
+GPU via MLX. Parakeet TDT 0.6b v3 is multilingual (25 languages), streams much
+faster than Whisper, and needs only about 600 MB of memory, which makes it a
+strong local default. Like `mlx`, the `parakeet` provider is selectable on every
+platform but only *available* on arm64 macOS.
+
+1. In the Speech-to-Text card, set **Provider** to `parakeet`.
+2. Click **📦 Install**, which runs `pipx install parakeet-mlx` plus `ffmpeg`
+   (the provider-aware install button installs the right runtime for whichever
+   provider is selected).
+3. The Parakeet model (`parakeet_model`, default
+   `mlx-community/parakeet-tdt-0.6b-v3`) downloads from Hugging Face on first
+   transcription and is cached under `~/.cache/huggingface/hub/`.
+
+`parakeet-mlx` is installed out-of-band via `pipx` for the same arm64-only
+reason as `mlx-whisper`; Kiro Crew invokes the `parakeet-mlx` CLI as a
+subprocess, reusing the same runner as the `whisper` and `mlx` providers.
 
 ## Voice Output (Text-to-Speech)
 

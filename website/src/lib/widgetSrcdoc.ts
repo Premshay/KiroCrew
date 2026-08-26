@@ -92,6 +92,13 @@ const HEIGHT_REPORT_EPSILON_PX = 2
  * never fires and the reporter goes quiet on the high value. */
 const HEIGHT_REPORT_SHRINK_MS = 200
 
+/** How long the loading indicator waits before uncovering the widget anyway.
+ * This is a HANG backstop, not a compile budget: the indicator normally clears
+ * the moment the Tailwind runtime injects its compiled <style>. Keeping it long
+ * matters — a short value uncovers the widget while it is still unstyled, which
+ * reproduces the blank-widget symptom the indicator exists to prevent. */
+const OVERLAY_HANG_BACKSTOP_MS = 15000
+
 /** Body of the height-reporter script. Defined as a string literal — the only
  * interpolation is the two numeric tuning constants above (never LLM/user
  * content; the LLM `html` never reaches here). Set as a script element via
@@ -111,6 +118,7 @@ const HEIGHT_REPORTER_BODY = `(function(){
   var shrinkTimer = null;
   var rafId = 0;
   var raf = window.requestAnimationFrame || function(cb){ return setTimeout(cb, 16); };
+  var unraf = window.cancelAnimationFrame || clearTimeout;
   function send(h){
     lastSent = h;
     parent.postMessage({type:'mc-widget-height', height:h}, '*');
@@ -153,7 +161,17 @@ const HEIGHT_REPORTER_BODY = `(function(){
   function schedule(){
     // Coalesce a burst of ResizeObserver callbacks (an animation can fire many
     // per frame) into a single measurement per frame.
-    if (rafId) return;
+    //
+    // Cancel-and-reschedule rather than an early return on a pending handle:
+    // requestAnimationFrame may return a handle whose callback never runs (a
+    // frame queued for a page the browser then puts in the back/forward cache is
+    // dropped), and latching on such a handle would stop this widget's height
+    // tracking permanently. Same defect and same fix as CliPanel's theme
+    // scheduler. NOTE this block lives inside a template literal, so it must
+    // carry neither a backtick nor a dollar-brace interpolation opener -- both
+    // terminate the literal, and the resulting parse error points here rather
+    // than at the string, which is why this warning is worth the two lines.
+    if (rafId) unraf(rafId);
     rafId = raf(evaluate);
   }
   new ResizeObserver(schedule).observe(document.body);
@@ -454,9 +472,15 @@ const COMMENT_BRIDGE_BODY = `(function(){
 
 function buildThemeCss(vars: Record<string, string>, mode: 'dark' | 'light'): string {
   const rootBody = Object.entries(vars).map(([k, v]) => `${k}:${v}`).join(';')
+  // No readable vars means no theme to apply, and inventing one is worse than
+  // the browser's own defaults — a guard pins that this path emits no `:root`.
   if (!rootBody) return ''
   return (
     `:root{${rootBody};color-scheme:${mode}}` +
+    // On the root element as well as the body: background propagates from html
+    // to the canvas, so an LLM body that sets its own background still paints
+    // over a themed base instead of over white.
+    `html{background:var(--bg)}` +
     `body{background:var(--bg);color:var(--text)}`
   )
 }
@@ -501,6 +525,15 @@ interface BuildSrcdocOptions {
    * + scroll/flash) so the parent can offer commenting inside the HTML render.
    * Off by default. */
   enableComments?: boolean
+  /** Cover the widget with a progress indicator until the Tailwind runtime has
+   * injected its compiled CSS. Set for widgets heavy enough that the compile is
+   * perceptible; without it a slow widget renders as a blank box. */
+  showLoadingOverlay?: boolean
+  /** Localized label for that indicator. Required when `showLoadingOverlay` is
+   * set — the iframe cannot reach the parent's i18n catalog, so an untranslated
+   * default here would visibly flip to English mid-load in every non-English
+   * locale. */
+  loadingLabel?: string
 }
 
 /** Build the srcdoc HTML for a sandboxed widget iframe. The LLM `html`
@@ -513,6 +546,8 @@ export function buildSrcdoc({
   mode,
   includeHeightReporter = false,
   enableComments = false,
+  showLoadingOverlay = false,
+  loadingLabel = '',
 }: BuildSrcdocOptions): string {
   // SSR / unit-test fallback: when there's no DOM (Node.js, vitest before
   // jsdom is set up), fall back to a minimal string-builder that does NOT
@@ -554,22 +589,67 @@ export function buildSrcdoc({
   head.appendChild(csp)
 
   // Tailwind v4 dark-mode directives (compiled by the runtime on load). Placed
-  // before the runtime script so the custom variant is registered first.
+  // Directives precede the runtime script so the dark variant registers before
+  // first paint.
   const tailwindCfg = doc.createElement('style')
   tailwindCfg.setAttribute('type', 'text/tailwindcss')
   tailwindCfg.textContent = TAILWIND_V4_DIRECTIVES
   head.appendChild(tailwindCfg)
 
-  // Same-origin Tailwind v4 browser runtime (replaces public cdn.tailwindcss.com).
-  const tailwind = doc.createElement('script')
-  tailwind.setAttribute('src', scriptOrigin + TAILWIND_RUNTIME_PATH)
-  head.appendChild(tailwind)
-
-  // <style> with base body styles + theme vars
+  // <style> with base body styles + theme vars.
+  //
+  // This MUST precede the Tailwind runtime <script src> below. A classic script
+  // in <head> blocks parsing of everything after it, so with the style behind it
+  // the document has no background and no `color-scheme` until that script has
+  // been fetched and executed — and the browser paints its default WHITE canvas
+  // for that whole window. On a phone over a slow link that reads as a white
+  // flash on every artifact and widget open. Inline CSS costs no fetch, so
+  // putting it first makes the first paint already themed.
   const style = doc.createElement('style')
   const themeCss = buildThemeCss(themeVars, mode)
   style.textContent = themeCss ? `${BASE_BODY_CSS} ${themeCss}` : BASE_BODY_CSS
   head.appendChild(style)
+
+  // Same-origin Tailwind v4 browser runtime (replaces public cdn.tailwindcss.com).
+  // NOTE: we insert a placeholder <meta> instead of a live <script> element and
+  // substitute it in the final serialized HTML. happy-dom eagerly fetches
+  // <script src> URLs when the element is connected to a document
+  // (HTMLScriptElement.[connectedToDocument]), which causes ECONNREFUSED in test
+  // environments that lack a running dev server. Using a non-fetching placeholder
+  // avoids the network dial entirely — the iframe's browser loads the script from
+  // the serialized HTML string, never from a live DOM node in our process.
+  const tailwindPlaceholder = doc.createElement('meta')
+  tailwindPlaceholder.setAttribute('name', 'x-script-placeholder')
+  tailwindPlaceholder.setAttribute('data-src', scriptOrigin + TAILWIND_RUNTIME_PATH)
+  head.appendChild(tailwindPlaceholder)
+
+  // Loading overlay: shown while Tailwind JIT compiles, hidden once ready or
+  // after a timeout. Only injected when showLoadingOverlay is set.
+  if (showLoadingOverlay) {
+    const overlayStyle = doc.createElement('style')
+    overlayStyle.textContent = [
+      // align-items:flex-start (not center): the iframe body can be far taller
+      // than the visible area, and a centred indicator ends up below the fold —
+      // present in the DOM but invisible, which defeats the purpose.
+      '#mc-tw-loading{position:fixed;inset:0;z-index:2147483647;',
+      'display:flex;align-items:flex-start;justify-content:center;padding-top:24px;',
+      'background:var(--bg,#1a1a2e);color:var(--muted,#888);',
+      'font:500 12px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;',
+      'transition:opacity .3s ease}',
+      '#mc-tw-loading.mc-hidden{opacity:0;pointer-events:none}',
+      '#mc-tw-loading .mc-spinner{width:16px;height:16px;',
+      'border:2px solid var(--border,#333);border-top-color:var(--accent,#6366f1);',
+      'border-radius:50%;animation:mc-spin .8s linear infinite;margin-right:8px}',
+      '@keyframes mc-spin{to{transform:rotate(360deg)}}',
+      // Match the parent indicator's motion-reduce treatment: the iframe has its
+      // own document, so the parent's Tailwind motion-reduce variant cannot
+      // reach this rule.
+      '@media (prefers-reduced-motion: reduce){',
+      '#mc-tw-loading .mc-spinner{animation:none}',
+      '#mc-tw-loading{transition:none}}',
+    ].join('')
+    head.appendChild(overlayStyle)
+  }
 
   // <body class="dark|light">
   body.className = mode
@@ -583,6 +663,44 @@ export function buildSrcdoc({
   // Re-clone <script> elements so they execute when the iframe parses srcdoc.
   recloneScripts(fragment, doc)
   body.appendChild(fragment)
+
+  // Progress indicator while the Tailwind runtime compiles. Hidden when the
+  // runtime injects its compiled <style> (MutationObserver on <head>); the
+  // timeout is a HANG backstop only, deliberately far longer than any real
+  // compile. A short timeout would defeat the purpose — it would uncover the
+  // widget while it is still blank, which is exactly the case this exists for.
+  if (showLoadingOverlay) {
+    const overlay = doc.createElement('div')
+    overlay.id = 'mc-tw-loading'
+    // Built with createElement/textContent, never innerHTML: assigning to
+    // innerHTML is prohibited repo-wide (it is an HTML parser sink), and the
+    // label is caller-supplied text that must not be parsed as markup.
+    const spinner = doc.createElement('div')
+    spinner.className = 'mc-spinner'
+    overlay.appendChild(spinner)
+    overlay.appendChild(doc.createTextNode(loadingLabel))
+    body.insertBefore(overlay, body.firstChild)
+
+    const revealScript = doc.createElement('script')
+    revealScript.textContent = `(function(){
+      var el=document.getElementById('mc-tw-loading');
+      if(!el)return;
+      function hide(){el.classList.add('mc-hidden');setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el)},400);}
+      var done=false;
+      function finish(){if(done)return;done=true;hide();}
+      setTimeout(finish,${OVERLAY_HANG_BACKSTOP_MS});
+      var obs=new MutationObserver(function(muts){
+        for(var i=0;i<muts.length;i++){
+          for(var j=0;j<muts[i].addedNodes.length;j++){
+            var n=muts[i].addedNodes[j];
+            if(n.tagName==='STYLE'&&!n.type){finish();obs.disconnect();return;}
+          }
+        }
+      });
+      obs.observe(document.head,{childList:true});
+    })();`
+    body.appendChild(revealScript)
+  }
 
   // Height reporter (optional). textContent assignment, not template-literal.
   if (includeHeightReporter) {
@@ -612,7 +730,20 @@ export function buildSrcdoc({
   // contains only the static DOCTYPE prefix and the *serialized* DOM tree
   // (which has already had LLM content adopted as typed DOM nodes), so no
   // raw LLM string is interpolated into HTML.
-  return `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
+  //
+  // Post-serialization: replace the SINGLE trusted placeholder with the real
+  // <script> tag. No `g` flag — only the one placeholder we inserted into
+  // <head> is replaced. Model-authored content lives in <body> and cannot
+  // inject a matching placeholder because: (1) it is adopted via
+  // createContextualFragment (typed DOM), not string interpolation, and
+  // (2) attribute serialization HTML-escapes quotes, so a model byte sequence
+  // cannot produce the exact `name="x-script-placeholder"` attribute pair.
+  // The non-global replace is a defense-in-depth backstop for that invariant.
+  const serialized = `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
+  return serialized.replace(
+    /<meta name="x-script-placeholder" data-src="([^"]*)">/,
+    (_match, src) => `<script src="${src}"></script>`,
+  )
 }
 
 /** SSR fallback for environments without a DOM. Used only by unit tests
@@ -638,8 +769,11 @@ function buildSrcdocSSR({ html, themeVars, mode, includeHeightReporter }: BuildS
     `<meta name="viewport" content="width=device-width, initial-scale=1">` +
     `<meta http-equiv="Content-Security-Policy" content="${cspFor('')}">` +
     `<style type="text/tailwindcss">${TAILWIND_V4_DIRECTIVES}</style>` +
-    `<script src="${TAILWIND_RUNTIME_PATH}"><\/script>` +
+    // Theme style precedes the runtime <script src> for the same reason as the
+    // DOM path: a head script blocks parsing, so a style behind it leaves the
+    // document unthemed — and painted white — until the script lands.
     `<style>${styleCss}</style>` +
+    `<script src="${TAILWIND_RUNTIME_PATH}"><\/script>` +
     `</head><body class="${mode}">` +
     `<!-- SSR fallback: LLM body omitted -->` +
     reporter +

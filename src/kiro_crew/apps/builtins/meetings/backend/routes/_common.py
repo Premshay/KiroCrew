@@ -27,6 +27,7 @@ from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.domain.session import MeetingSession
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.hooks import get_global_hook_store  # noqa: F401  (re-export for handlers)
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sel import sel
 
 logger = logging.getLogger("kirocrew.app.meetings")
@@ -47,6 +48,7 @@ class _ActiveMeeting:
 
     def __init__(self) -> None:
         self.session: MeetingSession | None = None
+        self.accepting_dispatches = False
 
     def get(self, meeting_id: str = "") -> MeetingSession | None:
         """The live session, optionally requiring it to be *meeting_id*'s."""
@@ -56,6 +58,20 @@ class _ActiveMeeting:
         if meeting_id and session.meeting_id != meeting_id:
             return None
         return session
+
+    def get_for_dispatch(self, meeting_id: str) -> MeetingSession | None:
+        """The matching session only while its transcript ingress is open."""
+        return self.get(meeting_id) if self.accepting_dispatches else None
+
+    def suspend_dispatches(self, session: MeetingSession | None = None) -> None:
+        """Close ingress for *session* without tearing down its agent queues."""
+        if session is not None and self.session is session:
+            self.accepting_dispatches = False
+
+    def resume_dispatches(self, session: MeetingSession) -> None:
+        """Open ingress only if *session* is still the installed session."""
+        if self.session is session:
+            self.accepting_dispatches = True
 
     def set(self, session: MeetingSession | None) -> None:
         """Install *session*, replacing any current one.
@@ -78,6 +94,7 @@ class _ActiveMeeting:
                 )
             previous.cancel_all()
         self.session = session
+        self.accepting_dispatches = session is not None
 
     def clear(self) -> MeetingSession | None:
         """Drop the session, CANCELLING anything still queued.
@@ -91,6 +108,7 @@ class _ActiveMeeting:
         if previous is not None:
             previous.cancel_all()
         self.session = None
+        self.accepting_dispatches = False
         return previous
 
     async def drain_and_clear(self) -> MeetingSession | None:
@@ -152,7 +170,14 @@ ACTIVE = _ActiveMeeting()
 #: the first — whose transcript then fails to dispatch with a confusing 409. An
 #: asyncio lock (not threading: this guards event-loop interleaving, not threads)
 #: makes the read and the install one critical section.
-START_LOCK = asyncio.Lock()
+START_LOCK = LoopBoundLock()
+
+# Dispatch appends await worker-thread file IO, while lifecycle flushes can await
+# slow agent turns. This separate admission lock protects only the short
+# check/append/fan-out transaction. Lifecycle handlers close ingress under it and
+# then release it before draining, so later speech is rejected promptly rather
+# than waiting behind the slowest agent.
+DISPATCH_LOCK = LoopBoundLock()
 
 
 # ── authorization ───────────────────────────────────────────────────────────

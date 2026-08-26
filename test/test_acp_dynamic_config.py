@@ -92,6 +92,17 @@ class TestGetValidEffortLevels:
         client._acp_config_options = [{"id": "model", "options": [{"value": "opus"}]}]
         assert client.get_valid_effort_levels() == []
 
+    def test_accepts_codex_reasoning_effort_config(self):
+        client = AcpClient()
+        client._acp_config_options = [
+            {
+                "id": "reasoning_effort",
+                "options": [{"value": "low"}, {"value": "high"}],
+            }
+        ]
+        assert client.get_valid_effort_levels() == ["low", "high"]
+        assert client.effort_config_option_id() == "reasoning_effort"
+
     def test_skips_non_dict_options(self):
         client = AcpClient()
         client._acp_config_options = [

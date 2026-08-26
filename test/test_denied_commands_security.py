@@ -8,6 +8,8 @@ catalog, the pure ``compute_effective_denied`` resolver, the dual-tier
 from __future__ import annotations
 
 import json
+import re
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -34,9 +36,9 @@ class TestCatalog:
         # 130 patterns ported byte-exact from the retired agent-config
         # deniedCommands list + 7 legacy security.py globs (secret-fetch tool
         # names + boto3 underscore destructive forms) restored as regexes.
-        assert len(BUILTIN_DENIED_RULES) == 139
+        assert len(BUILTIN_DENIED_RULES) == 140
         ids = [r.id for r in BUILTIN_DENIED_RULES]
-        assert len(set(ids)) == 139
+        assert len(set(ids)) == 140
 
     def test_token_mint_is_blocked_in_both_the_cli_and_module_forms(self):
         """`kirocrew token` mints a signed dashboard token that authenticates to EVERY gateway
@@ -116,8 +118,9 @@ class TestCatalog:
             'python -X dev -c "import kiro_crew.cli"',
             # STDIN forms: `python -` and a bare interpreter read the program from stdin, so a
             # heredoc body or a pipe producer reaches the CLI with nothing in argv. The program
-            # text is visible on the command line (heredoc body → later tokens; pipe source →
-            # earlier tokens), and matching the import there is the same fail-closed call.
+            # text is visible on the command line, and matching the import THERE -- in the
+            # heredoc body, the redirected file, or the pipe producer, and nowhere else in the
+            # frame (see TestStdinProgramTextScoping) -- is the same fail-closed call.
             "python - <<'PY'\nfrom kiro_crew.cli import main; main()\nPY",
             "python3 - <<EOF\nimport kiro_crew.cli\nEOF",
             "echo 'from kiro_crew.cli import main; main()' | python -",
@@ -174,7 +177,7 @@ class TestCatalog:
     def test_patterns_match_manifest_verbatim(self):
         golden = json.loads(_GOLDEN.read_text(encoding="utf-8"))
         golden_by_id = {g["id"]: g for g in golden}
-        assert len(golden_by_id) == 139
+        assert len(golden_by_id) == 140
         for rule in BUILTIN_DENIED_RULES:
             g = golden_by_id[rule.id]
             assert rule.pattern == g["pattern"]
@@ -188,7 +191,7 @@ class TestCatalog:
 
     def test_builtin_denied_rules_accessor_returns_dicts(self):
         rules = builtin_denied_rules()
-        assert len(rules) == 139
+        assert len(rules) == 140
         first = rules[0]
         assert set(first.keys()) == {"id", "pattern", "category", "description"}
         assert isinstance(first["id"], str)
@@ -196,6 +199,402 @@ class TestCatalog:
     def test_pinned_builtin_command_ids_empty_in_standalone(self):
         # Fail-soft: standalone/ungoverned host has no governance pins.
         assert pinned_builtin_command_ids() == set()
+
+
+class TestSelfProtectionFlagInterposition:
+    """The whole self-protection category stays deny-closed under interposed flags (#4799).
+
+    The CLI accepts top-level flags BEFORE the subcommand (``-v``/``--verbose`` is
+    ``action="count"`` and ``--no-jail`` sits on the top-level parser), so
+    ``kirocrew -v restart`` runs the same restart as ``kirocrew restart``. Four
+    self-protection patterns anchored the subcommand directly to the program name
+    and were defeated by exactly that spelling. This walk covers EVERY rule in the
+    category so the class cannot regress one rule at a time: a new self-protection
+    rule fails the completeness assertion until it registers its own template here.
+
+    Asserted through ``is_denied`` (the real enforcement path), not against
+    ``rule.pattern`` -- see ``test_token_mint_is_blocked_in_both_the_cli_and_module_forms``
+    for why that distinction matters.
+    """
+
+    # rule id -> command template; ``{flags}`` is where an attacker interposes
+    # flags between the anchor word and the token the rule keys on.
+    _TEMPLATES = {
+        "self-protection-restart": "kirocrew {flags} restart",
+        "self-protection-update": "kirocrew {flags} update",
+        "self-protection-gateway-restart": "kirocrew {flags} gateway restart",
+        "self-protection-cloud": "kirocrew {flags} cloud destroy",
+        # cron-adopt (added on main) already tolerates interposed flags via its own
+        # tempered-greedy pattern, so it needs no widening/floor from this PR -- it
+        # is listed here only to satisfy the category-completeness invariant.
+        "self-protection-cron-adopt": "kirocrew {flags} cron adopt",
+        # The kill rules key on the kill TARGET, not a CLI subcommand; their gap
+        # is between the kill verb and the product name.
+        "self-protection-kill": "pkill {flags} kirocrew",
+        "self-protection-kill-interpreter": (
+            "python -c \"import os; os.system('pkill {flags} -f kirocrew')\""
+        ),
+    }
+    _FLAGS = ("-v", "-vv", "--verbose", "--no-jail", "-v --no-jail")
+
+    @staticmethod
+    def _effective():
+        from kiro_crew import security
+
+        return list(
+            security.compute_effective_denied(security.BUILTIN_DENIED_RULES, (), False, (), ())
+        )
+
+    def test_every_self_protection_rule_has_a_template(self):
+        category_ids = {r.id for r in BUILTIN_DENIED_RULES if r.category == "self-protection"}
+        assert category_ids == set(self._TEMPLATES), (
+            "every self-protection rule must register an interposed-flag template "
+            "in this walk (and every template must name a live rule)"
+        )
+
+    def test_bare_and_flag_interposed_forms_are_all_denied(self):
+        from kiro_crew import security
+
+        effective = self._effective()
+        for rule_id, template in self._TEMPLATES.items():
+            # The bare form first: widening must not have lost the plain match.
+            bare = " ".join(template.format(flags="").split())
+            assert security.is_denied(
+                bare, denied_regexes=effective
+            ), f"{rule_id}: bare form not denied: {bare!r}"
+            for flags in self._FLAGS:
+                cmd = template.format(flags=flags)
+                assert security.is_denied(
+                    cmd, denied_regexes=effective
+                ), f"{rule_id}: flag-interposed form not denied: {cmd!r}"
+
+    def test_cloud_flag_interposition_denied_for_every_lifecycle_subcommand(self):
+        from kiro_crew import security
+
+        effective = self._effective()
+        for sub in ("destroy", "stop", "start", "launch", "connect", "tunnel", "login", "logout"):
+            cmd = f"kirocrew -v cloud {sub}"
+            assert security.is_denied(
+                cmd, denied_regexes=effective
+            ), f"cloud {sub} not denied behind -v: {cmd!r}"
+
+    def test_widened_patterns_still_require_the_subcommand_token(self):
+        """Not over-broad: the flag run alone must never satisfy a rule.
+
+        Benign invocations -- other subcommands behind the same flags, the flags
+        alone, cloud subcommands outside the destructive list, and a lifecycle
+        word sitting AFTER an unrelated subcommand (direct or module form) --
+        stay allowed.
+        """
+        from kiro_crew import security
+
+        effective = self._effective()
+        for allowed in (
+            "kirocrew -v",
+            "kirocrew --verbose",
+            "kirocrew --no-jail doctor",
+            "kirocrew -v status",
+            "kirocrew -vv cloud status",
+            # A lifecycle word AFTER an unrelated subcommand is not a lifecycle
+            # command: neither tier may scan past the first subcommand word
+            # (#5837, folded from the retired TestCatalog matrix).
+            "kirocrew doctor restart",
+            "kirocrew gateway status restart",
+            "kirocrew cloud status destroy",
+            "python -m kiro_crew doctor restart",
+            "python -m kiro_crew gateway status restart",
+            "python -m kiro_crew cloud status destroy",
+        ):
+            assert not security.is_denied(
+                allowed, denied_regexes=effective
+            ), f"false positive on {allowed!r}"
+
+    def test_stale_governance_pin_still_resolves_to_the_rule_id(self):
+        """A persisted policy pins by pattern STRING; widening must not orphan it.
+
+        The pin resolvers treat a governance pattern as pinning a built-in rule
+        only when it maps back to a rule id.  A ceiling/profile written against
+        the pre-widening catalog persists the OLD spelling, so without the legacy
+        aliases the pin would silently fall out of the id map on upgrade and a
+        user opt-out could drop a rule the administrator pinned.
+        """
+        from kiro_crew import security
+
+        legacy_to_id = {
+            ".*kiro.?crew restart.*": "self-protection-restart",
+            ".*kiro.?crew update.*": "self-protection-update",
+            ".*kiro.?crew\\s+cloud\\s+(destroy|stop|start|launch|connect|tunnel|log(in|out)).*": (
+                "self-protection-cloud"
+            ),
+            ".*kiro.?crew gateway restart.*": "self-protection-gateway-restart",
+        }
+        for legacy, rule_id in legacy_to_id.items():
+            # The old spelling resolves to the same rule id...
+            assert security._rule_id_for_pattern(legacy) == rule_id
+            # ...as the current spelling does.
+            current = next(r.pattern for r in BUILTIN_DENIED_RULES if r.id == rule_id)
+            assert security._rule_id_for_pattern(current) == rule_id
+        assert security._rule_id_for_pattern("not a rule") is None
+
+    def test_legacy_alias_spellings_stay_out_of_the_enforced_catalog(self):
+        """Aliases are lookup-only: not enforced, not built-in, not in the golden."""
+        from kiro_crew import security
+
+        golden = json.loads(_GOLDEN.read_text(encoding="utf-8"))
+        golden_patterns = {g["pattern"] for g in golden}
+        for legacy in security._LEGACY_RULE_ID_BY_PATTERN:
+            assert legacy not in BUILTIN_DENY_PATTERNS
+            assert legacy not in security._RULE_ID_BY_PATTERN
+            assert legacy not in golden_patterns
+
+    # Round 2 -> Option 2 (#4824): the four self-protection SUBCOMMAND rules get an
+    # argv-structural floor (``_is_self_*`` evaluated on the de-escaped, de-quoted
+    # argv), because a regex over RAW text cannot see through the shell's own
+    # de-escaping. Every dressing below reaches the shell as the plain command but
+    # splits a token in the raw string the regex tier matches, so only the floor
+    # catches it.
+    _SUBCOMMANDS = {
+        "self-protection-restart": ["restart"],
+        "self-protection-update": ["update"],
+        "self-protection-gateway-restart": ["gateway", "restart"],
+        "self-protection-cloud": ["cloud", "destroy"],
+    }
+
+    @staticmethod
+    def _dressings(words):
+        """Shell spellings whose argv carries the plain flag/verb tokens.
+
+        Every entry reaches the shell as ``kirocrew [<flag>] <words...>`` after
+        the shell's own de-escaping and quote removal. The ``bare`` and
+        ``real-flag`` entries also match the regex tier directly; the escaped,
+        continued, and quoted entries split a token in the raw string the regex
+        tier matches, so only the floor catches those.
+        """
+        rest = " ".join(words)
+        first = words[0]
+        tail = (" " + " ".join(words[1:])) if len(words) > 1 else ""
+        each_quoted = " ".join(f'"{w}"' for w in words)
+        each_single_quoted = " ".join(f"'{w}'" for w in words)
+        return {
+            "bare": f"kirocrew {rest}",
+            "real-flag": f"kirocrew -v {rest}",
+            "backslash-escaped-flag": f"kirocrew -\\v {rest}",  # -\v -> -v
+            "escaped-verb-letter": f"kirocrew \\{first}{tail}",  # \restart -> restart
+            "line-continuation-flag": f"kirocrew -\\\nv {rest}",
+            "continuation-before-verb": f"kirocrew \\\n{first}{tail}",
+            "each-word-quoted": f"kirocrew {each_quoted}",
+            "each-word-single-quoted": f"kirocrew {each_single_quoted}",
+            # Quoted FLAGS (#5837, folded from the retired TestCatalog matrix):
+            # the quotes split the flag token in the raw text, but the shell
+            # strips them, so the interposed flag still lands in argv. The full
+            # flag-by-quote-style cross lives in
+            # ``test_self_protection_denied_under_the_full_quoting_cross``.
+            "double-quoted-flag": f'kirocrew "-v" {rest}',  # "-v" -> -v
+            "single-quoted-flag": f"kirocrew '-v' {rest}",
+            "quoted-flag-and-quoted-verb": f'kirocrew "-v" {each_quoted}',
+        }
+
+    def test_self_protection_subcommands_denied_under_every_shell_dressing(self):
+        from kiro_crew import security
+
+        effective = self._effective()
+        for rule_id, words in self._SUBCOMMANDS.items():
+            for label, cmd in self._dressings(words).items():
+                assert security.is_denied(
+                    cmd, denied_regexes=effective
+                ), f"{rule_id} not denied under {label}: {cmd!r}"
+
+    _QUOTES = ('"', "'")
+    # Single-token global options. ``-v --no-jail`` from ``_FLAGS`` is two
+    # tokens and cannot be quoted as one flag, so it has no quoted cell.
+    _SINGLE_TOKEN_FLAGS = ("-v", "-vv", "--verbose", "--no-jail")
+
+    @classmethod
+    def _quoting_cross(cls, prefix: str, words: "list[str]") -> "list[str]":
+        """Every quoting spelling of ``<prefix> [flag] <words...>``.
+
+        The full cross the retired TestCatalog matrix asserted (#5837): quoted
+        verbs, quoted flags, and both together, in each quote style, for every
+        single-token global option. The shell strips the quotes, so every cell
+        lands as the same argv and must stay denied.
+        """
+        rest = " ".join(words)
+        quoted_word_forms = [" ".join(f"{q}{w}{q}" for w in words) for q in cls._QUOTES]
+        cmds = [f"{prefix} {form}" for form in quoted_word_forms]
+        for flag in cls._SINGLE_TOKEN_FLAGS:
+            cmds.extend(f"{prefix} {flag} {form}" for form in quoted_word_forms)
+            for q in cls._QUOTES:
+                cmds.append(f"{prefix} {q}{flag}{q} {rest}")
+                cmds.extend(f"{prefix} {q}{flag}{q} {form}" for form in quoted_word_forms)
+        return cmds
+
+    def test_self_protection_denied_under_the_full_quoting_cross(self):
+        from kiro_crew import security
+
+        effective = self._effective()
+        for rule_id, words in self._SUBCOMMANDS.items():
+            for cmd in self._quoting_cross("kirocrew", list(words)):
+                assert security.is_denied(
+                    cmd, denied_regexes=effective
+                ), f"{rule_id} not denied in the quoting cross: {cmd!r}"
+
+    def test_self_protection_floor_covers_every_subcommand_rule(self):
+        """The argv floor must cover every self-protection subcommand rule, so a
+        regex-only rule cannot silently ship bypassable by shell de-escaping.
+
+        ``_SUBCOMMANDS`` (which feeds the dressing, quoting-cross, and launcher
+        walks) is tied to the LIVE floor set here, the way ``_TEMPLATES`` is
+        tied to the category by ``test_every_self_protection_rule_has_a_template``:
+        a floor-listed rule whose template names a ``kirocrew`` CLI subcommand
+        must appear in ``_SUBCOMMANDS`` (and vice versa), so a fifth subcommand
+        rule joining the floor cannot silently skip all three walks. The kill
+        rules key on a kill target, not a CLI subcommand, and the credential
+        mint rule is outside the self-protection category -- neither has a
+        ``kirocrew ...`` template, so the derivation excludes them.
+        """
+        from kiro_crew import security
+
+        floor_subcommand_ids = {
+            rule_id
+            for rule_id in security._SELF_PROTECTION_FLOOR_RULE_IDS
+            if self._TEMPLATES.get(rule_id, "").startswith("kirocrew ")
+        }
+        assert set(self._SUBCOMMANDS) == floor_subcommand_ids, (
+            "every floor-listed kirocrew-subcommand rule must register its "
+            "words in _SUBCOMMANDS (and every _SUBCOMMANDS entry must be "
+            "floor-listed), or the shell-dressing walks silently skip it"
+        )
+        # the predicate for each is wired and fires on a de-escaped argv
+        assert security._is_self_restart("kirocrew -\\v restart")
+        assert security._is_self_update("kirocrew \\update")
+        assert security._is_self_gateway_restart("kirocrew -\\v gateway restart")
+        assert security._is_self_cloud_destructive("kirocrew -\\v cloud destroy")
+
+    def test_self_protection_denied_under_interposed_redirection(self):
+        """A redirection is removed from argv by the shell and can sit anywhere in
+        a simple command, so it must not shift the leading subcommand (#4824 r4).
+        """
+        from kiro_crew import security
+
+        effective = self._effective()
+        for cmd in (
+            "kirocrew 2>/tmp/x restart",  # attached redirect leaves fd residue
+            "kirocrew > /tmp/x restart",  # separate target
+            "kirocrew 2>&1 restart",
+            "kirocrew restart 2>/tmp/log",  # redirect AFTER the subcommand
+            "kirocrew >/dev/null -v update",  # redirect + flag
+            "kirocrew > 'audit;log' restart",  # quoted ';' in the target is a filename, not a boundary
+            "kirocrew 2> 'x|y' restart",  # quoted '|' in the target
+        ):
+            assert security.is_denied(
+                cmd, denied_regexes=effective
+            ), f"redirection-interposed form not denied: {cmd!r}"
+        # A redirect whose TARGET is a file named like the subcommand runs no
+        # subcommand, so it must stay allowed by the floor.
+        assert not security._is_self_restart("kirocrew > restart")
+
+    def test_self_protection_denied_under_dollar_quoting(self):
+        """ANSI-C (``$'...'``) and locale (``$"..."``) quoting decode to the value
+        bash passes, so a flag or the verb hidden in them must not slip past the
+        floor -- shlex leaves the ``$`` and does not decode ANSI-C escapes (#4824 r6).
+        """
+        from kiro_crew import security
+
+        effective = self._effective()
+        for cmd in (
+            "kirocrew $'-v' restart",  # ANSI-C flag
+            "kirocrew $'\\x2d\\x76' restart",  # ANSI-C hex -> -v
+            'kirocrew $"-v" restart',  # locale flag
+            "kirocrew $'restart'",  # ANSI-C on the verb
+            "kirocrew $'-v' cloud destroy",
+        ):
+            assert security.is_denied(
+                cmd, denied_regexes=effective
+            ), f"$-quoted self-protection form not denied: {cmd!r}"
+
+    def test_self_protection_module_form_denied_under_shell_dressing(self):
+        """``python -m kiro_crew <subcommand>`` dispatches the same self-action. The
+        escaped module form (``python -m kiro_crew -\\v restart``) slips past the
+        interpreter-position regex, so the floor resolves the module name and checks
+        the operands after it (#4824 r5).
+        """
+        from kiro_crew import security
+
+        effective = self._effective()
+        for cmd in (
+            "python -m kiro_crew restart",
+            r"python -m kiro_crew -\v restart",  # escaped: regex misses, floor catches
+            r"python -mkiro_crew -\v restart",  # attached -m spelling
+            r"python -m kiro_crew \update",
+            "python -m kiro_crew gateway restart",
+            r"python -m kiro_crew -\v cloud destroy",
+        ):
+            assert security.is_denied(
+                cmd, denied_regexes=effective
+            ), f"module-form self-protection not denied: {cmd!r}"
+        # benign module invocations stay allowed at the floor (not a targeted subcommand)
+        assert not security._is_self_restart("python -m kiro_crew status")
+        assert not security._is_self_cloud_destructive("python -m kiro_crew cloud status")
+        assert not security._is_self_restart("python -m pytest test/test_restart.py")
+
+    def test_self_protection_module_form_denied_under_version_launchers(self):
+        """Every interpreter launcher spelling of ``-m kiro_crew`` dispatches the
+        same self-action (#5837, folded from the retired TestCatalog matrix).
+
+        The spellings come from ``security._PYTHON_PROGRAM_RE``: version-suffixed
+        binaries, the Windows ``py`` launcher (its version selector is an
+        interpreter flag taking no operand), interpreter flags with separate
+        operands (``-X dev``), and the attached ``-mkiro_crew`` form. Each is
+        crossed with a bare and flag-interposed tail plus the full quoting
+        cross from ``_quoting_cross``, so every launcher cell the retired
+        TestCatalog matrix asserted survives here.
+        """
+        from kiro_crew import security
+
+        effective = self._effective()
+        launchers = (
+            "python -m kiro_crew",
+            "python3 -B -m kiro_crew",
+            "python3.12 -X dev -m kiro_crew",
+            "py -3.12 -m kiro_crew",
+            "python -mkiro_crew",
+        )
+        for launcher in launchers:
+            for rule_id, words in self._SUBCOMMANDS.items():
+                rest = " ".join(words)
+                cmds = [f"{launcher} {rest}"]
+                cmds.extend(f"{launcher} {flag} {rest}" for flag in self._SINGLE_TOKEN_FLAGS)
+                cmds.extend(self._quoting_cross(launcher, list(words)))
+                for cmd in cmds:
+                    assert security.is_denied(
+                        cmd, denied_regexes=effective
+                    ), f"{rule_id} not denied via version launcher: {cmd!r}"
+        # The same launchers running a benign subcommand (or another program
+        # entirely) stay allowed -- the launcher spelling is not the trigger.
+        for allowed in (
+            "py -3.12 -m kiro_crew status",
+            "python3.12 -X dev -m kiro_crew doctor",
+            "python3 -B -m pytest test/test_restart.py",
+        ):
+            assert not security.is_denied(
+                allowed, denied_regexes=effective
+            ), f"false positive on {allowed!r}"
+
+    def test_self_protection_floor_is_not_over_broad(self):
+        """The floor matches a real subcommand invocation, not a mention, a
+        benign subcommand, or a different rule's verb.
+        """
+        from kiro_crew import security
+
+        assert not security._is_self_restart("kirocrew -v status")
+        assert not security._is_self_cloud_destructive("kirocrew cloud status")
+        assert not security._is_self_cloud_destructive("kirocrew -vv cloud status")
+        # a mention inside another program's args is not a run (data-consumer /
+        # non-program position), so the floor itself does not fire on it
+        assert not security._is_self_restart("echo kirocrew restart")
+        assert not security._is_self_restart("grep restart /var/log/kirocrew.log")
+        # gateway-restart is a distinct rule from bare restart
+        assert not security._is_self_restart("kirocrew gateway restart")
 
 
 class TestComputeEffectiveDenied:
@@ -502,42 +901,113 @@ class TestIsDeniedReDoSResistance:
     # all the resolution this needs.
     _BUDGET_SECONDS = 5.0
 
-    #: Growth factor allowed when the input DOUBLES. Linear is ~2.0; the measured spread on an
-    #: idle machine is 1.7–2.2 across n=1000..8000, so 3.0 leaves real headroom while still
-    #: separating linear from quadratic (4.0) and from anything exponential.
-    _MAX_DOUBLING_RATIO = 3.0
+    @staticmethod
+    def _cpu_cost(fn: Callable[[], object]) -> float:
+        """CPU consumed by THIS thread while ``fn`` runs — the cost chokepoint.
+
+        ``thread_time`` is the one clock that isolates the subject's own work: wall-clock
+        adds however long the OS gave the core to other processes, and ``process_time``
+        adds CPU burned by OTHER THREADS of this process, so a concurrent in-process burst
+        wider than one sampling window lands in some samples and not others and perturbs
+        any comparison built on them. ``is_denied`` is single-threaded pure-regex work, so
+        per-thread CPU is its complete cost, and a genuinely catastrophic pattern inflates
+        it just the same (measured 1:1 against wall-clock when idle: 2.228s vs 2.230s).
+        """
+        start = time.thread_time()
+        fn()
+        return time.thread_time() - start
 
     def _elapsed(self, command: str) -> float:
-        """CPU time, not wall-clock — the property under test is algorithmic complexity.
+        """CPU time of one ``is_denied`` scan — see ``_cpu_cost`` for the clock choice."""
+        return self._cpu_cost(lambda: is_denied(command))
 
-        Wall-clock measures this process's work PLUS however long the OS gave the core to
-        someone else, so on a loaded CI runner (four xdist workers over two vCPUs) a scan that
-        burns ~2s of CPU can report >5s elapsed and fail a test whose subject never regressed.
-        ``process_time`` counts only CPU consumed by this process, which is exactly what a
-        backtracking blow-up inflates: measured 1:1 against wall-clock when idle (2.228s vs
-        2.230s), and a genuinely catastrophic pattern burns CPU rather than waiting.
+    def test_elapsed_routes_through_the_cpu_cost_chokepoint(self, monkeypatch):
+        # Every timing sample in this class must go through ``_cpu_cost`` — a raw
+        # clock read in ``_elapsed`` would silently re-open the burst-perturbation
+        # channel while every behavioral test stays green.
+        calls: list[object] = []
+
+        def fake_cpu_cost(fn: Callable[[], object]) -> float:
+            calls.append(fn)
+            fn()
+            return 0.123
+
+        monkeypatch.setattr(
+            TestIsDeniedReDoSResistance, "_cpu_cost", staticmethod(fake_cpu_cost)
+        )
+        assert self._elapsed("git status") == 0.123
+        assert len(calls) == 1
+
+    def test_cpu_cost_is_immune_to_other_threads_where_process_time_is_not(self):
+        """The measurement clock must not see other threads' CPU.
+
+        The budget tests in this class bound single CPU-cost samples, so any clock that can
+        be inflated by a concurrent in-process CPU burst (another worker thread, GC) turns
+        one-sided bursts into false budget failures.
+        This pins the invariant with a synthetic workload whose true cost is fixed by
+        construction: spin until this thread has consumed a set amount of CPU, while
+        burst threads saturate the process. ``_cpu_cost`` must report the true cost;
+        the process-wide clock demonstrably cannot, which is why ``_cpu_cost`` exists.
         """
-        start = time.process_time()
-        is_denied(command)
-        return time.process_time() - start
+        true_cost = 0.05
 
-    def _doubling_ratio(self, build: Callable[[int], str], n: int) -> float:
-        """CPU cost at ``2n`` divided by cost at ``n`` — the shape, not the magnitude.
+        def burn() -> None:
+            end = time.thread_time() + true_cost
+            while time.thread_time() < end:
+                pass
 
-        Absolute budgets cannot express "is this linear?" on instrumented runs. Coverage
-        (`--cov`, which CI enables on 3.12 only) multiplies the cost of every executed line, so
-        the same un-regressed matcher measured ~2s bare and >5s under coverage — which is why
-        3.12 shard 2 failed while 3.10 passed on the identical commit. Raising the budget would
-        have hidden a future real regression behind the instrumentation overhead; a RATIO is the
-        honest expression of the property, because a roughly constant multiplier cancels.
+        stop = threading.Event()
 
-        Best-of-3 per point: this is a floor measurement, and scheduler noise only ever adds.
-        """
-        best = min(self._elapsed(build(n)) for _ in range(3))
-        double = min(self._elapsed(build(2 * n)) for _ in range(3))
-        # Guard a degenerate denominator: if the small case is unmeasurable the ratio is
-        # meaningless, so report a passing value rather than dividing by ~0.
-        return double / best if best > 1e-6 else 1.0
+        def spin() -> None:
+            while not stop.is_set():
+                for _ in range(1000):
+                    pass
+
+        spinners = [threading.Thread(target=spin, daemon=True) for _ in range(2)]
+        for thread in spinners:
+            thread.start()
+        try:
+            # Majority vote across 5 independent samples, not a per-sample assert:
+            # both checks below depend on the OS scheduler actually interleaving
+            # this thread against the 2 spinners within each iteration's narrow
+            # window, which a heavily loaded shared CI runner (many concurrent
+            # pytest-xdist workers contending for the same cores) can occasionally
+            # fail to do for a single sample without the underlying invariant
+            # being false. A genuine break in `_cpu_cost` (seeing other threads'
+            # CPU, or the burst harness generating no process-level signal at all)
+            # still fails a majority of samples, since it holds on every iteration.
+            failures = []
+            for _ in range(5):
+                process_start = time.process_time()
+                measured = self._cpu_cost(burn)
+                process_delta = time.process_time() - process_start
+                if measured >= true_cost * 2.0:
+                    failures.append(
+                        f"_cpu_cost reported {measured:.3f}s for {true_cost}s of "
+                        "own-thread work — the clock is seeing other threads' CPU"
+                    )
+                    continue
+                # The control: the process-wide clock DOES absorb the burst (it
+                # accumulates the spinners' CPU during their GIL timeslices), so a
+                # clean _cpu_cost reading above is discriminating, not vacuous.
+                if process_delta <= measured:
+                    failures.append(
+                        "process_time did not exceed thread_time under a "
+                        "2-spinner burst — the burst harness is not generating "
+                        "in-process noise"
+                    )
+            assert len(failures) <= 1, (
+                f"{len(failures)}/5 samples failed (need a majority to hold): "
+                + "; ".join(failures)
+            )
+        finally:
+            stop.set()
+            for thread in spinners:
+                thread.join(timeout=5.0)
+            assert not any(thread.is_alive() for thread in spinners), (
+                "burst spinner failed to stop — it would poison every later "
+                "process-wide timing in this worker"
+            )
 
     def test_git_prefixed_flag_spam_returns_fast(self):
         # The historical regression input: whitespace/flag spam after ``git``.
@@ -554,30 +1024,113 @@ class TestIsDeniedReDoSResistance:
         assert self._elapsed("aws " + ("-x " * 5000)) < self._BUDGET_SECONDS
         assert self._elapsed("aws " + ("--foo=bar " * 5000)) < self._BUDGET_SECONDS
 
-    def test_mid_dotstar_chain_spam_stays_linear(self):
+    def test_mid_dotstar_chain_spam_stays_linear(self, monkeypatch):
         """``python.*open.*/\\.ssh/`` is polynomial per pattern under a single ``re.search``;
         fragment-splitting on the top-level ``.*`` gaps keeps it linear even when every literal
         (``python``/``open``/``/.ssh/``) is present, which defeats a literal pre-filter.
 
-        Asserted as a SCALING ratio rather than an absolute budget. This is the one input in
-        this class expensive enough that instrumentation changes the answer: the same
-        un-regressed matcher costs ~1.7s of CPU bare and >5s under ``--cov``, which CI enables
-        on 3.12 only — so an absolute 5s ceiling failed 3.12 shard 2 while 3.10 passed on the
-        identical commit. Raising the budget would bank the instrumentation overhead as
-        headroom and hide the next real regression; the ratio states the actual property and is
-        insensitive to a constant multiplier. The absolute bound is still asserted at the
-        smaller size, where there is real margin either way.
+        Asserted DETERMINISTICALLY, not by timing. A timed doubling ratio cannot separate this
+        property from the runner: on a shared CI host, scheduler noise, frequency scaling, and
+        co-tenant cache contention inflate even a thread-CPU ratio past any bound tight enough
+        to catch a quadratic (measured 3.2x against a 3.0 bound with the property intact), so
+        the ratio form false-reds PRs whose diff never touches the matcher. What makes the scan
+        linear is structural, so it is asserted structurally, and a regression has to break one
+        of these to reintroduce super-linear cost:
+
+          1. ROUTING — the chain rules take the full-input fragment path (never the bounded
+             whole-regex fallback, whose truncation cap is pinned separately by
+             ``test_documented_bound_user_only_builtins_full_input``), and every fragment they
+             split into is a plain literal, so each is one forward ``re.search`` scan with no
+             variable-width backtracking;
+          2. INVOCATIONS — doubling the adversarial input leaves the engine-invocation trace
+             IDENTICAL (same searches, same patterns, same order), so the only thing that grows
+             with the input is the length of each single linear scan.
+
+        The small-size absolute CPU budget stays as the catastrophic-blowup backstop for cost
+        added outside the matcher, where this trace cannot see it.
         """
-        for build in (
+        from kiro_crew.security import _DENY_MATCHER_CACHE, _deny_matcher
+
+        builds = (
             lambda n: "/.ssh/ " + ("python open " * n),
             lambda n: "/.ssh/ open " + ("python open " * n),
-        ):
-            assert self._elapsed(build(2000)) < self._BUDGET_SECONDS
-            ratio = self._doubling_ratio(build, 2000)
-            assert ratio < self._MAX_DOUBLING_RATIO, (
-                f"cost grew {ratio:.1f}x when the input doubled — linear is ~2x, so this "
-                "is the super-linear backtracking the fragment split exists to prevent"
+        )
+
+        # (1) Routing: the chain rules stay on the literal-fragment fast path.
+        chain_ids = {"sensitive-file-read-python-aws", "sensitive-file-read-python-ssh"}
+        chain_rules = [r for r in BUILTIN_DENIED_RULES if r.id in chain_ids]
+        assert {r.id for r in chain_rules} == chain_ids, (
+            "the mid-dotstar chain rules under test are gone from the catalog"
+        )
+        for rule in chain_rules:
+            matcher = _deny_matcher(rule.pattern)
+            assert matcher._disabled is False
+            assert matcher._bounded is False, (
+                f"{rule.id} left the full-input fragment path — the bounded fallback "
+                "truncates, so this is both a coverage loss and the polynomial "
+                "whole-regex scan the split exists to avoid"
             )
+            fragments = [p.pattern for p in matcher._frag_res]
+            assert len(fragments) >= 3, fragments
+            for fragment in fragments:
+                assert not re.search(r"[.*+?()\[\]{}|^$]", re.sub(r"\\.", "", fragment)), (
+                    f"fragment {fragment!r} of {rule.id} is not a plain literal — a "
+                    "single forward scan is no longer guaranteed linear"
+                )
+
+        # (2) Invocations, observed through delegating stand-ins for every memoized
+        # matcher's compiled patterns.
+        trace: list[tuple[str, str]] = []
+
+        class _TracingPattern:
+            """Records each ``search`` invocation, then delegates to the real pattern."""
+
+            def __init__(self, inner: re.Pattern[str], kind: str) -> None:
+                self._inner = inner
+                self._kind = kind
+                self.pattern = inner.pattern
+
+            def search(self, text: str, *args: int) -> re.Match[str] | None:
+                trace.append((self._kind, self._inner.pattern))
+                return self._inner.search(text, *args)
+
+        # Prime the memoized cache so every effective rule's matcher exists to wrap.
+        assert is_denied(builds[0](50)) is None
+        for matcher in _DENY_MATCHER_CACHE.values():
+            if matcher._frag_res:
+                monkeypatch.setattr(
+                    matcher,
+                    "_frag_res",
+                    [_TracingPattern(p, "frag") for p in matcher._frag_res],
+                )
+            if matcher._whole_re is not None:
+                monkeypatch.setattr(
+                    matcher, "_whole_re", _TracingPattern(matcher._whole_re, "bounded")
+                )
+
+        def traced(command: str) -> list[tuple[str, str]]:
+            trace.clear()
+            # The spam matches no rule, so evaluation runs the FULL catalog — a deny
+            # would short-circuit the loop and make the traces trivially equal.
+            assert is_denied(command) is None
+            return list(trace)
+
+        for build in builds:
+            base_trace = traced(build(2000))
+            double_trace = traced(build(4000))
+            frag_searches = {p for kind, p in base_trace if kind == "frag"}
+            assert {"python", "open"} <= frag_searches, (
+                "the chain fragments never ran — the instrument is not observing the "
+                "path under test"
+            )
+            assert double_trace == base_trace, (
+                "doubling the input changed WHAT the evaluation layer executes — "
+                "per-position or retry work that scales with the input is the "
+                "super-linear backtracking the fragment split exists to prevent"
+            )
+            # Catastrophic-blowup backstop, at the small size where 5s is generous
+            # margin even under coverage instrumentation.
+            assert self._elapsed(build(2000)) < self._BUDGET_SECONDS
 
     def test_long_leading_junk_then_real_deny_needle_still_caught(self):
         # A legitimate destructive command sits AFTER a long junk prefix in its
@@ -725,6 +1278,19 @@ class TestUserRegexReDoSGate:
         for pat in self._CATASTROPHIC:
             assert not is_safe_user_regex(pat), pat
 
+    def test_wrapped_builtin_flag_run_gets_no_user_regex_exemption(self):
+        """A USER regex embedding a built-in flag-run fragment verbatim must not
+        inherit the built-in scrub: wrapping the fragment in an outer quantifier
+        nests its ``*`` and backtracks catastrophically.  Only a COMPLETE
+        built-in pattern is exempt."""
+        from kiro_crew.security import (
+            _DANGEROUS_AWS_FLAG_RUN,
+            _LINEARIZED_AWS_FLAG_RUN,
+        )
+
+        for fragment in (_DANGEROUS_AWS_FLAG_RUN, _LINEARIZED_AWS_FLAG_RUN):
+            assert not is_safe_user_regex("(?:" + fragment + ")+Z")
+
     def test_is_safe_user_regex_rejects_malformed(self):
         assert not is_safe_user_regex("(unclosed")
         assert not is_safe_user_regex("[a-")
@@ -822,18 +1388,141 @@ def _rule_pattern(rule_id: str) -> str:
     return next(r.pattern for r in BUILTIN_DENIED_RULES if r.id == rule_id)
 
 
-def _denied_by(cmd: str) -> "str | None":
+def _denied_by(cmd: str, reason_notes: "dict[str, str] | None" = None) -> "str | None":
     """Return the rule id that denied ``cmd``, or ``None`` if it is allowed.
 
     Goes through the PUBLIC gate (``is_denied``) rather than re-running the
     regex, so these tests survive a refactor of how rules are compiled.
+
+    Only the FIRST line is parsed. An operator note is appended to the refusal on
+    its own second line, so partitioning the whole string would fold that note
+    into the captured pattern and every id lookup would miss. Single-line
+    refusals (every call that passes no ``reason_notes``) are unaffected:
+    ``verdict.splitlines()[0]`` is the verdict itself.
     """
-    verdict = is_denied(cmd)
+    verdict = is_denied(cmd, reason_notes=reason_notes)
     if verdict is None:
         return None
-    _, _, pattern = verdict.partition("Blocked by security policy: ")
+    head = verdict.splitlines()[0]
+    _, _, pattern = head.partition("Blocked by security policy: ")
     by_pattern = {r.pattern: r.id for r in BUILTIN_DENIED_RULES}
     return by_pattern.get(pattern or verdict, f"<unmapped:{verdict}>")
+
+
+class TestDeniedReasonNotes:
+    """``reason_notes`` decorates a refusal; it can never change the verdict.
+
+    The note lands on a SECOND line because the first line is a machine-parsed
+    contract on both sides: ``RecoveryCard.tsx`` extracts the pattern with a
+    per-line, end-anchored regex, and ``_denied_by`` above partitions on the
+    exact ``"Blocked by security policy: "`` separator. Anything appended to the
+    same line would be captured as part of the pattern.
+    """
+
+    _USER_PATTERN = r"frobnicate.*"
+    _CMD = "frobnicate the box"
+    _NOTE = "use --dry-run instead"
+
+    def _plain(self):
+        return is_denied(self._CMD, denied_regexes=[self._USER_PATTERN])
+
+    def _annotated(self, note=None):
+        return is_denied(
+            self._CMD,
+            denied_regexes=[self._USER_PATTERN],
+            reason_notes={self._USER_PATTERN: self._NOTE if note is None else note},
+        )
+
+    def test_first_line_is_byte_identical_to_the_unannotated_form(self):
+        plain = self._plain()
+        annotated = self._annotated()
+        assert plain == f"Blocked by security policy: {self._USER_PATTERN}"
+        assert annotated.splitlines()[0] == plain
+        assert annotated == f"{plain}\n{self._NOTE}"
+        assert annotated.count("\n") == 1  # exactly two lines, no trailing newline
+
+    def test_reason_notes_none_reproduces_todays_exact_string(self):
+        assert (
+            is_denied(self._CMD, denied_regexes=[self._USER_PATTERN], reason_notes=None)
+            == self._plain()
+        )
+
+    def test_empty_map_reproduces_todays_exact_string(self):
+        assert (
+            is_denied(self._CMD, denied_regexes=[self._USER_PATTERN], reason_notes={})
+            == self._plain()
+        )
+
+    def test_pattern_with_no_note_of_its_own_is_unchanged(self):
+        # A note for a DIFFERENT pattern must not leak onto this refusal — the
+        # lookup is keyed, not "any note in the map".
+        assert (
+            is_denied(
+                self._CMD,
+                denied_regexes=[self._USER_PATTERN],
+                reason_notes={"some-other-pattern": "unrelated"},
+            )
+            == self._plain()
+        )
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t", "\n"])
+    def test_blank_note_adds_no_second_line(self, blank):
+        # ``_reason`` strips before deciding, so a blank note cannot append an
+        # empty line the reader would have to skip.
+        assert self._annotated(blank) == self._plain()
+
+    def test_note_never_changes_whether_something_matches(self):
+        # Denied stays denied; allowed stays allowed. A note is presentation
+        # only, so it can neither create nor suppress a match.
+        assert self._annotated() is not None
+        allowed = is_denied(
+            "echo hello",
+            denied_regexes=[self._USER_PATTERN],
+            reason_notes={self._USER_PATTERN: self._NOTE, "echo.*": "would match if notes matched"},
+        )
+        assert allowed is None
+        # And a note attached to a pattern that is NOT in the effective set
+        # cannot re-admit that pattern as a rule.
+        assert (
+            is_denied("echo hello", denied_regexes=[], reason_notes={"echo.*": "not a rule"})
+            is None
+        )
+
+    def test_note_does_not_change_which_pattern_matched(self):
+        # Two rules, note on the one that does NOT match: the reported pattern is
+        # still the matching one, un-annotated.
+        reason = is_denied(
+            self._CMD,
+            denied_regexes=["never-matches-this", self._USER_PATTERN],
+            reason_notes={"never-matches-this": "wrong rule"},
+        )
+        assert reason == self._plain()
+
+    def test_denied_by_resolves_the_rule_id_with_a_note_present(self):
+        # THE regression guard for ``_denied_by``: a note appended to the matched
+        # rule's refusal must not break rule-id resolution. Naively partitioning
+        # the WHOLE verdict yields "<pattern>\n<note>", which is in no lookup
+        # table, so every id-based assertion in this file would silently degrade
+        # to "<unmapped:...>". Parsing the first line keeps the id recoverable.
+        cmd = "aws ec2 terminate-instances --instance-ids i-1"
+        expected_id = _denied_by(cmd)
+        assert expected_id == "aws-destructive-ec2-terminate-instances"
+        pattern = _rule_pattern(expected_id)
+        annotated = {pattern: "open a ticket first"}
+        # Same id, even though the refusal now carries a second line.
+        assert _denied_by(cmd, annotated) == expected_id
+        verdict = is_denied(cmd, reason_notes=annotated)
+        assert verdict.splitlines() == [
+            f"Blocked by security policy: {pattern}",
+            "open a ticket first",
+        ]
+        # A note on an unrelated pattern leaves the id resolution untouched too.
+        assert _denied_by(cmd, {"unrelated-pattern": "ignore me"}) == expected_id
+
+    def test_builtin_refusals_are_single_line_by_default(self):
+        # Nothing annotates built-ins unless a caller passes a map, so the
+        # historical single-line shape is preserved for the whole catalog path.
+        assert "\n" not in is_denied("aws ec2 terminate-instances --instance-ids i-1")
 
 
 class TestBuiltinRuleMatcherShape:
@@ -959,13 +1648,13 @@ class TestSelfProtectionFloorIsAdditive:
         from kiro_crew.security import normalize_shell_command
 
         monkeypatch.setattr(_os.path, "expanduser", lambda _p: r"C:\Users\runneradmin")
-        # The guard is that this RETURNS rather than raising.  (POSIX ``shlex``
-        # then eats the backslashes, which is pre-existing behaviour for Windows
-        # paths and not what this test is about.)
+        # The guard is that this RETURNS rather than raising.
         assert normalize_shell_command(f"{_PK} {_NAME}") == [_PK, _NAME]
+        # $HOME expansion now happens AFTER shlex tokenization, so the Windows
+        # home path backslashes are preserved (not eaten by shlex).
         expanded = normalize_shell_command("ls $HOME/x")
         assert expanded[0] == "ls"
-        assert "usersrunneradmin" in expanded[1].lower().replace("\\", "")
+        assert r"C:\Users\runneradmin" in expanded[1] or "C:\\Users\\runneradmin" in expanded[1]
 
 
 class TestInterpreterArgvLiteralMint:
@@ -2722,3 +3411,371 @@ class TestCredentialMintSegmentScoping:
         mentioned_after = f"grep {_TOK}_auth.py  # in a {_NAME} worktree"
         assert _denied_by(under_path) is None
         assert _denied_by(mentioned_after) is None
+
+
+class TestSelfFloorShortCircuit:
+    """Perf gate for the self-protection floor (issue #3603).
+
+    The floor predicates tokenize the command and descend every nested shell
+    payload, which dominates deny-scan cost on complex bash. The gate
+    ``_self_floor_can_fire`` skips that descent when firing is provably
+    impossible. Ratcheted on STRUCTURE, never timing: (a) a benign command
+    performs ZERO descents; (b) every obfuscated spelling the floor denies
+    today still passes the gate, so no bypass window opens.
+    """
+
+    def _descent_calls(self, monkeypatch, text: str) -> int:
+        from kiro_crew import security
+
+        calls = {"n": 0}
+        real = security._self_token_frames
+
+        def spy(t: str):
+            calls["n"] += 1
+            return real(t)
+
+        monkeypatch.setattr(security, "_self_token_frames", spy)
+        security._is_credential_mint(text)
+        security._is_self_kill(text)
+        return calls["n"]
+
+    def test_benign_command_skips_the_descent_entirely(self, monkeypatch):
+        # The 95%+ common case: a tool name plus a path. No self name, no
+        # shell machinery — the recursive tokenize-and-descend must not run.
+        for benign in (
+            "fs_read /workplace/user/project/src/main.py",
+            "ls -la /tmp/foo",
+            "git status",
+            "cat notes.txt",
+            "npm run build",
+        ):
+            assert self._descent_calls(monkeypatch, benign) == 0, (
+                f"descent ran for benign input: {benign!r}"
+            )
+
+    def test_name_carrying_command_still_descends(self, monkeypatch):
+        # A real candidate must reach the full structural scan.
+        assert self._descent_calls(monkeypatch, "kirocrew token") >= 1
+        assert self._descent_calls(monkeypatch, "pkill -f kirocrew") >= 1
+
+    def test_gate_is_a_necessary_condition_not_a_name_grep(self):
+        """Every obfuscated spelling the floor denies must pass the gate.
+
+        The issue proposed gating on a raw ``_SELF_NAME_RE`` search; that is
+        UNSOUND — each input below fires a predicate today while its raw text
+        never matches ``kiro[-.]?crew``. The gate must answer True for all of
+        them (over-matching is safe; under-matching is a bypass).
+        """
+        from kiro_crew import security
+
+        for evasive in (
+            "python -m kiro_crew token",  # underscored module spelling
+            "[k]irocrew token",  # one-char bracket class
+            "kiro$()crew token",  # empty command substitution
+            "kiro${x:-crew} token",  # parameter default
+            'bash -c "\\x6birocrew token"',  # printf hex escape
+            'k""iro""crew token',  # empty-string concatenation
+            "kiro?rew token",  # glob the shell expands before exec
+            "kill $(pgrep -f kirocrew)",  # bare kill via substitution
+            'python -c "exec(__import__(\'base64\').b64decode(\'x\'))" token',
+        ):
+            assert security._self_floor_can_fire(evasive), (
+                f"gate would bypass the floor for {evasive!r}"
+            )
+
+    def test_gated_predicates_still_deny_the_obfuscation_corpus(self):
+        """End-to-end: the predicates (with the gate in front) keep firing."""
+        from kiro_crew import security
+
+        for mint in (
+            "[k]irocrew token",
+            "kiro$()crew token",
+            "kiro${x:-crew} token",
+            'bash -c "\\x6birocrew token"',
+            'k""iro""crew token',
+            "kiro?rew token",
+        ):
+            assert security._is_credential_mint(mint), f"mint not caught: {mint!r}"
+        assert security._is_self_kill("kill $(pgrep -f kirocrew)")
+        assert security._is_self_kill("pkill -f kirocrew")
+
+    def test_gate_declines_plain_text_without_machinery(self):
+        from kiro_crew import security
+
+        for plain in (
+            "ls -la /tmp/foo",
+            "git status",
+            "grep token app.log",
+            "cat /workplace/user/notes.txt",
+        ):
+            assert not security._self_floor_can_fire(plain), (
+                f"gate over-triggered on {plain!r}"
+            )
+
+    def test_tilde_expansion_still_reaches_the_floor(self, monkeypatch):
+        """``pkill -f ~`` IS a self-kill whenever $HOME lies under the product
+        tree: the kill predicates expanduser their targets, so the raw text
+        carries neither the self name nor any other machinery character.
+        ``~`` must therefore be in the machinery class, or the gate opens a
+        real bypass (pre-push review finding).
+        """
+        from kiro_crew import security
+
+        # expanduser reads HOME on POSIX but USERPROFILE on Windows — set
+        # both so the tilde target resolves under the product tree everywhere.
+        monkeypatch.setenv("HOME", "/opt/kiro-crew")
+        monkeypatch.setenv("USERPROFILE", "/opt/kiro-crew")
+        for kill in ("pkill -f ~", "killall ~", "pkill -f ~/"):
+            assert security._self_floor_can_fire(kill), (
+                f"gate would bypass the floor for {kill!r}"
+            )
+        # End-to-end: the gated predicate still denies it.
+        assert security._is_self_kill("pkill -f ~")
+
+    def test_quote_glued_dynamic_exec_still_reaches_the_floor(self):
+        """Empty-quote glue hides the dynamic-exec verb exactly as it hides the
+        name.  ``python -c "ex""ec(...)"`` carries no product name, no machinery
+        character, and no *raw* ``exec(`` — yet the floor denies it as a
+        credential mint, because the tokenizer removes the quotes before
+        ``_inline_payload_reaches_cli`` looks.  The gate must therefore search
+        the dynamic-exec marker on the quote-stripped text too, not only on the
+        raw text (pre-merge review finding, confirmed by two reviewers).
+        """
+        from kiro_crew import security
+
+        glued = "ex" + '""' + "ec"
+        cmd = f'python -c "{glued}(open(chr(47)).read())"'
+
+        # Precondition: none of the other branches can catch this input, so the
+        # test genuinely exercises the stripped dynamic-exec branch.
+        assert not security._SELF_FLOOR_NAME_HINT_RE.search(cmd)
+        assert not security._SELF_FLOOR_MACHINERY_RE.search(cmd)
+        assert not security._INLINE_DYNAMIC_EXEC_RE.search(cmd)
+
+        assert security._self_floor_can_fire(cmd), (
+            "gate would bypass the floor for quote-glued dynamic exec"
+        )
+        # And the floor's verdict survives the gate: still denied end-to-end.
+        assert security._is_credential_mint(cmd)
+
+
+class TestStdinProgramTextScoping:
+    """A stdin-reading interpreter is judged on its PROGRAM, not on its neighbours.
+
+    Regression for #2660.  ``normalize_shell_command`` does not split a frame on a
+    newline, so a multi-line script arrives as ONE token frame.  The stdin branch of
+    ``_has_self_importing_inline_program`` used to search that whole frame for the
+    import name, which made an unrelated neighbour's FILE PATH satisfy the check --
+    a benign ``python - <<'PY' … PY`` in the same script as any command naming a
+    ``kiro_crew`` path read as a credential mint, with no ``token`` word anywhere.
+    """
+
+    # Every one of these is read-only or a formatter run, and none carries the mint
+    # verb.  The product name appears ONLY as a file path handed to another program.
+    BENIGN_NEIGHBOUR = (
+        # The report's own case 2, reduced: format two source files, then edit one
+        # through a heredoc whose payload does not import anything.
+        "isort src/kiro_crew/mcp_core.py\npython3 - <<'PY'\nprint(1)\nPY",
+        # The same shape behind the other two separators a frame preserves.
+        "isort src/kiro_crew/x.py && python3 -",
+        "black src/kiro_crew/security.py; python3 - <<'PY'\nprint(2)\nPY",
+        # Order does not matter: the neighbour may follow the interpreter too.
+        "python3 - <<PY\nprint(1)\nPY\nisort src/kiro_crew/x.py",
+        # A here-string whose payload is harmless, next to a product-named path.
+        "isort src/kiro_crew/x.py\npython3 - <<<'print(1)'",
+        # A substitution operand whose text is harmless, next to a product-named path.
+        "isort src/kiro_crew/x.py\npython3 - <<<$(printf %s 'print(1)')",
+        # A stdin redirect belonging to ANOTHER command, with no interpreter in play.
+        "isort src/kiro_crew/x.py\ncat < notes.txt",
+        # A pipe that does NOT feed this interpreter (it consumes its output).
+        "python3 - <<PY\nprint(1)\nPY\n| grep kiro_crew",
+    )
+
+    # Every way the shell can put a PROGRAM on a simple command's stdin, at every
+    # position it is allowed to appear.  Enumerated from the shell grammar rather than
+    # grown one review round at a time: the first revision covered only the heredoc,
+    # here-string and post-program spellings, and every omission was a real bypass.
+    REAL_STDIN_REACH = (
+        # Heredoc body, in every spelling of the marker.
+        "python3 - <<'PY'\nimport kiro_crew\nPY",
+        "python3 - <<-PY\nimport kiro_crew\nPY",
+        "python3 - << PY\nimport kiro_crew\nPY",
+        "python << 'PY'\nimport kiro_crew\nPY",
+        # An unterminated heredoc runs to the end of the frame (over-block, not under).
+        "python3 - <<PY\nimport kiro_crew\n",
+        # A body LINE that merely CONTAINS the tag word is not a closing delimiter:
+        # bash closes only on a line holding it ALONE, and line structure does not
+        # survive tokenizing, so the body must end at the LAST occurrence of the tag.
+        # `# EOF` is an ordinary Python comment and was enough to close it early.
+        "python3 - <<EOF\n# EOF\nimport kiro_crew\nEOF",
+        "python3 - <<EOF\nx = 1  # EOF\nimport kiro_crew\nEOF",
+        "python3 - <<PY\nprint('PY')\nimport kiro_crew\nPY",
+        # A command AFTER the closing tag is a NEW command, not this interpreter's
+        # script argument -- reading it as one made the detector answer False and
+        # skipped the branch entirely, leaving the heredoc payload unscanned.
+        "python3 <<PY\nimport kiro_crew\nPY\necho ok",
+        "python3 - <<PY\nimport kiro_crew\nPY; echo ok",
+        "python3 - <<PY\nimport kiro_crew\nPY && echo ok",
+        # HERE-STRING: the operand itself is the program on stdin. `<<<` also starts with
+        # `<<`, so reading it as a heredoc made the payload a delimiter and dropped it.
+        "python3 - <<<'import kiro_crew'",
+        "python3 -<<<'import kiro_crew'",
+        "python3 <<<'import kiro_crew'",
+        "python3 - <<< 'import kiro_crew'",
+        "python3 - <<<$'import kiro_crew'",
+        # Pipe producer -- the left side writes this interpreter's stdin.  Every
+        # spacing spelling, because the tokenizer splits on whitespace only, so the
+        # operator glues into a neighbouring word and `|` is often NOT its own token.
+        "echo 'import kiro_crew' | python3 -",
+        "echo 'import kiro_crew'|python3 -",
+        "echo 'import kiro_crew' |python3 -",
+        "echo 'import kiro_crew'| python3 -",
+        "cat src/kiro_crew/cli.py | python3 -",
+        "cat src/kiro_crew/cli.py|python3 -",
+        "printf 'import kiro_crew'|python3",
+        "echo 'import kiro_crew' | python3",
+        # Stdin redirect -- the file's CONTENT becomes the program.
+        "python3 - < src/kiro_crew/cli.py",
+        "python3 -<src/kiro_crew/cli.py",
+        "python3 - 0< src/kiro_crew/cli.py",
+        # Process substitution and command substitution -- the operand is one shell WORD
+        # whose text carries whitespace, so it spans tokens to its closing delimiter.
+        "python3 - < <(echo 'import kiro_crew')",
+        'python3 - <<<$(printf %s "import kiro_crew")',
+        "python3 - <<<`printf %s 'import kiro_crew'`",
+        'python3 - <<<"${x:-import kiro_crew}"',
+        'python3 - < $(printf %s "src/kiro_crew/cli.py")',
+        "python3 - <<<$(cat src/kiro_crew/cli.py)",
+        # A QUOTED delimiter inside the substitution: quoting is stripped before this
+        # code sees the tokens, so balancing the count is not decidable and the operand
+        # must span to the LAST closer.
+        "python3 - <<<$(true ')'; printf %s \"import kiro_crew\")",
+        'python3 - <<<$(echo ")" ; printf %s "import kiro_crew")',
+        # A split operand with NO `-`, where the detector must consume the whole operand
+        # rather than read the substitution's second token as a script path.
+        'python <<< $(printf %s "import kiro_crew")',
+        'python3 <<< $(printf %s "import kiro_crew")',
+        'python3 < $(printf %s "src/kiro_crew/cli.py")',
+        # A redirection may appear ANYWHERE in a simple command, before the program
+        # name included.  These are ordinary bash and reach the identical mint.
+        "<<'PY' python -\nimport kiro_crew\nPY",
+        "<<PY python3 -\nimport kiro_crew\nPY",
+        "<src/kiro_crew/cli.py python3 -",
+        "< src/kiro_crew/cli.py python3 -",
+        "<<<'import kiro_crew' python3 -",
+        # ... a marker and its BODY may straddle the program name, so the carrier walk
+        # cannot be split per side of the interpreter without losing the association.
+        "<<EOF python -\nimport kiro_crew\nEOF",
+        "<<EOF python3 -\nimport kiro_crew\nEOF",
+        "<< EOF python -\nimport kiro_crew\nEOF",
+        # ... including GLUED to the program name with no space at all, which is one
+        # single token: `python3<<<'…'`.  Excluding the interpreter's own token from the
+        # walk is what missed these.
+        'python3<<<"import kiro_crew"',
+        "python3<<<'import kiro_crew'",
+        "python3<src/kiro_crew/cli.py",
+        "python3<<PY\nimport kiro_crew\nPY",
+        "python3<<-PY\nimport kiro_crew\nPY",
+        "python<<<'import kiro_crew'",
+        "python<<EOF\nimport kiro_crew\nEOF",
+        "python3<<EOF\nimport kiro_crew\nEOF",
+    )
+
+    def test_benign_neighbour_no_longer_reads_as_a_mint(self):
+        from kiro_crew import security
+
+        for cmd in self.BENIGN_NEIGHBOUR:
+            assert not security._is_credential_mint(cmd.lower()), f"frame contamination: {cmd!r}"
+            assert security.is_denied(cmd) is None, f"frame contamination: {cmd!r}"
+
+    def test_real_stdin_reach_stays_denied(self):
+        from kiro_crew import security
+
+        for cmd in self.REAL_STDIN_REACH:
+            assert security.is_denied(cmd) is not None, f"stdin reach not blocked: {cmd!r}"
+
+    def test_carriers_are_the_only_search_space(self):
+        """The helper yields program text and nothing else.
+
+        Asserted on the helper directly, so the SCOPE is pinned rather than only its
+        effect on one deny verdict.
+        """
+        from kiro_crew import security
+
+        tokens = security.normalize_shell_command(
+            "isort src/kiro_crew/mcp_core.py\npython3 - <<'PY'\nprint(1)\nPY"
+        )
+        i = tokens.index("python3")
+        assert list(security._stdin_program_text(tokens, i)) == ["print(1)"]
+
+        piped = security.normalize_shell_command("echo 'import kiro_crew' | python3 -")
+        j = piped.index("python3")
+        assert "import kiro_crew" in list(security._stdin_program_text(piped, j))
+
+    def test_bare_interpreter_with_a_heredoc_is_recognised_as_reading_stdin(self):
+        """``python << 'PY' … PY`` (no ``-``) really does read its program from stdin.
+
+        ``_python_reads_stdin`` classified this FALSE: it consulted
+        ``_normalize_operand``, which strips a redirection to the empty string, so its
+        heredoc branch was unreachable and the first word of the BODY read as a script
+        path.  The form was denied anyway, but only by accident -- the closing tag
+        ``PY`` matched ``_PYTHON_PROGRAM_RE`` and the old frame-wide scan then found
+        the import anywhere in the frame.  Once the scan is scoped to real carriers
+        that accident stops covering it, so the detector has to be right.
+        """
+        from kiro_crew import security
+
+        for cmd, expect_stdin in (
+            ("python << 'PY'\nimport kiro_crew\nPY", True),
+            ("python <<PY\nimport kiro_crew\nPY", True),
+            ("python <<-PY\nimport kiro_crew\nPY", True),
+            ("python <<<'import kiro_crew'", True),
+            ("python <<< 'import kiro_crew'", True),
+            ('python <<< $(printf %s "import kiro_crew")', True),
+            ("python < prog.py", True),
+            ("python script.py", False),
+            ("python script.py < input.txt", False),
+            ("python -c 'print(1)'", False),
+            ("python -m kiro_crew gateway", False),
+        ):
+            frame = security.normalize_shell_command(cmd)
+            i = next(
+                k
+                for k, t in enumerate(frame)
+                if security._PYTHON_PROGRAM_RE.match(security._program_basename(t.lower()))
+            )
+            assert security._python_reads_stdin(frame[i + 1 :]) is expect_stdin, cmd
+
+    def test_a_pipe_anywhere_left_is_a_known_over_block(self):
+        """The producer branch over-yields on a pipe that does not feed the interpreter.
+
+        ``a | b; python -`` pipes into ``b``, not into the interpreter, yet the whole
+        left side is still treated as program text.  Pinned as a KNOWN over-block
+        rather than tightened: the alternative -- requiring the pipe to be adjacent --
+        is what let all four no-space spellings through, because the tokenizer glues
+        the operator into a neighbouring word.  A missed producer is a bypass; an extra
+        token is a visible refusal.  If this assertion ever flips, the tightening that
+        did it must be checked against the no-space spellings above.
+        """
+        from kiro_crew import security
+
+        assert security.is_denied("grep kiro_crew src | head; python3 -") is not None
+
+    def test_rule_does_not_fire_on_its_own_pattern_text(self):
+        """Quoting this rule must not trip it.
+
+        ``credential-exfil-kirocrew-token``'s code comment claims this exemption
+        ("a regex LITERAL quoting this very rule ... from reading as a mint"), and
+        #2660 reported the claim failing in practice.  Pin it so discussing,
+        documenting or testing the rule by quoting it stays possible.
+        """
+        from kiro_crew import security
+
+        rule = next(
+            r for r in security.BUILTIN_DENIED_RULES if r.id == "credential-exfil-kirocrew-token"
+        )
+        for cmd in (
+            f'grep -n "{rule.pattern}" notes.txt',
+            f"echo {rule.pattern!r} >> notes.txt",
+        ):
+            assert security.is_denied(cmd) is None, f"rule fires on its own text: {cmd!r}"

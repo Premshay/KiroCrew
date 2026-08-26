@@ -3,7 +3,11 @@ import { useEffect, useState } from 'react'
 import { X, Keyboard } from 'lucide-react'
 import { DEFAULT_SHORTCUTS, formatShortcut, SHORTCUT_GROUPS, shortcutGroupLabel, shortcutLabel, SHORTCUTS_ENABLED_KEY, SHORTCUTS_ENABLED_EVENT, IS_MAC, MAC_CTRL_DIGITS_KEY } from '../hooks/useKeyboardShortcuts'
 import { useQuickSearchShortcut } from '../hooks/useQuickSearchShortcut'
-import { formatQuickSearchKeys } from '../lib/quickSearchShortcut'
+import { usePanelToggleShortcuts } from '../hooks/usePanelToggleShortcuts'
+import { useGlobalHotkey } from '../hooks/useGlobalHotkey'
+import { formatQuickSearchKeys, formatChordKeys } from '../lib/quickSearchShortcut'
+import { PANEL_TOGGLE_IDS, type PanelToggleId } from '../lib/panelToggleShortcuts'
+import { formatAcceleratorKeys } from '../lib/globalHotkey'
 import { isElectron } from '../lib/electron'
 import { Toggle } from './ui'
 
@@ -133,8 +137,69 @@ export function SearchEverywhereRow() {
   )
 }
 
+/**
+ * Catalog KEY for each panel-toggle's display label. Kept beside the shortcut
+ * display surfaces (not in the pure `panelToggleShortcuts` lib, which carries no
+ * i18n) and shared by the Alt+K modal and Settings → Shortcuts so their labels
+ * cannot drift.
+ */
+export const PANEL_TOGGLE_LABEL_KEY: Record<PanelToggleId, string> = {
+  'left-sidebar': 'hooks.useKeyboardShortcuts.toggle_left_sidebar',
+  'session-panel': 'hooks.useKeyboardShortcuts.toggle_session_panel',
+  'side-panel': 'hooks.useKeyboardShortcuts.toggle_side_panel',
+}
+
+/**
+ * Read-only reference rows for the three user-rebindable panel toggles. Their
+ * bindings live outside DEFAULT_SHORTCUTS (they are user-configurable and may be
+ * unbound), so the caps reflect the live binding — or a muted "not set" when the
+ * user has cleared it. Editing happens in Settings → Shortcuts.
+ */
+export function PanelToggleRows() {
+  const { bindings } = usePanelToggleShortcuts()
+  return (
+    <>
+      {PANEL_TOGGLE_IDS.map(id => {
+        const chord = bindings[id]
+        return (
+          <div key={id} className="flex items-center justify-between py-1.5 px-2 rounded-md hover:bg-bg-hover transition-colors">
+            {/* A div, not a span: the label and the "Not set" state are separate
+                catalog units; a block label ends the inline text run so the i18n
+                render gate never sees them joined into one string. */}
+            <div className="text-[13px] text-text">{i18nT(PANEL_TOGGLE_LABEL_KEY[id])}</div>
+            {chord
+              ? <span className="flex items-center gap-1"><KeyCapSequence caps={formatChordKeys(chord)} plus /></span>
+              : <div className="text-muted text-[11px]">{i18nT('components.shortcutsModal.unset')}</div>}
+          </div>
+        )
+      })}
+    </>
+  )
+}
+
+/**
+ * Desktop-only reference row for the system-wide summon hotkey. Lives outside
+ * DEFAULT_SHORTCUTS because it is not a renderer chord at all: the desktop
+ * shell's main process registers it OS-wide (electron/global-hotkey.js) and it
+ * works while the app is in the background. Renders the accelerator as
+ * ACTUALLY bound — {@link useGlobalHotkey} returns null in a plain browser and
+ * when nothing could be bound, and the whole row is hidden rather than
+ * advertising a chord that does not work.
+ */
+export function GlobalHotkeyRow() {
+  const hotkey = useGlobalHotkey()
+  if (!hotkey) return null
+  return (
+    <ShortcutRow
+      label={i18nT('components.shortcutsModal.show_or_focus_the_kiro_crew_window')}
+      keys={formatAcceleratorKeys(hotkey.accelerator, IS_MAC)}
+    />
+  )
+}
+
 export default function ShortcutsModal({ onClose }: { onClose: () => void }) {
   const { enabled, macCtrl, toggle, toggleMacCtrl } = useShortcutPrefs()
+  const globalHotkey = useGlobalHotkey()
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -176,6 +241,21 @@ export default function ShortcutsModal({ onClose }: { onClose: () => void }) {
             <SearchEverywhereRow />
           </div>
         </div>
+        <div className="mb-5 last:mb-0">
+          <div className="text-[12px] font-medium text-muted uppercase tracking-wider mb-2">{i18nT('components.shortcutsModal.panel_toggles')}</div>
+          <div className="grid gap-1">
+            <PanelToggleRows />
+          </div>
+        </div>
+        {globalHotkey && (
+          <div className="mb-5 last:mb-0">
+            <div className="text-[12px] font-medium text-muted uppercase tracking-wider mb-2">{i18nT('components.shortcutsModal.desktop_app')}</div>
+            <div className="grid gap-1">
+              <GlobalHotkeyRow />
+            </div>
+            <div className="text-[11px] text-muted mt-1 px-2">{i18nT('components.shortcutsModal.global_hotkey_hint')}</div>
+          </div>
+        )}
         <div className="mt-4 pt-3 border-t border-border flex items-center justify-between">
           <span className="flex items-center gap-2 text-[12px] text-muted cursor-pointer">
             <Toggle checked={enabled} onChange={toggle} label={i18nT('components.shortcutsModal.enable_shortcuts')} />

@@ -1,12 +1,15 @@
 """Tests for CLI module."""
 
 import argparse
+import asyncio
 import contextlib
 import hashlib
 import json
 import os
 import subprocess
 import sys
+import threading
+import types
 import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -75,7 +78,11 @@ def _healthy_agent_file(path: Path) -> None:
         allowed=refs,
         servers={
             name: {
-                "command": "/usr/local/bin/kirocrew",
+                # sys.executable, not a literal like /usr/local/bin/kirocrew:
+                # doctor's dead-path scan stats every absolute command for real
+                # (no shutil.which stub covers it), so the fixture's "healthy"
+                # spec must name a binary that actually exists on the runner.
+                "command": sys.executable,
                 # The subcommand is the server name minus the "kirocrew-" prefix
                 # ("kirocrew-core" -> "mcp-core"), matching the real invocation.
                 "args": [f"mcp-{name.split('-', 1)[1]}"],
@@ -117,6 +124,17 @@ class TestDoctor:
 
         monkeypatch.setattr(_doc, "_load_llama_class", lambda: object)
         monkeypatch.setattr(_doc, "model_file_present", lambda path=None: False)
+
+    @pytest.fixture(autouse=True)
+    def _hermetic_sandbox(self, monkeypatch):
+        """Pin the Sandbox section host-independently: a CI runner can restrict
+        user namespaces with no profile installed, which is a genuine issue on
+        that HOST (doctor exits 1 for it) but not the subject of these tests."""
+        import kiro_crew.cli_doctor as _doc
+
+        monkeypatch.setattr(
+            _doc.sandbox, "detect_backend", lambda config_mode="auto": "namespace"
+        )
 
     def test_doctor_with_kiro(self, tmp_path):
         agent_file = tmp_path / "kirocrew.json"
@@ -177,6 +195,68 @@ class TestDoctor:
         ):
             # Must NOT raise SystemExit(1): the two STT gaps are notes on Windows.
             _doctor()
+
+    @pytest.mark.parametrize(
+        "is_windows, expected_mark",
+        [(False, "❌"), (True, "⚠️ ")],
+        ids=["posix-fatal", "windows-note"],
+    )
+    def test_doctor_stt_marker_arms_match_platform(
+        self, tmp_path, capsys, monkeypatch, is_windows, expected_mark
+    ):
+        """The whisper/ffmpeg severity marker is derived once (stt_mark) from
+        stt_fatal: a hard-issue mark on POSIX, a note mark on Windows. Pins
+        both arms byte-for-byte — including the note mark's trailing pad
+        space, which keeps the report columns aligned — AND that the twin
+        report lines can never disagree, so a one-arm edit to either site
+        fails here (issue #5096)."""
+        import kiro_crew.cli_doctor as _doc
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        agent_file = tmp_path / "kirocrew.json"
+        _healthy_agent_file(agent_file)
+        mock_run = MagicMock(returncode=0, stdout="kiro-cli 1.0.0", stderr="")
+        monkeypatch.setattr(_doc.platform_compat, "IS_WINDOWS", is_windows)
+
+        # STT enabled with whisper provider, neither binary present — the
+        # autouse fixture pins STT OFF, so re-enable here.
+        def _cfg_with_stt() -> KiroCrewConfig:
+            cfg = KiroCrewConfig()
+            cfg.stt.enabled = True
+            cfg.stt.provider = "whisper"
+            return cfg
+
+        monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: _cfg_with_stt()))
+        monkeypatch.setattr(_doc, "_find_whisper", lambda path=None: None)
+        monkeypatch.setattr(_doc, "ensure_ffmpeg_in_path", lambda: None)
+
+        def _which(binary, **_kw):
+            # Everything resolves EXCEPT the two STT binaries.
+            if binary in ("whisper", "ffmpeg"):
+                return None
+            return f"/usr/local/bin/{binary}"
+
+        with (
+            patch("kiro_crew.cli_doctor.shutil.which", side_effect=_which),
+            patch("kiro_crew.cli_doctor.KIRO_AGENTS_DIR", tmp_path),
+            patch("kiro_crew.cli_doctor.subprocess.run", return_value=mock_run),
+            patch("urllib.request.urlopen", side_effect=urllib.error.URLError("no gateway")),
+            patch("kiro_crew.cli_doctor.is_local_only", return_value=True),
+            patch("kiro_crew.cli_doctor.config_dir", return_value=tmp_path),
+            patch("kiro_crew.cli_doctor.probe_server", side_effect=_noop_probe_server),
+        ):
+            # On POSIX the two gaps are hard issues and doctor exits 1; on
+            # Windows they are notes. Exit semantics are pinned elsewhere —
+            # here only the printed markers matter.
+            try:
+                _doctor()
+            except SystemExit:
+                pass
+        out = capsys.readouterr().out
+        # Exact literals from the production f-strings: any drift in glyph,
+        # variation selector, or the note arm's padding space fails here.
+        assert f"  whisper:     {expected_mark} not found" in out
+        assert f"  ffmpeg:      {expected_mark} not found" in out
 
     def test_doctor_reports_platform_boot_error_without_crashing(self, tmp_path, capsys):
         """A PlatformCompositionError from boot must be REPORTED by the doctor,
@@ -338,14 +418,14 @@ class TestSetupWorkspaceDir:
         assert "Default:" in output
 
 
-# Common patches for _update tests — simulate a source tree with a git pull that has changes
-_UPDATE_PATCHES = {
-    "KIROCREW_PROJECT_DIR": "/fake/proj",
-}
+# The _update tests simulate a source tree whose git calls are faked. The project
+# root has to be a REAL directory, because update detection resolves git's answer
+# to one — so each test takes it from its own tmp_path rather than a module-level
+# temp dir, which would be created at collection time and outlive the run.
 
 
 def _patch_path():
-    """Mock Path so .git check passes, .install-method is absent, and .brazil dir exists."""
+    """Mock Path so .install-method is absent and the .brazil dir exists."""
     mock_git_dir = MagicMock(
         is_dir=MagicMock(return_value=True), exists=MagicMock(return_value=True)
     )
@@ -367,6 +447,24 @@ def _patch_path():
     return patch("kiro_crew.cli_server.Path", return_value=mock_path_inst)
 
 
+@contextlib.contextmanager
+def _git_resolvable():
+    """Pin git's resolution so these tests do not depend on the host's layout.
+
+    The probe resolves git from fixed system directories rather than ``PATH``, and
+    on Windows git legitimately lives under ``C:\\Program Files\\Git`` — not in
+    System32 — so the real lookup declines and the probe never reaches the mocked
+    ``subprocess.run`` these tests drive detection through. That is correct product
+    behaviour (it degrades to the on-disk repository markers), but it makes the
+    test assert the host's git layout instead of the failure handling it is about.
+    """
+    with patch(
+        "kiro_crew.platform.update_capability.trusted_system_bin",
+        return_value="/usr/bin/git",
+    ):
+        yield
+
+
 class TestUpdateFailures:
     """Tests for _update build-step failure handling (public pip/git flow).
 
@@ -375,37 +473,53 @@ class TestUpdateFailures:
     A non-zero return code from a critical step exits with code 1.
     """
 
-    @patch.dict("os.environ", _UPDATE_PATCHES)
-    def test_git_fetch_failure_exits(self):
+    def test_git_fetch_failure_exits(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_capability.running_from_checkout",
+            lambda root, **kw: True,
+        )
+
         def _side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
             m = MagicMock()
             m.returncode = 0
             m.stdout = ""
             m.stderr = ""
-            if cmd and "rev-parse" in cmd:
+            if cmd and "--show-toplevel" in cmd:
+                m.stdout = str(tmp_path)
+            elif cmd and "rev-parse" in cmd:
                 m.stdout = "beta-braveheart"
             if cmd and "fetch" in cmd:
                 m.returncode = 1
                 m.stderr = "network error"
             return m
 
-        with _patch_path(), patch("subprocess.run", side_effect=_side_effect):
+        with _patch_path(), _git_resolvable(), patch(
+            "subprocess.run", side_effect=_side_effect
+        ):
             try:
                 _update()
                 assert False, "Expected SystemExit"
             except SystemExit as e:
                 assert e.code == 1
 
-    @patch.dict("os.environ", _UPDATE_PATCHES)
-    def test_pip_install_failure_exits(self):
+    def test_pip_install_failure_exits(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_capability.running_from_checkout",
+            lambda root, **kw: True,
+        )
+
         def _side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
             m = MagicMock()
             m.returncode = 0
             m.stdout = ""
             m.stderr = ""
-            if cmd and "rev-parse" in cmd:
+            if cmd and "--show-toplevel" in cmd:
+                m.stdout = str(tmp_path)
+            elif cmd and "rev-parse" in cmd:
                 m.stdout = "beta-braveheart"
             # git diff --quiet returns 1 when there ARE new commits
             if cmd and "diff" in cmd and "--quiet" in cmd:
@@ -413,14 +527,22 @@ class TestUpdateFailures:
             # pip install -e . fails
             if cmd and "pip" in cmd and "install" in cmd:
                 m.returncode = 1
-                m.stderr = "build failed"
+                # BYTES: the install captures without text=True.
+                m.stderr = b"build failed"
+                m.stdout = b""
             return m
 
         with (
             _patch_path(),
+            _git_resolvable(),
             patch("kiro_crew.cli_server.shutil.which", return_value=None),
             patch("kiro_crew.cli_server.build_frontend_sync"),
             patch("kiro_crew.cli._ensure_node"),
+            # Pin the install route to the reinstall this test is about; the real
+            # probe reads the test interpreter's own Scripts dir, and the origin
+            # guard would otherwise run the stubbed interpreter for its answer.
+            patch("kiro_crew.dep_sync.locked_console_scripts", return_value=[]),
+            patch("kiro_crew.dep_sync.venv_not_mapped_to", return_value=None),
             patch("subprocess.run", side_effect=_side_effect),
         ):
             try:
@@ -971,7 +1093,7 @@ class TestCronCli:
             "--agent",
             "ea-briefing",
         ]
-        with patch.object(sys, "argv", argv), patch("kiro_crew.cli._cron") as mock_cron:
+        with patch.object(sys, "argv", argv), patch("kiro_crew.cli_commands._cron") as mock_cron:
             from kiro_crew.cli import main
 
             main()
@@ -994,7 +1116,7 @@ class TestCronCli:
             "--every",
             "300",
         ]
-        with patch.object(sys, "argv", argv), patch("kiro_crew.cli._cron") as mock_cron:
+        with patch.object(sys, "argv", argv), patch("kiro_crew.cli_commands._cron") as mock_cron:
             from kiro_crew.cli import main
 
             main()
@@ -1013,7 +1135,7 @@ class TestCronCli:
             "--agent",
             "oncall-agent",
         ]
-        with patch.object(sys, "argv", argv), patch("kiro_crew.cli._cron") as mock_cron:
+        with patch.object(sys, "argv", argv), patch("kiro_crew.cli_commands._cron") as mock_cron:
             from kiro_crew.cli import main
 
             main()
@@ -1034,12 +1156,60 @@ class TestCronCli:
             "--name",
             "renamed",
         ]
-        with patch.object(sys, "argv", argv), patch("kiro_crew.cli._cron") as mock_cron:
+        with patch.object(sys, "argv", argv), patch("kiro_crew.cli_commands._cron") as mock_cron:
             from kiro_crew.cli import main
 
             main()
             ns = mock_cron.call_args[0][0]
             assert ns.agent is None
+
+    def test_cron_remove_emits_sel_audit(self):
+        # Single-job delete must be SEL-audited like cron.add/cron.update:
+        # after the job vanishes from crons.json the audit trail is the only
+        # way to tell a deliberate delete from data loss.
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel") as mock_sel,
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.remove_job.return_value = True
+            args = argparse.Namespace(cron_action="remove", job_id="abc123")
+            _cron(args)
+            mock_svc.remove_job.assert_called_once_with(
+                "abc123", actor="cli", source="cli"
+            )
+            mock_sel.return_value.log_api_access.assert_not_called()
+
+    def test_cron_remove_not_found_audits_not_found(self):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel") as mock_sel,
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.remove_job.return_value = False
+            args = argparse.Namespace(cron_action="remove", job_id="ghost")
+            _cron(args)
+            mock_svc.remove_job.assert_called_once_with(
+                "ghost", actor="cli", source="cli"
+            )
+            mock_sel.return_value.log_api_access.assert_not_called()
+
+    def test_cron_remove_succeeds_when_audit_raises(self, capsys):
+        # The first sel() of a process constructs the log and can raise; the
+        # job is already removed by then, so the command must still report the
+        # completed delete instead of crashing.
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel") as mock_sel,
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.remove_job.return_value = True
+            args = argparse.Namespace(cron_action="remove", job_id="abc123")
+            _cron(args)
+            out = capsys.readouterr()
+            assert "Removed job: abc123" in out.out
+            assert out.err == ""
+            mock_sel.assert_not_called()
 
 
 class TestPortEnvValidatedAtEntry:
@@ -1062,7 +1232,7 @@ class TestPortEnvValidatedAtEntry:
             monkeypatch.setenv("KIROCREW_PORT", bad)
             dispatched = []
             with patch.object(sys, "argv", ["kirocrew", "cron", "list"]), patch(
-                "kiro_crew.cli._cron", lambda _ns: dispatched.append(True)
+                "kiro_crew.cli_commands._cron", lambda _ns: dispatched.append(True)
             ):
                 from kiro_crew.cli import main
 
@@ -1078,7 +1248,7 @@ class TestPortEnvValidatedAtEntry:
         monkeypatch.setenv("KIROCREW_PORT", "5477")
         dispatched = []
         with patch.object(sys, "argv", ["kirocrew", "cron", "list"]), patch(
-            "kiro_crew.cli._cron", lambda _ns: dispatched.append(True)
+            "kiro_crew.cli_commands._cron", lambda _ns: dispatched.append(True)
         ):
             from kiro_crew.cli import main
 
@@ -1101,6 +1271,10 @@ class TestSandboxActiveMarkerCleared:
         import sys
 
         monkeypatch.setenv("KIROCREW_SANDBOX_ACTIVE", "1")
+        # The companion tier record must be dropped with it: a stale inherited
+        # level would be read as the ACTIVE tier by a descendant's passthrough
+        # and corrupt its downgrade audit.
+        monkeypatch.setenv("KIROCREW_SANDBOX_LEVEL", "strict")
         # A trivial subcommand so main() dispatches and returns cleanly; assert
         # the marker was popped before dispatch (patch the target to observe).
         argv = ["kirocrew", "cron", "list"]
@@ -1108,13 +1282,16 @@ class TestSandboxActiveMarkerCleared:
 
         def _capture(_ns):
             seen["marker"] = os.environ.get("KIROCREW_SANDBOX_ACTIVE")
+            seen["level"] = os.environ.get("KIROCREW_SANDBOX_LEVEL")
 
-        with patch.object(sys, "argv", argv), patch("kiro_crew.cli._cron", _capture):
+        with patch.object(sys, "argv", argv), patch("kiro_crew.cli_commands._cron", _capture):
             from kiro_crew.cli import main
 
             main()
         assert seen.get("marker") is None
+        assert seen.get("level") is None
         assert os.environ.get("KIROCREW_SANDBOX_ACTIVE") is None
+        assert os.environ.get("KIROCREW_SANDBOX_LEVEL") is None
 
 
 class TestDirectCliOverrideAttestation:
@@ -1211,24 +1388,32 @@ class TestSetupTimezone:
         monkeypatch.setattr(builtins, "__import__", _no_tzlocal)
         assert cli_setup._detect_system_timezone() == ""
 
-    def test_input_or_skip_returns_none_on_eof(self, monkeypatch):
-        """A closed/piped stdin must skip the step, not raise EOFError into a
-        raw traceback mid-wizard (the Windows first-run failure)."""
-        from kiro_crew.cli_setup import _input_or_skip
+    def test_input_or_skip_returns_none_on_empty_and_raises_on_eof(self, monkeypatch):
+        """Empty input keeps the caller's default (returns None as the "skip"
+        sentinel). A closed/piped stdin raises _SetupAborted so the wizard exits
+        cleanly at the top level rather than tracebacking at the NEXT bare
+        input() call in a later step."""
+        from kiro_crew.cli_setup import _input_or_skip, _SetupAborted
+
+        monkeypatch.setattr("builtins.input", lambda _p: "")
+        assert _input_or_skip("tz: ") is None
 
         def _raise_eof(_prompt):
             raise EOFError
 
         monkeypatch.setattr("builtins.input", _raise_eof)
-        assert _input_or_skip("tz: ") is None
+        with pytest.raises(_SetupAborted):
+            _input_or_skip("tz: ")
 
-    def test_timezone_retry_eof_skips_without_crash(self, tmp_path, monkeypatch):
-        """An invalid entry followed by EOF on the retry prompt skips cleanly."""
+    def test_timezone_retry_eof_propagates_setup_aborted(self, tmp_path, monkeypatch):
+        """EOF on any prompt inside a step propagates _SetupAborted so the
+        top-level catch can exit cleanly with one line, rather than leaving the
+        next step to traceback."""
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text("{}")
         monkeypatch.setattr("kiro_crew.cli_setup.config_path", lambda: cfg_file)
 
-        from kiro_crew.cli_setup import _setup_timezone
+        from kiro_crew.cli_setup import _setup_timezone, _SetupAborted
 
         answers = iter(["Not/AZone"])
 
@@ -1240,7 +1425,8 @@ class TestSetupTimezone:
 
         with patch("builtins.input", _input):
             with patch("kiro_crew.cli_setup._detect_system_timezone", return_value=""):
-                _setup_timezone()  # must not raise
+                with pytest.raises(_SetupAborted):
+                    _setup_timezone()
 
         # Skipped: no timezone persisted.
         data = json.loads(cfg_file.read_text(encoding="utf-8"))
@@ -1387,13 +1573,56 @@ class TestGetAlias:
 class TestManifest:
     """Tests for _manifest."""
 
+    def test_packaged_manifest_declares_complete_oauth_scopes(self):
+        import yaml
+
+        from kiro_crew import slack_manifest
+
+        manifest = yaml.safe_load(slack_manifest.render("scope-test"))
+        assert manifest["oauth_config"]["scopes"] == {
+            "bot": [
+                "app_mentions:read",
+                "channels:history",
+                "channels:read",
+                "chat:write",
+                "commands",
+                "files:read",
+                "files:write",
+                "groups:history",
+                "groups:read",
+                "im:history",
+                "im:read",
+                "im:write",
+                "reactions:write",
+                "users:read",
+            ],
+            "user": [
+                "channels:history",
+                "channels:read",
+                "groups:history",
+                "groups:read",
+                "im:history",
+                "im:read",
+                "mpim:history",
+                "mpim:read",
+                "search:read",
+                "users:read",
+            ],
+        }
+        bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
+        assert "message.groups" in bot_events
+
     def _patch_template(
         self, content="name: KiroCrew-{{ALIAS}}\ndisplay_name: KiroCrew-{{ALIAS}}\n"
     ):
-        """Patch importlib.resources.files to return a fake template."""
+        """Patch importlib.resources.files to return a fake template.
+
+        Patched on ``slack_manifest`` — the single module that reads the packaged
+        template for the CLI, the dashboard handler, and the exfil validator.
+        """
         mock_resource = MagicMock()
         mock_resource.joinpath.return_value.read_text.return_value = content
-        return patch("kiro_crew.cli_setup._pkg_files", return_value=mock_resource)
+        return patch("kiro_crew.slack_manifest._pkg_files", return_value=mock_resource)
 
     def test_renders_alias_to_stdout(self, capsys):
         with self._patch_template():
@@ -1424,7 +1653,7 @@ class TestManifest:
     def test_exits_when_template_missing(self):
         mock_resource = MagicMock()
         mock_resource.joinpath.return_value.read_text.side_effect = FileNotFoundError
-        with patch("kiro_crew.cli_setup._pkg_files", return_value=mock_resource):
+        with patch("kiro_crew.slack_manifest._pkg_files", return_value=mock_resource):
             from kiro_crew.cli_setup import _manifest
 
             try:
@@ -1463,7 +1692,7 @@ class TestLogout:
         """Successful logout prints success message."""
         secret_file = tmp_path / ".local_secret"
         secret_file.write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
 
         from kiro_crew.cli_server import _logout
 
@@ -1472,12 +1701,12 @@ class TestLogout:
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
         mock_resp.__exit__ = MagicMock(return_value=False)
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
+        with patch("kiro_crew.cli_server.loopback_urlopen", return_value=mock_resp):
             _logout(5476)  # Should not raise
 
     def test_logout_gateway_not_running(self, tmp_path, monkeypatch):
         """Missing secret file means gateway not running."""
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "")
 
         from kiro_crew.cli_server import _logout
 
@@ -1491,12 +1720,12 @@ class TestLogout:
         """HTTP error from gateway is handled."""
         secret_file = tmp_path / ".local_secret"
         secret_file.write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
 
         from kiro_crew.cli_server import _logout
 
         with patch(
-            "urllib.request.urlopen",
+            "kiro_crew.cli_server.loopback_urlopen",
             side_effect=urllib.error.HTTPError(None, 403, "Forbidden", {}, None),
         ):
             try:
@@ -1511,11 +1740,12 @@ class TestLogout:
         secret_file.parent.mkdir(parents=True, exist_ok=True)
         secret_file.write_text("test-secret")
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret")
 
         from kiro_crew.cli_server import _logout
 
         with patch(
-            "urllib.request.urlopen",
+            "kiro_crew.cli_server.loopback_urlopen",
             side_effect=urllib.error.URLError("Connection refused"),
         ):
             try:
@@ -1538,7 +1768,7 @@ class TestLogout:
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
         mock_resp.__exit__ = MagicMock(return_value=False)
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
+        with patch("kiro_crew.cli_server.loopback_urlopen", return_value=mock_resp):
             try:
                 _logout(5476)
                 assert False, "should have exited"
@@ -1557,7 +1787,7 @@ class TestStatus:
         from kiro_crew.cli_server import _status
 
         with patch(
-            "urllib.request.urlopen",
+            "kiro_crew.cli_server.loopback_urlopen",
             side_effect=urllib.error.HTTPError(
                 "http://127.0.0.1:5476/api/status", 403, "Forbidden", {}, None
             ),
@@ -1572,7 +1802,7 @@ class TestStatus:
         from kiro_crew.cli_server import _status
 
         with patch(
-            "urllib.request.urlopen",
+            "kiro_crew.cli_server.loopback_urlopen",
             side_effect=urllib.error.HTTPError(
                 "http://127.0.0.1:5476/api/status", 500, "Internal Server Error", {}, None
             ),
@@ -1587,7 +1817,7 @@ class TestStatus:
         from kiro_crew.cli_server import _status
 
         with patch(
-            "urllib.request.urlopen",
+            "kiro_crew.cli_server.loopback_urlopen",
             side_effect=urllib.error.URLError("Connection refused"),
         ):
             _status(self._make_args())
@@ -1613,7 +1843,7 @@ class TestStatus:
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
         mock_resp.__exit__ = MagicMock(return_value=False)
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
+        with patch("kiro_crew.cli_server.loopback_urlopen", return_value=mock_resp):
             _status(self._make_args())
         out = capsys.readouterr().out
         assert "1h 0m" in out
@@ -1623,7 +1853,7 @@ class TestStatus:
         """Non-network exceptions should report gateway as running with unexpected response."""
         from kiro_crew.cli_server import _status
 
-        with patch("urllib.request.urlopen", side_effect=RuntimeError("unexpected")):
+        with patch("kiro_crew.cli_server.loopback_urlopen", side_effect=RuntimeError("unexpected")):
             _status(self._make_args())
         out = capsys.readouterr().out
         assert "running" in out
@@ -1730,6 +1960,13 @@ class TestArgsLookLikeKirocrew:
             "python3 -m kiro_crew gateway",
             "python -m kiro_crew dashboard",
             "python3.10 -m kiro_crew start",
+            # macOS framework build: the vendored interpreter's basename is
+            # "Python" (capital P) — a case-sensitive startswith("python") missed
+            # it, so stop/restart no-oped on macOS framework-build installs
+            # (Toolbox being the common one).
+            "/Library/Frameworks/Python.framework/Versions/3.10/Resources/"
+            "Python.app/Contents/MacOS/Python -m kiro_crew gateway --no-open",
+            "Python -m kiro_crew gateway",
             # Subcommand followed by trailing flags.
             "python -m kiro_crew gateway --no-open --port 7777",
             # Legacy dotted-submodule form.
@@ -3081,9 +3318,13 @@ class TestCliLoopbackAddress:
 
         from kiro_crew import cli_server
 
-        body = inspect.getsource(cli_server._token)
+        # The URL printing lives in _emit_session_urls, which _token calls. Inspect the
+        # function that actually owns the invariant, and assert the call still happens,
+        # so this stays a real check rather than passing on an empty search.
+        body = inspect.getsource(cli_server._emit_session_urls)
         assert "resolve_dashboard_host(local_only=True)" in body
         assert 'print(f"http://{host}:{port}?token={token}")' in body
+        assert "_emit_session_urls(" in inspect.getsource(cli_server._token)
 
 
 class TestEnsurePrerequisites:
@@ -3418,6 +3659,40 @@ class TestDoctorMcpTools:
         # No probe attempted since no server spec survived the parse failure.
         probe_mock.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "content", ["[1, 2, 3]", "42", "null", "true", '"a string"']
+    )
+    def test_valid_json_non_object_agent_config_does_not_crash(
+        self, tmp_path, capsys, content
+    ):
+        """A spec that is valid JSON but not an object (a list, a scalar,
+        null) parses fine, so the json.loads try/except never fires — but
+        every .get() on the result would raise AttributeError. Doctor must
+        coerce it to an empty config, say what is wrong, and report cleanly,
+        same as the truncated case above — and it must never rewrite the
+        user's file with the coerced empty config."""
+        from kiro_crew.cli_doctor import _doctor_mcp_tools
+
+        agent_path = tmp_path / "kirocrew.json"
+        agent_path.write_text(content)
+
+        issues: list[str] = []
+        with self._mock_probe({}) as probe_mock:
+            _doctor_mcp_tools(agent_path, issues)
+
+        out = capsys.readouterr().out
+        # The defect itself is named, not just its downstream symptoms.
+        assert "agent spec is not a JSON object" in out
+        # Empty config → both managed servers report missing from mcpServers.
+        assert "@kirocrew-core: ❌ missing from mcpServers" in out
+        assert "@kirocrew-cron: ❌ missing from mcpServers" in out
+        # No probe attempted since no server spec survived the coercion.
+        probe_mock.assert_not_called()
+        # The no-clobber contract: doctor diagnoses the broken spec, it never
+        # persists the coerced empty config over the user's original file.
+        assert agent_path.read_text() == content
+        assert "Auto-fixed" not in out
+
 
 class TestDoctorStt:
     """Tests for doctor Speech-to-Text section."""
@@ -3696,11 +3971,10 @@ class TestConfigDirOverride:
 
         assert _detect_project_dir() == str(proj.resolve())
 
-    def test_logout_reads_secret_from_config_dir(self, tmp_path, monkeypatch):
-        """_logout reads .local_secret from config_dir(), not ~/.kirocrew."""
-        secret_file = tmp_path / ".local_secret"
-        secret_file.write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+    def test_logout_reads_secret_for_listener_port(self, monkeypatch):
+        """_logout resolves the secret paired with the requested listener."""
+        read_secret = MagicMock(return_value="test-secret")
+        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", read_secret)
 
         from kiro_crew.cli_server import _logout
 
@@ -3709,8 +3983,9 @@ class TestConfigDirOverride:
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
         mock_resp.__exit__ = MagicMock(return_value=False)
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
+        with patch("kiro_crew.cli_server.loopback_urlopen", return_value=mock_resp):
             _logout(5476)
+        read_secret.assert_called_once_with(5476)
 
     def test_setup_slack_tokens_writes_to_config_dir(self, tmp_path, monkeypatch):
         """_setup_slack_tokens writes .env to config_dir(), not ~/.kirocrew."""
@@ -3727,6 +4002,222 @@ class TestConfigDirOverride:
         content = (tmp_path / ".env").read_text(encoding="utf-8")
         assert "xapp-test" in content
 
+    def test_setup_slack_tokens_locks_env_to_owner(self, tmp_path, monkeypatch):
+        """The credential write must route through atomic_write's owner
+        lockdown: a bare chmod(0o600) is a silent no-op for Windows ACLs, and
+        any lockdown applied only AFTER the tokens are on disk leaves them
+        readable through the directory's inherited DACL in the failure window.
+        The lockdown therefore lands on the temp file, before any token byte
+        reaches it."""
+        import os as os_mod
+
+        import kiro_crew.cli_setup as cs
+        from kiro_crew import platform_compat as pc
+
+        env_file = tmp_path / ".env"
+        monkeypatch.setattr("kiro_crew.cli_setup.env_path", lambda: env_file)
+        inputs = iter(["y", "xapp-test", "xoxb-test", "U12345"])
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+        seen: list[tuple[Path, bool]] = []
+        real = pc.restrict_to_owner
+
+        def _spy(path):
+            # Record what the lockdown saw: the path, and whether the tokens
+            # were already readable there at that moment.
+            p = Path(path)
+            seen.append((p.parent, "xoxb-test" in p.read_text(encoding="utf-8")))
+            return real(path)
+
+        monkeypatch.setattr(pc, "restrict_to_owner", _spy)
+        cs._setup_slack_tokens()
+        # Locked exactly once, on a file in the credential dir, while it was
+        # still empty of tokens.
+        assert seen == [(tmp_path, False)]
+        assert "xoxb-test" in env_file.read_text(encoding="utf-8")
+        assert not list(tmp_path.glob("*.tmp"))  # no temp residue
+        if os_mod.name == "posix":
+            assert env_file.stat().st_mode & 0o777 == 0o600
+
+    def test_setup_slack_tokens_survives_a_lockdown_refusal(self, tmp_path, monkeypatch):
+        """A host where the owner lockdown fails (e.g. SID resolution refused)
+        must not abort the wizard with a traceback after the user already
+        typed their tokens: the .env doctrine is enforce-and-warn, matching
+        the dashboard credential writers."""
+        import kiro_crew.cli_setup as cs
+        from kiro_crew import platform_compat as pc
+
+        env_file = tmp_path / ".env"
+        monkeypatch.setattr("kiro_crew.cli_setup.env_path", lambda: env_file)
+        inputs = iter(["y", "xapp-test", "xoxb-test", "U12345"])
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+        monkeypatch.setattr(
+            pc, "restrict_to_owner", MagicMock(side_effect=OSError("icacls failed"))
+        )
+
+        cs._setup_slack_tokens()  # must not raise
+        assert "xoxb-test" in env_file.read_text(encoding="utf-8")
+        assert not list(tmp_path.glob("*.tmp"))  # failure leaves no temp residue
+
+    def test_setup_slack_tokens_aborts_when_shared_env_lock_is_held(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The Slack setup writer serializes on the SAME .env.lock the importer
+        and the dashboard credential writers use, so it aborts (rather than
+        racing the importer's commit and clobbering it) when another writer
+        holds the lock — and leaves .env untouched."""
+        import os as os_mod
+
+        import kiro_crew.cli_setup as cs
+        from kiro_crew import platform_compat as pc
+        from kiro_crew.secrets.migrate import _env_lock_path
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("EXISTING=1\n", encoding="utf-8")
+        monkeypatch.setattr("kiro_crew.cli_setup.env_path", lambda: env_file)
+        inputs = iter(["y", "xapp-test", "xoxb-test", "U12345"])
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+
+        # Simulate another writer (e.g. `kirocrew secrets import`) holding the
+        # shared advisory lock.
+        lock_path = _env_lock_path(env_file)
+        held_fd = os_mod.open(lock_path, os_mod.O_CREAT | os_mod.O_RDWR, 0o600)
+        assert pc.try_acquire_lock(held_fd, exclusive=True)
+        try:
+            cs._setup_slack_tokens()  # must not raise
+            # .env is untouched — the aborted save did not write the tokens.
+            assert env_file.read_text(encoding="utf-8") == "EXISTING=1\n"
+        finally:
+            pc.release_lock(held_fd)
+            os_mod.close(held_fd)
+
+
+class TestSetupChannelGating:
+    """`kirocrew setup` runs the Slack steps only with --slack.
+
+    Messaging channels are optional: the default wizard must configure none and
+    instead print the pointer to connect channels later, while `--slack` opts
+    into the guided Slack credential + slash-command steps.
+    """
+
+    def _run_setup(self, monkeypatch, tmp_path, **kwargs):
+        import kiro_crew.cli_setup as cs
+
+        calls: list[str] = []
+        monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+        # Imported inside _setup_impl — patch at their source modules.
+        monkeypatch.setattr(
+            "kiro_crew.agent.install_agent", lambda clean=False: tmp_path / "agent.json"
+        )
+        # Mirror the real signature (bin_dir, *, claim_existing): the setup path
+        # passes claim_existing=True, and a stub that refused it would fail here
+        # for a reason that has nothing to do with channel gating.
+        monkeypatch.setattr(
+            "kiro_crew.agent.ensure_kirocrew_on_path", lambda *a, **k: None
+        )
+        monkeypatch.setattr("kiro_crew.mcp_cleanup.clean_stale_managed_mcp", lambda: [])
+        # Neutralize every unrelated wizard step so only the gating is under test.
+        for name in (
+            "_ensure_prerequisites",
+            "_setup_workspace_dir",
+            "_setup_sandbox_consent",
+            "_setup_timezone",
+            "_maybe_setup_dashboard_url",
+            "_maybe_setup_custom_domain",
+            "_maybe_setup_cloud",
+            "_ensure_default_agent_in_config",
+        ):
+            monkeypatch.setattr(cs, name, lambda *a, **k: None)
+        monkeypatch.setattr(cs, "_setup_slack_tokens", lambda: calls.append("slack_tokens"))
+        monkeypatch.setattr(cs, "_setup_slash_command", lambda: calls.append("slash_command"))
+        monkeypatch.setattr(cs, "_setup_whatsapp", lambda: calls.append("whatsapp"))
+        # Conductor-skill step catches Exception and continues.
+        monkeypatch.setattr(
+            cs, "KiroCrewConfig", MagicMock(load=MagicMock(side_effect=RuntimeError("no config")))
+        )
+        # Keep the macOS-only desktop-app input() prompt off the path.
+        monkeypatch.setattr(cs.platform, "system", lambda: "Linux")
+
+        cs._setup_impl(**kwargs)
+        return calls
+
+    def test_default_setup_skips_slack_steps(self, tmp_path, monkeypatch, capsys):
+        """Default wizard: no Slack prompts, prints the channels pointer instead."""
+        calls = self._run_setup(monkeypatch, tmp_path)
+        assert calls == []
+        out = capsys.readouterr().out
+        assert "Messaging Channels" in out
+        assert "setup --slack" in out
+
+    def test_slack_flag_opts_into_slack_steps(self, tmp_path, monkeypatch):
+        """--slack runs the guided Slack credential + slash-command steps in order."""
+        calls = self._run_setup(monkeypatch, tmp_path, slack=True)
+        assert calls == ["slack_tokens", "slash_command"]
+
+    def test_agent_only_with_slack_warns_and_skips_slack_steps(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """--agent-only --slack: no Slack steps run, but a notice explains why."""
+        calls = self._run_setup(monkeypatch, tmp_path, agent_only=True, slack=True)
+        assert calls == []
+        out = capsys.readouterr().out
+        assert "--slack is ignored with --agent-only" in out
+        assert "setup --slack" in out
+
+    def test_agent_only_without_slack_prints_no_notice(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """--agent-only alone: the guided-setup pointer is not printed."""
+        calls = self._run_setup(monkeypatch, tmp_path, agent_only=True)
+        assert calls == []
+        out = capsys.readouterr().out
+        assert "--slack is ignored" not in out
+
+    def test_default_setup_names_whatsapp_among_the_connectable_channels(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The fallback blurb is where an operator learns which channels exist.
+        Omitting WhatsApp made the only channel with an install prerequisite the
+        one channel the wizard never mentions."""
+        self._run_setup(monkeypatch, tmp_path)
+        out = capsys.readouterr().out
+        assert "WhatsApp" in out
+        assert "setup --whatsapp" in out
+
+    def test_whatsapp_flag_opts_into_the_whatsapp_step_only(self, tmp_path, monkeypatch):
+        """--whatsapp runs its own step and NOT the Slack ones (there is no token
+        to collect and no slash command on WhatsApp)."""
+        calls = self._run_setup(monkeypatch, tmp_path, whatsapp=True)
+        assert calls == ["whatsapp"]
+
+    def test_both_flags_run_both_guided_setups(self, tmp_path, monkeypatch):
+        calls = self._run_setup(monkeypatch, tmp_path, slack=True, whatsapp=True)
+        assert calls == ["slack_tokens", "slash_command", "whatsapp"]
+
+    def test_the_whatsapp_flag_reaches_setup_from_the_command_line(self):
+        """The wizard-level tests call ``_setup_impl`` directly, so the argparse
+        flag and its plumbing need their own guard: without them
+        ``kirocrew setup --whatsapp`` exits 2 instead of running anything."""
+        import sys
+
+        argv = ["kirocrew", "setup", "--whatsapp"]
+        with patch.object(sys, "argv", argv), patch("kiro_crew.cli._setup") as mock_setup:
+            from kiro_crew.cli import main
+
+            main()
+            assert mock_setup.call_args.kwargs["whatsapp"] is True
+
+    def test_agent_only_with_whatsapp_warns_and_skips_the_step(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """--agent-only --whatsapp: the step is skipped, and the notice names the
+        flag the caller actually passed rather than only --slack."""
+        calls = self._run_setup(monkeypatch, tmp_path, agent_only=True, whatsapp=True)
+        assert calls == []
+        out = capsys.readouterr().out
+        assert "--whatsapp is ignored with --agent-only" in out
+        assert "--slack is ignored" not in out
+
 
 class TestSpawnCliAuth:
     """``kirocrew spawn`` attaches X-Internal-Secret on every gateway call.
@@ -3739,23 +4230,23 @@ class TestSpawnCliAuth:
     """
 
     def test_internal_secret_reads_local_secret_file(self, tmp_path, monkeypatch):
-        (tmp_path / ".local_secret").write_text("abc123\n")
-        monkeypatch.setattr("kiro_crew.cli_commands.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.cli_commands.read_local_secret", lambda _port: "abc123")
 
         from kiro_crew.cli_commands import _internal_secret
 
-        assert _internal_secret() == "abc123"
+        assert _internal_secret(5476) == "abc123"
 
     def test_internal_secret_returns_empty_when_missing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("kiro_crew.cli_commands.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.cli_commands.read_local_secret", lambda _port: "")
 
         from kiro_crew.cli_commands import _internal_secret
 
-        assert _internal_secret() == ""
+        assert _internal_secret(5476) == ""
 
     def test_spawn_list_sends_internal_secret_header(self, tmp_path, monkeypatch, capsys):
-        (tmp_path / ".local_secret").write_text("test-secret-xyz")
-        monkeypatch.setattr("kiro_crew.cli_commands.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.cli_commands.read_local_secret", lambda _port: "test-secret-xyz"
+        )
 
         captured: list[urllib.request.Request] = []
         mock_resp = MagicMock()
@@ -3767,7 +4258,7 @@ class TestSpawnCliAuth:
             captured.append(req)
             return mock_resp
 
-        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.cli_commands.loopback_urlopen", fake_urlopen)
 
         from kiro_crew.cli_commands import _spawn
 
@@ -3781,8 +4272,9 @@ class TestSpawnCliAuth:
         assert headers_lower["x-internal-secret"] == "test-secret-xyz"
 
     def test_spawn_run_sends_internal_secret_header(self, tmp_path, monkeypatch, capsys):
-        (tmp_path / ".local_secret").write_text("run-secret-abc")
-        monkeypatch.setattr("kiro_crew.cli_commands.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.cli_commands.read_local_secret", lambda _port: "run-secret-abc"
+        )
 
         captured: list[urllib.request.Request] = []
         mock_resp = MagicMock()
@@ -3794,7 +4286,7 @@ class TestSpawnCliAuth:
             captured.append(req)
             return mock_resp
 
-        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.cli_commands.loopback_urlopen", fake_urlopen)
 
         from kiro_crew.cli_commands import _spawn_run
 
@@ -3811,8 +4303,7 @@ class TestSpawnCliAuth:
 
     def test_spawn_list_403_prints_token_required(self, tmp_path, monkeypatch, capsys):
         """A bare 403 from the gateway is reported, not masked as 'not running'."""
-        (tmp_path / ".local_secret").write_text("")
-        monkeypatch.setattr("kiro_crew.cli_commands.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.cli_commands.read_local_secret", lambda _port: "")
 
         def fake_urlopen(*_args: object, **_kwargs: object) -> None:
             raise urllib.error.HTTPError(
@@ -3823,7 +4314,7 @@ class TestSpawnCliAuth:
                 fp=None,
             )
 
-        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr("kiro_crew.cli_commands.loopback_urlopen", fake_urlopen)
 
         from kiro_crew.cli_commands import _spawn
 
@@ -3856,7 +4347,7 @@ class TestArtifactCli:
         # Surface any HTTP call as a fatal so we can prove the function exited
         # at the security check, not at the network layer.
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "kiro_crew.cli_commands.loopback_urlopen",
             lambda *_a, **_kw: pytest.fail("_artifact must refuse before opening any HTTP request"),
         )
 
@@ -3882,7 +4373,7 @@ class TestArtifactCli:
 
         monkeypatch.setattr("kiro_crew.cli_commands.is_sensitive_path", lambda _p: True)
         monkeypatch.setattr(
-            "urllib.request.urlopen",
+            "kiro_crew.cli_commands.loopback_urlopen",
             lambda *_a, **_kw: pytest.fail("_artifact must refuse before opening any HTTP request"),
         )
 
@@ -3917,6 +4408,9 @@ class TestMcpBuiltinDispatch:
         builtin_name = "fakebuiltin"
         # Patch the registry the CLI reads when building subparsers and dispatching.
         monkeypatch.setattr(cli_mod, "_BUILTIN_NAMES", [builtin_name])
+        # The verb is only registered (and dispatched) when the builtin's
+        # mcp_server module resolves (#5901) — make the synthetic one resolve.
+        monkeypatch.setattr(cli_mod, "_builtin_mcp_server_available", lambda _name: True)
         mock_module = MagicMock()
 
         monkeypatch.setattr(sys, "argv", ["kirocrew", f"mcp-{builtin_name}"])
@@ -3947,7 +4441,7 @@ class TestSeedDispatch:
         mock_seed = MagicMock(return_value=0)
         with (
             patch("kiro_crew.cli.seed_cmd", mock_seed),
-            patch("kiro_crew.cli._gateway"),
+            patch("kiro_crew.cli_server._gateway"),
             patch("kiro_crew.cli.asyncio.run"),
         ):
             from kiro_crew.cli import main
@@ -3972,7 +4466,7 @@ class TestSeedDispatch:
         mock_seed = MagicMock()
         with (
             patch("kiro_crew.cli.seed_cmd", mock_seed),
-            patch("kiro_crew.cli._gateway"),
+            patch("kiro_crew.cli_server._gateway"),
             patch("asyncio.run"),
         ):
             from kiro_crew.cli import main
@@ -3990,7 +4484,7 @@ class TestSeedDispatch:
         mock_seed = MagicMock(return_value=0)
         with (
             patch("kiro_crew.cli.seed_cmd", mock_seed),
-            patch("kiro_crew.cli._gateway"),
+            patch("kiro_crew.cli_server._gateway"),
             patch("asyncio.run"),
         ):
             from kiro_crew.cli import main
@@ -4006,18 +4500,62 @@ class TestDoctorEmbeddings:
     def _hermetic_config(self, monkeypatch):
         """Pin config to a pristine default (see ``_pin_default_config``)."""
         _pin_default_config(monkeypatch)
+        # LLAMA_CPP_LIB_PATH selects between two mutually exclusive diagnoses: name the
+        # missing bundled libs, or blame the operator's override directory. Which branch a
+        # test exercises is therefore part of its scenario, not an ambient property of the
+        # host — and the variable is easy to inherit, because the real loader sets it to its
+        # own bundled libs dir the first time embeddings load. Cleared per test; the tests
+        # that exercise the override branch set it themselves.
+        monkeypatch.delenv("LLAMA_CPP_LIB_PATH", raising=False)
 
     @staticmethod
-    def _run_doctor(tmp_path, monkeypatch, *, runtime_ok: bool, model_present: bool, platform_supported: bool = True):
-        """Run _doctor with the embeddings runtime/model state stubbed."""
+    def _run_doctor(tmp_path, monkeypatch, *, runtime_ok: bool, model_present: bool, platform_supported: bool = True, missing_libs: dict | None = None, loader_setdefaults: str = "", lib_path_override: str | None = None):
+        """Run _doctor with the embeddings runtime/model state stubbed.
+
+        ``loader_setdefaults`` reproduces the real loader's side effect of
+        ``setdefault``-ing LLAMA_CPP_LIB_PATH to its own bundled libs dir, which
+        is what makes reading that var after the load call ambiguous.
+
+        ``lib_path_override`` controls the LLAMA_CPP_LIB_PATH the doctor sees:
+        ``None`` (default) CLEARS it — the var LEAKS between tests otherwise,
+        because both the ``loader_setdefaults`` path and the real embeddings
+        loader plant it via ``os.environ.setdefault`` (invisible to
+        monkeypatch teardown), so whichever test ran first in the pytest
+        worker poisoned override-sensitive assertions (shard-layout-dependent
+        CI failures). A string sets the override deliberately, via monkeypatch
+        so it is restored on teardown.
+        """
         agent_file = tmp_path / "kirocrew.json"
         _healthy_agent_file(agent_file)
         import kiro_crew.cli_doctor as doc
 
-        monkeypatch.setattr(doc, "_load_llama_class", lambda: object if runtime_ok else None)
+        if lib_path_override is None:
+            # setenv FIRST so monkeypatch records a teardown action even when
+            # the var is ABSENT: delenv(raising=False) on a missing var
+            # registers nothing, so the loader_setdefaults path's direct
+            # os.environ.setdefault would still leak into later tests in
+            # workers where the var was never set (GPT review). The
+            # setenv+delenv pair restores the original state either way.
+            monkeypatch.setenv("LLAMA_CPP_LIB_PATH", "")
+            monkeypatch.delenv("LLAMA_CPP_LIB_PATH", raising=False)
+        else:
+            monkeypatch.setenv("LLAMA_CPP_LIB_PATH", lib_path_override)
+
+        def _load():
+            if loader_setdefaults:
+                # Through monkeypatch, not a bare os.environ write: the real loader's
+                # setdefault is a process-wide mutation, and reproducing it literally leaked
+                # the variable into every later test in the same worker, flipping them onto
+                # the override branch depending on distribution order.
+                if "LLAMA_CPP_LIB_PATH" not in os.environ:
+                    monkeypatch.setenv("LLAMA_CPP_LIB_PATH", loader_setdefaults)
+            return object if runtime_ok else None
+
+        monkeypatch.setattr(doc, "_load_llama_class", _load)
         monkeypatch.setattr(
             doc, "_platform_libs_dirname", lambda: "macos_arm64" if platform_supported else None
         )
+        monkeypatch.setattr(doc, "verify_vendored_libs", lambda: missing_libs or {})
         monkeypatch.setattr(doc, "model_file_present", lambda path=None: model_present)
         default_run = MagicMock(returncode=0, stdout="kiro-cli 1.0.0", stderr="")
         with (
@@ -4044,6 +4582,92 @@ class TestDoctorEmbeddings:
         self._run_doctor(tmp_path, monkeypatch, runtime_ok=False, model_present=False)
         out = capsys.readouterr().out
         assert "runtime:     ❌ vendored runtime failed to load" in out
+        # A COMPLETE payload that still fails to load must not be blamed on
+        # packaging — that would send the user reinstalling for nothing.
+        assert "incomplete" not in out
+
+    def test_doctor_names_the_missing_native_libs(self, tmp_path, capsys, monkeypatch):
+        """An incomplete shipped payload names the absent files.
+
+        ctypes reports only "base name 'llama' not found", which reads as an
+        unsupported architecture — so a bare "failed to load" sends diagnosis
+        after the CPU arch instead of the packaging rule that dropped the file
+        on every arch.
+        """
+        # This test asserts the NO-override branch, so the var must be absent.
+        # It is not, reliably: the doctor branches on LLAMA_CPP_LIB_PATH and the
+        # value can arrive from outside this test -- a dev shell that exports it,
+        # or the sibling override test, whose helper sets it via a raw
+        # os.environ.setdefault that escapes pytest teardown. Either way the
+        # doctor takes the "libs load from the override dir" path and this
+        # assertion can never match. Clearing it here (mirroring the sibling,
+        # which explicitly setenv-s) makes the expectation independent of both
+        # the ambient environment and test order -- pytest-split reshuffles
+        # shards whenever the suite test count changes, so the leak surfaced on
+        # an unrelated PR that merely added tests elsewhere.
+        monkeypatch.delenv("LLAMA_CPP_LIB_PATH", raising=False)
+        self._run_doctor(
+            tmp_path,
+            monkeypatch,
+            runtime_ok=False,
+            model_present=False,
+            missing_libs={"macos_arm64": ["libllama.dylib"]},
+        )
+        out = capsys.readouterr().out
+        assert "Missing native libs for macos_arm64: libllama.dylib" in out
+        assert "packaging" in out
+
+    def test_doctor_blames_the_override_dir_not_the_bundled_tree(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Under LLAMA_CPP_LIB_PATH, point at the override — not a reinstall.
+
+        The libs load from the operator's directory, so "reinstall Kiro Crew"
+        would send them to replace a package they are deliberately not loading
+        from, while saying nothing about the dir that actually failed. Mirrors
+        the loader's exemption so the two diagnostics cannot disagree.
+        """
+        monkeypatch.setenv("LLAMA_CPP_LIB_PATH", "/opt/my-gpu-llama")
+        self._run_doctor(
+            tmp_path,
+            monkeypatch,
+            runtime_ok=False,
+            model_present=False,
+            missing_libs={"macos_arm64": ["libllama.dylib"]},
+            lib_path_override="/opt/my-gpu-llama",
+        )
+        out = capsys.readouterr().out
+        assert "/opt/my-gpu-llama" in out
+        assert "Missing native libs" not in out
+        assert "reinstall Kiro Crew" not in out
+
+    def test_doctor_does_not_mistake_the_loaders_own_setdefault_for_an_override(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """A complete payload that fails to import is not reported as overridden.
+
+        `_load_llama_class()` `setdefault`s LLAMA_CPP_LIB_PATH to its OWN bundled
+        libs dir, so reading the var AFTER that call cannot distinguish "operator
+        set it" from "the loader just set it to the bundle" — which produced the
+        self-contradiction "the libs load from <bundled path>, not the bundled
+        tree". Doctor must sample the environment before the load.
+        """
+        monkeypatch.delenv("LLAMA_CPP_LIB_PATH", raising=False)
+        # Libs ARE missing, so reading the var too late suppresses the real
+        # packaging diagnosis and prints the override note in its place. With no
+        # missing libs both branches stay silent and the bug is invisible.
+        self._run_doctor(
+            tmp_path,
+            monkeypatch,
+            runtime_ok=False,
+            model_present=False,
+            missing_libs={"macos_arm64": ["libllama.dylib"]},
+            loader_setdefaults="/bundled/_vendor/llama_cpp_libs/x",
+        )
+        out = capsys.readouterr().out
+
+        assert "not the bundled tree" not in out
+        assert "Missing native libs for macos_arm64: libllama.dylib" in out
 
     def test_doctor_unsupported_platform_is_not_an_issue(self, tmp_path, capsys, monkeypatch):
         """No vendored libs for this platform = designed degradation, not a doctor failure."""
@@ -4212,7 +4836,7 @@ class TestWaitGatewayReady:
         from kiro_crew import cli_server
 
         with patch(
-            "kiro_crew.cli_server.urllib.request.urlopen",
+            "kiro_crew.cli_server.loopback_urlopen",
             side_effect=http.client.BadStatusLine("garbage"),
         ):
             assert cli_server._probe_gateway_ready(7777) == 0
@@ -4223,15 +4847,32 @@ class TestWaitGatewayReady:
         Otherwise the operator is sent looking for a live process that no longer
         exists, with no exit status to explain it.
         """
+        import types
+
         from kiro_crew import cli_server
 
         proc = MagicMock()
         # Alive for the loop's entry poll, exited by the deadline re-poll.
         proc.poll.side_effect = [None, 3]
 
+        # The clock is stubbed on cli_server's OWN attribute rather than through
+        # `cli_server.time.monotonic`: that path resolves to the shared `time`
+        # module, so it would swap the clock for every caller in the process --
+        # including background threads -- and a finite side_effect list them lets
+        # steal a value and raise StopIteration here. This stub is scoped to the
+        # module under test and answers any number of calls: the first reads the
+        # loop's entry time, every later one is past the deadline.
+        calls: list[float] = []
+
+        def clock() -> float:
+            calls.append(0.0)
+            return 0.0 if len(calls) == 1 else 100.0
+
+        fake_time = types.SimpleNamespace(monotonic=clock, sleep=lambda _seconds: None)
+
         with (
             patch("kiro_crew.cli_server._probe_gateway_ready", return_value=503),
-            patch("kiro_crew.cli_server.time.monotonic", side_effect=[0.0, 100.0]),
+            patch.object(cli_server, "time", fake_time),
         ):
             verdict, status = cli_server._wait_gateway_ready(proc, 7777, None, 0.0)
 
@@ -4319,21 +4960,23 @@ class TestWaitGatewayReady:
         resp = MagicMock(status=200)
         resp.__enter__ = lambda s: s
         resp.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=resp) as mock_open:
+        with patch("kiro_crew.cli_server.loopback_urlopen", return_value=resp) as mock_open:
             assert cli_server._probe_gateway_ready(7777) == 200
         assert mock_open.call_args.args[0] == "http://127.0.0.1:7777/api/ready"
 
     def test_probe_reports_zero_when_unreachable(self):
         from kiro_crew import cli_server
 
-        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+        with patch(
+            "kiro_crew.cli_server.loopback_urlopen", side_effect=urllib.error.URLError("down")
+        ):
             assert cli_server._probe_gateway_ready(7777) == 0
 
     def test_probe_reports_the_http_status_of_a_not_ready_gateway(self):
         from kiro_crew import cli_server
 
         err = urllib.error.HTTPError("u", 503, "not ready", {}, None)
-        with patch("urllib.request.urlopen", side_effect=err):
+        with patch("kiro_crew.cli_server.loopback_urlopen", side_effect=err):
             assert cli_server._probe_gateway_ready(7777) == 503
 
 
@@ -4343,9 +4986,9 @@ class TestPrintTokenUrl:
     def test_prints_token_on_success(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _print_token_url
 
-        secret_file = tmp_path / ".local_secret"
-        secret_file.write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret"
+        )
         monkeypatch.setattr(
             "kiro_crew.cli_server.KiroCrewConfig.load",
             lambda: MagicMock(dashboard=MagicMock(url="")),
@@ -4365,7 +5008,7 @@ class TestPrintTokenUrl:
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
+        with patch("kiro_crew.cli_server.loopback_urlopen", return_value=mock_resp):
             _print_token_url(7777)
 
         out = capsys.readouterr().out
@@ -4374,9 +5017,9 @@ class TestPrintTokenUrl:
     def test_prints_custom_origin(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _print_token_url
 
-        secret_file = tmp_path / ".local_secret"
-        secret_file.write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret"
+        )
         monkeypatch.setattr(
             "kiro_crew.cli_server.KiroCrewConfig.load",
             lambda: MagicMock(dashboard=MagicMock(url="http://kirocrew.dev:7777")),
@@ -4390,7 +5033,7 @@ class TestPrintTokenUrl:
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
+        with patch("kiro_crew.cli_server.loopback_urlopen", return_value=mock_resp):
             _print_token_url(7777)
 
         out = capsys.readouterr().out
@@ -4399,9 +5042,9 @@ class TestPrintTokenUrl:
     def test_fallback_on_timeout(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _print_token_url
 
-        secret_file = tmp_path / ".local_secret"
-        secret_file.write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret"
+        )
         monkeypatch.setattr("kiro_crew.cli_server._RESTART_READY_TIMEOUT", 0)
 
         _print_token_url(7777)
@@ -4412,7 +5055,7 @@ class TestPrintTokenUrl:
     def test_fallback_on_no_secret(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _print_token_url
 
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: "")
         monkeypatch.setattr("kiro_crew.cli_server._RESTART_READY_TIMEOUT", 0)
 
         _print_token_url(7777)
@@ -4756,8 +5399,9 @@ class TestTokenCommand:
     def test_prints_loopback_only(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _token
 
-        (tmp_path / ".local_secret").write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret"
+        )
         monkeypatch.setattr(
             "kiro_crew.cli_server.KiroCrewConfig.load",
             lambda: MagicMock(dashboard=MagicMock(url="")),
@@ -4771,7 +5415,10 @@ class TestTokenCommand:
         )
 
         args = argparse.Namespace(ttl="1h", port=7777)
-        with patch("urllib.request.urlopen", return_value=self._mock_token_response("abc123")):
+        with patch(
+            "kiro_crew.cli_server.loopback_urlopen",
+            return_value=self._mock_token_response("abc123"),
+        ):
             _token(args)
 
         out = capsys.readouterr().out
@@ -4784,8 +5431,9 @@ class TestTokenCommand:
     def test_separates_custom_origin_with_blank_line(self, tmp_path, capsys, monkeypatch):
         from kiro_crew.cli_server import _token
 
-        (tmp_path / ".local_secret").write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "kiro_crew.cli_server.read_local_secret", lambda _port: "test-secret"
+        )
         monkeypatch.setattr(
             "kiro_crew.cli_server.KiroCrewConfig.load",
             lambda: MagicMock(dashboard=MagicMock(url="https://kirocrew.dev:7777")),
@@ -4799,7 +5447,10 @@ class TestTokenCommand:
         )
 
         args = argparse.Namespace(ttl="1h", port=7777)
-        with patch("urllib.request.urlopen", return_value=self._mock_token_response("xyz789")):
+        with patch(
+            "kiro_crew.cli_server.loopback_urlopen",
+            return_value=self._mock_token_response("xyz789"),
+        ):
             _token(args)
 
         out = capsys.readouterr().out
@@ -4819,9 +5470,8 @@ class TestTokenCommand:
     # a bare "<no stderr>".
 
     def _stub_token_env(self, tmp_path, monkeypatch, *, secret: bool = True) -> None:
-        if secret:
-            (tmp_path / ".local_secret").write_text("test-secret")
-        monkeypatch.setattr("kiro_crew.cli_server.config_dir", lambda: tmp_path)
+        value = "test-secret" if secret else ""
+        monkeypatch.setattr("kiro_crew.cli_server.read_local_secret", lambda _port: value)
         monkeypatch.setattr(
             "kiro_crew.cli_server.KiroCrewConfig.load",
             lambda: MagicMock(dashboard=MagicMock(url="")),
@@ -4858,7 +5508,9 @@ class TestTokenCommand:
         from kiro_crew.cli_server import _token
 
         self._stub_token_env(tmp_path, monkeypatch)
-        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+        with patch(
+            "kiro_crew.cli_server.loopback_urlopen", side_effect=urllib.error.URLError("refused")
+        ):
             with pytest.raises(SystemExit) as excinfo:
                 _token(argparse.Namespace(ttl="1h", port=7777))
         assert excinfo.value.code == 1
@@ -4870,7 +5522,9 @@ class TestTokenCommand:
         from kiro_crew.cli_server import _token
 
         self._stub_token_env(tmp_path, monkeypatch)
-        with patch("urllib.request.urlopen", return_value=self._mock_token_response("")):
+        with patch(
+            "kiro_crew.cli_server.loopback_urlopen", return_value=self._mock_token_response("")
+        ):
             with pytest.raises(SystemExit) as excinfo:
                 _token(argparse.Namespace(ttl="1h", port=7777))
         assert excinfo.value.code == 1
@@ -4890,7 +5544,10 @@ class TestTokenCommand:
         from kiro_crew.cli_server import _token
 
         self._stub_token_env(tmp_path, monkeypatch)
-        with patch("urllib.request.urlopen", return_value=self._mock_token_response("eyJa.b")):
+        with patch(
+            "kiro_crew.cli_server.loopback_urlopen",
+            return_value=self._mock_token_response("eyJa.b"),
+        ):
             _token(argparse.Namespace(ttl="1h", port=7777))
         captured = capsys.readouterr()
         lines = [ln for ln in captured.out.splitlines() if ln.strip()]
@@ -4962,3 +5619,1680 @@ class TestBannerBranding:
         # The 'Cl' of Claw is `/ __| |` + `(__| / _`; Crew is `/ __|_ _` + `(__| '_/`.
         for name, b in (("cli", MAIN), ("cli_chat", CHAT), ("cloud", CLOUD)):
             assert "(__| / _`" not in b, f"{name} banner still spells Claw"
+
+
+class TestChatPermissionRequest:
+    """`kirocrew chat` must ANSWER a permission request, and answering one is an
+    authorization decision.
+
+    Every case drives the real ``_send_and_print`` against a provider whose
+    stream cannot finish until the request is answered, and against a real
+    ``HookManager`` -- not a stub returning the verdict the test wants.
+    """
+
+    #: Bounds a stalled turn so the suite fails instead of hanging. Never
+    #: reached when the request is answered.
+    _TIMEOUT = 10.0
+
+    class _StrictTextStream:
+        """A TTY-like stream that raises on anything its codec cannot encode."""
+
+        errors = "strict"
+
+        def __init__(self, encoding):
+            self.encoding = encoding
+            self._chunks = []
+
+        def write(self, text):
+            text.encode(self.encoding, errors=self.errors)
+            self._chunks.append(text)
+            return len(text)
+
+        def flush(self):
+            return None
+
+        def isatty(self):
+            return True
+
+        def getvalue(self):
+            return "".join(self._chunks)
+
+    @pytest.fixture(autouse=True)
+    def _fresh_stdin_state(self, monkeypatch):
+        """Poisoning is process-wide state; monkeypatch restores it per test."""
+        import kiro_crew.cli_chat as cli_chat
+
+        monkeypatch.setattr(cli_chat, "_stdin_poisoned", False)
+
+    @staticmethod
+    def _event(
+        *,
+        title="Terminal",
+        command=None,
+        tool_name="",
+        mcp_server_name="",
+        tool_kind=None,
+        shell_classified=True,
+        raw_params=None,
+    ):
+        """A permission request in the shape the wire delivers.
+
+        ``tool_input`` rather than ``raw_tool_params`` carries the command,
+        because that is where a permission_request puts it -- the fallback the
+        gate depends on to recover what really executes.
+
+        ``tool_kind`` defaults to ``execute`` only when a command is supplied.
+        An execute-kind request with no recoverable command is the cache-miss
+        anomaly ``_unverifiable_shell`` refuses outright, so it must not be the
+        default shape for tests about display, teardown or stdin -- those need a
+        request that actually reaches the prompt. Pass ``tool_kind`` explicitly
+        to exercise the anomaly.
+
+        ``shell_classified`` defaults True for the same reason: the normal wire
+        shape is a preceding ``tool_call`` that carried a resolvable ``kind``, so
+        the shell cache was populated and ``is_shell`` is a RESOLVED answer. The
+        miss -- where nothing was classified and the gate must refuse rather than
+        read the payload's own kind -- is opted into explicitly.
+        """
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+        return LLMEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            request_id=7,
+            title=title,
+            tool_kind=tool_kind if tool_kind is not None else ("execute" if command else "read"),
+            is_shell=command is not None,
+            shell_classified=shell_classified,
+            tool_input=json.dumps({"command": command}) if command else "",
+            tool_name=tool_name,
+            raw_tool_params=raw_params,
+            mcp_server_name=mcp_server_name,
+            # Advertised by a real backend; the CLI must NOT read these -- option
+            # ids are backend-specific and the ACP layer owns the mapping.
+            options=[{"id": "allow", "label": "Allow Once"}],
+        )
+
+    @staticmethod
+    def _direct_tool_call(client, *, path="notes.md", tool_call_id="tc-direct"):
+        """Populate the real direct-client provenance caches for an edit call."""
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        event = client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": tool_call_id,
+                        "title": "Edit notes",
+                        "kind": "edit",
+                        "rawInput": {"path": path, "content": "updated"},
+                        "_meta": {"kiro": {"toolName": "fs_write"}},
+                    }
+                },
+            )
+        )
+        assert event is not None
+
+    @staticmethod
+    def _direct_permission_message(*, tool_call_id="tc-direct", inline_path=None):
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        tool_call: dict[str, object] = {
+            "toolCallId": tool_call_id,
+            "title": "Edit notes",
+            "kind": "edit",
+        }
+        if inline_path is not None:
+            tool_call["input"] = {"path": inline_path, "content": "inline"}
+        return JsonRpcMessage(
+            id="req-direct",
+            method="session/request_permission",
+            params={
+                "toolCall": tool_call,
+                "options": [
+                    {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
+                    {"optionId": "reject", "name": "Deny", "kind": "reject_once"},
+                ],
+            },
+        )
+
+    class _GatedProvider:
+        """Cannot finish its turn until the permission is answered.
+
+        Provider calls and audit records land in ONE ``trace`` so their relative
+        order is observable, not just their presence.
+        """
+
+        def __init__(self, event, trace):
+            self._event, self.trace = event, trace
+            self.answered = asyncio.Event()
+
+        @property
+        def calls(self):
+            return [t for t in self.trace if t[0] in ("approve", "reject")]
+
+        async def stream(self, message):
+            from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="I'll check that. ")
+            yield self._event
+            await self.answered.wait()
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="done")
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        async def approve_tool(self, request_id, *, always: bool = False):
+            self.trace.append(("approve", request_id, always))
+            self.answered.set()
+
+        async def reject_tool(self, request_id):
+            self.trace.append(("reject", request_id, False))
+            self.answered.set()
+
+        def context_usage_pct(self):
+            return 0.0
+
+    @staticmethod
+    def _gate():
+        """A gate carrying the REAL HookManager: the built-in sensitive-path and
+        denied-command rules are the thing under test in several cases."""
+        import kiro_crew.cli_chat as cli_chat
+        from kiro_crew.hooks import HookManager, HooksConfig
+
+        return cli_chat._ToolGate(hooks=HookManager(HooksConfig.from_dict({})), agent="cli-tester")
+
+    @staticmethod
+    def _patch_env(monkeypatch, *, tty=True, trace=None, answer="d"):
+        """Wire the seams every case shares. Returns the stdin-read record.
+
+        The blocking read is patched at ``_read_line_blocking`` -- the single
+        blocking seam -- NOT at the choice helper or the gate, so the exact-match
+        rule, the daemon-thread plumbing, the gate call and the audit ordering
+        all run as production code.
+        """
+        import kiro_crew.cli_chat as cli_chat
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: tty, raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: tty, raising=False)
+        monkeypatch.setattr(
+            cli_chat,
+            "sel",
+            lambda: types.SimpleNamespace(
+                log_tool_invocation=lambda **kw: (
+                    trace.append(("sel", kw)) if trace is not None else None
+                )
+            ),
+        )
+        reads = {"n": 0, "prompts": []}
+
+        def fake_read(prompt=""):
+            reads["n"] += 1
+            reads["prompts"].append(prompt)
+            if answer is EOFError:
+                raise EOFError
+            return answer
+
+        monkeypatch.setattr(cli_chat, "_read_line_blocking", fake_read)
+        return reads
+
+    async def _drive(self, monkeypatch, *, event=None, interactive=True, tty=True, answer="d"):
+        """Run one gated turn. Returns (provider, sel records, stdin reads).
+
+        ``interactive`` is the command mode the caller passes and ``tty`` is
+        patched onto the real streams, so the production ``_can_prompt`` decides
+        -- patching that helper would test the stub rather than the rule.
+        """
+        import kiro_crew.cli_chat as cli_chat
+
+        trace: list = []
+        provider = self._GatedProvider(event or self._event(), trace)
+        reads = self._patch_env(monkeypatch, tty=tty, trace=trace, answer=answer)
+        await asyncio.wait_for(
+            cli_chat._send_and_print(
+                provider, "run it", interactive=interactive, gate=self._gate()
+            ),
+            timeout=self._TIMEOUT,
+        )
+        return provider, [t[1] for t in trace if t[0] == "sel"], reads
+
+    # ── The security gate ────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_a_benign_title_cannot_hide_a_sensitive_command(self, monkeypatch, capsys):
+        """The gate judges what executes, not what the model called it.
+
+        ``title`` for a shell tool is an LLM-authored description, so a
+        credential read labelled "List project files" is the bypass that keying
+        on the title alone would let through. The user is never even asked.
+        """
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(title="List project files", command="cat ~/.ssh/id_rsa"),
+            answer="a",  # the user WOULD have allowed it
+        )
+        assert provider.calls == [("reject", 7, False)]
+        assert reads["n"] == 0
+        # A stable code, not the gate's reason: the reason names the very path
+        # being protected, and an audit record must not restate it.
+        assert sels[0]["error"] == "hook_deny"
+        assert ".ssh" not in json.dumps(sels[0])
+        # The reason still reaches the terminal, and it has to be the REAL one:
+        # `is_shell` with no command also denies, via the gate's deny-by-default
+        # backstop, so "it was denied" would pass just as well when the command
+        # is never forwarded at all.
+        err = capsys.readouterr().err
+        assert "sensitive credential path" in err
+        assert "could not be verified" not in err
+
+    @pytest.mark.asyncio
+    async def test_a_denied_command_is_not_the_users_to_override(self, monkeypatch):
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(title="Tidy the workspace", command="rm -rf /"),
+            answer="a",
+        )
+        assert provider.calls == [("reject", 7, False)]
+        assert reads["n"] == 0
+        assert [s["outcome"] for s in sels] == ["denied"]
+
+    # ── The audit record ─────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "event_kw,answer,order,code",
+        [
+            (dict(title="x", command="rm -rf /"), "a", ["sel", "reject"], "hook_deny"),
+            ({}, "a", ["sel", "approve"], ""),
+            ({}, "d", ["sel", "reject"], "user_denied"),
+        ],
+    )
+    async def test_the_audit_precedes_the_transport(
+        self, monkeypatch, event_kw, answer, order, code
+    ):
+        """A transport failure must not erase the decision, and the code stays a
+        stable token so the log is queryable and quotes nothing.
+
+        Asserting the interleaved trace, rather than two separate lists, is what
+        makes this an ordering test.
+        """
+        provider, sels, _ = await self._drive(
+            monkeypatch, event=self._event(**event_kw), answer=answer
+        )
+        assert [t[0] for t in provider.trace] == order
+        assert sels[0]["error"] == code
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "event_kw,expected,forbidden",
+        [
+            # The canonical `_meta.kiro` identity wins over LLM prose.
+            (
+                dict(title="do something friendly", tool_name="mcp__files__read"),
+                "mcp__files__read",
+                "friendly",
+            ),
+            # No canonical name: the title is all there is, so scrub it -- SEL
+            # does not redact for its callers.
+            (dict(title="deploy with AKIAIOSFODNN7EXAMPLE"), None, "AKIAIOSFODNN7EXAMPLE"),
+        ],
+    )
+    async def test_the_audited_identity_is_not_model_authored(
+        self, monkeypatch, event_kw, expected, forbidden
+    ):
+        _, sels, _ = await self._drive(monkeypatch, event=self._event(**event_kw), answer="a")
+        if expected is not None:
+            assert sels[0]["tool_name"] == expected
+        assert forbidden not in sels[0]["tool_name"]
+
+    # ── The human decision ───────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer,call,outcome",
+        [("a", ("approve", 7, False), "allowed"), ("d", ("reject", 7, False), "denied")],
+    )
+    async def test_the_turn_completes_whatever_the_human_answers(
+        self, monkeypatch, capsys, answer, call, outcome
+    ):
+        """Denial answers the gate; it must not abandon the turn."""
+        provider, sels, reads = await self._drive(monkeypatch, answer=answer)
+        assert provider.calls == [call]
+        assert reads["n"] == 1
+        assert [s["outcome"] for s in sels] == [outcome]
+        assert "done" in capsys.readouterr().out  # text after the gate reached stdout
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer,allows",
+        # A prefix match reads `abort` as an allow -- the opposite of intent.
+        # The other rejects are what a person types when a single-key prompt did
+        # not register, plus the do-nothing answers.
+        [(a, True) for a in ("a", "A", " a ", "a\n")]
+        + [(a, False) for a in ("abort", "allow", "always", "wait", "ad", "x", "", EOFError)],
+    )
+    async def test_only_the_exact_allow_token_approves(self, monkeypatch, answer, allows):
+        provider, sels, _ = await self._drive(monkeypatch, answer=answer)
+        assert provider.calls == [("approve", 7, False) if allows else ("reject", 7, False)]
+        assert [s["outcome"] for s in sels] == ["allowed" if allows else "denied"]
+
+    @pytest.mark.asyncio
+    async def test_no_answer_grants_a_persistent_approval(self, monkeypatch):
+        """There is no "always allow": a backend that records one stops sending
+        permission requests for matching calls, and a request never sent is a
+        call this ladder never runs and never audits."""
+        for answer in ("a", "w", "always"):
+            provider, _, reads = await self._drive(monkeypatch, answer=answer)
+            assert all(not always for kind, _, always in provider.calls if kind == "approve")
+        # The prompt must not advertise an option the responder cannot honour.
+        assert "always" not in reads["prompts"][0].lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "interactive,tty",
+        [
+            # `-m` is documented as non-interactive, so a terminal does not
+            # license a prompt: a script under a pty would block on a question
+            # nobody is watching for.
+            (False, True),
+            # And a prompt nobody can see is a hang, not consent.
+            (True, False),
+        ],
+    )
+    async def test_a_prompt_nobody_can_answer_denies_without_reading_stdin(
+        self, monkeypatch, capsys, interactive, tty
+    ):
+        provider, sels, reads = await self._drive(
+            monkeypatch, interactive=interactive, tty=tty, answer="a"
+        )
+        assert provider.calls == [("reject", 7, False)]
+        assert reads["n"] == 0
+        assert sels[0]["error"] == "noninteractive"
+        captured = capsys.readouterr()
+        assert "done" in captured.out  # the turn still finished
+        assert "Denied automatically" in captured.err
+        # The notice's own wording stays ASCII, which is a legibility choice: a
+        # redirected stream encodes with the locale codec, and an escaped
+        # character reads as noise mid-sentence. This case supplies an ASCII
+        # title, so the whole captured notice is ASCII.
+        #
+        # It is NOT a safety property, and the title is not covered by it — see
+        # TestDenialNoticeEncoding, which drives a real child process to pin what
+        # actually protects an arbitrary-Unicode title.
+        captured.err.encode("ascii")
+
+    # ── What the human is shown ──────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "command,expected,absent",
+        [
+            ("git status --short", "Command: git status --short", None),
+            # Collapsed to one line: a heredoc must not reflow the question.
+            ("printf 'a\\n\\tb'\nwc -l", "Command: printf 'a\\n\\tb' wc -l", None),
+            # Capped, with the cut made explicit.
+            ("echo " + "x" * 400, "... [truncated]", "x" * 400),
+            # Redacted on the way to the screen.
+            ("deploy --key AKIAIOSFODNN7EXAMPLE", None, "AKIAIOSFODNN7EXAMPLE"),
+            # Nothing to show for a non-shell call.
+            (None, None, "Command:"),
+        ],
+    )
+    async def test_a_shell_prompt_shows_what_will_actually_run(
+        self, monkeypatch, capsys, command, expected, absent
+    ):
+        """Approving on an LLM-authored title alone is consent to a description.
+
+        The gate already keys on ``shell_command``; the human deciding needs the
+        same ground truth.
+        """
+        await self._drive(
+            monkeypatch,
+            event=self._event(title="Run a helpful script", command=command),
+            answer="a",
+        )
+        out = capsys.readouterr().out
+        # Non-vacuous control: for a shell call the line must have been printed
+        # at all, or an "absent" assertion passes for a request that never
+        # reached the prompt.
+        assert ("Command:" in out) is (command is not None)
+        if expected:
+            assert expected in out
+        if absent:
+            assert absent not in out
+
+    # ── stdin lifecycle ──────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_the_event_loop_keeps_running_while_the_prompt_waits(self, monkeypatch):
+        """The turn is parked INSIDE an active stream, not at an idle REPL.
+
+        The blocking read does not return until a loop-side ticker has advanced,
+        so a synchronous implementation deadlocks and this times out rather than
+        passing quietly.
+        """
+        import kiro_crew.cli_chat as cli_chat
+
+        ticks, released = {"n": 0}, threading.Event()
+
+        async def _ticker():
+            while True:
+                await asyncio.sleep(0.01)
+                ticks["n"] += 1
+                if ticks["n"] >= 3:
+                    released.set()
+
+        def blocking_read(prompt=""):
+            # Waits for the LOOP to progress: only reachable off the loop thread.
+            assert released.wait(timeout=self._TIMEOUT), "event loop was blocked"
+            return "a"
+
+        self._patch_env(monkeypatch)
+        monkeypatch.setattr(cli_chat, "_read_line_blocking", blocking_read)
+        provider = self._GatedProvider(self._event(), [])
+        ticker = asyncio.create_task(_ticker())
+        try:
+            await asyncio.wait_for(
+                cli_chat._send_and_print(provider, "run it", interactive=True, gate=self._gate()),
+                timeout=self._TIMEOUT,
+            )
+        finally:
+            ticker.cancel()
+        assert provider.calls == [("approve", 7, False)]
+
+    @pytest.mark.asyncio
+    async def test_a_poisoned_session_never_starts_a_second_reader(self, monkeypatch):
+        """No later entry point may race the abandoned reader for keystrokes --
+        not a second permission prompt, and not the REPL."""
+        import kiro_crew.cli_chat as cli_chat
+
+        self._patch_env(monkeypatch)
+        monkeypatch.setattr(cli_chat, "_stdin_poisoned", True)
+
+        def never(prompt=""):
+            raise AssertionError("a poisoned session read stdin")
+
+        monkeypatch.setattr(cli_chat, "_read_line_blocking", never)
+        monkeypatch.setattr("builtins.input", never)
+
+        provider = self._GatedProvider(self._event(), [])
+        with pytest.raises(cli_chat.StdinPoisonedError):
+            await cli_chat._send_and_print(provider, "run it", interactive=True, gate=self._gate())
+        with pytest.raises(cli_chat.StdinPoisonedError):
+            await cli_chat._interactive(provider, types.SimpleNamespace())
+
+    @pytest.mark.asyncio
+    async def test_teardown_never_awaits_the_backend(self, monkeypatch):
+        """Cancelling frees the coroutine, not the reader thread, and a wedged
+        transport must not swallow the cancellation being delivered.
+
+        The abandoned reader stays parked and takes the next line the user types
+        -- measured -- so stdin has to be marked unusable. And ``CancelledError``
+        has already been raised once with nothing to re-deliver it, so awaiting a
+        ``reject_tool`` that never returns would leave the Ctrl-C that asked for
+        this teardown unable to land.
+        """
+        import kiro_crew.cli_chat as cli_chat
+
+        entered = threading.Event()
+
+        class _HungReject(self._GatedProvider):
+            async def reject_tool(self, request_id):
+                self.trace.append(("reject", request_id, False))
+                await asyncio.Event().wait()  # never returns
+
+        def blocking_read(prompt=""):
+            entered.set()
+            threading.Event().wait(timeout=self._TIMEOUT)
+            return "a"
+
+        trace: list = []
+        self._patch_env(monkeypatch, trace=trace)
+        monkeypatch.setattr(cli_chat, "_read_line_blocking", blocking_read)
+        provider = _HungReject(self._event(), trace)
+        task = asyncio.create_task(
+            cli_chat._send_and_print(provider, "run it", interactive=True, gate=self._gate())
+        )
+        await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5.0)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=self._TIMEOUT)
+        assert cli_chat._stdin_poisoned is True
+        assert provider.calls == []  # nothing was awaited on the way out
+        assert [s[1]["error"] for s in trace if s[0] == "sel"] == ["session_aborted"]
+
+    @pytest.mark.asyncio
+    async def test_the_teardown_audit_also_runs_off_the_event_loop(self, monkeypatch):
+        """The exit path is the one where blocking the loop hurts most: the loop
+        still owns the ACP reader and stderr-drain tasks, and cold ``sel()``
+        initialization replays the audit log to recover the HMAC chain. Auditing
+        synchronously here would relocate the freeze this path exists to end.
+
+        Shielded, so the record still lands if another cancellation arrives
+        mid-write -- ``session_aborted`` is the outcome an audit reader can least
+        afford to lose, because it is what distinguishes a died-unanswered turn
+        from a user who said no.
+        """
+        import kiro_crew.cli_chat as cli_chat
+
+        entered = threading.Event()
+        threads: list = []
+        trace: list = []
+
+        def blocking_read(prompt=""):
+            entered.set()
+            threading.Event().wait(timeout=self._TIMEOUT)
+            return "a"
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(cli_chat, "_read_line_blocking", blocking_read)
+
+        def _record(**kw):
+            threads.append(threading.current_thread())
+            trace.append(("sel", kw))
+
+        monkeypatch.setattr(
+            cli_chat, "sel", lambda: types.SimpleNamespace(log_tool_invocation=_record)
+        )
+
+        provider = self._GatedProvider(self._event(), trace)
+        task = asyncio.create_task(
+            cli_chat._send_and_print(provider, "run it", interactive=True, gate=self._gate())
+        )
+        await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5.0)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=self._TIMEOUT)
+
+        assert [s[1]["error"] for s in trace if s[0] == "sel"] == ["session_aborted"]
+        assert threads[0] is not threading.main_thread(), (
+            "the teardown SEL write ran on the event loop thread; a slow audit "
+            "store would stall ACP draining while the turn is being torn down"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_approval_that_cannot_be_audited_is_refused(self, monkeypatch):
+        """AUDIT-OR-DENY on the allow path. An unwritable SEL log otherwise means
+        the tool RUNS while the only record that a human authorized it is dropped
+        by the background writer -- and on this surface the consent was a
+        keystroke, so nothing else can reconstruct it afterwards.
+
+        Refused rather than raised: letting the failure escape would abandon the
+        request unanswered, and the backend holds the turn open until it is
+        answered, which is the hang this path exists to end.
+        """
+        import kiro_crew.cli_chat as cli_chat
+
+        trace: list = []
+
+        def _explode(**kw):
+            trace.append(("sel", kw))
+            if kw.get("critical"):
+                raise OSError("SEL log is read-only")
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(cli_chat, "_read_line_blocking", lambda prompt="": "a")
+        monkeypatch.setattr(
+            cli_chat, "sel", lambda: types.SimpleNamespace(log_tool_invocation=_explode)
+        )
+
+        provider = self._GatedProvider(self._event(), trace)
+        await asyncio.wait_for(
+            cli_chat._send_and_print(
+                provider, "run it", interactive=True, gate=self._gate()
+            ),
+            timeout=self._TIMEOUT,
+        )
+
+        assert provider.calls == [("reject", 7, False)], "the tool must not run unaudited"
+        outcomes = [(s[1]["outcome"], s[1].get("error", "")) for s in trace if s[0] == "sel"]
+        assert ("allowed", "") in outcomes, "the critical attempt must have been made"
+        assert ("denied", "audit_unwritable") in outcomes, (
+            "the downgrade must be recorded under its OWN code -- the operator said "
+            "yes, so an audit reader must not be told they refused"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_allow_audit_is_critical_and_the_deny_audit_is_not(self, monkeypatch):
+        """The asymmetry is deliberate. Fail-closed only has meaning where the
+        alternative is EXECUTION: a deny is already refusing, so a lost record
+        cannot authorize anything, and making it audit-or-deny would turn a
+        refusal into an error for no security gain."""
+        import kiro_crew.cli_chat as cli_chat
+
+        seen: dict = {}
+
+        async def _drive(answer, key):
+            trace: list = []
+            self._patch_env(monkeypatch, trace=trace, answer=answer)
+            provider = self._GatedProvider(self._event(), trace)
+            await asyncio.wait_for(
+                cli_chat._send_and_print(
+                    provider, "run it", interactive=True, gate=self._gate()
+                ),
+                timeout=self._TIMEOUT,
+            )
+            seen[key] = [s[1].get("critical", False) for s in trace if s[0] == "sel"]
+
+        await _drive("a", "allow")
+        await _drive("d", "deny")
+
+        assert seen["allow"] == [True], "the approval must be audit-or-deny"
+        assert seen["deny"] == [False], "a refusal must not be gated on its own audit"
+
+    @pytest.mark.asyncio
+    async def test_the_prompt_and_the_gate_share_one_set_of_path_spellings(self, monkeypatch):
+        """A ``filePath`` target used to be DISPLAYED as though it had been vetted
+        while the keystone never read that key. Both sides now resolve through
+        ``hooks.target_paths``, so the parity is structural rather than asserted in
+        a comment -- and a sensitive value under any spelling is refused by the
+        gate before a human is ever asked.
+        """
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(
+                title="Tidy up the notes",
+                tool_name="fs_write",
+                tool_kind="edit",
+                raw_params={"filePath": "~/.ssh/id_rsa"},
+            ),
+            answer="a",
+        )
+        assert provider.calls == [("reject", 7, False)], "the keystone must refuse it"
+        assert reads["n"] == 0, "a policy denial is not the user's to override"
+        assert [s["error"] for s in sels] == ["hook_deny"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer,tty,interactive,expected_error",
+        [
+            ("d", True, True, "user_denied"),
+            ("a", False, True, "noninteractive"),
+        ],
+    )
+    async def test_a_refusal_survives_its_own_audit_failing(
+        self, monkeypatch, answer, tty, interactive, expected_error
+    ):
+        """The audit is bookkeeping; ``reject_tool`` is what ends the turn. If a
+        raising audit skipped the rejection, the backend would hold the turn open
+        on an unanswered request -- the hang this path exists to end, reached
+        through the bookkeeping instead of the decision.
+
+        Parametrised across two different refusal reasons so this pins the CLASS,
+        not the single call site: every refusal path shares one helper.
+        """
+        import kiro_crew.cli_chat as cli_chat
+
+        trace: list = []
+
+        def _explode(**kw):
+            trace.append(("sel", kw))
+            raise ValueError("invalid SEL key")
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: tty, raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: tty, raising=False)
+        monkeypatch.setattr(cli_chat, "_read_line_blocking", lambda prompt="": answer)
+        monkeypatch.setattr(
+            cli_chat, "sel", lambda: types.SimpleNamespace(log_tool_invocation=_explode)
+        )
+
+        provider = self._GatedProvider(self._event(), trace)
+        await asyncio.wait_for(
+            cli_chat._send_and_print(
+                provider, "run it", interactive=interactive, gate=self._gate()
+            ),
+            timeout=self._TIMEOUT,
+        )
+
+        assert provider.calls == [("reject", 7, False)], (
+            "the audit failure swallowed the rejection; the backend would wait "
+            "forever on an unanswered permission request"
+        )
+        assert [s[1].get("error") for s in trace if s[0] == "sel"] == [expected_error]
+
+    @pytest.mark.asyncio
+    async def test_a_policy_denial_survives_its_own_audit_failing(self, monkeypatch):
+        """The gate-deny path is the one a prompt-injected agent is most likely to
+        reach, so it must not be the one where a broken audit sink turns a refusal
+        into an abandoned turn."""
+        import kiro_crew.cli_chat as cli_chat
+
+        trace: list = []
+
+        def _explode(**kw):
+            trace.append(("sel", kw))
+            raise ValueError("invalid SEL key")
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(cli_chat, "_read_line_blocking", lambda prompt="": "a")
+        monkeypatch.setattr(
+            cli_chat, "sel", lambda: types.SimpleNamespace(log_tool_invocation=_explode)
+        )
+
+        event = self._event(
+            title="Tidy up", tool_name="fs_write", tool_kind="edit",
+            raw_params={"path": "~/.ssh/id_rsa"},
+        )
+        provider = self._GatedProvider(event, trace)
+        await asyncio.wait_for(
+            cli_chat._send_and_print(
+                provider, "run it", interactive=True, gate=self._gate()
+            ),
+            timeout=self._TIMEOUT,
+        )
+
+        assert provider.calls == [("reject", 7, False)]
+        assert [s[1].get("error") for s in trace if s[0] == "sel"] == ["hook_deny"]
+
+    @pytest.mark.asyncio
+    async def test_a_gate_exception_is_explicitly_rejected(self, monkeypatch, capsys):
+        """A broken authorization gate cannot become an unanswered request."""
+        import kiro_crew.cli_chat as cli_chat
+
+        trace: list = []
+        event = self._event(title="Check it", tool_name="fs_read")
+        provider = self._GatedProvider(event, trace)
+        reads = self._patch_env(monkeypatch, tty=True, trace=trace, answer="a")
+        gate = self._gate()
+
+        def broken_gate(*args, **kwargs):
+            raise ValueError("malformed tool input")
+
+        monkeypatch.setattr(gate.hooks, "on_tool_call", broken_gate)
+        await asyncio.wait_for(
+            cli_chat._send_and_print(provider, "run it", interactive=True, gate=gate),
+            timeout=self._TIMEOUT,
+        )
+
+        assert provider.calls == [("reject", 7, False)]
+        assert reads["n"] == 0
+        assert [s[1].get("error") for s in trace if s[0] == "sel"] == ["gate_failed"]
+        captured = capsys.readouterr()
+        assert "done" in captured.out
+        assert "security gate could not verify" in captured.err
+
+    # ── Unchanged behaviour ──────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_stream_without_a_permission_request_is_unchanged(self, capsys):
+        import kiro_crew.cli_chat as cli_chat
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        class _PlainProvider(self._GatedProvider):
+            async def stream(self, message):
+                yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="hello ")
+                yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="world")
+                yield LLMEvent(kind=EVENT_COMPLETE)
+
+        provider = _PlainProvider(self._event(), [])
+        await cli_chat._send_and_print(provider, "hi")
+        assert capsys.readouterr().out == "hello world\n"
+        assert provider.calls == []
+
+    # ── Terminal controls on the consent surface ─────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_osc52_title_cannot_reach_the_terminal(self, monkeypatch, capsys):
+        # An OSC 52 sequence in a model-authored title writes the user's
+        # clipboard if it reaches the terminal. Neither ESC nor BEL -- the
+        # sequence's introducer and terminator -- may survive to the prompt.
+        # The prompt's own terminal reset is fixed, trusted bytes rather than
+        # anything a title can influence, so it is subtracted before asserting
+        # that NOTHING else escaped: that keeps this a whole-output guarantee
+        # instead of narrowing it to one line.
+        import kiro_crew.cli_chat as cli_chat
+
+        title = "Read file\x1b]52;c;aGVsbG8=\x07 please"
+        await self._drive(monkeypatch, event=self._event(title=title))
+        out = capsys.readouterr().out
+        untrusted = out.replace(cli_chat._PROMPT_TERMINAL_RESET, "")
+        assert "\x1b" not in untrusted and "\x07" not in untrusted
+        assert "]52;c;aGVsbG8=" in out  # neutralised to inert text, not dropped
+        assert "Read file" in out
+
+    @pytest.mark.asyncio
+    async def test_csi_sequence_cannot_reach_the_terminal(self, monkeypatch, capsys):
+        # CSI can move the cursor and erase what is already drawn, so a title
+        # could repaint the question the user is answering. The newline is part
+        # of the same class: a multi-line title pushes the prompt off screen.
+        title = "Delete\x1b[2K\x1b[1Anothing\nimportant"
+        await self._drive(monkeypatch, event=self._event(title=title))
+        out = capsys.readouterr().out
+        line = next(ln for ln in out.splitlines() if ln.startswith("Permission required:"))
+        assert "\x1b" not in line
+        assert line == "Permission required: Delete [2K [1Anothing important"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("encoding", ["utf-8", "cp1252"])
+    async def test_malicious_unicode_title_and_tool_input_are_answered(
+        self, monkeypatch, encoding
+    ):
+        """Strict UTF-8 rejects lone surrogates; strict cp1252 rejects wider Unicode.
+
+        Drive the whole pending-request flow through a strict destination stream
+        so either case raises before ``approve_tool`` when the render boundary is
+        missing. ``tool_input`` is used because that is the permission-request
+        wire shape ``shell_command`` decodes.
+        """
+        stream = self._StrictTextStream(encoding)
+        monkeypatch.setattr(sys, "stdout", stream)
+        bomb = chr(0x1F4A3)
+        command = f"printf '{chr(0xDFFF)} {bomb}'"
+        event = self._event(title=f"Run safely {chr(0xD800)} 刪除 {bomb}", command=command)
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+
+        assert provider.calls == [("approve", 7, False)]
+        assert reads["n"] == 1
+        assert [record["outcome"] for record in sels] == ["allowed"]
+        rendered = stream.getvalue()
+        rendered.encode(encoding, errors="strict")
+        assert "\ud800" not in rendered and "\udfff" not in rendered
+        assert "Permission required:" in rendered and "Command:" in rendered
+        if encoding == "cp1252":
+            assert "\\u522a\\u9664" in rendered
+            assert "\\U0001f4a3" in rendered
+        else:
+            assert "刪除" in rendered and bomb in rendered
+
+    @pytest.mark.asyncio
+    async def test_a_prompt_render_failure_is_explicitly_rejected(self, monkeypatch, capsys):
+        """A render bug is not allowed to escape between request and response."""
+        import kiro_crew.cli_chat as cli_chat
+
+        async def broken_prompt(event):
+            raise UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogate")
+
+        monkeypatch.setattr(cli_chat, "_prompt_allows", broken_prompt)
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(title="Render \ud800", tool_name="fs_write"),
+            answer="a",
+        )
+
+        assert provider.calls == [("reject", 7, False)]
+        assert reads["n"] == 0
+        assert [record["error"] for record in sels] == ["prompt_failed"]
+        captured = capsys.readouterr()
+        assert "done" in captured.out
+        assert "could not be rendered or read" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_control_characters_in_a_command_are_neutralised(self, monkeypatch, capsys):
+        # The shell command is untrusted display text on the same surface, and
+        # keeps its existing one-line collapse contract.
+        event = self._event(title="Run it", command="echo \x1b]52;c;x\x07hi\nls")
+        await self._drive(monkeypatch, event=event)
+        out = capsys.readouterr().out
+        line = next(ln for ln in out.splitlines() if ln.startswith("Command:"))
+        assert "\x1b" not in line and "\x07" not in line
+        assert line == "Command: echo ]52;c;x hi ls"
+
+    @pytest.mark.asyncio
+    async def test_an_unverifiable_execute_request_is_never_put_to_the_user(
+        self, monkeypatch, capsys
+    ):
+        """``is_shell`` comes only from the trusted preceding-tool_call cache.
+
+        On a cache miss it stays False, and ``shell_command`` returns None
+        whenever it is False -- so a real command would be gated on nothing but
+        its LLM-authored title. The request is refused instead of asked about,
+        even though the user would have allowed it.
+        """
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(title="List project files", tool_kind="execute"),
+            answer="a",  # the user WOULD have allowed it
+        )
+        assert provider.calls == [("reject", 7, False)]
+        assert reads["n"] == 0  # never prompted
+        assert sels[0]["outcome"] == "denied"
+        # Its own code: the gate did not reject this, we refused to ask.
+        assert sels[0]["error"] == "unverified_shell"
+        assert "could not be verified" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_a_cosmetic_kind_variant_still_refuses(self, monkeypatch):
+        # Widening a fail-closed test is safe, so casing/padding must not be a
+        # way to present an unverifiable command as an ordinary tool call.
+        provider, sels, _ = await self._drive(
+            monkeypatch,
+            event=self._event(title="List files", tool_kind="  Execute "),
+            answer="a",
+        )
+        assert provider.calls == [("reject", 7, False)]
+        assert sels[0]["error"] == "unverified_shell"
+
+    @pytest.mark.asyncio
+    async def test_a_non_string_kind_still_gets_answered(self, monkeypatch):
+        # ACP relays ``toolCall.kind`` verbatim, so a backend can send ``kind: 1``.
+        # The gate reads the kind as text, so an unguarded value raises inside the
+        # hook and the turn ends with the request UNANSWERED -- the hang this
+        # whole path exists to end. The request must still be decided, and an
+        # unusable kind must not qualify for the read-only allow-list.
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(title="List files", tool_kind=1),
+            answer="a",
+        )
+        assert provider.calls == [("approve", 7, False)]
+        assert reads["n"] == 1
+        assert [s["outcome"] for s in sels] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_a_builtin_call_shows_its_trusted_tool_name(self, monkeypatch, capsys):
+        # A builtin has no MCP server, so the prompt otherwise carries only the
+        # model-authored title and a file write reaches the human as whatever
+        # prose the model chose. ``tool_name`` is the trusted ``_meta.kiro``
+        # identity, so consent covers what runs rather than its description.
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(title="Tidy up the notes", tool_name="fs_write"),
+            answer="a",
+        )
+        assert provider.calls == [("approve", 7, False)]
+        assert "fs_write" in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["path", "file_path", "filePath"])
+    async def test_a_file_write_discloses_its_target_path(self, monkeypatch, capsys, key):
+        # The trusted identity says WHICH tool runs, not what it runs AGAINST.
+        # ``fs_write`` under a benign title is consent to a verb, and the gate's
+        # sensitive-path deny covers only the named-dangerous paths -- so what is
+        # left undisclosed is exactly the ordinary valuable file no rule speaks
+        # for. Every spelling the gate accepts must be read here too, or the
+        # prompt and the gate disagree about which value is the target.
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(
+                title="Tidy up the notes",
+                tool_name="fs_write",
+                raw_params={key: "/home/tester/thesis.md"},
+            ),
+            answer="a",
+        )
+        assert provider.calls == [("approve", 7, False)]
+        assert "/home/tester/thesis.md" in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_a_pathless_call_is_still_asked_about(self, monkeypatch):
+        # Absence of a path is NOT a refusal. Most builtin calls legitimately act
+        # on no file, so denying whenever a path cannot be found would refuse
+        # them all to close a gap that only exists for tools which name a file.
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(title="Remember this", tool_name="memory_write"),
+            answer="a",
+        )
+        assert provider.calls == [("approve", 7, False)]
+        assert reads["n"] == 1, "a call with no path must still reach the human"
+        assert [s["outcome"] for s in sels] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_a_long_path_cannot_push_the_question_off_screen(self, monkeypatch, capsys):
+        # The path is attacker-influenceable text on an authorization prompt, so
+        # it is capped for the same reason the command line is.
+        import kiro_crew.cli_chat as cli_chat
+
+        flood = "/tmp/" + "a" * (cli_chat._MAX_COMMAND_DISPLAY * 3)
+        await self._drive(
+            monkeypatch,
+            event=self._event(title="Tidy up", tool_name="fs_write", raw_params={"path": flood}),
+            answer="a",
+        )
+        out = capsys.readouterr().out
+        assert "[truncated]" in out
+        assert flood not in out
+
+    @pytest.mark.asyncio
+    async def test_a_non_string_path_argument_does_not_break_the_prompt(self, monkeypatch):
+        # ``raw_tool_params`` is relayed from the backend, so a value need not be
+        # a string. Raising here would leave the permission request unanswered --
+        # the hang this whole path exists to end.
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(
+                title="Tidy up",
+                tool_name="fs_write",
+                raw_params={"path": {"nested": 1}},
+            ),
+            answer="a",
+        )
+        assert provider.calls == [("approve", 7, False)]
+        assert [s["outcome"] for s in sels] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_the_audit_write_never_runs_on_the_event_loop(self, monkeypatch):
+        """``sel()`` opens the audit log and replays it to recover the HMAC chain,
+        so the first permission of a fresh chat pays a filesystem cost inside the
+        call -- unbounded on slow or corrupt storage. This coroutine shares its
+        loop with the ACP reader and stderr-drain tasks, so a blocking write here
+        stops draining the backend and freezes the turn the audit is about."""
+        import threading
+
+        import kiro_crew.cli_chat as cli_chat
+
+        threads: list = []
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(cli_chat, "_read_line_blocking", lambda prompt="": "a")
+        monkeypatch.setattr(
+            cli_chat,
+            "sel",
+            lambda: types.SimpleNamespace(
+                log_tool_invocation=lambda **kw: threads.append(threading.current_thread())
+            ),
+        )
+
+        class _P:
+            def __init__(self):
+                self.calls = []
+
+            async def approve_tool(self, request_id, *, always: bool = False):
+                self.calls.append(("approve", request_id))
+
+            async def reject_tool(self, request_id):
+                self.calls.append(("reject", request_id))
+
+        provider = _P()
+        await asyncio.wait_for(
+            cli_chat._answer_permission(
+                provider,
+                self._event(title="Tidy up", tool_name="fs_write"),
+                interactive=True,
+                gate=self._gate(),
+            ),
+            timeout=self._TIMEOUT,
+        )
+        assert provider.calls == [("approve", 7)]
+        assert threads, "nothing was audited"
+        assert threads[0] is not threading.main_thread(), (
+            "the SEL write ran on the event loop thread; a slow audit store would "
+            "stall ACP draining and freeze the turn"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_prompt_resets_terminal_modes_first(self, monkeypatch, capsys):
+        # Streamed model output is printed raw, so a turn can leave the terminal
+        # in conceal mode and the prompt would draw invisibly into it --
+        # sanitising the prompt's own strings cannot undo inherited state. The
+        # reset has to precede the question, or it does not protect it.
+        await self._drive(
+            monkeypatch,
+            event=self._event(title="Tidy up the notes", tool_name="fs_write"),
+            answer="a",
+        )
+        out = capsys.readouterr().out
+        assert "\x1b[0m" in out and "\x1b[?25h" in out
+        assert out.index("\x1b[0m") < out.index("Permission required")
+
+    @pytest.mark.asyncio
+    async def test_the_mcp_audit_record_names_the_server(self, monkeypatch):
+        # An MCP tool name is unique only within its server, so the audit record
+        # must carry both halves or two servers exposing the same name produce
+        # indistinguishable records.
+        _, sels, _ = await self._drive(
+            monkeypatch,
+            event=self._event(
+                title="Tidy up", tool_name="write_file", mcp_server_name="filesystem"
+            ),
+            answer="d",
+        )
+        assert sels[0]["tool_name"] == "@filesystem/write_file"
+
+    @pytest.mark.asyncio
+    async def test_the_mcp_audit_identity_cannot_collide_on_underscores(self, monkeypatch):
+        # `mcp__<server>__<tool>` re-splits on the LAST `__`, so server "a__b"
+        # with tool "c" and server "a" with tool "b__c" would compose to the same
+        # string. The `/`-joined reference keeps them distinct, because neither an
+        # MCP server nor an MCP tool name contains a slash.
+        _, first, _ = await self._drive(
+            monkeypatch,
+            event=self._event(title="One", tool_name="c", mcp_server_name="a__b"),
+            answer="d",
+        )
+        _, second, _ = await self._drive(
+            monkeypatch,
+            event=self._event(title="Two", tool_name="b__c", mcp_server_name="a"),
+            answer="d",
+        )
+        assert first[0]["tool_name"] == "@a__b/c"
+        assert second[0]["tool_name"] == "@a/b__c"
+        assert first[0]["tool_name"] != second[0]["tool_name"]
+
+    @pytest.mark.asyncio
+    async def test_a_non_mcp_audit_record_keeps_the_plain_tool_name(self, monkeypatch):
+        # The negative control: without an MCP server there is nothing to
+        # qualify, so the record must not gain an `@` prefix.
+        _, sels, _ = await self._drive(
+            monkeypatch,
+            event=self._event(title="Read it", tool_name="fs_read"),
+            answer="d",
+        )
+        assert sels[0]["tool_name"] == "fs_read"
+
+    @pytest.mark.asyncio
+    async def test_the_reset_closes_an_open_string_before_resetting_modes(
+        self, monkeypatch, capsys
+    ):
+        # An OSC/DCS sequence the model left UNTERMINATED puts the terminal in
+        # string-consuming mode: everything after it is swallowed as that
+        # sequence's payload. A mode reset sent into that state is itself eaten,
+        # and so is the prompt. So the abort must come FIRST -- once it discards
+        # the string, the rest of the reset is interpreted again.
+        await self._drive(
+            monkeypatch,
+            event=self._event(title="Tidy up the notes", tool_name="fs_write"),
+            answer="a",
+        )
+        out = capsys.readouterr().out
+        can = out.index("\x18")
+        assert can < out.index("\x1b[0m"), "the abort must precede the mode reset"
+        assert can < out.index("Permission required")
+
+    @pytest.mark.asyncio
+    async def test_the_reset_aborts_rather_than_terminates_a_pending_string(
+        self, monkeypatch, capsys
+    ):
+        # A String Terminator would COMPLETE the pending string, handing an
+        # unterminated OSC 52 from model output to the terminal as a finished
+        # command -- which sets the user's clipboard from attacker-controlled
+        # text. The reset must abort the sequence, so it must not contain ST.
+        await self._drive(
+            monkeypatch,
+            event=self._event(title="Tidy up the notes", tool_name="fs_write"),
+            answer="a",
+        )
+        out = capsys.readouterr().out
+        assert "\x18" in out
+        assert "\x1b\\" not in out, "ST completes the pending string instead of discarding it"
+
+    @pytest.mark.asyncio
+    async def test_the_reset_does_not_beep(self, monkeypatch, capsys):
+        # BEL also ends an OSC string, but it beeps audibly when no string is
+        # open -- on every single prompt. CAN is silent and, unlike BEL, discards
+        # the pending payload rather than delivering it, so the reset must not
+        # fall back to BEL.
+        await self._drive(
+            monkeypatch,
+            event=self._event(title="Tidy up the notes", tool_name="fs_write"),
+            answer="a",
+        )
+        assert "\x07" not in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_the_reset_is_withheld_when_stdout_is_not_a_terminal(self, monkeypatch):
+        # The negative control, exercised directly: driving a full turn with
+        # tty=False never renders the prompt at all, so asserting on its output
+        # would pass no matter what this branch does. Escape bytes written to a
+        # pipe or a redirected file are literal noise in someone's log.
+        import kiro_crew.cli_chat as cli_chat
+
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+        assert cli_chat._terminal_reset() == ""
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+        assert cli_chat._terminal_reset() == cli_chat._PROMPT_TERMINAL_RESET
+
+        def boom():
+            raise ValueError("detached")
+
+        # A closed or detached stream must not let the check itself break the
+        # prompt the user is waiting on.
+        monkeypatch.setattr(sys.stdout, "isatty", boom, raising=False)
+        assert cli_chat._terminal_reset() == ""
+
+    @pytest.mark.asyncio
+    async def test_a_verified_shell_call_is_still_asked_about(self, monkeypatch):
+        # The negative control: the refusal must key on the MISSING trusted
+        # signal, not on execute-kind itself, or every shell call would die
+        # here and the test above would pass for the wrong reason.
+        provider, sels, reads = await self._drive(
+            monkeypatch,
+            event=self._event(title="Run the tests", command="pytest -q"),
+            answer="a",
+        )
+        assert provider.calls == [("approve", 7, False)]
+        assert reads["n"] == 1
+        assert [s["outcome"] for s in sels] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_direct_client_non_shell_permission_can_be_allowed(
+        self, monkeypatch, tmp_path
+    ):
+        """The Claude/direct transport must distinguish cached False from a miss.
+
+        This drives the production ``AcpClient`` parser before the CLI consumer;
+        hand-building an event with ``shell_classified=True`` would not catch a
+        transport that dropped the provenance flag while copying the cache.
+        """
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        self._direct_tool_call(client)
+        event = client._build_permission_event(self._direct_permission_message())
+
+        assert event.is_shell is False
+        assert event.shell_classified is True
+        assert event.raw_params_trusted is True
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("approve", "req-direct", False)]
+        assert reads["n"] == 1
+        assert [s["outcome"] for s in sels] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_direct_client_repeat_keeps_cached_params_authoritative(
+        self, monkeypatch, tmp_path
+    ):
+        """A repeated request cannot replace trusted args with inline prose."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        self._direct_tool_call(client, path="~/.ssh/id_rsa")
+        first = client._build_permission_event(self._direct_permission_message())
+        repeat = client._build_permission_event(
+            self._direct_permission_message(inline_path="notes.md")
+        )
+
+        assert first.raw_tool_params == repeat.raw_tool_params
+        assert repeat.raw_tool_params is not None
+        assert repeat.raw_tool_params["path"] == "~/.ssh/id_rsa"
+        assert repeat.raw_params_trusted is True
+        assert repeat.shell_classified is True
+        provider, _, reads = await self._drive(monkeypatch, event=repeat, answer="a")
+        assert provider.calls == [("reject", "req-direct", False)]
+        assert reads["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_direct_client_cache_miss_stays_fail_closed(
+        self, monkeypatch, tmp_path
+    ):
+        """Inline permission data cannot manufacture trusted provenance."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        event = client._build_permission_event(
+            self._direct_permission_message(tool_call_id="uncached", inline_path="notes.md")
+        )
+
+        assert event.raw_params_trusted is False
+        assert event.shell_classified is False
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("reject", "req-direct", False)]
+        assert reads["n"] == 0
+        assert sels[0]["error"] == "unverified_shell"
+
+    @pytest.mark.asyncio
+    async def test_ordinary_title_and_command_display_unchanged(self, monkeypatch, capsys):
+        # The control-stripping must not disturb ordinary text: this is the
+        # control for the three cases above.
+        event = self._event(title="Run the test suite", command="pytest -q test/test_cli.py")
+        await self._drive(monkeypatch, event=event)
+        out = capsys.readouterr().out
+        assert "Permission required: Run the test suite" in out
+        assert "Command: pytest -q test/test_cli.py" in out
+        # A shell call has no MCP identity to disclose, so the line is absent
+        # rather than empty -- the negative control for the MCP cases below.
+        assert "MCP tool:" not in out
+
+    @pytest.mark.asyncio
+    async def test_mcp_identity_is_disclosed_not_just_the_title(self, monkeypatch, capsys):
+        # An MCP call shows no command, so before this the human saw ONLY the
+        # model-authored title: a benign description could win consent for an
+        # undisclosed tool. The trusted _meta identity must reach the prompt.
+        event = self._event(
+            title="Tidy up the workspace",
+            tool_name="delete_everything",
+            mcp_server_name="filesystem",
+        )
+        await self._drive(monkeypatch, event=event)
+        out = capsys.readouterr().out
+        assert "MCP tool: filesystem / delete_everything" in out
+
+    @pytest.mark.asyncio
+    async def test_mcp_identity_is_neutralised_and_survives_a_nameless_tool(
+        self, monkeypatch, capsys
+    ):
+        # The identity is server-supplied text on the consent surface, so it
+        # gets the same one-line control-stripping as the title and command. A
+        # missing tool name still discloses the server rather than printing a
+        # bare separator that reads as though nothing was withheld.
+        event = self._event(
+            title="Tidy up",
+            tool_name="",
+            mcp_server_name="fs\x1b[2Kspoof\nserver",
+        )
+        await self._drive(monkeypatch, event=event)
+        line = next(
+            ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("MCP tool:")
+        )
+        assert "\x1b" not in line
+        assert line == "MCP tool: fs [2Kspoof server / unnamed tool"
+
+    # ── Canonical MCP identity reaches the shared gate ───────────────────
+
+    @pytest.mark.asyncio
+    async def test_canonical_mcp_identity_is_forwarded_and_denies(self, monkeypatch):
+        # The wiring guard: a permission_request carrying the trusted _meta.kiro
+        # server + tool names must reach HookManager as those fields, so a
+        # governance rule naming the canonical mcp__server__tool denies the call
+        # -- the backend is rejected and the human is never asked.
+        import kiro_crew.cli_chat as cli_chat
+        import kiro_crew.hooks as hooks_mod
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+        seen: list[str] = []
+
+        def fake_gov(ctx, name, *a, **k):
+            # One question carries every identity for the call (title, trusted
+            # tool name, canonical MCP reference), so match against all of them.
+            targets = [name, *k.get("extra_titles", ()), k.get("mcp_ref", "")]
+            for target in targets:
+                if target and target not in seen:
+                    seen.append(target)
+            if "@weather:srv/wipe_disk" in targets:
+                return "Blocked by governance policy: denied"
+            return None
+
+        monkeypatch.setattr(hooks_mod, "_governance_denial", fake_gov)
+        event = LLMEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            request_id=7,
+            title="Check the forecast",  # benign model-authored prose
+            tool_kind="other",
+            mcp_server_name="weather:srv",
+            tool_name="wipe_disk",
+            options=[{"id": "allow", "label": "Allow Once"}],
+        )
+        trace: list = []
+        provider = self._GatedProvider(event, trace)
+        reads = self._patch_env(monkeypatch, tty=True, trace=trace, answer="a")
+        await asyncio.wait_for(
+            cli_chat._send_and_print(provider, "run it", interactive=True, gate=self._gate()),
+            timeout=self._TIMEOUT,
+        )
+
+        assert "@weather:srv/wipe_disk" in seen  # forwarded, not just the title
+        assert provider.calls == [("reject", 7, False)]
+        assert reads["n"] == 0  # the human was never asked
+        assert [s[1]["error"] for s in trace if s[0] == "sel"] == ["hook_deny"]
+
+    @pytest.mark.asyncio
+    async def test_gate_verdict_is_obtained_off_the_event_loop(self, monkeypatch):
+        # The gate resolves the governance profile, which stats and reads
+        # ``profiles/``. This coroutine shares its loop with the ACP reader and
+        # drain tasks, so that walk must not run on the loop: on slow or network
+        # storage a synchronous call stalls the whole session. Pinned by asserting
+        # the call lands on a DIFFERENT thread than the loop's.
+        import threading
+
+        import kiro_crew.cli_chat as cli_chat
+        import kiro_crew.hooks as hooks_mod
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+        loop_thread = threading.get_ident()
+        call_threads: list[int] = []
+        real = hooks_mod.HookManager.on_tool_call
+
+        def recording(self, *a, **k):
+            call_threads.append(threading.get_ident())
+            return real(self, *a, **k)
+
+        monkeypatch.setattr(hooks_mod.HookManager, "on_tool_call", recording)
+        event = LLMEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            request_id=11,
+            title="Read a file",
+            tool_kind="read",
+            options=[{"id": "allow", "label": "Allow Once"}],
+        )
+        trace: list = []
+        provider = self._GatedProvider(event, trace)
+        self._patch_env(monkeypatch, tty=True, trace=trace, answer="a")
+        await asyncio.wait_for(
+            cli_chat._send_and_print(provider, "go", interactive=True, gate=self._gate()),
+            timeout=self._TIMEOUT,
+        )
+
+        assert call_threads, "the gate was never consulted"
+        assert loop_thread not in call_threads, (
+            "on_tool_call ran on the event-loop thread; its profile walk must be "
+            "offloaded via asyncio.to_thread"
+        )
+
+    def test_an_unclassified_request_is_refused_whatever_kind_it_claims(self):
+        # THE VECTOR. A real shell call whose preceding tool_call carried no
+        # resolvable kind leaves the cache empty, so is_shell is the MISS default
+        # rather than a resolved "not a shell tool". Labelling it ``read`` must not
+        # buy it a trip to the human prompt, where the only thing on display would
+        # be a title with no command behind it.
+        import kiro_crew.cli_chat as cli_chat
+
+        event = self._event(title="Read a file", tool_kind="read", shell_classified=False)
+        assert cli_chat._unverifiable_shell(event) is True
+
+    def test_a_resolved_non_shell_request_is_not_refused(self):
+        # The negative control that keeps the deny narrow: a RESOLVED non-shell
+        # classification is a real answer, and must still reach the prompt.
+        import kiro_crew.cli_chat as cli_chat
+
+        event = self._event(title="Read a file", tool_kind="read")
+        assert cli_chat._unverifiable_shell(event) is False
+
+    def test_audit_scrubs_a_credential_out_of_the_tool_identity(self, monkeypatch):
+        # The audited identity comes from the backend, and SEL does not redact for
+        # its callers, so a credential riding in a tool name would be persisted and
+        # served over /api/sel/events.
+        import types as _types
+
+        import kiro_crew.cli_chat as cli_chat
+
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        trace: list = []
+        gate = self._gate()
+        monkeypatch.setattr(
+            cli_chat,
+            "sel",
+            lambda: _types.SimpleNamespace(
+                log_tool_invocation=lambda **kw: trace.append(("sel", kw))
+            ),
+        )
+        event = self._event(title="Terminal", tool_name=f"fetch_{secret}")
+        cli_chat._audit(gate, event, "approved")
+
+        logged = [s[1]["tool_name"] for s in trace if s[0] == "sel"]
+        assert logged, "nothing was audited"
+        assert secret not in logged[0], f"credential survived into the audit: {logged[0]!r}"
+
+
+class TestDenialNoticeEncoding:
+    """The automatic-denial notice interpolates a title the model or the tool
+    chose, and is written to stderr precisely when stderr is REDIRECTED — where
+    the stream encodes with the locale codec rather than UTF-8.
+
+    Run in a CHILD PROCESS on purpose. The contract under test is a property of
+    the real interpreter's standard streams, and in-process substitutes do not
+    have it: a ``TextIOWrapper`` or ``StringIO`` built by a test carries whatever
+    error handler the test chose, so a strict one would manufacture a failure
+    this code path cannot actually produce, and pytest's own capture replaces
+    ``sys.stderr`` outright.
+    """
+
+    #: Han the cp950 codec can encode, plus an emoji no legacy codepage can.
+    _TITLE = "刪除全部 \U0001f4a3 rm -rf"
+
+    _CHILD = """
+import asyncio, json, sys
+import kiro_crew.cli_chat as cli_chat
+from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+print(f"encoding={sys.stderr.encoding}")
+print(f"errors={sys.stderr.errors}")
+
+
+class P:
+    async def approve_tool(self, rid):
+        print("approve")
+
+    async def reject_tool(self, rid):
+        print("reject")
+
+
+event = LLMEvent(
+    kind=EVENT_PERMISSION_REQUEST,
+    request_id=7,
+    title=%(title)r,
+    tool_kind="read",
+    is_shell=False,
+    tool_input=json.dumps({}),
+    tool_name="",
+    options=[{"id": "allow", "label": "Allow Once"}],
+)
+# interactive=False takes the automatic-denial branch, whose notice goes to
+# stderr with the title interpolated into it.
+asyncio.run(cli_chat._answer_permission(P(), event, interactive=False))
+print("survived")
+"""
+
+    @pytest.mark.parametrize("io_encoding", ["cp950", "cp950:strict"])
+    def test_denial_notice_survives_a_non_utf8_redirected_stderr(
+        self, tmp_path, io_encoding
+    ):
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = io_encoding
+        # Keep the SEL audit write inside the test's own tree.
+        env["KIROCREW_HOME"] = str(tmp_path / "home")
+        out_path = tmp_path / "child.out"
+        err_path = tmp_path / "child.err"
+        with open(out_path, "wb") as out, open(err_path, "wb") as err:
+            rc = subprocess.call(
+                [sys.executable, "-c", self._CHILD % {"title": self._TITLE}],
+                stdout=out,
+                stderr=err,  # a real OS handle, so the stream is redirected
+                env=env,
+                # Anchor the child OUTSIDE the checkout. It imports the installed
+                # package, so CWD is not on its import path, and any relative
+                # artifact it or a library writes then lands in the test's own tree
+                # instead of surviving in the repo.
+                cwd=tmp_path,
+            )
+        stdout = out_path.read_text(encoding="utf-8", errors="replace")
+
+        assert rc == 0, f"the denial notice killed the CLI:\n{stdout}"
+        assert "survived" in stdout
+        assert "reject" in stdout
+        # The premise a reviewer keeps reaching for is that a locale codec makes
+        # this strict. It does not: CPython pins stderr to backslashreplace, and
+        # the ``:strict`` half of PYTHONIOENCODING is ignored for this stream.
+        assert "encoding=cp950" in stdout
+        assert "errors=backslashreplace" in stdout
+        # And the unencodable character is escaped rather than raised.
+        written = err_path.read_bytes().decode("cp950", errors="replace")
+        assert "\\U0001f4a3" in written
+
+
+class TestChatProviderShutdown:
+    """``provider.start()`` hands back a live backend process, so every exit from
+    the turn -- return, error, or cancellation -- has to run ``shutdown()``."""
+
+    class _FakeProvider:
+        def __init__(self):
+            self.started = 0
+            self.shutdowns = 0
+
+        async def start(self):
+            self.started += 1
+
+        async def shutdown(self):
+            self.shutdowns += 1
+
+        def context_usage_pct(self):
+            return 0.0
+
+    def _patch(self, monkeypatch, provider):
+        import kiro_crew.cli_chat as cli_chat
+        from kiro_crew.config import KiroCrewConfig
+
+        monkeypatch.setattr(KiroCrewConfig, "load", staticmethod(lambda: KiroCrewConfig()))
+        monkeypatch.setattr(
+            cli_chat, "build_provider_factory", lambda cfg: (lambda *a, **k: provider)
+        )
+        monkeypatch.setattr(cli_chat, "_build_tool_gate", lambda agent: None)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_runs_when_the_turn_is_cancelled(self, monkeypatch):
+        # A permission prompt cancelled at the terminal raises through the turn
+        # by design. The backend must still be torn down, and the cancellation
+        # must still reach the caller.
+        import kiro_crew.cli_chat as cli_chat
+
+        provider = self._FakeProvider()
+        self._patch(monkeypatch, provider)
+
+        async def cancelled(*a, **k):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(cli_chat, "_send_and_print", cancelled)
+        with pytest.raises(asyncio.CancelledError):
+            await cli_chat._chat("hello", None)
+        assert provider.shutdowns == 1
+
+    @pytest.mark.asyncio
+    async def test_shutdown_runs_when_the_turn_raises(self, monkeypatch):
+        import kiro_crew.cli_chat as cli_chat
+
+        provider = self._FakeProvider()
+        self._patch(monkeypatch, provider)
+
+        async def boom(*a, **k):
+            raise RuntimeError("backend died")
+
+        monkeypatch.setattr(cli_chat, "_send_and_print", boom)
+        with pytest.raises(RuntimeError, match="backend died"):
+            await cli_chat._chat("hello", None)
+        assert provider.shutdowns == 1
+
+    @pytest.mark.asyncio
+    async def test_shutdown_runs_exactly_once_on_the_normal_path(self, monkeypatch):
+        import kiro_crew.cli_chat as cli_chat
+
+        provider = self._FakeProvider()
+        self._patch(monkeypatch, provider)
+
+        async def ok(*a, **k):
+            return None
+
+        monkeypatch.setattr(cli_chat, "_send_and_print", ok)
+        await cli_chat._chat("hello", None)
+        assert provider.shutdowns == 1
+
+    @pytest.mark.asyncio
+    async def test_gc_runs_even_when_shutdown_raises(self, monkeypatch):
+        # gc.collect() collects the subprocess transports while the loop is
+        # still open; a failing shutdown must not skip it, and must not replace
+        # the exception already propagating.
+        import kiro_crew.cli_chat as cli_chat
+
+        class _BadShutdown(self._FakeProvider):
+            async def shutdown(self):
+                self.shutdowns += 1
+                raise RuntimeError("shutdown failed")
+
+        provider = _BadShutdown()
+        self._patch(monkeypatch, provider)
+        collected = {"n": 0}
+        monkeypatch.setattr(cli_chat.gc, "collect", lambda: collected.__setitem__("n", 1))
+
+        async def cancelled(*a, **k):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(cli_chat, "_send_and_print", cancelled)
+        with pytest.raises(asyncio.CancelledError):
+            await cli_chat._chat("hello", None)
+        assert provider.shutdowns == 1
+        assert collected["n"] == 1

@@ -10,6 +10,8 @@ from urllib.parse import parse_qs, urlsplit
 from aiohttp import web
 
 from kiro_crew.connections import get_provider
+from kiro_crew.connections.registry import Provider
+from kiro_crew.dashboard.handlers.mcp import _is_valid_mcp_name
 from kiro_crew.sel import sel
 
 _MAX_RETURN_ADDRESS_BYTES = 8192
@@ -95,15 +97,28 @@ def _validated_loopback_return_address(value: object) -> _LoopbackCallback | Non
     )
 
 
+class _NoListener(Exception):
+    """Nothing is bound to the loopback port a return address names."""
+
+
 async def _relay_loopback_callback(callback: _LoopbackCallback) -> int:
     """Send one GET to a fixed loopback host and return its HTTP status."""
     host = "::1" if callback.ipv6 else "127.0.0.1"
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(host, callback.port),
-        timeout=3,
-    )
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, callback.port),
+            timeout=3,
+        )
+    except ConnectionRefusedError as refused:
+        # The kernel answered for this port and said nothing is bound to it. That
+        # is the only signal proving the listener is ABSENT rather than merely
+        # slow, saturated or unroutable, so it is the only one raised distinctly:
+        # every other dial failure stays an ordinary delivery failure. Once the
+        # connection is established the listener demonstrably exists, so nothing
+        # after this point may reach here either.
+        raise _NoListener(str(refused)) from refused
     try:
         host_header = f"[{host}]" if callback.ipv6 else host
         request = (
@@ -136,6 +151,10 @@ def _bad_gateway(error: str, code: str) -> web.Response:
     return web.json_response({"error": error, "code": code}, status=502)
 
 
+def _approval_superseded(error: str, code: str) -> web.Response:
+    return web.json_response({"error": error, "code": code}, status=409)
+
+
 async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
     """POST /api/mcp/oauth/relay — deliver a failed browser redirect locally."""
     try:
@@ -145,12 +164,25 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return _bad_request("request body must be an object", "invalid_request_body")
 
+    # The relay only DELIVERS an already-minted authorization code to the
+    # loopback listener that minted it; it never mints one. That listener and its
+    # PKCE verifier belong to a specific pending kiro-cli OAuth flow regardless of
+    # whether the server is a curated Connections provider or a user-added /
+    # self-hosted one (issue #4491, the #4008 population). So relay membership is
+    # NOT gated on the Connections registry — every safety property here is
+    # provider-independent: the return address must target the gateway's own
+    # loopback listener (_validated_loopback_return_address), and a port nothing is
+    # bound to is reported as a spent approval (_NoListener). The name is
+    # validated with the SAME shape user-added servers pass at add time
+    # (_is_valid_mcp_name: bounded length, safe charset, traversal rejected) so a
+    # server the add path accepted — `myServer`, `@org/tools` — can also relay,
+    # while staying a safe, bounded SEL audit label rather than
+    # attacker-controlled log content. The registry-slug shape stays on the MINT
+    # path only (_requested_provider). This is deliberately distinct from
+    # generalising the MINT to uncurated URLs, which is parked decision #4286 and
+    # untouched here.
     server = body.get("server")
-    if (
-        not isinstance(server, str)
-        or not _SERVER_SLUG_RE.fullmatch(server)
-        or get_provider(server) is None
-    ):
+    if not isinstance(server, str) or not _is_valid_mcp_name(server):
         return _bad_request("invalid server", "invalid_server")
     callback = _validated_loopback_return_address(body.get("redirect_url"))
     if callback is None:
@@ -161,6 +193,23 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
 
     try:
         callback_status = await _relay_loopback_callback(callback)
+    except _NoListener:
+        # Nothing is bound to that port. The listener and the PKCE verifier are
+        # created by the process that minted the authorize URL and die with it, so
+        # its absence proves the code can no longer be redeemed BY ANYONE -- a
+        # fresh listener on the same port never saw the verifier. Answering with
+        # the delivery-failure message below would blame the paste for an
+        # approval that is simply spent.
+        sel().log_api_access(
+            caller="dashboard",
+            operation="mcp_oauth_callback_relay",
+            outcome="denied",
+            resources=server,
+        )
+        return _approval_superseded(
+            "the approval this return address belongs to is no longer live",
+            "approval_superseded",
+        )
     except (asyncio.TimeoutError, OSError, ValueError):
         sel().log_api_access(
             caller="dashboard",
@@ -192,3 +241,195 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
         resources=server,
     )
     return web.json_response({"ok": True})
+
+
+# ── On-demand approval-URL mint ──
+#
+# Connect asks for a URL instead of waiting for one. The engine lives in
+# kiro_crew.connections.mint; these two handlers are its HTTP surface, and the
+# GET is the card's authoritative feed for a card-initiated mint.
+
+# Fire-and-forget mint tasks, held so the loop cannot collect one mid-flight.
+_mint_tasks: set[asyncio.Task] = set()
+
+
+def _requested_provider(slug: str) -> Provider | None:
+    """The registry provider ``slug`` names, or None."""
+    if not slug or len(slug) > 64 or not _SERVER_SLUG_RE.match(slug):
+        return None
+    provider = get_provider(slug)
+    if provider is None or not provider.get("mcp_url"):
+        return None
+    return provider
+
+
+async def _mint_request(
+    request: web.Request,
+) -> tuple[dict, Provider] | web.Response:
+    """The JSON body and its registry provider, or the error response to return.
+
+    Registry membership is the bound on what a caller can make the gateway spawn: a
+    mint starts a kiro-cli process, so the slug has to resolve to a provider we ship
+    rather than to arbitrary caller-supplied text.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — malformed body is a client error, not a fault
+        return _bad_request("body must be JSON", "invalid_body")
+    if not isinstance(body, dict):
+        return _bad_request("body must be a JSON object", "invalid_body")
+    slug = str(body.get("slug") or "").strip().lower()
+    provider = _requested_provider(slug)
+    if provider is None:
+        return _bad_request("unknown provider", "unknown_provider")
+    return body, provider
+
+
+async def api_connections_mint(request: web.Request) -> web.Response:
+    """POST /api/connections/mint — start minting a provider's approval URL.
+
+    Returns as soon as the mint is scheduled. The URL is not ready yet: the
+    caller polls :func:`api_connections_mint_state` for it.
+    """
+    parsed = await _mint_request(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    _body, provider = parsed
+    slug = str(provider["slug"])
+
+    # Function-local by DESIGN, not for a cycle: this handlers package is imported
+    # on the gateway boot path, and the mint engine drags in the ACP client, the
+    # credential predicate and the PID registry. Keeping it here is what stops a
+    # gateway start paying for a subsystem most requests never touch, and
+    # test_the_handlers_package_does_not_import_the_mint_engine enforces it in a
+    # subprocess -- hoisting this to module scope turns that test red.
+    from kiro_crew.connections.mint import _dispose_mint, reserve_mint_row, start_oauth_mint
+
+    # Reserved BEFORE responding: the response names a row this tab polls
+    # immediately, so the row has to be visible first. Allocating only a token here
+    # would leave the previous (possibly terminal) row answering that poll, and the
+    # card would read it as the verdict on this attempt.
+    token, prior = await reserve_mint_row(slug)
+    try:
+        task = asyncio.create_task(start_oauth_mint(slug, str(provider["mcp_url"]), token, prior))
+    except BaseException:
+        # The flow owns the displaced row once it starts; if it never starts,
+        # nothing else will ever release that row's process and spec.
+        if prior is not None:
+            await _dispose_mint(prior)
+        raise
+    _mint_tasks.add(task)
+    task.add_done_callback(_mint_tasks.discard)
+
+    # Off the loop: only the append is queued to SEL's writer thread. The FIRST
+    # sel() of a process CONSTRUCTS the log -- trust-dir creation, key validation,
+    # and on Windows an icacls subprocess -- and this handler runs BEFORE the audit
+    # middleware's own call (that one logs the response), so on a fresh gateway
+    # whose first state-changing request is a Connect click it would land here and
+    # stall every other request. Same reasoning as server._audit_denied.
+    await asyncio.to_thread(
+        lambda: sel().log_api_access(
+            caller="dashboard",
+            operation="connections_mint",
+            outcome="started",
+            resources=f"provider:{slug}",
+        )
+    )
+    return web.json_response({"ok": True, "slug": slug, "state": "minting", "token": token})
+
+
+async def api_connections_mint_state(request: web.Request) -> web.Response:
+    """GET /api/connections/mint?slug=… — this provider's mint state and URL.
+
+    ``idle`` means no mint exists for the provider, which is distinct from a mint
+    that ran and produced nothing: the card treats it as "nothing pending" rather
+    than as a failure.
+    """
+    slug = str(request.query.get("slug") or "").strip().lower()
+    if _requested_provider(slug) is None:
+        return _bad_request("unknown provider", "unknown_provider")
+
+    # Function-local for the same reason as the POST above: the boot path must not
+    # carry the mint engine, and the subprocess guard test enforces it.
+    from kiro_crew.connections.mint import expire_dead_holder, pending_mint_for
+
+    # Commit the dead-holder verdict before reporting it, so the row the abandon
+    # fence sees matches the state this response hands the card.
+    await expire_dead_holder(slug)
+    view = pending_mint_for(slug)
+    if view is None:
+        return web.json_response({"slug": slug, "state": "idle"})
+    payload: dict[str, object] = {"slug": slug, "state": view.get("state", "minting")}
+    if view.get("token"):
+        payload["token"] = view["token"]
+    if view.get("oauth_url"):
+        payload["oauth_url"] = view["oauth_url"]
+    if view.get("reason"):
+        payload["reason"] = view["reason"]
+    return web.json_response(payload)
+
+
+async def api_connections_status(request: web.Request) -> web.Response:
+    """GET /api/connections/status — authorization verdict per visible provider.
+
+    Reports whether kiro-cli holds a grant (``grantPresent``) and the persisted
+    first-connect time (``connectedSince``) for each visible provider. It does
+    NOT probe endpoint reachability -- that stays with ``/api/mcp`` -- and it
+    never owns approval-URL minting, which remains the mint endpoints' job. It is
+    the authorization axis the card is otherwise blind to: a provider authorized
+    outside the dashboard, and one never authorized, both answer the reachability
+    probe with the same 401, and only a grant presence check tells them apart.
+    """
+    # Function-local for the same reason as the mint handlers below: the gateway
+    # imports this package at boot, and status collection reaches the mint engine
+    # for grant presence -- test_the_handlers_package_does_not_import_the_mint_engine
+    # keeps that engine off the boot path.
+    from kiro_crew.connections.status import _STATUS_SCHEMA_VERSION, collect_connection_statuses
+
+    statuses = await collect_connection_statuses()
+    return web.json_response({"schema_version": _STATUS_SCHEMA_VERSION, "connections": statuses})
+
+
+async def api_connections_cancel(request: web.Request) -> web.Response:
+    """POST /api/connections/cancel — dispose a provider's in-flight mint.
+
+    Body: ``{"slug": "<provider>", "token"?: "<row token>"}``. Releases the mint
+    process, its loopback listener and its ephemeral spec so a Connect the user
+    abandoned does not hold them until the TTL expires. It deliberately does NOT
+    remove the MCP config entry: the card owns that decision, because a cancelled
+    NEW connect uninstalls the entry it just created while a cancelled reconnect
+    keeps the working connection. Idempotent -- cancelling a provider with no
+    live mint answers ``dropped=false``.
+    """
+    parsed = await _mint_request(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    body, provider = parsed
+    slug = str(provider["slug"])
+    raw_token = body.get("token")
+    # Only an ABSENT token (or JSON null, its wire spelling) means "cancel
+    # whatever row is current". A token that is present but empty or non-string
+    # is a malformed request, not a privilege: coercing it to None would let a
+    # caller that failed to echo its row token dispose another tab's mint.
+    if raw_token is not None and (not isinstance(raw_token, str) or not raw_token):
+        return _bad_request("token must be a non-empty string when provided", "invalid_token")
+    token = raw_token
+
+    # Function-local, same boot-path reason as the mint handlers.
+    from kiro_crew.connections.mint import cancel_mint
+
+    dropped = await cancel_mint(slug, token)
+
+    # Off the loop: the FIRST sel() of a process constructs the log (trust-dir
+    # creation, key validation, on Windows an icacls subprocess). Same reasoning
+    # as api_connections_mint above.
+    await asyncio.to_thread(
+        lambda: sel().log_api_access(
+            caller="dashboard",
+            operation="connections_cancel",
+            outcome="ok",
+            source="dashboard",
+            resources=f"provider:{slug} dropped={dropped}",
+        )
+    )
+    return web.json_response({"ok": True, "slug": slug, "dropped": dropped})

@@ -1,8 +1,9 @@
 import { useState, useMemo, useEffect, memo, useRef } from 'react'
 import { motion } from 'framer-motion'
-import { Copy, Check, Volume2, Code, ClipboardList, CheckCircle, RefreshCw, ChevronLeft, ChevronRight, GitFork, Loader2, Link2, Compass, Clock } from 'lucide-react'
+import { Copy, Check, Volume2, Code, ClipboardList, CheckCircle, RefreshCw, ChevronLeft, ChevronRight, GitFork, Loader2, Link2, Compass, Clock, Pin, PinOff } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
+import { HOVER_NONE_ACTIONS_ROW_CLS } from '../../utils/touchActions'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import MessageErrorBoundary from '../../components/MessageErrorBoundary'
 import SelectionToolbar, { useSelectionActions } from '../../components/SelectionToolbar'
@@ -14,17 +15,24 @@ import type { FileChipStyle } from './ChatSettings'
 import { loadChatConfig } from './ChatSettings'
 import { useSmoothStream } from '../../hooks/useSmoothStream'
 import type { PlanStepInput } from '../../api/client'
-import { OPTION_MARKER_RE } from '../../utils/optionsMarker'
+import { extractSteeringAcks, parseOptions, stripPartialOptionMarker } from '../../app-sdk/protocol'
 import { i18nT } from '../../i18n/t'
 import { fmtCurrency, fmtDuration, fmtNumber, fmtUnit } from '../../i18n/format'
-const PLAN_HEADER_RE = /📋\s*Plan for:/i
-const STAGE_RE = /^Stage\s+\d+\s*:/m
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 
 /** Per-turn stats attached by the backend to the last assistant message of a
  *  completed turn (chat_runner._attach_turn_stats). Parity with the end-of-turn
  *  line kiro-cli prints natively: elapsed wall clock + credits (kiro) or
  *  API cost (claude_code). Zero fields are omitted by the backend. */
-export interface TurnStats { elapsed_ms: number; credits?: number; cost_usd?: number }
+export interface TurnStats { elapsed_ms: number; credits?: number; cost_usd?: number; model?: string }
+
+/** Trim a served model id to a compact footer label: drop region/vendor
+ *  routing prefixes ("global.anthropic.claude-opus-4-8[1m]" → "claude-opus-4-8[1m]").
+ *  The full untrimmed id stays available in the footer tooltip, so this only
+ *  affects the inline label. Unknown shapes pass through unchanged. */
+export function fmtTurnModel(id: string): string {
+  return id.replace(/^(?:(?:us|eu|apac|global)\.)?(?:anthropic|amazon|openai|bedrock)\./, '')
+}
 
 /** "8.4s" under 10s, "42s" under a minute, "2m 34s" beyond. */
 export function fmtTurnElapsed(ms: number): string {
@@ -46,42 +54,6 @@ export function fmtCredits(c: number): string {
   return fmtNumber(c, { minimumFractionDigits: digits, maximumFractionDigits: digits })
 }
 
-export function parseOptions(content: string): { text: string; options: string[]; multi: boolean; isPlan: boolean } {
-  let last: RegExpMatchArray | null = null
-  for (const m of content.matchAll(OPTION_MARKER_RE)) last = m
-  if (!last || last.index === undefined) return { text: content, options: [], multi: true, isPlan: false }
-  const multi = !!last[1] // [OPTIONS:] is the multi-select syntax; [OPTION:] is single
-  const sep = last[2].includes('|') ? '|' : ','
-  const options = last[2].split(sep).map(o => o.trim()).filter(Boolean)
-  const isPlan = PLAN_HEADER_RE.test(content) && STAGE_RE.test(content)
-  // Strip ALL markers from the displayed text (not just the last) so a stray earlier
-  // marker can't leak as raw "[OPTION: …]" syntax to the user; options still come from
-  // the LAST marker (computed above). OPTION_MARKER_RE is global, so replace removes
-  // every occurrence while preserving the prose around them.
-  const text = content.replace(OPTION_MARKER_RE, '').trim()
-  return { text, options, multi, isPlan }
-}
-
-// kiro-cli emits a steering acknowledgment inline in the model's output when it
-// consumes a mid-turn steer: `[STEERING steer-<id>: <what it did in response>]`.
-// Showing that raw marker is ugly; instead we pull it out and render it as a
-// distinct "Steered" chip (mirrors KiRoom's stripSteeringTag display-parity).
-// The id part is `steer-<hex>` (no ']' or ':'); the summary is non-greedy up to
-// the first ']' (matching KiRoom's behavior — a literal ']' inside a summary ends
-// it early, which producers avoid).
-const STEER_ACK_RE = /\[STEERING\s+steer-[^\]:]+:\s*([\s\S]*?)\]/g
-
-export function extractSteeringAcks(content: string): { cleaned: string; acks: string[] } {
-  const acks: string[] = []
-  const cleaned = content.replace(STEER_ACK_RE, (_m, summary) => {
-    const s = String(summary).trim()
-    if (s) acks.push(s)
-    return ''
-  })
-  // Collapse the blank line the removed marker leaves behind.
-  return { cleaned: cleaned.replace(/\n{3,}/g, '\n\n').trimEnd(), acks }
-}
-
 // A compact "Steered" chip rendered in place of the raw [STEERING …] marker.
 function SteerAckChip({ summary }: { summary: string }) {
   return (
@@ -89,18 +61,19 @@ function SteerAckChip({ summary }: { summary: string }) {
       initial={{ opacity: 0, y: 4 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.25, ease: 'easeOut' }}
-      className="mt-2 inline-flex flex-col items-start rounded-lg bg-accent-subtle px-2.5 py-1.5 text-[12px] leading-snug max-w-full"
+      className="mt-2 inline-flex flex-col items-start rounded-lg bg-accent-subtle px-3 py-2 text-[12px] leading-5 max-w-full"
     >
-      <span className="inline-flex items-center gap-1.5 text-accent">
+      <span className="inline-flex items-center gap-2 text-accent">
         <Compass size={13} className="shrink-0" />
         <span className="font-semibold">{i18nT('pages.chat.assistantMessage.steered')}</span>
       </span>
-      {summary ? <span className="text-text ml-[19px] mt-0.5">{summary}</span> : null}
+      {summary ? <span className="text-text ml-6 mt-1">{summary}</span> : null}
     </motion.div>
   )
 }
 
-const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, onFileOpen, onFolderOpen, onArtifactOpen, planTaskId, onApplyPlan, slotRunning, onSpeak, timestamp, showFooter = true, onRegenerate, variants, variantIdx, onSwitchVariant, isRegenerating, onFork, onPlanFromHere, forkIndex, onQuote, onAsk, messageTs, slotKey, slotTitle, mode, fileChanges, onOpenDiff, fileChipStyle, artifactPaths, turnStats, linkPreviews }: { content: string; isStreaming: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; planTaskId?: string; onApplyPlan?: (steps: PlanStepInput[]) => Promise<boolean>; slotRunning?: boolean; onSpeak?: (content: string) => void; timestamp?: string; showFooter?: boolean; onRegenerate?: () => void; variants?: { content: string; ts?: string }[]; variantIdx?: number; onSwitchVariant?: (index: number) => void; isRegenerating?: boolean; onFork?: (index: number) => void | Promise<void>; onPlanFromHere?: (index: number) => void | Promise<void>; forkIndex?: number; onQuote?: (text: string, rect: DOMRect) => void; onAsk?: (text: string, rect: DOMRect) => void; messageTs?: string; slotKey?: string; slotTitle?: string; mode?: string; fileChanges?: FileChangeEntry[]; onOpenDiff?: (path: string, modified: string, original: string) => void; fileChipStyle?: FileChipStyle; artifactPaths?: Set<string>; turnStats?: TurnStats; linkPreviews?: boolean }) {
+const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, onFileOpen, onFolderOpen, onArtifactOpen, planTaskId, onApplyPlan, slotRunning, onSpeak, timestamp, timestampTitle, showFooter = true, onRegenerate, variants, variantIdx, onSwitchVariant, isRegenerating, onFork, onPlanFromHere, forkIndex, onQuote, onAsk, messageTs, slotKey, slotTitle, mode, fileChanges, onOpenDiff, fileChipStyle, artifactPaths, turnStats, linkPreviews, pinned, onTogglePin, suppressSteerAck }: { content: string; isStreaming: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; planTaskId?: string; onApplyPlan?: (steps: PlanStepInput[]) => Promise<boolean>; slotRunning?: boolean; onSpeak?: (content: string) => void; timestamp?: string; timestampTitle?: string; showFooter?: boolean; onRegenerate?: () => void; variants?: { content: string; ts?: string }[]; variantIdx?: number; onSwitchVariant?: (index: number) => void; isRegenerating?: boolean; onFork?: (index: number) => void | Promise<void>; onPlanFromHere?: (index: number) => void | Promise<void>; forkIndex?: number; onQuote?: (text: string, rect: DOMRect) => void; onAsk?: (text: string, rect: DOMRect) => void; messageTs?: string; slotKey?: string; slotTitle?: string; mode?: string; fileChanges?: FileChangeEntry[]; onOpenDiff?: (path: string, modified: string, original: string) => void; fileChipStyle?: FileChipStyle; artifactPaths?: Set<string>; turnStats?: TurnStats; linkPreviews?: boolean; pinned?: boolean; onTogglePin?: () => void; /** Drop the steer chip: this turn's steer was a system policy notice, not the user's. */ suppressSteerAck?: boolean }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [applied, setApplied] = useState(false)
   const [copied, setCopied] = useState(false)
   const [linkCopied, setLinkCopied] = useState(false)
@@ -118,7 +91,13 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
   // Applied state impossible to reach. setApplied is stable.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { if (applied) setApplied(false) }, [effectiveContent])
-  const { text } = parseOptions(effectiveContent)
+  const { text: parsedText } = parseOptions(effectiveContent)
+  // While the marker line is still arriving it has no closing `]`, so
+  // OPTION_MARKER_RE can't match it yet and the raw `[OPTIONS: …` would type
+  // itself out as prose before flipping to pills at turn end. Suppress the
+  // growing tail — streaming only, so a finished message still renders an
+  // unterminated marker (prose about the syntax, or a truncated turn) as written.
+  const text = isStreaming ? stripPartialOptionMarker(parsedText) : parsedText
   // Pull kiro-cli's [STEERING …] acknowledgments out of the prose; render them as
   // chips instead of raw markers. Feed the cleaned text (marker removed) to the
   // stream so the raw tag never renders.
@@ -224,22 +203,31 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
     const cost = hasCost
       ? fmtCurrency(turnStats.cost_usd!, 'USD', { maximumFractionDigits: 4, minimumFractionDigits: 4 })
       : ''
-    if (hasCredits && hasCost) return i18nT('pages.chat.assistantMessage.turn_took_credits_cost', { elapsed, credits, cost })
-    if (hasCredits) return i18nT('pages.chat.assistantMessage.turn_took_credits', { elapsed, credits })
-    if (hasCost) return i18nT('pages.chat.assistantMessage.turn_took_cost', { elapsed, cost })
-    return i18nT('pages.chat.assistantMessage.turn_took', { elapsed })
+    const base = hasCredits && hasCost ? i18nT('pages.chat.assistantMessage.turn_took_credits_cost', { elapsed, credits, cost })
+      : hasCredits ? i18nT('pages.chat.assistantMessage.turn_took_credits', { elapsed, credits })
+      : hasCost ? i18nT('pages.chat.assistantMessage.turn_took_cost', { elapsed, cost })
+      : i18nT('pages.chat.assistantMessage.turn_took', { elapsed })
+    // The tooltip carries the FULL untrimmed model id (the inline label is
+    // shortened by fmtTurnModel), so the profile/region routing detail stays
+    // one hover away instead of widening the footer line.
+    return turnStats.model ? `${base} · ${i18nT('pages.chat.assistantMessage.turn_model', { model: turnStats.model })}` : base
   })()
 
   return <div data-role="assistant" className="group/msg">
     {/* 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md */}
-    <div ref={contentRef} className="message-bubble msg-content group/bubble relative text-sm leading-relaxed text-text overflow-hidden" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+    <div ref={contentRef} className="message-bubble msg-content group/bubble relative text-sm leading-6 text-text overflow-hidden" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
       <MessageErrorBoundary rawContent={smoothedText}>
         <MarkdownRenderer content={smoothedText} streaming={isStreaming} onFileOpen={onFileOpen} onFolderOpen={onFolderOpen} onArtifactOpen={onArtifactOpen} rawMode={rawMode} messageTs={messageTs} slotKey={slotKey} glow={isStreaming} smooth={smooth} linkPreviews={linkPreviews && !draining} />
       </MessageErrorBoundary>
       {/* Render the steer ack the moment kiro-cli emits the [STEERING …] marker
           — including mid-stream — so the user sees the agent acknowledge the
-          steer live, not only after the whole turn finishes. */}
-      {steerAcks.length > 0 && (
+          steer live, not only after the whole turn finishes.
+          Suppressed for a turn a policy block explained in-band: the same
+          mechanism carries that notice, so the chip would credit the PERSON with
+          a steer the system sent — and the blocked-tool card in the same turn
+          already says what happened. The marker is still stripped from the prose
+          either way (steerCleaned), so nothing leaks as raw text. */}
+      {!suppressSteerAck && steerAcks.length > 0 && (
         <div className="flex flex-col items-start gap-1 mb-2">
           {steerAcks.map((a, i) => <SteerAckChip key={i} summary={a} />)}
         </div>
@@ -247,10 +235,15 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
       {!isStreaming && selectionActions.length > 0 && <SelectionToolbar containerRef={contentRef} actions={selectionActions} />}
     </div>
     {fileChanges && fileChanges.length > 0 && !isStreaming && (
-      <FileChangeChips fileChanges={fileChanges} onOpenDiff={onOpenDiff} style={fileChipStyle} artifactPaths={artifactPaths} disclosureKey={messageTs ? `fcc-${messageTs}` : undefined} />
+      <FileChangeChips fileChanges={fileChanges} onOpenDiff={onOpenDiff} onFileOpen={onFileOpen ? (p: string) => onFileOpen(p) : undefined} style={fileChipStyle} artifactPaths={artifactPaths} disclosureKey={messageTs ? `fcc-${messageTs}` : undefined} />
     )}
     {!isStreaming && showFooter && turnStats && turnStats.elapsed_ms > 0 && (
-      <div className="flex items-center gap-1 mt-1 text-[11px] text-muted/60 font-mono tabular-nums" data-testid="turn-stats" title={turnStatsTitle}>
+      /* No `font-mono`: "1.98 credits · 59s" is a labelled measurement, not
+         code, and Tailwind's `font-mono` pins `var(--mono)` — a token the Font
+         Family setting never writes, so this line ignored the user's choice.
+         `tabular-nums` stays: fixed-width digits are what the mono was earning
+         here, and it works in a proportional face too. */
+      <div className="flex items-center gap-1 mt-1 text-[11px] leading-4 text-muted/60 tabular-nums" data-testid="turn-stats" title={turnStatsTitle}>
         {/* Cost leads, elapsed trails: credits are the scarce resource users
             actually budget, so they read first. The clock icon travels WITH the
             elapsed value (never leads the line) so it never appears to label
@@ -262,6 +255,9 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
             ? `${fmtCredits(credits)} credits`
             : cost > 0 ? `$${cost.toFixed(cost < 0.01 ? 4 : 2)}` : ''
           return <>
+            {/* Model leads (what served), then cost (what it took), then time.
+                Trimmed for width; the untrimmed id is in the footer tooltip. */}
+            {turnStats.model && <span className="font-mono" data-testid="turn-model">{fmtTurnModel(turnStats.model)} ·</span>}
             {billed && <span>{billed} ·</span>}
             <Clock size={11} aria-hidden="true" />
             <span>{fmtTurnElapsed(turnStats.elapsed_ms)}</span>
@@ -273,22 +269,36 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
         every action to a 40px touch target (20px icon + 10px padding); pointer
         devices keep the compact 14px icons untouched. */}
     {!isStreaming && showFooter && (
-      <div className="flex items-center gap-1 mt-0.5 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 [@media(hover:none)]:opacity-100 [@media(hover:none)]:flex-wrap [@media(hover:none)]:[&_button]:p-2.5 [@media(hover:none)]:[&_svg]:h-5 [@media(hover:none)]:[&_svg]:w-5">
-        {timestamp && <span className="text-muted text-[12px] font-mono mr-1.5">{timestamp}</span>}
+      <div className={`flex items-center gap-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
+        {/* No `font-mono`: a formatted date is prose, and Tailwind's `font-mono`
+            pins `var(--mono)` — a token the Font Family setting never writes, so
+            it overrode the user's choice and put JetBrains Mono (no CJK
+            coverage) under a date that a zh/ja dashboard renders WITH CJK
+            characters. `tabular-nums` keeps digits fixed-width, which is the
+            alignment the mono was actually there for — and it holds the action
+            row below at the same x across messages. */}
+        {timestamp && <span className="text-muted text-[12px] leading-5 tabular-nums mr-2" title={timestampTitle}>{timestamp}</span>}
         <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={i18nT('pages.chat.assistantMessage.copy')} aria-label={copied ? i18nT('pages.chat.assistantMessage.copied') : i18nT('pages.chat.assistantMessage.copy')} onClick={() => { copyToClipboard(steerCleaned).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500) }).catch(() => {}) }}>{copied ? <Check size={14} className="text-ok" /> : <Copy size={14} />}</button>
         {messageTs && slotKey && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={i18nT('pages.chat.assistantMessage.copy_link_to_message')} aria-label={i18nT('pages.chat.assistantMessage.copy_link_to_message')} onClick={() => { copySessionLink(slotKey, slotTitle, messageTs, mode).then(() => { setLinkCopied(true); setTimeout(() => setLinkCopied(false), 1500) }).catch(() => {}) }}>{linkCopied ? <Check size={14} className="text-ok" /> : <Link2 size={14} />}</button>}
+        {messageTs && onTogglePin && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={pinned ? i18nT('pages.chat.assistantMessage.unpin_message') : i18nT('pages.chat.assistantMessage.pin_message')} aria-label={pinned ? i18nT('pages.chat.assistantMessage.unpin_message') : i18nT('pages.chat.assistantMessage.pin_message')} onClick={onTogglePin}>{pinned ? <PinOff size={14} /> : <Pin size={14} />}</button>}
         {onFork && forkIndex !== undefined && <button className="text-muted hover:text-text p-0.5 rounded transition-colors disabled:opacity-50" disabled={busyAction !== null} title={i18nT('pages.chat.assistantMessage.fork_conversation_from_here')} aria-label={i18nT('pages.chat.assistantMessage.fork_conversation_from_here')} onClick={async () => { setBusyAction('fork'); try { await onFork(forkIndex) } finally { setBusyAction(null) } }}>{busyAction === 'fork' ? <Loader2 size={14} className="animate-spin" /> : <GitFork size={14} />}</button>}
         {onPlanFromHere && forkIndex !== undefined && <button className="text-muted hover:text-text p-0.5 rounded transition-colors disabled:opacity-50" disabled={busyAction !== null} title={i18nT('pages.chat.assistantMessage.plan_from_here')} aria-label={i18nT('pages.chat.assistantMessage.plan_from_here')} onClick={async () => { setBusyAction('plan'); try { await onPlanFromHere(forkIndex) } finally { setBusyAction(null) } }}>{busyAction === 'plan' ? <Loader2 size={14} className="animate-spin" /> : <ClipboardList size={14} />}</button>}
         {text.length >= 50 && onSpeak && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={i18nT('pages.chat.assistantMessage.speak')} aria-label={i18nT('pages.chat.assistantMessage.speak_message')} onClick={() => onSpeak(content)}><Volume2 size={14} /></button>}
-        {text.length > 20 && <button className={`p-0.5 rounded transition-colors flex items-center gap-0.5 text-[11px] ${rawMode ? 'text-text' : 'text-muted hover:text-text'}`} title={rawMode ? i18nT('pages.chat.assistantMessage.rendered_view') : i18nT('pages.chat.assistantMessage.raw_markdown')} aria-label={rawMode ? i18nT('pages.chat.assistantMessage.switch_to_rendered_view') : i18nT('pages.chat.assistantMessage.switch_to_raw_markdown_view')} onClick={() => setRawMode(!rawMode)}><Code size={14} />{rawMode ? i18nT('pages.chat.assistantMessage.rendered') : i18nT('pages.chat.assistantMessage.raw')}</button>}
+        {text.length > 20 && <button className={`p-0.5 rounded transition-colors flex items-center gap-0.5 text-[11px] leading-4 ${rawMode ? 'text-text' : 'text-muted hover:text-text'}`} title={rawMode ? i18nT('pages.chat.assistantMessage.rendered_view') : i18nT('pages.chat.assistantMessage.raw_markdown')} aria-label={rawMode ? i18nT('pages.chat.assistantMessage.switch_to_rendered_view') : i18nT('pages.chat.assistantMessage.switch_to_raw_markdown_view')} onClick={() => setRawMode(!rawMode)}><Code size={14} />{rawMode ? i18nT('pages.chat.assistantMessage.rendered') : i18nT('pages.chat.assistantMessage.raw')}</button>}
         {onRegenerate && !slotRunning && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={i18nT('pages.chat.assistantMessage.regenerate')} aria-label={i18nT('pages.chat.assistantMessage.regenerate_response')} onClick={onRegenerate}><RefreshCw size={14} /></button>}
         {hasVariants && (() => {
           const curIdx = activeIdx
           const switchFn = onSwitchVariant || ((i: number) => setLocalIdx(i))
           return (
-            <div className="flex items-center gap-0.5 ml-1 text-[11px] text-muted">
+            <div className="flex items-center gap-0.5 ml-1 text-[11px] leading-4 text-muted">
               <button className="hover:text-text p-0.5 rounded transition-colors disabled:opacity-30 disabled:cursor-default cursor-pointer" title={i18nT('pages.chat.assistantMessage.previous_version')} aria-label={i18nT('pages.chat.assistantMessage.previous_version')} disabled={curIdx <= 0 || !!slotRunning} onClick={() => switchFn(curIdx - 1)}><ChevronLeft size={14} /></button>
-              <span className="font-mono">{curIdx + 1}/{variants!.length}</span>
+              {/* No `font-mono`, same as the timestamp two elements to the left:
+                  "2/3" is a pagination counter, not code, and it sits in the
+                  SAME hover row — leaving it on `var(--mono)` would have made
+                  half of one row follow the Font Family setting and half ignore
+                  it. `tabular-nums` also stops the chevrons shifting when the
+                  index crosses into two digits. */}
+              <span className="tabular-nums">{curIdx + 1}/{variants!.length}</span>
               <button className="hover:text-text p-0.5 rounded transition-colors disabled:opacity-30 disabled:cursor-default cursor-pointer" title={i18nT('pages.chat.assistantMessage.next_version')} aria-label={i18nT('pages.chat.assistantMessage.next_version')} disabled={curIdx >= variants!.length - 1 || !!slotRunning} onClick={() => switchFn(curIdx + 1)}><ChevronRight size={14} /></button>
             </div>
           )
@@ -296,11 +306,11 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
       </div>
     )}
     {planSteps && onApplyPlan && !applied && !isRegenerating && (
-      <button className="mt-1 px-3 py-1.5 rounded-md text-[13px] font-medium border border-accent text-accent bg-transparent cursor-pointer hover:bg-accent hover:text-accent-fg transition-all" onClick={async () => { const ok = await onApplyPlan(planSteps); if (ok) setApplied(true) }}>
+      <button className="mt-1 px-3 py-2 rounded-md text-[13px] leading-5 font-medium border border-accent text-accent bg-transparent cursor-pointer hover:bg-accent hover:text-accent-fg transition-all" onClick={async () => { const ok = await onApplyPlan(planSteps); if (ok) setApplied(true) }}>
         <ClipboardList className="lucide-inline" /> {i18nT('pages.chat.assistantMessage.use_as_plan_count', { count: planSteps.length })}
       </button>
     )}
-    {applied && <div className="mt-1 text-[13px] text-ok"><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.assistantMessage.applied_to_tasks')}</div>}
+    {applied && <div className="mt-1 text-[13px] leading-5 text-ok"><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.assistantMessage.applied_to_tasks')}</div>}
   </div>
 })
 

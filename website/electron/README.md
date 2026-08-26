@@ -1,7 +1,8 @@
 # KiroCrew Desktop (Electron)
 
-Desktop shell for the Kiro Crew web dashboard on macOS and Linux. It
-automatically starts `kirocrew gateway` and connects to `localhost:5476`.
+Desktop shell for the Kiro Crew web dashboard on macOS, Linux, and Windows
+(Windows is in preview — see the build note below). It automatically starts
+`kirocrew gateway` and connects to `localhost:5476`.
 
 ## Quick Start
 
@@ -13,22 +14,30 @@ npx electron .
 
 The app will:
 
-1. Reuse an existing gateway if one is already reachable
+1. Reuse an existing gateway if one is already reachable and actually serving
+   (`/api/ready` 200) — a gateway draining after `/api/shutdown` still answers
+   `/api/status`, so it is never adopted; the app waits for the port to clear
+   and spawns fresh instead
 2. Launch `kirocrew gateway` when needed
-3. Show a loading screen while the backend boots
+3. Show a loading screen while the backend boots. A live bundled backend gets an
+   extended Windows cold-start window; a child that actually exits still fails
+   immediately with its launch-log cause.
 4. Load the dashboard
-5. Guide the user through Kiro CLI installation and device sign-in on the
-   gateway host when either prerequisite is missing
+5. Point the user at Kiro CLI installation and sign-in on the gateway host when
+   either prerequisite is missing
 
 The Electron shell uses the same gateway-hosted setup screen as every browser;
-it has no separate installer or login runner. On macOS and Linux, **Install Kiro
-CLI** downloads and runs Kiro's official HTTPS installer only after the user
-clicks the button. Native Windows gateways expose the same workflow through the
-browser dashboard. **Sign in to Kiro** starts
-`kiro-cli login --use-device-flow`; the app waits for `kiro-cli whoami` to
-succeed before continuing. Candidate selection is fail-closed: a broken
-higher-priority Kiro CLI is shown as needing repair and is not skipped in favor
-of a later candidate. Remote tunnel sessions check the remote gateway host.
+it has no separate installer or login runner, and it performs neither step. The
+screen links out to <https://kiro.dev/cli/> for the CLI, and names the commands
+the user runs to sign in: `kiro-cli login` for a personal account, or
+`kiro-cli login --use-device-flow --license pro` for organization SSO. Both are
+shown because the portal the bare command opens offers a free Builder ID
+alongside organization SSO, and picking the wrong one still succeeds — the
+mismatch only surfaces later as missing models. The app observes completion
+through the read-only `kiro-cli whoami` probe. Candidate selection is
+fail-closed: a broken higher-priority Kiro CLI is shown as needing repair and is
+not skipped in favor of a later candidate. Remote tunnel sessions check the
+remote gateway host.
 
 ## Install as macOS App
 
@@ -52,7 +61,57 @@ Right-click the Dock icon → Options → Keep in Dock to pin it.
 npm run dist
 ```
 
-Output goes to `electron/dist/`.
+Output goes to `electron/dist/`. The DMG opens to a branded 660×420 logical-size
+drag-to-Applications layout on a flat light-purple ground carrying the opening
+animation's white ghost cast, with one chevron pointing from the app to
+`/Applications`.
+Its background is a multi-resolution TIFF with 1× and Retina 2× representations.
+The release workflow uses this Electron-built DMG as a layout template, removes
+its unsigned app, and inserts the signed/stapled app before the DMG itself is
+signed and notarized. That keeps local previews and shipped downloads aligned.
+
+## Build Windows Installer (NSIS)
+
+The Windows desktop build is wired end to end: `package.json` declares an
+`nsis` target under `build.win`, and `packaging/build-desktop.sh` has a full
+Windows branch. Run it from Git Bash (or MSYS/Cygwin — the script normalizes
+those to `windows`) at the repo root:
+
+```bash
+bash packaging/build-desktop.sh
+```
+
+Notes:
+
+- **The build must run natively on Windows**, not cross-built from macOS or
+  Linux: the script provisions a Windows python-build-standalone interpreter
+  via `uv` and executes its `python.exe` to install and verify the bundled
+  backend, then runs `electron-builder --win` to produce the NSIS installer.
+- **Signing is optional for a local build.** The `signtoolOptions.sign` hook
+  (`scripts/sign-windows.js`) skips cleanly when none of the
+  `WINDOWS_SIGNING_*` environment variables are set, so a credential-less
+  build produces a working unsigned installer. (Setting only some of the five
+  variables is treated as a misconfiguration and fails the build.)
+- The result is an assisted (non-one-click, per-user) NSIS installer,
+  `KiroCrew Setup <version>.exe` (nightly builds:
+  `KiroCrew Nightly Setup <version>.exe`), in `website/electron/dist/`.
+- The pinned electron-builder NSIS template is patched during `npm install` to
+  expose Kiro Crew's staged-payload publish hook. On a normal same-volume
+  per-user install it renames the large `resources` / `locales` trees into place
+  and copies only the small root remainder; per-machine installs keep the
+  upstream copy path so files inherit the Program Files ACL. Cross-volume or
+  occupied destinations also retain the upstream copy-and-retry fallback. The
+  Windows backend ships checked-hash
+  bytecode for the measured gateway import closure, so first launch consumes
+  build-time caches rather than generating thousands of files under Defender.
+- The native welcome/finish sidebar and the header used on intermediate pages
+  carry the Kiro Crew logo and ghost artwork. The standard NSIS controls and
+  localized instructions remain native. Page boundaries use a short Win32
+  alpha-blended cross-fade that follows the system client-area animation setting;
+  extraction itself stays on the native progress page without timer-driven art.
+
+See `../../docs/guides/windows-install.md` for the CI-built installer and the
+current Windows support status.
 
 ## Updating
 

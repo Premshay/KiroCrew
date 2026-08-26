@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from conftest import make_escaping_link
 from kiro_crew.apps.manifest import (
     AppManifest,
     CapabilityDependencies,
     Dependencies,
     SetupConfig,
 )
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,6 +74,46 @@ class TestValidation:
         errors = m.validate()
         assert any("kebab-case" in e for e in errors)
 
+    def test_reserved_name_rejected(self):
+        """The system.* notification namespace stays un-shadowable."""
+        m = AppManifest.from_dict(_valid_manifest(name="system"))
+        errors = m.validate()
+        assert any("reserved" in e for e in errors)
+
+    @pytest.mark.parametrize("name", sorted(WINDOWS_DEVICE_STEMS))
+    def test_every_windows_device_stem_is_rejected(self, name):
+        """The whole documented device-name set, not just the stems that happen
+        to fail on one build. An app name is a persistent published identity, so
+        admitting a stem is a one-way door while over-refusing is freely
+        relaxable."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        errors = m.validate()
+        assert any("not portable" in e for e in errors), (name, errors)
+
+    def test_device_stem_vocabulary_is_not_duplicated(self):
+        """One definition, shared with the git-branch grammar. Two copies of a
+        22-name set drift, and the branch rule is the precedent this follows."""
+        from kiro_crew.apps.manifest import UNPORTABLE_APP_NAMES
+
+        assert UNPORTABLE_APP_NAMES is WINDOWS_DEVICE_STEMS
+
+    @pytest.mark.parametrize("name", ["null-app", "console", "com10", "lpt10", "connect"])
+    def test_names_merely_resembling_a_device_stay_valid(self, name):
+        """The rule matches the exact stem. ``com10``/``lpt10`` are outside the
+        reserved 1-9 range and the rest are ordinary words."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        assert m.validate() == []
+
+    @pytest.mark.parametrize("name", ["demo\n", "nul\n", "system\n", "demo\r\n", "demo\n\n"])
+    def test_a_trailing_newline_cannot_slip_through(self, name):
+        """``$`` also matches before a trailing newline, so a ``$``-anchored
+        grammar admits ``"demo\\n"`` — and worse, ``"nul\\n"`` and ``"system\\n"``
+        evade the reserved-name checks that run after it, because those compare
+        against the exact string. ``KEBAB_RE`` is anchored with ``\\Z``."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        errors = m.validate()
+        assert any("kebab-case" in e for e in errors), (name, errors)
+
     def test_invalid_version_format(self):
         m = AppManifest.from_dict(_valid_manifest(version="not-semver"))
         errors = m.validate()
@@ -116,22 +162,64 @@ class TestValidation:
         assert m.validate() == []
 
     def test_canonical_containment_with_app_root(self, tmp_path):
-        # A symlink whose target escapes the app root must be flagged when
+        # A link whose target escapes the app root must be flagged when
         # app_root is known; a plain relative path inside the root passes.
         app_root = tmp_path / "app"
         app_root.mkdir()
         outside = tmp_path / "outside"
         outside.mkdir()
         (outside / "secret.py").write_text("x = 1\n")
-        (app_root / "link.py").symlink_to(outside / "secret.py")
         (app_root / "ok.py").write_text("y = 2\n")
+        entry_point = make_escaping_link(app_root, outside)
 
-        escaping = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": "link.py"}))
+        escaping = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": entry_point}))
         errors = escaping.validate(app_root=app_root)
         assert any("path traversal" in e for e in errors)
 
         contained = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": "ok.py"}))
         assert contained.validate(app_root=app_root) == []
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "/tmp/evil.py",  # POSIX-absolute
+            "\\\\server\\share\\evil.py",  # UNC
+            "C:/evil.py",  # drive + root, forward slashes
+            "C:\\evil.py",  # drive + root, backslashes
+            "D:evil.py",  # drive-RELATIVE: no root, but relocates the join
+            "..\\evil.py",  # backslash traversal
+            "../evil.py",  # forward-slash traversal
+            "ui/../../evil.py",  # traversal in a non-leading segment
+        ],
+    )
+    def test_rooted_or_traversing_entrypoint_rejected(self, entry, tmp_path):
+        # Rooted and traversing paths must be refused identically whether or not
+        # app_root is known, and on either host OS -- an app-resource path is
+        # joined onto the app root, so anything carrying a drive, a root anchor
+        # or a ".." segment can relocate that join. Asserting BOTH call forms is
+        # what pins host-independence: a manifest is portable data validated on
+        # whichever host installs the app, and "..\evil.py" resolves *inside* a
+        # POSIX app_root, so a validator that leaned on canonical containment
+        # for traversal would accept on POSIX what it rejects on Windows.
+        m = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": entry}))
+        assert any("path traversal" in e for e in m.validate())
+        assert any("path traversal" in e for e in m.validate(app_root=tmp_path))
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "index.mjs",
+            "backend/server.py",
+            "ui\\index.mjs",  # backslash separator is not a traversal
+            "kiro_crew.apps.builtins.x.server",  # dotted module-style
+            "a..b/c.py",  # ".." inside a segment, not a segment itself
+        ],
+    )
+    def test_plain_relative_entrypoint_accepted(self, entry):
+        # Guards the flip side of the containment rule: widening it must not
+        # start refusing the ordinary relative paths every shipped app declares.
+        m = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": entry}))
+        assert m.validate() == []
 
     def test_cron_missing_name(self):
         m = AppManifest.from_dict(_valid_manifest(crons=[{"every": 60, "message": "hi"}]))
@@ -623,11 +711,10 @@ class TestDependencies:
         silent, so the useful thing to pin is the general property.
         """
         import json
-        from pathlib import Path
 
         from kiro_crew.apps.manifest import AppManifest
 
-        builtins = Path("src/kiro_crew/apps/builtins")
+        builtins = _REPO_ROOT / "src/kiro_crew/apps/builtins"
         for app_json in sorted(builtins.glob("*/app.json")):
             raw = json.loads(app_json.read_text(encoding="utf-8"))
             declared = raw.get("dependencies") or {}
@@ -897,7 +984,6 @@ class TestRequiresDesktopApp:
 
     def test_mochi_builtin_declares_it(self):
         """Mochi is the first consumer: its panel needs the Electron shell."""
-        from pathlib import Path
 
         import kiro_crew.apps.builtins as builtins_pkg
 
@@ -932,3 +1018,186 @@ class TestRequiresDesktopApp:
         from kiro_crew.apps.manifest import PlatformConfig
 
         assert PlatformConfig().supports_platform("win32") is False
+
+
+class TestScalarGrantDoesNotBecomeAWildcard:
+    """A list-valued grant given a JSON SCALAR must deny, not be coerced.
+
+    `[str(x) for x in value]` over a STRING iterates its characters, so a manifest
+    that wrote a bare string where a list belongs was handed the tokens those
+    characters spell -- including the wildcards each of these fields honours:
+
+      exposeToApps  `"*"`         -> ["*"] -> every sibling app may observe my slots
+      events        `"*"`         -> ["*"] -> the whole WS scope vocabulary
+      api           `"/api/chat"` -> ["/", "a", ...] and `app_token_path_allowed`
+                                     matches the prefix "/" against every path
+      mcpTools      `"*"`         -> ["*"]
+
+    Same defect class as `bool("false")` on the boolean grants above, and the same
+    direction of fix: an unexpected value withholds the grant.
+    """
+
+    def test_scalar_star_never_yields_the_wildcard(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        for field in ("exposeToApps", "events", "api", "mcpTools"):
+            perms = Permissions.from_dict({field: "*"})
+            assert getattr(perms, field) == [], (
+                f"{field}: a scalar must not be exploded into a wildcard"
+            )
+
+    def test_scalar_path_never_yields_a_match_everything_prefix(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        assert Permissions.from_dict({"api": "/api/chat"}).api == []
+
+    def test_other_scalar_shapes_also_deny(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        for value in (True, 1, {"a": "b"}, None):
+            assert Permissions.from_dict({"exposeToApps": value}).exposeToApps == []
+
+    def test_a_real_list_still_works(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        perms = Permissions.from_dict(
+            {
+                "exposeToApps": ["mochi", "", "workflows"],
+                "events": ["slots:own", "notification"],
+                "api": ["/api/chat", "/api/ws"],
+                "mcpTools": ["cron_add"],
+            }
+        )
+        # Falsy entries are still dropped; everything else is preserved verbatim.
+        assert perms.exposeToApps == ["mochi", "workflows"]
+        assert perms.events == ["slots:own", "notification"]
+        assert perms.api == ["/api/chat", "/api/ws"]
+        assert perms.mcpTools == ["cron_add"]
+
+    def test_the_wildcard_still_works_when_declared_as_a_list(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        assert Permissions.from_dict({"exposeToApps": ["*"]}).exposeToApps == ["*"]
+        assert Permissions.from_dict({"events": ["*"]}).events == ["*"]
+
+
+# ---------------------------------------------------------------------------
+# UI overlays
+# ---------------------------------------------------------------------------
+
+
+def _overlay_manifest(*overlays) -> AppManifest:
+    return AppManifest.from_dict(_valid_manifest(ui={"overlays": list(overlays)}))
+
+
+def test_overlay_parses_and_round_trips():
+    decl = {"id": "command-bar", "replaces": "quick-search"}
+    m = _overlay_manifest(decl)
+    assert len(m.ui.overlays) == 1
+    assert m.ui.overlays[0].id == "command-bar"
+    assert m.ui.overlays[0].replaces == "quick-search"
+    assert m.validate() == []
+    # Round-trip must preserve the declaration, or the frontend stops seeing the slot.
+    assert AppManifest.from_dict(m.to_dict()).ui.overlays == m.ui.overlays
+    assert m.to_dict()["ui"]["overlays"] == [decl]
+
+
+def test_overlay_without_overlays_key_is_empty_not_none():
+    m = AppManifest.from_dict(_valid_manifest(ui={"pages": [{"route": "/x", "label": "X"}]}))
+    assert m.ui.overlays == []
+    assert "overlays" not in m.to_dict()["ui"]
+
+
+def test_overlay_non_dict_entries_are_dropped():
+    m = AppManifest.from_dict(_valid_manifest(ui={"overlays": ["nope", 7, None]}))
+    assert m.ui.overlays == []
+
+
+@pytest.mark.parametrize("value", [None, "overlays", 7, {"id": "x"}])
+def test_overlay_non_list_value_parses_to_empty(value):
+    """A present-but-not-a-list ``overlays`` must not raise.
+
+    ``dict.get`` returns the stored value rather than the default when the key
+    exists, so a hand-edited manifest carrying ``"overlays": null`` would otherwise
+    iterate ``None`` and take install validation down with a TypeError.
+    """
+    m = AppManifest.from_dict(_valid_manifest(ui={"overlays": value}))
+    assert m.ui.overlays == []
+    assert m.validate() == []
+
+
+@pytest.mark.parametrize(
+    "decl,expected",
+    [
+        ({"replaces": "quick-search"}, "ui overlay missing required field: id"),
+        (
+            {"id": "Command-Bar", "replaces": "quick-search"},
+            "ui overlay id must be kebab-case: 'Command-Bar'",
+        ),
+        ({"id": "-lead", "replaces": "quick-search"}, "ui overlay id must be kebab-case: '-lead'"),
+        ({"id": "a/b", "replaces": "quick-search"}, "ui overlay id must be kebab-case: 'a/b'"),
+        # An overlay is opened only through a slot the host owns, so a declaration
+        # without one could never be shown.
+        ({"id": "ok"}, "ui overlay 'ok' missing required field: replaces"),
+    ],
+)
+def test_overlay_validation_rejects(decl, expected):
+    assert expected in _overlay_manifest(decl).validate()
+
+
+def test_overlay_duplicate_ids_rejected():
+    decl = {"id": "dup", "replaces": "quick-search"}
+    assert "ui overlay duplicate id: 'dup'" in _overlay_manifest(decl, dict(decl)).validate()
+
+
+def test_overlay_replaces_must_be_a_slug():
+    errors = _overlay_manifest({"id": "ok", "replaces": "Quick Search"}).validate()
+    assert any("replaces must be kebab-case: 'Quick Search'" in e for e in errors)
+
+
+def test_overlay_builtins_must_not_ship_a_ui_bundle():
+    """A builtin declaring ``ui.overlays`` must not also declare ``ui.entry``.
+
+    Slot ownership requires ``origin == "builtin"``, which is the only provenance a
+    self-registering app cannot forge. But ``register_builtin_apps`` re-derives origin
+    on every startup for an already-registered builtin and downgrades it to ``local``
+    when the manifest carries a ``ui.entry`` bundle. Such an app would therefore be
+    refused its own slot after the first restart, and the refusal surfaces only as a
+    browser console warning. This is a build failure instead, because the combination
+    is invisible at runtime until someone notices the surface silently reverted.
+    """
+    offenders = []
+    for entry in sorted((_REPO_ROOT / "src/kiro_crew/apps/builtins").iterdir()):
+        manifest_path = entry / "app.json"
+        if not manifest_path.is_file():
+            continue
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        ui = raw.get("ui") or {}
+        if ui.get("overlays") and ui.get("entry"):
+            offenders.append(raw.get("name"))
+    assert not offenders, (
+        "builtins declaring both ui.overlays and ui.entry (origin is downgraded to "
+        f"'local' on restart, so the slot is refused): {offenders}"
+    )
+
+
+def test_command_bar_builtin_is_overlay_only_and_default_on():
+    """The shipped Command Bar app is the first overlay-only builtin.
+
+    Its shape is load-bearing: no page (it is not routed), no backend entry point (so
+    being enabled spawns no process), and default-ON: the launcher owns the
+    quick-search gesture on a fresh install, and the legacy palette is what a reader
+    opts back into by disabling the app. The default-on decision itself is declared
+    in ``manager._DEFAULT_ON_BUILTINS``; the opt-in policy tests read it from there.
+    """
+    raw = json.loads(
+        (
+            _REPO_ROOT / "src/kiro_crew/apps/builtins/command_bar/app.json"
+        ).read_text(encoding="utf-8")
+    )
+    m = AppManifest.from_dict(raw)
+    assert m.validate() == []
+    assert raw["defaultEnabled"] is True
+    assert m.ui.pages == []
+    assert not m.backend.entryPoint
+    assert [(o.id, o.replaces) for o in m.ui.overlays] == [("command-bar", "quick-search")]

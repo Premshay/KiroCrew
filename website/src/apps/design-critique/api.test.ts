@@ -22,7 +22,7 @@ describe('designCritiqueApi agent selection', () => {
     await expect(designCritiqueApi.send('dc-1', 'crew-codex', 'Review this screen.')).resolves.toBeUndefined()
 
     expect(slotBody).toMatchObject({ agent: 'crew-codex', memory_mode: 'temporary', mode: 'design-critique' })
-    expect(messageBody).toEqual({ message: 'Review this screen.', slot: 'dc-1', agent: 'crew-codex', memory_mode: 'temporary' })
+    expect(messageBody).toEqual({ message: 'Review this screen.', slot: 'dc-1', agent: 'crew-codex', memory_mode: 'temporary', mode: 'design-critique' })
   })
 
   it('persists the critique lifecycle through the app-owned run API', async () => {

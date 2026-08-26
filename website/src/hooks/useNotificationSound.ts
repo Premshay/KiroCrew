@@ -6,7 +6,7 @@ import { useEffect } from 'react'
 import { MC_NOTIFICATION_EVENT, MC_SOUND_SETTINGS_CHANGED_EVENT, type McNotificationDetail } from './notificationEvent'
 import { safeSetItem } from '../utils/safeStorage'
 
-export const SOUND_PRESETS = ['chime', 'ding', 'blip', 'pop'] as const
+export const SOUND_PRESETS = ['chime', 'ding', 'blip', 'pop', 'pulse'] as const
 export type SoundPreset = typeof SOUND_PRESETS[number] | 'none'
 
 /** Category mirrors Notification.kind values used by NotificationsPage, plus
@@ -95,6 +95,45 @@ const PRESETS: Record<Exclude<SoundPreset, 'none'>, ToneStep[]> = {
   ding:  [{ freq: 1760, start: 0, dur: 0.45, gain: 1.0 }],
   blip:  [{ freq: 880,  start: 0, dur: 0.08, gain: 1.0 }],
   pop:   [{ freq: 220,  start: 0, dur: 0.12, gain: 0.9 }],
+  pulse: [
+    { freq: 660,  start: 0,    dur: 0.12, gain: 1.0 },
+    { freq: 880,  start: 0.15, dur: 0.12, gain: 1.0 },
+    { freq: 660,  start: 0.30, dur: 0.12, gain: 0.9 },
+    { freq: 880,  start: 0.45, dur: 0.12, gain: 0.9 },
+  ],
+}
+
+const ATTACK_DURATION = 0.005
+const RELEASE_DURATION = 0.005
+const ENVELOPE_FLOOR_RATIO = 0.01
+const VOLUME_EXPONENT = 1.5
+const CURVE_POINTS = 32
+
+/** Chime partials overlap and can otherwise exceed full scale. Single-voice
+ * presets retain almost all of their existing level while sharing a little
+ * output headroom. */
+const PRESET_OUTPUT_GAIN: Record<Exclude<SoundPreset, 'none'>, number> = {
+  chime: 0.89,
+  ding: 0.98,
+  blip: 0.98,
+  pop: 0.98,
+  pulse: 0.98,
+}
+
+function smoothstepCurve(from: number, to: number): Float32Array {
+  return Float32Array.from({ length: CURVE_POINTS }, (_, i) => {
+    const x = i / (CURVE_POINTS - 1)
+    const smooth = x * x * (3 - 2 * x)
+    return from + (to - from) * smooth
+  })
+}
+
+function scheduleEnvelope(gain: AudioParam, start: number, duration: number, peak: number): void {
+  const floor = peak * ENVELOPE_FLOOR_RATIO
+  const releaseStart = start + duration - RELEASE_DURATION
+  gain.setValueCurveAtTime(smoothstepCurve(0, peak), start, ATTACK_DURATION)
+  gain.exponentialRampToValueAtTime(floor, releaseStart)
+  gain.setValueCurveAtTime(smoothstepCurve(floor, 0), releaseStart, RELEASE_DURATION)
 }
 
 export function playPreset(preset: SoundPreset, volume: number): void {
@@ -144,14 +183,14 @@ function scheduleTones(ctx: AudioContext, preset: Exclude<SoundPreset, 'none'>, 
   // close events over the page lifetime.
   closedRecoveryCount = 0
   const now = ctx.currentTime
+  const perceptualVolume = Math.min(1, Math.max(0, volume)) ** VOLUME_EXPONENT
   for (const step of PRESETS[preset]) {
     const osc = ctx.createOscillator()
     const g = ctx.createGain()
     osc.type = 'sine'
     osc.frequency.value = step.freq
-    const peak = Math.max(0.001, volume * step.gain)
-    g.gain.setValueAtTime(peak, now + step.start)
-    g.gain.exponentialRampToValueAtTime(0.01, now + step.start + step.dur)
+    const peak = Math.max(0.001, perceptualVolume * step.gain * PRESET_OUTPUT_GAIN[preset])
+    scheduleEnvelope(g.gain, now + step.start, step.dur, peak)
     osc.connect(g)
     g.connect(ctx.destination)
     osc.onended = () => { osc.disconnect(); g.disconnect() }
@@ -161,11 +200,21 @@ function scheduleTones(ctx: AudioContext, preset: Exclude<SoundPreset, 'none'>, 
 }
 
 /** Picks preset for a given notification kind using current settings. */
+/** Built-in preset defaults for specific categories. Unlike DEFAULTS.perCategory,
+ * these are NOT persisted to localStorage and therefore cannot be clobbered by
+ * a "Use default" reset. They apply only when the user has never explicitly
+ * chosen a preset for the category. */
+const BUILTIN_CATEGORY_DEFAULTS: Partial<Record<SoundCategory, SoundPreset>> = {
+  approval: 'pulse',
+}
+
 export function presetForKind(kind: string | undefined, settings: SoundSettings): SoundPreset {
   if (!settings.enabled) return 'none'
   const cat = kind && VALID_CATEGORIES.has(kind) ? (kind as SoundCategory) : undefined
   const specific = cat ? settings.perCategory[cat] : undefined
   if (specific) return specific
+  // Built-in category default (not persisted — survives "Use default" reset)
+  if (cat && BUILTIN_CATEGORY_DEFAULTS[cat]) return BUILTIN_CATEGORY_DEFAULTS[cat]!
   return settings.perCategory.all ?? 'chime'
 }
 

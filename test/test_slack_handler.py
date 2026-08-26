@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pytest
 
@@ -106,6 +107,12 @@ class FakeSessionManager:
     def release(self, key):
         pass
 
+    def is_busy(self, key):
+        # Interface parity with the real SessionManager. False = no other turn is
+        # in flight, so the post-footer re-check treats a recorded OPTIONS control
+        # as still current — which is what these single-turn tests exercise.
+        return False
+
     def begin_turn(self, key):
         # Pre-dispatch gate parity with the real SessionManager (open state).
         pass
@@ -133,6 +140,9 @@ class FakeSessionManager:
 
     async def destroy(self, key):
         self.removed.append(f"destroy:{key}")
+
+    async def discard_conversation(self, key):
+        self.removed.append(f"discard:{key}")
 
     def has_session(self, key):
         return key in self.keys_seen
@@ -2021,14 +2031,14 @@ class TestAutoTitleSlack:
 
     @pytest.fixture(autouse=True)
     def _clean_titled_threads(self):
-        import kiro_crew.slack.handler as _h
-        from kiro_crew.slack.handler import _titled_threads
+        # The claim LRU and its lock live in `messaging.auto_title`; `reset()` does
+        # both halves, which matters because a test that crashed mid-title leaves
+        # the claim marked AND the permit held.
+        from kiro_crew.messaging import auto_title
 
-        _titled_threads.clear()
-        _h._auto_title_lock = None
+        auto_title.reset()
         yield
-        _titled_threads.clear()
-        _h._auto_title_lock = None
+        auto_title.reset()
 
     @pytest.mark.asyncio
     async def test_auto_title_happy_path(self):
@@ -2044,6 +2054,78 @@ class TestAutoTitleSlack:
         assert len(title_actions) == 1
         assert title_actions[0][1]["title"] == "ETL Debug Session"
         assert "sk1" in _titled_threads
+
+    @pytest.mark.asyncio
+    async def test_auto_title_unexpected_error_surfaces_at_warning(self, caplog):
+        """An unexpected failure is logged at WARNING with the exception type.
+
+        Regression for #4800: this blanket handler runs on a fire-and-forget
+        task, so its log line is the only place a real defect surfaces. At
+        DEBUG it masked a deterministic cross-loop ``RuntimeError`` into three
+        order-dependent CI flake classes (#4177, #4789). The claim must also be
+        released so the next exchange retries.
+        """
+        import logging
+
+        from kiro_crew.slack.handler import _mark_titled, _maybe_auto_title_slack, _titled_threads
+
+        class ExplodingSessionManager(FakeSessionManager):
+            async def get_or_create(self, key, agent=None, channel_id=None):
+                raise RuntimeError("bound to a different event loop")
+
+        slack = MockSlackClient()
+        _mark_titled("sk-err")
+        # The shared module's logger: the blanket handler this pins lives in
+        # `messaging.auto_title` now, and naming the wrong logger is not a harmless
+        # miss — `at_level` also SETS the level, so a DEBUG assertion against a
+        # logger that emits nothing passes vacuously (its sibling below did).
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.messaging.auto_title"):
+            await _maybe_auto_title_slack(
+                slack, ExplodingSessionManager(), "C1", "sk-err", None, "help", "sure"
+            )
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "auto-title failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1, "unexpected error must surface at WARNING, not debug"
+        assert "RuntimeError" in warnings[0].getMessage()
+        assert warnings[0].exc_info is not None, "traceback must be attached"
+        # Claim released so the next exchange can retry.
+        assert "sk-err" not in _titled_threads
+        # And nothing was titled.
+        assert not [a for a in slack.actions if a[0] == "set_thread_title"]
+
+    @pytest.mark.asyncio
+    async def test_auto_title_stream_timeout_stays_at_debug(self, caplog):
+        """A title-stream timeout is routine noise, not the masking concern:
+        it must NOT emit the WARNING traceback (one per exchange on a slow
+        model would be log spam), while still releasing the claim for retry."""
+        import logging
+
+        from kiro_crew.slack.handler import _mark_titled, _maybe_auto_title_slack, _titled_threads
+
+        class TimingOutSessionManager(FakeSessionManager):
+            async def get_or_create(self, key, agent=None, channel_id=None):
+                raise asyncio.TimeoutError()
+
+        slack = MockSlackClient()
+        _mark_titled("sk-slow")
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.messaging.auto_title"):
+            await _maybe_auto_title_slack(
+                slack, TimingOutSessionManager(), "C1", "sk-slow", None, "help", "sure"
+            )
+
+        assert not [
+            r for r in caplog.records if r.levelno >= logging.WARNING
+        ], "timeout must not warn"
+        assert [
+            r
+            for r in caplog.records
+            if r.levelno == logging.DEBUG and "timed out" in r.getMessage()
+        ]
+        assert "sk-slow" not in _titled_threads  # claim released for retry
 
     @pytest.mark.asyncio
     async def test_auto_title_skip_removes_claim(self):
@@ -2382,6 +2464,63 @@ class TestToSlackMrkdwnKeepTables:
         assert "```mermaid" not in result
 
 
+class TestToSlackMrkdwnImages:
+    """Markdown IMAGE syntax must survive conversion untouched.
+
+    Slack mrkdwn has no image form, so running an image through the
+    ``[text](url)`` -> ``<url|text>`` rewrite emits a stray ``!`` in front of a
+    clickable link to a destination Slack cannot open (a local path is not even
+    reachable from Slack's servers). Raw passthrough is what the reader can act
+    on, and it matches Discord, whose renderer rewrites no links at all.
+    """
+
+    def test_image_with_local_path_is_untouched(self):
+        from kiro_crew.slack.format import to_slack_mrkdwn
+
+        assert to_slack_mrkdwn("![shot](/tmp/x.png)") == "![shot](/tmp/x.png)"
+
+    def test_image_with_http_url_is_untouched(self):
+        from kiro_crew.slack.format import to_slack_mrkdwn
+
+        text = "![diagram](https://example.com/d.png)"
+        assert to_slack_mrkdwn(text) == text
+
+    def test_regular_link_still_converts(self):
+        from kiro_crew.slack.format import to_slack_mrkdwn
+
+        assert to_slack_mrkdwn("[docs](https://example.com)") == "<https://example.com|docs>"
+
+    def test_mixed_line_converts_only_the_link(self):
+        from kiro_crew.slack.format import to_slack_mrkdwn
+
+        out = to_slack_mrkdwn("see ![a](/x.png) and [b](https://y)")
+        assert out == "see ![a](/x.png) and <https://y|b>"
+
+    def test_escaped_bang_is_still_treated_as_an_image(self):
+        from kiro_crew.slack.format import to_slack_mrkdwn
+
+        # CommonMark reads ``\![x](p)`` as an escaped literal ``!`` followed by a
+        # LINK, so a strict reader would convert it. This converter has no
+        # backslash-unescaping layer, so honouring that in detection alone would
+        # emit ``\!<p|x>`` -- a stray literal backslash in place of a stray ``!``.
+        # Passing it through raw also matches ``image_artifacts._IMAGE_MD_RE``,
+        # which registers ``\![x](p)`` as an image on the dashboard side.
+        assert to_slack_mrkdwn(r"\![x](p)") == r"\![x](p)"
+
+    def test_sentence_bang_before_a_link_is_an_image_per_commonmark(self):
+        from kiro_crew.slack.format import to_slack_mrkdwn
+
+        # No space between ``!`` and ``[``: CommonMark binds the ``!`` into image
+        # syntax, so this is an image, not "exclamation mark, then link".
+        assert to_slack_mrkdwn("Wow![click](https://x)") == "Wow![click](https://x)"
+
+    def test_image_inside_a_code_fence_is_untouched(self):
+        from kiro_crew.slack.format import to_slack_mrkdwn
+
+        text = "```\n![a](/x.png)\n```"
+        assert to_slack_mrkdwn(text) == text
+
+
 class TestMermaidSequenceArrows:
     """Regression: dashed sequence-diagram arrows were rendered by a dead branch.
 
@@ -2696,7 +2835,11 @@ class TestCompactCommand:
 
     @pytest.mark.asyncio
     async def test_compact_exception_cleans_up(self):
-        """When compact() raises, handler posts error and removes session."""
+        """When compact() raises, handler posts an error and tears the session down.
+
+        The teardown discards the wedged native conversation rather than
+        destroying the session-map entry, so the thread keeps its binding.
+        """
         provider = FakeProvider()
 
         async def compact(context=""):
@@ -2711,8 +2854,9 @@ class TestCompactCommand:
         texts = self._posted_texts(slack)
         assert any("unexpectedly" in t for t in texts)
         assert (
-            "destroy:thread1" in sessions.removed
-        ), "Session must be destroyed after compact failure"
+            "discard:thread1" in sessions.removed
+        ), "Session must be torn down after compact failure"
+        assert "destroy:thread1" not in sessions.removed, "the thread binding must survive"
 
     @pytest.mark.asyncio
     async def test_compact_posts_timing_footer_without_ctx(self):
@@ -3076,18 +3220,20 @@ class TestToolElapsedTimer:
         slack = MockSlackClient()
         slack._stream_enabled = True
 
-        # We need to track when _tool_start_time gets set
-        # The simplest way: wrap the original and track based on call count
-        # From debug: ~20 calls happen. The timer start is around call 7-8
-        # and elapsed calc around call 18. We need start to be early, elapsed late.
+        # Advance the clock by >60s on EVERY monotonic() call. The elapsed
+        # calc always runs at least one call after _start_tool_timer, so the
+        # computed elapsed is >= one step regardless of how many unrelated
+        # monotonic() calls precede the timer start. (A fixed call-count
+        # threshold here was order-dependent: module caches touched by earlier
+        # tests in this file change the pre-timer call count, so the test
+        # broke whenever a pytest-split shard boundary landed inside this
+        # class.)
         calls = [0]
         base = handler.time.monotonic()
 
         def fake_monotonic():
             calls[0] += 1
-            # Calls 1-10 return base (timer sets _tool_start_time here)
-            # Calls 11+ return base + 75.5 (elapsed calculation)
-            return base if calls[0] <= 10 else base + 75.5
+            return base + calls[0] * 75.5
 
         monkeypatch.setattr(handler.time, "monotonic", fake_monotonic)
         provider = FakeProvider(
@@ -3102,9 +3248,13 @@ class TestToolElapsedTimer:
         task_appends = [a for a in slack.actions if a[0] == "append_task"]
         complete_tasks = [t for t in task_appends if t[1].get("status") == "complete"]
         # Elapsed time is shown in the TITLE (Slack replaces title on same
-        # task_id; details would APPEND and accumulate ⏱ stamps).
+        # task_id; details would APPEND and accumulate ⏱ stamps). Elapsed is
+        # N*75.5s for some N>=1, so assert the minutes FORMAT rather than a
+        # specific minute count.
         title_list = [str(t[1].get("title", "")) for t in complete_tasks]
-        assert any("1m" in t for t in title_list), f"Expected '1m' in title but got: {title_list}"
+        assert any(
+            re.search(r"⏱ \d+m \d+(\.\d+)?s", t) for t in title_list
+        ), f"Expected minutes-format elapsed in title but got: {title_list}"
         # Regression guard: elapsed must NOT be in details (append bug)
         details_list = [str(t[1].get("details", "")) for t in complete_tasks]
         assert all("⏱" not in d for d in details_list), f"⏱ leaked into details: {details_list}"
@@ -3167,9 +3317,11 @@ class TestToolElapsedTimer:
 
         def fake_monotonic():
             calls[0] += 1
-            # Early calls (tool 1 timer start) return base; later calls
-            # (transition completion elapsed calc) return base + 42s.
-            return base if calls[0] <= 10 else base + 42.0
+            # Advance >1s per call: the transition's elapsed calc always runs
+            # after the first tool's timer start, so elapsed >= one 42s step.
+            # (A fixed call-count threshold was order-dependent — see
+            # test_elapsed_time_shows_minutes_format.)
+            return base + calls[0] * 42.0
 
         monkeypatch.setattr(handler.time, "monotonic", fake_monotonic)
         provider = FakeProvider(

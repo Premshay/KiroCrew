@@ -120,7 +120,7 @@ Three mechanisms:
 | Mechanism | Where | Covers |
 |---|---|---|
 | git self-update | `slack/gateway.py:4959` (`_check_for_updates`, called once from startup at `:5426`) → `_auto_apply_update` (`:5004`) | `source` only |
-| Electron OTA | `website/electron/auto-update.js` (electron-updater, `autoDownload=false`, `autoInstallOnAppQuit=false`) | `dmg`, `appimage` |
+| Electron OTA | `website/electron/auto-update.js` (electron-updater, `autoDownload=false` at the library level with an auto-download preference above it, `autoInstallOnAppQuit=false`) | `dmg`, `appimage` |
 | — none — | | `wheel`, `docker` |
 
 All three backend entry points to the git path guard on roughly the same two
@@ -244,8 +244,10 @@ re-asked which shapes it still governs.
   a button.
 - One shared drain-and-restart sequence, with success defined by a health +
   version handshake rather than a clean exit code.
-- No regression to the desktop OTA engine, whose consent-first posture is load
-  bearing for signing and notarization.
+- No regression to the desktop OTA engine, whose install-ordering posture is load
+  bearing for signing and notarization. (Its *consent* posture has since become a
+  default-on preference — see the amended §4 — but the ordering invariant it was
+  protecting, gateway-stopped-before-swap, is unchanged.)
 
 ## Non-goals
 
@@ -417,6 +419,95 @@ capability check it never had.
   running gateway holds live sessions; the helper is what makes the swap
   survivable.
 
+  **Managed-venv replacement mechanics (invariants, not a settled design).**
+  `cli.sh` has two install branches, and only one of them is pipx. The other —
+  the default when pipx is absent — is a fixed-path managed venv
+  (`${KIROCREW_HOME}-venv`, `cli.sh:331`) upgraded **in place** today. For that
+  shape the promising direction is *versioned trees with atomic promotion*:
+  build `crew-venv-<version>` completely while the old gateway keeps serving,
+  then promote a stable path to point at it, then restart. (Precedent:
+  Claude Code's native installer keeps per-version binaries under
+  `~/.local/share/claude/versions/` behind one symlink; Codex CLI instead
+  detects the owning package manager and delegates.) A cross-vendor
+  adversarial council reviewed a concrete version of this design
+  (2026-08-06, GPT 5.6 / DeepSeek 3.2 / GLM 5 — REVISE / REJECT / REVISE)
+  and reduced it to the following **invariants any Phase 2 implementation
+  must satisfy**, with the mechanism itself left to the implementation PR:
+
+  - **Promotion must be actually atomic.** `ln -sfn` is unlink + create — a
+    missing-path window — and is not atomic on NFS at all. Atomic promotion is
+    a sibling symlink replaced via `rename(2)` / `os.replace`.
+  - **Every persisted launch path must resolve through the stable path.** At
+    least four exist today: `KIROCREW_SERVICE_BIN`, the `kirocrew_bin()` value
+    systemd renders into `ExecStart`, the generated macOS live-gateway
+    launcher, and the non-service restart in `updates.py`, which re-execs
+    `sys.executable` — the old version-specific interpreter. Fixing only the
+    service unit resurrects the old tree on every other path.
+  - **The old-inode guarantee holds only for versioned trees.** A Python
+    process imports lazily; after a flip, not-yet-imported modules resolve from
+    the new tree. "The running gateway is unaffected" is true only once the
+    running gateway was itself started from an immutable versioned directory —
+    which makes the **first migration** (moving off today's fixed real
+    directory without breaking the live venv's absolute shebangs) a protocol
+    of its own. That protocol is now defined:
+
+    **First-migration protocol.** The existing `${KIROCREW_HOME}-venv` real
+    directory is **never renamed, moved, or converted in place** — renaming it
+    breaks its own absolute shebangs while a gateway may still be running from
+    it, and a non-empty directory cannot be atomically replaced by a symlink
+    anyway. Instead the stable path is a **new name** that has always been a
+    symlink:
+
+    1. The helper builds `crew-venv-<version>` fresh and verifies it
+       (provenance per this section, hash-pinned dependencies, import check).
+    2. It creates `crew-venv-current → crew-venv-<version>` atomically
+       (sibling symlink + `rename(2)`; trivially safe because the name did not
+       previously exist).
+    3. The installer rewrites **all four persisted launch paths** (above) to
+       resolve through `crew-venv-current`, re-rendering the service unit and
+       the generated macOS launcher.
+    4. Drain per §5, restart via the supervisor, then the post-restart
+       health + version handshake.
+    5. **On a failed handshake**, launch paths are pointed back at the old
+       fixed directory — which still works, because it was never touched. This
+       is a *fallback to a still-functional tree*, not a rollback protocol,
+       and is consistent with rollback remaining a non-goal.
+    6. The old fixed directory is pruned only after N consecutive verified
+       boots (suggested N=3), and a pruning failure never fails an update.
+
+    The load-bearing property: **no tree that a live process might be using is
+    ever moved or deleted**, and the atomicity problem of replacing a real
+    directory with a symlink is dodged entirely by putting the symlink at a
+    fresh name. Subsequent updates are pure symlink flips on
+    `crew-venv-current` and never revisit this protocol.
+  - **A fresh venv re-resolves the dependency graph.** `setup.cfg` carries wide
+    ranges; a rebuilt environment downloads packages covered by nobody's
+    signature. The install step needs locked, hash-pinned constraints (or a
+    wheelhouse) inside the verified payload, or the provenance story covers
+    only the Kiro Crew wheel itself.
+  - **Provenance must bind more than a digest.** The feed is unsigned; an
+    actor who controls it can point at a *different* artifact with valid
+    provenance from the same repo. Verification must check workflow, commit
+    lineage and channel policy against the client-pinned root — and the SLSA
+    requirement above is unconditional; no "or" fallbacks.
+  - **pipx delegation is not a safety property.** `pipx install --force`
+    mutates the fixed pipx environment in place while the old gateway is using
+    it — the torn-runtime hazard this section exists to avoid. If Phase 2
+    ships a pipx apply path at all, it drains first, accepts the downtime, and
+    documents rollback as unsupported for that shape. Which branch owns a
+    given install is also **not derivable at update time** (pipx presence now
+    proves nothing about install time); the installer must persist the branch
+    it took.
+  - **Rollback stays a non-goal.** Retained old trees are *manual recovery
+    targets*, nothing more; any pruning policy must never delete the tree the
+    running process was started from, and cleanup failures must not fail the
+    update.
+  - **macOS TCC identity across path rotation is an open compatibility test,
+    not a solved problem.** The console script's shebang names the rotating
+    versioned interpreter, so a stable outer symlink may not preserve grants
+    (Claude Code hit exactly this: anthropics/claude-code#76246, #77081,
+    #80899).
+
   The checksum is necessary and not sufficient. `SHA256SUMS` is served from the
   same CDN as the wheel, so an actor who can replace one can replace both —
   `publish-cli.yml:85-87` says this in as many words ("integrity, not
@@ -439,14 +530,39 @@ post-restart verification.
 
 | | nightly | insider | stable |
 |---|---|---|---|
-| desktop | opt-in background staging, apply on idle/quit | consent-first | consent-first |
+| desktop | background download by default, install on next quit (opt out in About) | same | same |
 | wheel | notify + explicit apply (in-app button or `kirocrew update`) | same | same |
 | source | notify only | same | same |
 
+**Amended (desktop row).** This row originally read "opt-in background staging"
+for nightly and "consent-first" for insider and stable. Desktop now downloads by
+default on every channel, with an opt-out in Settings → About
+(`autoDownloadUpdates`, default true). Two things did NOT change with it, and
+they are what keep the row honest:
+
+- **The install is still not automatic in-session.** A downloaded update is
+  armed on `before-quit` and installs on the user's own next quit, after an
+  awaited gateway stop. Nothing swaps the bundle under a running session, which
+  is the property §5's drain sequence exists to protect and the reason
+  "apply on idle/quit" survives as "install on next quit".
+- **`autoInstallOnAppQuit` stays false on every platform.** Auto-download does
+  not imply it and must never be conflated with it: on macOS that flag stages
+  eagerly, and staging is what ARMS ShipIt to swap the bundle on any exit,
+  including exits that skip the gateway teardown. It cannot be un-armed, so it
+  also defeats the retraction that `allowDowngrade=true` provides.
+
+The consent-first path is therefore preserved as the opt-out rather than
+deleted, and the distinction the original row was drawing — between fetching
+bytes and committing them — is now carried by the download/install split
+instead of by the channel.
+
 **"Explicit" means a deliberate user action, not necessarily a terminal.** An
-in-app Apply button is as explicit as typing the command, and since the backend
-can invoke the install helper it can serve both — which is why `wheel` carries
-`can_apply: true` after Phase 2. What is ruled out for the CLI shape is the
+in-app Apply button and `kirocrew update` in a terminal both qualify, and since
+the backend can invoke the install helper it can serve both — which is why
+`wheel` carries `can_apply: true` after Phase 2. They are **not equivalent in
+authority**, however: the in-app path additionally requires the host-local
+step-up resolved in Open Question 7, because a dashboard session is weaker
+authority than a shell on the host. What is ruled out for the CLI shape is the
 *silent* path: no background download-and-swap, no apply without the user asking
 for it in one of those two places.
 
@@ -609,9 +725,19 @@ contract tells it not to.
   nothing short of a system-installed, root-owned helper would. Whether that is
   worth building is Open Question 1; until it is answered, the local-execution
   case is an accepted, stated gap rather than a covered one.
-- Desktop consent-first behavior is unchanged. Nothing in this RFC introduces a
-  path that installs a signed bundle without an explicit user action, outside
-  the existing policy-mandated case.
+- **Desktop now DOWNLOADS without an explicit user action, and still does not
+  INSTALL without one.** This supersedes the original claim that nothing here
+  installs a signed bundle without explicit action. The distinction is the whole
+  security argument: a download is a fetch of sha512-verified bytes into a cache
+  that changes nothing until it is committed, whereas the commit remains gated on
+  the user's own quit plus an awaited gateway stop. `autoInstallOnAppQuit` stays
+  false on every platform, so no code path hands the platform installer the bytes
+  outside `quitAndInstall()`, and release retraction keeps working because
+  nothing is staged early. The opt-out is `autoDownloadUpdates` (default true).
+- The in-app Apply step-up resolved in Open Question 7 is unaffected: it governs
+  a *dashboard-session-triggered* install of the WHEEL shape, where the authority
+  is a network-reachable bearer. The desktop path here is triggered by the user's
+  own quit on the host, which is not that actor.
 
 ## Alternatives considered
 
@@ -706,6 +832,32 @@ see §4.
    `unavailable_reason` by §2 but not yet expressed as `check_status`. Unifying
    them is right in principle and may not be worth a Phase 1b churn on a lane
    that currently works.
+7. **RESOLVED — the dashboard session is NOT sufficient authority to install
+   code; Apply requires a gateway-enforced, host-local step-up.** The button
+   turns an update into a network-reachable code-install trigger for anyone
+   holding a dashboard session — including sessions arriving through tunnels
+   (Tailscale serve / cloudflared). This repository has already documented
+   (issue #1762) that IP pinning is broken under every same-host proxy, making
+   the session effectively a transferable bearer for remote access. A
+   credential with that mobility is acceptable authority for chat and
+   operations; it is not acceptable authority for replacing the gateway's own
+   code. A frontend confirmation dialog changes nothing: the SPA is served
+   from the CDN and a compromised SPA can dismiss its own modal.
+
+   **Mechanism.** Apply from the SPA *arms* a pending update request (single-
+   use nonce; TTL ≈ 10 minutes; recorded with target version, channel,
+   artifact digest, attempt id, and request source). Approval requires an
+   action the SPA cannot perform for itself: `kirocrew update approve` run on
+   the gateway host, whose identity comes from loopback + filesystem access
+   rather than the dashboard session. Only an armed-and-approved request may
+   enter §5's drain-then-swap. The audit record gains the approval's origin
+   and outcome; an expired or unapproved request decays without side effects.
+
+   **What this rules out and keeps.** One-click remote apply is deliberately
+   ruled out in Phase 2. A future policy key could relax the step-up for
+   fleets that accept the reduced posture, but it is not part of this design
+   and would need its own review. `kirocrew update` run in a terminal on the
+   host already *is* the step-up, so the CLI path needs no extra ceremony.
 
 ## Provenance
 
@@ -785,4 +937,30 @@ independently; sources in the session record):
   which walks up to any ancestor repo) is itself an instance of the failure
   these two walk-backs describe, which is why OQ5 requires the equality check
   rather than the exit status alone.
+
+### Managed-venv mechanics review (2026-08-06, same day, second panel)
+
+A second adversarial panel (`gpt-5.6-sol`, `deepseek-3.2`, `glm-5`; a fourth
+member failed twice on an upstream error) red-teamed a concrete
+versioned-venv-plus-symlink-flip design for the wheel shape, drawn from a
+comparison against Claude Code's native installer (per-version binaries behind
+one symlink) and Codex CLI (detect the owning package manager and delegate).
+Verdicts: REVISE / REJECT / REVISE. The direction survived; the specific
+guarantees did not — `ln -sfn` is not atomic, the old-inode claim ignores lazy
+imports, four persisted launch paths exist rather than one, a rebuilt venv
+re-resolves unsigned dependencies, digest-only provenance admits
+artifact-substitution from an unsigned feed, and pipx delegation re-creates the
+in-place torn-runtime hazard. Per the panel's convergent placement finding, the
+outcome entered §3 as **invariants plus a first-migration open problem**, and
+the consent exposure as Open Question 7 — not as a settled mechanism. The
+mechanism itself is Phase 2 implementation-PR territory.
+
+Human review (rajpratham1, 2026-08-07) then required both open boundaries to be
+resolved before Phase 2 implementation. This revision resolves them: the
+first-migration protocol is defined in §3 (fresh stable symlink name; the
+existing fixed directory is never moved and remains a functional fallback), and
+Open Question 7 is resolved to a gateway-enforced, host-local step-up for the
+in-app Apply — the dashboard session alone is explicitly not sufficient
+authority to install code, on the strength of the documented tunnel-pin
+breakage (issue #1762).
 

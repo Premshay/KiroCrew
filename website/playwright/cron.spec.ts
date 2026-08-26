@@ -1,19 +1,21 @@
 import { test, expect } from '@playwright/test'
+import { pickFromDropdown } from './helpers/dropdown'
 
 // Cron management moved from an Overview tab to the standalone /schedule page
 // (SchedulePage). The create/edit form is a slide-out panel opened via "Add
 // Job" rendering JobForm in vertical layout: Name is a labelled <input> and
 // Message a <textarea> (no placeholders), so anchor on their helper spans.
 // Submit is "Create"; pause/resume/delete are per-row panel actions
-// (delete via an arm→Confirm state machine on the same in-row button).
+// (delete via an arm→"Delete?" state machine on the same in-row button).
 
 type Page = import('@playwright/test').Page
 
 // Vertical-layout fields have no placeholders — anchor on their unique helper text.
 const nameField = (page: Page) => page.locator('span:has-text("A short label for this job") ~ input')
 const msgField = (page: Page) => page.locator('span:has-text("The prompt or task sent to the agent") ~ textarea')
-// Mode select is not the first <select> (approval precedes it) — target by option text.
-const modeSelect = (page: Page) => page.locator('select').filter({ hasText: 'Weekly schedule' })
+// The schedule-kind dropdown, addressed by its accessible name. Its rows read
+// "Every interval" / "Weekly schedule" / "Cron expression".
+const pickSchedMode = (page: Page, label: string) => pickFromDropdown(page, 'Schedule', label)
 
 const openForm = async (page: Page) => {
   await page.getByRole('button', { name: /add job/i }).click()
@@ -65,14 +67,14 @@ test.describe('Schedule (Cron) Page E2E Tests', () => {
     await nameField(page).fill(jobName)
     await msgField(page).fill('Run E2E tests every hour')
     await page.locator('input[type="number"]').first().fill('2')
-    await page.locator('select').filter({ hasText: 'minutes' }).selectOption('hours')
+    await pickFromDropdown(page, 'Every interval', 'hours')
     await page.getByRole('button', { name: /^create$/i }).click()
     const row = page.getByRole('row').filter({ hasText: jobName })
     await expect(row).toBeVisible({ timeout: 5000 })
     await expect(page.getByText('Run E2E tests every hour').first()).toBeVisible()
-    // Cleanup: row-scoped arm→Confirm delete (see 'deletes a cron job').
+    // Cleanup: row-scoped arm→"Delete?" delete (see 'deletes a cron job').
     await row.getByRole('button', { name: /^delete$/i }).click()
-    await row.getByRole('button', { name: /^confirm$/i }).click()
+    await row.getByRole('button', { name: /^delete\?$/i }).click()
     await expect(page.getByRole('cell', { name: jobName })).toHaveCount(0, { timeout: 5000 })
   })
 
@@ -81,7 +83,7 @@ test.describe('Schedule (Cron) Page E2E Tests', () => {
     await openForm(page)
     await nameField(page).fill(jobName)
     await msgField(page).fill('Generate weekly metrics')
-    await modeSelect(page).selectOption('weekly')
+    await pickSchedMode(page, 'Weekly schedule')
     await page.getByRole('button', { name: /^mon$/i }).click()
     await page.getByRole('button', { name: /^fri$/i }).click()
     await page.locator('input[type="time"]').fill('09:00')
@@ -90,7 +92,7 @@ test.describe('Schedule (Cron) Page E2E Tests', () => {
     await expect(row).toBeVisible({ timeout: 5000 })
     // Cleanup: don't leave a live Mon/Fri 09:00 job armed on the gateway.
     await row.getByRole('button', { name: /^delete$/i }).click()
-    await row.getByRole('button', { name: /^confirm$/i }).click()
+    await row.getByRole('button', { name: /^delete\?$/i }).click()
     await expect(page.getByRole('cell', { name: jobName })).toHaveCount(0, { timeout: 5000 })
   })
 
@@ -108,18 +110,24 @@ test.describe('Schedule (Cron) Page E2E Tests', () => {
     const row = page.getByRole('row').filter({ hasText: jobName })
     await expect(row).toBeVisible({ timeout: 5000 })
 
-    // Pause/Resume are inline per-row buttons (SchedulePage renders them in the
-    // row, the label toggled by j.enabled). Scope to this job's row -- the page
-    // renders one such button per enabled row, so an unscoped page-level locator
-    // is ambiguous (strict-mode violation once >1 job exists).
-    await row.getByRole('button', { name: /^pause$/i }).click()
-    await expect(row.getByRole('button', { name: /^resume$/i })).toBeVisible({ timeout: 5000 })
-    await row.getByRole('button', { name: /^resume$/i }).click()
-    await expect(row.getByRole('button', { name: /^pause$/i })).toBeVisible({ timeout: 5000 })
+    // Pause/Resume moved OUT of the row and into its ⋯ overflow menu, so the
+    // actions column fits the table width (six row buttons did not). The menu is
+    // scoped to this job's row -- one ⋯ per row, so an unscoped page-level
+    // locator is ambiguous (strict-mode violation once >1 job exists). The menu
+    // itself renders in a portal at the document root, hence page-level item
+    // locators after opening it.
+    const pauseVia = async (label: RegExp) => {
+      await row.getByRole('button', { name: /^actions$/i }).click()
+      await page.getByRole('menuitem', { name: label }).click()
+    }
+    await pauseVia(/^pause$/i)
+    await expect(row.getByRole('button', { name: /^run$/i })).toBeDisabled({ timeout: 5000 })
+    await pauseVia(/^resume$/i)
+    await expect(row.getByRole('button', { name: /^run$/i })).toBeEnabled({ timeout: 5000 })
 
-    // Cleanup: row-scoped arm→Confirm delete.
+    // Cleanup: row-scoped arm→"Delete?" delete.
     await row.getByRole('button', { name: /^delete$/i }).click()
-    await row.getByRole('button', { name: /^confirm$/i }).click()
+    await row.getByRole('button', { name: /^delete\?$/i }).click()
     await expect(page.getByRole('cell', { name: jobName })).toHaveCount(0, { timeout: 5000 })
   })
 
@@ -137,10 +145,10 @@ test.describe('Schedule (Cron) Page E2E Tests', () => {
     await expect(row).toBeVisible({ timeout: 5000 })
 
     // Delete is a two-click arm→confirm on the same in-row button: the first
-    // click re-labels "Delete"→"Confirm", the second commits (see SchedulePage
-    // confirmDeleteId state machine). Scope both clicks to this job's row.
+    // click re-labels "Delete"→"Delete?" (self-explanatory on touch, #4120), the
+    // second commits (see SchedulePage confirmDeleteId). Scope clicks to this row.
     await row.getByRole('button', { name: /^delete$/i }).click()
-    await row.getByRole('button', { name: /^confirm$/i }).click()
+    await row.getByRole('button', { name: /^delete\?$/i }).click()
     await expect(page.getByRole('cell', { name: jobName })).toHaveCount(0, { timeout: 5000 })
   })
 
@@ -161,7 +169,7 @@ test.describe('Schedule (Cron) Page E2E Tests', () => {
     await openForm(page)
     await nameField(page).fill('Test')
     await msgField(page).fill('Test task')
-    await modeSelect(page).selectOption('weekly')
+    await pickSchedMode(page, 'Weekly schedule')
     await page.getByRole('button', { name: /^create$/i }).click()
     await expect(page.getByText(/select at least one day/i)).toBeVisible({ timeout: 3000 })
   })

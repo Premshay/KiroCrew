@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Maximize2, Minimize2, Shrink, Expand } from 'lucide-react'
 import { IconButton, IconButtonGroup } from './ui'
 import { useDialogFocusTrap } from '../hooks/useDialogFocusTrap'
+import { useTheme } from '../hooks/useTheme'
 import { i18nT } from '../i18n/t'
 import {
   buildMcpAppSrcdoc,
@@ -9,6 +10,7 @@ import {
   type McpAppRenderPayload,
 } from '../lib/mcpAppSrcdoc'
 import { planReveal, prefersReducedMotion, hasRevealed, markRevealed } from './mcpAppReveal'
+import { noteStaleOwnerResponse } from '../api/staleOwnerSignal'
 
 /** Inline height for a rendered MCP App before it reports its own size. */
 const DEFAULT_HEIGHT = 480
@@ -19,7 +21,12 @@ const MAX_HEIGHT = 1200
 // MCP Apps UI-channel JSON-RPC method names (SEP-1865). The `ui/` namespace is
 // disjoint from the MCP tools namespace, carried over postMessage between the
 // host (this component) and the app iframe.
-const PROTOCOL_VERSION = '2025-11-21'
+/** The SEP-1865 revision this host speaks, returned in the `ui/initialize`
+ *  result. Must be a PUBLISHED revision id — the spec's own handshake examples
+ *  use the revision, and an app comparing against a value that was never
+ *  published cannot negotiate. Revisions live at
+ *  github.com/modelcontextprotocol/ext-apps/tree/main/specification. */
+const PROTOCOL_VERSION = '2026-01-26'
 const M_INITIALIZE = 'ui/initialize'
 const M_TOOLS_CALL = 'tools/call'
 const M_REQUEST_DISPLAY_MODE = 'ui/request-display-mode'
@@ -364,6 +371,17 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
   const presentationRef = useRef<Presentation>(presentation)
   presentationRef.current = presentation
 
+  // The app styles itself from `hostContext.theme` alone: this host injects no
+  // CSS into the srcdoc (see mcpAppSrcdoc.ts), so a hardcoded value left every
+  // app dark regardless of the user's theme. `ResolvedMode` is already exactly
+  // 'dark' | 'light', so it maps 1:1 onto the protocol field.
+  //
+  // Mirrored like `presentation` above because the bridge effect below closes
+  // over `[]` — it must not re-subscribe when the theme changes.
+  const { theme } = useTheme()
+  const themeRef = useRef(theme)
+  themeRef.current = theme
+
   // --- `wide`: breaking out of the chat column -------------------------------
   // The frame's width ceiling is not its own: the transcript row wrapper caps it
   // at `--mc-content-width` (default 900px, user-configurable), so on a wide
@@ -529,7 +547,7 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
                 hostInfo: { name: 'kirocrew', version: '0.1' },
                 hostCapabilities: HOST_CAPABILITIES,
                 hostContext: {
-                  theme: 'dark',
+                  theme: themeRef.current,
                   platform: 'web',
                   displayMode: PROTOCOL_MODE[presentationRef.current],
                   availableDisplayModes: AVAILABLE_DISPLAY_MODES,
@@ -650,6 +668,10 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
               const body = (await resp.json().catch(() => null)) as
                 | { result?: unknown; error?: unknown }
                 | null
+              // Raise the dashboard's re-auth prompt when the relay was denied
+              // for a stale pre-owner session; the error below still reaches
+              // the app iframe, which keeps its own failure handling.
+              if (!resp.ok) noteStaleOwnerResponse(resp.status, body)
               if (resp.ok && body && 'result' in body) {
                 post({ jsonrpc: '2.0', id: msg.id, result: body.result })
               } else if (body && body.error && typeof body.error === 'object') {
@@ -791,6 +813,7 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
           method: N_HOST_CONTEXT_CHANGED,
           // Partial context update — only the changed fields, per spec.
           params: {
+            theme: themeRef.current,
             displayMode: PROTOCOL_MODE[next],
             containerDimensions: dimensionsFor(next, wideWidth),
           },
@@ -799,6 +822,25 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
       )
     } catch { /* frame torn down */ }
   }, [])
+
+  // A theme switch must reach an app that is ALREADY mounted — fixing only the
+  // initialize reply above would leave the bug reachable by toggling the theme
+  // with an app open.
+  //
+  // Routed through `notifyHostContext` rather than its own postMessage so the
+  // frame keeps exactly one outbound post site: that one already carries the
+  // navigated-away guard and the wildcard-origin review annotation, and adding a
+  // second would mean re-auditing a null-origin sandboxed target.
+  //
+  // Compares against the last theme SENT rather than using a first-run flag:
+  // StrictMode remounts effects, and a boolean would post a spurious update on
+  // the second mount.
+  const sentThemeRef = useRef(theme)
+  useEffect(() => {
+    if (sentThemeRef.current === theme) return
+    sentThemeRef.current = theme
+    notifyHostContext(presentationRef.current, wideWidthRef.current)
+  }, [theme, notifyHostContext])
 
   // Host-initiated presentation change (the header controls).
   // The app MUST be told: it may gate an editable surface on the mode, and a

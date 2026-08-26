@@ -131,6 +131,58 @@ class TestRoleModels:
 # ── General ──────────────────────────────────────────────────────────────
 
 
+# ── Terminal default shell (dashboard.terminal.shell) ─────────────────────
+
+
+class TestTerminalShell:
+    """Save-time gate: a value must be an executable; "" clears the setting."""
+
+    @pytest.mark.asyncio
+    async def test_empty_clears_setting(self, tmp_config) -> None:
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.shell", "")
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text())
+        assert data["dashboard"]["terminal"]["shell"] == ""
+
+    @pytest.mark.asyncio
+    async def test_executable_accepted_and_written_nested(self, tmp_config) -> None:
+        import sys
+
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.shell", sys.executable)
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text())
+        assert data["dashboard"]["terminal"]["shell"] == sys.executable
+
+    @pytest.mark.asyncio
+    async def test_non_executable_rejected(self, tmp_config) -> None:
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.shell", "/opt/definitely-not-a-shell")
+            assert resp.status == 400
+            body = await resp.json()
+            assert "executable" in body["error"]
+            # Machine-readable code (AGENTS contract for new non-2xx JSON):
+            # the Settings field maps it to a catalog key instead of rendering
+            # the English sentence in a translated dashboard.
+            assert body["code"] == "shell_not_executable"
+        # The refused value must not have been persisted.
+        data = json.loads(tmp_config.read_text())
+        assert "dashboard" not in data or "shell" not in data.get("dashboard", {}).get(
+            "terminal", {}
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_string_rejected(self, tmp_config) -> None:
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.shell", 123)
+            assert resp.status == 400
+
+
 class TestPatchGeneral:
     @pytest.mark.asyncio
     async def test_unknown_field_returns_400(self, tmp_config) -> None:
@@ -631,3 +683,186 @@ class TestDefaultReasoningEffortPatch:
         # A default change must NEVER take the destructive path — that clears
         # _sessions and shuts live providers down, killing in-flight turns.
         sessions.reload_provider_factory.assert_not_awaited()
+
+
+# ── Local telemetry switch (telemetry.enabled) ───────────────────────────
+
+
+class TestTelemetryEnabledPatch:
+    """The Telemetry panel's switch: writable, and live without a restart.
+
+    The recorder is built once per process and memoized, so a write that only
+    lands in config.json would leave the panel reporting "on" while every metric
+    call site stayed a no-op. Dropping the cached recorder is what makes the
+    switch mean something, which is why it is pinned rather than left to the
+    next restart.
+    """
+
+    @pytest.mark.asyncio
+    async def test_enable_persists(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "telemetry.enabled", True)).status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["telemetry"]["enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_disable_persists(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "telemetry.enabled", True)).status == 200
+            assert (await _patch(c, "telemetry.enabled", False)).status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["telemetry"]["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_non_boolean_rejected(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "telemetry.enabled", "yes")).status == 400
+
+    @pytest.mark.asyncio
+    async def test_drops_the_memoized_recorder(self, tmp_config) -> None:
+        with patch("kiro_crew.metrics.provider.shutdown") as reset:
+            async with TestClient(TestServer(_make_app())) as c:
+                assert (await _patch(c, "telemetry.enabled", True)).status == 200
+        reset.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unrelated_field_leaves_the_recorder_alone(self, tmp_config) -> None:
+        # Rebuilding the recorder flushes and restarts the exporter thread, so it
+        # must not ride along on every unrelated config write.
+        with patch("kiro_crew.metrics.provider.shutdown") as reset:
+            async with TestClient(TestServer(_make_app())) as c:
+                assert (await _patch(c, "session.timeout_secs", 600)).status == 200
+        reset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rejected_value_leaves_the_recorder_alone(self, tmp_config) -> None:
+        with patch("kiro_crew.metrics.provider.shutdown") as reset:
+            async with TestClient(TestServer(_make_app())) as c:
+                assert (await _patch(c, "telemetry.enabled", "yes")).status == 400
+        reset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recorder_reset_failure_does_not_fail_the_write(self, tmp_config) -> None:
+        # The value is already durable by this point; a flush that raises must not
+        # report the save as failed and send the UI's switch back.
+        with patch("kiro_crew.metrics.provider.shutdown", side_effect=RuntimeError("boom")):
+            async with TestClient(TestServer(_make_app())) as c:
+                assert (await _patch(c, "telemetry.enabled", True)).status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["telemetry"]["enabled"] is True
+
+
+class TestTelemetryEnabledEgressGate:
+    """The switch promises local-only, so it must not reach a state that exports.
+
+    `_build_recorder` attaches an OTLP reader whenever `telemetry.otlp_endpoint` is
+    set, so on a host that configured an endpoint, enabling collection from the
+    dashboard would start network egress under a control whose own description says
+    "Nothing is exported". Enabling is refused there; disabling always composes.
+    """
+
+    def _seed_endpoint(self, cfg_path, endpoint: str) -> None:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        data.setdefault("telemetry", {})["otlp_endpoint"] = endpoint
+        cfg_path.write_text(json.dumps(data), encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_enable_is_refused_when_an_endpoint_is_configured(self, tmp_config) -> None:
+        self._seed_endpoint(tmp_config, "http://otel.internal:4318/v1/metrics")
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "telemetry.enabled", True)
+            assert resp.status == 409
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["telemetry"].get("enabled") is not True
+
+    @pytest.mark.asyncio
+    async def test_disable_is_still_allowed_when_an_endpoint_is_configured(
+        self, tmp_config
+    ) -> None:
+        # Tightening always composes — refusing it would strand a user who wants
+        # collection off on exactly the host where it also exports.
+        self._seed_endpoint(tmp_config, "http://otel.internal:4318/v1/metrics")
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "telemetry.enabled", False)).status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["telemetry"]["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_blank_endpoint_does_not_block_enabling(self, tmp_config) -> None:
+        self._seed_endpoint(tmp_config, "   ")
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "telemetry.enabled", True)).status == 200
+
+    @pytest.mark.asyncio
+    async def test_refused_enable_does_not_touch_the_recorder(self, tmp_config) -> None:
+        self._seed_endpoint(tmp_config, "http://otel.internal:4318/v1/metrics")
+        with patch("kiro_crew.metrics.provider.shutdown") as reset:
+            async with TestClient(TestServer(_make_app())) as c:
+                assert (await _patch(c, "telemetry.enabled", True)).status == 409
+        reset.assert_not_called()
+
+
+# ── Update-nudge snooze/skip (dashboard.update_nudge) ────────────────────
+
+
+class TestUpdateNudgeKeys:
+    """The proactive update popup's per-version snooze/skip persistence.
+
+    ONE atomic dict write: the three fields form a single verdict, so
+    per-field writes would open both a crash window (an old verdict paired
+    with a new version) and a two-client interleave assembling a verdict
+    nobody expressed. The strict dict spec (all keys required, no extras,
+    per-key scalar validation) is what keeps this from becoming a generic
+    JSON passthrough.
+    """
+
+    _REC = {"version": "0.5.0", "snoozed_until": 1756000000.0, "skipped": True}
+
+    @pytest.mark.asyncio
+    async def test_full_record_round_trips_atomically(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "dashboard.update_nudge", self._REC)).status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["dashboard"]["update_nudge"] == self._REC
+
+    @pytest.mark.asyncio
+    async def test_non_object_rejected(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "dashboard.update_nudge", "0.5.0")).status == 400
+
+    @pytest.mark.asyncio
+    async def test_missing_key_rejected(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            rec = {"version": "0.5.0", "skipped": True}
+            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
+
+    @pytest.mark.asyncio
+    async def test_unknown_key_rejected(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            rec = {**self._REC, "extra": 1}
+            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
+
+    @pytest.mark.asyncio
+    async def test_version_overlong_rejected(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            rec = {**self._REC, "version": "x" * 129}
+            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
+
+    @pytest.mark.asyncio
+    async def test_negative_snooze_rejected(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            rec = {**self._REC, "snoozed_until": -1.0}
+            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
+
+    @pytest.mark.asyncio
+    async def test_bool_snooze_rejected(self, tmp_config) -> None:
+        # bool is an int subclass; a bare float() coercion would store 1.0.
+        async with TestClient(TestServer(_make_app())) as c:
+            rec = {**self._REC, "snoozed_until": True}
+            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400
+
+    @pytest.mark.asyncio
+    async def test_skipped_wrong_type_rejected(self, tmp_config) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            rec = {**self._REC, "skipped": "yes"}
+            assert (await _patch(c, "dashboard.update_nudge", rec)).status == 400

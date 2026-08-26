@@ -26,12 +26,14 @@ export type LazyComponent = React.LazyExoticComponent<ComponentType<Record<strin
 export const BUILTIN_COMPONENT_REGISTRY: Record<string, LazyComponent> = {
   '/worlds': lazy(() => import('../pages/WorldsPage')),
   '/channels': lazy(() => import('../pages/ChannelPage')),
+  '/auto-improvement': lazy(() => import('./auto-improvement/AutoImprovementPage')),
   '/auto-research': lazy(() => import('./auto-research/ResearchLabPage')),
   '/file-explorer': lazy(() => import('./file-explorer/FileExplorerPage')),
   '/code-review-sage': lazy(() => import('./code-review-sage/CodeReviewSagePage')),
   '/workflows': lazy(() => import('./workflows/WorkflowsPage')),
   '/dev-fleet': lazy(() => import('../pages/DevFleetPage')),
   '/issue-radar': lazy(() => import('./issue-radar/IssueRadarPage')),
+  '/auto-triage-pipeline': lazy(() => import('./auto-triage-pipeline/AutoTriagePipelinePage')),
   '/meetings': lazy(() => import('./meetings/MeetingsPage')),
   '/papyrus': lazy(() => import('./papyrus/PapyrusPage')),
   '/pptx-maker': lazy(() => import('./pptx-maker/PptxMakerPage')),
@@ -42,6 +44,8 @@ export const BUILTIN_COMPONENT_REGISTRY: Record<string, LazyComponent> = {
   '/md-notebook': lazy(() => import('./md-notebook/MdNotebookPage')),
   '/mochi': lazy(() => import('./mochi/MochiPage')),
   '/spec-builder': lazy(() => import('./spec-builder/SpecBuilderPage')),
+  '/personal-shopper': lazy(() => import('./personal-shopper/PersonalShopperPage')),
+  '/design-tweak': lazy(() => import('./design-tweak/DesignTweakPage')),
 }
 
 /**

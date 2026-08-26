@@ -1,7 +1,7 @@
 /**
  * /notifications scroll contract, per viewport.
  *
- * Desktop height-locks the master/detail split (`overflow-hidden` container,
+ * Desktop height-locks the primary/detail split (`overflow-hidden` container,
  * `flex-1 min-h-0` split) so feed and detail scroll as independent panes. On
  * mobile the split collapses to one column and the stat grid stacks several
  * rows tall, so the same lock pins the feed and detail to whatever sliver is
@@ -101,18 +101,59 @@ describe('NotificationsPage scroll containers', () => {
     expect(splitRow().className).not.toContain('min-h-0')
   })
 
-  it('mobile detail: natural-height card, so a long body scrolls with the page', () => {
+  it('mobile detail: natural-height card with a sticky Back row above it', () => {
     mobile = true
     const store = createTestStore(stateWith([note]))
     renderWithProviders(<NotificationsPage />, { store })
 
     fireEvent.click(screen.getByRole('button', { name: 'Open notification: Cron Result' }))
 
-    // The feed row also carries the body text (hidden, still in the DOM), so
-    // anchor on the detail card's Back button instead.
-    const card = screen.getByRole('button', { name: 'Back' }).closest('.card-glow') as HTMLElement
-    expect(card).not.toBeNull()
+    // The Back row lives OUTSIDE the Card (.card-glow is overflow-hidden,
+    // which disables sticky within) and sticks to the page scroll container
+    // so a long body always keeps an exit in view.
+    const backRow = screen.getByRole('button', { name: 'Back' }).parentElement as HTMLElement
+    expect(backRow.className).toContain('sticky')
+    expect(backRow.className).toContain('top-0')
+    expect(backRow.closest('.card-glow')).toBeNull()
+
+    // The detail card itself takes natural height so the body scrolls with
+    // the page instead of inner-scrolling a clipped pane.
+    const card = backRow.nextElementSibling as HTMLElement
+    expect(card.className).toContain('card-glow')
     expect(card.className).not.toContain('h-full')
     expect(card.className).not.toContain('min-h-0')
+  })
+
+  it('mobile: opens the detail at the top and restores the feed offset on Back', () => {
+    // Feed and detail share ONE scroll container on mobile; without explicit
+    // management the feed's large scrollTop clamps to the shorter detail's
+    // bottom (user lands at the end, Back off-screen) and the feed position
+    // is lost on return. happy-dom does no layout but scrollTop is a plain
+    // settable property, so the capture/reset/restore contract is assertable.
+    mobile = true
+    const store = createTestStore(stateWith([note]))
+    renderWithProviders(<NotificationsPage />, { store })
+
+    const container = contentContainer()
+    container.scrollTop = 1234 // user is deep in the feed
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open notification: Cron Result' }))
+    expect(container.scrollTop).toBe(0) // detail opens at the top
+
+    container.scrollTop = 555 // user reads down the detail
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    expect(container.scrollTop).toBe(1234) // feed position restored
+  })
+
+  it('desktop: selection does not touch the container scroll position', () => {
+    // Desktop panes scroll independently; the mobile-only management must not
+    // reach in and reset them.
+    const store = createTestStore(stateWith([note]))
+    renderWithProviders(<NotificationsPage />, { store })
+
+    const container = contentContainer()
+    container.scrollTop = 42
+    fireEvent.click(screen.getByRole('button', { name: 'Open notification: Cron Result' }))
+    expect(container.scrollTop).toBe(42)
   })
 })

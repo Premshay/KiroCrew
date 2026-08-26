@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
-import { usePanelTabs, __resetPanelTabs } from '../hooks/usePanelTabs'
+import { usePanelTabs, openPanelView, __resetPanelTabs } from '../hooks/usePanelTabs'
 
 // The panel-tab store is module-level + localStorage-persisted (so the
 // strip survives ChatPage route unmounts and reloads). Reset it before each
@@ -72,6 +72,79 @@ describe('usePanelTabs', () => {
     act(() => result.current.openFile('/src/pages/ChatPage.tsx', 'body-2', 'slot-a'))
     expect(result.current.tabs).toHaveLength(1)
     expect(result.current.activeTab?.content).toBe('body-2')
+  })
+
+  it('re-opening a file with unsaved edits focuses it and keeps the edited buffer', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openFile('/notes.md', 'on-disk', 'slot-a'))
+    // The user types into the editor (MarkdownPanel patches content per edit).
+    act(() => result.current.patchTab('file:/notes.md', { content: 'user edits' }))
+    // Something re-opens the same path — another chip, the Files tab row.
+    act(() => result.current.openFile('/notes.md', 'on-disk'))
+    expect(result.current.tabs).toHaveLength(1)
+    expect(result.current.activeId).toBe('file:/notes.md')
+    // The buffer survives; the on-disk bytes do not revert it silently.
+    expect(result.current.activeTab?.content).toBe('user edits')
+    expect(result.current.activeTab?.savedContent).toBe('on-disk')
+  })
+
+  it('re-opening a clean file refreshes it from disk', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openFile('/notes.md', 'version-1'))
+    act(() => result.current.openFile('/notes.md', 'version-2'))
+    expect(result.current.activeTab?.content).toBe('version-2')
+    expect(result.current.activeTab?.savedContent).toBe('version-2')
+  })
+
+  it('a completed save re-arms the baseline so later opens refresh again', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openFile('/notes.md', 'v1'))
+    act(() => result.current.patchTab('file:/notes.md', { content: 'typed' }))
+    // The save handler stamps the written bytes as the new baseline.
+    act(() => result.current.patchTab('file:/notes.md', { savedContent: 'typed' }))
+    // Buffer matches baseline now: an external change may flow in.
+    act(() => result.current.openFile('/notes.md', 'external-edit'))
+    expect(result.current.activeTab?.content).toBe('external-edit')
+  })
+
+  it('a buffered tab with no baseline yet is treated as dirty, not reverted', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openFile('/notes.md', 'v1'))
+    // Simulate a legacy/restored tab whose baseline was never established.
+    act(() => result.current.patchTab('file:/notes.md', { savedContent: undefined }))
+    act(() => result.current.openFile('/notes.md', 'v2'))
+    expect(result.current.activeTab?.content).toBe('v1')
+  })
+
+  it('a disk-originated refresh restamps the baseline so later opens refresh', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openFile('/notes.md', 'v1'))
+    // What SidePanel's onDiskContent wiring does when the file watch or the
+    // panel's Refresh lands new disk bytes in the buffer.
+    act(() => result.current.patchTab('file:/notes.md', { content: 'disk-new', savedContent: 'disk-new' }))
+    act(() => result.current.openFile('/notes.md', 'disk-newer'))
+    expect(result.current.activeTab?.content).toBe('disk-newer')
+  })
+
+  it('persists metadata only: the saved baseline never reaches localStorage', () => {
+    // savedContent mirrors a file body ("can be MBs"), so persisting it would
+    // defeat the same quota protection that strips content itself.
+    vi.useFakeTimers()
+    try {
+      const { result } = renderHook(() => usePanelTabs())
+      act(() => result.current.openFile('/big.md', 'body'))
+      act(() => result.current.patchTab('file:/big.md', { content: 'edited' }))
+      act(() => { vi.advanceTimersByTime(500) })
+      const raw = localStorage.getItem('mc-panel-tabs:__no_slot__')
+      expect(raw).toBeTruthy()
+      const bucket = JSON.parse(raw!)
+      const tab = bucket.tabs.find((t: { id: string }) => t.id === 'file:/big.md')
+      expect(tab.content).toBeUndefined()
+      expect(tab.savedContent).toBeUndefined()
+      expect(tab.path).toBe('/big.md')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('openFile with replaceId swaps the new tab into the replaced tab\'s strip position', () => {
@@ -320,7 +393,7 @@ describe('usePanelTabs — per-slot isolation', () => {
     const { result } = renderHook(() => usePanelTabs())
     act(() => result.current.openView('logs'))
     act(() => result.current.syncPinned(['files', 'changes']))
-    // Pinned views are ordered per PINNED_VIEWS (changes, files, artifacts),
+    // Pinned views are ordered per PINNED_VIEWS (changes, artifacts, files),
     // always ahead of dynamic tabs.
     expect(result.current.tabs.map(t => t.id)).toEqual(['changes', 'files', 'logs'])
   })
@@ -345,5 +418,60 @@ describe('usePanelTabs — per-slot isolation', () => {
     // Emptying content removes only the pinned view; dynamic tabs untouched.
     act(() => result.current.syncPinned([]))
     expect(result.current.tabs.map(t => t.id)).toEqual(['logs', 'side'])
+  })
+
+  it('openView("git") creates a singleton tab titled "Git"', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openView('git'))
+    expect(result.current.tabs).toHaveLength(1)
+    expect(result.current.activeTab).toMatchObject({
+      id: 'git', kind: 'git', title: 'Git',
+    })
+    // Reopen: no duplicate, still one tab.
+    act(() => result.current.openView('git'))
+    expect(result.current.tabs).toHaveLength(1)
+    expect(result.current.activeId).toBe('git')
+  })
+
+  it('git view is closable (not a pinned view)', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openView('git'))
+    act(() => result.current.closeTab('git'))
+    expect(result.current.tabs).toHaveLength(0)
+    expect(result.current.activeId).toBeNull()
+  })
+})
+
+/* ── openPanelView: address a strip by slot, with no hook binding ──────────
+ * A sidebar chip switches sessions and opens a panel view in ONE gesture, so at
+ * call time the mounted `usePanelTabs` is still bound to the chat being LEFT.
+ * These pin that the slot argument — not the binding — decides the strip. */
+describe('openPanelView', () => {
+  it('opens the view on the NAMED slot, not the one the hook is bound to', () => {
+    const { result, rerender } = renderHook(({ slot }: { slot: string | null }) => usePanelTabs(slot), {
+      initialProps: { slot: 'chat-a' as string | null },
+    })
+    // Bound to A; ask for B. This is the sidebar's exact situation.
+    act(() => openPanelView('chat-b', 'changes'))
+    expect(result.current.tabs).toEqual([])
+
+    rerender({ slot: 'chat-b' })
+    expect(result.current.tabs.map(t => t.id)).toEqual(['changes'])
+    expect(result.current.activeId).toBe('changes')
+  })
+
+  it('focuses an existing view instead of duplicating it', () => {
+    const { result } = renderHook(() => usePanelTabs('chat-a'))
+    act(() => result.current.openView('files'))
+    act(() => openPanelView('chat-a', 'issues'))
+    act(() => openPanelView('chat-a', 'files'))
+    expect(result.current.tabs.map(t => t.id)).toEqual(['files', 'issues'])
+    expect(result.current.activeId).toBe('files')
+  })
+
+  it('routes a null slot to the same fallback bucket the hook uses', () => {
+    const { result } = renderHook(() => usePanelTabs(null))
+    act(() => openPanelView(null, 'issues'))
+    expect(result.current.tabs.map(t => t.id)).toEqual(['issues'])
   })
 })

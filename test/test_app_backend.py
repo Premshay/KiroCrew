@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew.apps.backend import (
     AppProcess,
     PortUnavailableError,
@@ -159,11 +160,16 @@ def app_env(tmp_path, monkeypatch, worker_id):
 
 
 class TestPortAllocation:
-    def test_find_free_port(self):
-        port = _find_free_port()
-        assert 9100 <= port <= 9200
+    def test_find_free_port(self, app_env):
+        import kiro_crew.apps.backend as bmod
 
-    def test_concurrent_allocation_never_hands_out_the_same_port(self, monkeypatch):
+        port = _find_free_port()
+        # Bounds read off the module, not the 9100/9200 literals: ``app_env`` gives
+        # each xdist worker a DISJOINT window, so a hardcoded range would fail on
+        # every worker but gw0.
+        assert bmod._MIN_PORT <= port <= bmod._MAX_PORT
+
+    def test_concurrent_allocation_never_hands_out_the_same_port(self, app_env, monkeypatch):
         """Parallel boot spawns must not collide on one auto-allocated port.
 
         Boot starts app backends concurrently, so two apps can select a port at
@@ -410,6 +416,14 @@ def _slow_never_owns(port, pid):
     return False
 
 
+def _frozen_spawn_time() -> SimpleNamespace:
+    """Keep poll-count scenarios independent of host wall-clock scheduling."""
+    return SimpleNamespace(
+        monotonic=lambda: 0.0,
+        sleep=lambda _seconds: None,
+    )
+
+
 class TestBootSpawnLatency:
     def test_survival_check_exits_early_for_a_healthy_child(self, monkeypatch):
         """A living child must not cost the full survival window.
@@ -449,7 +463,9 @@ class TestBootSpawnLatency:
         """
         import kiro_crew.apps.backend as bmod
 
-        monkeypatch.setattr(bmod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(bmod, "time", _frozen_spawn_time())
+        monkeypatch.setattr(bmod.platform_compat, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(bmod, "_port_is_listening", lambda port: True)
         monkeypatch.setattr(bmod, "_spawn_owns_listener", lambda port, pid: False)
 
         class _DiesLate:
@@ -474,8 +490,10 @@ class TestBootSpawnLatency:
         """
         import kiro_crew.apps.backend as bmod
 
-        monkeypatch.setattr(bmod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(bmod, "time", _frozen_spawn_time())
         # Something is listening, but it is not our child (nor its descendant).
+        monkeypatch.setattr(bmod.platform_compat, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(bmod, "_port_is_listening", lambda port: True)
         monkeypatch.setattr(bmod, "_listening_pids", lambda port: [99999])
         monkeypatch.setattr(bmod, "_pid_is_self_or_descendant_of", lambda pid, ancestor: False)
 
@@ -500,20 +518,29 @@ class TestBootSpawnLatency:
         """
         import kiro_crew.apps.backend as bmod
 
-        monkeypatch.setattr(bmod.time, "sleep", lambda s: None)
+        monkeypatch.setattr(bmod, "time", _frozen_spawn_time())
+        monkeypatch.setattr(bmod.platform_compat, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(bmod, "_port_is_listening", lambda port: True)
         monkeypatch.setattr(bmod, "_listening_pids", lambda port: [4243])
         monkeypatch.setattr(
-            bmod, "_pid_is_self_or_descendant_of",
+            bmod,
+            "_pid_is_self_or_descendant_of",
             lambda pid, ancestor: pid == 4243 and ancestor == 4242,
         )
 
-        class _Alive:
+        class _DiesAfterBind:
             pid = 4242
 
-            def poll(self) -> None:
-                return None
+            def __init__(self) -> None:
+                self.calls = 0
 
-        assert bmod._survived_spawn(_Alive(), 9100) is True
+            def poll(self):
+                self.calls += 1
+                return None if self.calls == 1 else 1
+
+        proc = _DiesAfterBind()
+        assert bmod._survived_spawn(proc, 9100) is True
+        assert proc.calls == 1
 
     def test_failure_path_never_exceeds_the_original_budget(self):
         """The ownership probe must not stretch the wait it is embedded in.
@@ -743,6 +770,7 @@ class TestBackendLifecycle:
         result = start_app_backend("bad-entry")
         assert result is None
 
+    @requires_symlinks
     def test_backend_entrypoint_escapes_app_root(self, tmp_path, app_env, caplog):
         # The boot path (start_installed_backends) spawns persisted manifests
         # WITHOUT re-running validate(), so a manifest whose backend.entryPoint
@@ -1392,3 +1420,55 @@ class TestHealthGatedMcpRegistration:
         finally:
             with bmod._lock:
                 bmod._processes.clear()
+
+
+# =============================================================================
+# KIROCREW_DEVFLEET_REPO forwarding (silent-empty-fleet fix)
+# =============================================================================
+
+
+def test_devfleet_repo_survives_the_app_backend_env_allowlist(monkeypatch):
+    """The documented dev-fleet repo override must be ABLE to reach the backend.
+
+    The dev-fleet backend runs as a separate process started with
+    ``apps.registry.minimal_env()``, which passes only a fixed safe-key set.
+    ``KIROCREW_DEVFLEET_REPO`` is dev-fleet's highest-priority repo discovery
+    hint, but until it is added to the explicit platform extras the allowlist
+    strips it — the operator sets the documented override, the backend never
+    sees it, and the fleet silently renders empty (the remaining hints are
+    ``KIROCREW_PROJECT_DIR``, which packaged installs point at the app bundle
+    with no ``.git``, and a hardcoded ``~/kirocrew`` fallback).
+    """
+    from pathlib import Path
+
+    import kiro_crew.apps.backend as bmod
+    from kiro_crew.apps.registry import minimal_env
+
+    monkeypatch.setenv("KIROCREW_DEVFLEET_REPO", "/opt/checkouts/kirocrew")
+    # The generic allowlist does NOT carry it — that is the trap this guards.
+    assert "KIROCREW_DEVFLEET_REPO" not in minimal_env()
+
+    # apps/backend.py must therefore add it to the explicit platform extras
+    # (same mechanism that carries KIROCREW_PROJECT_DIR and the
+    # KIROCREW_DEVFLEET_BIN_* trusted-binary overrides).
+    body = Path(bmod.__file__).read_text()
+    assert '_platform_extra["KIROCREW_DEVFLEET_REPO"]' in body, \
+        "the KIROCREW_DEVFLEET_REPO override no longer reaches app backends"
+
+
+def test_devfleet_repo_env_wins_repo_discovery(monkeypatch, tmp_path):
+    """dev-fleet honors the forwarded override ahead of every other hint."""
+    from kiro_crew.apps.builtins.dev_fleet import server as dfmod
+
+    proj = tmp_path / "proj"
+    (proj / ".git").mkdir(parents=True)
+    (proj / "src" / "kiro_crew").mkdir(parents=True)
+    (proj / "pyproject.toml").write_text("[project]\nname = 'kiro-crew'\n")
+    monkeypatch.setenv("KIROCREW_DEVFLEET_REPO", "/opt/checkouts/kirocrew")
+    monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
+    assert dfmod._default_main_repo() == "/opt/checkouts/kirocrew"
+
+    # Without the override the chain falls through to PROJECT_DIR, which is
+    # adopted only because it carries the Kiro Crew checkout markers.
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO")
+    assert dfmod._default_main_repo() == str(proj)

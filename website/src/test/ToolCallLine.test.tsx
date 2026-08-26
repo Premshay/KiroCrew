@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { screen, fireEvent, waitFor } from '@testing-library/react'
+import { screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
 import ToolCallLine from '../pages/chat/ToolCallLine'
-import { resolveByApprovalId } from '../store/chatSlice'
+import { resolveByApprovalId, sseToolResult } from '../store/chatSlice'
 import type { RootState } from '../store'
 import type { ChatMessage } from '../types'
 
@@ -69,6 +69,19 @@ describe('ToolCallLine simplifiedToolNames', () => {
 })
 
 describe('ToolCallLine inline expansion', () => {
+  it('shows an indeterminate activity status for a running shell tool', () => {
+    const store = createTestStore({
+      chat: {
+        messages: [toolMsg()],
+        toolLog: [{ type: 'tool', text: 'echo hello', tool_call_id: 'tc_1', is_shell: true, ts: 1 }],
+        slotRunning: true,
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<ToolCallLine message={toolMsg()} running />, { store })
+    expect(screen.getByText(/Running ·/)).toBeTruthy()
+    expect(screen.getByLabelText('Show details for tool: Running: echo hello')).toBeTruthy()
+  })
+
   it('starts collapsed and expands on click, defaulting to Output section', () => {
     const store = createTestStore({
       chat: {
@@ -104,24 +117,23 @@ describe('ToolCallLine inline expansion', () => {
     expect(screen.getByText('only-output')).toBeTruthy()
   })
 
-  it('renders both segments with the missing one disabled', () => {
+  it('labels the one available section instead of offering a dead segment', () => {
     const store = createTestStore({
       chat: {
         messages: [toolMsg()],
-        // Output present, no input → Input segment should be disabled, Output active.
+        // Output present, no input → nothing to switch between, so the control
+        // is a label naming what is on screen, not a two-segment capsule with
+        // one segment greyed out.
         toolLog: [{ type: 'tool', text: 'echo hello', purpose: 'Say hello', tool_call_id: 'tc_1', output: 'only-output', ts: 1 }],
         slotRunning: false,
       } as unknown as ChatState,
     })
     renderWithProviders(<ToolCallLine message={toolMsg()} running={false} />, { store })
     fireEvent.click(screen.getByRole('button', { name: /Show details/i }))
-    const inputBtn = screen.getByRole('button', { name: 'Input' })
-    const outputBtn = screen.getByRole('button', { name: 'Output' })
-    expect(inputBtn.hasAttribute('disabled')).toBe(true)
-    expect(outputBtn.hasAttribute('disabled')).toBe(false)
-    expect(inputBtn.getAttribute('title')).toBe('Input not yet available')
-    // Clicking the disabled Input segment must not flip the panel
-    fireEvent.click(inputBtn)
+    expect(screen.queryByRole('button', { name: 'Input' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Output' })).toBeNull()
+    // The section is still named, so the user knows which half they are reading.
+    expect(screen.getByText('Output')).toBeTruthy()
     expect(screen.getByText('only-output')).toBeTruthy()
   })
 
@@ -394,6 +406,92 @@ describe('ToolCallLine entrance reveal', () => {
   })
 })
 
+/** The transcript is pinned to the bottom and the virtualizer's pin is instant,
+ *  so an un-animated mount/unmount moves everything above the row in a single
+ *  frame. Both the row's first appearance and its status line's removal
+ *  therefore ease their own HEIGHT — the pin then spreads over those frames and
+ *  reads as a slide. */
+describe('ToolCallLine row slide', () => {
+  it('keeps the shell status line mounted while it collapses, then drops it', async () => {
+    const msg = toolMsg({ meta: { tool_call_id: 'tc_slide_exit' } })
+    const store = createTestStore({
+      chat: {
+        activeSlot: 'S',
+        messages: [msg],
+        toolLog: [{ type: 'tool', text: 'echo hello', tool_call_id: 'tc_slide_exit', is_shell: true, ts: 1 }],
+        slotRunning: true,
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<ToolCallLine message={msg} running />, { store })
+    expect(screen.getByText(/Running ·/)).toBeTruthy()
+
+    // The tool result lands — the status line no longer applies.
+    act(() => {
+      store.dispatch(sseToolResult({ slot: 'S', output: 'hello', tool_call_id: 'tc_slide_exit' }))
+    })
+    // Still in the DOM on the commit that hid it: it is easing its height to
+    // zero, not vanishing in one frame (which is what jumped the rows above).
+    expect(screen.getByText(/Running ·/)).toBeTruthy()
+    // …and gone once the collapse finishes.
+    await waitFor(() => expect(screen.queryByText(/Running ·/)).toBeNull())
+  })
+
+  it('grows a first-appearance row from zero height and releases it afterwards', async () => {
+    const msg = toolMsg({ meta: { tool_call_id: 'tc_slide_enter' } })
+    const store = createTestStore({
+      chat: {
+        messages: [msg],
+        toolLog: [{ type: 'tool', text: 'echo hello', tool_call_id: 'tc_slide_enter', output: 'hello', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    const first = renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
+    const row = first.container.firstElementChild as HTMLElement
+    expect(row.style.height).toBe('0px')
+    expect(row.style.overflow).toBe('hidden')
+    // Released when the grow ends, so anything that grows later (details panel,
+    // MCP app iframe) is neither clipped nor pinned to the entrance height. Both
+    // values are polled together because they are cleared by different owners —
+    // framer's own final commit and the release effect — and can land a tick
+    // apart. The released height is asserted as "not a pixel height" rather than
+    // a literal: a real browser settles on `auto`, happy-dom on empty, and
+    // either is the row sizing itself again.
+    await waitFor(() => {
+      expect(row.style.height).not.toMatch(/px$/)
+      expect(row.style.overflow).not.toBe('hidden')
+    })
+    first.unmount()
+
+    // A remount is not a first appearance (turn promotion, virtualizer
+    // recycling): replaying the grow there would slide every previously-shown
+    // row again whenever the turn advances.
+    const second = renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
+    const again = second.container.firstElementChild as HTMLElement
+    expect(again.style.height).not.toMatch(/px$/)
+    expect(again.style.overflow).not.toBe('hidden')
+  })
+
+  it('never grows a row with no stable id, which the reveal set cannot remember', () => {
+    // Pre-persistence historical row: no tool_call_id on the meta and no
+    // toolLog entry to resolve one from. `revealedToolIds` has nothing to key
+    // on, so its one-shot guard is permanently open — and the virtualizer
+    // remounts a row every time it re-enters the mounted window, which would
+    // replay the grow and shift layout under a reader scrolling through
+    // history. The fade still replays there (opacity moves nothing); the height
+    // must not.
+    const msg = toolMsg({ meta: {} })
+    const store = createTestStore({
+      chat: { messages: [msg], toolLog: [], slotRunning: false } as unknown as ChatState,
+    })
+    const { container } = renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
+    const row = container.firstElementChild as HTMLElement
+    expect(row.style.height).not.toMatch(/px$/)
+    expect(row.style.overflow).not.toBe('hidden')
+    // The fade is unchanged — this test pins the height, not the entrance fade.
+    expect(row.className).toContain('ft-block-reveal')
+  })
+})
+
 /** The pill's LABEL is prose with the odd argument spliced in ("Searching for
  *  'YOLO' in src"), so it must follow the user's Font Family choice
  *  (`--font-body`). Tailwind's `font-mono` resolves to `var(--mono)`, a token
@@ -487,7 +585,7 @@ describe('ToolCallLine auto-denied detection', () => {
   // the visible 🔧 pill's tool_call_id when a security-policy deny rule or
   // hook blocks a call. The pill must find that sibling and render amber
   // (warn) instead of the green success state.
-  it('renders warn tone and a standard blocked message when a 🚫 sibling shares the tool_call_id', () => {
+  it('renders warn tone and the deny reason when a 🚫 sibling shares the tool_call_id', () => {
     const pill = toolMsg({ meta: { tool_call_id: 'tc_deny' } })
     const denySibling: ChatMessage = {
       role: 'tool',
@@ -506,11 +604,20 @@ describe('ToolCallLine auto-denied detection', () => {
     // Amber slash icon, not the green success dot
     expect(container.querySelector('.text-warn')).toBeTruthy()
     expect(container.querySelector('.text-ok')).toBeFalsy()
-    // Expanded output shows the standard blocked message — the 🚫 sibling's
-    // content is a redacted title (often just "shell"), not a usable reason —
-    // and never kiro-cli's misleading boilerplate.
+    // The expanded output names WHICH rule fired, taken from the 🚫 sibling's
+    // content — a bare "blocked" line leaves the user unable to tell a policy
+    // deny from any other failure. kiro-cli's misleading boilerplate ("User
+    // denied tool execution", which attributes a host decision to the person)
+    // must never surface.
     fireEvent.click(screen.getByRole('button', { name: /show details/i }))
-    expect(screen.getByText('Blocked by security policy')).toBeTruthy()
+    // The rule is named, WITHOUT the English wire marker: the localized sentence
+    // leads, so repeating "Blocked by security policy:" would hand a non-English
+    // reader untranslated text in front of their own.
+    expect(screen.getByText(/deny rule/)).toBeTruthy()
+    expect(screen.queryByText(/Blocked by security policy:/)).toBeFalsy()
+    // The localized lead is present, so the reader is told what happened in their
+    // own language even when the detail is a raw pattern.
+    expect(screen.getByText(/blocked the call|blocked by security policy/i)).toBeTruthy()
     expect(screen.queryByText('User denied tool execution')).toBeFalsy()
   })
 
@@ -551,5 +658,30 @@ describe('ToolCallLine auto-denied detection', () => {
     const { container } = renderWithProviders(<ToolCallLine message={pill} running={false} />, { store })
     expect(container.querySelector('.text-danger')).toBeTruthy()
     expect(container.querySelector('.text-warn')).toBeFalsy()
+  })
+})
+
+describe('ToolCallLine elapsed timer survives remount', () => {
+  it('shows elapsed time anchored to the tool log timestamp, not mount time', () => {
+    // Simulate a tool that started 30 seconds ago
+    const startTs = Date.now() - 30_000
+    const store = createTestStore({
+      chat: {
+        messages: [toolMsg()],
+        toolLog: [{ type: 'tool', text: 'echo hello', tool_call_id: 'tc_1', is_shell: true, ts: startTs }],
+        slotRunning: true,
+      } as unknown as ChatState,
+    })
+    const { unmount } = renderWithProviders(<ToolCallLine message={toolMsg()} running />, { store })
+    // Should show ~30s, not 0s — proving the timer uses the persisted ts
+    const statusText = screen.getByText(/Running ·/)
+    expect(statusText.textContent).toMatch(/30|29|31/)
+
+    // Unmount and remount (simulates navigating away and back)
+    unmount()
+    renderWithProviders(<ToolCallLine message={toolMsg()} running />, { store })
+    const afterRemount = screen.getByText(/Running ·/)
+    // Still shows ~30s, NOT reset to 0s
+    expect(afterRemount.textContent).toMatch(/30|29|31/)
   })
 })

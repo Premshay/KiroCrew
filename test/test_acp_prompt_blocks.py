@@ -11,9 +11,12 @@ from __future__ import annotations
 import base64
 import io
 import os
+import random
+from pathlib import Path
 
 import pytest
 
+from kiro_crew import hooks
 from kiro_crew.acp import prompt_blocks
 from kiro_crew.acp.prompt_blocks import (
     _POSIX_PATH_RE,
@@ -100,8 +103,15 @@ class TestBuildPromptBlocks:
 
     @pytest.mark.parametrize("suffix,mime", sorted(IMAGE_MEDIA_TYPES.items()))
     def test_every_supported_suffix_maps_to_its_mime(self, tmp_path, suffix, mime):
+        # Fixtures are format-faithful (real bytes per format, not one PNG
+        # renamed): the emitted mimeType tracks the header-DETECTED format,
+        # because the backend validates the bytes, not the file extension.
+        pil = pytest.importorskip("PIL.Image")
+        fmt = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG",
+               ".gif": "GIF", ".webp": "WEBP", ".bmp": "BMP"}[suffix]
         p = tmp_path / f"img{suffix}"
-        p.write_bytes(_PNG)
+        mode = "P" if fmt == "GIF" else "RGB"
+        pil.new(mode, (2, 2)).save(p, format=fmt)
         blocks = build_prompt_blocks(f"see {p}")
         assert blocks[1]["mimeType"] == mime
 
@@ -200,14 +210,111 @@ class TestPlatformPathGrammar:
             r"C:\Users\alice\AppData\Local\Temp\tmpabc.png",
             r"C:/Users/alice/AppData/Local/Temp/tmpabc.png",
             r"\\fileserver\team\diagram.jpg",
+            "//fileserver/team/diagram.jpg",
         ],
     )
     def test_windows_pattern_matches_native_absolute_paths(self, text):
-        """The shapes the gateway actually produces on Windows."""
+        """The shapes the gateway actually produces on Windows.
+
+        The forward-slash UNC form is what the dashboard composer serializes
+        into message text (a markdown destination cannot carry raw
+        backslashes), and Windows file APIs accept it verbatim.
+        """
         assert prompt_blocks._WINDOWS_PATH_RE.search(text) is not None
+
+    def test_windows_pattern_extracts_dashboard_unc_image_markdown(self):
+        """A UNC upload serialized by the dashboard must yield the usable path.
+
+        This is the sender-side wire form for a roaming-profile upload: the
+        composer emits ``![image](//host/share/...)``. The extracted group must
+        be the path itself (openable via ``open()`` on Windows), not a mangled
+        span, or the agent silently receives no image block.
+        """
+        text = "![image](//fileserver/home/me/.kiro/crew/uploads/shot.png)"
+        m = prompt_blocks._WINDOWS_PATH_RE.search(text)
+        assert m is not None
+        assert m.group(1) == "//fileserver/home/me/.kiro/crew/uploads/shot.png"
+
+    def test_windows_pattern_ignores_urls(self):
+        """``//`` acceptance must not make ``https://host/x.png`` a candidate."""
+        assert prompt_blocks._WINDOWS_PATH_RE.search("see https://example.com/docs/logo.png") is None
+        assert prompt_blocks._WINDOWS_PATH_RE.search("see http://host/a.png here") is None
 
     def test_windows_pattern_requires_an_absolute_path(self):
         assert prompt_blocks._WINDOWS_PATH_RE.search(r"shots\logo.png") is None
+
+
+class TestUncProbeGate:
+    """UNC-shaped candidates must never reach the filesystem un-gated.
+
+    ``Path.is_file()`` on a UNC path makes Windows open an SMB connection to
+    the named host, so untrusted message text (``\\\\evil\\share\\x.png`` or
+    ``//evil/share/x.png``) would trigger an outbound credential probe. Only
+    UNC paths under the gateway's own attachment roots may be probed.
+    """
+
+    @pytest.mark.parametrize(
+        "raw,want",
+        [
+            (r"\\host\share\x.png", True),
+            ("//host/share/x.png", True),
+            (r"C:\Users\me\x.png", False),
+            ("C:/Users/me/x.png", False),
+            ("/tmp/x.png", False),
+        ],
+    )
+    def test_unc_shape_detection(self, raw, want):
+        assert hooks.is_unc_shape(raw) is want
+
+    def test_attacker_host_is_refused(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.data_home", lambda: tmp_path / "home"
+        )
+        assert hooks.unc_probe_allowed(r"\\evil\share\x.png") is False
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+
+    def test_unc_under_a_unc_data_home_is_allowed(self, monkeypatch):
+        """Roaming profile: the data home ITSELF is a UNC share."""
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.data_home",
+            lambda: Path(r"\\fileserver\home\me\.kiro\crew"),
+        )
+        allowed = hooks.unc_probe_allowed(
+            r"\\fileserver\home\me\.kiro\crew\uploads\shot.png"
+        )
+        forward = hooks.unc_probe_allowed(
+            "//fileserver/home/me/.kiro/crew/uploads/shot.png"
+        )
+        # normcase/normpath only fold separators and case on Windows, so the
+        # cross-separator equivalence holds there; on POSIX the gate is never
+        # consulted (the probe loop is os.name == "nt" scoped).
+        if os.name == "nt":
+            assert allowed is True
+            assert forward is True
+
+    def test_sibling_share_on_same_server_is_refused(self, monkeypatch):
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.data_home",
+            lambda: Path(r"\\fileserver\home\me\.kiro\crew"),
+        )
+        if os.name == "nt":
+            assert hooks.unc_probe_allowed(r"\\fileserver\other\x.png") is False
+
+    def test_untrusted_unc_text_is_never_stat_probed_on_windows(self, monkeypatch):
+        """End-to-end: build_prompt_blocks must not touch the filesystem for a
+        refused UNC candidate."""
+        if os.name != "nt":
+            pytest.skip("probe loop is Windows-scoped")
+        probed: list[str] = []
+        real_is_file = Path.is_file
+
+        def spy(self):  # type: ignore[no-untyped-def]
+            probed.append(str(self))
+            return real_is_file(self)
+
+        monkeypatch.setattr(Path, "is_file", spy)
+        prompt_blocks.build_prompt_blocks(r"look at \\evil\share\x.png please")
+        assert not any("evil" in p for p in probed)
 
     def test_active_pattern_follows_the_host(self):
         expected = (
@@ -398,3 +505,87 @@ class TestImageDownscale:
             assert 0x0112 not in out.getexif()  # tag baked away, not carried
             assert h > w  # rotation applied to the pixels -> portrait
             assert max(w, h) <= MAX_IMAGE_EDGE_PX
+
+
+def _noise_image(tmp_path, w, h, name="noise.png", fmt="PNG"):
+    """An image that resists compression, so its encoded size tracks pixel count.
+
+    Built from one bytes buffer rather than a list of per-pixel tuples: at
+    2400x2400 that list is 5.76M three-tuples, ~390 MiB of transient peak for a
+    17 MB image, and it was the largest single-test excursion in the suite. A
+    worker's high-water mark is what the memory budget has to reserve for, so a
+    spike nobody sees still costs every other worker headroom.
+    """
+    pil = pytest.importorskip("PIL.Image")
+    rnd = random.Random(1234)
+    img = pil.frombytes("RGB", (w, h), rnd.randbytes(w * h * 3))
+    p = tmp_path / name
+    img.save(p, format=fmt)
+    return p
+
+
+class TestImageEncodedBudget:
+    """The per-image ENCODED byte ceiling.
+
+    The dimension cap alone is not enough: Bedrock rejects a single image over
+    5 MiB base64, and a raster can sit well inside 2000px while encoding past
+    that. A rejected image is replayed from history every later turn, so letting
+    one through wedges the whole session.
+    """
+
+    def test_default_cap_is_5_mib(self):
+        assert prompt_blocks.MAX_IMAGE_B64_BYTES == 5 * 1024 * 1024
+
+    def test_b64_len_matches_real_encoding(self):
+        from kiro_crew.imaging import _b64_len
+
+        for n in (0, 1, 2, 3, 4, 100, 1023, 4096):
+            assert _b64_len(n) == len(base64.b64encode(b"x" * n))
+
+    def test_image_inside_dimension_cap_but_over_budget_is_shrunk(self, tmp_path):
+        """The exact production defect: dimensions are already legal, so the
+        dimension pass is a no-op, yet the payload still exceeds the wire limit.
+        """
+        p = _noise_image(tmp_path, 900, 900)
+        budget = len(base64.b64encode(p.read_bytes())) // 3
+        blocks = build_prompt_blocks(f"see {p}", max_image_b64_bytes=budget)
+        assert [b["type"] for b in blocks] == ["text", "image"]
+        assert len(blocks[1]["data"]) <= budget
+        # Shrunk, not passed through: the bug was inlining the original here.
+        assert base64.b64decode(blocks[1]["data"]) != p.read_bytes()
+        assert max(_decoded_size(blocks[1])) < 900
+
+    def test_image_within_budget_is_byte_identical(self, tmp_path):
+        p = _sized_image(tmp_path, 100, 80)
+        original = p.read_bytes()
+        blocks = build_prompt_blocks(f"see {p}")
+        assert base64.b64decode(blocks[1]["data"]) == original
+
+    def test_unshrinkable_image_falls_back_to_a_path(self, tmp_path):
+        """Fail CLOSED: a budget no rendition can meet must leave the path as
+        text rather than inline a payload the backend will reject forever."""
+        p = _noise_image(tmp_path, 400, 400)
+        blocks = build_prompt_blocks(f"see {p}", max_image_b64_bytes=8)
+        assert [b["type"] for b in blocks] == ["text"]
+        assert str(p) in blocks[0]["text"]
+
+    def test_zero_budget_disables_the_check(self, tmp_path):
+        p = _noise_image(tmp_path, 120, 120)
+        original = p.read_bytes()
+        blocks = build_prompt_blocks(f"see {p}", max_image_b64_bytes=0)
+        assert base64.b64decode(blocks[1]["data"]) == original
+
+    def test_budget_applies_after_the_dimension_cap(self, tmp_path):
+        """Both caps hold at once -- shrinking for bytes must not reintroduce an
+        over-dimension rendition, and vice versa."""
+        p = _noise_image(tmp_path, 2400, 2400, name="big.jpg", fmt="JPEG")
+        blocks = build_prompt_blocks(f"see {p}", max_image_b64_bytes=400_000)
+        assert max(_decoded_size(blocks[1])) <= MAX_IMAGE_EDGE_PX
+        assert len(blocks[1]["data"]) <= 400_000
+
+    def test_shrink_floor_is_respected(self, tmp_path):
+        """The loop never grinds an image below the usable-accuracy floor; it
+        gives up and hands back a path instead."""
+        p = _noise_image(tmp_path, 1000, 1000)
+        blocks = build_prompt_blocks(f"see {p}", max_image_b64_bytes=64)
+        assert [b["type"] for b in blocks] == ["text"]

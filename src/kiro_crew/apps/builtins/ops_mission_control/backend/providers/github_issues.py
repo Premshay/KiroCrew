@@ -38,6 +38,7 @@ from kiro_crew.apps.builtins.ops_mission_control.backend.providers.base import (
     ActionResult,
     TruncatedSignals,
 )
+from kiro_crew.platform_compat import kill_and_reap
 from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
 
 logger = logging.getLogger(__name__)
@@ -65,8 +66,8 @@ async def _run_gh(args: list[str]) -> tuple[int, str, str]:
 
     Routed through ``sandboxed_spawn_argv`` (OS filesystem isolation +
     credential-scrubbed environment) and given a kernel resource ceiling via
-    ``resource_limit_preexec``, because the repo, label set, and comment body all
-    come from config an agent can influence — and ``gh`` reads the repo's own
+    ``create_subprocess_limited``, because the repo, label set, and comment body
+    all come from config an agent can influence — and ``gh`` reads the repo's own
     config on the way. This is the chokepoint ``test/test_spawn_audit.py``
     requires every agent-influenced spawn to use.
 
@@ -90,8 +91,7 @@ async def _run_gh(args: list[str]) -> tuple[int, str, str]:
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_GH_TIMEOUT_SECS)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await kill_and_reap(proc)
             return 1, "", f"gh timed out after {_GH_TIMEOUT_SECS:.0f}s"
         return (
             proc.returncode or 0,

@@ -102,30 +102,36 @@ export function LogViewer({ compact }: { compact?: boolean }) {
     : { btn: 'px-3.5 py-[5px] text-[13px]', input: 'px-3 py-1.5 text-[13px]', row: 'text-[13px]', gap: 'gap-1.5 mb-3', label: 'text-[13px]' }
 
   return (
-    <div className={`flex-1 flex flex-col min-h-0 ${compact ? '' : 'px-6 pb-8'}`}>
+    <div className={`flex-1 flex flex-col min-h-0 ${compact ? '' : 'px-4 md:px-6 pb-8'}`}>
       <div className={`flex ${sz.gap} flex-wrap items-center`}>
         <span className={`${sz.label} text-muted mr-1`}>{i18nT('pages.logsPage.log_level')}</span>
         {LEVELS.map(l => (
           <button key={l} className={`${sz.btn} rounded-full font-medium font-body cursor-pointer border transition-all ${levelBg(l, currentLevel === l)}`} onClick={() => changeLevel(l)}>{l.charAt(0) + l.slice(1).toLowerCase()}</button>
         ))}
       </div>
-      <div className={`flex gap-2 ${compact ? 'mb-2' : 'mb-3'} items-center`}>
+      {/* `flex-wrap` for the same reason the level row above it carries one: the
+          three trailing toggles are `whitespace-nowrap` and the filter field is
+          `flex-1`, so at 390px the row needs 154px more than it has. Nothing here
+          scrolls, so without wrapping `Wrap` sits 74px past the right edge and
+          `Tail` 154px past it — off-screen and untappable, which is a WCAG 1.4.10
+          Reflow failure rather than a cosmetic one. */}
+      <div className={`flex gap-2 flex-wrap ${compact ? 'mb-2' : 'mb-3'} items-center`}>
         <input type="text" aria-label={i18nT('pages.logsPage.filter_logs')} placeholder={i18nT('pages.logsPage.filter_logs_2')} value={search}
           onChange={e => { const v = e.target.value; setSearch(v); if (!v) setMatchesOnly(false) }}
-          className={`flex-1 ${sz.input} rounded-lg border border-border bg-surface text-text font-mono placeholder:text-muted focus:outline-none focus:border-accent`}
+          className={`flex-1 ${sz.input} rounded-lg border border-border bg-bg-elevated text-text font-mono placeholder:text-muted focus:outline-none focus-visible:border-accent`}
         />
         {search && (
           <>
-            <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${matchesOnly ? 'bg-surface border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
+            <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${matchesOnly ? 'bg-bg-elevated border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
               onClick={() => setMatchesOnly(p => !p)}>{i18nT('pages.logsPage.matches_only')}</button>
             <span className={`${sz.label} text-muted whitespace-nowrap`}>{matchCount} {i18nT('pages.logsPage.matches')}</span>
           </>
         )}
-        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ml-auto ${newestFirst ? 'bg-surface border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
+        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ml-auto ${newestFirst ? 'bg-bg-elevated border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
           onClick={() => setNewestFirst(p => !p)}>{newestFirst ? i18nT('pages.logsPage.latest_first') : i18nT('pages.logsPage.latest_last')}</button>
-        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${wrapLines ? 'bg-surface border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
+        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${wrapLines ? 'bg-bg-elevated border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
           onClick={() => setWrapLines(p => !p)}>{wrapLines ? i18nT('pages.logsPage.wrap_on') : i18nT('pages.logsPage.wrap_off')}</button>
-        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${autoFollow ? 'bg-surface border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
+        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${autoFollow ? 'bg-bg-elevated border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
           onClick={toggleTail}>{autoFollow ? i18nT('pages.logsPage.tail_on') : i18nT('pages.logsPage.tail_off')}</button>
       </div>
       <div className={`flex-1 flex flex-col min-h-0 ${compact ? 'border border-border rounded-lg overflow-hidden mb-2' : 'card-glow border border-border bg-card rounded-lg p-5 animate-rise shadow-sm transition-all'}`}>
@@ -133,7 +139,7 @@ export function LogViewer({ compact }: { compact?: boolean }) {
           atTopStateChange={setAtTop}
           style={{ flex: 1, minHeight: 0 }}
           itemContent={(_i, l) => (
-            <div data-testid="log-line" className={`font-mono ${sz.row} ${wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'} px-2.5 py-0.5 leading-[1.7] ${l.match ? 'border-l-2 border-accent bg-accent/10' : ''} ${levelColor(l.level)}`}>
+            <div data-testid="log-line" className={`font-mono ${sz.row} ${wrapLines ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'} px-2.5 py-0.5 leading-[1.7] ${l.match ? 'border-l-2 border-accent bg-accent/10' : ''} ${levelColor(l.level)}`}>
               {l.match ? highlight(l.msg) : l.msg}
             </div>
           )}

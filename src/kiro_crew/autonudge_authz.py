@@ -23,9 +23,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
-from kiro_crew.autonudge import is_channel_key
+from kiro_crew.autonudge import NudgeAdmissionRefused, is_channel_key
 from kiro_crew.config.loader import workspace_dir_for
 from kiro_crew.security import (
     is_sensitive_path,
@@ -57,6 +57,13 @@ def resolve_stop_sentinel(slot_key: str, workspace: str = "default") -> str:
     return str(ws_dir / f".stop-{safe_key}")
 
 
+# Wall-clock budget ceiling (7 days), the single authoritative bound. The
+# MONITOR_*_SCHEMA FieldSpecs mirror it for the MCP tools; enforcing it here
+# too covers the REST and workflow paths, which do not pass through those
+# schemas (GPT review on #2116: REST accepted 604801 unchanged).
+MAX_RUNTIME_SECS_CEILING = 604800
+
+
 async def authorize_and_update_nudge(
     *,
     svc: Any,
@@ -65,6 +72,7 @@ async def authorize_and_update_nudge(
     idle_secs: Any = None,
     max_cycles: Any = None,
     active: Any = None,
+    max_runtime_secs: Any = None,
     source: str,
     caller: str = "",
 ) -> tuple[Any | None, str | None, int]:
@@ -126,15 +134,24 @@ async def authorize_and_update_nudge(
         # Reject non-integral values rather than silently truncating: idle_secs
         # 59.9 must not become 59, and `Infinity` (legal JSON in many parsers)
         # raises OverflowError from int(), which would surface as a 500.
-        for _name, _val in (("idle_secs", idle_secs), ("max_cycles", max_cycles)):
+        for _name, _val in (
+            ("idle_secs", idle_secs),
+            ("max_cycles", max_cycles),
+            ("max_runtime_secs", max_runtime_secs),
+        ):
             if _val is None or isinstance(_val, bool):
                 continue
             if isinstance(_val, float) and not _val.is_integer():
                 return _deny(f"{_name} must be a whole number", 400)
         idle_secs = None if idle_secs is None else int(idle_secs)
         max_cycles = None if max_cycles is None else int(max_cycles)
+        max_runtime_secs = None if max_runtime_secs is None else int(max_runtime_secs)
     except (TypeError, ValueError, OverflowError):
-        return _deny("idle_secs and max_cycles must be integers", 400)
+        return _deny("idle_secs, max_cycles and max_runtime_secs must be integers", 400)
+    if max_runtime_secs is not None and not (0 <= max_runtime_secs <= MAX_RUNTIME_SECS_CEILING):
+        return _deny(
+            f"max_runtime_secs must be between 0 and {MAX_RUNTIME_SECS_CEILING} (7 days)", 400
+        )
     # ``active`` must be a real boolean. bool("false") is True, so accepting a
     # JSON string would turn an explicit pause request into a RESUME — the
     # opposite of what the caller asked for on a loop that runs tools
@@ -157,6 +174,7 @@ async def authorize_and_update_nudge(
                         ("message", message),
                         ("idle_secs", idle_secs),
                         ("max_cycles", max_cycles),
+                        ("max_runtime_secs", max_runtime_secs),
                         ("active", active),
                     )
                     if v is not None
@@ -177,6 +195,7 @@ async def authorize_and_update_nudge(
             idle_secs=idle_secs,
             max_cycles=max_cycles,
             active=active,
+            max_runtime_secs=max_runtime_secs,
         )
     except Exception as exc:  # noqa: BLE001 - audit the failure, then propagate
         _audit("error", f"svc.update failed: {type(exc).__name__}")
@@ -196,6 +215,7 @@ async def authorize_and_add_nudge(
     idle_secs: int = 60,
     max_cycles: int = 0,
     stop_sentinel_path: str = "",
+    max_runtime_secs: int = 0,
     source: str,
     caller: str = "",
 ) -> tuple[Any | None, str | None, int]:
@@ -244,6 +264,7 @@ async def authorize_and_add_nudge(
                     "slot_key": slot_key,
                     "idle_secs": idle_secs,
                     "max_cycles": max_cycles,
+                    "max_runtime_secs": max_runtime_secs,
                     "caller": caller,
                 },
             )
@@ -259,13 +280,30 @@ async def authorize_and_add_nudge(
         return None, "auto-nudge disabled (KIROCREW_AUTONUDGE not set)", 503
     if not slot_key or not message:
         return _deny("session_key (or slot_key) and message required", 400)
+    try:
+        _budget = int(max_runtime_secs)
+    except (TypeError, ValueError, OverflowError):
+        return _deny("max_runtime_secs must be an integer", 400)
+    if not (0 <= _budget <= MAX_RUNTIME_SECS_CEILING):
+        return _deny(
+            f"max_runtime_secs must be between 0 and {MAX_RUNTIME_SECS_CEILING} (7 days)", 400
+        )
+    admission_check: Callable[[], bool]
     if is_channel_key(slot_key):
         # Channel-bound loop (Slack / Discord ...). Validate the session is
         # routable so a nudge fired later has somewhere to reply.
         if slot_key.startswith("slack:"):
             sessions = getattr(state, "sessions", None)
-            if sessions is None or not sessions.get_channel(slot_key):
+            if sessions is None:
                 return _deny(f"unknown slack session {slot_key}", 404)
+            channel = sessions.get_channel(slot_key)
+            if channel is None:
+                return _deny(f"unknown slack session {slot_key}", 404)
+
+            def _slack_admission() -> bool:
+                return sessions.get_channel(slot_key) is channel
+
+            admission_check = _slack_admission
         elif slot_key.startswith("discord:"):
             # Deny-by-default (mirrors the Discord inbound allowlist): only DM
             # sessions of ALLOWLISTED users, and only the user's CURRENT
@@ -289,10 +327,70 @@ async def authorize_and_add_nudge(
                 current_key = ""
             if slot_key != current_key:
                 return _deny("discord session key does not match the user's current session", 404)
+            authorized_transport = transport
+            authorized_dispatcher = dispatcher
+
+            def _discord_admission() -> bool:
+                try:
+                    return (
+                        (getattr(state, "channel_transports", None) or {}).get("discord")
+                        is authorized_transport
+                        and authorized_dispatcher.is_authorized(user_id)
+                        and authorized_dispatcher.current_session_key(user_id) == slot_key
+                    )
+                except Exception:
+                    return False
+
+            admission_check = _discord_admission
+        elif slot_key.startswith("webex:"):
+            # Deny-by-default, mirroring the Discord branch and for the same
+            # reason: an authenticated caller must not be able to mint a loop that
+            # DMs an arbitrary Webex user through the agent. DM sessions of
+            # allow-listed people only, and only the user's CURRENT key exactly as
+            # the dispatcher derives it.
+            transports = getattr(state, "channel_transports", None) or {}
+            transport = transports.get("webex")
+            dispatcher = transport.dispatcher if transport is not None else None
+            if transport is None or dispatcher is None:
+                return _deny("webex transport not running", 404)
+            parts = slot_key.split(":")
+            if len(parts) < 4 or parts[2] != "direct":
+                return _deny(f"unsupported webex session {slot_key} (DM sessions only)", 400)
+            email = parts[3]
+            if not transport.is_authorized(email):
+                return _deny("webex user is not in the allowed_emails allowlist", 403)
+            try:
+                current_key = dispatcher.current_session_key(email)
+            except Exception:
+                current_key = ""
+            if slot_key != current_key:
+                return _deny("webex session key does not match the user's current session", 404)
+            authorized_transport = transport
+            authorized_dispatcher = dispatcher
+
+            def _webex_admission() -> bool:
+                try:
+                    return (
+                        (getattr(state, "channel_transports", None) or {}).get("webex")
+                        is authorized_transport
+                        and authorized_transport.is_authorized(email)
+                        and authorized_dispatcher.current_session_key(email) == slot_key
+                    )
+                except Exception:
+                    return False
+
+            admission_check = _webex_admission
         else:
             return _deny(f"unsupported channel session {slot_key}", 400)
-    elif slot_key not in state._slots:
-        return _deny(f"unknown slot {slot_key}", 404)
+    else:
+        if slot_key not in state._slots:
+            return _deny(f"unknown slot {slot_key}", 404)
+        authorized_slot = state._slots.get(slot_key)
+
+        def _dashboard_admission() -> bool:
+            return slot_key in state._slots and state._slots.get(slot_key) is authorized_slot
+
+        admission_check = _dashboard_admission
     if len(message) > 8000:
         return _deny("message too long (max 8000 chars)", 400)
     stop_sentinel_path = (stop_sentinel_path or "").strip()
@@ -337,6 +435,7 @@ async def authorize_and_add_nudge(
                 "slot_key": slot_key,
                 "idle_secs": int(idle_secs),
                 "max_cycles": int(max_cycles),
+                "max_runtime_secs": int(max_runtime_secs),
                 "caller": caller,
             },
         )
@@ -353,7 +452,11 @@ async def authorize_and_add_nudge(
             idle_secs=int(idle_secs),
             max_cycles=int(max_cycles),
             stop_sentinel_path=stop_sentinel_path,
+            max_runtime_secs=int(max_runtime_secs),
+            admission_check=admission_check,
         )
+    except NudgeAdmissionRefused:
+        return _deny("session changed before nudge arm committed", 409)
     except Exception as exc:  # noqa: BLE001 - audit the failure, then propagate
         _audit("error", f"svc.add failed: {type(exc).__name__}")
         raise
@@ -371,6 +474,7 @@ async def authorize_and_add_nudge(
             },
         )
     except Exception:  # noqa: BLE001 - armed loop already covered by ``invoked``
-        logger.warning("autonudge success audit failed (invoked event covers the arm)",
-                       exc_info=True)
+        logger.warning(
+            "autonudge success audit failed (invoked event covers the arm)", exc_info=True
+        )
     return loop, None, 200

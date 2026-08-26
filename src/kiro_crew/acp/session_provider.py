@@ -28,12 +28,15 @@ from kiro_crew.acp.client import (
     AcpError,
     AcpModelUnavailable,
     AcpProcessDied,
+    acp_config_option_values,
     advertised_model_ids,
     model_is_unusable,
 )
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead, AcpRuntimeError, AcpSessionHandle
-from kiro_crew.acp.types import STOP_REASON_END_TURN
+from kiro_crew.acp.session_handle import WatchdogSettings
+from kiro_crew.acp.types import ACP_BACKENDS_KIRO_IDENTITY_STORE, STOP_REASON_END_TURN
 from kiro_crew.config.paths import kiro_sessions_dir
+from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.mcp_gateway.claim import schedule_claim
 from kiro_crew.providers.base import CancelOutcome, LLMEvent, LLMProvider
 
@@ -154,6 +157,16 @@ class AcpSessionProvider(LLMProvider):
         except Exception:  # pragma: no cover - handle types without the attr
             logger.debug("set_keep_transcript: handle rejected attribute", exc_info=True)
 
+    @property
+    def child_fidelity_aware(self) -> bool:
+        """See AcpSessionHandle.child_fidelity_aware."""
+        return getattr(self._handle, "child_fidelity_aware", False)
+
+    @child_fidelity_aware.setter
+    def child_fidelity_aware(self, value: bool) -> None:
+        if hasattr(self._handle, "child_fidelity_aware"):
+            self._handle.child_fidelity_aware = value
+
     async def shutdown(self) -> None:
         """Destroy the session and optionally kill the runtime.
 
@@ -163,7 +176,7 @@ class AcpSessionProvider(LLMProvider):
         """
         if self._owns_runtime:
             try:
-                await self._runtime.kill()
+                await self._runtime.kill(expected=True)  # deliberate session teardown
             except Exception:
                 logger.debug("AcpSessionProvider.shutdown: runtime kill failed", exc_info=True)
         else:
@@ -177,17 +190,35 @@ class AcpSessionProvider(LLMProvider):
             # prompt on that sessionId with "already in progress". So cancel the
             # session's turn first (best-effort, bounded so an unresponsive
             # runtime can't turn shutdown into a hang), then destroy the handle.
-            if self._handle.is_turn_active:
-                try:
-                    await asyncio.wait_for(self._handle.cancel(), timeout=5.0)
-                except Exception:
-                    logger.debug(
-                        "AcpSessionProvider.shutdown: session cancel failed", exc_info=True
-                    )
+            # The destroy is in a `finally` because the cancel above can be
+            # left through a door `except Exception` does not cover:
+            # `asyncio.CancelledError` is a `BaseException`. That is not a
+            # theoretical exit — the session-restart path runs
+            # `asyncio.wait_for(p.shutdown(), timeout=_SHUTDOWN_TIMEOUT_SECS)`
+            # inside an `asyncio.gather`, so both a shutdown that outruns the
+            # budget and a cancelled restart task deliver a cancellation into
+            # this coroutine, at whatever await it is sitting on.
+            #
+            # Sequentially, that skipped the destroy entirely — and the destroy
+            # is where this arm's two invariants live: `terminate_session`
+            # evicts the session from the SHARED kiro-cli process (it is the
+            # only RSS reclaim on a runtime nothing here is allowed to kill),
+            # and the transcript unlink is the only thing that removes
+            # `~/.kiro/sessions/cli/{sid}.json(+.jsonl)`, as the comment below
+            # says. Nothing retries: every caller drops the provider afterwards.
             try:
-                await self._handle.destroy()
-            except Exception:
-                logger.debug("AcpSessionProvider.shutdown: destroy failed", exc_info=True)
+                if self._handle.is_turn_active:
+                    try:
+                        await asyncio.wait_for(self._handle.cancel(), timeout=5.0)
+                    except Exception:
+                        logger.debug(
+                            "AcpSessionProvider.shutdown: session cancel failed", exc_info=True
+                        )
+            finally:
+                try:
+                    await self._handle.destroy()
+                except Exception:
+                    logger.debug("AcpSessionProvider.shutdown: destroy failed", exc_info=True)
             # destroy() deletes the shared-subagent session transcript
             # (~/.kiro/sessions/cli/{sid}.json+.jsonl); no separate cleanup call
             # needed. cleanup_session() below remains for the LLMProvider API.
@@ -241,14 +272,34 @@ class AcpSessionProvider(LLMProvider):
         return await self._guarded(self._handle.steer(message))
 
     @property
+    def last_steer_monotonic(self) -> float:
+        """Monotonic time of the handle's last steer (0.0 if never steered)."""
+        return float(getattr(self._handle, "last_steer_monotonic", 0.0) or 0.0)
+
+    @property
     def supports_steer(self) -> bool:
         """True when the backing handle supports mid-turn steer (kiro-cli)."""
         return self._handle.supports_steer
 
     async def stream_command(self, command: str) -> AsyncIterator[LLMEvent]:
-        """Execute a slash command via prompt (kiro handles commands in-prompt)."""
-        async for event in self.stream(command):
-            yield event
+        """Execute a slash command natively via ``_kiro.dev/commands/execute``.
+
+        Routes through AcpSessionHandle.stream_command so kiro-cli executes the
+        command itself and returns its structured output deterministically —
+        no LLM round-trip. (Previously delegated to stream(), which sent the
+        command through session/prompt: a full model turn that summarized the
+        output instead of returning it.) The handle keeps /compact, /help, and
+        non-kiro backends (KAS) on the prompt transport — see its docstring.
+        Same exception translation as stream(): everything leaving this
+        surface stays within AcpError.
+        """
+        try:
+            async for event in self._handle.stream_command(command):
+                yield event
+        except AcpRuntimeDead as exc:
+            raise self._translate_dead(exc) from exc
+        except AcpRuntimeError as exc:
+            raise AcpError(str(exc)) from exc
 
     def _translate_dead(self, exc: AcpRuntimeDead) -> AcpProcessDied | AcpAuthRequired:
         """Map a shared-runtime death (AcpRuntimeDead — an AcpRuntimeError OUTSIDE
@@ -307,6 +358,11 @@ class AcpSessionProvider(LLMProvider):
         """Return last known context usage percentage."""
         return self._handle.last_prompt_stats.context_pct
 
+    def context_usage_unknown(self) -> bool:
+        """True when the 0% reading is a post-compaction unknown, not an empty
+        transcript."""
+        return self._handle.last_prompt_stats.context_pct_unknown
+
     def context_window_tokens(self) -> int:
         """Return the context window size in tokens."""
         return self._handle.last_prompt_stats.context_window_tokens
@@ -338,16 +394,37 @@ class AcpSessionProvider(LLMProvider):
         """Refresh activity timestamp on the runtime."""
         self._runtime._last_activity = time.monotonic()
 
-    def rekey(self, session_key: str, channel_id: str | None = None) -> None:
+    def rekey(
+        self,
+        session_key: str,
+        channel_id: str | None = None,
+        crew_agent: str = "",
+        watchdog: WatchdogSettings | None = None,
+    ) -> None:
         """Re-key for a different session on warm-pool claim (parity with
         AcpClient.rekey). session.py:1309 calls provider.client.rekey(...); when
         the pooled provider is kiro-shared, provider.client is THIS class, so a
         missing rekey() would AttributeError on claim. Stores the correlation
         keys and refreshes runtime activity so the just-claimed process is not
-        idle-reaped."""
+        idle-reaped.
+
+        ``crew_agent`` is the claiming session's canonical crew identity: the
+        pooled runtime was spawned before any crew claimed it, so both the
+        runtime default (future sessions, e.g. new_conversation) and the live
+        handle's watchdog snapshot are rebound here — the identity travels
+        with the session, not the pool key. Empty means "no crew" and rebinds
+        to the globals, so a recycled runtime never carries a previous crew's
+        windows. ``watchdog`` is the pre-resolved snapshot from the async
+        caller (resolved off-loop); None makes rebind load it synchronously."""
         self._session_key = session_key
         self._channel_id = channel_id
+        self._runtime._crew_agent = crew_agent
+        self._handle.rebind_watchdog(crew_agent, settings=watchdog)
         self._runtime._last_activity = time.monotonic()
+        # Parity with AcpClient.rekey: the handle's prompt stats describe the
+        # session this runtime served BEFORE the handoff; leaking them lets
+        # check_context_usage() compact the new, empty session (#2932).
+        self._handle.last_prompt_stats.reset_context_state()
         # Claim-push: re-target every MCP stub connection under the shared
         # runtime's PID to the claiming session (see AcpClient.rekey for the
         # rationale). Fire-and-forget; no-ops without a gateway socket.
@@ -379,8 +456,27 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def backend(self) -> str:
-        """ACP backend identifier. Always empty string for kiro-cli."""
-        return ""
+        """ACP backend identifier, delegated to the runtime that serves it.
+
+        Not a constant: this provider fronts whichever backend ``AcpRuntime``
+        spawned, and it replaces the placeholder ``AcpClient`` on
+        ``AcpProvider._client`` once startup completes — so it is the only
+        remaining place a consumer can read the backend back off a started
+        provider. Reporting kiro unconditionally would persist every KAS
+        session under the kiro label.
+        """
+        return self._runtime.acp_backend
+
+    @property
+    def uses_kiro_identity_store(self) -> bool:
+        """True when this provider's child signs in from kiro-cli's own store.
+
+        Membership in ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` (harness-parity
+        H5/H14), read off the runtime's backend for the same reason
+        :attr:`backend` is: this provider fronts whichever backend the runtime
+        spawned.
+        """
+        return self._runtime.acp_backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
 
     def has_active_turn(self) -> bool:
         """True if a prompt turn is currently in progress.
@@ -467,7 +563,9 @@ class AcpSessionProvider(LLMProvider):
         """Trigger context compaction."""
         await self._guarded(self._handle.compact(context))
 
-    async def wait_for_compaction(self, timeout: float = 120.0) -> dict[str, str]:
+    async def wait_for_compaction(
+        self, timeout: float = COMPACT_WAIT_TIMEOUT_SECS
+    ) -> dict[str, str]:
         """Wait for compaction completed/failed event."""
         return await self._guarded(self._handle.wait_for_compaction(timeout))
 
@@ -490,7 +588,8 @@ class AcpSessionProvider(LLMProvider):
         error instead of recovering with a session reset — a reset here would
         destroy the live conversation and still land on a different model.
         """
-        advertised = advertised_model_ids(self._handle.available_models)
+        advertised = acp_config_option_values(self.acp_config_options, "model")
+        advertised.extend(advertised_model_ids(self._handle.available_models))
         if model_is_unusable(model_id, advertised):
             raise AcpModelUnavailable(model_id, advertised)
         await self._guarded(self._handle.set_model(model_id))
@@ -510,6 +609,17 @@ class AcpSessionProvider(LLMProvider):
     def _model(self, value: str) -> None:
         """Set model name (AcpClient-compatible attribute)."""
         self._handle._model = value
+
+    @property
+    def served_model(self) -> str:
+        """Backend-resolved model id serving this session (``""`` until known).
+
+        Public delegation to :attr:`AcpSessionHandle.served_model` — covers
+        both the explicit ``set_model`` path and the backend-default path
+        (``currentModelId``), unlike ``_model`` which only reflects the
+        former.
+        """
+        return self._handle.served_model
 
     @property
     def _session_id(self) -> str:
@@ -546,6 +656,10 @@ class AcpSessionProvider(LLMProvider):
     def get_valid_effort_levels(self) -> list[str]:
         """Valid effort levels from config options."""
         return self._handle.get_valid_effort_levels()
+
+    def effort_config_option_id(self) -> str | None:
+        """ACP id used to change reasoning effort on this backend."""
+        return self._handle.effort_config_option_id()
 
     def supports_config_option(self, config_id: str) -> bool:
         """Whether the session advertised a config option with this id."""

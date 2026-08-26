@@ -14,6 +14,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import secrets
 import tempfile
 import time
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 
 from aiohttp import web
 
+from kiro_crew import aws_consent
 from kiro_crew.config.loader import config_path
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -28,9 +30,11 @@ from kiro_crew.slack.handler import _vc
 from kiro_crew.voice_reply import (
     DEFAULT_POCKET_VOICE,
     PROVIDER_PIPER,
+    PROVIDER_POLLY,
     PROVIDER_POCKET,
     VALID_ENGINES,
     VALID_PROVIDERS,
+    resolve_polly_cli,
     stitch_mp3s,
     stream_pocket_speech,
     streaming_voice_reply,
@@ -102,11 +106,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
     # ``in VALID_PROVIDERS`` would raise TypeError on an unhashable JSON value
     # (list/dict), 500ing the PUT — require a str first.
     selected_provider = None
-    if (
-        "provider" in body
-        and isinstance(body["provider"], str)
-        and body["provider"] in VALID_PROVIDERS
-    ):
+    if "provider" in body and isinstance(body["provider"], str) and body["provider"] in VALID_PROVIDERS:
         selected_provider = body["provider"]
         _vc.provider = selected_provider
         if selected_provider == PROVIDER_POCKET and "voice" not in body:
@@ -267,7 +267,9 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
             "voice_error",
             {"slot": slot_key, "error": err_msg},
         )
-        return web.json_response({"ok": False, "error": err_msg}, status=500)
+        return web.json_response(
+            {"ok": False, "error": err_msg}, status=500
+        )
     finally:
         if final_path:
             with contextlib.suppress(OSError):
@@ -277,11 +279,69 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
                 os.unlink(p)
 
 
+async def _synthesize_nonstreaming(
+    state: DashboardState, text: str, slot_key: str
+) -> web.Response:
+    """Synthesize one clip via the provider-aware ``synthesize_speech`` and emit
+    it as a single ``voice_chunk`` + ``voice_complete``.
+
+    Used for providers (Piper) that produce a single local file rather than the
+    sentence-chunked Polly SSML stream. The audio is delivered whole; the
+    dashboard player already handles a single-chunk reply.
+    """
+    audio_path: str | None = None
+    try:
+        audio_path = await synthesize_speech(
+            text,
+            provider=_vc.provider,
+            piper_binary=_vc.piper_binary,
+            piper_model=_vc.piper_model,
+            piper_model_config=_vc.piper_model_config,
+            length_scale=_vc.piper_length_scale,
+        )
+        if not audio_path:
+            msg = "Piper TTS unavailable — check the piper binary and model path in Voice settings."
+            state.broadcast_ws("voice_error", {"slot": slot_key, "error": msg})
+            return web.json_response({"ok": False, "error": msg}, status=502)
+        with open(audio_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode()
+        audio_mime = "audio/wav" if audio_path.lower().endswith(".wav") else "audio/mpeg"
+        state.broadcast_ws(
+            "voice_chunk",
+            {
+                "slot": slot_key,
+                "index": 0,
+                "sentence": text,
+                "audio": audio_b64,
+                "audioMime": audio_mime,
+            },
+        )
+        state.broadcast_ws(
+            "voice_complete",
+            {"slot": slot_key, "audio": audio_b64, "chunks": 1, "audioMime": audio_mime},
+        )
+        return web.json_response({"ok": True, "chunks": 1})
+    except Exception as exc:
+        logger.exception("Piper voice synthesis failed")
+        err_msg, _ = redact_exfiltration_urls(str(exc))
+        err_msg, _ = redact_credentials(err_msg)
+        state.broadcast_ws("voice_error", {"slot": slot_key, "error": err_msg})
+        return web.json_response({"ok": False, "error": err_msg}, status=500)
+    finally:
+        if audio_path:
+            with contextlib.suppress(OSError):
+                os.unlink(audio_path)
+
+
 async def api_voice_replay(request: web.Request) -> web.Response:
     """Create a one-time Pocket replay URL, or select the legacy path."""
     try:
         body = await request.json()
-    except Exception:
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response(
+            {"code": "voice_replay_invalid_json", "error": "invalid JSON"}, status=400
+        )
+    if not isinstance(body, dict):
         return web.json_response(
             {"code": "voice_replay_invalid_json", "error": "invalid JSON"}, status=400
         )
@@ -292,6 +352,7 @@ async def api_voice_replay(request: web.Request) -> web.Response:
         )
     if _vc.provider != PROVIDER_POCKET:
         return web.json_response({"mode": "legacy"})
+
     text, _ = redact_exfiltration_urls(text)
     text, _ = redact_credentials(text)
     now = time.monotonic()
@@ -345,6 +406,7 @@ async def api_voice_replay_stream(request: web.Request) -> web.StreamResponse:
         return web.json_response(
             {"code": "voice_replay_unavailable", "error": "voice replay is unavailable"}, status=502
         )
+
     response = web.StreamResponse(
         status=200,
         headers={"Content-Type": "audio/ogg; codecs=opus", "Cache-Control": "no-store"},
@@ -358,63 +420,11 @@ async def api_voice_replay_stream(request: web.Request) -> web.StreamResponse:
     except ConnectionError:
         logger.debug("Pocket replay client disconnected")
     except Exception:
-        logger.exception("Pocket replay stream failed")
+        logger.exception("Pocket replay stream failed after response started")
     finally:
         with contextlib.suppress(Exception):
             await stream.aclose()
     return response
-
-
-async def _synthesize_nonstreaming(state: DashboardState, text: str, slot_key: str) -> web.Response:
-    """Synthesize one clip via the provider-aware ``synthesize_speech`` and emit
-    it as a single ``voice_chunk`` + ``voice_complete``.
-
-    Used for providers (Piper) that produce a single local file rather than the
-    sentence-chunked Polly SSML stream. The audio is delivered whole; the
-    dashboard player already handles a single-chunk reply.
-    """
-    audio_path: str | None = None
-    try:
-        audio_path = await synthesize_speech(
-            text,
-            provider=_vc.provider,
-            piper_binary=_vc.piper_binary,
-            piper_model=_vc.piper_model,
-            piper_model_config=_vc.piper_model_config,
-            length_scale=_vc.piper_length_scale,
-        )
-        if not audio_path:
-            msg = "Local TTS unavailable — check the configured binary and model path in Voice settings."
-            state.broadcast_ws("voice_error", {"slot": slot_key, "error": msg})
-            return web.json_response({"ok": False, "error": msg}, status=502)
-        with open(audio_path, "rb") as f:
-            audio_b64 = base64.b64encode(f.read()).decode()
-        audio_mime = "audio/wav" if audio_path.lower().endswith(".wav") else "audio/mpeg"
-        state.broadcast_ws(
-            "voice_chunk",
-            {
-                "slot": slot_key,
-                "index": 0,
-                "sentence": text,
-                "audio": audio_b64,
-                "audioMime": audio_mime,
-            },
-        )
-        state.broadcast_ws(
-            "voice_complete",
-            {"slot": slot_key, "audio": audio_b64, "chunks": 1, "audioMime": audio_mime},
-        )
-        return web.json_response({"ok": True, "chunks": 1})
-    except Exception as exc:
-        logger.exception("Local voice synthesis failed")
-        err_msg, _ = redact_exfiltration_urls(str(exc))
-        err_msg, _ = redact_credentials(err_msg)
-        state.broadcast_ws("voice_error", {"slot": slot_key, "error": err_msg})
-        return web.json_response({"ok": False, "error": err_msg}, status=500)
-    finally:
-        if audio_path:
-            with contextlib.suppress(OSError):
-                os.unlink(audio_path)
 
 
 # ── Voices list (cached) ──
@@ -432,7 +442,44 @@ async def api_voice_voices(request: web.Request) -> web.Response:
     if _voices_cache is not None and (now - _voices_cache_ts) < _VOICES_CACHE_TTL:
         return web.json_response({"voices": _voices_cache})
 
-    cmd = ["aws", "polly", "describe-voices", "--output", "json"]
+    # The catalogue lives behind a paid provider, so two gates come before the
+    # subprocess. Both used to be absent here: the ONLY thing stopping this
+    # endpoint from calling AWS was the frontend declining to fetch it while
+    # Piper was selected, so any other client — or a direct request — reached
+    # `aws polly describe-voices` against whatever the ambient credential chain
+    # resolved to.
+    #
+    # 1. Not the active provider: a Piper user has no business shipping a
+    #    request to Polly at all.
+    if _vc.provider != PROVIDER_POLLY:
+        return web.json_response({"voices": []})
+    # 2. Polly IS selected but unconfirmed. Same empty list: the operator-facing
+    #    explanation is the consent card's job (it has its own GET carrying the
+    #    reason), so returning a second copy here would be a response field with
+    #    no reader. Routed through ``refuse_and_log`` rather than ``authorize``
+    #    so the denial reaches the tamper-evident audit log like every other
+    #    gated call site -- a denial that only logs is a denial an incident
+    #    review cannot see.
+    if not await aws_consent.refuse_and_log(
+        aws_consent.SERVICE_POLLY, profile=_vc.aws_profile, region=_vc.region
+    ):
+        return web.json_response({"voices": []})
+
+    aws_bin = await asyncio.to_thread(resolve_polly_cli)
+    if aws_bin is None:
+        # Polly voice listing needs the AWS CLI, which is optional (the
+        # default Piper provider works without it). Resolution goes through
+        # the deploy engine's shared well-known-dirs resolver, so a gateway
+        # running under launchd with a minimal PATH still finds a Homebrew /
+        # official-pkg install (#4770). When the CLI genuinely is not
+        # installed, degrade to an empty list instead of a 500 + traceback.
+        # Not cached, so the list recovers as soon as `aws` becomes
+        # resolvable. The probe runs in a thread so a wedged network mount
+        # on PATH cannot stall the event loop.
+        logger.info("aws CLI not resolvable — returning empty voices list")
+        return web.json_response({"voices": []})
+
+    cmd = [aws_bin, "polly", "describe-voices", "--output", "json"]
     if _vc.aws_profile:
         cmd += ["--profile", _vc.aws_profile]
     if _vc.region:
@@ -467,8 +514,23 @@ async def api_voice_voices(request: web.Request) -> web.Response:
     except asyncio.TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
-        await proc.wait()
+        # Reap via communicate(), not wait(): wait_for cancelled the pipe
+        # readers before the kill landed, so a child blocked writing to a
+        # full stderr PIPE is never drained and wait() can hang the request
+        # handler indefinitely (#5975, same class as #5834).
+        await proc.communicate()
         return web.json_response({"error": "timeout"}, status=504)
+    except FileNotFoundError:
+        # Defense-in-depth behind the which() guard above: exec can still
+        # fail with ENOENT — the binary was removed between the check and
+        # the spawn, or `aws` is a script whose interpreter is missing.
+        # Same graceful degrade as the guard, with the exception logged so
+        # the non-PATH causes stay diagnosable.
+        logger.info(
+            "aws CLI could not be executed — returning empty voices list",
+            exc_info=True,
+        )
+        return web.json_response({"voices": []})
     except Exception:
         logger.exception("describe-voices error")
         return web.json_response({"error": "Failed to retrieve voices"}, status=500)

@@ -20,7 +20,8 @@ Three layers sit beneath Kiro Crew, and the distinction matters:
    tool execution (bash, file read/write, grep, glob), MCP server management,
    session persistence, context compaction, and **ACP** (the Agent Client
    Protocol): a JSON-RPC 2.0 stdio interface any orchestrator can drive.
-2. **Agent configs** (JSON under `~/.kiro/agents/`) tell kiro-cli *how* to
+2. **Agent configs** (JSON under `~/.kiro/agents/`, or a project's own
+   `<project>/.kiro/agents/`) tell kiro-cli *how* to
    behave: system prompt, enabled tools, MCP servers. Every agent runs as
    `kiro-cli acp --agent <name>`; the `--agent` flag selects the config, the
    runtime is always kiro-cli. Kiro Crew generates and refreshes its own
@@ -284,9 +285,17 @@ graph TB
   turn that hits it ends with a card naming the limit rather than failing
   silently. The ACP transport carries its own prompt timeout of the same
   magnitude and bounds the turn first.
+- **Tool-approval window**: `agent.tool_approval_timeout_secs` defaults to
+  **600s** (10 min). It must expire *inside* the turn that opened it — otherwise
+  an unanswered prompt is reported as a turn timeout and the real cause is lost —
+  so it is bounded twice: to 60s below the turn ceiling at config load, and at
+  arm time to the budget actually remaining in the running turn. A prompt arming
+  with less than that margin left is declined immediately rather than waiting on
+  a deadline the ceiling would beat. On expiry the tool is declined and a card
+  says the approval went unanswered and to send the message again.
 - **Circuit breaker**: five consecutive failures on one session force a reset.
 - **Auto-compaction** at `session.autocompact_pct` of the context window
-  (default 90%).
+  (default 70%).
 
 ### Lifecycle by caller
 
@@ -430,10 +439,11 @@ Outer to inner:
    default-ON and user-configurable from Settings → Security; the governance
    `commands` scope is the force-pin a user cannot opt out of. Sensitive-path
    blocking (`~/.aws`, `~/.ssh`, the trust-root files) runs here too.
-4. **OS sandbox** (`sandbox.py`). `agent.sandbox` defaults to `off`, deferring to
-   kiro-cli's own internal agent sandbox; `auto` re-enables Kiro Crew's layer
-   (user namespaces on Linux, `sandbox-exec`/Seatbelt on macOS). The two are
-   mutually exclusive on macOS because nested Seatbelt profiles fail with EPERM.
+4. **OS sandbox** (`sandbox.py`). `agent.sandbox` defaults to `auto`, engaging
+   OS-level isolation (user namespaces on Linux, `sandbox-exec`/Seatbelt on
+   macOS). On macOS, when kiro-cli's own internal sandbox is enabled, Kiro Crew
+   delegates to it instead (the two are mutually exclusive because nested
+   Seatbelt profiles fail with EPERM). Set to `off` to skip Kiro Crew's sandbox.
 5. **Output redaction.** Credential shapes (AWS access key IDs, presigned-URL
    credential parameters, and more) are scrubbed before text reaches a user or
    an egress tool.
@@ -461,6 +471,79 @@ the ceiling evaluator, which dispatches by control archetype and is
 scope-name-agnostic (adding a scope is a `SCOPE_CATALOG` data change).
 
 Spec: [`../system-specs/modules/platform-context.md`](../system-specs/modules/platform-context.md).
+
+## The app boundary
+
+Tenet 8 in [`../../TENETS.md`](../../TENETS.md) says everything is an app. This
+section is where that becomes a line you can point at in review.
+
+**The core is the trust boundary plus the state every app shares.** Five things
+live below the line, and they are there for one reason each:
+
+| In the core | Why it cannot be an app |
+|---|---|
+| Sessions and transcripts | Every surface reads the same conversation. Two implementations means two histories. |
+| Memory and lessons | Same argument, across sessions instead of across surfaces. |
+| Approvals and the PreToolUse gate | Its value is being unavoidable. An app-supplied gate is a gate with an off switch. |
+| The governance ceiling | `effective = POLICY ∩ PROFILE`, tightest-wins, and the keystone files the agent cannot write. A replaceable ceiling is not a ceiling. |
+| The event bus and identity | The thing apps agree through. It cannot itself be one of the parties. |
+
+Everything above that line renders or interprets, and is an app: pages, overview
+and summary surfaces, review and triage workflows, editors, panels. When a
+surface up there cannot be built as an app, the missing seam is the bug to file.
+
+**That boundary is enforced against the agent, not against app code.** Every
+control in the table gates the agent's tool-call surface. An app's Python runs in
+the gateway process: `src/kiro_crew/apps/module_loader.py:34-39` states that the
+permission system "does NOT restrict `import`, filesystem, network, or access to
+in-memory credentials. Installing an app is therefore equivalent to granting it
+full gateway-process privileges." So the table says what no app may be *asked* to
+supply, and the mechanism that would stop one supplying it anyway does not exist
+yet — the keystone path list is a mutable module-level list
+(`src/kiro_crew/security.py:4436`), and app admission admits when no policy file
+is present (`src/kiro_crew/apps/admission.py:25-30`). Read the table as the
+intended boundary and
+[`../request-for-change/rfc-app-sandbox-isolation.md`](../request-for-change/rfc-app-sandbox-isolation.md)
+as the work that makes it real.
+
+**Replacement is whole-surface, not per-widget.** An app takes over a named slot
+and owns what appears there. Several apps each contributing a card into one page
+needs layout negotiation between parties who cannot see each other, and produces
+a surface nobody owns. This is what makes the per-job-family overview tractable:
+a team swaps the whole overview, rather than five apps bidding for space inside
+one. The card-composition shape already exists as edition seam 7,
+`registerOverviewStatCards`, and it has no registrants in the stock build.
+
+**The shipped set is a starting opinion.** Built-in apps are curated defaults, so
+users and field engineers pick which surfaces are central to their work. Because
+users take defaults, arguing about the default set is a product argument with a
+small blast radius, which is the point of moving it out of the architecture.
+
+**An app has to be able to do what a built-in page does**, or "make it an app"
+becomes a way to decline a feature while appearing to accept it. Three gaps are
+open against that standard today:
+
+- Apps add, and cannot intervene. `backend.hooks` (`routes`, `on_startup`,
+  `on_shutdown`) and `setup.onEnable` / `onDisable` are the in-gateway entry
+  points, and none of them lets an app take a position in a flow the core owns.
+  `HookManager` is built only from `config.json`'s `hooks` section
+  (`src/kiro_crew/hooks.py:931`) and exposes no registration path.
+- The platform states no version for its own app-facing surface.
+  `minKiroCrewVersion` is a floor an app declares about the gateway, checked at
+  install and update only (`src/kiro_crew/apps/manager.py:281`), so changing or
+  withdrawing a seam carries no compatibility promise in the other direction.
+- Manifest fields that nothing reads. `ui.sidebar.section` and `ui.sidebar.order`
+  are documented and parsed, and the dashboard does not place apps by them, so
+  navigation position is not yet app-controlled. Ten more fields are in the same
+  state, `jobFamilies` among them.
+
+Decomposing a core surface into an app is how the list above gets shorter, and
+the list is the evidence for which seam to build next.
+
+Rationale, the full dead-field inventory, and the phased plan:
+[`../request-for-change/rfc-everything-is-an-app.md`](../request-for-change/rfc-everything-is-an-app.md).
+Contracts: [`../system-specs/modules/app-kit-platform.md`](../system-specs/modules/app-kit-platform.md),
+[`../app-kit/manifest-reference.md`](../app-kit/manifest-reference.md).
 
 ## Frontend architecture
 
@@ -571,7 +654,9 @@ automatically. Selected entries:
 
 Generated kiro-cli agent JSON does **not** live here: it is written to
 `~/.kiro/agents/` (`kiro_home()/agents`), because that is where kiro-cli reads
-agent specs.
+agent specs. That directory stays the only *write* target; a project's own
+`<project>/.kiro/agents/` is additionally *read* for sessions bound to a project
+(kiro-cli searches it first, since Kiro Crew runs kiro-cli in that directory).
 
 ## Feature and subsystem map
 

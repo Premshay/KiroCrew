@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import asdict
 from typing import Any
@@ -20,6 +21,7 @@ from kiro_crew.autonudge_authz import (  # noqa: F401 - re-exported
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.sel import sel
+from kiro_crew.session_ledger import ledger_key, render_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,33 @@ logger = logging.getLogger(__name__)
 def render_nudge_message(message: str, stop_sentinel_path: str | None) -> str:
     """Replace {{STOP_FILE}} template with the resolved sentinel path."""
     return message.replace("{{STOP_FILE}}", stop_sentinel_path or "")
+
+
+async def compose_nudge_body(
+    message: str, stop_sentinel_path: str | None, slot_key: str | None
+) -> str:
+    """Compose one nudge cycle's full body text — the shared fire-path composer.
+
+    Applies :func:`render_nudge_message`'s template substitution and, when the
+    loop's session has a non-empty, non-terminal work ledger, prefixes a
+    compact snapshot of it so every cycle starts from the durable state
+    instead of from transcript memory. Derived server-side at fire time;
+    sessions without a ledger render exactly as before.
+
+    The ledger read is filesystem I/O, so it runs in a worker thread — a slow
+    or wedged filesystem costs this loop's snapshot, never the event loop.
+    Best-effort throughout: a snapshot failure must not cost the nudge itself.
+    """
+    body = render_nudge_message(message, stop_sentinel_path)
+    if slot_key:
+        try:
+            snapshot = await asyncio.to_thread(render_snapshot, ledger_key(slot_key))
+        except Exception:
+            logger.debug("nudge: ledger snapshot failed for %s", slot_key, exc_info=True)
+            snapshot = ""
+        if snapshot:
+            return f"{snapshot}\n\n{body}"
+    return body
 
 
 def _serialize(loop: Any) -> dict:
@@ -54,28 +83,44 @@ async def api_autonudge_get(request: web.Request) -> web.Response:
 async def api_autonudge_start(request: web.Request) -> web.Response:
     """POST /api/autonudge — start or replace a loop on a slot.
 
-    Body: { slot_key, message, idle_secs?, max_cycles?, stop_sentinel_path? }
+    Body: { slot_key, message, idle_secs?, max_cycles?, max_runtime_secs?, stop_sentinel_path? }
     """
     svc = _autonudge_get()
     if svc is None:
         return web.json_response(
-            {"error": "auto-nudge disabled (KIROCREW_AUTONUDGE not set)"}, status=503
+            {
+                "error": "auto-nudge disabled (KIROCREW_AUTONUDGE not set)",
+                "code": "autonudge_disabled",
+            },
+            status=503,
         )
     state: DashboardState = request.app["state"]
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    # idle_secs/max_cycles come straight from the request body: int() raises
-    # ValueError on "abc" and TypeError on null/list, which would surface as a
-    # 500 instead of a 400. Coerce up front and reject bad input, matching the
-    # sibling handlers_instances.api_instances_add guard on the same pattern.
+    # idle_secs/max_cycles/max_runtime_secs come straight from the request
+    # body: int() raises ValueError on "abc", TypeError on null/list, and
+    # OverflowError on float("inf") (1e309 is legal JSON in aiohttp's parser),
+    # any of which would surface as a 500 instead of a 400. Non-integral
+    # floats are rejected rather than silently truncated (int(1.5) -> 1 would
+    # store a value the caller never asked for). Coerce up front and reject
+    # bad input, matching the sibling handlers_instances.api_instances_add
+    # guard on the same pattern.
     try:
+        for _name in ("idle_secs", "max_cycles", "max_runtime_secs"):
+            _val = body.get(_name)
+            if isinstance(_val, float) and not _val.is_integer():
+                return web.json_response(
+                    {"error": f"{_name} must be a whole number", "code": "not_a_whole_number"},
+                    status=400,
+                )
         idle_secs = int(body.get("idle_secs", 60))
         max_cycles = int(body.get("max_cycles", 0))
-    except (TypeError, ValueError):
+        max_runtime_secs = int(body.get("max_runtime_secs", 0))
+    except (TypeError, ValueError, OverflowError):
         return web.json_response(
-            {"error": "idle_secs and max_cycles must be integers"}, status=400
+            {"error": "idle_secs, max_cycles and max_runtime_secs must be integers"}, status=400
         )
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
@@ -85,11 +130,12 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         idle_secs=idle_secs,
         max_cycles=max_cycles,
         stop_sentinel_path=(body.get("stop_sentinel_path") or ""),
+        max_runtime_secs=max_runtime_secs,
         source="dashboard",
         caller=request.remote or "",
     )
     if error is not None:
-        return web.json_response({"error": error}, status=status)
+        return web.json_response({"error": error, "code": "autonudge_not_armed"}, status=status)
     return web.json_response({"ok": True, "loop": _serialize(loop)})
 
 
@@ -103,7 +149,13 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
     """
     svc = _autonudge_get()
     if svc is None:
-        return web.json_response({"error": "auto-nudge disabled"}, status=503)
+        return web.json_response(
+            {
+                "error": "auto-nudge disabled",
+                "code": "autonudge_disabled",
+            },
+            status=503,
+        )
     loop_id = request.match_info["loop_id"]
     try:
         body = await request.json()
@@ -116,6 +168,7 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
         idle_secs=body.get("idle_secs"),
         max_cycles=body.get("max_cycles"),
         active=body.get("active"),
+        max_runtime_secs=body.get("max_runtime_secs"),
         source="dashboard",
         caller=request.remote or "",
     )
@@ -128,7 +181,13 @@ async def api_autonudge_delete(request: web.Request) -> web.Response:
     """DELETE /api/autonudge/{loop_id} — stop and remove a loop."""
     svc = _autonudge_get()
     if svc is None:
-        return web.json_response({"error": "auto-nudge disabled"}, status=503)
+        return web.json_response(
+            {
+                "error": "auto-nudge disabled",
+                "code": "autonudge_disabled",
+            },
+            status=503,
+        )
     loop_id = request.match_info["loop_id"]
     # Capture slot_key for audit before removal (loop is gone after remove()).
     existing = next((lp for lp in svc.list_all() if lp.id == loop_id), None)

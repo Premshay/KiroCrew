@@ -12,18 +12,23 @@ app-specific fields.
 from __future__ import annotations
 
 import json
-import ntpath
-import posixpath
 import re
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS
+from kiro_crew.cron import is_valid_skip_date, is_valid_timezone
 
 # ---------------------------------------------------------------------------
 # Nested manifest types
 # ---------------------------------------------------------------------------
 
+# `$` matches at the true end of the string AND just before a trailing newline,
+# so this pattern only carries its intended grammar under ``fullmatch``:
+# ``KEBAB_RE.match("demo\n")`` succeeds. Any caller gating an identity on it must
+# use ``fullmatch`` — see ``app_name_error``.
 KEBAB_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+([+-]|$)")
 
@@ -33,23 +38,113 @@ SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+([+-]|$)")
 # validation AND defense-in-depth at the push endpoint.
 RESERVED_APP_NAMES = frozenset({"system"})
 
+# App names that are not safe portable filesystem identities. An app name becomes
+# a directory (``apps/<name>/``, plus ``apps/<name>/data`` at first startup), and
+# Windows reserves these stems as device names by naming contract.
+#
+# Only ``nul`` has a measured failure here — ``mkdir`` raises WinError 3 on
+# Windows 11 26200 via CPython — while the other stems created usable directories
+# on that same path. They are refused anyway, as policy rather than reproduction:
+# the reservation is a documented Windows naming rule whose observable behaviour
+# differs across Windows APIs and builds, so one host's success does not make the
+# name portable. An app name is a PERSISTENT published identity, which makes the
+# directions asymmetric: admitting a stem is the one-way door, since tightening
+# later invalidates an app already published and installed, while relaxing an
+# over-strict rule costs nothing.
+#
+# Rejected on all platforms, not only Windows. Resource paths in this file are
+# already validated under both path flavours for the same reason (see
+# ``_has_dotdot_segment``), and ``is_valid_followup_branch`` applies this same
+# vocabulary to git branch names on every platform so that grammar does not
+# depend on where the gateway runs.
+#
+# The set is lowercase and ``KEBAB_RE`` already forces lowercase, so membership
+# is tested directly with no case folding.
+UNPORTABLE_APP_NAMES = WINDOWS_DEVICE_STEMS
+
+
+def app_name_error(name: str) -> str | None:
+    """Return why *name* is inadmissible as an app identifier, else ``None``.
+
+    The single app-name contract. Every path that admits a new app funnels
+    through here — manifest validation (install, update, discovery), external
+    self-registration, and builtin registration — so that a name refused at one
+    door cannot be admitted at another. The name is an identity AND a directory
+    component, so the same string has to satisfy both roles.
+    """
+    if not name:
+        return "app name must not be empty"
+    # fullmatch, not match: the pattern's `$` also matches before a trailing
+    # newline, so `match` admits "demo\n" — and the reserved-name comparisons
+    # below test the exact string, so "nul\n" and "system\n" would evade those
+    # too and reach a backend that stores and joins the RAW name.
+    if not KEBAB_RE.fullmatch(name):
+        return f"app name must be kebab-case (lowercase alphanumeric + hyphens): {name!r}"
+    if name in RESERVED_APP_NAMES:
+        return (
+            f"app name {name!r} is reserved (would shadow the "
+            f"{name}.* notification channel namespace)"
+        )
+    if name in UNPORTABLE_APP_NAMES:
+        return (
+            f"app name {name!r} is not portable: Windows reserves it as a device name, "
+            f"so the app directory is not safe to create there"
+        )
+    return None
+
+
+def _is_rooted_path(rel_path: str) -> bool:
+    """Return True if ``rel_path`` is anything other than a purely relative path.
+
+    App-resource paths are joined onto the app root, so any path carrying a drive
+    or a root anchor can relocate that join and must be refused. ``is_absolute()``
+    is too narrow twice over:
+
+    - It is flavour-bound to the RUNNING host, and ``os.path`` IS ``ntpath`` on
+      Windows, so ``os.path.isabs(x) or ntpath.isabs(x)`` collapses to one
+      Windows-only test there. Windows' flavour does not consider ``/etc/passwd``
+      anchored (no drive), so a POSIX-absolute path passed validation on Windows.
+      The Windows flavour is a strict superset — it reads ``/`` and ``\\`` as a
+      root — so testing it alone covers both syntaxes on either host.
+    - A drive-relative path (``D:evil.py``) has a drive but no root, so
+      ``is_absolute()`` is False, yet joining it onto the app root yields
+      ``D:evil.py`` and escapes. Hence drive-OR-root, not ``is_absolute()``.
+    """
+    win = PureWindowsPath(rel_path)
+    return bool(win.drive or win.root)
+
+
+def _has_dotdot_segment(rel_path: str) -> bool:
+    """Return True if ``rel_path`` contains a ``..`` segment under EITHER flavour.
+
+    Segmenting both ways is load-bearing: a POSIX host reads ``..\\evil`` as one
+    opaque filename, so a POSIX-only split lets a backslash traversal through —
+    and the manifest that declares it is portable data, validated on whichever
+    host happens to install the app. No legitimate resource path has a bare
+    ``..`` segment (``a..b`` and ``notes..md`` are single segments and unaffected).
+    """
+    return ".." in PurePosixPath(rel_path).parts or ".." in PureWindowsPath(rel_path).parts
+
 
 def _path_escapes_app_root(rel_path: str, app_root: Path | None) -> bool:
     """Return True if ``rel_path`` is an unsafe app-resource path.
 
-    Unsafe = absolute (POSIX/Windows/UNC), or — resolved against ``app_root`` —
-    escapes ``app_root`` (canonical containment, matching the runtime checks in
-    ``module_loader`` / ``bridges``). When ``app_root`` is None (pure-format
-    validation / round-trip tests) falls back to a lexical check that rejects
-    absolute paths and any ``..`` path segment.
+    Unsafe = rooted (drive-qualified, POSIX-absolute, or UNC), or containing a
+    ``..`` segment, or — resolved against ``app_root`` — escaping ``app_root``
+    (canonical containment, matching the runtime checks in ``module_loader`` /
+    ``bridges``).
+
+    The lexical checks run BEFORE the canonical one and regardless of whether
+    ``app_root`` is known, so a manifest is judged identically on every host.
+    Deferring them to ``resolve()`` would make the verdict host-dependent: on a
+    POSIX host ``app_root / "..\\evil.py"`` is a single odd filename that stays
+    inside the root and would be accepted, while the same manifest is rejected on
+    Windows. Canonical containment then adds what no lexical check can see — a
+    symlink or reparse point inside the root whose target leaves it.
     """
     if not rel_path:
         return False
-    # Check BOTH flavors explicitly: on Windows ``os.path is ntpath``, so
-    # ``os.path.isabs`` alone would miss POSIX-absolute paths like
-    # ``/etc/passwd`` (ntpath treats a leading "/" as relative), and on POSIX
-    # ``os.path is posixpath`` would miss Windows-drive/UNC paths.
-    if posixpath.isabs(rel_path) or ntpath.isabs(rel_path):
+    if _is_rooted_path(rel_path) or _has_dotdot_segment(rel_path):
         return True
     if app_root is not None:
         try:
@@ -57,7 +152,18 @@ def _path_escapes_app_root(rel_path: str, app_root: Path | None) -> bool:
             return not resolved.is_relative_to(app_root.resolve())
         except (OSError, ValueError):
             return True
-    return ".." in Path(rel_path).parts
+    return False
+
+
+# Expected JSON type per CronEntry field that from_dict type-gates, used to turn
+# a recorded parse-time violation into a message an app author can act on.
+_CRON_FIELD_JSON_TYPES = {
+    "every": "a number of seconds",
+    "agent_sequence": "an array of agent names",
+    "env": "an object of string keys to string values",
+    "timezone": "a string IANA zone name",
+    "skip_dates": "an array of YYYY-MM-DD strings",
+}
 
 
 @dataclass
@@ -76,6 +182,16 @@ class CronEntry:
     env: dict[str, str] = field(default_factory=dict)  # environment variables for the job
     persistent_session: bool = True  # whether to carry context between runs
     silent: bool = False  # suppress dashboard notifications
+    # IANA zone the schedule and skip_dates are evaluated in (e.g.
+    # "America/New_York"). Empty falls back to the gateway config's timezone and
+    # then to UTC, so a job whose hour is only meaningful in one zone -- market
+    # hours, a regional business-day digest -- must name it here. A per-USER zone
+    # is not manifest data: an app that schedules against its user's local time
+    # passes ``timezone`` to ``ctx.cron.add_job`` instead.
+    timezone: str = ""
+    # Calendar dates (YYYY-MM-DD, evaluated in ``timezone``) the job must not
+    # fire on -- e.g. a publisher's own holiday list.
+    skip_dates: list[str] = field(default_factory=list)
     # When False the cron is registered in a paused state (visible in the
     # dashboard Schedule view, resumable) instead of firing on install/enable.
     # Apps that need user configuration before their crons are useful ship
@@ -86,6 +202,14 @@ class CronEntry:
     # silently re-creating the fires-unconfigured bug). Reported as a
     # validation error; never serialized.
     enabled_type_invalid: bool = False
+    # Names of container/numeric fields whose manifest value was PRESENT and
+    # non-null but of the wrong JSON type. Parsing degrades them to the field's
+    # empty value so /api/apps/register cannot 500, and validate() reports each
+    # one -- erasing a wrong-typed value SILENTLY would be its own bug: an
+    # author who wrote "skip_dates": "2026-12-25" (a string, not an array) asked
+    # for a skip, and dropping it without a word lets the job fire on the
+    # excluded date. Same shape as enabled_type_invalid; never serialized.
+    type_invalid_fields: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"name": self.name}
@@ -105,6 +229,10 @@ class CronEntry:
             d["agent_sequence"] = self.agent_sequence
         if self.env:
             d["env"] = self.env
+        if self.timezone:
+            d["timezone"] = self.timezone
+        if self.skip_dates:
+            d["skip_dates"] = self.skip_dates
         if not self.persistent_session:
             d["persistent_session"] = False
         if self.silent:
@@ -118,16 +246,84 @@ class CronEntry:
         def _str_or_empty(v: Any) -> str:
             return v if isinstance(v, str) else ""
 
-        return cls(
+        # app.json is third-party, hand-editable input reached from
+        # /api/apps/register, so a wrong JSON TYPE must not raise:
+        # `data.get(key, [])` defends only the ABSENT key, and an explicit
+        # `"skip_dates": null` (or a scalar, or an object) returns that value,
+        # after which the comprehension raises TypeError / AttributeError out of
+        # from_dict and surfaces as an HTTP 500 rather than a validation error.
+        # Two distinct cases, deliberately treated differently:
+        #   * null == "not set" -> the empty value, no error (mirrors
+        #     _str_or_empty, and JSON null is how generators spell "absent").
+        #   * present, non-null, WRONG type -> the empty value AND a recorded
+        #     violation, because silently erasing it would drop a skip date the
+        #     author asked for and let the job fire on that date.
+        invalid: list[str] = []
+
+        def _list_or_empty(key: str, v: Any) -> list[Any]:
+            if isinstance(v, list):
+                return v
+            if v is not None:
+                invalid.append(key)
+            return []
+
+        def _dict_or_empty(key: str, v: Any) -> dict[Any, Any]:
+            if isinstance(v, dict):
+                return v
+            if v is not None:
+                invalid.append(key)
+            return {}
+
+        def _int_or_zero(key: str, v: Any) -> int:
+            # bool is an int subclass, so `"every": true` would pass isinstance
+            # and coerce to a 1-second interval; it is a type slip, not a
+            # schedule. 0 is already the "not set, use cron_expr" value.
+            if isinstance(v, bool):
+                invalid.append(key)
+                return 0
+            try:
+                return int(v)
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError is the infinity case: json.loads accepts
+                # `"every": 1e1000000` and yields float('inf'), which int()
+                # refuses. NaN lands in ValueError. A merely ENORMOUS finite
+                # value is not caught here and does not need to be -- it is a
+                # valid int, and compute_next_run_ts already absorbs it into
+                # "next run unknown" rather than raising.
+                if v is not None:
+                    invalid.append(key)
+                return 0
+
+        def _str_or_flagged(key: str, v: Any) -> str:
+            # `timezone` gets the recording treatment that plain _str_or_empty
+            # does not, because discarding it silently reproduces the very bug
+            # this field exists to fix: validation would pass, the job would
+            # persist timezone="" and fire in the fallback zone (UTC on a fresh
+            # install), and the author would see a schedule running on the wrong
+            # calendar day with nothing anywhere saying why. A discarded `agent`
+            # or `message` degrades visibly; a discarded zone does not.
+            if isinstance(v, str):
+                return v
+            if v is not None:
+                invalid.append(key)
+            return ""
+
+        entry = cls(
             name=_str_or_empty(data.get("name")),
-            every=int(data.get("every", 0)),
+            every=_int_or_zero("every", data.get("every", 0)),
             cron_expr=_str_or_empty(data.get("cron_expr")),
             agent=_str_or_empty(data.get("agent")),
             message=_str_or_empty(data.get("message")),
             command=_str_or_empty(data.get("command")),
             script=_str_or_empty(data.get("script")),
-            agent_sequence=[str(a) for a in data.get("agent_sequence", [])],
-            env={str(k): str(v) for k, v in data.get("env", {}).items()},
+            agent_sequence=[
+                str(a) for a in _list_or_empty("agent_sequence", data.get("agent_sequence"))
+            ],
+            env={
+                str(k): str(v) for k, v in _dict_or_empty("env", data.get("env")).items()
+            },
+            timezone=_str_or_flagged("timezone", data.get("timezone")),
+            skip_dates=[str(d) for d in _list_or_empty("skip_dates", data.get("skip_dates"))],
             persistent_session=bool(data.get("persistent_session", True)),
             silent=bool(data.get("silent", False)),
             # STRICT boolean: "enabled" gates whether a cron fires at all, so a
@@ -138,6 +334,8 @@ class CronEntry:
             enabled=(data["enabled"] if isinstance(data.get("enabled"), bool) else True),
             enabled_type_invalid=("enabled" in data and not isinstance(data["enabled"], bool)),
         )
+        entry.type_invalid_fields = invalid
+        return entry
 
 
 @dataclass
@@ -184,6 +382,43 @@ class UIPage:
         )
 
 
+# Overlay ids and the host slots they replace are kebab-case slugs: they key the
+# frontend overlay registry, so the grammar is deliberately narrower than a page
+# route (no dots, no path separators, no leading dash).
+_OVERLAY_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+@dataclass
+class UIOverlay:
+    """A global overlay surface contributed by an app.
+
+    An overlay is not routed: it floats above whatever the user is looking at
+    and is opened by a gesture the host owns, so it carries no sidebar
+    placement and no URL. ``id`` keys the frontend overlay registry the same way
+    :class:`UIPage`'s ``route`` keys the builtin component registry.
+
+    ``replaces`` names the host overlay slot this app takes over while it is
+    enabled (e.g. ``"quick-search"``), and is required: the host opens an overlay
+    only through a slot it owns, so a declaration without one can never be shown.
+    Whether the named slot exists is decided by the frontend registry, which
+    reports an unknown slot rather than vanishing silently -- the same posture as
+    an unroutable page route.
+    """
+
+    id: str = ""
+    replaces: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "replaces": self.replaces}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> UIOverlay:
+        return cls(
+            id=str(data.get("id", "")),
+            replaces=str(data.get("replaces", "")),
+        )
+
+
 @dataclass
 class UISidebar:
     """Sidebar placement config for app pages."""
@@ -213,6 +448,7 @@ class UIConfig:
 
     entry: str = ""  # ESM bundle path relative to app root, e.g. "dist/index.mjs"
     pages: list[UIPage] = field(default_factory=list)
+    overlays: list[UIOverlay] = field(default_factory=list)
     sidebar: UISidebar = field(default_factory=UISidebar)
 
     def to_dict(self) -> dict[str, Any]:
@@ -221,6 +457,8 @@ class UIConfig:
             d["entry"] = self.entry
         if self.pages:
             d["pages"] = [p.to_dict() for p in self.pages]
+        if self.overlays:
+            d["overlays"] = [o.to_dict() for o in self.overlays]
         sidebar_d = self.sidebar.to_dict()
         if sidebar_d:
             d["sidebar"] = sidebar_d
@@ -229,9 +467,23 @@ class UIConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> UIConfig:
         pages = [UIPage.from_dict(p) for p in data.get("pages", []) if isinstance(p, dict)]
+        # A hand-edited manifest can carry `"overlays": null` (or a string, or a
+        # number): the key is present, so `get` returns that value rather than the
+        # default and iterating it would raise out of install validation.
+        raw_overlays = data.get("overlays", [])
+        overlays = (
+            [UIOverlay.from_dict(o) for o in raw_overlays if isinstance(o, dict)]
+            if isinstance(raw_overlays, list)
+            else []
+        )
         sidebar_raw = data.get("sidebar", {})
         sidebar = UISidebar.from_dict(sidebar_raw) if isinstance(sidebar_raw, dict) else UISidebar()
-        return cls(entry=str(data.get("entry", "")), pages=pages, sidebar=sidebar)
+        return cls(
+            entry=str(data.get("entry", "")),
+            pages=pages,
+            overlays=overlays,
+            sidebar=sidebar,
+        )
 
 
 @dataclass
@@ -324,6 +576,21 @@ class BackendConfig:
         )
 
 
+def _granted_list(value: Any) -> list[str]:
+    """The entries of a list-valued GRANT, or nothing if it is not a list.
+
+    A JSON scalar must NOT be coerced. `[str(x) for x in value]` over a STRING
+    iterates its characters, so `"exposeToApps": "*"` would yield `["*"]` -- the
+    wildcard -- and any string containing `*` or `/` produces that token too:
+    `"api": "/api/chat"` gives the prefix `"/"`, which `app_token_path_allowed`
+    matches against every path. A malformed grant has to deny, the same direction
+    the boolean grants below fail in.
+    """
+    if not isinstance(value, list):
+        return []
+    return [str(v) for v in value if v]
+
+
 @dataclass
 class Permissions:
     """Declared permissions for an app."""
@@ -339,6 +606,10 @@ class Permissions:
     #: Declared rather than implicit so "which apps can start an agent" is
     #: auditable from the manifest instead of from an app's import graph.
     spawn: bool = False
+    # WS cross-app visibility opt-in: app names (or ["*"]) allowed to use
+    # slots:app:<this-app> / subagent:app:<this-app> declarations to observe
+    # this app's slots and subagents. Empty list = no cross-app visibility.
+    exposeToApps: list[str] = field(default_factory=list)  # noqa: N815
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {}
@@ -358,6 +629,8 @@ class Permissions:
             d["cron"] = True
         if self.spawn:
             d["spawn"] = True
+        if self.exposeToApps:
+            d["exposeToApps"] = self.exposeToApps
         return d
 
     @classmethod
@@ -374,14 +647,15 @@ class Permissions:
         # restriction ON. Same defect class, mirrored fix — the safe default
         # follows what the field grants or withholds, not the field's type.
         return cls(
-            api=[str(p) for p in data.get("api", []) if p],
-            events=[str(e) for e in data.get("events", []) if e],
-            mcpTools=[str(t) for t in data.get("mcpTools", []) if t],  # noqa: N815
+            api=_granted_list(data.get("api")),
+            events=_granted_list(data.get("events")),
+            mcpTools=_granted_list(data.get("mcpTools")),  # noqa: N815
             storage=data.get("storage") is True,
             network=data.get("network") is True,
             memory=str(data.get("memory", "")),
             cron=data.get("cron") is True,
             spawn=data.get("spawn") is True,
+            exposeToApps=_granted_list(data.get("exposeToApps")),  # noqa: N815
         )
 
 
@@ -783,7 +1057,11 @@ class NotificationsConfig:
             if not ch.id:
                 errors.append("notifications.channels: channel missing required field: id")
                 continue
-            if not KEBAB_RE.match(ch.id):
+            # fullmatch, not match: KEBAB_RE ends in `$`, which also matches
+            # just before a trailing newline, so `match` accepts an id with one
+            # trailing. The id is joined into a channel name ("<app>.<id>") and
+            # used as a subscription key, so the newline survives into both.
+            if not KEBAB_RE.fullmatch(ch.id):
                 errors.append(f"notifications.channels: channel id must be kebab-case: {ch.id!r}")
             if ch.id in seen:
                 errors.append(f"notifications.channels: duplicate channel id: {ch.id!r}")
@@ -908,15 +1186,10 @@ class AppManifest:
         # Required fields
         if not self.name:
             errors.append("missing required field: name")
-        elif not KEBAB_RE.match(self.name):
-            errors.append(
-                f"name must be kebab-case (lowercase alphanumeric + hyphens), got: {self.name!r}"
-            )
-        elif self.name in RESERVED_APP_NAMES:
-            errors.append(
-                f"app name {self.name!r} is reserved (would shadow the "
-                f"{self.name}.* notification channel namespace)"
-            )
+        else:
+            name_error = app_name_error(self.name)
+            if name_error:
+                errors.append(name_error)
 
         if not self.version:
             errors.append("missing required field: version")
@@ -958,6 +1231,25 @@ class AppManifest:
             if page.entryPoint and _path_escapes_app_root(page.entryPoint, app_root):
                 errors.append(f"ui page entryPoint contains path traversal: {page.entryPoint!r}")
 
+        # UI overlay validation
+        seen_overlay_ids: set[str] = set()
+        for overlay in self.ui.overlays:
+            if not overlay.id:
+                errors.append("ui overlay missing required field: id")
+                continue
+            if not _OVERLAY_SLUG_RE.match(overlay.id):
+                errors.append(f"ui overlay id must be kebab-case: {overlay.id!r}")
+            if overlay.id in seen_overlay_ids:
+                errors.append(f"ui overlay duplicate id: {overlay.id!r}")
+            seen_overlay_ids.add(overlay.id)
+            if not overlay.replaces:
+                errors.append(f"ui overlay {overlay.id!r} missing required field: replaces")
+            elif not _OVERLAY_SLUG_RE.match(overlay.replaces):
+                errors.append(
+                    f"ui overlay {overlay.id!r}: replaces must be kebab-case: "
+                    f"{overlay.replaces!r}"
+                )
+
         # Cron validation
         for cron in self.crons:
             if not cron.name:
@@ -970,6 +1262,30 @@ class AppManifest:
                 errors.append(
                     f"cron entry {cron.name!r}: 'command' and 'script' are mutually exclusive"
                 )
+            # Calendar fields are validated HERE as well as at the persistence
+            # owner. register_app_crons_with_service catches a per-job
+            # ValueError, logs it and moves on, so a bad zone shipped in a
+            # manifest would otherwise register nothing and say so only in the
+            # gateway log -- the app author sees a cron that silently does not
+            # exist. Surfacing it as a manifest validation error reports it at
+            # install/validate time instead.
+            for _bad in cron.type_invalid_fields:
+                errors.append(
+                    f"cron entry {cron.name!r}: {_bad!r} has the wrong JSON type "
+                    f"(expected {_CRON_FIELD_JSON_TYPES.get(_bad, 'a different type')}); "
+                    f"the value was ignored"
+                )
+            if cron.timezone and not is_valid_timezone(cron.timezone):
+                errors.append(
+                    f"cron entry {cron.name!r}: unknown timezone: {cron.timezone!r} "
+                    f"(expected an IANA zone name such as 'America/New_York')"
+                )
+            for _skip in cron.skip_dates:
+                if not is_valid_skip_date(_skip):
+                    errors.append(
+                        f"cron entry {cron.name!r}: invalid skip_date: {_skip!r} "
+                        f"(expected zero-padded YYYY-MM-DD)"
+                    )
             if cron.enabled_type_invalid:
                 errors.append(
                     f"cron entry {cron.name!r}: 'enabled' must be a JSON boolean "

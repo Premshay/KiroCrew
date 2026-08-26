@@ -8,6 +8,8 @@ from kiro_crew.validation import (
     ARTIFACT_SAVE_SCHEMA,
     CHANNEL_ID_RE,
     CRON_ADD_SCHEMA,
+    FILE_READ_SCHEMA,
+    FILE_WRITE_SCHEMA,
     LEARN_ADD_SCHEMA,
     SEND_MESSAGE_SCHEMA,
     SET_PROJECT_SCHEMA,
@@ -19,6 +21,7 @@ from kiro_crew.validation import (
     ValidationError,
     build_tool_response,
     normalize_unicode,
+    sanitize_json_values,
     sanitize_response,
     sanitize_string,
     strip_hidden_unicode,
@@ -165,6 +168,30 @@ class TestSanitizeString:
         assert sanitize_string("\u0645\u200c\u062e") == "\u0645\u200c\u062e"
 
 
+class TestSanitizeJsonValues:
+    def test_strips_hidden_chars_from_nested_values_and_keys(self):
+        # A ``\u200b`` escape in raw JSON is plain ASCII to the schema
+        # sanitizer; it becomes a real zero-width char only on decode. The
+        # decoded walk must strip it wherever it lands.
+        decoded = {
+            "no\u200bte": "AKIA\u200bIOSFODNN7EXAMPLE",
+            "nested": {"list": ["a\u200bb", 7, None, True]},
+        }
+        cleaned = sanitize_json_values(decoded)
+        assert cleaned == {
+            "note": "AKIAIOSFODNN7EXAMPLE",
+            "nested": {"list": ["ab", 7, None, True]},
+        }
+
+    def test_non_string_scalars_untouched(self):
+        assert sanitize_json_values({"n": 1, "f": 2.5, "b": False, "x": None}) == {
+            "n": 1,
+            "f": 2.5,
+            "b": False,
+            "x": None,
+        }
+
+
 # ── Response Sanitization ──
 
 
@@ -257,6 +284,31 @@ class TestValidateToolArgs:
     def test_spawn_run_max_turns_negative_rejected(self):
         with pytest.raises(ValidationError, match=">="):
             validate_tool_args({"task": "x", "max_turns": -1}, SPAWN_RUN_SCHEMA)
+
+    def test_spawn_run_context_groups_accepted(self):
+        result = validate_tool_args(
+            {
+                "task": "x",
+                "include_memory": False,
+                "include_lessons": True,
+                "include_project": False,
+            },
+            SPAWN_RUN_SCHEMA,
+        )
+        assert result["include_memory"] is False
+        assert result["include_lessons"] is True
+        assert result["include_project"] is False
+
+    def test_spawn_run_context_groups_omitted(self):
+        """Absent flags must not materialize as False — omitted means all groups on."""
+        result = validate_tool_args({"task": "x"}, SPAWN_RUN_SCHEMA)
+        assert result.get("include_memory") is not False
+        assert result.get("include_lessons") is not False
+        assert result.get("include_project") is not False
+
+    def test_spawn_run_context_group_non_bool_rejected(self):
+        with pytest.raises(ValidationError):
+            validate_tool_args({"task": "x", "include_memory": "no"}, SPAWN_RUN_SCHEMA)
 
     def test_learn_add_valid(self):
         result = validate_tool_args(
@@ -363,6 +415,25 @@ class TestValidateToolArgs:
                 {"name": "x", "script": "C:\\crons\\job.py", "every": 300},
                 CRON_ADD_SCHEMA,
             )
+
+    def test_cron_add_accepts_windows_path_with_spaces(self):
+        # "First Last" is the DEFAULT Windows account-name shape, and
+        # config_dir() is rooted at %USERPROFILE%, so rejecting spaces made a
+        # script cron impossible for a typical Windows user.
+        spaced = "C:\\Users\\John Smith\\.kiro\\crew\\crons\\job.py:run"
+        result = validate_tool_args(
+            {"name": "s", "script": spaced, "every": 300}, CRON_ADD_SCHEMA
+        )
+        assert result["script"] == spaced
+
+    def test_cron_add_rejects_unc_script_path(self):
+        # A UNC path is not a local script, and resolving one triggers an
+        # outbound SMB/DNS probe before the crons-root check can reject it.
+        for unc in ("\\\\host\\share\\job.py:run", "//host/share/job.py:run"):
+            with pytest.raises(ValidationError, match="invalid format"):
+                validate_tool_args(
+                    {"name": "x", "script": unc, "every": 300}, CRON_ADD_SCHEMA
+                )
 
     def test_task_run_valid(self):
         result = validate_tool_args({"spec": "do things"}, TASK_RUN_SCHEMA)
@@ -1008,3 +1079,82 @@ def test_unique_items_distinguishes_bool_from_number():
             {"type": "object",
              "properties": {"x": {"type": "array", "uniqueItems": True}}},
         )
+
+
+# ── File I/O path shape (FILE_READ_SCHEMA / FILE_WRITE_SCHEMA) ──
+
+
+class TestFilePathShape:
+    """The syntax gate every dashboard file endpoint validates `path` against.
+
+    It ran POSIX-only until the dashboard file viewer was found to 400 on every
+    file on Windows: the pattern required a `~` or `/` first character and
+    allowed neither `\\` nor `:`, so a native Windows path was refused ahead of
+    the Windows-aware canonicalization below it.
+    """
+
+    @staticmethod
+    def _accepts(path: str) -> bool:
+        try:
+            validate_tool_args({"path": path}, FILE_READ_SCHEMA)
+            return True
+        except ValidationError:
+            return False
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/home/user/project/notes.md",
+            "~/project/notes.md",
+            "/tmp/a file with spaces.md",
+        ],
+    )
+    def test_accepts_posix_absolute(self, path):
+        assert self._accepts(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            r"C:\Users\me\workspace\notes.md",
+            "C:/Users/me/workspace/notes.md",
+            r"c:\lower\drive\letter.md",
+            r"\\host\share\notes.md",
+            r"C:\Users\me\a file with spaces.md",
+        ],
+    )
+    def test_accepts_windows_absolute(self, path):
+        assert self._accepts(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Drive-relative: resolves against a per-drive working directory the
+            # caller cannot see, so its target is not the path it appears to name.
+            r"C:notes.md",
+            # NTFS alternate data stream: reads a different byte stream than the
+            # file the path appears to name. ':' is confined to the drive prefix
+            # precisely so this stays refused.
+            r"C:\Users\me\notes.md:hidden",
+            # A bare relative path is still refused -- the endpoints that accept
+            # relative input rewrite it to absolute via _resolve_project_relative
+            # under resolve=1, ahead of this gate.
+            "src/main.py",
+            # Shell metacharacters remain outside the allowed body class.
+            "/tmp/$evil",
+            "/tmp/a;rm -rf b",
+            "/tmp/a|b",
+            # A prefix alone names a root, not a file.
+            "/",
+            "C:\\",
+            # Newline injection into anything that later logs or splits the path.
+            "/tmp/a\nb",
+        ],
+    )
+    def test_refuses(self, path):
+        assert not self._accepts(path)
+
+    def test_write_schema_shares_the_same_gate(self):
+        # One pattern object backs both schemas, so they cannot drift apart.
+        validate_tool_args({"path": r"C:\Users\me\notes.md", "content": "x"}, FILE_WRITE_SCHEMA)
+        with pytest.raises(ValidationError):
+            validate_tool_args({"path": r"C:notes.md", "content": "x"}, FILE_WRITE_SCHEMA)

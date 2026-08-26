@@ -50,7 +50,7 @@ from kiro_crew.dashboard.handlers._shared import (  # noqa: E402, F401
     _get_memory,
     _get_skills,
     _is_restricted_session,
-    _resolve_aim_skill_path,
+    _resolve_package_skill_path,
 )
 
 # ── Agents (extracted to handlers/agents.py) ──
@@ -89,17 +89,28 @@ from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
 )
 
 # ── Connections OAuth relay (handlers/connections.py) ──
-from kiro_crew.dashboard.handlers.connections import api_mcp_oauth_relay  # noqa: E402, F401
+from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
+    api_connections_cancel,
+    api_connections_mint,
+    api_connections_mint_state,
+    api_connections_status,
+    api_mcp_oauth_relay,
+)
 from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
     api_cron_ack,
     api_cron_batch_delete,
     api_cron_cancel,
     api_cron_delete,
     api_cron_enable,
+    api_cron_folders,
+    api_cron_folders_create,
+    api_cron_folders_delete,
+    api_cron_folders_update,
     api_cron_history,
     api_cron_history_all,
     api_cron_history_detail,
     api_cron_run,
+    api_cron_script_source,
     api_cron_to_chat,
     api_cron_update,
     api_crons,
@@ -127,12 +138,17 @@ from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     api_file_raw,
     api_file_read,
     api_file_search,
+    api_file_sheet,
+    api_file_stream,
     api_file_watch,
     api_file_write,
     api_outbox_download,
     api_outbox_list,
     api_outbox_notify,
     api_project_git,
+    api_project_git_log,
+    api_project_git_status,
+    api_project_tree,
     api_reveal_path,
     api_screenshot,
     api_slack_upload_file,
@@ -158,6 +174,13 @@ from kiro_crew.dashboard.handlers.hooks import (  # noqa: E402, F401
     api_hooks_agent,
     api_hooks_create,
     api_kiro_hooks,
+    api_webhook_context_delete,
+    api_webhook_test,
+    api_webhook_token_create,
+    api_webhook_token_delete,
+    api_webhook_token_update,
+    api_webhooks,
+    api_webhooks_switch,
 )
 from kiro_crew.dashboard.handlers.kiro_prerequisite import (  # noqa: E402, F401
     api_kiro_prerequisite_repair_specs,
@@ -171,12 +194,15 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_gateway_enable,
     api_mcp_gateway_metrics,
     api_mcp_gateway_servers,
-    api_mcp_gateway_set_poolable,
+    api_mcp_gateway_set_stub,
     api_mcp_gateway_status,
     api_mcp_global_scopes,
+    api_mcp_measure_progress,
+    api_mcp_measure_start,
     api_mcp_probe,
     api_mcp_probe_cached,
     api_mcp_remove,
+    api_mcp_resolve_refresh,
     api_mcp_server_detail,
     api_mcp_servers,
     api_mcp_sync,
@@ -221,18 +247,20 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     _redact,
     _resolve_session_target,
     _sanitize_blocks,
-    api_browser_auth_retry,
     api_browser_command,
     api_browser_command_drain,
     api_browser_command_result,
-    api_browser_config_get,
-    api_browser_config_save,
-    api_browser_event,
-    api_browser_frame,
-    api_browser_pump_audit,
+    api_browser_engine_install,
+    api_browser_install_get,
+    api_browser_install_start,
+    api_browser_token_put,
+    api_browser_view_get,
+    api_browser_view_start,
     api_delete_message,
     api_discord_config_get,
     api_discord_config_save,
+    api_imessage_config_get,
+    api_imessage_config_save,
     api_notification_ack,
     api_notification_agent_push,
     api_notification_channel_settings,
@@ -279,6 +307,7 @@ from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     api_prompts,
     api_skill_detail,
     api_skill_file,
+    api_skill_inject_on_trigger,
     api_skill_pending_approve,
     api_skill_pending_detail,
     api_skill_pending_dismiss,
@@ -287,9 +316,29 @@ from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     api_skills,
     api_skills_create,
     api_skills_pending,
+    api_skills_pending_dismiss_all,
+    api_skills_trust,
+    api_skills_trust_grant,
+    api_skills_trust_revoke,
+)
+
+# ── Session work ledger (handlers/session_ledger.py) ──
+from kiro_crew.dashboard.handlers.session_ledger import (  # noqa: E402, F401
+    api_session_ledger_get,
+    api_session_ledger_record,
 )
 
 # ── Sessions (extracted to handlers/sessions.py) ──
+from kiro_crew.dashboard.handlers.session_storage import (  # noqa: E402, F401
+    api_session_inventory,
+    api_session_inventory_detail,
+    api_session_inventory_trash,
+    api_session_storage,
+    api_session_storage_cleanup,
+    api_session_storage_empty,
+    api_session_storage_empty_status,
+    api_session_storage_restore,
+)
 from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     _SHUTDOWN_TIMEOUT_SECS,
     _fetch_usage_bg,
@@ -323,7 +372,14 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.side import (  # noqa: E402, F401
     api_side_close,
     api_side_open,
+    api_side_queue_cancel,
+    api_side_queue_edit,
     api_side_turn,
+)
+
+# ── Skill context budget (extracted to handlers/skill_budget.py) ──
+from kiro_crew.dashboard.handlers.skill_budget import (  # noqa: E402, F401
+    api_skills_budget,
 )
 from kiro_crew.dashboard.handlers.sso_login import (  # noqa: E402, F401
     api_sso_login_ws,
@@ -336,6 +392,15 @@ from kiro_crew.dashboard.handlers.steering import (  # noqa: E402, F401
     list_steering_blocking,
     resolve_steering_file,
     steering_roots,
+)
+from kiro_crew.dashboard.handlers.tailnet import (  # noqa: E402, F401
+    api_tailnet_status,
+)
+from kiro_crew.dashboard.handlers.tailnet_mobile import (  # noqa: E402, F401
+    api_tailnet_mobile_publish,
+    api_tailnet_mobile_qr,
+    api_tailnet_mobile_status,
+    api_tailnet_mobile_unpublish,
 )
 
 # ── Task Runner (extracted to handlers/taskrunner.py) ──
@@ -364,8 +429,10 @@ from kiro_crew.dashboard.handlers.taskrunner import (  # noqa: E402, F401
 )
 from kiro_crew.dashboard.handlers.telemetry import (  # noqa: E402, F401
     api_beacon_status,
+    api_collection_status,
     api_context_trace,
     api_telemetry_startup,
+    api_usage_turns,
 )
 from kiro_crew.dashboard.handlers.terminal import (  # noqa: E402, F401
     api_terminal_complete,
@@ -400,13 +467,16 @@ from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     _update_info,
     _version_key,
     api_changelog,
+    api_gateway_restart,
     api_log_level,
     api_log_level_get,
     api_logs,
+    api_releases,
     api_stream,
     api_update_apply,
     api_update_auto,
     api_update_cancel,
+    api_update_channel,
     api_update_check,
     api_update_simulate,
     get_update_info,
@@ -479,14 +549,16 @@ def _list_aim_prompts() -> list[dict[str, Any]]:
                 logger.debug("Skipping sensitive path: %s", sop_file)
                 continue
             name = sop_file.stem.removesuffix(".sop")
-            result.append({
-                "name": name,
-                "fullName": f"agent-sop:{name}",
-                "description": _extract_sop_description(sop_file),
-                "path": resolved,
-                "package": root.name,
-                "source": "package",
-            })
+            result.append(
+                {
+                    "name": name,
+                    "fullName": f"agent-sop:{name}",
+                    "description": _extract_sop_description(sop_file),
+                    "path": resolved,
+                    "package": root.name,
+                    "source": "package",
+                }
+            )
 
     # Also scan ~/.kiro/prompts/ for user-created prompts
     home = Path.home()
@@ -514,6 +586,15 @@ def _list_aim_prompts() -> list[dict[str, Any]]:
     _prompt_cache_ts = now
     return [dict(p) for p in result]
 
+
+# Paid-AWS-service consent — the operator's confirmation surface for Amazon
+# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant
+# alongside the ``kirocrew aws-consent`` CLI.
+from kiro_crew.dashboard.handlers.aws_consent import (  # noqa: E402, F401
+    api_aws_consent_delete,
+    api_aws_consent_get,
+    api_aws_consent_post,
+)
 
 # Computer use — the Settings config pair (browser, cookie-authed) plus the two
 # loopback legs: ``invoke`` (the ``kirocrew-computer`` MCP shim's forward) and
@@ -585,4 +666,8 @@ from kiro_crew.dashboard.handlers.security import (  # noqa: E402, F401
     api_denied_commands_disable_all,
     api_denied_commands_list,
     api_governance_policy,
+    api_trusted_app_grant,
+    api_trusted_app_revoke,
+    api_trusted_apps_allow_all,
+    api_trusted_apps_list,
 )

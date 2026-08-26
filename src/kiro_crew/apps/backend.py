@@ -28,17 +28,21 @@ from kiro_crew.apps.execution import (
     shipped_builtin_app_root,
     shipped_builtin_module_path,
 )
+from kiro_crew.apps.interpreter import resolve_app_python, venv_python_path
 from kiro_crew.apps.manager import app_dir, get_app_manifest, list_apps
 from kiro_crew.apps.registry import minimal_env
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 from kiro_crew.sandbox import (
-    build_resource_limit_preexec,
+    RLIMIT_PROFILE_BUILD,
+    RLIMIT_PROFILE_TOOL,
     cgroup_scope_argv,
-    resource_limit_preexec,
+    popen_limited,
+    run_limited,
     wrap_argv,
 )
 from kiro_crew.sel import sel
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +77,6 @@ _BOOT_SPAWN_MAX_WORKERS = 8
 # applied PER orphan, not shared across the batch.
 _REAP_SIGTERM_GRACE = 3.0  # seconds to wait for an orphan to exit after SIGTERM
 _REAP_POLL_INTERVAL = 0.1  # liveness re-poll cadence during the grace window
-_PS_TIMEOUT = 2  # seconds before a `ps` start-time probe is abandoned
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +179,86 @@ def _listening_pids(port: int) -> list[int]:
         return []
 
 
+def _probe_adoption_health(port: int, health_path: str) -> bool:
+    """Whether ``127.0.0.1:port`` answers the manifest's health check (< 400)."""
+
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}{health_path}",
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return bool(resp.status < 400)
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def _capture_adopted_owners(
+    app_name: str, port: int, health_path: str
+) -> tuple[list[int], dict[int, str]] | None:
+    """Owner PIDs + start-time identities for the backend answering on loopback.
+
+    The health probe and the owner lookup are separate observations, so the
+    responder can exit between them and the lookup would attribute ownership to
+    a bystander (e.g. a coexisting v6-only wildcard listener the probe never
+    reached). Close that window with a consistency sandwich: capture owners and
+    identities, then require the health check to STILL answer and the owner set
+    to read back unchanged. Any drift means the observations do not describe one
+    stable backend — refuse adoption; the next start simply re-probes.
+
+    Returns ``None`` (with a logged reason) when no owner is attributable, an
+    owner's start-time identity is unreadable (an owner that cannot be
+    positively named later cannot be stopped — refuse rather than adopt a
+    backend the gateway could never revoke), or the sandwich detects drift.
+    """
+    owners: list[int] = platform_compat.loopback_owner_pids(
+        platform_compat.find_port_listeners(port)
+    )
+    if not owners:
+        logger.warning(
+            "App %s: cannot record owning PIDs on 127.0.0.1:%d "
+            "(port->PID tool unavailable?) — skipping adoption",
+            app_name, port,
+        )
+        return None
+    start_times: dict[int, str] = {}
+    for pid in owners:
+        st = _proc_start_time(pid)
+        if st is not None:
+            start_times[pid] = st
+    if set(start_times) != set(owners):
+        # An owner with no readable identity could never be signalled later —
+        # stop and uninstall would skip it, leaving a third-party backend
+        # running after its trust was revoked. Adoption is only offered when
+        # every owner can be positively named, so refusal here fails closed:
+        # the gateway declines to manage what it could not later stop.
+        logger.warning(
+            "App %s: start-time identity unreadable for owner PID(s) %s on "
+            "port %d — refusing adoption (an owner that cannot be identified "
+            "cannot be stopped later)",
+            app_name, sorted(set(owners) - set(start_times)), port,
+        )
+        return None
+    if not _probe_adoption_health(port, health_path):
+        logger.warning(
+            "App %s: backend on port %d stopped answering its health check "
+            "while ownership was being recorded — skipping adoption",
+            app_name, port,
+        )
+        return None
+    owners_recheck = platform_compat.loopback_owner_pids(
+        platform_compat.find_port_listeners(port)
+    )
+    if set(owners_recheck) != set(owners):
+        logger.warning(
+            "App %s: port %d owners changed while ownership was being recorded "
+            "(%s -> %s) — skipping adoption",
+            app_name, port, owners, owners_recheck,
+        )
+        return None
+    return owners, start_times
+
+
 def _pid_is_self_or_descendant_of(pid: int, ancestor: int) -> bool:
     """Whether *pid* is *ancestor* or is descended from it (bounded walk)."""
 
@@ -268,6 +351,12 @@ class AppProcess:
     started_at: float = 0.0
     log_path: str = ""
     adopted_pids: list[int] = field(default_factory=list)
+    # PID-reuse guard for the adopted set: pid -> platform_compat.process_start_time
+    # token captured at adoption. stop signals a recorded PID only when its live
+    # start time still POSITIVELY matches (same convention as the spawned-backend
+    # reap); a missing or mismatched token means the PID may name another process
+    # now, and it is never signalled.
+    adopted_start_times: dict[int, str] = field(default_factory=dict)
     # True only for the transient placeholder a single-flighting spawn inserts while it
     # allocates a port + launches the process; replaced by the real record on success or
     # popped on failure. Concurrent start_app_backend calls see it and skip duplicate spawn.
@@ -310,7 +399,9 @@ def _resolve_nvm_path(binary_name: str) -> str | None:
     try:
         result = subprocess.run(
             ["bash", "-c", f'source "{nvm_sh}" --no-use && nvm which current'],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            timeout=10,
+            **UTF8_TEXT,
         )
         if result.returncode == 0 and result.stdout.strip():
             nvm_node = result.stdout.strip()
@@ -609,16 +700,7 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                 s.settimeout(1)
                 s.connect(("127.0.0.1", port))
             # Port occupied — probe health endpoint before giving up
-            healthy = False
-            try:
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}{manifest.backend.healthCheck}",
-                    method="GET",
-                )
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    healthy = resp.status < 400
-            except (urllib.error.URLError, OSError):
-                pass
+            healthy = _probe_adoption_health(port, manifest.backend.healthCheck)
 
             if healthy:
                 try:
@@ -628,32 +710,29 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                     )
                 except Exception as exc:
                     logger.debug("SEL audit failed for app %s backend adopt: %s", app_name, exc)
-                # Record PIDs listening on this port at adoption time
-                adopted_pids: list[int] = []
-                try:
-                    lsof_result = subprocess.run(
-                        ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    if lsof_result.returncode == 0 and lsof_result.stdout.strip():
-                        for pid_str in lsof_result.stdout.strip().split("\n"):
-                            try:
-                                adopted_pids.append(int(pid_str.strip()))
-                            except ValueError:
-                                pass
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-                if not adopted_pids:
-                    logger.warning(
-                        "App %s: cannot record PIDs on port %d (lsof unavailable?) — skipping adoption",
-                        app_name, port,
-                    )
+                # Record owning PIDs at adoption time, scoped to the listener
+                # the health probe actually reached. The probe above only ever
+                # talks to 127.0.0.1:<port>; loopback_owner_pids mirrors the
+                # kernel's most-specific-bind dispatch (exact 127.0.0.1 beats a
+                # v4 wildcard, which beats a dual-stack v6 one), so a process
+                # holding a different local address — or a v6-only wildcard
+                # next to the real v4 owner — was never health-checked and is
+                # not recorded. Each owner's start-time identity rides along so
+                # stop can refuse a recycled PID, and the capture is sandwiched
+                # between health checks so a responder that exits mid-capture
+                # cannot hand ownership to a bystander.
+                adopted = _capture_adopted_owners(
+                    app_name, port, manifest.backend.healthCheck
+                )
+                if adopted is None:
                     return None
+                adopted_pids, adopted_start_times = adopted
                 logger.info("App %s: healthy instance already on port %d — adopting (pids=%s)", app_name, port, adopted_pids)
                 ap = AppProcess(
                     app_name=app_name, port=port, pid=0, proc=None,
                     healthy=True, started_at=time.time(), log_path=str(log_path),
                     adopted_pids=adopted_pids,
+                    adopted_start_times=adopted_start_times,
                 )
                 # Adopted (externally-managed) backends are deliberately NOT
                 # recorded for the startup stale-reap: the reap SIGTERMs a whole
@@ -662,7 +741,7 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                 # If the gateway dies, the external instance keeps running and is
                 # simply re-probed and re-adopted on the next start — so reaping it
                 # would kill a healthy service we would immediately re-adopt. stop's
-                # adopted path kills only the lsof-revalidated PIDs for this reason.
+                # adopted path kills only the re-validated PIDs for this reason.
                 with _lock:
                     _processes[app_name] = ap
                     _allocated_ports[app_name] = port
@@ -691,25 +770,31 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
         _env = minimal_env()  # don't leak secrets to pip/venv subprocesses
         try:
             if not venv_dir.exists():
+                # sys.executable, never a bare "python3": the bare name relies on
+                # PATH (absent on some hosts, a Store stub on Windows) — the same
+                # policy every app spawn path applies via apps/interpreter.
                 venv_cmd, _ = wrap_argv(
-                    ["python3", "-m", "venv", str(venv_dir)], mode="standard"
+                    [sys.executable, "-m", "venv", str(venv_dir)], mode="standard"
                 )
                 venv_cmd = cgroup_scope_argv(venv_cmd)  # cgroup DoS ceiling
-                subprocess.run(
+                run_limited(
                     venv_cmd,
                     check=True, capture_output=True, timeout=60, env=_env,
-                    preexec_fn=resource_limit_preexec(),
                 )
-            pip_bin = str(venv_dir / "bin" / "pip")
+            # Invoke pip through the venv's own interpreter: `.venv/bin/pip` is
+            # POSIX-only (Windows venvs ship Scripts\), and `<venv python> -m pip`
+            # is the layout-independent spelling. Without it a Windows venv is
+            # created but never provisioned — and would then be preferred by the
+            # venv-first interpreter policy while holding none of the app's deps.
+            venv_python = str(venv_python_path(root))
             pip_cmd, _ = wrap_argv(
-                [pip_bin, "install", "--quiet", "--disable-pip-version-check",
-                 "-r", str(req_file)], mode="standard"
+                [venv_python, "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "-r", str(req_file)], mode="standard"
             )
             pip_cmd = cgroup_scope_argv(pip_cmd)  # cgroup DoS ceiling
-            subprocess.run(
+            run_limited(
                 pip_cmd,
                 capture_output=True, timeout=60, env=_env,
-                preexec_fn=resource_limit_preexec(),
             )
         except Exception as exc:
             logger.warning("Failed to install deps for app %s: %s", app_name, exc)
@@ -737,6 +822,44 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
         # backend can detect an edition but never manufacture consent to compile
         # one.
         _platform_extra["KIROCREW_EDITION_DIR"] = os.environ["KIROCREW_EDITION_DIR"]
+    if os.environ.get("KIROCREW_DEVFLEET_REPO"):
+        # Operator-declared main-checkout override (same trust class as the
+        # KIROCREW_DEVFLEET_BIN_* overrides below). dev-fleet reads it as the
+        # highest-priority repo discovery hint, ahead of KIROCREW_PROJECT_DIR
+        # — which packaged installs point at the app bundle (no .git), leaving
+        # only the ~/kirocrew fallback. minimal_env() strips the var, so
+        # without this forward the documented override silently never reaches
+        # the backend and the fleet renders empty. A path, not a secret.
+        _platform_extra["KIROCREW_DEVFLEET_REPO"] = os.environ["KIROCREW_DEVFLEET_REPO"]
+    if os.environ.get("KIROCREW_PROFILE"):
+        # Forward the edition-profile override to the backend subprocess.
+        # minimal_env() strips it otherwise, so a gateway launched with an
+        # explicit KIROCREW_PROFILE (e.g. =standalone to override an installed
+        # companion) would have the child re-resolve the profile from on-disk
+        # markers and diverge from the parent. Since the backend now boots the
+        # platform context at startup (fail-closed), that divergence would make
+        # the subprocess refuse to start rather than fail lazily. Forwarding it
+        # keeps the child on the SAME profile the gateway resolved. A profile
+        # name, not a secret.
+        _platform_extra["KIROCREW_PROFILE"] = os.environ["KIROCREW_PROFILE"]
+    for _policy_env in ("KIROCREW_SECURITY_POLICY", "KIROCREW_ADMISSION_POLICY"):
+        # Forward the governance trust-root path overrides alongside the profile.
+        # These are the fleet operator's highest-priority policy sources
+        # (governance.load_security_policy / admission), and minimal_env() strips
+        # them. Now that the backend boots the platform context itself, dropping
+        # them would make the child resolve its ceiling from the on-disk /
+        # packaged default instead of the administrator-pinned policy — a looser
+        # ceiling for governed app commands.
+        #
+        # Absolutize against THIS process's cwd before forwarding: the loaders
+        # read the value as a bare Path() with no resolve()/expanduser(), and the
+        # backend subprocess runs with a different cwd (the package root, set
+        # below), so forwarding a RELATIVE override verbatim would make the child
+        # look in the wrong directory and fail closed. Resolving here binds the
+        # child to the exact file the gateway resolved. A path, not a secret.
+        _policy_val = os.environ.get(_policy_env)
+        if _policy_val:
+            _platform_extra[_policy_env] = os.path.abspath(os.path.expanduser(_policy_val))
     for _k, _v in os.environ.items():
         # Operator-declared trusted-binary overrides (unit-file owned):
         # backends resolve credential-bearing tools through these instead of
@@ -805,10 +928,9 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                     sandboxed_npm = cgroup_scope_argv(
                         sandboxed_npm
                     )  # cgroup DoS ceiling
-                    subprocess.run(
+                    run_limited(
                         sandboxed_npm,
                         cwd=str(root), env=env, capture_output=True, timeout=120,
-                        preexec_fn=resource_limit_preexec(),
                     )
                 except Exception as exc:
                     logger.warning("Failed to install npm deps for app %s: %s", app_name, exc)
@@ -860,13 +982,13 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
     elif backend_type == "asgi" or (
         not backend_type and _is_asgi_entry(entry)
     ):
-        venv_python = str(root / ".venv" / "bin" / "python3")
-        # Fall back to the gateway's own interpreter (sys.executable) rather than a bare
-        # "python3": a bare name relies on PATH, which isn't guaranteed (e.g. some
-        # build environments ship only a versioned interpreter, so execvp("python3") raises
-        # FileNotFoundError and the backend dies immediately). Matches the module-style
-        # branch above.
-        python_bin = venv_python if (root / ".venv" / "bin" / "python3").is_file() else sys.executable
+        # Prefer the app's venv interpreter, else the gateway's own (sys.executable) —
+        # never a bare "python3": a bare name relies on PATH, which isn't guaranteed
+        # (e.g. some build environments ship only a versioned interpreter, so
+        # execvp("python3") raises FileNotFoundError and the backend dies immediately).
+        # One policy shared with the stdio MCP registration path — see
+        # kiro_crew.apps.interpreter.
+        python_bin = resolve_app_python(root)
         # Derive the module path for uvicorn (e.g. backend.app:app)
         rel = entry.relative_to(root)
         parts = list(rel.parts)
@@ -886,10 +1008,9 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
 
     # --- Plain Python backend (default) ---
     else:
-        venv_python = str(root / ".venv" / "bin" / "python3")
-        # See the ASGI branch: prefer the venv python, else the gateway's own interpreter
-        # (sys.executable) — a bare "python3" relies on PATH and isn't always present.
-        python_bin = venv_python if (root / ".venv" / "bin" / "python3").is_file() else sys.executable
+        # See the ASGI branch: venv python first, else the gateway's own interpreter —
+        # one policy shared with the stdio MCP registration path.
+        python_bin = resolve_app_python(root)
         cmd = [python_bin, entry_str]
         cwd = str(root)
 
@@ -915,7 +1036,7 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
         # overload resolution on the build fleet): start_new_session=True is a
         # no-op on Windows, creationflags resolves to 0 (no-op) on POSIX.
         try:
-            proc = subprocess.Popen(
+            proc = popen_limited(
                 sandboxed_cmd,
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
@@ -928,9 +1049,9 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                 # ceiling: the backend is the ANCESTOR of its build workloads
                 # (vite/pip) and a 1024 hard cap starves every descendant.
                 # All other apps keep the standard configured policy.
-                preexec_fn=(build_resource_limit_preexec()
-                            if app_name in _BUILD_CAPABLE_APPS
-                            else resource_limit_preexec()),
+                profile=(RLIMIT_PROFILE_BUILD
+                         if app_name in _BUILD_CAPABLE_APPS
+                         else RLIMIT_PROFILE_TOOL),
             )
         except OSError:
             log_fh.close()
@@ -1087,36 +1208,56 @@ def stop_app_backend(app_name: str) -> bool:
                     _allocated_ports.setdefault(app_name, ap.port)
             return False
         try:
-            target_pids: set[int] = set(ap.adopted_pids)
-
-            # Verify adopted PIDs still belong to this port (guards against
-            # PID recycling between adoption and stop).
-            try:
-                lsof_result = subprocess.run(
-                    ["lsof", "-ti", f":{ap.port}", "-sTCP:LISTEN"],
-                    capture_output=True, text=True, timeout=5,
+            # PID-reuse guard: signal a recorded PID only when its live
+            # start-time identity still POSITIVELY matches the token captured
+            # at adoption (same convention as the spawned-backend reap). This
+            # is process identity, not a port/address heuristic, so every
+            # recycling shape — same address, another local address, a
+            # v6-only wildcard, or a non-listener — fails the match and is
+            # never signalled. A PID with no recorded token (identity was
+            # unreadable at adoption) or an unreadable live value reads as
+            # "identity unconfirmed" and is skipped, per the
+            # process_start_time contract: do not kill what you cannot name.
+            target_pids: set[int] = set()
+            unconfirmed: list[int] = []
+            for pid in ap.adopted_pids:
+                recorded_st = ap.adopted_start_times.get(pid)
+                if recorded_st is not None and _proc_start_time(pid) == recorded_st:
+                    target_pids.add(pid)
+                elif platform_compat.pid_exists(pid):
+                    unconfirmed.append(pid)
+            if unconfirmed:
+                logger.warning(
+                    "Adopted backend for %s on port %s: skipping live PIDs %s — "
+                    "start-time identity does not match the adoption record "
+                    "(recycled PID or unreadable identity); not signalling them",
+                    app_name, ap.port, unconfirmed,
                 )
-                if lsof_result.returncode == 0 and lsof_result.stdout.strip():
-                    current_pids: set[int] = set()
-                    for pid_str in lsof_result.stdout.strip().split("\n"):
-                        try:
-                            current_pids.add(int(pid_str.strip()))
-                        except ValueError:
-                            pass
-                    # Only kill PIDs that are both adopted AND still on this port
-                    target_pids = target_pids & current_pids
-            except (OSError, subprocess.TimeoutExpired):
-                # lsof unavailable at stop time — proceed with adopted PIDs
-                # (they were validated at adoption time)
-                pass
 
             pids: list[int] = []
             for pid in target_pids:
                 if pid <= 0:
                     continue
                 try:
-                    # kill_pid: os.kill on POSIX, taskkill /F on Windows.
-                    platform_compat.kill_pid(pid, platform_compat.SIGTERM)
+                    # Identity-PINNED (kill_pid_pinned): on Windows the handle
+                    # that re-verifies the start time stays open across the
+                    # terminate, so the PID taskkill resolves cannot have been
+                    # recycled between the identity check above and the signal.
+                    # False means the pin could not be established (the process
+                    # exited since the check) — nothing to stop, skip it.
+                    # POSIX delegates straight through to os.kill.
+                    if (
+                        platform_compat.kill_pid_pinned(
+                            pid, ap.adopted_start_times[pid], platform_compat.SIGTERM
+                        )
+                        is False
+                    ):
+                        logger.info(
+                            "Adopted backend for %s: pid %d exited before the "
+                            "pinned SIGTERM — nothing to signal",
+                            app_name, pid,
+                        )
+                        continue
                     pids.append(pid)
                 except (ProcessLookupError, OSError):
                     pass
@@ -1133,12 +1274,27 @@ def stop_app_backend(app_name: str) -> bool:
             # Escalate to SIGKILL if still alive
             escalated: list[int] = []
             for pid in pids:
-                # pid_exists (not os.kill(pid,0), which terminates on Windows);
-                # kill_pid dispatches os.kill / taskkill per platform.
-                if platform_compat.pid_exists(pid):
+                # pid_exists (not os.kill(pid,0), which terminates on Windows).
+                # The graceful-shutdown wait above is exactly the window in
+                # which the backend can exit and its PID be recycled, and
+                # SIGKILL is the destructive half — so the escalation re-reads
+                # the start-time identity here (this is what covers POSIX,
+                # where kill_pid_pinned delegates straight through) and the
+                # pinned kill then holds the Windows handle across the signal.
+                if (
+                    platform_compat.pid_exists(pid)
+                    and _proc_start_time(pid) == ap.adopted_start_times[pid]
+                ):
                     try:
-                        platform_compat.kill_pid(pid, platform_compat.SIGKILL)
-                        escalated.append(pid)
+                        if (
+                            platform_compat.kill_pid_pinned(
+                                pid,
+                                ap.adopted_start_times[pid],
+                                platform_compat.SIGKILL,
+                            )
+                            is not False
+                        ):
+                            escalated.append(pid)
                     except (ProcessLookupError, OSError):
                         pass
             if escalated:
@@ -1191,6 +1347,70 @@ def get_app_backend_port(app_name: str) -> int | None:
     with _lock:
         ap = _processes.get(app_name)
         return ap.port if ap and ap.healthy else None
+
+
+def recorded_backend_port(app_name: str) -> int | None:
+    """The port THIS GATEWAY recorded for *app_name*'s backend, or None.
+
+    Gateway-owned provenance, in preference order: the live tracking entry, then
+    the pidfile written at spawn/adoption. Neither is reachable by the app — the
+    pidfile lives under ``KIROCREW_HOME``, not in the app directory — which is
+    what makes this usable as evidence when the app's own manifest is not.
+
+    Must be read BEFORE :func:`stop_app_backend`, which drops both records.
+    """
+    with _lock:
+        ap = _processes.get(app_name)
+        if ap and ap.port:
+            return int(ap.port)
+    entry = _read_pidfile().get(app_name)
+    if isinstance(entry, dict):
+        port = entry.get("port")
+        if isinstance(port, int) and _MIN_PORT <= port <= _MAX_PORT:
+            return port
+    return None
+
+
+def unstopped_backend_port(app_name: str, *, port_hint: int | None = None) -> int | None:
+    """The port *app_name*'s backend is still listening on after a stop, else None.
+
+    Answers the one question :func:`stop_app_backend`'s boolean cannot: it returns
+    ``False`` both for "there was nothing to stop" (never started, already dead,
+    crashed) and for "something is running that I did not stop" (never adopted at
+    boot, or adopted with no usable PIDs) — and ``True`` only means the process it
+    was TRACKING is gone, which says nothing about a detached worker the app
+    spawned for itself. Those need opposite handling, so the caller observes the
+    port instead of reading a flag.
+
+    ``port_hint`` is the gateway-recorded port from :func:`recorded_backend_port`,
+    captured before the stop. It is preferred over the manifest because the
+    manifest is ``app.json`` INSIDE the app directory — writable by any app trusted
+    to run code, so an app could otherwise relabel its port (or claim ``auto``) to
+    hide from this probe. The hint also covers ``port: auto`` backends, whose real
+    port only the gateway ever knew.
+
+    The manifest is the fallback for the case the hint cannot cover: a fixed-port
+    backend this gateway never tracked at all (adoption skipped at boot), where the
+    declared port is the only lead available. Only ``backend.entryPoint`` apps are
+    considered there — an app whose backend is a loopback ``mcpServers`` URL is a
+    process the gateway never spawned and does not own, so a listener on it is not
+    an unstopped child. ``None`` means "nothing observed", not "definitely stopped".
+    """
+    if port_hint is not None:
+        return port_hint if _port_is_listening(port_hint) else None
+    try:
+        manifest = get_app_manifest(app_name)
+        if manifest is None or not manifest.backend.entryPoint:
+            return None
+        port_str = str(manifest.backend.port)
+        if not port_str or port_str == "auto":
+            return None
+        port = int(port_str)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not (_MIN_PORT <= port <= _MAX_PORT):
+        return None
+    return port if _port_is_listening(port) else None
 
 
 # ---------------------------------------------------------------------------
@@ -1305,25 +1525,14 @@ def _proc_start_time(pid: int) -> str | None:
     prior generation against one read now), so it cannot use ``hash()`` — that
     is salted per interpreter by ``PYTHONHASHSEED``.
 
-    Linux reads ``/proc/<pid>/stat`` field 22 (start time in clock ticks since
-    boot): monotonic, locale-independent, and far finer than 1s, so same-second
-    PID reuse cannot alias. macOS falls back to ``ps -o lstart=`` (1s resolution,
-    locale/TZ-formatted); a format/resolution drift there can only make the guard
-    FAIL SAFE (decline to reap → orphan leaks), never kill the wrong process.
+    Per-platform sources live in ``platform_compat.process_start_time``: Linux
+    reads ``/proc/<pid>/stat`` field 22, Windows the process creation FILETIME
+    through a query-only handle, and other POSIX ``ps -o lstart=``. Resolving it
+    there is what keeps the guard alive on Windows — a ``/proc``-or-``ps`` probe
+    answers None for every pid there, and a recorded None makes the reap decline
+    to confirm ANY backend, so nothing is ever reaped and the entries accumulate.
     """
-    try:
-        if sys.platform == "linux":
-            stat = Path(f"/proc/{pid}/stat").read_text()
-            # The comm field can contain spaces/parens; split after the last ')'.
-            fields = stat.rsplit(")", 1)[1].split()
-            return fields[19]  # field 22 (1-based) = starttime in clock ticks
-        out = subprocess.check_output(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
-            stderr=subprocess.DEVNULL, timeout=_PS_TIMEOUT,
-        )
-        return out.decode().strip() or None
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
-        return None
+    return platform_compat.process_start_time(pid)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1372,11 +1581,12 @@ def _record_app_pid(app_name: str, pid: int, port: int) -> None:
     if pid <= 0:
         return
     try:
-        # Compute start_time BEFORE taking the lock: on macOS _proc_start_time
-        # shells out to `ps` (up to _PS_TIMEOUT), and holding _pidfile_lock
-        # across that slow IO would serialize concurrent enable/stop/uninstall
-        # ops behind it. Mirrors the reap path's validate-lock-free /
-        # store-under-lock discipline.
+        # Compute start_time BEFORE taking the lock: the probe is slow on the
+        # platforms that cannot answer from memory (a `ps` spawn on macOS, an
+        # OpenProcess round trip on Windows), and holding _pidfile_lock across
+        # that IO would serialize concurrent enable/stop/uninstall ops behind
+        # it. Mirrors the reap path's validate-lock-free / store-under-lock
+        # discipline.
         start_time = _proc_start_time(pid)
         with _pidfile_lock:
             data = _read_pidfile()
@@ -1456,9 +1666,24 @@ def _reap_stale_app_backends() -> int:
             )
             continue
         try:
-            platform_compat.kill_process_tree(pid, platform_compat.SIGTERM)
+            # Identity-PINNED: on Windows the handle that re-verifies the start
+            # time stays open across the terminate, so the pid taskkill resolves
+            # cannot have been recycled between the check above and the signal.
+            # False means the identity could not be pinned -- keep the entry
+            # (omit from ``handled``) and retry on a later start, exactly as the
+            # unconfirmed-start_time branch above does. POSIX delegates straight
+            # through and is unchanged.
+            signalled = platform_compat.kill_process_tree_pinned(
+                pid, recorded_st, platform_compat.SIGTERM
+            )
         except (ProcessLookupError, OSError):
             handled[app_name] = entry  # gone between the probe and the signal
+            continue
+        if not signalled:
+            logger.info(
+                "Skipping stale-reap of %s pid %d: identity could not be pinned for the kill",
+                app_name, pid,
+            )
             continue
         handled[app_name] = entry
         # Carry recorded_st so the delayed SIGKILL can re-confirm identity before
@@ -1494,7 +1719,17 @@ def _reap_stale_app_backends() -> int:
             )
             continue
         try:
-            platform_compat.kill_process_tree(pid, platform_compat.SIGKILL)
+            # Same pinning as the SIGTERM path, and it matters more here: this is
+            # the destructive escalation, and the grace window above is exactly
+            # the interval in which the pid can be recycled.
+            if not platform_compat.kill_process_tree_pinned(
+                pid, recorded_st, platform_compat.SIGKILL
+            ):
+                logger.info(
+                    "Skipping stale-reap SIGKILL of %s pid %d: identity could not be pinned",
+                    app_name, pid,
+                )
+                continue
         except (ProcessLookupError, OSError):
             continue
         try:

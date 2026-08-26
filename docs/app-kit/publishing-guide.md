@@ -48,7 +48,7 @@ own repo.
 
 | Field | Rules |
 |-------|-------|
-| `name` | Required. Kebab-case, matched against `^[a-z0-9]+(?:-[a-z0-9]+)*$`, unique across all apps. This is the install id and the on-disk directory name. `system` is reserved (it would shadow the `system.*` notification-channel namespace). |
+| `name` | Required. Kebab-case, matched against `^[a-z0-9]+(?:-[a-z0-9]+)*$`, unique across all apps. This is the install id and the on-disk directory name. `system` is reserved (it would shadow the `system.*` notification-channel namespace), as are the Windows device stems `con`, `prn`, `aux`, `nul`, `com1`–`com9` and `lpt1`–`lpt9` (the name becomes a directory, and Windows resolves those inside every directory). Names that merely resemble one — `console`, `com10`, `null-app` — are fine. All are refused on every platform, so an app that installs on Linux also installs on Windows. |
 | `version` | Required. Semver (`major.minor.patch`, optionally with a pre-release or build suffix). Bump on every release. |
 | `displayName` | Required. Rendered in a fixed-width row that truncates, so keep it short. |
 | `description` | Required. Plain text, no markdown. Discover's list row shows one truncated line; the feature cards clamp to two; the detail page shows it in full. Two or three sentences is the useful range. |
@@ -94,10 +94,21 @@ Path form depends on distribution: a registry app uses a repo-relative path
 
 | Field | Rendered where | Aspect |
 |-------|----------------|--------|
-| `iconPath` | Card and row icon, and the gradient fallback's centerpiece | Square PNG with transparency; 256x256 or larger |
+| `iconPath` / `iconPathDark` | Card and row icon, the sidebar glyph, and the gradient fallback's centerpiece | Square, **512x512**, **opaque** — no transparency. The dark variant is optional |
 | `screenshots` / `screenshotsDark` | Detail-page gallery with a lightbox; the first screenshot is also the last-resort hero | Landscape; around 1200px wide |
 | `heroImage` / `heroImageDark` | Discover rows, Library rows, the featured spotlight, feature cards, and the detail banner when no detail-specific art exists | 16:9 (for example 1200x675) |
 | `heroImageDetail` / `heroImageDetailDark` | Detail-page banner only, preferred there over `heroImage` | 25:6 (for example 1200x288) |
+
+The required icon must be **opaque**. An opaque tile carries its own
+background, so it reads correctly on any surface — which is what makes
+`iconPathDark` genuinely optional rather than a latent bug. A transparent icon
+that looks right on light chrome turns into a dark smear on dark chrome, and an
+app that then omits the dark variant ships a broken card.
+
+Built-in first-party apps take a different path: their icon is an SVG under
+`/app-assets/`, inlined and painted from the theme's `--ico-a` / `--ico-b`
+tokens, so a single file covers both appearances and no dark variant exists.
+Raster art cannot repaint, which is the whole reason the variant field is here.
 
 Ship hero art. Every store surface uses it, and it is the difference between
 looking like a product and looking like a list entry.
@@ -338,8 +349,27 @@ MyAppRepo/
 
 ## 10. Add a registry entry
 
-The core registry is `src/kiro_crew/apps/app-registry.json` in the Kiro Crew repo.
-Listing an app there means opening a pull request.
+There are two listing surfaces, and they take different paths:
+
+**The official App Store catalog** lives in its own repository,
+[KiroCrewApps](https://github.com/kirodotdev/KiroCrewApps) — not in the Kiro Crew
+repo. Since the catalog became the store's inventory, publishing an entry there
+is what makes your app appear in the store *and installable*, with **no Kiro
+Crew release involved**. You author a `git` source (URL + a branch or tag; the
+publish pipeline resolves and pins the exact commit) plus a category, and open a
+pull request on that repository. Its README documents the authored schema, the
+validators, and the two-schema (authored vs published) contract. Clients install
+the pinned commit exactly and read update availability from the published
+entry's `version` field, so publishing a new revision of the catalog is also how
+an update reaches users.
+
+**The bundled seed** (`src/kiro_crew/apps/app-registry.json` in the Kiro Crew
+repo) is the catalog's offline snapshot, not the listing surface: it is what a
+client falls back to when the catalog host is unreachable. Entries here ride the
+Kiro Crew release train. A catalog row for the same repository supersedes the
+seed row, so the seed needs touching only when offline availability matters.
+
+The seed (and any federated registry index) uses this row shape:
 
 ```json
 [
@@ -356,21 +386,17 @@ Listing an app there means opening a pull request.
 | `name` | yes | Must match `app.json`'s `name`. |
 | `gitUrl` | yes | Any git-cloneable URL (`https://github.com/...`, `git@host:...`). The legacy `repo` field is still read and used as the clone target when no `gitUrl` is present. |
 | `repo` | | Repo identifier the blob proxy uses to serve committed images. |
-| `branch` | | Branch to read and clone. Defaults to `main`. |
+| `branch` | | Branch to read and clone. Defaults to `main`. For an entry cloning the registry repo itself (the monorepo layout), the registry's **configured** branch overrides this declaration — the index was read from that branch, so a divergent declaration names a state that does not exist there; the divergence is warning-logged. Entries cloning a different repository keep their declared branch. |
 | `subdirectory` | | Path within the repo holding `app.json`, for a monorepo layout. Treated as untrusted: it is joined with symlink-resolving containment and rejected if it escapes the clone root. |
 | `resources` | | `"gateway"` (default) or `"app"`: who registers agents, skills, MCP servers, and crons. |
 | `lifecycle` | | `"gateway"` (default), `"app"`, or `"locked"`: who owns updates and uninstall. |
 | `detectInstalled` | | Shell command that exits 0 when the app is already present on the machine (for self-managed apps). It runs sandboxed with a 5s timeout. |
 | `featured` | | Curator flag for the Discover editorial layer. `true` marks the app featured; a number both marks it and orders the slots (lower first). It lives on the registry entry, not in `app.json`, and is honored only for core-registry entries: a `featured` flag from an external registry is ignored, so adding a registry cannot seize the spotlight. With nothing flagged, the store falls back to a deterministic pick (apps with hero art first, then verified publishers, then name). |
 
-Open the pull request:
-
-```bash
-git checkout -b add-my-app
-# edit src/kiro_crew/apps/app-registry.json
-git commit -am "feat(apps): add my-app to registry"
-git push origin add-my-app
-```
+To reach the official store, open the pull request on **KiroCrewApps** (add your
+entry to `catalog/official-registry.json` there; run its `tools/validate.py`
+first). A seed change in the Kiro Crew repo follows the normal contribution flow
+and ships with the next release.
 
 ## 11. Federated external registries
 
@@ -403,9 +429,11 @@ trusted forge and have the gateway read it with ambient credentials.
 
 **The same-repo carve-out** relaxes that for the monorepo layout. When an index
 entry's effective clone URL is byte-identical to the registry repo URL the owner
-configured, the owner did designate exactly that URL, so manifest fetches and
-installs use owner credentials. The comparison is exact string equality with no
-normalization: sibling repos on the same host stay anonymous and strict.
+configured, the owner did designate exactly that URL, so all three clone
+chokepoints use owner credentials: the manifest fetch, the install clone, and
+the App Store's icon/screenshot blob fetch. The comparison is exact string
+equality with no normalization: sibling repos on the same host stay anonymous
+and strict.
 
 **Private-forge recipe.** On a credential-only forge (SSH keys, no anonymous
 read), keep every app inside the registry repo so the carve-out applies:
@@ -417,8 +445,20 @@ apps/
   other-app/app.json
 ```
 
-Apps in separate repos on the same private forge will not benefit from the
-carve-out and will fail to clone.
+With this layout the store lists, installs, and renders icons/screenshots for
+those apps using the owner's credentials. Apps in separate repos on the same
+private forge do not benefit from the carve-out: they fail to clone, and their
+icons and screenshots fall back to the name-seeded gradient.
+
+**Keep the configured URL byte-identical.** Because the carve-out is exact
+string equality, editing the registry `repo` between otherwise-equivalent forms
+— `ssh://host/x` versus `ssh://user@host/x`, or adding/removing a trailing
+`.git` — silently drops every app back to anonymous + strict. On a credential-only
+forge that means apps stop cloning and icons go blank, and the changed URL also
+triggers a one-time move-aside re-clone of any already-installed app. This is
+deliberate and safe (the new string is a URL the owner did not previously
+designate), but if you see "apps stopped cloning after I changed the registry
+URL", restore the byte-identical value or expect the one-time re-clone to settle.
 
 ## 12. How a user install runs
 
@@ -436,7 +476,11 @@ The store's Install button (`POST /api/apps/registry/install`, or the SSE varian
    app; 60s timeout) and run a detected build: `npm install` plus `npm run build`
    when `package.json` declares a build script, or `pip install .` /
    `pip install -r requirements.txt` for a Python source tree. A missing
-   toolchain is a logged skip, not a failure.
+   toolchain is a logged skip, not a failure. **An official-catalog entry does
+   not clone a branch**: it fetches exactly the commit the published catalog
+   pins and hard-fails on any mismatch, never reuses a pre-existing checkout
+   (the old one is set aside and restored if the install fails), and clones
+   credential-free.
 5. Run `setup.onInstall` (300s).
 6. Resolve declared dependencies.
 7. For a gateway-managed app: copy into `~/.kiro/crew/apps/{name}/`, register
@@ -476,8 +520,13 @@ for what each classification value changes.
 
 ## 13. Updates and versioning
 
-Bump `version` in `app.json` and push. The registry entry carries no version, so
-there is nothing to update there.
+Bump `version` in `app.json` and push. A seed or federated-registry entry
+carries no version, so there is nothing to update there. **An official-catalog
+entry is different**: the published document pins a commit and bakes `version`
+from your `app.json` at publish time, so pushing to your branch changes nothing
+for users — an update ships when the catalog republishes your entry with a new
+pin, and clients detect it by comparing the published `version` against the
+installed one.
 
 - Patch for fixes, minor for features, major for breaking changes (agent config
   schema, MCP tool interface).

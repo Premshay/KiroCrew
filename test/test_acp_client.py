@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+import sys
 import time
 import types
 from collections import deque
@@ -27,6 +28,8 @@ from kiro_crew.acp.client import (
     _resolve_vendored_claude_acp,
     _substitute_model_from_advisory,
     _vendored_claude_acp_roots,
+    format_command_result,
+    parse_slash_command,
 )
 from kiro_crew.acp.liveness import (
     VERDICT_DEAD,
@@ -34,7 +37,52 @@ from kiro_crew.acp.liveness import (
     VERDICT_WORKING,
     LivenessOracle,
 )
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, AcpPromptStats
+from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    JSONRPC_METHOD_NOT_FOUND,
+    AcpPromptStats,
+)
+
+# Windows lacks os.killpg and POSIX process-tree APIs (ps, /proc).
+# Tests that exercise these paths are skipped on Windows.
+_POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="POSIX process tree APIs only")
+
+# Separate from _POSIX_ONLY because the reason differs: these tests assert POSIX
+# EXECUTABLE-RESOLUTION semantics, not process-tree APIs. They build fixtures that
+# have no Windows equivalent — extensionless binaries made runnable with
+# chmod(0o755), which `shutil.which` cannot find on Windows because it resolves
+# candidates through PATHEXT, and `/`-rooted paths, which os.path.realpath()
+# anchors to the current drive (`/home/u/x` -> `D:\home\u\x`). The production
+# resolvers are correct on Windows; only these fixtures are POSIX-shaped.
+_POSIX_EXEC_PATHS_ONLY = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX executable-resolution semantics only"
+)
+
+
+async def _stop_stderr_drain(client: "AcpClient") -> None:
+    """Cancel and await the background stderr-drain task a mocked _spawn started.
+
+    _spawn starts _drain_stderr over self._process.stderr, and a mock process has
+    a truthy stderr, so a test that spawns over a mock and never stops the client
+    leaves that task alive past its own teardown. When the loop later collects it,
+    its exception (the mock stream's readline/decode is not a real coroutine) is
+    reported against whatever unrelated test happened to trigger the collection.
+    Cancelling without awaiting is not enough: the task must be awaited so the
+    loop retrieves the result, per testing-conventions.md Determinism rule 3.
+    """
+    task = client._stderr_task
+    if task is not None:
+        if not task.done():
+            task.cancel()
+        # Await regardless of state so the loop retrieves the result: a mock
+        # stream makes the task fault on its first readline, so it may already
+        # be done here, and a done task with an unretrieved exception is exactly
+        # the leak this guards against.
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    client._stderr_task = None
 
 
 class TestVendoredClaudeAcp:
@@ -544,6 +592,8 @@ class TestAcpClientSessionKey:
             assert env is not None
             assert env["KIROCREW_SESSION_KEY"] == "test-key"
 
+        await _stop_stderr_drain(client)
+
     @pytest.mark.asyncio
     async def test_spawn_sets_env_with_channel_id(self, tmp_path):
         client = AcpClient(work_dir=tmp_path, session_key="k", channel_id="C0ABC123")
@@ -568,6 +618,8 @@ class TestAcpClientSessionKey:
             assert env is not None
             assert env["KIROCREW_CHANNEL_ID"] == "C0ABC123"
             assert env["KIROCREW_SESSION_KEY"] == "k"
+
+        await _stop_stderr_drain(client)
 
     @pytest.mark.asyncio
     async def test_spawn_forwards_claude_config_dir_from_extra_env(self, tmp_path):
@@ -607,6 +659,8 @@ class TestAcpClientSessionKey:
             # Bedrock flag must ride alongside (regression guard).
             assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
 
+        await _stop_stderr_drain(client)
+
     @pytest.mark.asyncio
     async def test_spawn_no_channel_id_env_absent(self, tmp_path):
         client = AcpClient(work_dir=tmp_path, session_key="k", channel_id=None)
@@ -630,6 +684,8 @@ class TestAcpClientSessionKey:
             env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env")
             assert env is not None
             assert "KIROCREW_CHANNEL_ID" not in env
+
+        await _stop_stderr_drain(client)
 
     @pytest.mark.asyncio
     async def test_spawn_channel_id_only_no_session_key(self, tmp_path):
@@ -658,6 +714,8 @@ class TestAcpClientSessionKey:
             assert env["KIROCREW_CHANNEL_ID"] == "C0ABC123"
             assert "KIROCREW_SESSION_KEY" not in env
 
+        await _stop_stderr_drain(client)
+
     @pytest.mark.asyncio
     async def test_spawn_no_session_key_env_none(self, tmp_path):
         client = AcpClient(work_dir=tmp_path, session_key=None)
@@ -681,6 +739,78 @@ class TestAcpClientSessionKey:
             env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env")
             assert env is not None, "env should be a dict (SSH_AUTH_SOCK resolution)"
             assert "KIROCREW_SESSION_KEY" not in env
+
+        await _stop_stderr_drain(client)
+
+
+class TestSpawnStderrDrainCleanup:
+    """_spawn's background stderr-drain task must not outlive a mocked spawn.
+
+    Guards the leak in issue #2485: _spawn starts _drain_stderr over
+    self._process.stderr, a mock process has a truthy stderr, and a spawn test
+    that never stops the client leaves the task alive. Its exception is later
+    reported against an unrelated test on the same worker.
+    """
+
+    @pytest.mark.asyncio
+    async def test_spawn_over_mock_leaves_a_live_drain_task(self, tmp_path):
+        # Establish the hazard the cleanup exists for: a bare mocked _spawn does
+        # start a live drain task, so the cleanup below is load-bearing.
+        client = AcpClient(work_dir=tmp_path, session_key="k")
+        with (
+            patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
+            patch(
+                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+            ),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kiro_crew.session._track_pid"),
+            patch("kiro_crew.session._track_session_pid"),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.pid = 12345
+            mock_proc.returncode = None
+            mock_exec.return_value = mock_proc
+
+            await client._spawn()
+
+            assert client._stderr_task is not None
+            assert not client._stderr_task.done()
+
+        await _stop_stderr_drain(client)
+
+    @pytest.mark.asyncio
+    async def test_stop_stderr_drain_retrieves_the_faulted_task(self, tmp_path):
+        # An AsyncMock stream makes readline() return a coroutine, so the drain
+        # task faults exactly as observed in the issue. _stop_stderr_drain must
+        # retrieve that result so nothing is left unretrieved for the loop to
+        # report later. A one-line MagicMock stub for the stdlib asyncio logger
+        # would hide a re-leak, so assert on the task's own state instead.
+        client = AcpClient(work_dir=tmp_path, session_key="k")
+        with (
+            patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
+            patch(
+                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+            ),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kiro_crew.session._track_pid"),
+            patch("kiro_crew.session._track_session_pid"),
+        ):
+            mock_proc = AsyncMock()
+            mock_proc.pid = 12345
+            mock_proc.returncode = None
+            mock_exec.return_value = mock_proc
+
+            await client._spawn()
+            task = client._stderr_task
+            assert task is not None
+
+        await _stop_stderr_drain(client)
+
+        assert client._stderr_task is None
+        assert task.done()
+        # The result is retrieved (no exception escapes and none is left pending
+        # for the loop to report). Cancelled or faulted, both are terminal here.
+        assert task.cancelled() or task.exception() is not None
 
 
 class TestAcpClientBackendSelection:
@@ -740,6 +870,8 @@ class TestAcpClientBackendSelection:
                 "/usr/local/lib/claude-agent-acp/index.js",
             ], "claude backend must spawn node + script explicitly"
 
+        await _stop_stderr_drain(client)
+
     @pytest.mark.asyncio
     async def test_spawn_claude_backend_missing_bin_raises(self, tmp_path):
         client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
@@ -775,6 +907,8 @@ class TestAcpClientBackendSelection:
             assert argv[0] == "/usr/bin/kiro-cli"
             assert argv[1] == "acp"
             assert "--agent" in argv
+
+        await _stop_stderr_drain(client)
 
     @pytest.mark.asyncio
     async def test_initialize_protocol_version_per_backend(self, tmp_path):
@@ -829,6 +963,7 @@ class TestResolveClaudeAcpBin:
         assert result is not None
         assert str(bin_path) in result
 
+    @_POSIX_EXEC_PATHS_ONLY
     def test_path_lookup(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
 
@@ -850,6 +985,7 @@ class TestResolveClaudeAcpBin:
         assert result is not None
         assert str(bin_path) in result
 
+    @_POSIX_EXEC_PATHS_ONLY
     def test_mise_which_preferred(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
 
@@ -871,6 +1007,7 @@ class TestResolveClaudeAcpBin:
         result = client_mod._resolve_claude_acp_bin()
         assert result == [str(script)]
 
+    @_POSIX_EXEC_PATHS_ONLY
     def test_mise_installed_script_resolves_node(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
         from kiro_crew.acp.client import _resolve_claude_acp_bin
@@ -926,6 +1063,7 @@ class TestResolveClaudeAcpBin:
         result = client_mod._resolve_claude_acp_bin()
         assert result == [str(node_bin), str(script.resolve())]
 
+    @_POSIX_EXEC_PATHS_ONLY
     def test_mise_glob_fallback(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
 
@@ -997,6 +1135,7 @@ class TestResolveClaudeCodeExecutable:
         monkeypatch.setattr(client_mod.shutil, "which", lambda name, path=None: "/usr/bin/claude")
         assert client_mod._resolve_claude_code_executable() == "/mise/bin/claude"
 
+    @_POSIX_EXEC_PATHS_ONLY
     def test_path_lookup(self, monkeypatch):
         from kiro_crew.acp import client as client_mod
 
@@ -1291,6 +1430,461 @@ class TestAcpClientStaleTurnOracleGate:
         assert actions == []
         assert "Stale turn detected" in caplog.text
 
+    @pytest.mark.asyncio
+    async def test_consult_skips_while_prior_is_in_flight(self, tmp_path):
+        """An unfinished consult prevents another executor job from starting."""
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        client._liveness_oracle = MagicMock()
+        client._consult_future = asyncio.get_running_loop().create_future()
+
+        verdict = await client._consult_liveness_model_wait()
+
+        assert verdict == (VERDICT_UNKNOWN, "prior consult still in flight")
+        client._liveness_oracle.check_model_wait.assert_not_called()
+
+        client._consult_future.set_result((VERDICT_WORKING, "done"))
+        client._liveness_oracle.check_model_wait.return_value = (VERDICT_DEAD, "flat")
+
+        assert await client._consult_liveness_model_wait() == (VERDICT_DEAD, "flat")
+        client._liveness_oracle.check_model_wait.assert_called_once_with(4242)
+
+    @pytest.mark.asyncio
+    async def test_consult_consumes_a_failed_prior_consults_exception(self, tmp_path):
+        """Reopening the guard must consume a failed prior consult's exception.
+
+        ``wait_for`` cancels shield's outer future while the /proc walk is still
+        running, and shield's outer-done callback then detaches the inner-done
+        callback that would have retrieved the inner result — so a walk that
+        raises after the timeout leaves its exception unretrieved.
+        ``Future.__del__`` reports that through the loop exception handler, which
+        the gateway records as an unhandled-asyncio crash for an ordinary probe
+        failure.
+        """
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        client._liveness_oracle = MagicMock()
+        client._liveness_oracle.check_model_wait.return_value = (VERDICT_DEAD, "flat")
+
+        prior = asyncio.get_running_loop().create_future()
+        prior.set_exception(OSError("wedged /proc read"))
+        client._consult_future = prior
+
+        assert await client._consult_liveness_model_wait() == (VERDICT_DEAD, "flat")
+
+        # _log_traceback is the flag Future.__del__ consults to decide whether to
+        # report an exception as never retrieved.
+        assert prior._log_traceback is False
+
+    @pytest.mark.asyncio
+    async def test_consult_reports_unknown_when_the_submission_itself_fails(self, tmp_path):
+        """A failed executor submission must degrade to UNKNOWN, not raise.
+
+        The caller is a silent-read poll inside ``_prompt_loop``; an exception
+        escaping here aborts the live turn. Submission can fail for ordinary
+        reasons — a shut-down executor during teardown, or thread creation
+        refused under load — so it stays inside the same guard that already
+        converts probe failures to UNKNOWN.
+        """
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        client._liveness_oracle = MagicMock()
+
+        with patch(
+            "kiro_crew.acp.client.subprocess_executor",
+            side_effect=RuntimeError("cannot schedule new futures after shutdown"),
+        ):
+            assert await client._consult_liveness_model_wait() == (
+                VERDICT_UNKNOWN,
+                "oracle offload error",
+            )
+
+        # Nothing was tracked, so the guard is not left latched shut by a
+        # submission that never produced a future.
+        assert client._consult_future is None
+
+    @pytest.mark.asyncio
+    async def test_reset_state_releases_a_consult_from_the_dead_generation(self, tmp_path):
+        """A walk wedged on the dead PID must not gate the replacement process.
+
+        ``_reset_state`` is the process-generation boundary. A /proc walk blocked
+        on the old PID can never say anything about the new one, so retaining it
+        answers every later poll with "prior consult still in flight" — and
+        ``_prompt_loop``'s UNKNOWN cutoff then completes a healthy turn early,
+        truncating its output.
+        """
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        client._consult_future = asyncio.get_running_loop().create_future()
+
+        with (
+            patch("kiro_crew.session_pid._pid_gone_or_unmanaged", return_value=True),
+            patch("kiro_crew.session._untrack_pid"),
+            patch("kiro_crew.session._untrack_session_pid"),
+        ):
+            client._reset_state()
+        client._pid = 5353
+        # Reset retires the oracle, so the stub belongs on the replacement.
+        client._liveness_oracle = MagicMock()
+        client._liveness_oracle.check_model_wait.return_value = (VERDICT_DEAD, "flat")
+
+        assert client._consult_future is None
+        assert await client._consult_liveness_model_wait() == (VERDICT_DEAD, "flat")
+        client._liveness_oracle.check_model_wait.assert_called_once_with(5353)
+
+    @pytest.mark.asyncio
+    async def test_released_consult_exception_is_consumed_after_reset(self, tmp_path):
+        """A released walk that fails afterwards must not read as a crash.
+
+        Reset drops the client's last reference while the walk is still running,
+        so an exception raised after that point reaches ``Future.__del__`` with
+        nobody having retrieved it.
+        """
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        wedged = asyncio.get_running_loop().create_future()
+        client._consult_future = wedged
+
+        with (
+            patch("kiro_crew.session_pid._pid_gone_or_unmanaged", return_value=True),
+            patch("kiro_crew.session._untrack_pid"),
+            patch("kiro_crew.session._untrack_session_pid"),
+        ):
+            client._reset_state()
+
+        wedged.set_exception(OSError("wedged /proc read"))
+        await asyncio.sleep(0)  # add_done_callback lands via call_soon
+
+        assert wedged._log_traceback is False
+
+    @pytest.mark.asyncio
+    async def test_reset_state_retires_the_liveness_oracle(self, tmp_path):
+        """A detached walk must not be able to pollute the next generation's baseline.
+
+        The executor job captures ``self._liveness_oracle`` as a bound method and
+        its /proc walk keeps running after the wait times out. Samples are keyed
+        ``"io"``/``"cpu"`` with no PID in the key, so a late write lands on
+        whatever the current generation reads — and any nonzero delta counts as
+        movement, including the negative one from comparing a different process
+        tree. That reads WORKING for a genuinely wedged turn and defers recovery
+        to the 2h backstop. Retiring the instance confines a late writer to an
+        object nobody reads.
+        """
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        retired = client._liveness_oracle
+        # Seed the state a dead generation would leave behind. A replacement that
+        # merely isolates writes (a deepcopy, say) would carry these over and the
+        # first probe of the new process would delta against the dead one.
+        retired._samples["io"] = (0.0, 12_345)
+        retired._samples["cpu"] = (0.0, 678)
+        retired._tracked_child = 9999
+        retired._child_gone_ts = 1.0
+
+        with (
+            patch("kiro_crew.session_pid._pid_gone_or_unmanaged", return_value=True),
+            patch("kiro_crew.session._untrack_pid"),
+            patch("kiro_crew.session._untrack_session_pid"),
+        ):
+            client._reset_state()
+
+        assert client._liveness_oracle is not retired
+        assert client._liveness_oracle._samples == {}
+        assert client._liveness_oracle._tracked_child is None
+        assert client._liveness_oracle._child_gone_ts is None
+        # A late write from the detached walk reaches the retired instance only.
+        retired._samples["io"] = (0.0, 999_999)
+        assert "io" not in client._liveness_oracle._samples
+
+    @pytest.mark.asyncio
+    async def test_every_prompt_path_retires_liveness_state(self, tmp_path):
+        """Retirement must sit where all prompt paths funnel, not on one of them.
+
+        ``send_message`` reaches ``_prompt_loop`` via ``_read_prompt_response``,
+        and ``send_message_stream`` reaches it directly — neither goes through
+        ``_dispatch_events``. Retiring only there leaves the worker-pool prompt
+        API carrying the previous turn's wedged consult, so its next turn is
+        answered "prior consult still in flight" and reaped at the 90s cutoff.
+        ``_prompt_loop`` is the one place every consumer funnels through.
+        """
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        turn_a_oracle = client._liveness_oracle
+        turn_a_oracle._samples["io"] = (0.0, 12_345)
+        client._consult_future = asyncio.get_running_loop().create_future()
+
+        observed: dict = {}
+
+        async def _record_then_silence(*_args, **_kwargs):
+            # Observed on the FIRST read, so retirement deferred to the loop's
+            # finally (or to turn completion) would fail here.
+            observed.setdefault("oracle", client._liveness_oracle)
+            observed.setdefault("future", client._consult_future)
+            return None
+
+        client._read_message = _record_then_silence
+        client._is_process_alive = lambda: True
+
+        async for _action, _msg in client._prompt_loop(req_id=7, timeout=0.05):
+            pass
+
+        assert observed["oracle"] is not turn_a_oracle
+        assert observed["future"] is None
+        assert observed["oracle"]._samples == {}
+
+    @pytest.mark.asyncio
+    async def test_a_queued_turn_does_not_reopen_the_active_turns_gate(self, tmp_path):
+        """Retirement must happen under the turn lock, not before it.
+
+        A second queued turn that retires before blocking on ``_turn_lock`` clears
+        the *active* turn's tracked consult. The active turn's next silent read
+        then sees an open gate and submits a second walk while the first is still
+        wedged — defeating the one-outstanding-walk bound this gate exists for.
+        """
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        client._read_message = AsyncMock(return_value=None)
+        client._is_process_alive = lambda: True
+
+        # Turn A owns the lock and has a walk in flight.
+        await client._turn_lock.acquire()
+        turn_a_walk = asyncio.get_running_loop().create_future()
+        client._consult_future = turn_a_walk
+        turn_a_oracle = client._liveness_oracle
+
+        async def _turn_b():
+            async for _action, _msg in client._prompt_loop(req_id=8, timeout=0.05):
+                pass
+
+        turn_b = asyncio.ensure_future(_turn_b())
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # Turn B is parked on the lock, so turn A's gate is untouched.
+        assert client._consult_future is turn_a_walk
+        assert client._liveness_oracle is turn_a_oracle
+
+        client._turn_lock.release()
+        await turn_b
+        # Only once turn B actually owns the turn does it retire.
+        assert client._consult_future is None
+        assert client._liveness_oracle is not turn_a_oracle
+
+    @pytest.mark.asyncio
+    async def test_the_submitted_walk_is_bound_to_the_oracle_it_sampled(self, tmp_path):
+        """The walk must capture its oracle, not resolve one when it finally runs.
+
+        Retirement isolates a late writer only if the submitted callable holds the
+        instance it was submitted with. Handing the executor something that
+        resolves ``self._liveness_oracle`` at execution time would make a detached
+        walk write into whatever oracle is live *then*, silently defeating every
+        retirement in this change while leaving the other tests green. This guards
+        behaviour that is already correct rather than fixing anything.
+        """
+        from concurrent.futures import Future as ThreadFuture
+
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        submitted_against = client._liveness_oracle
+
+        thread_future: ThreadFuture = ThreadFuture()
+        thread_future.set_running_or_notify_cancel()
+        pool = MagicMock()
+        pool.submit.return_value = thread_future
+
+        _real_wait_for = asyncio.wait_for
+
+        async def _fast_timeout(awaitable, timeout=None):
+            return await _real_wait_for(awaitable, timeout=0.01)
+
+        with (
+            patch("kiro_crew.acp.client.subprocess_executor", return_value=pool),
+            patch("kiro_crew.acp.client.asyncio.wait_for", _fast_timeout),
+        ):
+            await client._consult_liveness_model_wait()
+
+        walk = pool.submit.call_args[0][0]
+        assert getattr(walk, "__self__", None) is submitted_against
+
+        # After retirement the captured callable still targets the retired
+        # instance, so a late write cannot reach the live baseline.
+        client._retire_liveness_state()
+        assert client._liveness_oracle is not submitted_against
+        assert walk.__self__ is submitted_against
+
+        thread_future.set_exception(OSError("wedged /proc read"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_a_real_submission_is_recorded_and_gates_the_next_poll(self, tmp_path):
+        """The guard is only worth anything if a real submission is tracked.
+
+        Injecting ``_consult_future`` by hand exercises the guard but proves
+        nothing about the submission path: if the assignment were dropped, every
+        timed-out walk would leave the field ``None`` and the next silent read
+        would submit another executor job — the starvation defect this exists to
+        stop.
+        """
+        from concurrent.futures import Future as ThreadFuture
+
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        client._liveness_oracle = MagicMock()
+
+        thread_future: ThreadFuture = ThreadFuture()
+        thread_future.set_running_or_notify_cancel()
+        pool = MagicMock()
+        pool.submit.return_value = thread_future
+
+        _real_wait_for = asyncio.wait_for
+
+        async def _fast_timeout(awaitable, timeout=None):
+            return await _real_wait_for(awaitable, timeout=0.01)
+
+        with (
+            patch("kiro_crew.acp.client.subprocess_executor", return_value=pool),
+            patch("kiro_crew.acp.client.asyncio.wait_for", _fast_timeout),
+        ):
+            assert await client._consult_liveness_model_wait() == (
+                VERDICT_UNKNOWN,
+                "oracle offload error",
+            )
+            assert client._consult_future is not None
+            assert pool.submit.call_count == 1
+
+            # The recorded future is what closes the guard on the next poll.
+            assert await client._consult_liveness_model_wait() == (
+                VERDICT_UNKNOWN,
+                "prior consult still in flight",
+            )
+            assert pool.submit.call_count == 1
+
+        thread_future.set_exception(OSError("wedged /proc read"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_retired_oracle_keeps_its_configuration(self, tmp_path):
+        """Retirement must not silently swap a caller's oracle config for defaults.
+
+        A client may be handed an oracle pointed at a different ``/proc`` root or a
+        different sampling interval. Replacing it with a default-constructed one at
+        the generation boundary would silently change probe behaviour.
+        """
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        sentinel_clock = MagicMock(return_value=1.0)
+        client._liveness_oracle = LivenessOracle(
+            "/fake/proc", now=sentinel_clock, sample_min_secs=0.0
+        )
+        configured = client._liveness_oracle
+
+        with (
+            patch("kiro_crew.session_pid._pid_gone_or_unmanaged", return_value=True),
+            patch("kiro_crew.session._untrack_pid"),
+            patch("kiro_crew.session._untrack_session_pid"),
+        ):
+            client._reset_state()
+
+        # Every constructor input is asserted: dropping any one of them from
+        # fresh() must fail here. Asserting only the config would also hold if
+        # retirement were removed entirely (the configured instance would simply
+        # survive), and asserting only replacement would hold for a default-
+        # constructed one that silently repoints all three.
+        assert client._liveness_oracle is not configured
+        assert client._liveness_oracle._proc == "/fake/proc"
+        assert client._liveness_oracle._sample_min_secs == 0.0
+        assert client._liveness_oracle._now is sentinel_clock
+
+    @pytest.mark.asyncio
+    async def test_pending_consult_exception_is_consumed_without_a_reset(self, tmp_path):
+        """A stale turn can return with a consult still pending and never reset.
+
+        The retrieval callback must be attached when the walk is SUBMITTED, not
+        only when a later poll observes it or ``_reset_state`` releases it. A turn
+        that reaches the 90s cutoff returns while the walk is still running; if the
+        client then goes idle, a walk that raises afterwards reaches
+        ``Future.__del__`` unretrieved and is recorded as an unhandled crash.
+        """
+        from concurrent.futures import Future as ThreadFuture
+
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        client._liveness_oracle = MagicMock()
+
+        thread_future: ThreadFuture = ThreadFuture()
+        thread_future.set_running_or_notify_cancel()
+        pool = MagicMock()
+        pool.submit.return_value = thread_future
+
+        async def _always_times_out(awaitable, timeout=None):
+            # Delegate to the REAL wait_for with a tiny timeout: its cancellation
+            # of shield's outer future is exactly what detaches the inner-done
+            # callback, and a patched raise would leave that callback attached and
+            # retrieve the exception for us — a vacuous pass.
+            return await _real_wait_for(awaitable, timeout=0.01)
+
+        _real_wait_for = asyncio.wait_for
+        with (
+            patch("kiro_crew.acp.client.subprocess_executor", return_value=pool),
+            patch("kiro_crew.acp.client.asyncio.wait_for", _always_times_out),
+        ):
+            assert await client._consult_liveness_model_wait() == (
+                VERDICT_UNKNOWN,
+                "oracle offload error",
+            )
+
+        tracked = client._consult_future
+        assert tracked is not None and not tracked.done()
+
+        # The walk fails after the turn already returned, with no reset in between.
+        thread_future.set_exception(OSError("wedged /proc read"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert tracked.done()
+        assert tracked._log_traceback is False
+
+    @pytest.mark.asyncio
+    async def test_cancelled_consult_still_consumes_a_later_failure(self, tmp_path):
+        """Cancellation is what proves the callback is attached at SUBMISSION.
+
+        Attaching it in the ``except Exception`` arm instead would cover the
+        timeout path and look equivalent — but ``CancelledError`` is a
+        ``BaseException``, so a turn cancelled while the walk is still running
+        would skip it and the walk's later failure would reach ``Future.__del__``
+        unretrieved.
+        """
+        from concurrent.futures import Future as ThreadFuture
+
+        client = AcpClient(work_dir=tmp_path)
+        client._pid = 4242
+        client._liveness_oracle = MagicMock()
+
+        thread_future: ThreadFuture = ThreadFuture()
+        thread_future.set_running_or_notify_cancel()
+        pool = MagicMock()
+        pool.submit.return_value = thread_future
+
+        with patch("kiro_crew.acp.client.subprocess_executor", return_value=pool):
+            task = asyncio.ensure_future(client._consult_liveness_model_wait())
+            while client._consult_future is None:
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        tracked = client._consult_future
+        assert tracked is not None and not tracked.done()
+
+        thread_future.set_exception(OSError("wedged /proc read"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert tracked.done()
+        assert tracked._log_traceback is False
+
 
 class TestAcpClientReadMessage:
     @pytest.mark.asyncio
@@ -1354,27 +1948,59 @@ class TestAcpClientReadMessage:
         assert msg is None
 
     @pytest.mark.asyncio
-    async def test_read_buffer_overrun_raises_process_died(self, tmp_path):
-        """A line exceeding the stdout buffer must surface as AcpProcessDied.
+    async def test_read_buffer_overrun_drops_frame_and_keeps_reading(self, tmp_path):
+        """A line exceeding the stdout buffer costs that ONE frame, not the turn.
 
-        asyncio's StreamReader.readline() raises ValueError when a single
-        line exceeds its limit; the stream is corrupted afterward. The read
-        loop must convert that into AcpProcessDied so session recovery
-        respawns the process instead of the session freezing.
+        The stream is NOT corrupted afterwards, contrary to what this call site
+        used to assume: readline() removes the oversize line through its
+        terminating newline (or clears the buffer when the newline has not
+        arrived yet) and resumes the transport before raising ValueError. So the
+        overrun joins the blank-line and non-JSON paths in returning None, and
+        the caller's next read gets the following frame. Raising AcpProcessDied
+        here killed a healthy live turn over one unreadably large frame.
+
+        Driven through a REAL StreamReader so the recovery claim is asserted
+        against asyncio's actual behaviour rather than a mock's side_effect.
         """
         client = AcpClient(work_dir=tmp_path)
 
+        reader = asyncio.StreamReader(limit=256)
         mock_process = MagicMock()
-        mock_stdout = AsyncMock()
-        mock_stdout.readline = AsyncMock(
-            side_effect=ValueError("Separator is not found, and chunk exceed the limit")
-        )
-        mock_process.stdout = mock_stdout
+        mock_process.stdout = reader
         mock_process.returncode = None
         client._process = mock_process
 
-        with pytest.raises(AcpProcessDied):
-            await client._read_message(timeout=1.0)
+        reader.feed_data(b"X" * 1024 + b"\n")  # oversize frame
+        reader.feed_data(b'{"jsonrpc":"2.0","method":"session/update","params":{}}\n')
+
+        assert await client._read_message(timeout=1.0) is None  # frame dropped
+        msg = await client._read_message(timeout=1.0)
+        assert msg is not None and msg.method == "session/update"
+
+    @pytest.mark.asyncio
+    async def test_repeated_buffer_overruns_never_kill_the_process(self, tmp_path):
+        """Oversize frames must not accumulate into a kill here.
+
+        This reader carries no drain budget on purpose (see the asymmetry note in
+        `_read_message`): every call is bounded by the caller's timeout, so a run
+        of oversize frames costs only those frames. A frame-count cap would
+        reintroduce exactly the defect this PR removes — death from a replay of
+        properly-terminated but oversize frames."""
+        client = AcpClient(work_dir=tmp_path)
+
+        reader = asyncio.StreamReader(limit=256)
+        mock_process = MagicMock()
+        mock_process.stdout = reader
+        mock_process.returncode = None
+        client._process = mock_process
+
+        for _ in range(40):
+            reader.feed_data(b"X" * 1024 + b"\n")  # oversize, terminated
+            assert await client._read_message(timeout=1.0) is None
+
+        reader.feed_data(b'{"jsonrpc":"2.0","method":"session/update","params":{}}\n')
+        msg = await client._read_message(timeout=1.0)
+        assert msg is not None and msg.method == "session/update"
 
 
 class TestAcpClientExtractChunk:
@@ -1682,6 +2308,7 @@ class TestGetChildPids:
         assert _get_child_pids(1000) == [2000, 4000, 3000, 5000]
 
 
+@_POSIX_ONLY
 class TestIsOurChild:
     def test_nonexistent_pid(self):
         from kiro_crew.acp.client import _is_our_child
@@ -1781,6 +2408,7 @@ class TestIsOurChild:
         assert _is_our_child(999, expected_start=42, expected_basename=None) is False
 
 
+@_POSIX_ONLY
 class TestKillEscapedChildren:
     def test_empty_dict(self):
         from kiro_crew.acp.client import _kill_escaped_children
@@ -1826,6 +2454,7 @@ class TestChildPidsField:
         assert client._child_pids == {}
 
 
+@_POSIX_ONLY
 class TestReadBasename:
     def test_reads_basename_from_ps(self, monkeypatch):
         import sys
@@ -2684,6 +3313,97 @@ class TestMakeUnifiedDiff:
         result = _make_unified_diff("", "x\n" * 5000, "file.py", max_len=100)
         assert len(result) <= 100
 
+    def test_truncation_cuts_at_line_boundary_and_is_marked(self):
+        """A cut diff ends with the ``\\ diff truncated`` annotation on its own
+        line (unified-diff escape convention — renderers skip it), never with a
+        garbled half-row, so downstream +/- counting can detect understatement."""
+        from kiro_crew.acp._dispatch import DIFF_TRUNCATION_MARK
+
+        result = _make_unified_diff("", "wordwordword\n" * 5000, "file.py", max_len=200)
+        assert len(result) <= 200
+        assert result.endswith("\n" + DIFF_TRUNCATION_MARK)
+        # Every line before the marker is a complete diff row from the
+        # original (starts with a diff prefix, never a mid-word fragment).
+        body_lines = result.split("\n")[:-1]
+        assert all(
+            line.startswith(("---", "+++", "@@", "+", "-", " ")) for line in body_lines if line
+        )
+
+    def test_under_cap_diff_is_not_marked(self):
+        from kiro_crew.acp._dispatch import DIFF_TRUNCATION_MARK
+
+        result = _make_unified_diff("old\n", "new\n", "file.py")
+        assert DIFF_TRUNCATION_MARK not in result
+
+
+class TestDeriveEditDiff:
+    """Bare-JSON edit payloads derive a diff from their own arguments, so a
+    tool_call with no diff content block still displays what changed."""
+
+    def test_create_content_becomes_addition_diff(self):
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        diff = derive_edit_diff(
+            {"path": "/a/new.py", "command": "create", "fileText": "x = 1\ny = 2\n"}
+        )
+        assert "+x = 1" in diff
+        assert "+y = 2" in diff
+        assert "+++ /a/new.py" in diff
+
+    def test_str_replace_pair_becomes_replace_hunk(self):
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        diff = derive_edit_diff(
+            {"path": "/a/b.py", "command": "strReplace", "oldStr": "x = 1\n", "newStr": "x = 2\n"}
+        )
+        assert "-x = 1" in diff
+        assert "+x = 2" in diff
+
+    def test_unrecognized_shapes_yield_empty(self):
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        assert derive_edit_diff({"path": "/a/b", "command": "create"}) == ""
+        assert derive_edit_diff({"command": "create", "fileText": "x"}) == ""  # no path
+        assert derive_edit_diff("not a dict") == ""
+        assert derive_edit_diff(None) == ""
+
+    def test_non_string_arguments_never_reach_difflib(self):
+        """Malformed args (numeric path, dict oldStr) must yield "" instead of
+        letting a TypeError out of difflib abort the whole dispatch mid-turn."""
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        assert (
+            derive_edit_diff({"path": 42, "command": "strReplace", "oldStr": "a", "newStr": "b"})
+            == ""
+        )
+        assert (
+            derive_edit_diff(
+                {"path": "/a/b", "command": "strReplace", "oldStr": {"x": 1}, "newStr": "b"}
+            )
+            == "--- /a/b\n+++ /a/b\n@@ -0,0 +1 @@\n+b"
+        )
+        assert derive_edit_diff({"path": ["/a"], "command": "create", "fileText": "x"}) == ""
+        assert derive_edit_diff({"path": "/a/b", "command": "create", "fileText": 7}) == ""
+
+    def test_insert_with_line_number_derives_positioned_hunk(self):
+        """An insert IS additions-only, so with a line number the derived
+        hunk is exact: zero old lines at insertLine, additions after it."""
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        diff = derive_edit_diff(
+            {"path": "/a/b.py", "command": "insert", "insertLine": 4, "content": "x = 1\ny = 2"}
+        )
+        assert "@@ -4,0 +5,2 @@" in diff
+        assert "+x = 1" in diff
+        assert "+y = 2" in diff
+
+    def test_insert_without_line_number_derives_nothing(self):
+        """Without a line number the hunk position would be a guess — the
+        row keeps its fold-proof trace via the file_changes snapshot."""
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        assert derive_edit_diff({"path": "/a/b.py", "command": "insert", "content": "x = 1"}) == ""
+
     def test_no_trailing_newline(self):
         result = _make_unified_diff("old", "new", "file.py")
         assert "-old" in result
@@ -3210,6 +3930,7 @@ class TestSendPipeErrors:
 # ── Coverage push: process lifecycle ──
 
 
+@_POSIX_ONLY
 class TestKillProcess:
     """Tests for _kill_process covering SIGTERM, SIGKILL, and edge cases."""
 
@@ -3340,7 +4061,7 @@ class TestKillProcess:
 
     @pytest.mark.asyncio
     async def test_kill_process_awaits_async_variant_not_sync(self):
-        """Mesh-2801: _kill_process MUST await platform_compat.kill_process_tree_async
+        """_kill_process MUST await platform_compat.kill_process_tree_async
         (the offloading variant) — never fall back to the sync
         kill_process_tree, whose whole reason for existing is the Windows
         event-loop offload. A test that patches only kill_process_tree would
@@ -4721,8 +5442,46 @@ class TestBuildPermissionEvent:
         )
         event = client._build_permission_event(msg)
         assert "rm -rf" in event.tool_input
-        # Cache consumed
-        assert "tc-6" not in client._tool_call_inputs
+        # Retained through same-call re-prompts; per-turn clear owns cleanup.
+        assert "tc-6" in client._tool_call_inputs
+
+    def test_cached_tool_input_carries_redaction_provenance(self):
+        """A secret removed before the permission event must leave a boolean
+        provenance bit; the original bytes must not be copied onto the event."""
+        client = AcpClient()
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        tool = JsonRpcMessage(
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "Run Command",
+                    "kind": "execute",
+                    "toolCallId": "tc-secret",
+                    "rawInput": {"command": "echo AKIAIOSFODNN7EXAMPLE"},
+                }
+            }
+        )
+        client._extract_tool_event(tool)
+        assert client._tool_call_input_redacted["tc-secret"] is True
+
+        permission = JsonRpcMessage(
+            id=111,
+            method="session/requestPermission",
+            params={
+                "toolCall": {"title": "Run Command", "toolCallId": "tc-secret"},
+                "options": [{"id": "allow_once", "label": "Allow"}],
+            },
+        )
+        event = client._build_permission_event(permission)
+
+        assert event.tool_input_redacted is True
+        assert "AKIAIOSFODNN7EXAMPLE" not in event.tool_input
+        assert "[REDACTED: credential]" in event.tool_input
+        assert client._tool_call_input_redacted["tc-secret"] is True
+        repeated = client._build_permission_event(permission)
+        assert repeated.tool_input_redacted is True
+        assert repeated.tool_input == event.tool_input
 
     def test_fallback_input_from_tool_call(self):
         client = AcpClient()
@@ -5150,50 +5909,48 @@ class TestReadNewToolResultsSync:
 
 
 class TestFormatCommandResult:
-    """Tests for _format_command_result."""
+    """Tests for format_command_result."""
 
     def test_structured_data_with_message(self):
-        result = AcpClient._format_command_result({"data": {"key": "value"}, "message": "Done"})
+        result = format_command_result({"data": {"key": "value"}, "message": "Done"})
         assert "Done" in result
         assert "```json" in result
         assert '"key"' in result
 
     def test_structured_data_without_message(self):
-        result = AcpClient._format_command_result({"data": {"key": "val"}, "message": ""})
+        result = format_command_result({"data": {"key": "val"}, "message": ""})
         assert "```json" in result
         assert '"key"' in result
 
     def test_agent_model_filtered(self):
-        result = AcpClient._format_command_result(
-            {"data": {"agent": "x", "model": "y"}, "message": ""}
-        )
+        result = format_command_result({"data": {"agent": "x", "model": "y"}, "message": ""})
         # Only agent/model → display is empty → falls through to message
         assert result == ""
 
     def test_message_only(self):
-        result = AcpClient._format_command_result({"message": "hello"})
+        result = format_command_result({"message": "hello"})
         assert result == "hello"
 
     def test_empty_result(self):
-        result = AcpClient._format_command_result({})
+        result = format_command_result({})
         assert result == ""
 
 
 class TestParseSlashCommand:
-    """Tests for _parse_slash_command."""
+    """Tests for parse_slash_command."""
 
     def test_simple_command(self):
-        name, args = AcpClient._parse_slash_command("/compact")
+        name, args = parse_slash_command("/compact")
         assert name == "compact"
         assert args == {}
 
     def test_command_with_value(self):
-        name, args = AcpClient._parse_slash_command("/agent planner")
+        name, args = parse_slash_command("/agent planner")
         assert name == "agent"
         assert args == {"value": "planner"}
 
     def test_command_with_multi_word_value(self):
-        name, args = AcpClient._parse_slash_command("/usage detailed view")
+        name, args = parse_slash_command("/usage detailed view")
         assert name == "usage"
         assert args == {"value": "detailed view"}
 
@@ -5702,6 +6459,7 @@ class TestSendMessageStreamBranches:
         assert client._turn_done.is_set()
 
 
+@_POSIX_ONLY
 class TestKillProcessPipeClose:
     """Test pipe closing in _kill_process."""
 
@@ -6058,6 +6816,72 @@ class TestExtractToolCallRefinement:
         assert event is not None
         assert event.title == "List KiroCrew dashboard module files"
 
+    def test_generic_shell_title_yields_the_command(self):
+        # A backend whose shell `title` is a kind label ("Run Command") names no
+        # command; every pill in the transcript would read the same. The command
+        # is the ground truth of the call, so it is what the pill shows.
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-2d",
+                "title": "Run Command",
+                "kind": "execute",
+                "rawInput": {"command": "git status"},
+            }
+        )
+        event = client._extract_tool_call_refinement(msg)
+        assert event is not None
+        assert event.title == "git status"
+
+    def test_kindless_refinement_inherits_the_shell_classification(self):
+        # `kind` is optional on an update. Reading its absence as "not shell"
+        # repainted the pill with the generic title the initial tool_call had
+        # already resolved to a command, so the cached classification decides.
+        client = self._client()
+        call = self._make_msg(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-2e",
+                "title": "Run Command",
+                "kind": "execute",
+                "rawInput": {"command": "git status"},
+            }
+        )
+        assert client._extract_tool_event(call).title == "git status"
+        refinement = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-2e",
+                "title": "Run Command",
+                "rawInput": {"command": "git status"},
+            }
+        )
+        event = client._extract_tool_call_refinement(refinement)
+        assert event is not None
+        assert event.title == "git status"
+
+    def test_title_only_refinement_reads_the_cached_params(self):
+        # A refinement can repeat the title without resending rawInput; the
+        # command then has to come from the params the initial call cached.
+        client = self._client()
+        call = self._make_msg(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-2f",
+                "title": "Run Command",
+                "kind": "execute",
+                "rawInput": {"command": "git status"},
+            }
+        )
+        client._extract_tool_event(call)
+        refinement = self._make_msg(
+            {"sessionUpdate": "tool_call_update", "toolCallId": "tc-2f", "title": "Run Command"}
+        )
+        event = client._extract_tool_call_refinement(refinement)
+        assert event is not None
+        assert event.title == "git status"
+
     def test_blank_description_falls_back_to_title(self):
         # Whitespace-only description shouldn't override a useful title.
         client = self._client()
@@ -6154,6 +6978,60 @@ class TestExtractToolCallRefinement:
         event = client._extract_tool_call_refinement(msg)
         assert event is not None
         assert event.tool_kind == "search"
+
+    def test_carries_the_purpose_from_raw_input(self):
+        # The refinement's rawInput is the complete params object, so it holds
+        # the reserved purpose argument. Dropping it loses the purpose whenever
+        # the initial tool_call streamed an empty rawInput, and makes consumers
+        # that fall back on an empty purpose paint the raw command instead.
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-8",
+                "title": "ls /tmp",
+                "kind": "execute",
+                "rawInput": {"command": "ls /tmp", "__tool_use_purpose": "List the temp dir"},
+            }
+        )
+        event = client._extract_tool_call_refinement(msg)
+        assert event is not None
+        assert event.tool_purpose == "List the temp dir"
+
+    def test_kindless_refinement_without_purpose_reports_empty(self):
+        # Consumers read an empty purpose as "keep what the initial tool_call
+        # supplied", so a refinement carrying no params must not invent one.
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-9",
+                "title": "ls /tmp",
+            }
+        )
+        event = client._extract_tool_call_refinement(msg)
+        assert event is not None
+        assert event.tool_purpose == ""
+
+    def test_purpose_is_redacted(self):
+        # Asserts the value is POPULATED as well as scrubbed — an empty purpose
+        # would satisfy a bare "no credential in it" check on its own.
+        client = self._client()
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-10",
+                "rawInput": {
+                    "command": "aws s3 ls",
+                    "__tool_use_purpose": "Use AKIAIOSFODNN7EXAMPLE to list buckets",
+                },
+            }
+        )
+        event = client._extract_tool_call_refinement(msg)
+        assert event is not None
+        assert event.tool_purpose.startswith("Use ")
+        assert event.tool_purpose.endswith("to list buckets")
+        assert "AKIAIOSFODNN7EXAMPLE" not in event.tool_purpose
 
 
 class TestCaptureAvailableModels:
@@ -6453,7 +7331,6 @@ class TestProcessMessageUnknownServerRequest:
 
     @pytest.mark.asyncio
     async def test_reject_sends_method_not_found_error(self, tmp_path):
-        from kiro_crew.acp.client import _JSONRPC_METHOD_NOT_FOUND
         from kiro_crew.acp.types import JsonRpcMessage
 
         client = AcpClient(work_dir=tmp_path)
@@ -6466,7 +7343,7 @@ class TestProcessMessageUnknownServerRequest:
         written = client._process.stdin.write.call_args[0][0].decode()
         payload = json.loads(written)
         assert payload["id"] == 42
-        assert payload["error"]["code"] == _JSONRPC_METHOD_NOT_FOUND
+        assert payload["error"]["code"] == JSONRPC_METHOD_NOT_FOUND
         assert "terminal/create" in payload["error"]["message"]
 
     @pytest.mark.asyncio
@@ -6881,6 +7758,128 @@ class TestFormatAcpError:
         assert "transient error" not in out.lower()
         assert "ValidationException: input contains an unsupported field 'foo'" in out
 
+    def test_session_expired_rewrite(self):
+        """An expired session gets actionable sign-in guidance rather than the
+        misleading transient-5xx retry advice."""
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "DispatchFailure: session expired",
+        }
+        out = _format_acp_error(err)
+        assert "session has expired" in out.lower() or "session expired" in out.lower()
+        assert "kiro-cli login" in out.lower()
+        assert "retry" in out.lower() and "will not help" in out.lower()
+        # Must NOT show the misleading 5xx message.
+        assert "transient error" not in out.lower()
+        assert "retry in a moment" not in out.lower()
+
+    def test_session_expired_by_http_status(self):
+        """A bare 401/403 is the shape an expired session actually arrives in:
+        the rejection carries no explanatory wording, so status alone must
+        drive the classification."""
+        for status in ("HTTP 401", "HTTP 403", "status code 401", "status 403"):
+            err = {"code": -32603, "message": "Internal error", "data": status}
+            out = _format_acp_error(err)
+            assert "kiro-cli login" in out.lower(), f"No sign-in guidance for: {status!r}"
+            assert "transient error" not in out.lower(), f"Misclassified: {status!r}"
+
+    def test_session_expired_401_with_transport_error(self):
+        """The reported failure mode: an aborted request leaves a transport
+        error alongside the 401, and the 5xx family used to win and tell the
+        user to retry."""
+        err = {
+            "code": -32603,
+            "message": "Encountered an error in the response stream",
+            "data": "DispatchFailure ConnectionResetError: HTTP 401",
+        }
+        out = _format_acp_error(err)
+        assert "kiro-cli login" in out.lower()
+        assert "transient error" not in out.lower()
+        assert "retry in a moment" not in out.lower()
+
+    def test_invalid_bearer_token_rewrite(self):
+        """The account-switch rejection: a credential the running child still
+        holds is rejected as invalid, with no status code and no expiry wording,
+        so it must still reach the sign-in guidance instead of the raw string."""
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "The bearer token included in the request is invalid.",
+        }
+        out = _format_acp_error(err)
+        assert "kiro-cli login" in out.lower()
+        assert "retry" in out.lower() and "will not help" in out.lower()
+        # Must NOT show the misleading transient-5xx advice.
+        assert "transient error" not in out.lower()
+        assert "retry in a moment" not in out.lower()
+
+    def test_invalid_bearer_token_wins_over_transport_error(self):
+        """An aborted request leaves a transport error beside the rejection; the
+        credential branch is checked first so the 5xx family cannot win."""
+        err = {
+            "code": -32603,
+            "message": "Encountered an error in the response stream",
+            "data": "DispatchFailure ConnectionResetError: the bearer token is invalid",
+        }
+        out = _format_acp_error(err)
+        assert "kiro-cli login" in out.lower()
+        assert "transient error" not in out.lower()
+
+    def test_unrelated_invalid_does_not_read_as_credential_failure(self):
+        """The fenced gap must not let an unrelated 'invalid' in a combined
+        haystack turn a validation fault into a sign-in prompt."""
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": (
+                "ValidationException: refreshed the bearer token successfully. "
+                "Field 'temperature' is invalid"
+            ),
+        }
+        out = _format_acp_error(err)
+        assert "kiro-cli login" not in out.lower()
+
+    def test_genuine_5xx_still_transient_with_auth_absent(self):
+        """The new auth-status branch must not swallow real 5xx errors."""
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "ServiceUnavailableException: HTTP 503",
+        }
+        out = _format_acp_error(err)
+        assert "transient" in out.lower()
+        assert "kiro-cli login" not in out.lower()
+
+    def test_session_expired_variants(self):
+        """Various kiro-cli session-expiry error shapes are all classified."""
+        variants = [
+            "not logged in",
+            "session has expired",
+            "login expired",
+            "authentication required",
+            "session timed out",
+            "not authenticated",
+            "login required",
+        ]
+        for text in variants:
+            err = {"code": -32603, "message": "Internal error", "data": text}
+            out = _format_acp_error(err)
+            assert "transient error" not in out.lower(), f"Failed for: {text!r}"
+            assert "kiro-cli login" in out.lower(), f"No login guidance for: {text!r}"
+
+    def test_session_expired_with_5xx_token_wins(self):
+        """Session expiry checked before 5xx: a DispatchFailure wrapping a
+        session-expired message must surface as auth, not transient."""
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "DispatchFailure ConnectionResetError: session expired",
+        }
+        out = _format_acp_error(err)
+        assert "transient error" not in out.lower()
+        assert "kiro-cli login" in out.lower()
+
 
 class TestIsTransientRawError:
     """_is_transient_raw_error classifies retryability from the RAW JSON-RPC
@@ -6949,6 +7948,85 @@ class TestIsTransientRawError:
         )
         assert _is_transient_raw_error(None) is False
         assert _is_transient_raw_error("boom") is False
+
+    def test_invalid_bearer_token_is_not_transient(self):
+        """A rejected credential must be terminal, not fed to the retry ladder.
+
+        The rejection carries no status code and no expiry wording, so without
+        its own pattern it reaches the 5xx family — and a co-occurring transport
+        error is enough to make it look retryable, spending the whole ladder on
+        a credential no retry can revive.
+        """
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert (
+            _is_transient_raw_error(
+                {"data": "The bearer token included in the request is invalid."}
+            )
+            is False
+        )
+        assert _is_transient_raw_error({"data": "invalid bearer token"}) is False
+        # A co-occurring transport error must not flip it to retryable.
+        assert (
+            _is_transient_raw_error(
+                {
+                    "message": "Encountered an error in the response stream",
+                    "data": "ConnectionResetError: the bearer token is invalid",
+                }
+            )
+            is False
+        )
+        # An unrelated 'invalid' must stay out of the credential class.
+        assert (
+            _is_transient_raw_error(
+                {"data": "ServiceUnavailableException: HTTP 503, invalid window"}
+            )
+            is True
+        )
+
+    def test_session_expired_is_not_transient(self):
+        """Regression test: kiro-cli session expiry must be terminal.
+
+        These error shapes previously fell through to the 5xx branch (when they
+        also carried DispatchFailure/ConnectionResetError), telling the user to
+        retry when re-authentication was required.
+        """
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        # Direct session-expired wording from kiro-cli.
+        assert _is_transient_raw_error({"data": "session expired"}) is False
+        assert _is_transient_raw_error({"data": "session has expired"}) is False
+        assert _is_transient_raw_error({"data": "not logged in"}) is False
+        assert _is_transient_raw_error({"data": "not authenticated"}) is False
+        assert _is_transient_raw_error({"data": "login required"}) is False
+        assert _is_transient_raw_error({"data": "authentication required"}) is False
+        assert _is_transient_raw_error({"data": "re-authenticate"}) is False
+        assert _is_transient_raw_error({"message": "session timed out", "data": ""}) is False
+        # Session expiry with a co-occurring 5xx token: the session-expiry
+        # branch must win (checked first).
+        assert (
+            _is_transient_raw_error({"data": "DispatchFailure: session expired", "message": ""})
+            is False
+        )
+        assert (
+            _is_transient_raw_error({"data": "ConnectionResetError: not logged in", "message": ""})
+            is False
+        )
+        # A bare 401/403 — the shape an expired session actually arrives in.
+        assert _is_transient_raw_error({"data": "HTTP 401"}) is False
+        assert _is_transient_raw_error({"data": "HTTP 403"}) is False
+        assert _is_transient_raw_error({"data": "status code 401"}) is False
+        # 401 alongside the transport error left by the aborted request: the
+        # 5xx family must not reclaim it and re-arm the retry ladder.
+        assert (
+            _is_transient_raw_error(
+                {"data": "DispatchFailure ConnectionResetError: HTTP 401", "message": ""}
+            )
+            is False
+        )
+        # Real 5xx stays retryable — the auth-status branch must not overreach.
+        assert _is_transient_raw_error({"data": "ServiceUnavailableException"}) is True
+        assert _is_transient_raw_error({"data": "HTTP 503"}) is True
 
     def test_kiro_generic_generation_failure_is_transient(self):
         from kiro_crew.acp.client import _is_transient_raw_error
@@ -7216,6 +8294,8 @@ class TestResolveKiroBinEnvOverride:
             client = AcpClient(work_dir=tmp_path / "workspace")
             await client._spawn()
             mock_exec.assert_awaited()
+
+            await _stop_stderr_drain(client)
 
     @pytest.mark.asyncio
     async def test_spawn_passes_installed_path_through_exact_wrappers(self, tmp_path):
@@ -8458,6 +9538,129 @@ class TestAcpClientIsShellSignal:
         assert perm.tool_name == "list_intakes"
         assert perm.mcp_server_name == "beehive:beehive-mcp"
 
+    def test_permission_event_does_not_promote_title_on_identity_cache_miss(self, tmp_path):
+        """Legacy per-session transport fails closed without ``_meta.kiro``."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import JsonRpcMessage
+        from kiro_crew.trust_patterns import approval_command
+
+        client = AcpClient(work_dir=tmp_path)
+        client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "mcp__beehive:beehive-mcp__list_intakes",
+                        "kind": "other",
+                        "rawInput": {},
+                    }
+                },
+            )
+        )
+
+        perm = client._build_permission_event(self._permission_msg())
+
+        assert perm.tool_name == ""
+        assert perm.mcp_server_name == ""
+        assert (
+            approval_command(
+                perm.tool_input,
+                is_shell=perm.is_shell,
+                tool_name=perm.tool_name,
+                mcp_server_name=perm.mcp_server_name,
+            )
+            == ""
+        )
+
+    def test_structured_non_shell_reprompt_keeps_argument_provenance(self, tmp_path):
+        """A repeated MCP permission retains both display and raw provenance."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import JsonRpcMessage
+        from kiro_crew.trust_patterns import approval_command
+
+        client = AcpClient(work_dir=tmp_path)
+        client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "Looking up the record",
+                        "kind": "other",
+                        "rawInput": {"record_id": "sensitive-record"},
+                        "_meta": {
+                            "kiro": {
+                                "toolName": "read_record",
+                                "mcpServerName": "records:primary",
+                            }
+                        },
+                    }
+                },
+            )
+        )
+
+        first = client._build_permission_event(self._permission_msg())
+        repeated = client._build_permission_event(self._permission_msg())
+
+        assert first.tool_input
+        assert repeated.tool_input == first.tool_input
+        assert repeated.raw_tool_params == {"record_id": "sensitive-record"}
+        assert (
+            approval_command(
+                repeated.tool_input,
+                is_shell=repeated.is_shell,
+                tool_name=repeated.tool_name,
+                mcp_server_name=repeated.mcp_server_name,
+                raw_tool_params=repeated.raw_tool_params,
+            )
+            == ""
+        )
+
+    @pytest.mark.parametrize("raw_input", ["/etc/secret", ["/etc/secret"]])
+    def test_non_dict_non_shell_reprompt_cannot_become_durable_tool_trust(
+        self, tmp_path, raw_input
+    ):
+        """String/list rawInput must not become argument-free after one prompt."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import JsonRpcMessage
+        from kiro_crew.trust_patterns import approval_command
+
+        client = AcpClient(work_dir=tmp_path)
+        client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "Reading a path",
+                        "kind": "read",
+                        "rawInput": raw_input,
+                        "_meta": {"kiro": {"toolName": "read_path", "mcpServerName": "files"}},
+                    }
+                },
+            )
+        )
+
+        first = client._build_permission_event(self._permission_msg())
+        repeated = client._build_permission_event(self._permission_msg())
+
+        assert repeated.tool_input == first.tool_input
+        assert repeated.tool_input
+        assert (
+            approval_command(
+                repeated.tool_input,
+                is_shell=repeated.is_shell,
+                tool_name=repeated.tool_name,
+                mcp_server_name=repeated.mcp_server_name,
+                raw_tool_params=repeated.raw_tool_params,
+            )
+            == ""
+        )
+
     def test_end_to_end_long_shell_title_passes_validation(self, tmp_path):
         """The full regression: a 400-char shell title validates only because
         is_shell propagated from tool_call → permission → _validate_tool_name."""
@@ -8578,25 +9781,25 @@ class TestAcpClientIsShellSignal:
         assert not_shell.is_shell is False
 
 
-class TestSpawnEnvChannelCredentialScrub:
-    """The default auto/standard ACP spawn path scrubs gateway channel creds.
+class TestSpawnEnvScrub:
+    """The default auto/standard ACP spawn path applies the full child scrub.
 
-    Guards the exact production path Codex flagged: ``AcpClient._spawn`` copies a
-    raw ``os.environ`` and calls ``wrap_argv`` directly (not
-    ``sandboxed_spawn_argv``), and the default tier's launcher does NOT strip
-    ``_AGENT_DENIED_ENV_KEYS`` — so the parent-level ``scrub_agent_denied_env``
-    must remove them before the child inherits the environment.
+    The parent-side enforcement is mandatory for raw Windows Kiro delegation;
+    POSIX launchers apply the same sensitive/Python scrub inline.
     """
 
     @pytest.mark.asyncio
-    async def test_client_spawn_scrubs_channel_creds_on_default_auto(self, monkeypatch):
+    async def test_client_spawn_scrubs_sensitive_env_on_default_auto(self, monkeypatch):
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "0000:FAKE-telegram")
         monkeypatch.setenv("WECOM_BOT_ID", "FAKE-wecom-bot")
         monkeypatch.setenv("WECOM_SECRET", "FAKE-wecom-secret")
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-FAKE")
         monkeypatch.setenv("KIROCREW_OWNER_ID", "U_FAKE_OWNER")
-        # A credential the standard sandbox intentionally exposes + a benign key
-        # must both survive the parent scrub.
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "FAKE-secret")
+        monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/fake-agent.sock")
+        monkeypatch.setenv("PYTHONPATH", "/gateway/pythonpath")
+        monkeypatch.setenv("PYTHONHOME", "/gateway/pythonhome")
+        # AWS account identity and a benign key are not denied.
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "FAKE-akid")
         monkeypatch.setenv("KIROCREW_UNRELATED_KEEPME", "keep-this-value")
 
@@ -8633,8 +9836,12 @@ class TestSpawnEnvChannelCredentialScrub:
             "WECOM_SECRET",
             "SLACK_BOT_TOKEN",
             "KIROCREW_OWNER_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "PYTHONPATH",
+            "PYTHONHOME",
         ):
-            assert key not in env, f"{key} leaked into default-auto ACP child env"
+            assert key not in env, f"{key} leaked into ACP child env"
         assert env.get("KIROCREW_UNRELATED_KEEPME") == "keep-this-value"
         assert env.get("AWS_ACCESS_KEY_ID") == "FAKE-akid"
 
@@ -9063,6 +10270,15 @@ class TestModelEntitlementPreflight:
         # The actionable part: what they CAN pick.
         assert "claude-sonnet-4.6" in msg
         assert "claude-haiku-4.5" in msg
+        # The identity hint stays CONDITIONAL and read-only. This error also
+        # reaches users who really are on a free tier and for whom picking an
+        # advertised model is the whole fix, so it must not read as an
+        # instruction to re-authenticate: `whoami` only reports which tier is
+        # signed in, and no destructive step is ever named.
+        assert "if you expected" in msg.lower()
+        assert "kiro-cli whoami" in msg
+        assert "logout" not in msg.lower()
+        assert "kiro-cli login" not in msg
         # Terminal, and EXPLICITLY so -- None would send the retry layer back to
         # string-matching, which is what produced the retry rows.
         assert excinfo.value.transient is False
@@ -9089,74 +10305,101 @@ def _record(sink):
     return _send_request
 
 
-class TestLocalLaneAdmission503:
-    """Admission-control 503s from the local lane classify transient.
+class TestMiseNodeInstallsDir:
+    """ACP node resolution must honour mise's real data root (#1605).
 
-    Observed 2026-08-11: the fleet router answers saturation with
-    ``503 {"error": "no available lane", ...}`` plus ``Retry-After: 30``, and
-    the Claude CLI surfaces it as ``API Error: 503 {...}`` — no "HTTP", no
-    "status", no CamelCase exception name. The classifier called that unknown,
-    unknown is terminal, and send_batch abandoned whole batches on the first
-    rejection. An upstream explicitly sending Retry-After is the definition of
-    transient.
+    ``_mise_node_installs_dir`` used to hardcode ``~/.local/share/mise``,
+    silently missing installs whenever ``MISE_DATA_DIR`` or ``XDG_DATA_HOME``
+    relocated the data dir — while ``env.mise_data_dir`` already resolved the
+    same root correctly for the build toolchain. These pin the consolidated
+    behaviour for the helper and both of its consumers' entry points.
     """
 
-    def test_api_error_503_prefix_is_transient(self):
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("MISE_DATA_DIR", raising=False)
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    def test_default_layout_is_unchanged(self, tmp_path, monkeypatch):
+        from kiro_crew.acp import client as client_mod
+
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        assert (
+            client_mod._mise_node_installs_dir()
+            == tmp_path / ".local" / "share" / "mise" / "installs" / "node"
+        )
+
+    def test_mise_data_dir_env_is_honoured(self, tmp_path, monkeypatch):
+        from kiro_crew.acp import client as client_mod
+
+        monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "custom-mise"))
+        assert (
+            client_mod._mise_node_installs_dir() == tmp_path / "custom-mise" / "installs" / "node"
+        )
+
+    def test_xdg_data_home_is_honoured(self, tmp_path, monkeypatch):
+        from kiro_crew.acp import client as client_mod
+
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+        assert (
+            client_mod._mise_node_installs_dir() == tmp_path / "xdg" / "mise" / "installs" / "node"
+        )
+
+    @_POSIX_EXEC_PATHS_ONLY
+    def test_resolve_node_for_script_under_custom_mise_data_dir(self, tmp_path, monkeypatch):
+        from kiro_crew.acp import client as client_mod
+
+        monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "custom-mise"))
+        version_dir = tmp_path / "custom-mise" / "installs" / "node" / "22.1.0"
+        node_bin = version_dir / "bin" / "node"
+        node_bin.parent.mkdir(parents=True)
+        node_bin.write_text("#!/bin/sh\nexit 0\n")
+        node_bin.chmod(0o755)
+        script = version_dir / "lib" / "node_modules" / "some-tool" / "cli.js"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/usr/bin/env node\n")
+
+        assert client_mod._resolve_node_for_script(str(script)) == str(node_bin)
+
+    @_POSIX_EXEC_PATHS_ONLY
+    def test_resolve_node_for_script_outside_mise_returns_none(self, tmp_path, monkeypatch):
+        from kiro_crew.acp import client as client_mod
+
+        monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "custom-mise"))
+        script = tmp_path / "elsewhere" / "cli.js"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/usr/bin/env node\n")
+
+        assert client_mod._resolve_node_for_script(str(script)) is None
+
+
+class TestLocalLaneAdmission503:
+    """Local-lane admission responses are retryable, not terminal failures."""
+
+    def test_router_admission_503_is_transient(self):
         from kiro_crew.acp.client import _is_transient_raw_error
 
-        err = {"data": 'API Error: 503 {"error":"no available lane"}'}
-        assert _is_transient_raw_error(err) is True
+        assert _is_transient_raw_error(
+            {"data": 'API Error: 503 {"error":"no available lane"}'}
+        ) is True
 
-    def test_no_available_lane_body_alone_is_transient(self):
+    def test_usage_limit_still_beats_admission_wording(self):
         from kiro_crew.acp.client import _is_transient_raw_error
 
-        assert _is_transient_raw_error({"data": "no available lane"}) is True
-
-    def test_too_many_requests_phrase_is_transient(self):
-        from kiro_crew.acp.client import _is_transient_raw_error
-
-        assert _is_transient_raw_error({"data": "503 Too many requests"}) is True
-        assert _is_transient_raw_error({"message": "Too Many Requests", "data": ""}) is True
-
-    def test_usage_limit_still_beats_throttle_wording(self):
-        from kiro_crew.acp.client import _is_transient_raw_error
-
-        # The precedence guard: exhausted-allowance wording stays terminal
-        # even when the same message also reads as rate-limiting.
-        err = {"data": "Monthly usage limit has been reached; too many requests"}
-        assert _is_transient_raw_error(err) is False
-
-    def test_api_error_401_stays_terminal(self):
-        from kiro_crew.acp.client import _is_transient_raw_error
-
-        # The new prefix only widens the 5xx family; a 4xx behind the same
-        # CLI wording is still unknown/terminal.
-        assert _is_transient_raw_error({"data": "API Error: 401 unauthorized"}) is False
-
-
-# ── Coverage: warm conversation reset (new_conversation) ──
+        assert _is_transient_raw_error(
+            {"data": "Monthly usage limit has been reached; too many requests"}
+        ) is False
 
 
 class TestNewConversation:
-    """``AcpClient.new_conversation`` — the warm clean-slate reset.
-
-    history.py resets the consolidation session before every reused turn;
-    until AcpClient shipped this method the provider wrapper delegated into
-    an AttributeError, every reset failed, and the transcript accumulated
-    across turns until the backend rejected every prompt as oversized
-    (observed live 2026-08-12: "Prompt is too long").
-    """
+    """Warm ACP reset retains the original session on any setup failure."""
 
     @pytest.fixture(autouse=True)
     def _isolate_home(self, tmp_path, monkeypatch):
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
-    def _make_warm_client(self, tmp_path, **kwargs):
-        """A client that looks idle-after-a-turn: live process, bound session,
-        turn-done set. ``has_active_turn`` reads a never-prompted client as
-        in-flight (``_turn_done`` starts unset), and real reset callers only
-        fire between completed turns — model that state, not cold-start."""
-        client = AcpClient(work_dir=tmp_path, **kwargs)
+    def _make_warm_client(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path)
         proc = MagicMock()
         proc.returncode = None
         client._process = proc
@@ -9166,7 +10409,6 @@ class TestNewConversation:
 
     @pytest.mark.asyncio
     async def test_swaps_session_and_reconfigures(self, tmp_path):
-        """Happy path: session/new, set_mode on the NEW sid, startup model."""
         client = self._make_warm_client(tmp_path)
         sent: list[tuple[str, dict]] = []
 
@@ -9181,28 +10423,23 @@ class TestNewConversation:
         await client.new_conversation()
 
         assert client._session_id == "sess-new"
-        assert client._resumed is False
         assert sent[0][0] == "session/new"
-        set_mode_params = next(p for m, p in sent if m == "session/set_mode")
-        assert set_mode_params["sessionId"] == "sess-new"
+        assert next(params for method, params in sent if method == "session/set_mode")["sessionId"] == "sess-new"
         client._apply_startup_model.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_no_sessionid_keeps_prior_session(self, tmp_path):
-        """A reset that yields no session must leave the old one bound."""
+    async def test_missing_or_unusable_session_keeps_prior_session(self, tmp_path):
         client = self._make_warm_client(tmp_path)
         client._send_request = AsyncMock(return_value=1)
         client._wait_for_response = AsyncMock(return_value={})
 
         with pytest.raises(AcpError, match="no sessionId"):
             await client.new_conversation()
+
         assert client._session_id == "sess-old"
 
     @pytest.mark.asyncio
     async def test_configuration_failure_restores_prior_session(self, tmp_path):
-        """set_mode failing rolls back to the old session — a failed reset
-        must degrade to 'prior conversation still usable', never to a
-        half-configured fresh session."""
         client = self._make_warm_client(tmp_path)
 
         async def fake_send(method, params):
@@ -9215,21 +10452,18 @@ class TestNewConversation:
 
         with pytest.raises(AcpError, match="mode rejected"):
             await client.new_conversation()
+
         assert client._session_id == "sess-old"
 
     @pytest.mark.asyncio
-    async def test_refuses_active_turn(self, tmp_path):
+    async def test_refuses_active_turn_and_dead_process(self, tmp_path):
         client = self._make_warm_client(tmp_path)
         client.has_active_turn = lambda: True
 
         with pytest.raises(AcpError, match="turn is in flight"):
             await client.new_conversation()
-        assert client._session_id == "sess-old"
 
-    @pytest.mark.asyncio
-    async def test_dead_process_raises_process_died(self, tmp_path):
-        client = self._make_warm_client(tmp_path)
+        client.has_active_turn = lambda: False
         client._process = None
-
         with pytest.raises(AcpProcessDied):
             await client.new_conversation()

@@ -29,7 +29,9 @@ Or with compose: copy [`docker/compose.yaml`](../../docker/compose.yaml) and run
 
 `linux/amd64` and `linux/arm64` are published under every tag. Version tags
 are never repointed once published; pin a version tag (or a digest) for
-reproducible deployments. Every published manifest carries SLSA build
+reproducible deployments. See
+[Release channels](../../README.md#release-channels) for who each channel is
+for. Every published manifest carries SLSA build
 provenance — verify with:
 
 ```
@@ -298,3 +300,14 @@ bytes identical to pip bytes for a given version:
 make wheel                                   # builds dist/kirocrew-*.whl
 docker build -f docker/Dockerfile -t kirocrew:dev .
 ```
+
+The Dockerfile consumes the wheel through a BuildKit bind mount, so the build
+requires BuildKit — the default builder since Docker 23. On an older engine
+(where the classic builder rejects `RUN --mount` with `Unknown flag: mount`),
+prefix the build with `DOCKER_BUILDKIT=1`.
+
+## Troubleshooting
+
+For solutions to common Docker deployment issues — port binding, permission
+errors, sandbox failures, health check loops, data loss, and more — see the
+dedicated [Docker Troubleshooting Guide](docker-troubleshooting.md).

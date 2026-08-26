@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kiro_crew import platform_compat as pc
 from kiro_crew.cron_script import (
     Done,
     Report,
@@ -22,6 +23,16 @@ from kiro_crew.cron_script import (
     run_command_sandboxed,
     run_script_sandboxed,
 )
+
+
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
 
 
 @pytest.fixture(autouse=True)
@@ -94,18 +105,25 @@ class TestResolveScriptPath:
         crons_dir.mkdir(parents=True)
         script = crons_dir / "monitor.py"
         script.write_text("def check(ctx): pass")
+        # ``os.path.expanduser`` reads $HOME on POSIX but %USERPROFILE% (then
+        # %HOMEDRIVE%+%HOMEPATH%) on Windows, so both must be redirected or the
+        # tilde resolves to the real profile dir and the file is not found.
         with patch("pathlib.Path.home", return_value=tmp_path), patch.dict(
-            os.environ, {"HOME": str(tmp_path)}
+            os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
         ):
             file_path, func_name = resolve_script_path("~/.kirocrew/crons/monitor.py:check")
         assert func_name == "check"
+        # The tilde must actually have expanded to the patched home, not been
+        # left literal — otherwise the assertion above would pass on a path that
+        # never resolved.
+        assert Path(file_path) == script.resolve()
 
 
 class TestRunCommandSandboxed:
     """Tests for run_command_sandboxed shell execution."""
 
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, posix_test_shell):
         """Run commands directly, bypassing the OS-sandbox wrap.
 
         These tests exercise the run_command_sandboxed output/exit-code plumbing,
@@ -116,6 +134,11 @@ class TestRunCommandSandboxed:
         """
         monkeypatch.setattr(
             "kiro_crew.cron_script.wrap_argv", lambda argv, **k: (list(argv), None)
+        )
+        # Bypass the runtime shell probe (which itself spawns a child): these
+        # tests exercise the run_command_sandboxed plumbing, not shell fingerprinting.
+        monkeypatch.setattr(
+            "kiro_crew.cron_script._resolve_command_shell", lambda: posix_test_shell
         )
 
     def test_basic_echo(self):
@@ -145,6 +168,57 @@ class TestRunCommandSandboxed:
         assert "truncated" in result["output"]
         assert len(result["output"]) <= 70000
 
+    def test_nonzero_exit_reports_stderr_tail_not_head(self):
+        """A leading startup warning must not displace the terminal error."""
+        leading_warning = "startup warning: " + ("x" * 1000)
+        terminal_error = "sh: fatal: actual cause"
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate.return_value = ("", leading_warning + "\n" + terminal_error)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            result = run_command_sandboxed("boom")
+        assert result["status"] == "error"
+        assert "actual cause" in result["output"]
+        assert "startup warning" not in result["output"]
+
+    def test_nonzero_exit_redacts_stderr_before_truncating(self):
+        """A credential straddling the 1000-char boundary must not leak its tail.
+
+        Redaction must run on the WHOLE stderr before the tail slice: slicing
+        first can cut off a secret's detectable prefix, so the pattern no
+        longer matches and the raw tail reaches the cron result.
+        """
+        # Built at runtime so no credential-shaped literal lands in the repo.
+        fake_key = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
+        # Sized so the 1000-char tail window starts 2 chars into the credential:
+        # a slice-then-redact order keeps "IA" + all 16 B's but drops the
+        # "AK" prefix, so the pattern no longer matches and the tail leaks.
+        padding = "p" * 100
+        trailing = "e" * 982
+        stderr_text = padding + fake_key + trailing
+        assert len(stderr_text) - 1000 == len(padding) + 2
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate.return_value = ("", stderr_text)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            result = run_command_sandboxed("boom")
+        assert result["status"] == "error"
+        assert "B" * 16 not in result["output"]
+        assert fake_key not in result["output"]
+        # Positive proof the payload flowed through redaction (not a vacuous
+        # pass on an empty result): the marker's tail survives the tail slice.
+        assert "credential]" in result["output"]
+        assert "e" * 50 in result["output"]
+
+    def test_nonzero_exit_short_stderr_stays_whole(self):
+        """A stderr already shorter than the 1000-char bound is kept whole."""
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate.return_value = ("", "short failure\n")
+        with patch("subprocess.Popen", return_value=mock_proc):
+            result = run_command_sandboxed("boom")
+        assert result["output"].endswith("stderr:\nshort failure")
+
 
 class TestCronSandboxUnavailableIsStructuredNotRaised:
     """A host with no OS sandbox backend (every Windows host) makes wrap_argv
@@ -166,6 +240,11 @@ class TestCronSandboxUnavailableIsStructuredNotRaised:
             )
 
         monkeypatch.setattr("kiro_crew.cron_script.wrap_argv", _raise)
+        # The runtime shell probe itself routes through wrap_argv now, so a
+        # sandbox-refusing test would surface the "No POSIX shell" error before
+        # ever reaching the wrap_argv call this test is about. Skip the probe
+        # to isolate what's under test.
+        monkeypatch.setattr("kiro_crew.cron_script._resolve_command_shell", lambda: "sh")
 
     def test_command_cron_returns_error_with_remedy(self, _sandbox_refuses):
         result = run_command_sandboxed("echo hello")
@@ -192,41 +271,114 @@ class TestCommandCronShellResolution:
     """Command crons run `sh -c`; a POSIX shell must be resolved before spawn,
     with a legible error (not a bare WinError 2) when none exists on Windows."""
 
-    def test_posix_shell_is_found_on_path(self, monkeypatch):
+    def test_posix_strict_sh_is_accepted(self, monkeypatch):
+        """A `sh` that refuses brace expansion (dash / ash / POSIX-strict) is
+        accepted — the language matches what mcp_cron._vet_shell_command was
+        written against."""
         from kiro_crew import cron_script
 
-        monkeypatch.setattr(cron_script.shutil, "which", lambda name: f"/usr/bin/{name}")
-        assert cron_script._resolve_command_shell() == "/usr/bin/bash"
+        monkeypatch.setattr(cron_script.platform_compat, "IS_WINDOWS", False)
+        # Resolver walks a FIXED trusted-path list (never $PATH). /bin/sh exists
+        # and passes the strict probe.
+        monkeypatch.setattr(cron_script.os.path, "isfile", lambda p: p == "/bin/sh")
+        monkeypatch.setattr(cron_script, "_shell_is_posix_strict", lambda s: True)
+        assert cron_script._resolve_command_shell() == "/bin/sh"
 
-    def test_windows_falls_back_to_git_bash_when_not_on_path(self, monkeypatch, tmp_path):
+    def test_brace_expanding_sh_is_rejected(self, monkeypatch):
+        """macOS /bin/sh is bash-in-POSIX-mode and STILL performs brace
+        expansion, so the runtime probe MUST reject it — otherwise
+        `cat ~/.a{w,w}s/credentials` hides from the vet the same way a `bash -c`
+        candidate would. No fallback: the caller then fails-closed with a
+        legible error, matching the Windows path."""
         from kiro_crew import cron_script
 
-        git_bin = tmp_path / "Git" / "bin"
-        git_bin.mkdir(parents=True)
-        bash = git_bin / "bash.exe"
-        bash.write_text("")
+        monkeypatch.setattr(cron_script.platform_compat, "IS_WINDOWS", False)
+        # Both trusted candidates exist on disk, but neither survives the
+        # probe (bash-in-sh-mode expands the brace).
+        monkeypatch.setattr(cron_script.os.path, "isfile", lambda p: True)
+        monkeypatch.setattr(cron_script, "_shell_is_posix_strict", lambda s: False)
+        assert cron_script._resolve_command_shell() is None
+
+    def test_resolver_never_consults_path(self, monkeypatch):
+        """PATH may include agent-writable directories (e.g. ~/.local/bin),
+        which is a private-key exposure vector if the resolver honors it: an
+        agent-planted `sh` shim would be probed under `cc` isolation but `cc`
+        leaves ~/.ssh reachable, so a probe-passing shim can then read it.
+        The resolver MUST NOT touch PATH — regression-locking here."""
+        from kiro_crew import cron_script
+
+        monkeypatch.setattr(cron_script.platform_compat, "IS_WINDOWS", False)
+
+        # No trusted-path shell available. If the resolver falls back to PATH
+        # it would find this planted shim; the test asserts it does not.
+        monkeypatch.setattr(cron_script.os.path, "isfile", lambda p: False)
+        called = {"probe": False}
+
+        def _probe(_shell: str) -> bool:
+            called["probe"] = True
+            return True
+
+        monkeypatch.setattr(cron_script, "_shell_is_posix_strict", _probe)
+        assert cron_script._resolve_command_shell() is None
+        assert called["probe"] is False, (
+            "Resolver invoked the probe with a non-trusted-path shell — "
+            "regression: it must not consult $PATH."
+        )
+
+    def test_shell_probe_detects_brace_expansion(self, monkeypatch):
+        """The probe distinguishes POSIX-strict `sh` from a bash-in-sh-mode by
+        the OUTPUT of `sh -c 'echo x.{a,a}'`: literal `x.{a,a}` (POSIX) vs
+        `x.a x.a` (bash expanded)."""
+        from unittest.mock import MagicMock
+
+        from kiro_crew import cron_script
+
+        # Bypass the sandbox wrap the probe now routes through (so this test
+        # exercises the DECISION LOGIC, not the sandbox backend availability).
+        monkeypatch.setattr(
+            "kiro_crew.cron_script.wrap_argv", lambda argv, **k: (argv, None)
+        )
+        # Fresh cache per test (the probe memoizes per shell path).
+        cron_script._POSIX_STRICT_CACHE.clear()
+
+        strict = MagicMock(returncode=0, stdout="x.{a,a}\n", stderr="")
+        expanding = MagicMock(returncode=0, stdout="x.a x.a\n", stderr="")
+        with patch.object(cron_script, "run_limited", return_value=strict):
+            assert cron_script._shell_is_posix_strict("/bin/dash") is True
+        cron_script._POSIX_STRICT_CACHE.clear()
+        with patch.object(cron_script, "run_limited", return_value=expanding):
+            assert cron_script._shell_is_posix_strict("/bin/sh-is-really-bash") is False
+
+    def test_windows_refuses_command_cron_shell(self, monkeypatch):
+        """Windows ships no shell whose language matches what
+        mcp_cron._vet_shell_command was written against: cmd.exe is not POSIX,
+        and Git-for-Windows's sh.exe IS bash and performs brace expansion (a
+        `cat ~/.a{w,w}s/credentials` payload hides from the vet the same way
+        under bash or Git-sh). Returning ``None`` on Windows makes command crons
+        fail-closed with the legible error rather than route a vetted string
+        through a shell that widens its language."""
+        from kiro_crew import cron_script
+
         monkeypatch.setattr(cron_script.platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(cron_script.shutil, "which", lambda name: None)
-        monkeypatch.setattr(cron_script, "_WINDOWS_GIT_SHELL_DIRS", (str(git_bin),))
-        assert cron_script._resolve_command_shell() == str(bash)
+        # Even if a `sh.exe` were reachable (Git for Windows ships one), Windows
+        # returns None unconditionally because that shell IS bash. The resolver
+        # short-circuits on IS_WINDOWS before it ever looks at the filesystem.
+        assert cron_script._resolve_command_shell() is None
 
     def test_no_shell_returns_legible_error_not_winerror(self, monkeypatch):
         from kiro_crew import cron_script
 
         monkeypatch.setattr(cron_script.platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(cron_script.shutil, "which", lambda name: None)
-        monkeypatch.setattr(cron_script, "_WINDOWS_GIT_SHELL_DIRS", ())
         result = cron_script.run_command_sandboxed("echo hi", timeout=10)
         assert result["status"] == "error"
         assert "No POSIX shell" in result["output"]
-        assert "Git for Windows" in result["output"]
 
 
 class TestRunScriptSandboxed:
     """Tests for run_script_sandboxed Python function execution."""
 
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, posix_test_shell):
         """Bypass OS-sandbox wrap and ensure subprocess can import kiro_crew.
 
         wrap_argv fails closed when no sandbox backend is available (e.g. macOS 26
@@ -243,6 +395,11 @@ class TestRunScriptSandboxed:
         monkeypatch.setattr(
             "kiro_crew.cron_script.wrap_argv", lambda argv, **k: (list(argv), None)
         )
+        # Bypass the runtime shell probe (which itself spawns a child): these
+        # tests exercise the run_command_sandboxed plumbing, not shell fingerprinting.
+        monkeypatch.setattr(
+            "kiro_crew.cron_script._resolve_command_shell", lambda: posix_test_shell
+        )
 
     def _write_script(self, tmp_path, code):
         crons_dir = tmp_path / ".kirocrew" / "crons"
@@ -250,6 +407,140 @@ class TestRunScriptSandboxed:
         script = crons_dir / "test_script.py"
         script.write_text(code)
         return str(script)
+
+    # ── Terminal stderr context on a hard failure ──
+    # These five drive the real ``proc.returncode != 0 and not stdout.strip()``
+    # branch through a real subprocess. The launcher ``exec``s the user module
+    # OUTSIDE its try/except, so a module-level raise is exactly the shape that
+    # reaches that branch: unhandled traceback on stderr, non-zero exit, and no
+    # structured stdout to parse.
+
+    TERMINAL_SENTINEL = "REAL_TERMINAL_FAILURE_9f3a"
+
+    def test_a_terminal_failure_survives_leading_stderr_noise(self, tmp_path):
+        """The reported error must name why the script died, not what it warned about.
+
+        A process that dies hard leaves its diagnosis at the END of stderr — the
+        traceback is the last thing written. Anything a startup path logged
+        first (a migration warning, a deprecation notice, an import-time banner)
+        sits in front of it, so reporting the HEAD of stderr reports the noise
+        and truncates the cause. The operator then reads a cron failure whose
+        message describes something that did not kill the job.
+
+        900 characters of leading noise is deliberately past the 500-byte bound,
+        so a head-anchored report cannot contain the sentinel by accident.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            'import sys\n'
+            'sys.stderr.write("W" * 900 + "\\n")\n'
+            'sys.stderr.flush()\n'
+            f'raise RuntimeError("{self.TERMINAL_SENTINEL}")\n',
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id")
+
+        assert result["status"] == "error"
+        assert self.TERMINAL_SENTINEL in result["error"], (
+            "the reported error is the head of stderr, so the terminal failure "
+            f"was truncated away: {result['error'][:120]!r}"
+        )
+
+    def test_a_short_stderr_is_reported_whole(self, tmp_path):
+        """Bounding must not start cutting output that already fits.
+
+        The bound exists to cap a runaway stderr, not to reshape the ordinary
+        case, so a diagnosis shorter than the cap keeps both ends. This one is a
+        CONTROL: it must pass identically before and after the change, which is
+        why the child exits WITHOUT a traceback -- an interpreter traceback
+        carries two absolute temp paths, and on Windows those alone push even a
+        one-line diagnosis past the bound, which would quietly turn this control
+        into a second copy of the case above.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            'import os, sys\n'
+            'sys.stderr.write("LEADING_CONTEXT\\n")\n'
+            f'sys.stderr.write("{self.TERMINAL_SENTINEL}\\n")\n'
+            'sys.stderr.flush()\n'
+            'os._exit(2)\n',
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id")
+
+        assert result["status"] == "error"
+        assert "LEADING_CONTEXT" in result["error"]
+        assert self.TERMINAL_SENTINEL in result["error"]
+
+    def test_a_silent_hard_exit_still_reports_the_exit_code(self, tmp_path):
+        """With nothing on either stream, the exit code is the only diagnosis.
+
+        ``os._exit`` skips the launcher's handlers entirely, which is what a
+        killed or self-terminating child looks like. The fallback must survive
+        the change, or those failures become an empty error string.
+        """
+        script_path = self._write_script(tmp_path, 'import os\nos._exit(3)\n')
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id")
+
+        assert result["status"] == "error"
+        assert result["error"] == "exit 3"
+
+    def test_a_credential_in_the_terminal_stderr_is_redacted(self, tmp_path):
+        """The reported text still leaves the box, so redaction still applies.
+
+        Moving WHICH slice of stderr is reported must not move it out from
+        behind ``redact`` — a traceback can carry a key in a repr just as a
+        startup warning can.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            'import sys\n'
+            'sys.stderr.write("W" * 900 + "\\n")\n'
+            'sys.stderr.flush()\n'
+            'raise RuntimeError("boom AKIAIOSFODNN7EXAMPLE")\n',
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id")
+
+        assert result["status"] == "error"
+        assert "AKIAIOSFODNN7EXAMPLE" not in result["error"]
+        assert "[REDACTED" in result["error"]
+
+    def test_a_credential_straddling_the_bound_does_not_leak_a_fragment(
+        self, tmp_path
+    ):
+        """Redaction must see the WHOLE stream before the 500-char bound cuts it.
+
+        If the suffix is sliced first, a credential that straddles the cut
+        point loses its leading characters before ``redact`` runs — and the
+        surviving fragment no longer matches any credential pattern, so it
+        reaches logs and the persisted ``last_error`` unmasked.
+
+        Byte layout (written verbatim, ``os._exit`` so no traceback shifts
+        it): 300 noise + a 20-char AWS key + 481 trailing chars = 801 total.
+        The -500 cut lands ONE character into the key, so slice-then-redact
+        leaks the 19-char fragment ``KIAIOSFODNN7EXAMPLE``; redact-then-slice
+        replaces the whole key with the tag, whose tail stays in the report.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            'import os, sys\n'
+            'sys.stderr.write("W" * 300)\n'
+            'sys.stderr.write("AKIAIOSFODNN7EXAMPLE")\n'
+            'sys.stderr.write("X" * 481)\n'
+            'sys.stderr.flush()\n'
+            'os._exit(2)\n',
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id")
+
+        assert result["status"] == "error"
+        assert "AKIAIOSFODNN7EXAMPLE" not in result["error"]
+        # The discriminator: the exact fragment the slice-then-redact order
+        # leaves behind. Absent under redact-then-slice; present under the bug.
+        assert "KIAIOSFODNN7EXAMPLE" not in result["error"]
+        assert "credential]" in result["error"]
 
     def test_ok_status(self, tmp_path):
         script_path = self._write_script(
@@ -507,7 +798,7 @@ class TestScriptContextNotify:
         mock_response.read.return_value = b'{"ok": true}'
         mock_response.__enter__ = MagicMock(return_value=mock_response)
         mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=mock_response):
+        with patch("kiro_crew.cron_script.loopback_urlopen", return_value=mock_response):
             result = ctx.notify("hello")
         assert result == {"ok": True}
 
@@ -518,7 +809,7 @@ class TestScriptContextNotify:
         mock_response.read.return_value = b'{"error": "forbidden"}'
         mock_response.__enter__ = MagicMock(return_value=mock_response)
         mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=mock_response):
+        with patch("kiro_crew.cron_script.loopback_urlopen", return_value=mock_response):
             with pytest.raises(RuntimeError, match="forbidden"):
                 ctx.notify("hello")
 
@@ -529,7 +820,9 @@ class TestScriptContextNotify:
         mock_response.read.return_value = b'{"ok": true}'
         mock_response.__enter__ = MagicMock(return_value=mock_response)
         mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
+        with patch(
+            "kiro_crew.cron_script.loopback_urlopen", return_value=mock_response
+        ) as mock_urlopen:
             ctx.notify("secret AKIA1234567890123456 text")
             # Verify the request was made (redaction happens internally)
             mock_urlopen.assert_called_once()
@@ -550,11 +843,16 @@ class TestRunCommandSandboxedEdgeCases:
     """Additional edge case tests for run_command_sandboxed."""
 
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, posix_test_shell):
         """Bypass the OS-sandbox wrap so these plumbing tests run without a
         sandbox backend (see TestRunCommandSandboxed._passthrough_sandbox)."""
         monkeypatch.setattr(
             "kiro_crew.cron_script.wrap_argv", lambda argv, **k: (list(argv), None)
+        )
+        # Bypass the runtime shell probe (which itself spawns a child): these
+        # tests exercise the run_command_sandboxed plumbing, not shell fingerprinting.
+        monkeypatch.setattr(
+            "kiro_crew.cron_script._resolve_command_shell", lambda: posix_test_shell
         )
 
     def test_command_with_env_vars(self):
@@ -588,6 +886,10 @@ class TestRunScriptSandboxedEdgeCases:
         monkeypatch.setattr(
             "kiro_crew.cron_script.wrap_argv", lambda argv, **k: (list(argv), None)
         )
+        # Bypass the runtime shell probe (which itself spawns a child): these
+        # tests exercise the run_command_sandboxed plumbing, not shell fingerprinting.
+        # Return "sh" so Popen mocks that assert on argv[0] still see it.
+        monkeypatch.setattr("kiro_crew.cron_script._resolve_command_shell", lambda: "sh")
 
     def _write_script(self, tmp_path, code):
         crons_dir = tmp_path / ".kirocrew" / "crons"
@@ -899,14 +1201,16 @@ class TestScriptContextPost:
         mock_response.read.return_value = b'{"status": "delivered"}'
         mock_response.__enter__ = MagicMock(return_value=mock_response)
         mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=mock_response):
+        with patch("kiro_crew.cron_script.loopback_urlopen", return_value=mock_response):
             result = ctx._post("/api/deliver", {"text": "hello"})
         assert result == {"status": "delivered"}
 
     def test_post_failure_returns_error(self):
         job = SimpleNamespace(id="j1", message="test")
         ctx = ScriptContext(job=job)
-        with patch("urllib.request.urlopen", side_effect=Exception("connection refused")):
+        with patch(
+            "kiro_crew.cron_script.loopback_urlopen", side_effect=Exception("connection refused")
+        ):
             result = ctx._post("/api/deliver", {"text": "hello"})
         assert "error" in result
         assert "connection refused" in result["error"]
@@ -916,10 +1220,15 @@ class TestRunCommandSandboxedExceptions:
     """Tests for run_command_sandboxed timeout and exception paths."""
 
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, posix_test_shell):
         """See TestRunCommandSandboxed._passthrough_sandbox."""
         monkeypatch.setattr(
             "kiro_crew.cron_script.wrap_argv", lambda argv, **k: (list(argv), None)
+        )
+        # Bypass the runtime shell probe (which itself spawns a child): these
+        # tests exercise the run_command_sandboxed plumbing, not shell fingerprinting.
+        monkeypatch.setattr(
+            "kiro_crew.cron_script._resolve_command_shell", lambda: posix_test_shell
         )
 
     def test_timeout_returns_error(self):
@@ -1016,8 +1325,6 @@ class TestRunScriptSandboxedErrorPaths:
             "kiro_crew.cron_script.resolve_script_path", return_value=("/f.py", "run")
         ), patch("kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)), patch(
             "subprocess.Popen", return_value=mock_proc
-        ), patch(
-            "pathlib.Path.unlink"
         ):
             result = run_script_sandboxed("/f.py:run", "j1", "")
         assert result["status"] == "error"
@@ -1032,12 +1339,42 @@ class TestRunScriptSandboxedErrorPaths:
             "kiro_crew.cron_script.resolve_script_path", return_value=("/f.py", "run")
         ), patch("kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)), patch(
             "subprocess.Popen", return_value=mock_proc
-        ), patch(
-            "pathlib.Path.unlink"
         ):
             result = run_script_sandboxed("/f.py:run", "j1", "")
         assert result["status"] == "error"
         assert "Bad output" in result.get("error", "")
+
+    def test_bad_json_output_redacts_before_truncating(self, tmp_path):
+        """A credential straddling the 200-char boundary must not leak its head.
+
+        Redaction must run on the WHOLE stdout before the head slice: slicing
+        first can cut a secret mid-pattern, so redaction no longer matches and
+        the raw head reaches the diagnostic.
+        """
+        # Built at runtime so no credential-shaped literal lands in the repo.
+        fake_key = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
+        # Sized so the 200-char head window ends 10 chars into the credential:
+        # a slice-then-redact order keeps "AKIA" + 6 B's — too short for the
+        # pattern to match, so the raw head leaks into the diagnostic.
+        padding = "p" * 190
+        stdout_text = padding + fake_key + "e" * 50
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate.return_value = (stdout_text, "")
+        with patch(
+            "kiro_crew.cron_script.resolve_script_path", return_value=("/f.py", "run")
+        ), patch("kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)), patch(
+            "subprocess.Popen", return_value=mock_proc
+        ):
+            result = run_script_sandboxed("/f.py:run", "j1", "")
+        assert result["status"] == "error"
+        assert "AKIA" not in result["error"]
+        assert fake_key not in result["error"]
+        # Positive proof the payload flowed through redaction (not a vacuous
+        # pass on an empty diagnostic): the 200-char head window ends 10 chars
+        # into the replacement marker, so its head survives the slice.
+        assert "[REDACTED:" in result["error"]
+        assert padding in result["error"]
 
 
 class TestMcpCronHandlerPaths:
@@ -1058,6 +1395,9 @@ class TestMcpCronHandlerPaths:
         job.last_status = "error"
         job.last_error = "connection refused"
         job.enabled = True
+        # cron_list scopes to the caller's own rows, so the fixture row has to
+        # name the session the autouse caller fixture provides.
+        job.session_key = os.environ["KIROCREW_SESSION_KEY"]
         with patch("kiro_crew.mcp_cron.config_dir", return_value=tmp_path), patch(
             "kiro_crew.mcp_cron.CronService"
         ) as mock_svc:
@@ -1080,6 +1420,9 @@ class TestMcpCronHandlerPaths:
         job.last_status = "ok"
         job.last_result = "CR passed"
         job.enabled = True
+        # cron_list scopes to the caller's own rows, so the fixture row has to
+        # name the session the autouse caller fixture provides.
+        job.session_key = os.environ["KIROCREW_SESSION_KEY"]
         with patch("kiro_crew.mcp_cron.config_dir", return_value=tmp_path), patch(
             "kiro_crew.mcp_cron.CronService"
         ) as mock_svc:
@@ -1178,8 +1521,7 @@ class TestRunScriptSandboxedTimeout:
         mock_proc = MagicMock()
         # CRITICAL: a bare MagicMock pid coerces to 1 via __index__, and the
         # timeout cleanup path would then run os.killpg(1, SIGKILL) ==
-        # kill(-1, SIGKILL) — SIGKILLing every process this uid owns
-        # (it repeatedly killed the whole login session on 2026-07-15).
+        # kill(-1, SIGKILL) — SIGKILLing every process this uid owns.
         # Always give mocked Popen objects a real, nonexistent int pid.
         mock_proc.pid = 2**22 + 12345  # > PID_MAX default, never a real pid
         mock_proc.communicate.side_effect = [sp.TimeoutExpired("cmd", 30), ("", "")]
@@ -1188,12 +1530,32 @@ class TestRunScriptSandboxedTimeout:
         ), patch("kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)), patch(
             "subprocess.Popen", return_value=mock_proc
         ), patch(
-            "pathlib.Path.unlink"
-        ):
+            # Stub the reap at the shim, NOT via the global subprocess.Popen
+            # patch above. On Windows _kill_proc_group reaps through
+            # platform_compat.kill_process_tree, which shells out to `taskkill
+            # /T /F` with subprocess.run — and subprocess.run builds its child
+            # from subprocess.Popen, so the patch aimed at the launcher spawn
+            # also hijacks taskkill's, handing subprocess.run a MagicMock whose
+            # communicate() returns a mock instead of a 2-tuple (ValueError:
+            # not enough values to unpack). The timeout HANDLER is what is under
+            # test; the kill mechanism has its own coverage in
+            # TestKillBroadcastGuard.
+            "kiro_crew.platform_compat.kill_process_tree",
+            return_value=True,
+        ) as mock_tree:
             result = run_script_sandboxed("/f.py:run", "j1", "", timeout=30)
         assert result["status"] == "error"
         assert "timed out" in result["error"]
         assert "30s" in result["error"]
+        # communicate() does not kill the child on timeout, so the handler MUST
+        # reap it — otherwise a timed-out cron leaks a live subprocess tree.
+        if pc.IS_POSIX:
+            # POSIX takes the os.killpg branch when a pgid resolves; the mocked
+            # pid does not exist, so _resolve_safe_pgid returns None and the
+            # shim is the fallback. Either way the process must be signalled.
+            assert mock_tree.called or mock_proc.kill.called
+        else:
+            mock_tree.assert_called_once_with(mock_proc.pid, pc.SIGKILL)
 
 
 class TestKillBroadcastGuard:
@@ -1230,13 +1592,30 @@ class TestKillBroadcastGuard:
         assert _resolve_safe_pgid(proc) is None
 
     def test_kill_proc_group_never_calls_killpg_for_mock(self):
+        """A bare-mock pid must never reach a group kill — the original footgun.
+
+        ``os.killpg`` does not exist on Windows, so patching it by name raises
+        AttributeError there. Use ``create=True``: the assertion we care about
+        is that the attribute is never *called*, which holds on both platforms
+        (on Windows ``_resolve_safe_pgid`` returns None so the killpg branch is
+        unreachable, and ``kill_process_tree`` takes the taskkill path).
+        """
         from kiro_crew.cron_script import _kill_proc_group
         proc = MagicMock()  # bare mock pid — the original footgun
-        with patch("os.killpg") as mock_killpg:
+        with patch("os.killpg", create=True) as mock_killpg, patch(
+            # Windows: _kill_proc_group reaps via taskkill before the
+            # single-process fallback. Stub it so the test never shells out.
+            "kiro_crew.platform_compat.kill_process_tree",
+            side_effect=OSError("stubbed"),
+        ):
             _kill_proc_group(proc)
         mock_killpg.assert_not_called()
         proc.kill.assert_called_once()
 
+    @pytest.mark.skipif(
+        not pc.IS_POSIX,
+        reason="POSIX broadcast guard (killpg/getpgid); Windows takes the taskkill path",
+    )
     def test_shim_kill_process_tree_refuses_mock_pid(self):
         """platform_compat.kill_process_tree: non-int pid must raise, never killpg."""
         import pytest as _pytest
@@ -1248,6 +1627,10 @@ class TestKillBroadcastGuard:
         mock_killpg.assert_not_called()
         mock_kill.assert_not_called()
 
+    @pytest.mark.skipif(
+        not pc.IS_POSIX,
+        reason="POSIX broadcast guard (killpg/getpgid); Windows takes the taskkill path",
+    )
     def test_shim_kill_process_tree_broadcast_pgid_degrades_to_pid_kill(self):
         """platform_compat.kill_process_tree: pgid<=1 degrades to scoped os.kill."""
         from kiro_crew import platform_compat
@@ -1258,6 +1641,31 @@ class TestKillBroadcastGuard:
             assert platform_compat.kill_process_tree(target, platform_compat.SIGKILL) is True
         mock_killpg.assert_not_called()
         mock_kill.assert_called_once_with(target, platform_compat.SIGKILL)
+
+    @pytest.mark.skipif(
+        pc.IS_POSIX, reason="Windows taskkill /T branch of kill_process_tree"
+    )
+    def test_shim_kill_process_tree_uses_taskkill_on_windows(self):
+        """Windows has no process groups: the shim must reap via ``taskkill /T``.
+
+        This is the Windows counterpart to the two POSIX broadcast-guard tests
+        above — same invariant (kill the whole tree, never broadcast), different
+        mechanism, so it needs its own coverage rather than a bare skip.
+        """
+        import ntpath
+
+        from kiro_crew import platform_compat
+        target = 2**22 + 31337
+        completed = MagicMock(returncode=0, stdout=b"", stderr=b"")
+        with patch("subprocess.run", return_value=completed) as mock_run:
+            assert platform_compat.kill_process_tree(target, platform_compat.SIGKILL) is True
+        argv = mock_run.call_args.args[0]
+        # argv[0] may be a bare name or an absolute trusted-system path
+        # (kill_process_tree resolves taskkill from GetSystemDirectoryW rather
+        # than trusting %PATH%), so match on the basename and its .exe suffix.
+        assert ntpath.basename(argv[0]).lower() in ("taskkill", "taskkill.exe")
+        assert "/T" in argv and "/F" in argv  # whole tree, forced
+        assert str(target) in argv
 
     def test_cancel_flag_cleared_when_terminate_fails(self):
         """kill_running_process: signal never delivered -> flag must not leak.
@@ -1291,7 +1699,7 @@ class TestResolveInternalSecret:
             "kiro_crew.config.loader.config_dir", return_value=tmp_path
         ):
             (tmp_path / ".local_secret").write_text("fromfile")
-            assert _resolve_internal_secret() == "fromenv"
+            assert _resolve_internal_secret(5476) == "fromenv"
 
     def test_falls_back_to_local_secret_file(self, tmp_path):
         (tmp_path / ".local_secret").write_text("filesecret\n")
@@ -1299,21 +1707,21 @@ class TestResolveInternalSecret:
         with patch.dict(os.environ, env, clear=True), patch(
             "kiro_crew.config.loader.config_dir", return_value=tmp_path
         ):
-            assert _resolve_internal_secret() == "filesecret"
+            assert _resolve_internal_secret(5476) == "filesecret"
 
     def test_empty_when_neither_present(self, tmp_path):
         env = {k: v for k, v in os.environ.items() if k != "KIROCREW_INTERNAL_SECRET"}
         with patch.dict(os.environ, env, clear=True), patch(
             "kiro_crew.config.loader.config_dir", return_value=tmp_path
         ):
-            assert _resolve_internal_secret() == ""
+            assert _resolve_internal_secret(5476) == ""
 
     def test_env_empty_string_falls_back_to_file(self, tmp_path):
         (tmp_path / ".local_secret").write_text("filesecret")
         with patch.dict(os.environ, {"KIROCREW_INTERNAL_SECRET": ""}), patch(
             "kiro_crew.config.loader.config_dir", return_value=tmp_path
         ):
-            assert _resolve_internal_secret() == "filesecret"
+            assert _resolve_internal_secret(5476) == "filesecret"
 
     def test_run_script_writes_local_secret_to_sandbox_when_env_unset(self, tmp_path):
         """End-to-end: run_script_sandboxed hands the sandbox the .local_secret value."""
@@ -1335,8 +1743,77 @@ class TestResolveInternalSecret:
             "kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)
         ), patch(
             "subprocess.Popen", side_effect=fake_popen
-        ), patch(
-            "pathlib.Path.unlink"
         ):
             run_script_sandboxed("/f.py:run", "j1", "", timeout=30)
         assert captured["secret"] == "realsecret"
+
+
+class TestPostKillDrainTimeoutHardening:
+    """The post-kill drain must not leak pipes or mislabel the kill-path result.
+
+    ``Popen.communicate`` does not kill the child on timeout, so both spawners
+    SIGKILL the process group and then reap it with a bounded
+    ``communicate(timeout=5)``. That second drain can ITSELF raise
+    ``TimeoutExpired`` when the pipes never reach EOF — the child outlived the
+    group kill, or another process still holds the write end open. Two
+    invariants have to survive that:
+
+    - the ``PIPE`` fds get closed rather than left open for the life of the
+      gateway. ``Popen._communicate`` closes them as a side effect of reaching
+      EOF, which is exactly the path it does not reach here.
+    - the kill path still reports a *timeout*. In ``run_command_sandboxed`` a
+      ``TimeoutExpired`` raised inside the ``except`` block bypasses that
+      block's own handler list, so the timed-out ``return`` is skipped and the
+      broad ``except Exception`` reports "Command failed" instead.
+    """
+
+    def test_script_drain_timeout_closes_pipes_and_keeps_contract(self):
+        import subprocess as sp
+
+        mock_proc = MagicMock()
+        # A bare MagicMock pid coerces to 1 via __index__, and os.killpg(1, sig)
+        # is kill(-1, sig) — see TestKillBroadcastGuard.
+        mock_proc.pid = 2**22 + 12345  # > PID_MAX default, never a real pid
+        # BOTH the initial read and the post-kill drain time out.
+        mock_proc.communicate.side_effect = sp.TimeoutExpired("cmd", 30)
+        with patch(
+            "kiro_crew.cron_script.resolve_script_path", return_value=("/f.py", "run")
+        ), patch("kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)), patch(
+            "subprocess.Popen", return_value=mock_proc
+        ), patch(
+            # Stub the reap at the shim, NOT via the subprocess.Popen patch above:
+            # same reason as TestRunScriptSandboxedTimeout.
+            "kiro_crew.platform_compat.kill_process_tree",
+            return_value=True,
+        ):
+            result = run_script_sandboxed("/f.py:run", "j1", "", timeout=30)
+        # The drain's own timeout must neither escape nor alter the contract.
+        assert result == {"status": "error", "error": "Script timed out after 30s"}
+        # The fd-leak assertion: both pipes closed even though EOF never came.
+        mock_proc.stdout.close.assert_called_once()
+        mock_proc.stderr.close.assert_called_once()
+
+    def test_command_drain_timeout_closes_pipes_and_keeps_contract(self, monkeypatch):
+        import subprocess as sp
+
+        # See TestRunCommandSandboxed._passthrough_sandbox: bypass the OS-sandbox
+        # wrap and the runtime shell probe so this exercises only the kill path.
+        monkeypatch.setattr(
+            "kiro_crew.cron_script.wrap_argv", lambda argv, **k: (list(argv), None)
+        )
+        monkeypatch.setattr("kiro_crew.cron_script._resolve_command_shell", lambda: "sh")
+        mock_proc = MagicMock()
+        mock_proc.pid = 2**22 + 12345  # > PID_MAX default, never a real pid
+        mock_proc.communicate.side_effect = sp.TimeoutExpired("cmd", 30)
+        with patch("subprocess.Popen", return_value=mock_proc), patch(
+            "kiro_crew.platform_compat.kill_process_tree", return_value=True
+        ):
+            result = run_command_sandboxed("sleep 30", timeout=30)
+        # A timed-out command must report the timeout, not "Command failed".
+        assert result == {
+            "status": "error",
+            "output": "❌ Command timed out after 30s",
+            "exit_code": -1,
+        }
+        mock_proc.stdout.close.assert_called_once()
+        mock_proc.stderr.close.assert_called_once()

@@ -9,6 +9,7 @@ import { Send } from 'lucide-react'
 
 import { i18nT } from '../../../i18n/t'
 import { Input, SendBtn } from '../../../components/ui'
+import { useImeGuard } from '../../../hooks/useImeGuard'
 
 interface Props {
   onSend: (text: string) => void
@@ -17,6 +18,7 @@ interface Props {
 }
 
 export default function BroadcastBar({ onSend, caption, disabled }: Props) {
+  const ime = useImeGuard()
   const inputRef = useRef<HTMLInputElement>(null)
 
   const send = () => {
@@ -27,10 +29,17 @@ export default function BroadcastBar({ onSend, caption, disabled }: Props) {
   }
 
   return (
-    <div className="flex-none px-6 py-3 border-t border-border bg-bg">
+    <div className="flex-none px-4 md:px-6 py-3 border-t border-border bg-bg">
       {caption && (
         <div
-          className="text-[12px] text-muted truncate mb-2"
+          // Wraps rather than clipping to one line: `truncate` set
+          // `white-space: nowrap`, so a caption longer than the bar was cut with
+          // an ellipsis — and `text-overflow` shows a string's HEAD, which pinned
+          // the display to the oldest speech. `line-clamp-2` keeps this bar from
+          // growing without limit and pushing the composer off-screen, since the
+          // bar is `flex-none` and cannot shrink. Pairing matches
+          // `issue-radar/components/IssueDetail.tsx`.
+          className="text-[12px] text-muted break-words line-clamp-2 mb-2"
           aria-live="polite"
           data-testid="meetings-caption"
         >
@@ -45,9 +54,7 @@ export default function BroadcastBar({ onSend, caption, disabled }: Props) {
           aria-label={i18nT('apps.meetings.broadcastBar.placeholder')}
           disabled={disabled}
           className="flex-1"
-          onKeyDown={e => {
-            if (e.key === 'Enter') send()
-          }}
+          {...ime.bindEnter({ onEnter: send })}
         />
         <SendBtn
           onClick={send}

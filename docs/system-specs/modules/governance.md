@@ -421,7 +421,7 @@ disposition:
   transport is an externally-reachable network surface — deny-by-default on any
   error is the safer posture there, and a transport that fails to start leaks
   nothing. `fail_closed=True` is the same disposition the authorization/admission
-  chokepoints use (e.g. `capabilities.publish` in `handlers/artifacts.py`,
+  chokepoints use (e.g. `capabilities.publish` in `publish_governance.py`,
   `capabilities.theme_install` in `handlers/themes.py`, `capabilities.theme_persona`
   in `chat_runner.py`) where a wrong permit lets bytes leave the box or ingests
   untrusted content. The ALLOW audit is disposition-split: a **governed** allow
@@ -448,8 +448,72 @@ The Slack posture check itself stays policy-only (a profile cannot carry
 `posture`, Rule 6).
 
 Profiles hot-reload via an mtime fingerprint (`ProfileStore`); a schema-invalid
-profile falls back to deny-all (Validation rule 5), **not** the ceiling.
-`extends` is monotonic narrowing (`compose_profiles`).
+profile falls back to deny-all (Validation rule 5), **not** the ceiling — unless
+the policy declares a top-level `fallback` profile (see *Configurable fallback*
+below), which is substituted instead. `extends` is monotonic narrowing
+(`compose_profiles`).
+
+**Configurable fallback (policy-only).** By default the substitute for an unusable
+profile is the most-restrictive deny-all. A policy MAY declare a top-level
+`fallback` object — parsed as a narrow-only profile (same scope validation; an
+unknown scope in it fails closed at boot, on both sides of the key-open asymmetry
+described below, because it is part of the policy document rather than a profile
+file) — which the loader substitutes at all
+three unusable-file sites instead of deny-all. Intersected with the ceiling like
+any profile, it can only narrow it: it lets an operator keep the basic operational
+planes available (subagent/cron/heartbeat/taskrunner) while still denying the
+sensitive ones (for example `channels`/`apps`) when a profile file cannot be
+loaded. Absent the key the fallback stays deny-all (the default is unchanged). A
+profile may NOT declare `fallback` (policy-only, rejected at parse). The chosen
+fallback is resolved against the composed ceiling, and the profile-store freshness
+key folds in whether a fallback is declared, so a store first-touched before the
+ceiling composed reloads once it does rather than baking deny-all permanently.
+
+**Unknown `capabilities.*` child in a PROFILE — tolerated ONLY when `enabled: true`.**
+An unknown governed key normally fails closed. The one exception is a child of a
+*key-open* namespace (`capabilities`) inside a **profile file**, and it is
+deliberately **asymmetric**:
+
+- **A payload of exactly `{"enabled": true}` (that one key, boolean identity) →
+  tolerated.** `parse_profile` skips it, logs a warning naming the profile and the
+  key, and records it on `Profile.unknown_scopes`. Known siblings in the same block
+  still parse and still enforce.
+- **Anything else → fails closed** exactly as before the tolerance existed
+  (`enabled: false`, `enabled` absent, a non-dict value, a non-boolean `enabled`,
+  or **any extra key beyond `enabled`** — capability payloads carry inner
+  narrowing rulesets like `spawn.agents`, so `{"enabled": true, "agents": {...}}`
+  is an enable-plus-narrowing whose narrowing must not be dropped), so the loader
+  substitutes the bind-preserving deny-all fallback.
+
+The tolerated side exists because cross-edition data-home sharing is supported: an
+edition that `register_scope`s extra capability rows seeds them into `host.json`
+with `enabled: true`, and a build without those rows used to reject the whole
+profile and degrade the surface to deny-all (every governance row reading "deny
+all"). It is safe because a profile is narrow-only and the intersection is applied
+by `resolve` (rule-2 intersect of ceiling ∘ profile) — declining to narrow an
+unregistered scope cannot change any decision in any build.
+
+The fail-closed side exists because an unknown **narrowing** is indistinguishable
+from a typo'd narrowing of a core capability: `{"spwan": {"enabled": false}}` reads
+exactly like a failed attempt to disable `spawn`. Tolerating it would silently grant
+what the operator tried to deny, so the loud deny-all fallback is the correct
+outcome — it surfaces the typo.
+
+**Accepted design consequence.** One residual class is knowingly not caught: a
+typo'd capability name that carries `enabled: true` (for example
+`{"spwan": {"enabled": true}}`) is tolerated rather than surfaced as an error. This
+is inert by the argument above — the declaration could not have changed a decision
+whether it was honored or skipped — so the cost is a missed diagnostic, not a
+permission change. `Profile.unknown_scopes`, surfaced in the Security page's
+governance payload as `unknown_profile_scopes`, is what makes that class visible.
+
+Three things are deliberately unchanged: a **policy** naming an unknown key still
+raises regardless of `enabled` (tamper-evidence, Rule 8); the policy's top-level
+`fallback` object — parsed as a profile body but not through `parse_profile` — still
+fails closed at boot; and an unknown **top-level** governed family in a profile
+still fails closed. The tolerance assumes `SCOPE_CATALOG` is **append-only** (a
+scope is added or retired, never renamed in place), else a renamed row declared
+`enabled: true` would be silently tolerated instead of surfacing as a migration.
 
 **Present-but-unrecoverable profile — governed fleet fails closed, standalone is
 lenient.** The reload reads each file's bytes SEPARATELY from parsing and handles
@@ -611,7 +675,37 @@ read-your-writes should add it deliberately, with its own tests.
   profile, title)` (governance, incl. the `commands` scope, and MCP titles
   `mcp__server__tool` converted to `@server/tool`) → first-party app-own MCP
   server auto-approve → read-only auto-approve →
-  user `auto_approve_tools` loop**. A governance deny wins over a user
+  user `auto_approve_tools` loop**. **Canonical MCP identity.** For a call
+  carrying BOTH trusted `_meta.kiro` fields, the gate reconstructs
+  `mcp__<mcp_server_name>__<mcp_tool_name>` once on the common path and runs the
+  deny-floor and `gate_decision` against it **in addition to** the display title
+  and raw command — never instead of them. `select_tool_title` prefers the
+  model's prose `description`, so an ordinary MCP call whose per-tool rule names
+  the real tool would otherwise miss the ceiling and reach interactive approval,
+  where a human "allow" runs a policy-denied tool. The two are not competing
+  spellings of one fact: the canonical name is the trusted, non-model-authored
+  statement of WHICH tool is invoked and is what a per-tool rule matches, while
+  the title and raw command carry the path/command/content signals that a tool
+  identity does not express. Each covers a security dimension the other cannot,
+  so a deny on EITHER denies the call: a `~/.aws/credentials` title still denies
+  behind a harmless canonical name, and a denied canonical name still denies
+  behind benign prose. **Server-only identity.** When the backend proves the
+  server but not the tool (no `_meta.kiro.toolName`, or an uncached permission
+  event), `gate_decision` is asked about `mcp__<mcp_server_name>` instead. That
+  is a complete question for this plane and only this plane: `mcp_title_to_ref`
+  maps it to `@server`, and an `@server` rule is defined to cover every tool
+  under that server, so a `deny @github` ceiling binds on a call whose tool
+  cannot be named — without it, governance sees only the model-authored title
+  and the call reaches a human who can approve a server the policy forbids. It
+  is deliberately NOT added to the deny-floor targets: that plane matches raw
+  text and operator regexes, where `mcp__<server>` is a different string from
+  the canonical identity a rule is written against rather than a broader form of
+  it. A server-only identity never satisfies auto-approval. Because this
+  enforcement is
+  on the common path, the first-party app-own auto-approve below does **not**
+  repeat it; what remains load-bearing there is the identity requirement itself
+  (an absent `mcp_tool_name` leaves the canonical name empty, so the tool cannot
+  be identified and is not auto-approved). A governance deny wins over a user
   auto-approve, and the read-only auto-approve fast-path runs strictly AFTER
   both the deny-floor and `gate_decision`, so a read-only classification can
   never re-admit a denied/governed call. **First-party app-own MCP server
@@ -650,8 +744,27 @@ read-your-writes should add it deliberately, with its own tests.
   is authoritative; KiroCrew does not regenerate `~/.kiro/agents/*.json`.
 - **Plane C — out-of-band executors**: the cron `command` (runs via `sh -c`
   outside the ACP flow) is gated in `mcp_cron._vet_command_governance`; the
-  cron *capability* on/off gate in `mcp_cron._vet_cron_capability_governance`
-  (at `cron_add`); the sandbox ordinal floor is clamped in `sandbox.wrap_argv`;
+  cron *capability* on/off gate in `mcp_cron._vet_cron_capability_governance`.
+  Both run at `cron_add` (authoring) AND again at fire time — for EVERY job
+  kind — via the shared `mcp_cron.vet_job_at_fire_time(job)` entry point
+  called from `slack.gateway._cron_callback` immediately before execution:
+  `command` jobs re-run the capability gate + the `commands` ceiling, `script`
+  jobs re-run the capability gate + the script-body scan
+  (`mcp_cron._vet_script_file`) on the freshly re-resolved path (so a script
+  file edited on disk after authoring is re-checked too), and `message` (LLM)
+  jobs re-run the capability gate before the session dispatch. A policy
+  tightened after a job was scheduled therefore denies that job's next run
+  instead of only affecting jobs authored after the change. Denial at
+  fire time marks the run `last_status="error"`, emits a SEL
+  `outcome="denied"` event keyed `cron:<job.id>`, and does not delete or pause
+  a RECURRING job — deliberately including the consecutive-failure auto-pause
+  counter, which a policy denial must not feed (five denied fires would
+  otherwise auto-pause the job permanently) — so a later policy loosening
+  lets it resume on its own at its next slot. A denied one-shot `at` job is
+  parked DISABLED instead (never deleted, even with `delete_after_run`): its
+  due time has passed, so leaving it enabled would refire it on every timer
+  tick; the operator re-enables it after loosening; the sandbox
+  ordinal floor is clamped in `sandbox.wrap_argv`;
   spawn in `subagent._vet_spawn_governance`; outbound messaging in
   `mcp_core._vet_messaging_governance` plus the per-transport `channels` check
   in `mcp_core._vet_channel_governance`; dashboard cross-surface mirror creation
@@ -857,7 +970,34 @@ ALLOWED turn in the channel could otherwise pull it into agent context), the
 `handle_message` keeps its own gate as defense-in-depth for its OTHER entry points
 (interaction re-dispatch, synthetic sends). **`!stop` (cancellation) is the sole
 exemption** — a denied channel must still be able to halt a runaway session it
-previously started; `!restart` is NOT cancellation and stays gated. The OPTIONS
+previously started; `!restart` is NOT cancellation and stays gated.
+
+The exemption is **channel-neutral**, not Slack-only. `messaging/dispatch.py`'s
+`inbound_permitted(channel_type, *, text, has_attachments)` carries it for every
+channel on the shared pipeline, via `is_pure_cancel()`. Two properties make it
+safe to state that broadly. The match is whole-message, so `/stop the presses`
+is an ordinary sentence rather than a cancel, and an ATTACHMENT-bearing message
+is never exempt: a channel that fetches media after authorization would
+otherwise let a denied channel trigger a download by attaching a file to the one
+word that skips the gate. Both arguments default to the gated behaviour, so a
+caller that does not pass them is unchanged. This matters most where the channel
+has no widgets: with `max_buttons=0` a typed `/stop` is the only cancel
+affordance the operator has.
+
+`_CANCEL_ALIASES` is the recognised set, and it is a MIRROR of the per-channel
+command tables (`/stop`, `/cancel`, Discord's `!` bang forms, WeCom's `停止`),
+which is the one thing about this exemption that has actually gone wrong: WeCom
+shipped `停止` in its own table and on its `/help` card while the shared set knew
+only the ASCII spellings, leaving a denied WeCom conversation with no reachable
+off-switch in the language that channel exists for. Deriving the union in
+`messaging/` would invert the dependency — the shared layer importing all nine
+channel packages — so the tripwire is a test
+(`test_messaging_dispatch.py::test_the_shared_set_covers_the_channel_command_tables`)
+which DISCOVERS the channel tables by walking the packages, checks both
+directions (an alias no channel accepts is an exemption granted to a dead word),
+and fails on a table shape it cannot parse rather than skipping it. An earlier
+version named Discord and Telegram by hand and was blind to the three channels
+that diverged, which is the same mirror one level up. The OPTIONS
 Send / legacy-choice buttons are gated at dispatch BEFORE they edit/post the
 selection to the channel (their re-dispatched turn is gated too, but the message
 edit precedes it); the spent-marker `_done_` no-op posts nothing and stays exempt.
@@ -881,7 +1021,8 @@ scope a release or the companion registers), intersects each boot-frozen POLICY
 control with the host-surface PROFILE control using the model's own
 `_compose_controls`, and reports
 `{scope, archetype, governed, source, scope_note, detail}` per scope plus
-`{version, has_policy, profile, surface, other_bound_surfaces, unavailable}`.
+`{version, has_policy, profile, surface, other_bound_surfaces, fallback_profiles,
+unavailable}`.
 
 **A row describes ONE surface, and must say which.** The host profile governs
 in-process host actions, so it legitimately pins capabilities the host process
@@ -900,13 +1041,35 @@ switched off. Two fields keep that honest:
   control, count, or rule from those profiles, so the POSTURE-only boundary below
   is unchanged. This answers the question a host-scoped row provokes: *is cron
   really off, or is that just the host's ceiling?*
+- **`fallback_profiles`** — file stems of every profile currently replaced by the
+  fallback built-in — deny-all by default, or the policy's declared `fallback`
+  profile (from `governance_profiles.fallback_profile_names()`), sorted.
+  **Names only**, same exposure contract as `other_bound_surfaces`: a stem is not
+  rule content, so the POSTURE-only boundary is unchanged. `_reload` substitutes
+  that built-in at three sites — a present-but-unreadable file, a file whose JSON
+  or schema does not parse, and a file that parses but `extends` a parent that is
+  missing or chained — and enforcement is correct in all three. What is NOT correct
+  without this field is the *display*: the substitute reports `source: "profile"`,
+  so an unusable file renders identically to a deliberate operator lockdown, and an
+  operator has to read server logs to tell them apart.
+
+  Reported as the whole SET rather than a flag for the host-resolved profile, for
+  two reasons. A bound non-host profile deny-alls its own surface just as silently
+  while appearing in `other_bound_surfaces` looking healthy. And a flag derived by
+  matching a resolved profile's declared `name` against file stems mislabels a
+  profile whose name collides with a broken sibling's stem, whereas these ARE the
+  stems.
+
+  One documented gap: a first-ever load of an unreadable file has no salvageable
+  bind, so it is an UNBOUND deny-all. Its stem appears here, but no surface
+  resolves to it — that surface falls back to the ceiling rather than being denied.
 
 **Posture, not contents (security boundary).** The serialized `detail` carries
 only POSTURE — set `mode`, entry COUNTS (`allow_count`/`deny_count`),
 capability `enabled` + inner scope names, ordinal `floor` — and NEVER the rule
 CONTENTS (the allow/deny globs, command patterns). This is deliberate: the
-dashboard is reachable by the agent's own browser tooling (Playwright extension
-mode attaches to the user's authenticated Chrome), and `security_policy.json` /
+dashboard is reachable by the agent's own browser tooling (`playwright-cli attach
+--extension` drives the user's authenticated Chrome), and `security_policy.json` /
 `profiles` are on the `is_sensitive_path` keystone precisely so the agent cannot
 read the ceiling it is fenced by — knowing the exact deny patterns is what would
 let it craft an evasion. The human operator reads the authoritative contents from
@@ -935,6 +1098,22 @@ denials leave the same forensic trail.
   relevant `commands` patterns. This is the same plane split the rest of the
   model uses (a shell command is a `commands` item, never re-parsed into its
   sub-effects).
+  [`docs/guides/assets/security-policy.example.json`](../../guides/assets/security-policy.example.json)
+  shows both scopes set together, but read it as **egress defense-in-depth,
+  not a bounded egress guarantee**: a `commands` deny list is a finite set of
+  known patterns, not an allow-shaped ceiling, so it cannot enumerate every
+  network-capable tool (`python`, `ssh`, `git`, `pip`, `openssl s_client`, a
+  `curl` invocation with no `://` in it, or a piped/absolute-path
+  invocation of any of the above), and it says nothing about the web terminal
+  PTY, which is an ungoverned plane by design (see below). A deployment that
+  needs an actual bound on where the host can reach should treat the example
+  as a starting point for defense-in-depth, not as sufficient on its own.
+  Separately: once a `commands` deny pattern is adopted into policy, it
+  becomes a force-pin via `resolve_pinned_commands` (ceiling pins ∪ profile
+  pins, union not override) — a user cannot locally opt out of a pinned rule
+  the way they can an unpinned one, so an operator copying the example should
+  expect its deny rows to be effectively permanent for anyone bound by that
+  policy, not something end users can narrow per-rule.
 - **Per-app profile binding via MCP chokepoints is best-effort.** The managed
   `kirocrew-core` MCP server is spawned by kiro-cli, not by an app backend, so
   `KIROCREW_APP_NAME` is absent there — `learn_add`/`send_message` resolve the
@@ -958,10 +1137,10 @@ denials leave the same forensic trail.
   through the same effective-deny floor as `on_tool_call` is tracked as its own
   follow-up; do not describe computer-use governance as covering it.
 - **Raster capture has two channels and neither is governed.** Computer use has no
-  `observations` scope any more, and Playwright's already-shipped
-  `browser_take_screenshot` never had one — a fleet that means "no raster capture"
-  must deny both `@kirocrew-computer` and `@playwright/browser_take_screenshot` via
-  the `mcp` scope.
+  `observations` scope any more, and `playwright-cli screenshot` is a shell command
+  rather than a tool call, so an `mcp` deny cannot reach it at all. A fleet that
+  means "no raster capture" must deny `@kirocrew-computer` via the `mcp` scope
+  **and** the browser CLI via the `commands` scope.
 - **The `mcp`-scope deny is now the ONLY governance lever over computer use, and it
   is keyed on a renameable alias.** `mcp.deny: ["@kirocrew-computer"]` works on
   unmodified shipped code, but the server key is derived by `mcp_server_alias()` from
@@ -1018,6 +1197,11 @@ activation), `sandbox.min_level` (ordinal
 floor at `wrap_argv`), `approval_mode` (boot floor only), and every capability
 gate — `capabilities.spawn`, `capabilities.messaging`, `capabilities.cron`,
 `capabilities.memory_writes`, `capabilities.script_hooks`,
+`capabilities.browse` (the native `browser` MCP tool's dispatch chokepoint —
+default on; a deny makes the tool refuse outright, and it does NOT fall back to
+`playwright-cli`. The `playwright-cli` fallback path itself remains governed by
+the `commands` scope, so denying browsing wholesale means denying both this
+capability AND the `playwright-cli` command),
 `capabilities.publish` (artifact publish chokepoint — see below),
 `capabilities.theme_persona` / `capabilities.theme_install`, and
 `capabilities.telemetry` (the anonymous beacon: send gate + both write
@@ -1064,9 +1248,9 @@ Display-only union — it does not widen enforcement.
 with an inner `destinations` `ScopedRuleset` (`identifier` matcher) bounding
 which publish-provider ids are allowed once the capability is on — the direct
 analogue of `capabilities.spawn`'s `agents` ruleset. It is enforced at a Plane-C
-out-of-band chokepoint in the artifact publish handler (`api_artifact_publish`),
-NOT at the host PreToolUse gate: publishing is a user-driven dashboard HTTP
-action ("NOT LLM tools"), so the title-gate never sees it. The chokepoint calls
+out-of-band chokepoint — `publish_governance.publish_denied_reason` — NOT at the
+host PreToolUse gate: publishing is a user-driven dashboard HTTP action ("NOT LLM
+tools"), so the title-gate never sees it. The chokepoint calls
 `governance_permits("capabilities.publish", "destinations:<provider_id>", …)`
 BEFORE dispatching to the provider, and additionally honours the standalone
 operator's `publish.allowed_destinations` config allowlist (default-open,
@@ -1076,6 +1260,26 @@ from `network.egress`: `capabilities.publish.enabled: true` never re-enables git
 publish (the floor is ADD-only and unconditional) nor a fetch host. WHO
 implements a destination is the orthogonal CPP `PublishRegistry` seam; governance
 decides only WHETHER + to WHERE, and runs first.
+
+Callers (one decision, several surfaces — the helper lives in its own module so a
+second surface cannot grow a drifting copy):
+
+| Surface | Destination id | On deny |
+|---|---|---|
+| `api_artifact_publish` + its sharing/review siblings (`handlers/artifacts.py`, via the module-local `_publish_governance_denied` alias) | the requested/effective `publication.provider` | 403 |
+| `GET /api/publish-providers` (`apps/routes.py`) | `deploy-web-aws` | the row is omitted, so the button never renders |
+| `POST /api/deploy/deploy` (`deploy/handlers.py`) | `deploy-web-aws` | 403, audited `deploy/denied` |
+| `POST /api/deploy/pending/{id}/confirm` | `deploy-web-aws` | 403 BEFORE `claim_pending`, so a denied confirm does not consume the entry |
+
+The deploy-path callers are what make the public-web destination genuinely
+closable: hiding the provider row alone would be presentation, not a control
+(the endpoint is reachable directly, and the `deploy_artifact` MCP preview goes
+through `/api/deploy/deploy` too), and gating only the initial deploy would leave
+a pending entry created before the ceiling changed still confirmable. Because the
+deploy path shares `publish.allowed_destinations`, an operator who had already
+narrowed that list for the registry must add `deploy-web-aws` to keep deploying —
+intentional: the list states which destinations are permitted, and the core
+deploy provider was previously the one destination exempt from it.
 
 Unlike the messaging/cron chokepoints (which degrade-to-permit on a transient
 governance-evaluation error so a latent regression can't wedge the surface),
@@ -1157,8 +1361,13 @@ scope growth without server-recorded grants is not covered by this decision.
 
 The anonymous daily heartbeat and official-app install receipt (`beacon.py` and
 `apps/install_receipt.py`; full spec in [metrics.md](metrics.md) → "Anonymous
-outbound telemetry") are the repo's **only default-on egress family**. Both use
-fixed anonymous payloads and the same effective-enable ladder. They are governed
+outbound telemetry"), together with the in-app session-pulse survey
+(`dashboard/handlers/feedback.py`), are the repo's **only default-on egress
+family**. All three gate on the same `beacon.telemetry_permitted` effective-enable
+ladder. The heartbeat and install receipt send fixed anonymous payloads; the
+survey egresses the user's own submitted answers plus an anonymous per-install
+id (`beacon.install_id`), and only once that same ladder — including the
+first-run privacy disclosure — permits it. They are governed
 by the `capabilities.telemetry` `SCOPE_CATALOG` capability row
 (`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
 change, mirroring the theme rows above).
@@ -1247,6 +1456,84 @@ The Security panel picks the row up automatically — `api_governance_policy` it
 bare "Telemetry", because this scope governs only the outbound heartbeat and NOT the
 unrelated local-only `telemetry.enabled` OTEL collection.
 
+### Tailnet origin derivation — `capabilities.tailnet_origin`
+
+`dashboard.tailscale.enabled` lets the gateway ask the local Tailscale daemon for
+this machine's MagicDNS name at startup and add `https://<name>` to the CSRF origin
+allowlist and the DNS-rebinding `Host` barrier, so `tailscale serve` reaches the
+dashboard without a hand-written `dashboard.url` (`dashboard/tailnet.py`; RFC
+`request-for-change/rfc-tailnet-dashboard-access.md`). Governed by the
+`capabilities.tailnet_origin` `SCOPE_CATALOG` capability row
+(`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
+change, mirroring the telemetry and theme rows above).
+
+**Why a governance row.** The config switch is an *operator* control that the agent
+can reach through the generic config setter. What a managed fleet objects to is not
+a preference but two effects it may forbid outright: **running the tailnet CLI on a
+managed host**, and **widening the set of origins the gateway accepts
+authenticated, state-changing requests from**. Read from the trust-root
+`security_policy.json` (inside `security._SENSITIVE_HOME_DIRS`, so the agent can
+neither read nor rewrite its own ceiling), the row is a control the running app
+cannot undo.
+
+Consulted at **four** chokepoints — the derivation, the publish action, and every
+write path to `dashboard.tailscale.enabled`; any one alone would be a
+half-control:
+
+| Chokepoint | Pinned-off behavior |
+|---|---|
+| `tailnet.resolve_tailnet_host()` | Contributes no origin **and does not spawn the CLI**, so the pin closes both halves an administrator objects to. Checked ahead of the daemon call |
+| `tailnet_serve.publish()` | Refuses to run `tailscale serve`, so the dashboard is never put on the tailnet in the first place. Checked before the spawn — refusing after publishing would be theatre |
+| `PATCH /api/config/kirocrew` (`handlers/core.py`) | **403** on `dashboard.tailscale.enabled=true` |
+| `kirocrew config set [--local] …` (`cli_config.py`) | Exits **1** without writing. The generic setter reaches the same key, and `--local` writes the overlay that takes PRECEDENCE over the base file |
+
+`tailnet_serve.unpublish()` is deliberately **not** gated, and the asymmetry is
+load-bearing rather than an oversight. `is_governance_pinned_off` returns true both
+for a real policy deny and for a ceiling it could not evaluate, so gating withdrawal
+would mean a transient policy-read failure leaves a dashboard published on a tailnet
+with no supported way to take it down — a fail-closed control failing open in
+effect. Removing exposure is always permitted, the same direction that lets a config
+write of `false` through while `true` is refused.
+
+Writing `false` is **always** permitted, for the reason the telemetry row gives:
+the ceiling is a floor, so a narrower local choice composes with it and refusing it
+would strand a user who wants to record a stricter preference already in effect.
+
+The write refusals exist so a pinned host cannot sit storing `enabled: true` behind
+a switch that does nothing — the derivation is already suppressed, so without them
+the config file and the Security panel card would both claim "on" while no origin is
+trusted and `tailscale serve` still fails the Origin check.
+
+**Fails CLOSED** (`fail_closed=True`), joining `capabilities.telemetry` /
+`theme_install` / `publish`. The two dispositions are not symmetric: a wrong-DENY
+costs a convenience and leaves the explicit-`dashboard.url` path exactly as it is
+today, while a wrong-PERMIT **widens a security boundary on a fleet that forbade
+it**. `fail_closed` also promotes the degrade to a critical SEL event, so an
+unevaluable ceiling is visible rather than silently permissive.
+
+**Audited at the enforcement call, not on the probe** — the same disposition
+telemetry documents, for the same reason. `resolve_tailnet_host` and both write
+chokepoints pass an `audit_tool`, so a suppressed derivation and a refused write
+each leave a `governance_decision` SEL record. `GET /api/tailnet/status`, which the
+Security panel's card refetches, passes none: auditing an *inspection* would append
+HMAC-chained rows for a question rather than a decision.
+
+**POLICY LAYER ONLY**, and the probe reads **three** outcomes rather than two, both
+exactly as the telemetry row above spells out: a policy-layer deny is a pin, a
+degrade (`reason` prefixed `GOVERNANCE_ERROR_REASON`) is a pin, and a profile-layer
+deny is **not** — because `resolve_active_scope` returns a synthetic deny-all
+profile during an unprimed-store race, and reading that as a pin would make the
+startup warning, the 403 and the CLI refusal all blame an administrator who does not
+exist. The probe also runs once at gateway startup carrying no session, so a
+per-surface Level-2 ceiling is not the question it asks.
+
+The Security panel picks the row up automatically (`api_governance_policy` iterates
+`SCOPE_CATALOG`), and the tailnet card additionally renders `governance_pinned` as a
+distinct `pinned` state — the card must separate "off because the operator left the
+switch off" (flippable) from "off because an administrator pinned it" (a config
+write returns 403), since offering a working-looking toggle for the second is the
+half-control this row exists to avoid.
+
 ### Computer use is NOT governed (deliberately)
 
 Computer use (see [computer-use.md](computer-use.md)) has **no scope rows in
@@ -1291,9 +1578,12 @@ Two things computer use still shares with this module, neither of them a decisio
 ## Audit
 
 `sel.log_governance_decision` records a `governance_decision` event
-(`outcome ∈ {allowed, denied}` — the existing permit vocabulary). On-disk SEL is
-not redacted by the writer and the HMAC chain signs the bytes as written, so the
-operation / item / reason are redacted via `redact_via_context` **before** `log`.
+(`outcome ∈ {allowed, denied}` — the existing permit vocabulary). The SEL writer
+applies the baseline credential/exfiltration passes to `metadata` values and the
+free-form top-level strings (`operation` / `resources` / `error`) before
+persisting, but `redact_via_context` is broader than those passes — so the
+operation / item / reason are ALSO redacted via `redact_via_context` **before**
+`log`; the writer's pass is a second layer, not a replacement.
 
 ## CLI
 

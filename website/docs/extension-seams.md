@@ -9,10 +9,10 @@ The backend has the sibling mechanism, Composed Platform Providers: see
 [`docs/system-specs/modules/platform-context.md`](../../docs/system-specs/modules/platform-context.md).
 The two are independent. Nothing here reads `CONTRACT_VERSION`.
 
-## The nine registry seams
+## The eleven registry seams
 
 Each entry is one registrar the edition may call, paired with the reader the core
-already calls. `src/extensions.ts` names exactly these nine in its header, and
+already calls. `src/extensions.ts` names exactly these eleven in its header, and
 `src/test/extensionSeams.test.tsx` exercises each one.
 
 | Seam | Module | Registrar to reader |
@@ -24,6 +24,8 @@ already calls. `src/extensions.ts` names exactly these nine in its header, and
 | Top-bar widgets | `apps/topBarWidgets.tsx` | `registerTopBarWidgets()` to `getTopBarWidgets()` |
 | Readout-capsule segments | `apps/capsuleSegments.tsx` | `registerCapsuleSegment()` to `getCapsuleSegments()` |
 | Overview status cards | `pages/overviewStatCards.tsx` | `registerOverviewStatCards()` to `getOverviewStatCards()` |
+| Overview lower panel (single owner) | `pages/overviewPanel.tsx` | `registerOverviewPanel()` to `getOverviewPanel()` |
+| Overview built-in suppression (subtractive) | `pages/overviewBuiltins.ts` | `suppressOverviewBuiltin()` to `isOverviewBuiltinSuppressed()` |
 | Panel-navigation chords | `hooks/useKeyboardShortcuts.ts` | `registerPanelShortcut()`, read by the shortcut handler and `DEFAULT_SHORTCUTS` |
 | Non-app route prefixes | `components/MigrationCheck.tsx` | `registerNonAppPrefix()`, read by `MigrationCheck` |
 
@@ -32,8 +34,14 @@ registry; see "API methods" below.
 
 Other `register*()` functions in `src/` (built-in surfaces, command-palette
 providers, tool pills, terminal sockets, highlight.js languages) are core-internal
-wiring, not edition seams. Only the nine above are called from the composition
+wiring, not edition seams. Only the eleven above are called from the composition
 root.
+
+Ten of the eleven are **additive** — the edition contributes a surface. The
+eleventh is **subtractive**: `suppressOverviewBuiltin()` removes a built-in
+Overview surface for a distribution whose environment makes it permanently
+inapplicable, which no additive seam can express. It is named `suppress*` rather
+than `register*` precisely so a call site cannot be misread as a contribution.
 
 ## Composition root
 
@@ -102,6 +110,48 @@ edition's TypeScript sources, where a rebuild could only produce a stock bundle.
 `frontend.edition_sources_missing()` detects that and the rebuild is **skipped**,
 keeping the shipped dashboard. Covered by `test/test_frontend_edition_build.py`.
 
+## Pre-boot shell branding: `branding.json` and the `public/` overlay
+
+Everything the registry seams brand is rendered by React — which means none of it
+exists before React mounts. Three surfaces are shown earlier: the `<title>` during
+boot (and whenever a PWA-install dialog or bookmark samples it), the
+`<meta name="theme-color">`, and the PWA identity (`manifest.json` plus
+`icon-192.png` / `icon-512.png`). `registerThemeBranding()` cannot reach any of
+them. The edition plugin patches them instead — the HTML fields on every build
+and dev transform, the `public/` overlay at build emit — from two optional
+inputs in the edition dir:
+
+- **`branding.json`** — `{"title": "Acme Crew", "themeColor": "#0055aa"}`. Both
+  keys optional; values are HTML-escaped into the root `index.html` only (app
+  panel pages are untouched). An unknown key, a non-string value, or malformed
+  JSON **fails the build** — a typoed key silently shipping the stock title is
+  the exact silent-degrade class this seam bans. So does a missing target tag:
+  if the core shell drops `<title>` or the theme-color meta, the edition build
+  breaks loudly rather than quietly reverting to stock.
+- **`public/`** — files here overlay the stock copies in the built `dist`,
+  edition-wins, emitted through the bundler (`generateBundle`/`emitFile`, which
+  takes precedence over the `publicDir` copy). Only an allowlist is accepted —
+  `manifest.json`, `icon-192.png`, `icon-512.png` — and any other file or
+  subdirectory in the edition's `public/` fails the build (OS junk dotfiles like
+  `.DS_Store` are skipped). The allowlist is the structural guarantee
+  that an edition cannot overwrite `index.html`, `sw.js`, or `vendor/*`; widen it
+  consciously (`SHELL_OVERLAY_ALLOWLIST` in `scripts/lib/editionShell.mjs`).
+
+Two known edges: the overlay is **build-only** (`generateBundle` never runs in
+the dev server, which keeps serving the stock `public/` files — the branded
+manifest/icons appear in `dist`), and `branding.json` is read eagerly at config
+load, so the dev server needs a restart after editing it.
+
+Both inputs are inert when absent, and the stock build (no `KIROCREW_EDITION_DIR`)
+is byte-identical to a build without this seam.
+
+**Replacing `icon-512.png` obliges you to replace the served logo too.** The
+gateway serves `/logo.png` (sidebar logo, favicon fallback, chat avatar) from its
+own static tree, and core CI pins that file byte-identical to
+`website/public/icon-512.png` so the installed-app icon and the favicon can never
+drift apart. An edition that overlays the PWA icons but leaves the gateway logo
+stock reintroduces exactly that drift — brand one, brand both.
+
 ## Edition peer-dependency rule
 
 An edition dir resolves bare imports from its OWN `node_modules`, so any
@@ -116,10 +166,106 @@ silently empty data, and they appear only at runtime, only in the edition build.
 package to that list**, and the edition should declare these as peer deps. The
 dedupe is harmless in the stock single-`node_modules` build.
 
+## Authoring an edition: the build pitfalls
+
+The seams above make an edition build possible; this section is what makes a
+first one work. Each pitfall below is silent or misleading at the moment it is
+introduced, and every one was hit in practice by a real downstream edition.
+
+### Theme CSS: never rely on load order, take specificity
+
+An edition that registers a theme (`registerTheme()`) ships that theme's CSS
+block in its own file, imported from its composition root. In the current
+build that CSS lands in the entry chunk's stylesheet, which `index.html` links
+**before** the chunk carrying the core's `index.css` — but chunk order is an
+artifact of the build, not a contract. What is contractual is the cascade: the
+core's default palette block sets the theme variables on
+`:root, [data-theme="dark"], …`, and `:root` is specificity (0,1,0). An edition
+block headed `[data-theme="acme"]` is also (0,1,0), so whichever stylesheet
+loads later wins — today that is the core, and every variable its default block
+also sets silently overrides the edition's. Nothing errors: the picker shows
+the theme, the palette stays stock.
+
+The built-in themes never hit this because their blocks live in `index.css`
+itself, after the default block — same sheet, later, wins.
+
+Prescription: prefix the edition's theme selectors with `html`, which wins on
+specificity regardless of load order:
+
+```css
+/* loses: (0,1,0), and the core's :root default block loads later */
+[data-theme='acme'] { --accent: #0055aa; }
+
+/* wins: (0,1,1) beats (0,1,0) in either load order */
+html[data-theme='acme'] { --accent: #0055aa; }
+```
+
+### Bare imports: the edition dir needs its own `node_modules`
+
+The composition root lives outside the SPA root, and Node-style resolution
+walks **up from the importing file** — it never reaches
+`website/node_modules` from a sibling repo. The first bare specifier in the
+edition (`import { Sparkles } from 'lucide-react'`) fails the build:
+
+```
+[vite]: Rolldown failed to resolve import "lucide-react" from
+"<edition dir>/extensions.tsx".
+```
+
+Give the edition dir its own `node_modules`: either a real install that
+declares the shared packages as peer dependencies, or a build-script symlink to
+`website/node_modules`. Either way, read the "Edition peer-dependency rule"
+above — once two `node_modules` trees exist, every context-carrying singleton
+must stay deduplicated or hooks bind to a second React.
+
+### Typecheck the edition, or ship ReferenceErrors
+
+The core's `tsc -b` covers `website/src` only (`tsconfig.app.json` has
+`"include": ["src"]`), so the edition's sources are outside every typecheck the
+core runs. The bundler does not fill the gap: TypeScript is erased, and a free
+identifier — a typo like `registerThemee` — compiles into the bundle as an
+assumed **global**. The build succeeds, `tsc -b` stays green, and the app
+throws `ReferenceError` at module load. Because the composition root runs
+before `App` mounts, that is a blank page, not a broken widget.
+
+Give the edition a `tsconfig.json` that extends the core's and run it in the
+edition's own build or CI (`npx tsc -p <edition>/tsconfig.json`) — the core
+will never run it for you:
+
+```jsonc
+{
+  "extends": "../KiroCrew/website/tsconfig.app.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // Without vite/client, every `import.meta.env` the edition touches
+    // (directly or via a core module it imports) is a TS2339 false positive.
+    "types": ["vite/client"]
+  },
+  "include": ["."]
+}
+```
+
+`extends` keeps the `@/*` path mapping working (TypeScript resolves inherited
+`paths` relative to the config that declares them), so the edition's
+`import { registerTheme } from '@/hooks/useTheme'` typechecks against the real
+core sources. With this in place the typo above is caught at build time:
+`TS2552: Cannot find name 'registerThemee'. Did you mean 'registerTheme'?`
+
+### A default theme needs configuration, not a seam
+
+To make the edition's theme the default, do not look for a frontend seam —
+seed `dashboard.theme_color` (and `theme_mode`) in the deployment's
+`config.json`. The dashboard applies the server value from
+`GET /api/theme/boot` over any stored client choice and writes it back, so a
+fresh install lands on the edition's theme and the user keeps free choice from
+then on. One caveat: the very first paint, before that response arrives, uses
+the compiled-in default (`DEFAULT_COLOR_THEME`); a returning visitor is
+unaffected because the applied value persists in `localStorage`.
+
 ## Collision policy
 
-`apps/seamCollision.ts` is the one policy every registrar routes rejections
-through. A registration whose key collides with a core entry (or an
+`apps/seamCollision.ts` is the one policy every **additive** registrar routes
+rejections through. A registration whose key collides with a core entry (or an
 already-registered one) is resolved core-wins, and `reportSeamCollision`:
 
 - **fails loud in dev and test** (it throws under `import.meta.env.DEV`, which is
@@ -127,6 +273,13 @@ already-registered one) is resolved core-wins, and `reportSeamCollision`:
   build/test time rather than by an end user;
 - **degrades safe in production** (warn and ignore), so a shipped app never
   white-screens over a duplicate.
+
+The subtractive seam is deliberately **exempt**. `suppressOverviewBuiltin()` is a
+set, and a repeat is not a conflict: two owners cannot share one render slot, but
+two parties that both want a surface gone agree. So re-entrant registration (HMR,
+a module imported twice) is silently idempotent rather than a
+`reportSeamCollision` — which is why it is the one seam whose second call is not
+an error.
 
 ## Per-seam validation
 
@@ -183,10 +336,76 @@ standalone pill in the header's right-hand actions area, next to the capsule.
 Widgets render in insertion order, take no props (each reads its own state or
 queries), and are each `ErrorBoundary`-isolated.
 
+**Theme centre decoration is a backdrop, not a cell.** `branding.topBar` used to
+render as a sized flow cell between the search and the actions group
+(`flex-1 min-w-0 h-full`). Under the three-track grid it renders as a full-header
+background layer instead: `absolute inset-0`, `pointer-events-none`,
+`aria-hidden`. A fourth in-flow child would land in an implicit column and shift
+the search off centre, and a sweep or scanline is visually a backdrop anyway. The
+narrowed contract: a registered decoration **cannot receive pointer events** and
+is **not announced**, so an interactive or gap-sized decoration degrades silently
+(the `ErrorBoundary` never fires — nothing throws). Register interactive chrome
+through `registerTopBarWidgets` instead.
+
+**Rung thresholds are locale-measured.** The container-query breakpoints in
+`.topbar`'s ladder (`src/index.css`) are the measured content width of each
+readout tier plus a margin, taken in one locale through
+`website/capture/topbar-search-variants.tsx`. A wider locale can push a tier past
+its own threshold, in which case the group squeezes or truncates its text before
+the rung fires — graceful, but it means the constants are an approximation, not a
+guarantee. Re-measure with that harness when readout content or the catalogs
+change materially.
+
+
+**Width budget for both top-bar seams.** The header is a three-track grid whose
+side groups are pure remainder (`minmax(0,1fr)`, no floor) — see `.topbar` in
+`src/index.css`. The actions group therefore does NOT grow to fit its contents;
+it gets what the window leaves after the centred search, and its built-in
+readouts give that space back through container-query rungs. Registered segments
+and widgets do not participate in those rungs, so a registered component must
+stay inside a budget: **keep the collapsed form under ~40px** and drop your own
+labels with your own `@container` rule keyed off `.tb-right` if you render text.
+The narrowest desktop width leaves the group about 206px, of which the built-in
+dot, metric icon, credit icon and bell already claim roughly 139px. A component
+wider than the remainder is clipped from the group's leading edge (the group
+clips deliberately rather than pushing the notifications bell out of the
+header), and at the terminal rung the capsule is reduced to its connection dot,
+which hides registered segments along with the core readouts.
+
 **Overview status cards.** `registerOverviewStatCards([{ id, order?, component }])`
 adds a self-contained `StatCard` (owning its own query and state, like the core
 `TunnelStatus`) to the Settings Overview grid, after the core cards, in ascending
 `order`. Each receives a `delay` prop for the grid's stagger animation.
+
+**Overview lower panel.** `registerOverviewPanel({ id, component })` claims the
+region below the Usage/Memory summary grid, which the stock build leaves empty.
+Unlike every other registry here this slot holds **at most one** entry: the first
+registration owns the region, and a second is a collision (throws in dev/test,
+warns and is ignored in production) rather than appending or replacing. That is
+the point — the region has one owner who renders whatever internal layout it
+wants and owns all of it, so there is no layout negotiation between parties who
+cannot see each other. Reach for `registerOverviewStatCards` instead when the
+contribution really is one more tile in the status grid; use this slot when the
+content does not fit a 150px tile. The component receives no props and is wrapped
+in an `ErrorBoundary`, so a throwing panel disables only itself.
+
+**Overview built-in suppression.** `suppressOverviewBuiltin(id)` takes an id from
+a **typed union**, not a free string. That is the validation: a misspelled
+free-form id would suppress nothing and say nothing, and that symptom is
+indistinguishable from the seam not working at all, so the union turns it into a
+compile error at the call site. Keep the union minimal and add a member only
+alongside a real consumer — an id with no caller is API surface that has never
+been exercised. The seam is **one-way** (there is no `unsuppress`) and, like every
+registry here, is read at render and not reactive, so suppression must be
+registered during composition.
+
+It is **not a security control**. Suppression removes a piece of guidance from one
+page and relaxes nothing: whatever policy made the surface inapplicable is still
+enforced server-side (for `tailnet-mobile` the status endpoint still derives its
+step and the QR mint still refuses a pinned install with `governance_pinned`), so
+hiding a card cannot grant access the backend would otherwise deny. At the render
+site the gate sits outside both the `ErrorBoundary` and the spacing wrapper, so a
+suppressed build emits no element at all rather than an empty, still-spaced one.
 
 **Non-app route prefixes.** `registerNonAppPrefix(prefix)` tells `MigrationCheck`
 that a route can never host a migratable app, so the migration banner does not
@@ -199,6 +418,29 @@ edition registers through the `extensions.ts` import path, before `main.tsx`
 mounts `App`; registering after mount does not appear until an unrelated
 re-render. Builtin routes are the one relaxed case, because they resolve lazily on
 navigation.
+
+## Product name: exported setter, not a registry
+
+The i18n catalogs interpolate `{{productName}}` instead of hardcoding the
+displayed product name (authoring rules:
+[i18n-catalog](i18n-catalog.md#the-product-name-is-an-interpolation-variable)).
+`initI18n()` feeds the variable to i18next as `interpolation.defaultVariables`,
+defaulting to `Kiro Crew`, so the stock build renders unchanged text.
+
+An edition rebrands by calling `setProductName('…')` (exported from
+`src/i18n`) in its composition root. The root is imported before `main.tsx`
+calls `initI18n()`, so the ordering holds by construction; a call after init
+throws in dev rather than half-applying (in production it returns silently
+rather than crash the shell). Like the API transport above, this is
+a single exported function rather than a registry: the core consumes the value
+itself, there is nothing to enumerate, and a whole-catalog transform hook would
+hand an edition the power to break any string for what is a one-variable
+substitution.
+
+Scope: catalog strings only. The `apps.<id>.manifest.*` keys mirror the
+Python-side `app.json` prose byte-for-byte and keep the literal name; the
+shell logo and welcome mark are the theme-branding seam's job; the chat bot
+display name stays `dashboard.bot_name`.
 
 ## API methods: exported transport, not a registry
 

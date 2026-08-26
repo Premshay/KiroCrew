@@ -7,12 +7,15 @@ claude-agent-acp does not implement the kiro-only
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from kiro_crew.acp.client import AcpAuthRequired
+from kiro_crew.acp.session_handle import AcpSessionHandle
+from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, AcpEvent, TurnUsage
 from kiro_crew.providers.acp import AcpProvider
 
@@ -38,6 +41,99 @@ def _async_iter(items):
             yield it
 
     return _gen()
+
+
+def test_model_switch_method_reaches_client():
+    with patch("kiro_crew.providers.acp.AcpClient") as client_cls:
+        provider = AcpProvider(
+            acp_backend=ACP_BACKEND_CLAUDE,
+            model_switch_method="session_set_model",
+        )
+
+    assert client_cls.call_args.kwargs["model_switch_method"] == "session_set_model"
+    assert provider.model_switch_method == "session_set_model"
+
+
+class TestServedModel:
+    """served_model is the PUBLIC accessor the poisoned-conversation canary
+    probes (chat_runner never reaches into ``_client`` internals). These tests
+    pin the resolution to the REAL client shapes so a refactor that moves the
+    underlying model attribute fails HERE instead of silently disabling the
+    escalation in production."""
+
+    @staticmethod
+    def _session_shape(handle: AcpSessionHandle) -> AcpSessionProvider:
+        return AcpSessionProvider(handle, runtime=MagicMock())
+
+    @staticmethod
+    def _real_handle() -> AcpSessionHandle:
+        return AcpSessionHandle("s1", asyncio.Queue(), MagicMock())
+
+    def test_backend_default_model_is_readable(self):
+        # Regression: a session on the backend-SELECTED default never gets an
+        # explicit set_model, so handle._model stays "" — the served model
+        # arrives only as currentModelId in the session/new response. The
+        # accessor must surface it, or the poisoned-conversation escalation
+        # is silently disabled for every default-model session.
+        handle = self._real_handle()
+        handle.store_session_config(
+            {"models": {"currentModelId": "claude-opus-5", "availableModels": []}}
+        )
+        provider = _build_provider(ACP_BACKEND_CLAUDE)
+        provider._client = self._session_shape(handle)
+        assert provider.served_model == "claude-opus-5"
+
+    def test_explicit_set_model_takes_precedence(self):
+        handle = self._real_handle()
+        handle.store_session_config(
+            {"models": {"currentModelId": "default-model", "availableModels": []}}
+        )
+        handle._model = "user-picked-model"  # what set_model assigns
+        provider = _build_provider(ACP_BACKEND_CLAUDE)
+        provider._client = self._session_shape(handle)
+        assert provider.served_model == "user-picked-model"
+
+    def test_session_provider_unresolved_is_empty(self):
+        # Fresh handle: no set_model, no session/new config yet.
+        provider = _build_provider(ACP_BACKEND_CLAUDE)
+        provider._client = self._session_shape(self._real_handle())
+        assert provider.served_model == ""
+
+    def test_raw_client_uses_resolved_id_never_requested_model(self):
+        # The raw AcpClient carries the REQUESTED `_model` (defaults to the
+        # "auto" sentinel) and the BACKEND-RESOLVED `_resolved_model_id`.
+        # Only the latter is served evidence.
+        provider = _build_provider(ACP_BACKEND_CLAUDE)
+
+        class _RawShape:
+            _model = "auto"
+            _resolved_model_id = "gpt-5.6-sol"
+
+        provider._client = _RawShape()
+        assert provider.served_model == "gpt-5.6-sol"
+
+    def test_auto_sentinel_is_filtered_to_unknown(self):
+        # A requested-but-unresolved "auto" must read as unknown ("") — a
+        # canary probing "auto" could land on a DIFFERENT model than the
+        # failing session and fabricate discard evidence.
+        provider = _build_provider(ACP_BACKEND_CLAUDE)
+
+        class _RawShape:
+            _model = "auto"
+            _resolved_model_id = None
+
+        provider._client = _RawShape()
+        assert provider.served_model == ""
+
+    def test_unresolvable_model_is_empty_not_error(self):
+        # No readable model → "" (callers treat as inconclusive, never wildcard).
+        provider = _build_provider(ACP_BACKEND_CLAUDE)
+
+        class _Bare:
+            pass
+
+        provider._client = _Bare()
+        assert provider.served_model == ""
 
 
 class TestStreamCommandRouting:
@@ -362,6 +458,7 @@ class TestEffortControl:
         provider._client.set_config_option = AsyncMock()
         # Default: the session advertises an 'effort' option (modern adapter).
         provider._client.supports_config_option = MagicMock(return_value=True)
+        provider._client.effort_config_option_id = MagicMock(return_value="effort")
         return provider
 
     @pytest.mark.asyncio
@@ -386,6 +483,15 @@ class TestEffortControl:
         provider._client.set_config_option.assert_awaited_once_with("effort", "high")
         # claude does NOT use the kiro /effort slash command
         provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_codex_change_effort_uses_reasoning_effort_config_option(self):
+        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="gpt-5.6-sol")
+        provider._client.effort_config_option_id.return_value = "reasoning_effort"
+
+        assert await provider.change_effort("high") is True
+
+        provider._client.set_config_option.assert_awaited_once_with("reasoning_effort", "high")
 
     @pytest.mark.asyncio
     async def test_claude_change_effort_steps_down_when_max_unsupported(self):
@@ -466,7 +572,7 @@ class TestEffortControl:
         # no error) rather than spamming 'Unknown config option' every spawn.
         provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
         provider._effort_per_model = {"claude-opus-4.7": "max"}
-        provider._client.supports_config_option = MagicMock(return_value=False)
+        provider._client.effort_config_option_id.return_value = None
         await provider._apply_initial_effort()
         provider._client.set_config_option.assert_not_awaited()
 
@@ -475,7 +581,7 @@ class TestEffortControl:
         # change_effort must report unsupported (False) instead of attempting a
         # push that fails with 'Unknown config option' and resets the session.
         provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-        provider._client.supports_config_option = MagicMock(return_value=False)
+        provider._client.effort_config_option_id.return_value = None
         ok = await provider.change_effort("high")
         assert ok is False
         provider._client.set_config_option.assert_not_awaited()
@@ -1024,3 +1130,48 @@ class TestStartKiroRuntimeModelEntitlement:
     async def test_auto_sentinel_never_reaches_the_check(self):
         handle = await self._run("auto", ["claude-sonnet-4.6"])
         handle.set_model.assert_not_awaited()
+
+
+def test_child_fidelity_aware_survives_client_replacement():
+    """The dashboard sets the fidelity opt-in on the OUTER AcpProvider before
+    startup; for the kiro backend the inner client is later REPLACED with an
+    AcpSessionProvider (_start_kiro_runtime_impl). The flag must be a real
+    forwarding property — a plain setattr would be inert and the handle
+    would fail-close the dashboard's child permission requests instead of
+    showing the interactive card."""
+    provider = _build_provider("")  # "" = kiro, the runtime-backed default
+
+    provider.child_fidelity_aware = True
+    assert provider.child_fidelity_aware is True
+    # Forwarded to the current inner client.
+    assert provider._client.child_fidelity_aware is True
+    # Stored on the provider itself, independent of the (soon-discarded)
+    # placeholder client — this is what _start_kiro_runtime_impl re-applies
+    # to the real AcpSessionProvider at replacement time.
+    provider._client = MagicMock()
+    assert provider.child_fidelity_aware is True
+
+
+def test_to_llm_event_preserves_provenance_flags():
+    """`AcpProvider._to_llm_event` reconstructs the event — dropping the two
+    provenance fields would zero them to False and flip child_low_fidelity to
+    True for EVERY child permission event on this surface, making the
+    full-fidelity half of the feature (mode-parity auto-approval) inert."""
+    from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+    from kiro_crew.providers.acp import AcpProvider
+
+    src = AcpEvent(
+        kind=EVENT_PERMISSION_REQUEST,
+        request_id=9,
+        title="Running: sha256sum x",
+        sub_session_id="child-a",
+        raw_tool_params={"command": "sha256sum x"},
+        raw_params_trusted=True,
+        is_shell=True,
+        shell_classified=True,
+    )
+    assert src.child_low_fidelity is False
+    out = AcpProvider._to_llm_event(src)
+    assert out.raw_params_trusted is True
+    assert out.shell_classified is True
+    assert out.child_low_fidelity is False

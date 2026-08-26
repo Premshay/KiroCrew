@@ -20,6 +20,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import { Workflow as WorkflowIcon, Play, FileCode, ListTree } from 'lucide-react'
 import { PageHeader } from '../../components/ui'
 import SegmentedControl from '../../components/SegmentedControl'
+import SimpleSelect from '../../components/SimpleSelect'
 import WorkflowsRuns from './WorkflowsRuns'
 import WorkflowRunTree from './WorkflowRunTree'
 import { groupByPhase, latestBudget, type WfEvent, type AgentRow, type PhaseGroup } from './runModel'
@@ -134,7 +135,7 @@ export default function WorkflowsPage() {
   return (
     <div>
       <PageHeader title={i18nT('apps.workflows.workflowsPage.workflows')} subtitle={i18nT('apps.workflows.workflowsPage.author_run_and_watch_dynamic_workflows')} />
-      <div className="px-6 pb-4">
+      <div className="px-4 md:px-6 pb-4">
         <SegmentedControl<WorkflowsView>
           segments={[
             { key: 'author', label: 'Author', icon: <FileCode size={14} /> },
@@ -149,7 +150,7 @@ export default function WorkflowsPage() {
       {view === 'runs' && <WorkflowsRuns />}
 
       {view === 'author' && (
-      <div className="px-6 pb-8 grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="px-4 md:px-6 pb-8 grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* ----- Author ----- */}
         <div className="flex flex-col gap-3">
           <div className="flex items-center gap-2 text-[13px] text-muted">
@@ -177,19 +178,26 @@ export default function WorkflowsPage() {
               {i18nT('apps.workflows.workflowsPage.validate')}
             </button>
             {examples.length > 0 && (
-              <select
-                onChange={e => {
-                  const ex = examples.find(x => x.name === e.target.value)
+              /* A one-shot ACTION list, not a persisted value. Nothing on this
+                 page records "which example is loaded" — picking one copies its
+                 source into the editor, which the operator then edits freely, so
+                 a trigger showing the last pick would be stale the moment it was
+                 set. Holding `value` at '' keeps the trigger on its command label
+                 and, because the controlled value never becomes the picked item,
+                 lets the SAME example be re-loaded after a bad edit — the old
+                 native select (like any value-bound select) refused to re-fire
+                 for the option already selected. */
+              <SimpleSelect
+                options={examples.map(ex => ex.name)}
+                value=""
+                onChange={name => {
+                  const ex = examples.find(x => x.name === name)
                   if (ex) setSource(ex.source)
                 }}
-                defaultValue=""
-                className="ml-auto px-2 py-1.5 text-[13px] rounded border border-border bg-card"
-              >
-                <option value="" disabled>{i18nT('apps.workflows.workflowsPage.load_example')}</option>
-                {examples.map(ex => (
-                  <option key={ex.name} value={ex.name}>{ex.name}</option>
-                ))}
-              </select>
+                triggerFallback={i18nT('apps.workflows.workflowsPage.load_example')}
+                aria-label={i18nT('apps.workflows.workflowsPage.load_example')}
+                style={{ marginLeft: 'auto' }}
+              />
             )}
           </div>
           {validation && !validation.ok && (

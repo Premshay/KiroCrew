@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { useImeGuard } from '../../hooks/useImeGuard'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, Check, AlertTriangle, Plus, X, Lock } from 'lucide-react'
 import { SlackIcon } from '../../components/SlackIcon'
@@ -9,7 +10,9 @@ import { api, type SlackConfigData, type SlackConfigSave } from '../../api/clien
 
 import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
-const SETUP_GUIDE = 'https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/slack-setup.md'
+/** Brand name — do-not-translate, so it lives here rather than in the catalog. */
+const CHANNEL_NAME = "Slack"
+const SETUP_GUIDE = 'https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/docs/slack-integration.md'
 
 type Draft = {
   owner_id: string
@@ -17,6 +20,10 @@ type Draft = {
   allowed_enterprise_ids: string[]
   reactions_enabled: boolean
   show_thinking: boolean
+  /** Whether Slack files its sessions in a folder at all (off = unfiled). */
+  session_folder_on: boolean
+  /** Folder name, kept while the toggle is off so turning it back on restores it. */
+  session_folder: string
 }
 
 function draftFrom(c: SlackConfigData): Draft {
@@ -26,6 +33,10 @@ function draftFrom(c: SlackConfigData): Draft {
     allowed_enterprise_ids: [...c.allowed_enterprise_ids],
     reactions_enabled: c.reactions_enabled,
     show_thinking: c.show_thinking,
+    // A configured name IS the on-state — the backend has one field, where ""
+    // means off, so the toggle is derived rather than separately persisted.
+    session_folder_on: !!c.session_folder,
+    session_folder: c.session_folder ?? '',
   }
 }
 
@@ -68,6 +79,7 @@ export function TagListEditor({ label, description, values, placeholder, onChang
 }) {
   const [draft, setDraft] = useState('')
   const [err, setErr] = useState('')
+  const ime = useImeGuard()
   const add = () => {
     const v = draft.trim()
     if (!v) return
@@ -78,17 +90,21 @@ export function TagListEditor({ label, description, values, placeholder, onChang
     setErr('')
   }
   return (
-    <div className="flex flex-col gap-1.5 py-1.5">
+    <div data-setting-label={label} className="flex flex-col gap-1.5 py-1.5">
       <span className="text-[13px] font-semibold text-text">{label}</span>
       {description && <div className="text-[12px] text-muted">{description}</div>}
       {values.length > 0 && (
         <div className="flex flex-wrap gap-1.5">
           {values.map(v => (
-            <span key={v} className="inline-flex items-center gap-1 rounded-md border border-border bg-bg-elevated px-2 py-1 text-[12px] font-mono text-text">
-              {v}
+            <span key={v} className="inline-flex max-w-full items-center gap-1 rounded-md border border-border bg-bg-elevated px-2 py-1 text-[12px] font-mono text-text">
+              {/* break-all, not truncate: these ids are opaque and a user checking
+                  one against their console needs every character. A Webex space id
+                  is a single unbreakable base64 token, so without this it runs off
+                  the card at narrow widths. */}
+              <span className="min-w-0 break-all">{v}</span>
               {!readOnly && (
                 <button type="button" onClick={() => onChange(values.filter(x => x !== v))}
-                  className="text-muted hover:text-danger transition-colors" aria-label={i18nT('pages.settings.slackPanel.remove', { name: v })}>
+                  className="shrink-0 text-muted hover:text-danger transition-colors" aria-label={i18nT('pages.settings.slackPanel.remove', { name: v })}>
                   <X size={12} />
                 </button>
               )}
@@ -99,10 +115,13 @@ export function TagListEditor({ label, description, values, placeholder, onChang
       {values.length === 0 && readOnly && <div className="text-[12px] text-muted">{i18nT('pages.settings.slackPanel.none')}</div>}
       {!readOnly && (
         <div className="flex items-center gap-2">
-          <Input value={draft} placeholder={placeholder} className="flex-none font-mono"
+          {/* min-w-0 + flex-1: a `flex-none` input keeps its intrinsic width, which
+              pushes the Add button off the card at 320px. Letting the input shrink
+              keeps both on one row at every width the repo supports. */}
+          <Input value={draft} placeholder={placeholder} className="min-w-0 flex-1 font-mono"
             onChange={e => { setDraft(e.target.value); setErr('') }}
-            onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); add() } }} />
-          <Btn onClick={add} disabled={!draft.trim()}><Plus size={13} /> {i18nT('pages.settings.slackPanel.add')}</Btn>
+            {...ime.bindEnter({ onEnter: add })} />
+          <Btn onClick={add} disabled={!draft.trim()} className="shrink-0"><Plus size={13} /> {i18nT('pages.settings.slackPanel.add')}</Btn>
         </div>
       )}
       {/* Client-side validation only ("X is not a valid ID") — there is nothing
@@ -203,6 +222,9 @@ export function SlackPanel() {
       allowed_enterprise_ids: draft.allowed_enterprise_ids,
       reactions_enabled: draft.reactions_enabled,
       show_thinking: draft.show_thinking,
+      // Off sends "" (the field's off-state); on with a blank name falls back
+      // to "Slack", which is what the toggle's description promises.
+      session_folder: draft.session_folder_on ? (draft.session_folder.trim() || CHANNEL_NAME) : '',
     }
     if (botClear) payload.bot_token_clear = true
     else if (botToken.trim()) payload.bot_token = botToken.trim()
@@ -279,7 +301,7 @@ export function SlackPanel() {
 
       {/* ── Required tokens ── */}
       <SettingsSection title={i18nT('pages.settings.slackPanel.required')}>
-        <SettingsCard>
+        <SettingsCard index={1}>
           <SecretField
             key={`bot-${formKey}`}
             label={i18nT('pages.settings.slackPanel.slack_bot_token')}
@@ -313,7 +335,7 @@ export function SlackPanel() {
 
       {/* ── Identity & access ── */}
       <SettingsSection title={i18nT('pages.settings.slackPanel.identity_access')}>
-        <SettingsCard>
+        <SettingsCard index={2}>
           <SettingsInput
             label={i18nT('pages.settings.slackPanel.owner_slack_member_id')}
             description={i18nT('pages.settings.slackPanel.the_one_member_who_can_always_interact_with_the')}
@@ -336,7 +358,7 @@ export function SlackPanel() {
 
       {/* ── Behavior ── */}
       <SettingsSection title={i18nT('pages.settings.slackPanel.behavior')}>
-        <SettingsCard>
+        <SettingsCard index={3}>
           <SettingsInput
             label={i18nT('pages.settings.slackPanel.slash_command')}
             description={i18nT('pages.settings.slackPanel.trigger_word_for_the_slack_slash_command_without')}
@@ -359,6 +381,29 @@ export function SlackPanel() {
             onChange={v => upd({ show_thinking: v })}
             disabled={ro}
           />
+          {/* Optional per-channel session filing. Off by default: Slack
+              conversations stay unfiled in the sidebar, as before. */}
+          <div className="border-t border-border mt-4 pt-4">
+            <SettingsToggle
+              label={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder')}
+              description={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder_desc', { channel: CHANNEL_NAME })}
+              checked={draft.session_folder_on}
+              onChange={v => upd({ session_folder_on: v })}
+              disabled={ro}
+            />
+            {draft.session_folder_on && (
+              <div className="mt-4">
+                <SettingsInput
+                  label={i18nT('pages.settings.botChannelPanel.session_folder_name')}
+                  description={i18nT('pages.settings.botChannelPanel.session_folder_name_desc')}
+                  value={draft.session_folder}
+                  onChange={v => upd({ session_folder: v })}
+                  placeholder={CHANNEL_NAME}
+                  disabled={ro}
+                />
+              </div>
+            )}
+          </div>
         </SettingsCard>
       </SettingsSection>
 

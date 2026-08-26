@@ -42,6 +42,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -50,12 +51,15 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from kiro_crew import frontend, hooks, platform_compat
+from kiro_crew import dep_sync, frontend, hooks, platform_compat
 from kiro_crew.apps.builtins.dev_fleet import gateway_service
+from kiro_crew.apps.proxy_auth import raw_request_target
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.env import find_node_tool, node_bin_dirs
 from kiro_crew.executors import subprocess_executor
-from kiro_crew.platform.bootstrap import boot_platform
+from kiro_crew.instances import run_marker
+from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.platform import boot_platform
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_BUILD,
     create_subprocess_limited,
@@ -125,7 +129,7 @@ def _resolve_primary_checkout(path: str) -> str:
     git = _trusted_bin("git")
     if git is None:
         return path
-    env = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_KEYS}
+    env = {k: v for k, v in os.environ.items() if _is_safe_env_key(k)}
     env["PATH"] = _TRUSTED_PATH
     try:
         out = subprocess.run(
@@ -140,22 +144,240 @@ def _resolve_primary_checkout(path: str) -> str:
     return path
 
 
-def _default_main_repo() -> str:
-    """Resolve the main checkout hint from env (NO subprocess at import time —
-    this module is imported from the async route-registration path and a git
-    call here would block the event loop). The hint is normalized to the
-    PRIMARY checkout in dev_fleet_startup() via the subprocess executor."""
-    explicit = os.environ.get("KIROCREW_DEVFLEET_REPO")
+class RepoUnavailable(RuntimeError):
+    """No usable main checkout. Base of the two ways that happens.
+
+    Sites that deliberately degrade rather than fail catch THIS, so a new reason
+    for "there is no fleet to act on" cannot slip past a handler that enumerated
+    only the reasons that existed when it was written.
+    """
+
+
+class RepoNotConfigured(RepoUnavailable):
+    """No Kiro Crew checkout could be found, so there is no fleet to manage.
+
+    Distinct from a discovery FAILURE, where a checkout was named and git could
+    not read it: nothing is broken here, the app simply has no checkout to point
+    at. Callers render a setup state asking where the checkout is, rather than an
+    error blaming a path.
+    """
+
+
+class RepoUnreadable(RepoUnavailable):
+    """A checkout was named but is not one this app can manage.
+
+    Either git cannot enumerate its worktrees, or the path is a readable
+    directory that does not carry the Kiro Crew markers. Carries the same
+    consequence as RepoNotConfigured for every route except ``/fleet``: the fleet
+    is unknown, so no action that needs a worktree can run. Typed separately so
+    the two states can be told apart — this one names the path and asks the user
+    to fix it, that one asks where the checkout is.
+    """
+
+
+#: Set at startup when the resolved checkout does not carry the Kiro Crew markers,
+#: to the message ``_repo()`` raises. Tiers 1-2 (env var, config) are taken
+#: verbatim, so a configured path can be a readable directory that is not this
+#: project; the message is composed on the executor at startup because it embeds
+#: the config-derived source hint.
+_REPO_INVALID_MSG: str | None = None
+
+
+def _repo() -> str:
+    """The resolved main checkout path, guaranteed usable.
+
+    The single gate between ``MAIN_REPO`` and every git argv or path built from
+    it. ``git -C ""`` does not fail — it silently runs against this process's
+    working directory — and ``Path("")`` is ``Path(".")``, so an unresolved
+    checkout reaching a consumer would operate on an arbitrary directory and
+    return plausible results. A configured path that is a readable but unrelated
+    git repository is the same hazard wearing a valid-looking path: git answers
+    happily, so nothing downstream can tell. Raising here makes both states fail
+    loud at every call site — including the ones that never touch a route, like
+    the background refresher and sync — instead of each site carrying (or
+    forgetting) its own guard. Sites that deliberately degrade catch
+    ``RepoUnavailable`` and say what the degraded answer is.
+    """
+    if not MAIN_REPO:
+        raise RepoNotConfigured("no Kiro Crew checkout found to manage")
+    if _REPO_INVALID_MSG:
+        raise RepoUnreadable(_REPO_INVALID_MSG)
+    return MAIN_REPO
+
+
+def _own_source_checkout() -> str | None:
+    """The source checkout whose code this process is EXECUTING, or None.
+
+    Derived from the location of the loaded module, so it needs no configuration
+    and cannot go stale. None for a packaged or site-packages install, which is
+    not a checkout at all.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if parent.name == "src" and (parent / "kiro_crew").is_dir():
+            return str(parent.parent)
+    return None
+
+
+def _is_kirocrew_checkout(path: str) -> bool:
+    """Whether *path* is a Kiro Crew source checkout. Blocking — stats only.
+
+    Fail-closed: every marker must be present. ``.git`` alone is not enough
+    because adopting an unrelated repository would list ITS worktrees and run
+    Pull+Build, rebase and worktree-removal git commands inside it. ``.git`` is
+    tested as a path rather than a directory since a linked worktree's is a file.
+    """
+    if not path:
+        return False
+    try:
+        p = Path(path)
+        return (
+            (p / ".git").exists()
+            and (p / "src" / "kiro_crew").is_dir()
+            and (p / "pyproject.toml").is_file()
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+# Conventional clone locations, probed in this order and ONLY as a last resort.
+# A candidate is adopted solely when it passes _is_kirocrew_checkout, so an
+# absent or unrelated directory is skipped rather than assumed; no candidate is
+# ever named in a user-facing message, because a path the user did not choose is
+# noise to them. Names are matched case-insensitively against what is on disk,
+# so only the canonical spelling is listed here.
+_CHECKOUT_DIR_NAMES = frozenset({"kirocrew", "kiro-crew"})
+_CHECKOUT_PARENT_DIRS = (
+    "", "repos", "src", "projects", "dev", "git", "code", "workplace",
+)
+
+
+def _matching_child_dirs(base: Path, wanted: frozenset[str] | set[str]) -> list[Path]:
+    """Child directories of *base* whose name is in *wanted*, compared
+    case-insensitively and returned as the filesystem spells them. Sorted so a
+    directory holding two case-variants resolves deterministically.
+    """
+    try:
+        return sorted(
+            child for child in base.iterdir()
+            if child.name.lower() in wanted and child.is_dir()
+        )
+    except (OSError, ValueError):
+        return []
+
+
+def _candidate_checkouts() -> list[str]:
+    """Conventional clone locations under the user's home, in probe order.
+
+    EVERY path segment comes from a directory listing rather than from joining
+    the guessed spellings. On a case-insensitive filesystem a blind join succeeds
+    against a differently-cased directory and yields a path that does not match
+    the ones git reports for the same tree; matching on disk also finds a clone
+    whose case is not in the name list, on any OS.
+    """
+    try:
+        home = Path.home()
+    except (OSError, RuntimeError):
+        return []
+    # One listing of home resolves every named parent to its real spelling.
+    parents: dict[str, list[Path]] = {}
+    for child in _matching_child_dirs(home, {p for p in _CHECKOUT_PARENT_DIRS if p}):
+        parents.setdefault(child.name.lower(), []).append(child)
+    found: list[str] = []
+    for parent in _CHECKOUT_PARENT_DIRS:
+        for base in ([home] if not parent else parents.get(parent, [])):
+            found.extend(str(p) for p in _matching_child_dirs(base, _CHECKOUT_DIR_NAMES))
+    return found
+
+
+def _configured_main_repo() -> str:
+    """The operator's explicit choice of main checkout, or ``""``.
+
+    Env wins over config so a one-off override needs no file edit. Both are
+    returned VERBATIM, with no marker test: the user named this path, so a typo
+    must surface as an error against THAT path instead of being silently replaced
+    by a discovered one.
+    """
+    explicit = os.environ.get("KIROCREW_DEVFLEET_REPO", "").strip()
     if explicit:
         return explicit
-    proj = os.environ.get("KIROCREW_PROJECT_DIR")
-    if proj and (Path(proj) / ".git").exists():
-        return proj
-    return str(Path.home() / "kirocrew")
+    configured = _load_dev_fleet_cfg().get("repo_path")
+    return configured.strip() if isinstance(configured, str) else ""
+
+
+def _repo_source_hint() -> str:
+    """Where the current MAIN_REPO came from, phrased as the remedy to apply.
+
+    Blocking (reads the config files) — executor ONLY. Being on an error path is
+    not a licence to read files on the event loop: a network-backed home stalls
+    every other request while this one composes its banner.
+    """
+    if os.environ.get("KIROCREW_DEVFLEET_REPO", "").strip():
+        return "It is set by the KIROCREW_DEVFLEET_REPO environment variable."
+    configured = _load_dev_fleet_cfg().get("repo_path")
+    if isinstance(configured, str) and configured.strip():
+        return "It is set by dev_fleet.repo_path in config.json."
+    return (
+        "Point Dev Fleet at your Kiro Crew checkout with the "
+        "KIROCREW_DEVFLEET_REPO environment variable, or with "
+        "dev_fleet.repo_path in config.json."
+    )
+
+
+def _discover_main_repo() -> str:
+    """Resolve the main checkout, or ``""`` when there is none to find.
+
+    Blocking (config read + stats) — executor only; ``dev_fleet_startup`` calls
+    it there. Order: the operator's explicit choice, the active project
+    directory, the checkout this gateway runs from, then conventional clone
+    locations. Every INFERRED candidate must pass the marker test, so the fleet
+    can only ever be pointed at a real Kiro Crew checkout.
+
+    ``""`` means "no checkout found" and is deliberately not a path: inventing
+    one made the out-of-the-box dashboard report a checkout as missing that the
+    user had never asked for, hiding the real question of where theirs lives.
+    """
+    configured = _configured_main_repo()
+    if configured:
+        return configured
+    for candidate in (
+        os.environ.get("KIROCREW_PROJECT_DIR", ""),
+        _own_source_checkout() or "",
+        *_candidate_checkouts(),
+    ):
+        if _is_kirocrew_checkout(candidate):
+            return candidate
+    return ""
+
+
+def _default_main_repo() -> str:
+    """The import-time main checkout hint.
+
+    Env and stat-only tiers of ``_discover_main_repo`` (NO subprocess and no file
+    reads — this module is imported from the async route-registration path, where
+    both would block the event loop). ``dev_fleet_startup`` then re-resolves via
+    the full discovery chain and normalizes the result to the PRIMARY checkout,
+    both on the subprocess executor.
+    """
+    explicit = os.environ.get("KIROCREW_DEVFLEET_REPO", "").strip()
+    if explicit:
+        return explicit
+    for candidate in (os.environ.get("KIROCREW_PROJECT_DIR", ""), _own_source_checkout() or ""):
+        if _is_kirocrew_checkout(candidate):
+            return candidate
+    return ""
 
 
 # --- configuration ---
-MAIN_REPO = _default_main_repo()
+def _default_main_repo_state() -> tuple[str, bool]:
+    """Import-time checkout hint and whether an inferred tier supplied it."""
+    repo = _default_main_repo()
+    explicit = os.environ.get("KIROCREW_DEVFLEET_REPO", "").strip()
+    return repo, bool(repo and not explicit)
+
+
+# Startup replaces this stat-only hint after the complete discovery chain runs.
+MAIN_REPO, MAIN_REPO_INFERRED = _default_main_repo_state()
 BASE_BRANCH = "main"
 
 # --- upstream remote resolution (replaces hardcoded 'origin') ---
@@ -172,8 +394,15 @@ async def _upstream_remote() -> str:
     global _UPSTREAM_REMOTE
     if _UPSTREAM_REMOTE is not None:
         return _UPSTREAM_REMOTE
+    try:
+        repo = _repo()
+    except RepoUnavailable:
+        # A repo that never resolved must not reach git at all — it would
+        # answer for whatever tree the backend happens to sit in. Remote
+        # resolution degrades to git's conventional default instead of failing.
+        return "origin"
     rc, out, _ = await _run_cmd(
-        ["git", "-C", MAIN_REPO, "config", f"branch.{BASE_BRANCH}.remote"],
+        ["git", "-C", repo, "config", f"branch.{BASE_BRANCH}.remote"],
         timeout=5,
     )
     cand = out.strip() if rc == 0 else ""
@@ -181,7 +410,7 @@ async def _upstream_remote() -> str:
     # that later argv interpolation (`git rebase {remote}/main`) would parse
     # as a flag. Accept only a plausible remote NAME that git itself lists.
     if cand and not cand.startswith("-") and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", cand):
-        rc2, remotes, _ = await _run_cmd(["git", "-C", MAIN_REPO, "remote"], timeout=5)
+        rc2, remotes, _ = await _run_cmd(["git", "-C", repo, "remote"], timeout=5)
         if rc2 == 0 and cand in remotes.split():
             _UPSTREAM_REMOTE = cand
             return _UPSTREAM_REMOTE
@@ -207,14 +436,16 @@ def _build_pending() -> bool:
     dashboard never told the user there was a build to apply.
     """
     try:
-        dist = Path(MAIN_REPO) / "src" / "kiro_crew" / "static" / "dist"
+        # Path("") is Path("."), which would stat this process's own tree —
+        # no checkout means nothing can be pending.
+        dist = Path(_repo()) / "src" / "kiro_crew" / "static" / "dist"
         if not dist.exists():
             return False
         # stat() follows a symlink on purpose: a source-tree install points
         # static/dist at website/dist, and the rebuild time we care about is the
         # target's.
         return dist.stat().st_mtime > _START_EPOCH
-    except OSError:
+    except (OSError, RepoUnavailable):
         return False
 
 
@@ -267,8 +498,8 @@ except ImportError as exc:
 
 # --- async run tracking ---
 _RUNS: dict[str, dict] = {}
-_RUNS_LOCK = asyncio.Lock()
-_SYNC_LOCK = asyncio.Lock()
+_RUNS_LOCK = LoopBoundLock()
+_SYNC_LOCK = LoopBoundLock()
 
 
 def _find_cli() -> list[str]:
@@ -359,9 +590,14 @@ def _own_checkout_path() -> str | None:
 
 
 def _same_path(a: str, b: str) -> bool:
+    # "Cannot resolve" means "not the same path", never a crash: ValueError
+    # covers unresolvable operands (an embedded NUL byte in caller-supplied
+    # input), OSError covers ELOOP and friends, and RuntimeError covers the
+    # symlink-loop signal Path.resolve() raises on some platform/version
+    # combinations instead of ELOOP.
     try:
         return Path(a).resolve() == Path(b).resolve()
-    except OSError:
+    except (OSError, ValueError, RuntimeError):
         return False
 
 
@@ -401,12 +637,8 @@ def _running_checkout() -> Path | None:
     for a packaged/site-packages install, which is not a checkout at all — the
     caller must treat that as "cannot verify" rather than as a mismatch.
     """
-    # .../<checkout>/src/kiro_crew/apps/builtins/dev_fleet/server.py
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        if parent.name == "src" and (parent / "kiro_crew").is_dir():
-            return parent.parent
-    return None
+    own = _own_source_checkout()
+    return Path(own) if own else None
 
 
 def _staged_target() -> str | None:
@@ -509,22 +741,27 @@ async def _live_worktree_path(*, fresh: bool = False) -> str | None:
 
 async def _load_fallback_repos() -> None:
     global _FALLBACK_REPOS
+    try:
+        repo = _repo()
+    except RepoUnavailable:
+        # No checkout, no remotes to enumerate; the fallback list stays empty.
+        return
     repos: list[str] = []
     upstream = await _upstream_remote()
-    rc, out, _err = await _run_cmd(["git", "-C", MAIN_REPO, "remote"], timeout=5)
+    rc, out, _err = await _run_cmd(["git", "-C", repo, "remote"], timeout=5)
     if rc == 0:
         for remote in out.split():
             if remote == upstream:
                 continue
             rc2, _, _ = await _run_cmd(
-                ["git", "-C", MAIN_REPO, "merge-base", "--is-ancestor",
+                ["git", "-C", repo, "merge-base", "--is-ancestor",
                  f"{remote}/{BASE_BRANCH}", f"{upstream}/{BASE_BRANCH}"],
                 timeout=10,
             )
             if rc2 != 0:
                 continue
             rc3, url, _ = await _run_cmd(
-                ["git", "-C", MAIN_REPO, "remote", "get-url", remote], timeout=5,
+                ["git", "-C", repo, "remote", "get-url", remote], timeout=5,
             )
             if rc3 == 0:
                 m = re.search(r"[:/]([^/]+/[^/]+?)(?:\.git)?$", url.strip())
@@ -718,6 +955,49 @@ def _invalidate_toolchain_cache() -> None:
 # arbitrarily long stderr.
 _SANDBOX_ERR_MAX = 900
 
+# Upper bound on a propagated generic git-discovery error. Git's own failure
+# messages are short ("fatal: not a git repository", "cannot change to ..."),
+# so a tight cap keeps the Discovery Error banner readable while still bounding
+# an arbitrarily long stderr from a broken repo.
+_GIT_ERR_MAX = 300
+
+# Identity for the "no trusted executable" failure, so callers can branch on
+# the CLASS of failure instead of re-matching prose: `_run_cmd` puts this
+# prefix on the stderr it synthesizes when `_trusted_bin` resolves nothing,
+# and error paths that want to name the remedy (set the per-tool override in
+# the service environment) test `startswith` on it. Deliberately a constant,
+# not an exception type: `_run_cmd` reports every failure through its
+# (rc, stdout, stderr) tuple and callers already handle it that way.
+_UNRESOLVED_TOOL_PREFIX = "no trusted executable for "
+
+
+def _bin_override_var(name: str) -> str:
+    """Env var that overrides trusted-bin resolution for *name*.
+
+    Single source of truth shared by `_trusted_bin` (which reads it) and the
+    user-facing remedy messages (which name it) — deriving it twice is how the
+    advertised remedy drifts from the one that works.
+    """
+    return f"KIROCREW_DEVFLEET_BIN_{name.upper().replace('-', '_')}"
+
+
+def _unresolved_tool_message(name: str) -> str:
+    """User-facing message for an unresolved trusted tool.
+
+    Blames the HOST toolchain, not the checkout (issue #2530: the previous
+    wording folded this failure into "git worktree discovery failed in
+    <repo>", sending users to debug a healthy repository), and names the
+    operator remedy in the same voice as the missing-checkout branch. The
+    trusted-PATH detail stays in the log line, not here: it is unactionable
+    noise in a UI banner.
+    """
+    return (
+        f"no trusted {name!r} executable found on this host — the checkout "
+        f"itself is not the problem. Set {_bin_override_var(name)} to an "
+        f"absolute path in the gateway's service environment (it needs a "
+        "restart to be seen)."
+    )
+
 
 def _trusted_bin(name: str) -> str | None:
     """Resolve *name* to a canonical executable in a system or Homebrew bin dir.
@@ -735,7 +1015,7 @@ def _trusted_bin(name: str) -> str | None:
     # system dirs (e.g. gh in ~/.local/bin): an explicit absolute path set
     # in the SERVICE environment (operator-owned unit file), never derived
     # from the inherited PATH.
-    override = os.environ.get(f"KIROCREW_DEVFLEET_BIN_{name.upper().replace('-', '_')}")
+    override = os.environ.get(_bin_override_var(name))
     if override and Path(override).is_absolute() and Path(override).is_file() \
             and os.access(override, os.X_OK):
         _TRUSTED_BIN_CACHE[name] = override
@@ -798,7 +1078,7 @@ def _toolchain_bin(name: str) -> str | None:
 
     Managed toolchain first, system npm second: a distribution's node can be
     older than ``website/package.json``'s ``engines`` (Amazon Linux 2023 ships
-    node 18 against ``20 || >=22``), while ``ensure-node.sh`` installs a version
+    node 18 against ``>=22``), while ``ensure-node.sh`` installs a version
     chosen to satisfy the build.
     """
     return find_node_tool(name, _TRUSTED_PATH) or _trusted_bin(name)
@@ -826,7 +1106,9 @@ async def _run_cmd(
     if cmd and "/" not in cmd[0]:
         trusted = _trusted_bin(cmd[0])
         if trusted is None:
-            return -1, "", f"no trusted executable for {cmd[0]!r} in {_TRUSTED_PATH}"
+            return -1, "", (
+                f"{_UNRESOLVED_TOOL_PREFIX}{cmd[0]!r} in {_TRUSTED_PATH}"
+            )
         cmd = [trusted, *cmd[1:]]
     base_env["PATH"] = _TRUSTED_PATH
     base_env.update(_GIT_ENV_NEUTRALIZERS)
@@ -876,16 +1158,17 @@ async def _run_cmd(
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             await _kill_tree(proc.pid)
-            proc.kill()
-            await proc.wait()
+            await platform_compat.kill_and_reap(proc)
             return -1, "", f"timeout ({timeout}s)"
         except asyncio.CancelledError:
             # Backend shutdown/restart cancels in-flight handlers: the child
             # runs in its own process group and would outlive us (a canceled
             # rebase never reaches its --abort path, wedging the worktree).
+            # kill_and_reap is best-effort throughout, so an already-reaped
+            # child cannot REPLACE the in-flight CancelledError with
+            # ProcessLookupError and swallow the cancellation.
             await _kill_tree(proc.pid)
-            proc.kill()
-            await proc.wait()
+            await platform_compat.kill_and_reap(proc)
             raise
         return proc.returncode or 0, (stdout or b"").decode(errors="replace"), (stderr or b"").decode(errors="replace")
     finally:
@@ -938,6 +1221,18 @@ async def _kill_tree(pid: int) -> None:
 # Active background runs: rid -> (worker task, subprocess). Tracked so
 # gateway cleanup can kill process trees instead of orphaning pip/npm.
 _ACTIVE_RUNS: dict[str, tuple[asyncio.Task, Any]] = {}
+
+# Shutdown admission control: once dev_fleet_cleanup starts, no new run may
+# register in _ACTIVE_RUNS.  The lock is held only for the two fast dict
+# operations that constitute the critical section (read flag + register, or
+# set flag + snapshot) — it is never held across slow kill/await calls, so
+# there is no risk of asyncio lock contention or done-callback deadlocks.
+# LoopBoundLock (not a bare asyncio.Lock) because a module-global primitive
+# binds to the import-time loop and raises RuntimeError from any other loop
+# (Python 3.10+, see #4800) — this module is imported once but serves
+# whichever loop the gateway runs.
+_SHUTDOWN_ADMISSION_LOCK = LoopBoundLock()
+_SHUTDOWN_IN_PROGRESS = False
 
 
 _RUNS_MAX_COMPLETED = 50
@@ -1068,24 +1363,47 @@ async def _start_run(
             # so a worktree-controlled build can't outlive its run record.
             if proc is not None and proc.returncode is None:
                 await _kill_tree(proc.pid)
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
+                await platform_compat.kill_and_reap(proc)
             async with _RUNS_LOCK:
                 _RUNS[rid]["status"] = "done"
                 _RUNS[rid]["exit_code"] = -1
                 _RUNS[rid]["output"].append("[error] " + str(exc))
         finally:
             for cp in (cleanup_paths or []):
+                # A caller may register a temp FILE, or a temp directory it
+                # created for one (the dependency-only sync stages a snapshot
+                # that way). unlink refuses a directory, so fall back to rmdir
+                # rather than leaking one temp dir per run.
                 try:
                     os.unlink(cp)
+                except IsADirectoryError:
+                    try:
+                        os.rmdir(cp)
+                    except OSError:
+                        pass
+                except PermissionError:
+                    # Windows raises PermissionError, not IsADirectoryError,
+                    # when unlink is handed a directory.
+                    try:
+                        os.rmdir(cp)
+                    except OSError:
+                        pass
                 except OSError:
                     pass
 
     task = asyncio.create_task(worker())
-    _ACTIVE_RUNS[rid] = (task, None)
+    # Register under the admission lock so this insertion is atomic with
+    # respect to dev_fleet_cleanup's flag-set + snapshot.  The lock is held
+    # only for these two dict writes (< 1 µs) — never across slow I/O — so
+    # it cannot stall cleanup or introduce done-callback deadlocks.
+    async with _SHUTDOWN_ADMISSION_LOCK:
+        if _SHUTDOWN_IN_PROGRESS:
+            # Cleanup has already snapshotted _ACTIVE_RUNS; cancelling the
+            # task here keeps the worker from running to completion after the
+            # gateway exits and mutating shared checkout state.
+            task.cancel()
+            raise RuntimeError("dev-fleet shutdown in progress: run refused")
+        _ACTIVE_RUNS[rid] = (task, None)
     task.add_done_callback(lambda _t: _ACTIVE_RUNS.pop(rid, None))
     return rid
 
@@ -1101,8 +1419,16 @@ _OWNER_REPO_RETRY_AT: float = 0.0  # monotonic deadline before retrying a failed
 async def _repo_owner_name() -> str | None:
     """Derive owner/repo from the upstream remote URL."""
     remote = await _upstream_remote()
+    try:
+        repo = _repo()
+    except RepoUnavailable:
+        # Best-effort helper: an unresolved checkout is "not derivable", the
+        # same answer every other failure below produces. Without the accessor
+        # this ran `git -C ""` and could report whatever repository the
+        # backend's working directory happened to be.
+        return None
     rc, stdout, _ = await _run_cmd(
-        ["git", "-C", MAIN_REPO, "remote", "get-url", remote], timeout=5
+        ["git", "-C", repo, "remote", "get-url", remote], timeout=5
     )
     if rc != 0:
         return None
@@ -1136,7 +1462,7 @@ async def _pr_query_one(owner_repo: str, branch: str) -> dict | None:
     # dropped from the payload by _redact_pr (which skips `_`-prefixed keys).
     rc, stdout, _ = await _run_cmd(
         ["gh", "pr", "list", "--repo", owner_repo, "--head", branch,
-         "--json", "number,state,url,isDraft,title,body", "--state", "all", "--limit", "1"],
+         "--json", "number,state,url,isDraft,title,body,headRefOid", "--state", "all", "--limit", "1"],
         timeout=15,
     )
     if rc != 0:
@@ -1148,6 +1474,7 @@ async def _pr_query_one(owner_repo: str, branch: str) -> dict | None:
         return None
     if pr is not None:
         pr["_repo"] = owner_repo
+        pr["_head_oid"] = pr.pop("headRefOid", None)
         if "body" in pr:
             pr["_body"] = pr.pop("body") or ""
     return pr
@@ -1211,12 +1538,21 @@ async def _fetch_pr_head_oid(branch: str, repo: str | None = None) -> str | None
         if data.get("state") != "MERGED":
             return None
         return data.get("headRefOid")
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return None
 
 
-async def _pr_status_cached(branch: str) -> dict | None:
-    """Return cached PR status for a branch."""
+async def _pr_status_cached(branch: str, head_oid: str | None = None) -> dict | None:
+    """Return cached PR status for a branch.
+
+    *head_oid* is the full current worktree HEAD commit.  When provided and
+    the cached entry records a MERGED verdict whose stored head OID
+    differs from *head_oid*, the entry is treated as stale and a fresh lookup is
+    performed.  This prevents a permanently-cached MERGED result from surviving
+    a branch name being reused for a new head commit.  Callers that do not have
+    the head OID readily available may omit *head_oid*; the cache then degrades
+    to the previous behaviour (MERGED is terminal, non-MERGED expires via TTL).
+    """
     if not branch or branch == BASE_BRANCH:
         return None
     now = time.time()
@@ -1225,10 +1561,37 @@ async def _pr_status_cached(branch: str) -> dict | None:
         # Only MERGED is permanently terminal — a CLOSED PR can be reopened,
         # so its cache entry must expire via the normal TTL.
         is_terminal = (ent.get("data") or {}).get("state") == "MERGED"
-        if is_terminal or (now - ent["ts"]) < _PR_TTL:
+        if is_terminal:
+            # Invalidate a MERGED entry when the caller supplies a head OID
+            # that differs from the one recorded at cache-write time.  A changed
+            # head means the branch was reused for new work; the old MERGED
+            # verdict no longer describes the current commits.
+            cached_head = ent.get("cached_head")
+            if head_oid and cached_head != head_oid:
+                # Head changed (or entry was written without a head OID) —
+                # fall through to a fresh fetch below.
+                pass
+            else:
+                return ent.get("data")
+        elif (now - ent["ts"]) < _PR_TTL:
             return ent.get("data")
     data = await _fetch_pr_status(branch)
-    _PR_CACHE[branch] = {"data": data, "ts": time.time()}
+    if (
+        data
+        and data.get("state") == "MERGED"
+        and head_oid
+        and data.get("_head_oid") != head_oid
+    ):
+        # GitHub may return the old merged PR when a branch name is reused
+        # before a replacement PR exists. A local head contained in the PR
+        # head is still fully shipped (for example, remote commits landed
+        # before merge); only a divergent head means this verdict is stale.
+        pr_head_oid = data.get("_head_oid")
+        if not pr_head_oid or not await _head_contained_in_pr(
+            _repo(), head_oid, pr_head_oid
+        ):
+            data = None
+    _PR_CACHE[branch] = {"data": data, "ts": time.time(), "cached_head": head_oid}
     return data
 
 
@@ -1336,9 +1699,14 @@ async def _html_repo_base() -> str | None:
     if _HTML_BASE:
         return _HTML_BASE
     remote = await _upstream_remote()
-    rc, out, _ = await _run_cmd(
-        ["git", "-C", MAIN_REPO, "remote", "get-url", remote], timeout=5
-    )
+    try:
+        rc, out, _ = await _run_cmd(
+            ["git", "-C", _repo(), "remote", "get-url", remote], timeout=5
+        )
+    except RepoUnavailable:
+        # Same degrade as a failed get-url: fall through to the cached
+        # owner/repo lookup (which answers None in this state too).
+        rc, out = 1, ""
     if rc == 0:
         base = _parse_html_repo_base(out.strip())
         if base:
@@ -1368,7 +1736,7 @@ def _load_dev_fleet_cfg() -> dict:
             if not p.is_file():
                 continue
             raw = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
+        except (OSError, ValueError):
             continue
         if isinstance(raw, dict) and isinstance(raw.get("dev_fleet"), dict):
             section.update(raw["dev_fleet"])
@@ -1481,8 +1849,11 @@ def _parse_worktree_porcelain(raw: str) -> list[dict]:
 
 async def _discover_worktrees() -> list[dict]:
     """List git worktrees of MAIN_REPO."""
+    # Nothing to discover when no checkout resolved; _repo() raises
+    # RepoNotConfigured and the setup state is the caller's job.
+    repo = _repo()
     rc, stdout, stderr = await _run_cmd(
-        ["git", "-C", MAIN_REPO, "worktree", "list", "--porcelain"], timeout=10
+        ["git", "-C", repo, "worktree", "list", "--porcelain"], timeout=10
     )
     if rc != 0:
         # Propagate sandbox/git failures as a RuntimeError so callers can
@@ -1495,8 +1866,49 @@ async def _discover_worktrees() -> list[dict]:
             # ~180-char preamble, so a tight cap would surface the diagnosis and
             # swallow the fix. Keep a generous bound purely to stop an unbounded
             # stderr reaching the UI.
-            raise RuntimeError(raw[:_SANDBOX_ERR_MAX])  # already prefixed by _run_cmd
-        return []
+            raise RepoUnreadable(raw[:_SANDBOX_ERR_MAX])  # already prefixed by _run_cmd
+        if raw.startswith(_UNRESOLVED_TOOL_PREFIX):
+            # git never ran: the HOST has no git the resolver is willing to
+            # execute. Checked before the .git probe because the probe's
+            # outcome is irrelevant here — wrapping this in "worktree
+            # discovery failed in <repo>" (the old behavior) sent users to
+            # debug a healthy checkout (#2530). The trusted-PATH detail is
+            # operator-diagnostic, so it goes to the log, not the banner.
+            logger.warning("dev-fleet: %s", raw)
+            raise RepoUnreadable(_unresolved_tool_message("git"))
+        # Every other git failure was previously swallowed into a silent [] —
+        # which the UI renders as the "No worktrees found / Nothing under the
+        # worktrees root yet" empty state. When MAIN_REPO is wrong that empty
+        # state is a lie: the fleet is not empty, it is unreadable. Reaching here
+        # means a checkout WAS named — discovery only ever adopts a path that
+        # carries the Kiro Crew markers, so an unverifiable one came from the
+        # operator's own env var or config — so name it and raise, and
+        # api_dev_fleet_fleet's error path renders the Discovery Error banner.
+        # The .git probe is a filesystem stat — on a wedged network mount it
+        # can block indefinitely, and this branch is reachable precisely when
+        # the checkout is unhealthy (git already failed or timed out against
+        # it). Same "Blocking — executor only" convention as _is_checkout().
+        loop = asyncio.get_running_loop()
+        repo_is_git = await loop.run_in_executor(
+            subprocess_executor(), (Path(repo) / ".git").exists
+        )
+        if not repo_is_git:
+            # Name the mechanism that supplied the path: the remedy is to edit
+            # THAT one, and a message listing both leaves the user guessing which
+            # of the two they set. Resolved on the executor with the probe above —
+            # it reads config files, and a network-backed home would otherwise
+            # stall the gateway loop on the way to rendering an error banner.
+            hint = await loop.run_in_executor(subprocess_executor(), _repo_source_hint)
+            raise RepoUnreadable(
+                f"main checkout not found: {repo} is missing or not a git "
+                f"checkout. {hint}"
+            )
+        # The repo exists but git failed for some other reason (corrupt repo,
+        # permissions): surface git's own message, redacted and bounded.
+        raise RepoUnreadable(
+            f"git worktree discovery failed in {repo}: "
+            f"{_redact(raw)[:_GIT_ERR_MAX] or 'unknown git error'}"
+        )
     entries = _parse_worktree_porcelain(stdout)
     # `git worktree list --porcelain` always lists the primary checkout
     # first — that is the authoritative main, regardless of whether
@@ -1526,11 +1938,13 @@ async def _git(
 
 async def _git_info(path: str) -> dict:
     info: dict = {
-        "branch": None, "head": None, "dirty": False,
+        "branch": None, "head": None, "head_oid": None, "dirty": False,
         "ahead": 0, "behind": 0, "last_updated_at": None,
     }
     info["branch"] = await _git(path, "rev-parse", "--abbrev-ref", "HEAD")
-    info["head"] = await _git(path, "rev-parse", "--short=7", "HEAD")
+    full_head = await _git(path, "rev-parse", "HEAD")
+    info["head_oid"] = full_head
+    info["head"] = full_head[:7] if full_head else None
     st = await _git(path, "status", "--porcelain")
     if st is not None:
         info["dirty"] = len(st) > 0
@@ -1734,11 +2148,10 @@ def _serving_install_reason_sync(
         if pkg == root or root in pkg.parents:
             return None
     if not _is_checkout(main_repo):
-        # Nothing is actually being managed. MAIN_REPO defaults to ~/kirocrew
-        # whether or not it exists, so a desktop-bundle or pip install with no
-        # source checkout — the out-of-the-box case — would otherwise get a
-        # permanent warning whose remedy ("start the gateway from <path>") names
-        # a directory that is not there. A dead-end instruction on every visit is
+        # Nothing is actually being managed: a desktop-bundle or pip install with
+        # no source checkout — the out-of-the-box case — would otherwise get a
+        # permanent warning whose remedy ("start the gateway from <path>") names a
+        # directory that is not there. A dead-end instruction on every visit is
         # how a signal gets trained away.
         return None
     return (
@@ -1755,16 +2168,44 @@ async def _serving_install_reason(worktrees: "list[dict]") -> str | None:
     managed = tuple(sorted(
         str(wt["path"]) for wt in worktrees if wt.get("path")
     ))
-    key = (MAIN_REPO, managed)
+    # Reached only with a built fleet in hand, so the accessor cannot raise
+    # here; it exists to keep the path build off the bare global.
+    repo = _repo()
+    key = (repo, managed)
     if _SERVING_REASON is not None and _SERVING_REASON[0] == key:
         return _SERVING_REASON[1]
     loop = asyncio.get_running_loop()
     reason = await loop.run_in_executor(
         subprocess_executor(),
-        functools.partial(_serving_install_reason_sync, MAIN_REPO, managed),
+        functools.partial(_serving_install_reason_sync, repo, managed),
     )
     _SERVING_REASON = (key, reason)
     return reason
+
+
+async def _provision_reattach_ids() -> dict[str, str]:
+    """Provision run ids the UI can reattach to after a page reload.
+
+    A run id is exposed while the run is still executing, or when it finished
+    unsuccessfully (the failed stepper + log must survive a reload). A failed
+    id persists until a newer provision for the same checkout overwrites it,
+    the run is evicted from the bounded registry, or the gateway restarts —
+    the UI dismiss is client-side only, so a reload after dismissing re-shows
+    the failure. Successful runs are omitted: the refreshed fleet row already
+    reports the built state, so there is nothing to reattach to. Run ids
+    evicted from the bounded run registry are omitted too — the UI could not
+    fetch their output anyway.
+    """
+    inflight = dict(_PROVISION_INFLIGHT)
+    out: dict[str, str] = {}
+    async with _RUNS_LOCK:
+        for name, rid in inflight.items():
+            run = _RUNS.get(rid)
+            if not run:
+                continue
+            if run.get("status") == "running" or run.get("exit_code") not in (None, 0):
+                out[name] = rid
+    return out
 
 
 async def _build_fleet() -> dict:
@@ -1781,7 +2222,7 @@ async def _build_fleet() -> dict:
         branch = wt.get("branch")
         is_main = wt.get("is_main", False)
         g = await _git_info(path)
-        pr = (await _pr_status_cached(branch)) if branch else None
+        pr = (await _pr_status_cached(branch, g.get("head_oid"))) if branch else None
         name = Path(path).name if not is_main else BASE_BRANCH
 
         # Pod status (best-effort)
@@ -1859,18 +2300,30 @@ async def _build_fleet() -> dict:
             and name.lower().startswith(legacy_prefixes),
             "last_updated_at": g["last_updated_at"],
         })
+    # The run pointers a reloaded page reattaches to -- `sync_run_id` and each
+    # row's `provision_run_id` -- are deliberately NOT set here. This snapshot is
+    # cached and served stale-while-revalidate, so a pointer written at build
+    # time is a frozen answer to a live question; `_with_live_run_pointers`
+    # overlays both at request time instead. One owner, so no reader can pick up
+    # a stale id.
     return {
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "worktrees": wts,
-        "main_repo": MAIN_REPO,
+        "main_repo": _redact(_repo()),
+        "main_repo_inferred": MAIN_REPO_INFERRED,
         "base_branch": BASE_BRANCH,
-        "sync_run_id": _SYNC_RID,
         "build_pending": _build_pending(),
         "gateway_service_active": await _gateway_service_active(),
         # Non-null while a cutover is staged but not yet running: the UI renders a
         # persistent pending-restart state from this, so the instruction outlives
         # the toast that announced it.
         "staged_target": _redact(staged_path) if staged_path else None,
+        # Whether the pointer-only cancel of that stage would be accepted (see
+        # _staged_cancel_available). Only probed while a stage exists; false
+        # otherwise so the dashboard's cancel control stays hidden.
+        "staged_cancel_available": (
+            staged_path is not None and await _staged_cancel_available()
+        ),
         "manual_restart": _manual_restart_command(),
         # WHY the gateway cannot be restarted/repointed from here, when it
         # cannot. Same lesson as pods_unavailable_reason below: the previous
@@ -1928,7 +2381,7 @@ async def _worktree_detail(name: str) -> dict:
     branch = wt.get("branch")
     is_main = wt.get("is_main", False)
     g = await _git_info(path)
-    pr = (await _pr_status_cached(branch)) if branch else None
+    pr = (await _pr_status_cached(branch, g.get("head_oid"))) if branch else None
     own_commits = await _own_commits_count(path)
 
     remote = await _upstream_remote()
@@ -2027,10 +2480,52 @@ def _load_cfg():
 # worktree-controlled code (pip/npm builds, pod CLI). The gateway's full
 # environment carries credentials (Slack/cloud tokens) that build scripts
 # must never be able to read.
-_SAFE_ENV_KEYS = (
+_POSIX_SAFE_ENV_KEYS = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR",
     "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
 )
+
+# Windows counterparts of the POSIX set above, written in the spelling Microsoft
+# documents. Matching is case-folded on Windows (see :func:`_is_safe_env_key`),
+# so these do not have to be upper-cased to survive ``os.environ``.
+#
+# SystemRoot is load-bearing, not cosmetic: Winsock locates its socket catalog
+# through it, so a child without it cannot resolve names at all. libcurl's
+# threaded resolver reports that as ``getaddrinfo() thread failed to start``,
+# which is what a credential-bearing ``git fetch`` fails with here. The rest
+# keep git and the node/pip toolchains functional: git reads its global config
+# through USERPROFILE, npm and pip need APPDATA/LOCALAPPDATA plus a writable
+# TEMP, PATHEXT is required to resolve ``.exe``/``.cmd`` at all, and
+# NUMBER_OF_PROCESSORS sizes build parallelism.
+#
+# This is platform parity, not a wider boundary: USERPROFILE/APPDATA are the
+# Windows equivalents of the POSIX HOME already allowlisted above, and every
+# name here is a platform path rather than a secret. No credential-bearing
+# variable is added, so build steps still cannot read Slack/cloud tokens.
+_WINDOWS_SAFE_ENV_KEYS = (
+    "SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "ProgramData",
+    "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432",
+    "TEMP", "TMP", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+)
+
+_SAFE_ENV_KEYS = _POSIX_SAFE_ENV_KEYS + (
+    _WINDOWS_SAFE_ENV_KEYS if platform_compat.IS_WINDOWS else ()
+)
+
+
+def _is_safe_env_key(key: str) -> bool:
+    """Whether *key* is allowlisted, honoring Windows' case-insensitive env.
+
+    Thin wrapper binding this module's allowlist to the shared matching
+    convention — exact on POSIX, case-folded on Windows. The rationale (why a
+    literal membership test silently drops ``SystemRoot`` on Windows, so a
+    spawned ``git`` cannot initialize Winsock and a fetch dies with
+    ``getaddrinfo() thread failed to start``, and why POSIX must stay exact)
+    lives on :func:`platform_compat.env_key_allowed`.
+    """
+    return platform_compat.env_key_allowed(key, _SAFE_ENV_KEYS)
 
 
 def _build_env(*, with_credentials: bool = False) -> dict:
@@ -2071,7 +2566,7 @@ def _build_env(*, with_credentials: bool = False) -> dict:
     never coexists with credentials. Both mechanisms must keep holding; do not
     remove one on the assumption that the other covers it.
     """
-    out = {k: v for k, v in os.environ.items() if k in _SAFE_ENV_KEYS}
+    out = {k: v for k, v in os.environ.items() if _is_safe_env_key(k)}
     out["PATH"] = _TRUSTED_PATH if with_credentials else _build_path()
     out.update(_GIT_ENV_NEUTRALIZERS)
     if with_credentials and _GIT_TRUSTED_HELPERS:
@@ -2081,7 +2576,7 @@ def _build_env(*, with_credentials: bool = False) -> dict:
 
 def _pod_env() -> dict:
     """Environment for pod CLI subprocesses (allowlisted base + pod repo)."""
-    return {**_build_env(), "KIROCREW_POD_REPO": MAIN_REPO}
+    return {**_build_env(), "KIROCREW_POD_REPO": _repo()}
 
 
 def _read_pin_strict(cfg: Any, name: str) -> tuple[bool, str | None]:
@@ -2184,6 +2679,92 @@ async def _pod_checkout_guard(name: str) -> str | None:
     return None
 
 
+def _reclaim_pod_locked(cfg, name: str, expected_checkout: str) -> tuple[str, str]:
+    """Attribute pod *name* and tear it down as ONE locked transaction.
+
+    Runs entirely inside ``rt.pod_name_mutex``, which is the cross-process flock
+    every mutating pod path cooperates on. That is the whole point of this
+    helper: checking the checkout pin in one process and then tearing down in
+    another leaves a window where a concurrent ``pod up`` from a DIFFERENT
+    checkout claims the same global basename, so the teardown would stop that
+    pod and delete its isolated HOME. Reading the pin under the same lock the
+    teardown holds closes it.
+
+    Necessarily in-process rather than via the ``pod down`` CLI: the lock is held
+    per open-file-description and ``stop_pod`` re-acquires it, so a caller that
+    held it around a shell-out would block the very child it waits on.
+    ``pod_name_mutex`` is reentrant WITHIN A THREAD, and this function is
+    submitted to the executor as one callable, so ``stop_pod``'s own acquisition
+    nests instead of deadlocking.
+
+    *expected_checkout* is this repo's worktree path for *name*, resolved by the
+    caller before the lock -- it is not the racy half, since a foreign ``up``
+    moves the PIN, never our own worktree.
+
+    Mirrors :func:`_pod_checkout_guard`'s attribution rules, and the CLI's
+    post-teardown env-file clear, so behaviour matches the paths it replaces.
+
+    Returns ``(outcome, detail)`` with outcome one of:
+      ``reclaimed``  -- ours, torn down, HOME verified gone
+      ``handed_over`` -- a new pod claimed the name mid-teardown; its state (and
+                        its pin) is deliberately left untouched. Callers treat
+                        this as a REFUSAL, not a success: a live pod may now be
+                        running out of the very checkout they are about to
+                        delete, and which pod holds the name is unknowable here.
+      ``foreign``    -- not attributable to this checkout; nothing was touched
+      ``failed``     -- attribution or teardown could not be completed
+    """
+    with rt.pod_name_mutex(cfg, name):
+        try:
+            env_exists, pinned = _read_pin_strict(cfg, name)
+        except Exception as exc:  # noqa: BLE001
+            # Pin state exists but cannot be positively read -> never treat as
+            # "unpinned"; that ambiguity is the cross-repo hole itself.
+            return "failed", f"cannot verify pod checkout pin: {_redact(str(exc))}"
+        if not env_exists:
+            # No pin means the HOME cannot be attributed to ANY checkout, and
+            # this path deletes it. ``_pod_checkout_guard`` allows an unpinned
+            # name when no unit is live, which is right for OPERATING on a pod
+            # the caller located; deletion is the stricter case and demands
+            # POSITIVE attribution, because a same-basename leftover from
+            # another checkout looks identical from here. Refusing costs an
+            # unpinned orphan an automatic reclaim -- `pod prune` still takes
+            # it -- while allowing it risks deleting another repo's data.
+            return "foreign", (
+                f"pod {name!r} has no checkout pin, so its HOME cannot be "
+                "attributed to this checkout (unattributable pod identity)"
+            )
+        if not pinned:
+            return "foreign", (
+                f"pod {name!r} has a pin file without a verifiable CHECKOUT "
+                "(ambiguous pod identity)"
+            )
+        try:
+            mine = Path(pinned).resolve() == Path(expected_checkout).resolve()
+        except OSError as exc:
+            return "failed", f"cannot resolve checkout paths: {_redact(str(exc))}"
+        if not mine:
+            return "foreign", (
+                f"pod {name!r} is pinned to a different checkout "
+                "(basename collision)"
+            )
+        cp = rt.stop_pod(cfg, name)
+        if cp.returncode != 0:
+            # Redacted like every other detail this helper returns: it reaches the
+            # worktree-remove response and therefore the dashboard, and teardown
+            # stderr can carry a path or credential from the pod's own output.
+            err = _redact((cp.stderr or "").strip())
+            return "failed", err or f"stop rc={cp.returncode}"
+        if rt.RECLAIMED_MARKER in (cp.stdout or ""):
+            # The env file now pins the NEW pod's checkout -- clearing it would
+            # strip that pod's identity.
+            return "handed_over", f"pod {name!r} was reclaimed by a new pod mid-teardown"
+        # Clear the pinned CHECKOUT=/SEED= so a later `up` re-resolves cleanly,
+        # the same post-reclaim step the CLI performs.
+        cfg.env_file(name).unlink(missing_ok=True)
+        return "reclaimed", ""
+
+
 async def _pod_up(name: str) -> dict:
     guard = await _pod_checkout_guard(name)
     if guard:
@@ -2192,7 +2773,7 @@ async def _pod_up(name: str) -> dict:
     # `pod up` runs the provision chain (npm ci + vite) when asked to.
     await _warm_build_path()
     cmd = _find_cli() + ["pod", "up", name, "--json"]
-    rc, stdout, stderr = await _run_cmd(cmd, cwd=MAIN_REPO, env=_pod_env(), timeout=180)
+    rc, stdout, stderr = await _run_cmd(cmd, cwd=_repo(), env=_pod_env(), timeout=180)
     if rc != 0:
         return {"ok": False, "error": _redact(stderr or stdout)}
     # Post-start verification (symmetry with _pod_down): rc==0 is not proof the
@@ -2215,7 +2796,7 @@ async def _pod_up(name: str) -> dict:
             }
     try:
         return {"ok": True, **json.loads(stdout)}
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return {"ok": True, "output": stdout}
 
 
@@ -2225,7 +2806,7 @@ async def _pod_down(name: str) -> dict:
         return {"ok": False, "error": guard}
     await _warm_build_path()
     cmd = _find_cli() + ["pod", "down", name]
-    rc, stdout, stderr = await _run_cmd(cmd, cwd=MAIN_REPO, env=_pod_env(), timeout=30)
+    rc, stdout, stderr = await _run_cmd(cmd, cwd=_repo(), env=_pod_env(), timeout=30)
     if rc != 0:
         return {"ok": False, "error": _redact(stderr or stdout)}
     # Post-stop verification: a CLI exit 0 is NOT proof the unit stopped (a
@@ -2295,7 +2876,7 @@ async def _pod_logs(name: str, n: int = 120) -> dict:
 # Per-worktree provisioning single-flight: name -> run id. Repeated POSTs
 # must not concurrently recreate .venv / dist for the same checkout.
 _PROVISION_INFLIGHT: dict[str, str] = {}
-_PROVISION_LOCK = asyncio.Lock()
+_PROVISION_LOCK = LoopBoundLock()
 
 
 async def _pod_provision(name: str) -> dict:
@@ -2321,7 +2902,7 @@ async def _pod_provision(name: str) -> dict:
             ),
         )
         rid = await _start_run(
-            "provision " + name, p_argv, cwd=MAIN_REPO, env=p_env,
+            "provision " + name, p_argv, cwd=_repo(), env=p_env,
             cleanup_paths=[p_cleanup] if p_cleanup else None,
         )
         _PROVISION_INFLIGHT[name] = rid
@@ -2374,18 +2955,50 @@ async def _worktree_remove(
     name: str,
     force: bool = False,
     progress: Callable[[str], None] | None = None,
+    _caller: str = "handler",
 ) -> dict:
-    """Remove a feature worktree. All safety gates preserved.
+    """Remove a feature worktree without racing its rebase lifecycle.
+
+    The unlocked check and acquisition are adjacent with no intervening await.
+    On asyncio's single event loop, acquiring a free lock completes without
+    yielding, so a rebase cannot enter between the fail-fast check and removal.
+    """
+    worktree_lock = _wt_lock(name)
+    if worktree_lock.locked():
+        return {"ok": False, "error": (
+            "refusing: a rebase is in progress for this worktree -- "
+            "wait for it to finish or abort it first"
+        )}
+    async with worktree_lock:
+        return await _worktree_remove_locked(name, force, progress, _caller)
+
+
+async def _worktree_remove_locked(
+    name: str,
+    force: bool = False,
+    progress: Callable[[str], None] | None = None,
+    _caller: str = "handler",
+) -> dict:
+    """Remove a feature worktree while its per-worktree lock is held.
 
     Non-forced removal of merged PRs uses a SQUASH-SAFE race guard: fetches
     the PR's headRefOid via `gh` and requires the worktree branch's current
     OID == the PR's merged headRefOid. Commits pushed after merge cause OID
     divergence and refuse the removal (unlike git cherry which never works
     for squash merges).
+
+    Lock order (must never be reversed to prevent deadlock):
+      _wt_lock(name)  →  _MAKE_LIVE_LOCK  →  _GIT_MUTATION_LOCK
+    The wrapper owns _wt_lock(name) for this entire function. The make-live
+    lock is held from the protection re-check through destructive deletion,
+    so neither rebase nor a live cutover can claim the target concurrently.
     """
     target, err = await _find_worktree(name)
     if target is None:
         return {"ok": False, "error": err}
+    # _find_worktree ran discovery, so the checkout is resolved from here on;
+    # the accessor keeps the removal git calls off the bare global.
+    repo = _repo()
     if target.get("is_main"):
         return {"ok": False, "error": "refusing: cannot remove the main checkout"}
     path = target["path"]
@@ -2412,12 +3025,15 @@ async def _worktree_remove(
         dirty = await _real_dirty(path)
         if dirty is not False:
             return {"ok": False, "error": (
-                "worktree has uncommitted changes (use force to override)"
+                "worktree has uncommitted changes"
+                " (force is allowed only when the PR is merged)"
                 if dirty else "cannot verify worktree state (git status failed)"
             )}
 
-    pr = (await _pr_status_cached(branch)) if branch else None
+    _rm_head_oid = (await _git(path, "rev-parse", "HEAD")) if branch else None
+    pr = (await _pr_status_cached(branch, _rm_head_oid)) if branch else None
     own = await _own_commits_count(path)
+
     if not force and not _is_pr_merged(pr):
         if own is None or own > 0:
             return {
@@ -2426,17 +3042,200 @@ async def _worktree_remove(
                 "pr": _redact_pr(pr),
             }
 
+    # Teardown guard: even with force=True, refuse to destroy a dirty worktree
+    # whose PR is not merged — that combination means unrecoverable data loss
+    # (uncommitted edits on an unmerged branch). Force retains its meaning for
+    # merged-dirty and diverged-OID overrides where the work IS already shipped.
+    #
+    # force_use_git_force tracks whether the removal command should use --force.
+    # When the unmerged tree verified CLEAN here, we intentionally omit --force
+    # at removal time so git's own dirty check acts as the atomic last-line
+    # guard against edits made in the window between this check and the actual
+    # removal (TOCTOU mitigation).
+    force_use_git_force = force  # default: honour caller's force flag
+    if force and not _is_pr_merged(pr):
+        dirty = await _real_dirty(path)
+        if dirty is True:
+            logger.info(
+                "worktree_removal_audit: worktree=%s branch=%s caller=%s force=%s "
+                "dirty=True own=%s pr_state=%s verdict_oid=n/a "
+                "action=refused_dirty_unmerged",
+                name, branch, _caller, force, own,
+                (pr or {}).get("state", "none"),
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "refusing forced removal: worktree has uncommitted changes "
+                    "and PR is not merged — this would cause unrecoverable data "
+                    f"loss (PR state: {(pr or {}).get('state', 'no PR')})"
+                ),
+                "pr": _redact_pr(pr),
+            }
+        elif dirty is None:
+            logger.info(
+                "worktree_removal_audit: worktree=%s branch=%s caller=%s force=%s "
+                "dirty=unknown own=%s pr_state=%s verdict_oid=n/a "
+                "action=refused_unverifiable",
+                name, branch, _caller, force, own,
+                (pr or {}).get("state", "none"),
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "cannot verify worktree cleanliness (git status failed) — "
+                    "refusing forced removal"
+                ),
+                "pr": _redact_pr(pr),
+            }
+        # Tree verified clean + unmerged: force override allowed, but do NOT
+        # pass --force to git so a late dirty edit is caught at removal time.
+        force_use_git_force = False
+        logger.info(
+            "worktree_removal_audit: worktree=%s branch=%s caller=%s "
+            "force=%s dirty=False own=%s pr_state=%s "
+            "action=unmerged_clean_no_git_force",
+            name, branch, _caller, force, own,
+            (pr or {}).get("state", "none"),
+        )
+
     # Pin the branch ref NOW — the same OID the safety verdict below evaluates
     # is the expected-old-OID for the atomic delete. A commit landing at any
     # point after this pin moves the ref, update-ref -d fails, branch retained.
-    verdict_oid = (await _git(MAIN_REPO, "rev-parse", f"refs/heads/{branch}")) if branch else None
-    if branch and branch != BASE_BRANCH and verdict_oid is None:
+    # Hoisted before the fresh-MERGED gate so containment uses the SAME pinned
+    # OID (closing a two-reads inconsistency where the first could fail while
+    # the second succeeds on retry).
+    verdict_oid = (await _git(repo, "rev-parse", f"refs/heads/{branch}")) if branch else None
+    if branch and branch != BASE_BRANCH and not verdict_oid:
+        logger.info(
+            "worktree_removal_audit: worktree=%s branch=%s caller=%s force=%s "
+            "dirty=n/a own=%s pr_state=%s verdict_oid=None "
+            "action=refused_unpinnable",
+            name, branch, _caller, force, own,
+            (pr or {}).get("state", "none"),
+        )
         return {"ok": False, "error": (
             "cannot pin branch OID (git rev-parse failed) — refusing removal"
         )}
 
+    # Fresh-MERGED gate: when force=True and the CACHED verdict says MERGED,
+    # confirm with a live gh query before allowing destruction of a dirty or
+    # unverifiable worktree. A permanently cached MERGED verdict (reused branch
+    # name whose old PR merged) would otherwise skip the unmerged guard above.
+    #
+    # CRITICAL: even when fresh verification CONFIRMS the PR is merged,
+    # a dirty or unverifiable worktree must NOT be removed with --force.
+    # Containment proves the branch's COMMITS are shipped; it says nothing
+    # about working-tree edits. `git worktree remove --force` bypasses git's
+    # own dirty check and would irrecoverably destroy uncommitted edits.
+    # Contract: NO path from this gate ever passes --force to git:
+    #   - dirty is not False → refuse outright (round 5)
+    #   - dirty is False → drop --force so git's own dirty check is the
+    #     atomic last line against edits arriving in the check-to-removal
+    #     window (round 6, mirrors the unmerged-clean TOCTOU pattern)
+    if force and _is_pr_merged(pr) and branch:
+        dirty = await _real_dirty(path)
+        if dirty is not False:
+            fresh_head = await _fetch_pr_head_oid(
+                branch, repo=(pr or {}).get("_repo")
+            )
+            if fresh_head is None:
+                logger.info(
+                    "worktree_removal_audit: worktree=%s branch=%s caller=%s "
+                    "force=%s dirty=%s own=%s pr_state=MERGED(cached) "
+                    "fresh_merged=False verdict_oid=%s "
+                    "action=refused_stale_merged",
+                    name, branch, _caller, force,
+                    "unknown" if dirty is None else "True", own,
+                    (verdict_oid or "").strip()[:12] if verdict_oid else "none",
+                )
+                return {
+                    "ok": False,
+                    "error": (
+                        "refusing forced removal: cached PR state is MERGED but "
+                        "fresh verification failed (stale cache or reused branch "
+                        "name) — cannot confirm work is shipped"
+                    ),
+                    "pr": _redact_pr(pr),
+                }
+            # Containment check: the branch's pinned OID must be contained in
+            # the freshly verified PR head. A reused branch name whose OLD PR
+            # merged returns a valid fresh_head, but the current branch OID
+            # (carrying new unmerged commits) won't be contained in it.
+            # Uses the single verdict_oid pin (hoisted above) — no second
+            # rev-parse that could diverge from the first.
+            assert verdict_oid  # guaranteed by the refused_unpinnable guard above
+            if not await _head_contained_in_pr(
+                repo, verdict_oid.strip(), fresh_head.strip()
+            ):
+                logger.info(
+                    "worktree_removal_audit: worktree=%s branch=%s caller=%s "
+                    "force=%s dirty=%s own=%s pr_state=MERGED(cached) "
+                    "fresh_head=%s verdict_oid=%s "
+                    "action=refused_uncontained_fresh_head",
+                    name, branch, _caller, force,
+                    "unknown" if dirty is None else "True", own,
+                    fresh_head.strip()[:12], verdict_oid.strip()[:12],
+                )
+                return {
+                    "ok": False,
+                    "error": (
+                        "refusing forced removal: branch has commits not "
+                        "contained in the verified PR head (possible reused "
+                        "branch name with new unmerged work)"
+                    ),
+                    "pr": _redact_pr(pr),
+                }
+            # Fresh verification confirms the PR is merged, but the worktree
+            # has uncommitted edits (dirty=True) or unverifiable state
+            # (dirty=None). Refuse: --force would bypass git's dirty check
+            # and destroy working-tree edits that containment cannot vouch for.
+            action = (
+                "refused_dirty_merged" if dirty is True
+                else "refused_unverifiable_merged"
+            )
+            logger.info(
+                "worktree_removal_audit: worktree=%s branch=%s caller=%s "
+                "force=%s dirty=%s own=%s pr_state=MERGED(fresh) "
+                "fresh_merged=True verdict_oid=%s "
+                "action=%s",
+                name, branch, _caller, force,
+                "unknown" if dirty is None else "True", own,
+                (verdict_oid or "").strip()[:12] if verdict_oid else "none",
+                action,
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "refusing forced removal: PR is merged but worktree has "
+                    + (
+                        "uncommitted changes"
+                        if dirty is True
+                        else "unverifiable state (git status failed)"
+                    )
+                    + " — commit, stash, or clean the working tree first"
+                ),
+                "pr": _redact_pr(pr),
+            }
+        else:
+            # dirty is False: tree is clean NOW, but an editor save during the
+            # check-to-removal window could dirty it. Drop --force so git's own
+            # dirty check is the atomic last line of defence (mirrors the
+            # unmerged-clean TOCTOU pattern). No path from the fresh-MERGED gate
+            # ever passes --force to git.
+            force_use_git_force = False
+            logger.info(
+                "worktree_removal_audit: worktree=%s branch=%s caller=%s "
+                "force=%s dirty=False own=%s pr_state=MERGED(cached) "
+                "action=merged_clean_no_git_force",
+                name, branch, _caller, force, own,
+            )
+
     # Squash-safe race guard: for merged PRs, verify the branch tip matches
     # the PR's merged headRefOid. A commit pushed after merge moves the OID.
+    # The pr_head_oid is reused later in the ref-delete gate for squash-safe
+    # containment — hoist to this scope so both code paths see it.
+    pr_head_oid: str | None = None
     if not force and _is_pr_merged(pr) and branch:
         branch_oid = verdict_oid
         if branch_oid is None:
@@ -2460,90 +3259,314 @@ async def _worktree_remove(
                 "pr": _redact_pr(pr),
             }
 
-    # stop pod if running
-    # Verification (dirty/PR/OID guards above) is the "verifying" phase; from
-    # here we enter pod shutdown, then the serialized git mutation. These phase
-    # signals drive the per-item prune checklist (no-op for other callers).
-    if progress is not None:
-        progress("stopping_pod")
-    cfg = _load_cfg()
-    stopped_pod = False
-    if _POD_AVAILABLE and cfg is None:
-        return {"ok": False, "error": "cannot load pod configuration to verify pod state"}
-    if _POD_AVAILABLE and cfg:
-        try:
-            loop = asyncio.get_running_loop()
-            active = await loop.run_in_executor(
-                subprocess_executor(), rt.active_names, cfg
-            )
-            if name in active:
-                r = await _pod_down(name)
-                if not r.get("ok"):
-                    return {"ok": False, "error": f"pod shutdown failed: {r.get('error')}"}
-                stopped_pod = True
+    # Hold _MAKE_LIVE_LOCK from the protection re-check through deletion.
+    # A concurrent /make-live can stage this worktree between the
+    # eager live-path check above and ``git worktree remove``; every removal
+    # caller delegates this ownership to the same internal critical section.
+    async with _MAKE_LIVE_LOCK:
+        # Protection re-check under the lock closes the TOCTOU window between
+        # the eager checks at function entry and the actual deletion.
+        _live2 = await _live_worktree_path(fresh=True)
+        if _live2 is not None and _same_path(path, _live2):
+            return {"ok": False, "error": (
+                "refusing: this worktree became the live gateway -- "
+                "switch the gateway to another checkout first"
+            )}
+        _staged2 = _staged_target()
+        if _staged2 is not None and _same_path(path, _staged2):
+            return {"ok": False, "error": (
+                "refusing: this worktree is a staged live-gateway cutover "
+                "target -- cancel the staged cutover before removing"
+            )}
+
+        # stop pod if running
+        # Verification (dirty/PR/OID guards above) is the "verifying" phase;
+        # from here we enter pod shutdown, then the serialized git mutation.
+        # These phase signals drive the per-item prune checklist (no-op for
+        # other callers).
+        if progress is not None:
+            progress("stopping_pod")
+        cfg = _load_cfg()
+        stopped_pod = False
+        # Distinct from ``stopped_pod``: nothing was running, an already-stopped
+        # pod's isolated HOME was reclaimed. Conflating the two would report a
+        # shutdown that never happened.
+        reclaimed_pod_home = False
+        if _POD_AVAILABLE and cfg is None:
+            return {"ok": False, "error": "cannot load pod configuration to verify pod state"}
+        if _POD_AVAILABLE and cfg:
+            # Pre-gate: verify the pod backend is reachable. If absent
+            # (PodBackendAbsent), pods cannot be supervised — a systemd --user
+            # unit requires a reachable session bus for its lifecycle. Even if
+            # the socket were removed under a running pod, that pod is now
+            # uncontrollable and will terminate on its next watchdog cycle.
+            # As a defense-in-depth measure, we also probe the unit file directly.
+            try:
+                rt.require_backend()
+            except rt.PodBackendAbsent:
+                # Defense-in-depth: attempt a direct unit-state query. If this
+                # somehow succeeds (bus re-appeared between require_backend and
+                # here), we fall through to the normal active-names path.
                 try:
-                    active2 = await loop.run_in_executor(
+                    loop = asyncio.get_running_loop()
+                    unit_state = await loop.run_in_executor(
+                        subprocess_executor(), rt.unit_state, cfg, name
+                    )
+                    if unit_state[0] == "active":
+                        return {
+                            "ok": False,
+                            "error": "pod backend reported absent but unit is active — refusing",
+                        }
+                except Exception:
+                    pass  # unit_state also fails → backend truly gone
+                # Name the residue instead of hiding the skip at debug level. The
+                # HOME cannot be reclaimed here — without a backend the pod's
+                # liveness is unprovable, and deleting a HOME that may belong to a
+                # live gateway is the one outcome teardown must never risk — but an
+                # operator who is told the path can reclaim it with `pod down`.
+                # Resolving the path is itself best-effort: a diagnostic must never
+                # be the reason a removal fails.
+                try:
+                    residue: object = rt.pod_home(cfg, name)
+                except Exception:  # noqa: BLE001
+                    residue = "its isolated HOME under the pod root"
+                logger.warning(
+                    "dev-fleet worktree_remove: pod backend absent, so %r's pod state "
+                    "cannot be verified and %s is left in place; reclaim it with "
+                    "`kirocrew pod down %s` once the backend is back",
+                    name,
+                    residue,
+                    name,
+                )
+            else:
+                try:
+                    loop = asyncio.get_running_loop()
+                    active = await loop.run_in_executor(
                         subprocess_executor(), rt.active_names, cfg
                     )
-                    if name in active2:
-                        return {"ok": False, "error": "pod still active after shutdown"}
+                    if name in active:
+                        outcome, detail = await loop.run_in_executor(
+                            subprocess_executor(), _reclaim_pod_locked, cfg, name, path
+                        )
+                        if outcome == "foreign":
+                            return {"ok": False, "error": f"refusing pod shutdown: {detail}"}
+                        if outcome == "handed_over":
+                            # A new pod holds this name. Which checkout it belongs to
+                            # is unknowable from here, and it may be running out of
+                            # THIS worktree -- removing the files under a live pod is
+                            # exactly what the liveness gate exists to prevent, and
+                            # the post-stop recheck below cannot be relied on to see
+                            # a unit that is still bootstrapping.
+                            return {"ok": False, "error": f"refusing removal: {detail}"}
+                        if outcome == "failed":
+                            return {"ok": False, "error": f"pod shutdown failed: {detail}"}
+                        stopped_pod = True
+                        # ``reclaimed_pod_home`` deliberately stays False here: the
+                        # teardown did reclaim the HOME, but the flag's job is to
+                        # distinguish a leftover reclaimed with NOTHING running from a
+                        # real shutdown, and ``stopped_pod`` already reports this one.
+                        try:
+                            active2 = await loop.run_in_executor(
+                                subprocess_executor(), rt.active_names, cfg
+                            )
+                            if name in active2:
+                                return {"ok": False, "error": "pod still active after shutdown"}
+                        except Exception as exc:
+                            return {
+                                "ok": False,
+                                "error": f"cannot verify pod shutdown: {_redact(str(exc))}",
+                            }
+                    else:
+                        # A STOPPED pod still owns its isolated HOME, and removing the
+                        # worktree is the last moment anything can attribute that
+                        # directory to this checkout: afterwards the pin naming it is
+                        # gone and only a bulk sweep could find it. Real usage stops
+                        # the pod when testing ends and prunes days later once the PR
+                        # merges, so gating reclamation on a LIVE unit meant the common
+                        # path never reclaimed anything — each removal stranded a full
+                        # isolated HOME (a per-instance model copy dominates it) for
+                        # good.
+                        #
+                        # ``orphan_homes`` is the authoritative predicate rather than a
+                        # bare directory probe, so this agrees with `pod ls` / `pod
+                        # prune` by construction: it skips symlinks, and on macOS it
+                        # treats a per-pod plist as "installed, not orphaned" so a name
+                        # mid-``up`` is never reclaimed underneath itself. It keys on
+                        # the pod root, liveness and plist and never on the checkout
+                        # pin, so attribution is the locked helper's job, not its.
+                        #
+                        # Two different fail directions, so two different scopes. The
+                        # ENUMERATION is best-effort cleanup: an orphan scan says
+                        # nothing about liveness, so its failure degrades to a named
+                        # leftover rather than turning a lost directory into a lost
+                        # removal. The RECLAIM is teardown, so it fails CLOSED -- a
+                        # returned failure refuses the removal, and a raised one is
+                        # deliberately left to the liveness handler below rather than
+                        # swallowed here, because a teardown that died mid-flight
+                        # (a stop that timed out against a still-activating unit) is
+                        # exactly the state in which removing the checkout is unsafe.
+                        try:
+                            # Probe the pod root FIRST: ``orphan_homes`` swallows an
+                            # enumeration OSError and answers ``[]``, which is
+                            # indistinguishable from "nothing to reclaim" -- so an
+                            # unreadable pod root would silently skip the HOME without
+                            # the warning this block promises. Reading it here puts the
+                            # error on a path that reaches that warning.
+                            await loop.run_in_executor(
+                                subprocess_executor(), lambda: list(cfg.pod_root.iterdir())
+                            )
+                            orphans = await loop.run_in_executor(
+                                subprocess_executor(), rt.orphan_homes, cfg
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "dev-fleet worktree_remove: could not look for %r's pod "
+                                "HOME (%s); the worktree is still removed — sweep the "
+                                "leftover with `kirocrew pod prune`",
+                                name,
+                                _redact(str(exc)),
+                            )
+                            orphans = []
+                        if name in orphans:
+                            outcome, detail = await loop.run_in_executor(
+                                subprocess_executor(), _reclaim_pod_locked, cfg, name, path
+                            )
+                            if outcome == "reclaimed":
+                                reclaimed_pod_home = True
+                            elif outcome == "foreign":
+                                # Not ours to delete, which is a reason to leave it --
+                                # never a reason to refuse this checkout's own removal,
+                                # since nothing of ours is at risk.
+                                logger.warning(
+                                    "dev-fleet worktree_remove: left a pod HOME named "
+                                    "%r in place (%s); continuing the removal",
+                                    name,
+                                    _redact(detail),
+                                )
+                            else:
+                                # failed, or handed_over -- a new pod now holds this
+                                # name and may be running out of this worktree.
+                                return {
+                                    "ok": False,
+                                    "error": f"pod home reclaim failed: {detail}",
+                                }
                 except Exception as exc:
                     return {
                         "ok": False,
-                        "error": f"cannot verify pod shutdown: {_redact(str(exc))}",
+                        "error": f"cannot verify pod state: {_redact(str(exc))}",
                     }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "error": f"cannot verify pod state: {_redact(str(exc))}",
-            }
 
-    if progress is not None:
-        progress("removing")
-    # Serialize the destructive git mutations. Concurrent `git worktree remove`
-    # / `update-ref -d` against the shared MAIN_REPO would race on the worktree
-    # admin dir and packed-refs locks, so only one worker mutates at a time.
-    async with _GIT_MUTATION_LOCK:
-        # TOCTOU recheck: the pod-inactive verification above happened BEFORE
-        # this lock was acquired. Under parallel prune a worker can queue here
-        # behind other removals — long enough for another session to restart
-        # the pod. Removing the checkout under a live pod would leave its
-        # gateway running from deleted files, so re-verify inactivity now.
-        if _POD_AVAILABLE and cfg:
-            try:
-                loop = asyncio.get_running_loop()
-                active3 = await loop.run_in_executor(
-                    subprocess_executor(), rt.active_names, cfg
-                )
-                if name in active3:
-                    return {"ok": False, "error": (
-                        "pod became active again before removal — refusing"
-                    )}
-            except Exception as exc:
-                return {
-                    "ok": False,
-                    "error": f"cannot re-verify pod state before removal: {_redact(str(exc))}",
-                }
-        cmd = ["git", "-C", MAIN_REPO, "worktree", "remove", path]
-        if force:
-            cmd.append("--force")
-        rc, stdout, stderr = await _run_cmd(cmd, timeout=60)
-        if rc != 0:
-            return {"ok": False, "error": _redact((stderr or stdout).strip()[:300])}
+        if progress is not None:
+            progress("removing")
+        # Serialize the destructive git mutations. Concurrent `git worktree remove`
+        # / `update-ref -d` against the shared MAIN_REPO would race on the worktree
+        # admin dir and packed-refs locks, so only one worker mutates at a time.
+        async with _GIT_MUTATION_LOCK:
+            # TOCTOU recheck: the pod-inactive verification above happened BEFORE
+            # this lock was acquired. Under parallel prune a worker can queue here
+            # behind other removals — long enough for another session to restart
+            # the pod. Removing the checkout under a live pod would leave its
+            # gateway running from deleted files, so re-verify inactivity now.
+            if _POD_AVAILABLE and cfg:
+                try:
+                    rt.require_backend()
+                except rt.PodBackendAbsent:
+                    pass  # backend provably absent — no pods can exist
+                else:
+                    try:
+                        loop = asyncio.get_running_loop()
+                        active3 = await loop.run_in_executor(
+                            subprocess_executor(), rt.active_names, cfg
+                        )
+                        if name in active3:
+                            return {"ok": False, "error": (
+                                "pod became active again before removal — refusing"
+                            )}
+                    except Exception as exc:
+                        return {
+                            "ok": False,
+                            "error": f"cannot re-verify pod state before removal: {_redact(str(exc))}",
+                        }
+            cmd = ["git", "-C", repo, "worktree", "remove", path]
+            if force_use_git_force:
+                cmd.append("--force")
+            rc, stdout, stderr = await _run_cmd(cmd, timeout=60)
+            if rc != 0:
+                # When the removal runs without --force (TOCTOU guard for
+                # clean-unmerged override), a git refusal means the tree became
+                # dirty in the window — surface it as a specific audit event.
+                if force and not force_use_git_force:
+                    logger.info(
+                        "worktree_removal_audit: worktree=%s branch=%s caller=%s "
+                        "force=%s dirty_at_removal=True verdict_oid=%s "
+                        "action=refused_dirty_at_removal",
+                        name, branch, _caller, force,
+                        (verdict_oid or "").strip()[:12] if verdict_oid else "none",
+                    )
+                return {"ok": False, "error": _redact((stderr or stdout).strip()[:300])}
 
-        # delete branch if shipped/empty — atomically against the pinned OID
-        if branch and branch != BASE_BRANCH and verdict_oid:
-            if _is_pr_merged(pr) or own == 0:
-                await _git(
-                    MAIN_REPO, "update-ref", "-d",
-                    f"refs/heads/{branch}", verdict_oid.strip(), timeout=10,
-                )
+            # Delete branch ref only when the PR is MERGED — atomically against
+            # the pinned OID. Unmerged branch refs are always retained, even when
+            # own == 0 (every commit already reachable from the upstream base, so
+            # no unique commits exist): keying deletion to PR state alone is a
+            # deliberately simpler, fail-closed policy (recoverable > irrecoverable).
+            # Known cost: removing an unmerged empty worktree leaves refs/heads/
+            # <branch> behind, which blocks re-creating a worktree under the same
+            # branch name until the ref is deleted manually.
+            # Fail-closed ancestry gate: even when the cached PR status says MERGED,
+            # verify the branch OID is actually contained in the base branch. A stale
+            # or wrong merged verdict cannot delete the only local pointer to unmerged
+            # commits — leaving a dangling ref is recoverable; deleting one is not.
+            # OR: squash-safe containment — a squash-merged branch head is never an
+            # ancestor of the base, but IS contained in the PR head (the squash
+            # commit). When ancestry fails, verify containment via _head_contained_in_pr
+            # using the pr_head_oid already fetched above (or fresh if needed).
+            if branch and branch != BASE_BRANCH and verdict_oid:
+                should_delete = False
+                if _is_pr_merged(pr):
+                    remote = await _upstream_remote()
+                    rc_anc, _, _ = await _run_cmd(
+                        [
+                            "git", "-C", repo, "merge-base", "--is-ancestor",
+                            verdict_oid.strip(), f"{remote}/{BASE_BRANCH}",
+                        ],
+                        timeout=10,
+                    )
+                    should_delete = rc_anc == 0
+                    # Squash-safe fallback: ancestry fails for squash/rebase merges.
+                    # Use the containment check (branch OID is ancestor of PR head).
+                    if not should_delete:
+                        head_oid = pr_head_oid or await _fetch_pr_head_oid(
+                            branch, repo=(pr or {}).get("_repo")
+                        )
+                        if head_oid:
+                            should_delete = await _head_contained_in_pr(
+                                repo, verdict_oid.strip(), head_oid.strip()
+                            )
+                if should_delete:
+                    await _git(
+                        repo, "update-ref", "-d",
+                        f"refs/heads/{branch}", verdict_oid.strip(), timeout=10,
+                    )
 
-    # Every removal path lands here — the single-worktree handler, each parallel
-    # prune worker, and the auto-prune reaper — so this is the one place the
-    # cached snapshot has to be told the row is gone.
-    _fleet_forget(name)
-    return {"ok": True, "removed": True, "stopped_pod": stopped_pod, "pr": _redact_pr(pr)}
+        # Every removal path lands here — the single-worktree handler, each parallel
+        # prune worker, and the auto-prune reaper — so this is the one place the
+        # cached snapshot has to be told the row is gone.
+        logger.info(
+            "worktree_removal_audit: worktree=%s branch=%s caller=%s force=%s "
+            "dirty=%s own=%s pr_state=%s verdict_oid=%s action=removed",
+            name, branch, _caller, force, "unknown", own,
+            (pr or {}).get("state", "none"),
+            (verdict_oid or "").strip()[:12] if verdict_oid else "none",
+        )
+        _fleet_forget(name)
+        return {
+            "ok": True,
+            "removed": True,
+            "stopped_pod": stopped_pod,
+            "reclaimed_pod_home": reclaimed_pod_home,
+            "pr": _redact_pr(pr),
+        }
 
 
 # --- sync (pull + build) ---
@@ -2557,7 +3580,41 @@ async def _sync() -> dict:
             async with _RUNS_LOCK:
                 run = _RUNS.get(_SYNC_RID)
             if run and run["status"] == "running":
-                return {"ok": False, "error": "sync already running", "run_id": _SYNC_RID}
+                # Guard against a stale "running" status: the worker task may
+                # have exited (process reaped) but the status update has not yet
+                # landed because the event loop has not yielded back to the
+                # worker's finally block.  The correct liveness signal is the
+                # subprocess handle: _ACTIVE_RUNS[rid] is (task, proc), and
+                # proc.returncode is not None means the process has exited even
+                # if the task's finally (cleanup_paths unlinking, status write)
+                # has not completed.  task.done() is strictly LATER than the
+                # status write, so checking it would miss the exact window.
+                active = _ACTIVE_RUNS.get(_SYNC_RID)
+                if active is not None:
+                    _task, proc = active
+                    if proc is None or proc.returncode is None:
+                        # Process still running (or not yet spawned) — genuine.
+                        return {"ok": False, "error": "sync already running", "run_id": _SYNC_RID}
+                    # Process exited but worker hasn't written status yet.
+                    # Wait briefly for the task's finally block to land the
+                    # status write + cleanup, rather than starting a new sync
+                    # while the old worker is still unlinking temp files in the
+                    # same worktree.
+                    try:
+                        await asyncio.wait_for(asyncio.shield(_task), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        # Worker still cleaning up after 2s — refuse the new
+                        # sync to avoid concurrent worktree writes.
+                        return {"ok": False, "error": "sync already running", "run_id": _SYNC_RID}
+                    except Exception:
+                        pass  # task raised during cleanup; safe to proceed
+                # Re-read status after giving the worker a chance to land it.
+                async with _RUNS_LOCK:
+                    run = _RUNS.get(_SYNC_RID)
+                if run and run["status"] == "running":
+                    # Still stale after the wait — reconcile defensively.
+                    run["status"] = "done"
+                    run["exit_code"] = run.get("exit_code") or -1
         return await _sync_start_locked()
 
 
@@ -2575,8 +3632,14 @@ async def _sync_start_locked() -> dict:
     """Start the sync run. Caller holds _SYNC_LOCK."""
     global _SYNC_RID  # noqa: F824 (assigned below after await)
 
+    try:
+        repo = _repo()
+    except RepoUnavailable as exc:
+        # Sync answers a UI action, so the unresolved state degrades to the
+        # same {"ok": False} shape every other refusal here uses.
+        return {"ok": False, "error": str(exc)}
     await _warm_build_path()
-    head = await _git(MAIN_REPO, "symbolic-ref", "--short", "HEAD")
+    head = await _git(repo, "symbolic-ref", "--short", "HEAD")
     if head is None:
         return {"ok": False, "error": "cannot determine checked-out branch (git failed)"}
     if head.strip() != BASE_BRANCH:
@@ -2591,25 +3654,40 @@ async def _sync_start_locked() -> dict:
     # — `pip install -e .` with it would re-point that venv's editable install
     # at MAIN_REPO, hijacking the running gateway's code identity on its next
     # restart (observed live: gateway silently became the main repo's code).
-    target_py = _venv_python(MAIN_REPO)
+    target_py = _venv_python(repo)
     if target_py is None:
         return {"ok": False, "error": (
             "main checkout has no .venv — provision it first "
-            f"(expected under {Path(MAIN_REPO) / '.venv'})"
+            f"(expected under {Path(repo) / '.venv'})"
         )}
     # Both binary lookups stat the filesystem (`_trusted_bin` walks the trusted
     # dirs; `_toolchain_bin` adds a `shutil.which` over the node bin dirs, which
-    # may be NFS-backed). Resolve them together on the executor so /api/sync
-    # cannot stall the gateway's requests and liveness behind a directory scan.
+    # may be NFS-backed). The console-script probe opens files in the target
+    # venv, and the origin probe RUNS that interpreter. Resolve them together on
+    # the executor so /api/sync cannot stall the gateway's requests and liveness
+    # behind a directory scan or a subprocess.
     loop = asyncio.get_running_loop()
-    git_bin, npm_bin = await loop.run_in_executor(
+    git_bin, npm_bin, locked_scripts, venv_origin = await loop.run_in_executor(
         subprocess_executor(),
-        lambda: (_trusted_bin("git"), _toolchain_bin("npm")),
+        lambda: (
+            _trusted_bin("git"),
+            _toolchain_bin("npm"),
+            dep_sync.locked_console_scripts(target_py),
+            dep_sync.installed_package_origin(target_py),
+        ),
     )
     if git_bin is None:
-        return {"ok": False, "error": (
-            f"no trusted executable for 'git' in {_TRUSTED_PATH}"
-        )}
+        # Same failure class as the discovery path: name the remedy in the
+        # response; the log records the event. The searched dirs are the
+        # static _TRUSTED_BIN_DIRS constant (and the discovery-path warning
+        # already prints them when it fires) — repeating them here trips
+        # CodeQL's name-based secret heuristic on _TRUSTED_PATH for no
+        # diagnostic gain.
+        logger.warning(
+            "dev-fleet: %s'git' — no trusted-dir candidate passed vetting "
+            "and no override is set", _UNRESOLVED_TOOL_PREFIX
+        )
+        return {"ok": False, "error": _unresolved_tool_message("git")}
     if npm_bin is None:
         # Drop the memoized resolution so the remedy this message advertises
         # actually works. `node_bin_dirs()` is lru_cached and `_BUILD_PATH_CACHE`
@@ -2630,12 +3708,98 @@ async def _sync_start_locked() -> dict:
             "service environment; that one does need a restart, because a "
             "running process cannot see a new environment variable."
         )}
-    raw_steps: list[tuple[list[str], str, dict, str]] = [
-        ([git_bin, "fetch", remote, BASE_BRANCH], "standard",
-         _build_env(with_credentials=True), "Pull"),
-        ([git_bin, "merge", "--ff-only", f"{remote}/{BASE_BRANCH}"], "strict", _build_env(), "Pull"),
-        ([str(target_py), "-m", "pip", "install", "-e", "."], "strict", _build_env(), "pip install"),
-    ]
+    # A locked console script does not have to mean the sync cannot happen.
+    #
+    # pip cannot replace a running executable on Windows, and its uninstall is
+    # not atomic: it renames the dist-info aside and deletes the editable `.pth`
+    # before it reaches the locked script, rolling back neither. So
+    # `pip install -e .` must not run against a venv serving this gateway.
+    #
+    # It does not have to run at all, though. An editable install needs no
+    # reinstall for a source change -- `src` is already on `sys.path`, so merged
+    # code is live the moment the merge lands. The only thing the reinstall was
+    # still buying is a dependency a new revision added, and installing a
+    # dependency never touches the project's own console script.
+    #
+    # The substitute keeps the SAME shape as the reinstall it stands in for:
+    # `fetch -> merge -> install the project's requirements`, in that order, with
+    # the project itself left out. Deviating from that shape -- installing before
+    # the merge so a failure cannot strand a merged checkout -- was tried and
+    # abandoned: it requires proving in advance that the merge cannot fail, which
+    # needs a growing set of preconditions that still cannot be complete. A failed
+    # install after a landed merge is what every other platform already does when
+    # its reinstall step fails.
+    #
+    # The substitute step runs with THIS backend's interpreter for the same
+    # reason the build+stage step does: the logic is revision-independent, so
+    # resolving it from the target would make the step's very EXISTENCE
+    # contingent on the pulled revision carrying dep_sync.
+    #
+    # It runs a pre-merge SNAPSHOT of that module, by path, and neither half of
+    # that is incidental. `-m kiro_crew...dep_sync` would import the module from
+    # the working tree AFTER the merge has landed, dragging in the whole package
+    # __init__ chain with it -- so a revision that raises the `requires-python`
+    # floor and uses newer syntax anywhere in that chain would die with a
+    # SyntaxError while being parsed, and the floor refusal that exists for
+    # exactly that revision could never run. Copying the module first and
+    # executing the copy keeps the only parsed file one this interpreter has
+    # already imported, which makes the refusal reachable in the case it is
+    # written for. Running it by path rather than by module name is what keeps
+    # the package chain out of it; the module imports nothing but the standard
+    # library, so it needs no package context.
+    #
+    # This mirrors pip rather than deviating from it: the INSTALLED pip reads the
+    # merged project's metadata, and an old pip refusing a too-new project is the
+    # behaviour being stood in for here.
+    fetch_step = ([git_bin, "fetch", remote, BASE_BRANCH], "standard",
+                  _build_env(with_credentials=True), "Pull")
+    merge_step = ([git_bin, "merge", "--ff-only", f"{remote}/{BASE_BRANCH}"], "strict",
+                  _build_env(), "Pull")
+    # The venv must be an install OF this checkout before either install step
+    # runs, and that is true of the reinstall just as much as the substitute.
+    #
+    # `<repo>/.venv` is only where the interpreter was FOUND; it says nothing
+    # about what it is an install of. When it serves a different checkout,
+    # `pip install -e .` silently repoints its editable install at this repo and
+    # the other checkout's gateway becomes this code on its next restart -- the
+    # same hijack the target_py resolution above exists to prevent, arriving by
+    # the other direction. The substitute has always refused this (dep_sync's own
+    # first check); the reinstall branch did not, so the safer path was the only
+    # guarded one. Checking here covers both, on every platform.
+    foreign = dep_sync.venv_not_mapped_to(venv_origin, Path(repo))
+    if foreign:
+        return {"ok": False, "error": (
+            f"refusing to sync: {foreign}. Give this checkout its own editable "
+            "install, or run the sync from the checkout that venv serves."
+        )}
+    dep_sync_snapshot: Path | None = None
+    if locked_scripts:
+        logger.info(
+            "dev-fleet: %s locked by a running process; substituting a "
+            "dependency-only sync for the editable reinstall",
+            ", ".join(locked_scripts),
+        )
+        # mkdtemp, not a fixed path under the system temp dir: executing a script
+        # by path puts its DIRECTORY on sys.path, so a shared or predictable
+        # directory would let anything dropped beside the snapshot shadow a
+        # stdlib module the snapshot imports. mkdtemp is unguessable and 0o700.
+        snapshot_dir = Path(tempfile.mkdtemp(prefix="kirocrew-dep-sync-"))
+        dep_sync_snapshot = snapshot_dir / "dep_sync.py"
+        shutil.copyfile(dep_sync.__file__, dep_sync_snapshot)
+        steps = [
+            fetch_step,
+            merge_step,
+            ([sys.executable, str(dep_sync_snapshot), str(repo), str(target_py)],
+             "strict", _build_env(), "pip install"),
+        ]
+    else:
+        steps = [
+            fetch_step,
+            merge_step,
+            ([str(target_py), "-m", "pip", "install", "-e", "."], "strict",
+             _build_env(), "pip install"),
+        ]
+    raw_steps: list[tuple[list[str], str, dict, str]] = steps
     # The whole FRONTEND half of the sync is skipped on an edition checkout.
     #
     # The build runs under _build_env(), whose allowlist (_SAFE_ENV_KEYS) drops
@@ -2682,10 +3846,14 @@ async def _sync_start_locked() -> dict:
             ([sys.executable, "-c",
               "import sys;from kiro_crew.frontend import build_and_stage;"
               "sys.exit(0 if build_and_stage(sys.argv[1], npm=sys.argv[2]) else 1)",
-              MAIN_REPO, npm_bin],
+              repo, npm_bin],
              "strict", _build_env(), "npm build + stage"),
         ]
     cleanups: list[str] = []
+    if dep_sync_snapshot is not None:
+        # File first, then its directory: the cleanup loop removes entries in
+        # order, and a directory cannot go until it is empty.
+        cleanups += [str(dep_sync_snapshot), str(dep_sync_snapshot.parent)]
     wrapped_steps: list[dict] = []
     loop = asyncio.get_running_loop()
     for argv, mode, base_env, label in raw_steps:
@@ -2698,11 +3866,30 @@ async def _sync_start_locked() -> dict:
         wrapped_steps.append({"argv": w_argv, "env": w_env, "label": label})
     script = (
         "import subprocess, sys, json\n"
+        # Align the writer with the reader. `_start_run` decodes this stream as
+        # UTF-8 (`line.decode(errors="replace")`), but a piped stdout on Windows
+        # encodes with the process locale codepage — so any non-ASCII that ever
+        # reaches a print here would be mangled at best and raise
+        # UnicodeEncodeError at worst, killing the runner before its first step.
+        # errors="replace" additionally guarantees no print can be fatal.
+        "sys.stdout.reconfigure(encoding='utf-8', errors='replace')\n"
         f"steps = json.loads({json.dumps(json.dumps(wrapped_steps))})\n"
-        f"cwd = {json.dumps(MAIN_REPO)}\n"
+        f"cwd = {json.dumps(repo)}\n"
         "for i, st in enumerate(steps):\n"
         "    print(f'::step::{i}::{st[\"label\"]}', flush=True)\n"
-        "    r = subprocess.run(st['argv'], cwd=cwd, env=st['env'])\n"
+        # reconfigure() above rebinds only THIS process's stdout object. Each
+        # step is a separate process that inherits the same pipe and re-derives
+        # its own encoding from the locale, so the Python steps — pip, and the
+        # build-and-stage child — would still encode a non-ASCII checkout path
+        # with the codepage and die on it. Set it in the environment, which is
+        # the only channel that reaches a child, so the whole pipe is UTF-8 from
+        # every writer the reader has to decode. Non-Python steps (git, npm)
+        # ignore the variable and are unaffected. Assigned rather than
+        # defaulted: the reader's encoding is fixed, so a divergent inherited
+        # value would be the defect, not a preference to preserve.
+        "    env = dict(st['env'])\n"
+        "    env['PYTHONIOENCODING'] = 'utf-8:replace'\n"
+        "    r = subprocess.run(st['argv'], cwd=cwd, env=env)\n"
         "    if r.returncode != 0:\n"
         "        sys.exit(r.returncode)\n"
     )
@@ -2716,11 +3903,11 @@ async def _sync_start_locked() -> dict:
 # Per-worktree mutation locks: two concurrent /rebase requests for the same
 # checkout could both pass the clean-state check, then one's failure path
 # would `rebase --abort` the OTHER's in-flight rebase.
-_WT_LOCKS: dict[str, asyncio.Lock] = {}
+_WT_LOCKS: dict[str, LoopBoundLock] = {}
 
 
-def _wt_lock(name: str) -> asyncio.Lock:
-    return _WT_LOCKS.setdefault(name, asyncio.Lock())
+def _wt_lock(name: str) -> LoopBoundLock:
+    return _WT_LOCKS.setdefault(name, LoopBoundLock())
 
 
 async def _rebase(name: str) -> dict:
@@ -2777,7 +3964,7 @@ _PRUNE_STATE: dict = {
     "running": False, "total": 0, "done": 0, "current": None,
     "results": [], "items": {},
 }
-_PRUNE_LOCK = asyncio.Lock()
+_PRUNE_LOCK = LoopBoundLock()
 # Cap on concurrent per-item prune phases (fresh gh verdict + pod shutdown).
 _PRUNE_CONCURRENCY = 4
 # Serializes the destructive git mutations (`git worktree remove` +
@@ -2786,7 +3973,10 @@ _PRUNE_CONCURRENCY = 4
 # mutate the shared MAIN_REPO ``.git`` state (worktree admin dir + packed-refs).
 # Uncontended in the sequential paths; only the parallel prune workers ever
 # queue on it.
-_GIT_MUTATION_LOCK = asyncio.Lock()
+# LoopBoundLock excludes within one loop only. That covers every contender
+# here: all acquirers are aiohttp handlers and tasks on the app's single
+# gateway loop — no worker thread runs its own loop against this .git.
+_GIT_MUTATION_LOCK = LoopBoundLock()
 
 
 async def _prunable(path: str, branch: str | None) -> dict:
@@ -2796,7 +3986,10 @@ async def _prunable(path: str, branch: str | None) -> dict:
     The race guard in _worktree_remove handles the edge case of commits pushed
     after the PR was merged by comparing branch OID to the PR's headRefOid.
     """
-    pr = (await _pr_status_cached(branch)) if branch else None
+    # Resolve the full HEAD once so cache invalidation cannot alias distinct
+    # commits that share an abbreviated prefix. Reuse it for the merge guard.
+    head_oid = (await _git(path, "rev-parse", "HEAD")) if branch else None
+    pr = (await _pr_status_cached(branch, head_oid)) if branch else None
     own = await _own_commits_count(path)
     dirty = await _real_dirty(path)
     try:
@@ -2812,14 +4005,13 @@ async def _prunable(path: str, branch: str | None) -> dict:
         # Same squash-safe race guard removal enforces: commits pushed AFTER
         # the merge mean the branch OID diverged from the PR head — surface it
         # at preview time instead of letting the candidate fail every run.
-        oid = await _git(path, "rev-parse", "HEAD")
         pr_oid = await _fetch_pr_head_oid(branch, repo=(pr or {}).get("_repo")) if branch else None
-        if not oid or not pr_oid:
+        if not head_oid or not pr_oid:
             # Cannot verify the squash-safe guard: removal would refuse this
             # anyway, so never present it as a candidate (fail-closed verdict
             # keeps preview and execution consistent).
             return {**base, "ok": False, "code": "merged_unverified"}
-        if not await _head_contained_in_pr(path, oid, pr_oid):
+        if not await _head_contained_in_pr(path, head_oid, pr_oid):
             return {**base, "ok": False, "code": "merged_new_commits"}
         return {**base, "ok": True, "code": "merged"}
     if own == 0 and not dirty:
@@ -2841,16 +4033,29 @@ async def _prune_candidates() -> dict:
         if v["ok"]:
             candidates.append(row)
         else:
+            # Surface dirty flag so the frontend can pre-disable force-selection
+            # for dirty+unmerged worktrees (the backend refuses force=True on
+            # those anyway — exposing the flag avoids a misleading checkbox).
+            if v.get("dirty") is True:
+                row["dirty"] = True
             kept.append(row)
     return {"ok": True, "candidates": candidates, "kept": kept, "scanned": len(worktrees) - 1}
 
 
-async def _prune_run(names: list[str]) -> dict:
+async def _prune_run(names: list[str], force_names: set[str] | None = None) -> dict:
     # Deduplicate while preserving order: the API accepts any list of names,
     # and a duplicate would spawn two workers racing to remove the SAME
     # worktree — the second one then reports a spurious failure over the
     # first one's success.
-    names = list(dict.fromkeys(names))
+    _force = force_names or set()
+    # Forced items (kept worktrees the user overrode) arrive in ``force_names``
+    # disjoint from the regular candidate ``names``. Both must be processed, so
+    # the work list is the order-preserving union — regulars first, then any
+    # forced name not already present. Building ``total``/``items``/the dispatch
+    # from this union (rather than ``names`` alone) is what keeps a force-only
+    # prune counted: otherwise its ``done`` bump has no matching denominator or
+    # item row, producing an impossible ``1/0`` counter and a false failure.
+    names = list(dict.fromkeys([*names, *_force]))
     async with _PRUNE_LOCK:
         if _PRUNE_STATE["running"]:
             return {"ok": False, "error": "prune already running"}
@@ -2892,16 +4097,22 @@ async def _prune_run(names: list[str]) -> dict:
                     error = err
                     result = {"name": nm, "ok": False, "error": err}
                 else:
-                    verdict = await _prunable(target["path"], target.get("branch"))
-                    if not verdict.get("ok"):
-                        error = f"not prunable: {verdict.get('code', 'unknown')}"
-                        result = {"name": nm, "ok": False, "error": error}
-                    else:
+                    is_forced = nm in _force
+                    if not is_forced:
+                        verdict = await _prunable(target["path"], target.get("branch"))
+                        if not verdict.get("ok"):
+                            error = f"not prunable: {verdict.get('code', 'unknown')}"
+                            result = {"name": nm, "ok": False, "error": error}
+                    if not error:
                         def _progress(phase: str, _nm: str = nm) -> None:
-                            # phase in {"stopping_pod", "removing"}
                             items[_nm]["status"] = phase
 
-                        res = await _worktree_remove(nm, force=False, progress=_progress)
+                        res = await _worktree_remove(
+                            nm,
+                            force=is_forced,
+                            progress=_progress,
+                            _caller="prune",
+                        )
                         result = {"name": nm, **res}
                         if res.get("ok"):
                             status, error = "done", None
@@ -2957,6 +4168,18 @@ _refresher_task: asyncio.Task | None = None
 _warm_task: asyncio.Task | None = None
 _reaper_task: asyncio.Task | None = None
 
+# Test-only escape hatch: a test that boots the real app via ``create_app()``
+# (e.g. to exercise the HMAC middleware) would otherwise start a genuine
+# network ``git fetch`` inside ``_status_refresher`` with nothing stubbed,
+# leaking a live background task into whichever test runs next. Unset in
+# production; ``test/conftest.py`` sets it for every test by default.
+_DISABLE_BACKGROUND_ENV = "KIROCREW_DEVFLEET_NO_BACKGROUND"
+
+
+def _background_tasks_disabled() -> bool:
+    return os.environ.get(_DISABLE_BACKGROUND_ENV) == "1"
+
+
 # Auto-prune reaper (opt-in via dev_fleet.auto_prune.enabled). The poll interval
 # is floored so a misconfigured tiny value can't hammer gh/git every cycle.
 _AUTO_PRUNE_MIN_INTERVAL_S = 300
@@ -2965,11 +4188,20 @@ _AUTO_PRUNE_DEFAULT_INTERVAL_S = 3600
 
 async def _status_refresher() -> None:
     """Background task: periodically fetch upstream + refresh fleet cache."""
+    try:
+        repo = _repo()
+    except RepoUnavailable as exc:
+        # No usable checkout to fetch or cache — nothing found, or the configured
+        # path is not one. Returning ends the task instead of logging a traceback
+        # every cycle forever; the resolved value only changes on restart, so
+        # there is nothing to wait for.
+        logger.info("dev-fleet: status refresher idle — %s", exc)
+        return
     while True:
         try:
             remote = await _upstream_remote()
             await _run_cmd(
-                ["git", "-C", MAIN_REPO, "fetch", remote, BASE_BRANCH, "--quiet"],
+                ["git", "-C", repo, "fetch", remote, BASE_BRANCH, "--quiet"],
                 timeout=90,
             )
             await _fleet_refresh()
@@ -3032,7 +4264,7 @@ async def _auto_prune_once() -> dict:
         if not name or row.get("code") != "merged":
             continue
         try:
-            res = await _worktree_remove(name, force=False)
+            res = await _worktree_remove(name, force=False, _caller="reaper")
         except Exception as exc:  # noqa: BLE001
             res = {"ok": False, "error": _redact(str(exc))}
         if res.get("ok"):
@@ -3052,7 +4284,18 @@ async def _auto_prune_reaper() -> None:
     """
     while True:
         enabled, interval = _auto_prune_cfg()
-        if enabled:
+        # Ask the accessor rather than testing MAIN_REPO for truthiness: a
+        # configured path that fails the marker test is TRUTHY but unusable, and
+        # a truthiness guard would let the cycle run, raise RepoUnreadable from
+        # _prune_candidates, log a traceback, and record a `failure` outcome in
+        # the SEL trail every interval — a tamper-evident audit asserting a
+        # failure that never happened.
+        usable = True
+        try:
+            _repo()
+        except RepoUnavailable:
+            usable = False
+        if enabled and usable:
             try:
                 res = await _auto_prune_once()
                 had_error = bool(res["failed"] or res.get("error"))
@@ -3074,15 +4317,50 @@ async def _auto_prune_reaper() -> None:
 # aiohttp route handlers
 # =============================================================================
 
+async def _with_live_run_pointers(data: dict) -> dict:
+    """Overlay the request-time run pointers onto a fleet snapshot.
+
+    ``sync_run_id`` and each row's ``provision_run_id`` are how a freshly-mounted
+    page reattaches its progress stepper to a run already in flight, but
+    ``_build_fleet`` bakes them into the snapshot ``_FLEET_CACHE`` then serves
+    stale-while-revalidate. A run started after that snapshot was built therefore
+    stayed invisible for a full cache cycle plus a rebuild: the page showed no
+    progress and left the button inviting a second press. Both pointers are
+    in-memory reads -- a module global, and a dict copy plus ``_RUNS`` lookups --
+    so reading them per request is cheap and always current.
+
+    Copies rather than mutates: ``data`` and its rows are the cache's own
+    objects, shared with every other in-flight request.
+    """
+    prov_rids = await _provision_reattach_ids()
+    rows = [
+        {**wt, "provision_run_id": prov_rids.get(wt.get("name"))}
+        for wt in data.get("worktrees", [])
+    ]
+    return {**data, "worktrees": rows, "sync_run_id": _SYNC_RID}
+
+
 async def api_dev_fleet_fleet(request: web.Request) -> web.Response:
     fresh = request.query.get("fresh") == "1"
     try:
         data = (await _fleet_refresh()) if fresh else (await _fleet_cached())
+    except RepoNotConfigured:
+        # Not an error: no checkout has been found yet. Reported as its own state
+        # (and WITHOUT an `error` field) so the page can ask where the checkout is
+        # instead of rendering a failure against a path the user never chose.
+        return web.json_response({"worktrees": [], "needs_setup": True})
+    except RepoUnreadable as exc:
+        # A checkout WAS named and git cannot read it: the page renders this as the
+        # Discovery Error banner, naming the path because the user chose it.
+        # Redacted like every other display string this module emits (and like the
+        # middleware's copy of the same exception) — git stderr can carry a remote
+        # URL with credentials in it.
+        return web.json_response({"worktrees": [], "error": _redact(str(exc))})
     except RuntimeError as exc:
         return web.json_response(
             {"worktrees": [], "error": str(exc)},  # _run_cmd already prefixes
         )
-    return web.json_response(data)
+    return web.json_response(await _with_live_run_pointers(data))
 
 
 async def api_dev_fleet_worktree(request: web.Request) -> web.Response:
@@ -3254,11 +4532,52 @@ async def api_dev_fleet_prune_run(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "error": "'names' must be a list of strings"}, status=400
         )
+    raw_force = body.get("force_names") or []
+    if not isinstance(raw_force, list) or not all(isinstance(n, str) for n in raw_force):
+        return web.json_response(
+            {"ok": False, "code": "invalid_force_names", "error": "'force_names' must be a list of strings"},
+            status=400,
+        )
     valid = await _valid_worktree_names()
-    names = [n for n in raw_names if n in valid]
-    if not names:
-        return web.json_response({"ok": False, "error": "no valid names"}, status=400)
-    return web.json_response(await _prune_run(names))
+    force_set: set[str] = set()
+    if raw_force:
+        # Guard: never force-remove the main checkout, the currently live
+        # worktree, or a staged cutover target (removing a staged target
+        # would leave live_target.json pointing at a missing checkout,
+        # silently abandoning the pending restart).
+        # Per-item _MAKE_LIVE_LOCK is held inside _prune_one for each forced
+        # removal (recheck + _worktree_remove atomically), preventing a
+        # concurrent /make-live from staging between check and deletion.
+        live_path = await _live_worktree_path()
+        live_name = Path(live_path).name if live_path else None
+        staged_path = _staged_target()
+        staged_name = Path(staged_path).name if staged_path else None
+        guarded: set[str] = set()
+        for nm in raw_force:
+            wt, _ = await _find_worktree(nm)
+            if wt and wt.get("is_main"):
+                guarded.add(nm)
+            elif live_name and nm == live_name:
+                guarded.add(nm)
+            elif staged_name and nm == staged_name:
+                guarded.add(nm)
+        if guarded:
+            return web.json_response(
+                {"ok": False, "code": "protected_worktree",
+                 "error": f"cannot force-remove protected worktrees: {', '.join(sorted(guarded))}"},
+                status=400,
+            )
+        force_set = {n for n in raw_force if n in valid}
+    # Merge both lists: regular + forced (forced items skip the prunable verdict).
+    all_names = [n for n in raw_names if n in valid]
+    for fn in raw_force:
+        if fn in valid and fn not in all_names:
+            all_names.append(fn)
+    if not all_names:
+        return web.json_response({"ok": False, "code": "no_valid_names", "error": "no valid names"}, status=400)
+    if force_set:
+        return web.json_response(await _prune_run(all_names, force_names=force_set))
+    return web.json_response(await _prune_run(all_names))
 
 
 async def _pod_name_action(request: web.Request, action) -> web.Response:
@@ -3312,30 +4631,82 @@ async def api_dev_fleet_rebase(request: web.Request) -> web.Response:
 # --- startup hook ---
 async def dev_fleet_startup(app: web.Application) -> None:
     """Start the background fleet refresher on app startup."""
-    global _refresher_task, _warm_task, _reaper_task, MAIN_REPO
+    global _refresher_task, _warm_task, _reaper_task, MAIN_REPO, MAIN_REPO_INFERRED
     loop = asyncio.get_running_loop()
-    MAIN_REPO = await loop.run_in_executor(
-        subprocess_executor(), _resolve_primary_checkout, MAIN_REPO
-    )
+    # Full discovery here rather than at import: it reads config.json and stats
+    # candidate directories, both of which would block the event loop on the
+    # route-registration path. Then normalize to the primary checkout, so a hint
+    # naming a linked worktree still manages the whole fleet. Discovery runs on
+    # a local so the global is written exactly once — this keeps the startup
+    # hook out of the AST ratchet's allowlist, so a future git call added here
+    # (where MAIN_REPO is most often still unresolved) cannot read the bare
+    # global unnoticed.
+    configured = await loop.run_in_executor(subprocess_executor(), _configured_main_repo)
+    discovered = await loop.run_in_executor(subprocess_executor(), _discover_main_repo)
+    if discovered:
+        discovered = await loop.run_in_executor(
+            subprocess_executor(), _resolve_primary_checkout, discovered
+        )
+        # Tiers 1-2 are taken verbatim so a typo surfaces against the path the
+        # user named — but "not replaced by a discovered checkout" and "not
+        # validated" are separable, and only the first is wanted. An unvalidated
+        # configured path that happens to be SOME readable git repository would
+        # have its worktrees listed and `worktree remove`, `update-ref -d`,
+        # `pull --ff-only` and `pip install -e` run inside it. Validated once here
+        # rather than per call, so no request or refresher cycle pays the stats;
+        # the message is composed here too because it embeds the config-derived
+        # source hint, which reads files.
+        global _REPO_INVALID_MSG
+        valid, hint = await loop.run_in_executor(
+            subprocess_executor(),
+            lambda: (_is_kirocrew_checkout(discovered), _repo_source_hint()),
+        )
+        _REPO_INVALID_MSG = None if valid else (
+            f"not a Kiro Crew checkout: {discovered} exists but does not carry the "
+            f"markers (.git, src/kiro_crew/, pyproject.toml). {hint}"
+        )
+    MAIN_REPO = discovered
+    MAIN_REPO_INFERRED = bool(discovered and not configured)
     await _load_trusted_credential_helpers()
     await _load_fallback_repos()
     await _upstream_remote()
     # Resolve the node build toolchain here, on the executor, so no request
     # handler ever pays for the filesystem scan (NFS homes make it slow).
     await _warm_build_path()
+    if _background_tasks_disabled():
+        return
     if _refresher_task is None or _refresher_task.done():
         _refresher_task = asyncio.create_task(_status_refresher())
     if _reaper_task is None or _reaper_task.done():
         _reaper_task = asyncio.create_task(_auto_prune_reaper())
-    _warm_task = asyncio.create_task(_fleet_refresh())
+    try:
+        _repo()
+    except RepoUnavailable:
+        # Same reason as the reaper: a configured-but-unusable path is truthy, and
+        # warming would only raise into a task nobody awaits ("Task exception was
+        # never retrieved"). The setup / discovery-error state is served from the
+        # route instead.
+        pass
+    else:
+        _warm_task = asyncio.create_task(_fleet_refresh())
 
 
 async def dev_fleet_cleanup(app: web.Application) -> None:
     """Cancel and await background tasks so a stopped runner leaves nothing behind."""
-    global _refresher_task, _warm_task, _reaper_task
+    global _refresher_task, _warm_task, _reaper_task, _SHUTDOWN_IN_PROGRESS
+    # Close the admission window first: set the flag and snapshot _ACTIVE_RUNS
+    # atomically under the admission lock.  The lock is held only for these two
+    # fast dict operations — no I/O, no awaits — so it cannot stall any in-
+    # flight handler or create done-callback deadlocks.  Once we drop the lock,
+    # _SHUTDOWN_IN_PROGRESS is True and _start_run will refuse new registrations,
+    # so the snapshot is complete: every run that could ever be in _ACTIVE_RUNS
+    # is either already in `active_snapshot` or will be refused by _start_run.
+    async with _SHUTDOWN_ADMISSION_LOCK:
+        _SHUTDOWN_IN_PROGRESS = True
+        active_snapshot = list(_ACTIVE_RUNS.items())
     # Kill active sync/provision subprocess trees first, then cancel workers —
     # otherwise a gateway restart leaves pip/npm mutating shared checkouts.
-    for rid, (task, proc) in list(_ACTIVE_RUNS.items()):
+    for rid, (task, proc) in active_snapshot:
         if proc is not None and proc.returncode is None:
             await _kill_tree(proc.pid)
             try:
@@ -3370,7 +4741,7 @@ async def hmac_proxy_middleware(request: web.Request, handler) -> web.Response:
     """Verify X-KiroCrew-Proxy HMAC on every request except /health.
 
     Message format matches routes.py signing:
-      msg = "<timestamp>:<METHOD>:<path>[?query]:<sha256(body)>"
+      msg = "<timestamp>:<METHOD>:<raw request-target>:<sha256(body)>"
     Fail-closed: missing/invalid/expired signature -> 401.
     """
     if request.path == "/health":
@@ -3418,17 +4789,38 @@ async def hmac_proxy_middleware(request: web.Request, handler) -> web.Response:
     # Reconstruct the signed message exactly as routes.py builds it
     body = await request.read() if request.can_read_body else b""
     body_hash = hashlib.sha256(body).hexdigest()
-    # The gateway signs "/api/<path>[?query]" — the path as received by the backend
-    msg = f"{ts_str}:{request.method}:{request.path}"
-    if request.query_string:
-        msg += f"?{request.query_string}"
-    msg += f":{body_hash}"
+    # The gateway signs the RAW percent-encoded request-target; recompute over
+    # the same wire bytes, never the decoded path + query_string (which diverge
+    # on percent-encodable characters and would fail closed with 401).
+    msg = f"{ts_str}:{request.method}:{raw_request_target(request)}:{body_hash}"
 
     expected_sig = _hmac_mod.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
     if not _hmac_mod.compare_digest(sig_received, expected_sig):
         return _deny("invalid proxy signature")
 
-    return await handler(request)
+    try:
+        return await handler(request)
+    except RepoUnreadable as exc:
+        # Ordered before RepoNotConfigured: it is a SUBCLASS of the same base, so
+        # a broader handler first would swallow it and report the wrong code.
+        # A checkout was named and cannot be managed (git cannot read it, or it is
+        # a readable directory without the Kiro Crew markers) — distinct code so a
+        # client can tell "the path you gave me is wrong" from "tell me where it is".
+        return web.json_response(
+            {"ok": False, "code": "repo_unreadable", "error": _redact(str(exc))},
+            status=409,
+        )
+    except RepoNotConfigured as exc:
+        # One boundary for every route rather than a catch per handler: any route
+        # that resolves a worktree goes through _repo(), and a missed handler would
+        # answer a first-run click with an uncaught 500 and a generic "failed"
+        # toast — the worst possible message in the state that has the least
+        # context. /fleet catches both of these first and keeps its own payload
+        # shapes, so neither reaches here from /fleet.
+        return web.json_response(
+            {"ok": False, "code": "repo_not_configured", "error": str(exc)},
+            status=409,
+        )
 
 
 # =============================================================================
@@ -3464,7 +4856,7 @@ _LIVE_GATEWAY_LABEL = "dev.kirocrew.gateway"
 # second concurrent request fails fast with ``busy`` rather than queueing (a
 # queued cutover could apply a stale target after the winner already restarted
 # the gateway out from under us).
-_MAKE_LIVE_LOCK = asyncio.Lock()
+_MAKE_LIVE_LOCK = LoopBoundLock()
 
 # Process-local "cutover committed" latch. ``systemd-run --collect ... restart``
 # only SCHEDULES the restart and returns immediately, so ``_MAKE_LIVE_LOCK`` is
@@ -3543,6 +4935,29 @@ def _gateway_backend() -> "gateway_service.GatewayServiceBackend | None":
     )
 
 
+def _foreground_backend() -> "gateway_service.ForegroundBackend | None":
+    """The last-resort foreground restart backend, or ``None`` off-POSIX.
+
+    Constructed per call for the same reason as :func:`_gateway_backend`, and
+    ``sys.platform`` is read through this module's globals so the tests that
+    patch ``server.sys`` keep controlling it. POSIX-only: the detach mechanism
+    is a new session standing in for ``systemd-run --collect``, and the hosts
+    this exists for (no drivable systemd/launchd) are Linux and macOS; Windows
+    keeps the manual-restart advisory. Whether a restart can actually be
+    attempted is the backend's ``status()``, not this constructor — callers
+    must gate on both :data:`gateway_service.FOREGROUND_ELIGIBLE` and
+    ``status() == ok``.
+    """
+    if sys.platform not in ("linux", "darwin"):
+        return None
+    return gateway_service.ForegroundBackend(
+        marker_ports=run_marker.marker_ports,
+        read_pid=run_marker.read_pid,
+        read_launcher=run_marker.read_launcher,
+        pid_exists=platform_compat.pid_exists,
+    )
+
+
 async def _gateway_service_reason() -> str | None:
     """Human-readable reason the gateway service cannot be driven, or ``None``.
 
@@ -3564,6 +4979,26 @@ async def _gateway_service_reason() -> str | None:
     return reason
 
 
+async def _staged_cancel_available() -> bool:
+    """Whether ``_make_live``'s pointer-only cancel of a staged cutover would
+    be accepted on this host.
+
+    Mirrors the cancel branch's own precondition (``not can_restart``). The
+    pointer-only cancel is deliberately limited to hosts whose service manager
+    this app cannot drive: on a drivable host the stage also carries a service
+    DEFINITION, so ``_make_live`` refuses the shortcut with
+    ``staged_cutover_pending``. The fleet payload reports this so the dashboard
+    only offers a cancel control the backend will accept — note it is NOT the
+    same signal as ``_gateway_service_active()``, which also goes true for the
+    foreground last resort (where ``can_restart`` stays false and the cancel
+    DOES work).
+    """
+    svc = _gateway_backend()
+    if svc is None:
+        return True
+    return (await _live_user_unit_status()) != "ok"
+
+
 async def _gateway_service_active() -> bool:
     """Cached check: is the gateway running as a service we can drive?
 
@@ -3576,7 +5011,19 @@ async def _gateway_service_active() -> bool:
     if _GATEWAY_SERVICE_ACTIVE is not None and (now - _GATEWAY_SERVICE_CHECK_AT) < _GATEWAY_SERVICE_TTL:
         return _GATEWAY_SERVICE_ACTIVE
     svc = _gateway_backend()
-    _GATEWAY_SERVICE_ACTIVE = False if svc is None else await svc.active()
+    active = False if svc is None else await svc.active()
+    if not active:
+        # Foreground backend is the last-resort restart path for hosts without
+        # a drivable service manager. If eligible, the Restart button and the
+        # auto-restart-after-sync flow should still be available — but ONLY
+        # when the backend is not confined (status() == STATUS_OK), mirroring
+        # the _make_live probe at line ~4558.
+        status = await _live_user_unit_status()
+        if _foreground_eligible(status):
+            fg = _foreground_backend()
+            if fg is not None and await fg.status() == gateway_service.STATUS_OK:
+                active = True
+    _GATEWAY_SERVICE_ACTIVE = active
     _GATEWAY_SERVICE_CHECK_AT = now
     return _GATEWAY_SERVICE_ACTIVE
 
@@ -3607,31 +5054,99 @@ async def _gateway_start_id() -> str | None:
     ``_restart_gateway`` / ``_make_live`` actually bounce (pod or live).
     """
     svc = _gateway_backend()
-    return None if svc is None else await svc.start_id()
+    sid = None if svc is None else await svc.start_id()
+    if sid is not None:
+        return sid
+    # Foreground fallback: on a host where no manager can be driven the
+    # handshake still needs an identity that changes when the replacement
+    # starts, or a foreground cutover could never be observed to complete. The
+    # run-marker pid stands in (see ForegroundBackend). Gated on the same
+    # eligibility codes as the foreground restart itself so that a host with a
+    # mis-set-up manager (which this app refuses to bounce) does not start
+    # advertising an identity for a restart path that will never run.
+    if _foreground_eligible(await _live_user_unit_status()):
+        fg = _foreground_backend()
+        if fg is not None:
+            return await fg.start_id()
+    return None
+
+
+def _foreground_eligible(status: str) -> bool:
+    """True when *status* permits the foreground last resort."""
+    return status in gateway_service.FOREGROUND_ELIGIBLE
 
 
 async def _restart_gateway() -> dict:
-    """Restart the gateway service via a detached systemd-run.
+    """Restart the gateway, preferring the service backend with foreground fallback.
 
-    The restart kills the current process, so we use systemd-run --collect
-    to schedule a restart that survives our own death.
+    Tries the platform service manager first (systemd/launchd). When that is
+    unavailable or inactive, falls through to the foreground backend — the same
+    detach-and-respawn path that Make Live uses on hosts without a drivable
+    service manager.
 
-    Returns the pre-restart ``start_id`` (the live unit's start identity
-    captured BEFORE scheduling) so the caller can poll until a DIFFERENT
-    identity appears -- a 200 from this same process still winding down must
-    not read as "recovered". ``start_id`` is None-safe (see _gateway_start_id).
+    Returns the pre-restart ``start_id`` so the frontend can poll until a
+    DIFFERENT identity appears.
     """
-    svc = _gateway_backend()
-    if svc is None or not await svc.active():
-        return {"ok": False, "error": "gateway is not running as a user service"}
-    # Capture identity BEFORE scheduling the restart: afterwards the detached
-    # bounce can tear this process down at any moment, and the whole point is to
-    # hand the frontend the OLD identity to wait past.
-    start_id = await _gateway_start_id()
-    ok, err = await svc.restart_detached()
-    if not ok:
-        return {"ok": False, "error": _redact(err)}
-    return {"ok": True, "start_id": start_id}
+    # Reject while a Make Live cutover is in-flight: restarting mid-staging
+    # would tear the gateway down between the pointer write and the reload,
+    # leaving persisted and loaded targets diverged. Acquire the lock to
+    # prevent a concurrent Make Live from starting while we restart.
+    global _MAKE_LIVE_COMMITTED
+    if _MAKE_LIVE_COMMITTED:
+        return {"ok": False, "error": "a Make Live cutover is in progress — retry after it completes"}
+    if _MAKE_LIVE_LOCK.locked():
+        return {"ok": False, "error": "a Make Live cutover is in progress — retry after it completes"}
+    async with _MAKE_LIVE_LOCK:
+        if _MAKE_LIVE_COMMITTED:
+            return {"ok": False, "error": "a Make Live cutover is in progress — retry after it completes"}
+
+        svc = _gateway_backend()
+        service_active = False if svc is None else await svc.active()
+
+        if service_active:
+            assert svc is not None  # narrowing: service_active implies svc is not None
+            start_id = await _gateway_start_id()
+            ok, err = await svc.restart_detached()
+            if not ok:
+                return {"ok": False, "error": _redact(err)}
+            _MAKE_LIVE_COMMITTED = True
+            return {"ok": True, "start_id": start_id}
+
+        # Foreground fallback: hosts without a drivable service manager (e.g. AL2
+        # with broken sudo, no systemd --user bus) can still restart via the
+        # detach-and-respawn path — but only when not confined (status check
+        # mirrors _make_live and _gateway_service_active).
+        status = await _live_user_unit_status()
+        if _foreground_eligible(status):
+            fg = _foreground_backend()
+            if fg is not None:
+                fg_status = await fg.status()
+                if fg_status == gateway_service.STATUS_OK:
+                    start_id = await _gateway_start_id()
+                    ok, err = await fg.restart_detached()
+                    if not ok:
+                        return {"ok": False, "error": _redact(err)}
+                    _MAKE_LIVE_COMMITTED = True
+                    return {"ok": True, "start_id": start_id}
+                # Foreground eligible but confined/broken — surface the
+                # foreground's own refusal reason plus the manual remedy.
+                return {
+                    "ok": False,
+                    "error": (
+                        f"foreground gateway cannot restart ({fg_status})"
+                        f" — run `{_manual_restart_command()}` to apply the build"
+                    ),
+                }
+
+        # Neither the service backend nor the foreground fallback can drive the
+        # restart — surface the specific reason plus the manual remedy.
+        return {
+            "ok": False,
+            "error": (
+                f"{_make_live_status_error(status)}"
+                f" — run `{_manual_restart_command()}` to apply the build"
+            ),
+        }
 
 
 @_audited("dev_fleet_restart_gateway")
@@ -3837,7 +5352,8 @@ def _staged_notice(name: str, unit_status: str) -> str:
     return (
         f"{name} is staged as the live target. Run "
         f"`{_manual_restart_command()}` to finish the cutover — the gateway "
-        f"will come up on it. It was not automatic because "
+        f"will come up on it. To back out instead, use the live row's "
+        f"Cancel staged cutover in Dev Fleet. It was not automatic because "
         f"{_make_live_status_error(unit_status)}."
     )
 
@@ -3912,30 +5428,47 @@ def _manual_restart_command() -> str:
 
 
 def _make_live_plan(worktree: Path, kcbin: Path, *,
-                    svc: "gateway_service.GatewayServiceBackend | None") -> dict:
+                    svc: "gateway_service.GatewayServiceBackend | None",
+                    foreground: "gateway_service.ForegroundBackend | None" = None,
+                    ) -> dict:
     """Describe — without mutating anything — what making *worktree* live does.
 
     Validates the target the same way the real cutover does, so a dry run
     reports an unusable worktree instead of promising a cutover that would then
     be refused. When the service is drivable the backend's own plan is folded in,
-    because the cutover restages that definition too.
+    because the cutover restages that definition too. *foreground* is the
+    last-resort restart that will be ATTEMPTED when no manager is drivable
+    (see ``_make_live``): a dry run must report that restart as automatic, or
+    the preview would promise a manual step the real call then performs itself.
     """
     live_target.validate(str(worktree))
     plan: dict = {
         "mechanism": "live-target pointer",
         "pointer_path": str(live_target.pointer_path()),
         "exec": str(kcbin),
-        "restart": "automatic" if svc is not None else "manual",
+        "restart": "automatic" if (svc is not None or foreground is not None) else "manual",
     }
-    if svc is None:
-        plan["manual_restart"] = _manual_restart_command()
-    else:
+    if svc is not None:
         plan.update(svc.plan(worktree, kcbin))
+    elif foreground is not None:
+        plan.update(foreground.plan(worktree, kcbin))
+    else:
+        plan["manual_restart"] = _manual_restart_command()
     return plan
 
 
-async def _make_live(path: str, dry_run: bool = False) -> dict:
+async def _make_live(path: str, dry_run: bool = False,
+                     expected_staged: str | None = None) -> dict:
     """Repoint the live gateway at *path* by staging the live-target pointer.
+
+    ``expected_staged`` binds a CANCEL to the state the operator confirmed:
+    when set, the request proceeds only while the staged target still
+    resolves to that path (checked at entry and re-checked under the
+    single-flight lock) AND *path* still resolves to the running checkout,
+    refusing with ``stage_changed`` otherwise — without both bindings, a
+    cancel confirmed against one stage/live pair could silently discard a
+    different stage, or fall through to the cutover path and restart the
+    gateway into a checkout that is no longer live.
 
     Validation order (all enforced for ``dry_run`` too): the path is a known,
     existing worktree (``unknown_path`` / ``missing_path``); NOT inside a pod,
@@ -3985,6 +5518,28 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
             "(run this from the live dashboard)"
         )}
 
+    # A request carrying expected_staged is a CANCEL of that exact stage and
+    # nothing else. Validated HERE, before any branching: if the named stage
+    # completed or was re-pointed while the confirm dialog sat open, the
+    # request must not fall through to the full-cutover path below — that
+    # would restart the gateway back into the requested checkout, turning a
+    # stale "cancel" into the destructive opposite of what the operator asked.
+    # Re-checked under the single-flight lock before the pointer write.
+    if expected_staged is not None:
+        pending_entry = _staged_target()
+        if pending_entry is None or not _same_path(expected_staged,
+                                                   pending_entry):
+            now_desc = (
+                f"{Path(pending_entry).name} is staged now"
+                if pending_entry is not None
+                else "nothing is staged now"
+            )
+            return {"ok": False, "code": "stage_changed", "error": (
+                "the staged cutover changed while you were confirming: "
+                f"{now_desc}, not {Path(expected_staged).name} — refresh "
+                "the fleet and retry"
+            )}
+
     # The live target is a POINTER the gateway resolves at startup, not an edit
     # to this host's service definition — so staging never needs the service
     # manager. Restarting still does, and that is the one thing a `kirocrew
@@ -3995,9 +5550,33 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
     svc = _gateway_backend()
     unit_status = await _live_user_unit_status()
     can_restart = svc is not None and unit_status == "ok"
+    # LAST RESORT (strictly systemd > launchd > foreground): when no manager is
+    # drivable at all, a detached `kirocrew restart` can still finish the
+    # cutover (see gateway_service.ForegroundBackend). Probed ONCE per request,
+    # mirroring can_restart, so the plan and the act cannot disagree. Only the
+    # FOREGROUND_ELIGIBLE codes qualify — a mis-set-up manager keeps its named
+    # remedy instead of being bounced behind its back.
+    foreground: "gateway_service.ForegroundBackend | None" = None
+    if not can_restart and _foreground_eligible(unit_status):
+        fg = _foreground_backend()
+        if fg is not None and await fg.status() == gateway_service.STATUS_OK:
+            foreground = fg
 
     live = await _live_worktree_path()
     same_as_running = live is not None and _same_path(str(real), live)
+    if expected_staged is not None and not same_as_running:
+        # A request carrying expected_staged is a CANCEL: it re-pins the
+        # checkout the operator saw as live. If the live checkout moved since
+        # the dialog (a cutover landed and re-staged in between), the request
+        # names a checkout that is no longer running — falling through to the
+        # cutover path below would restart the gateway into it, the
+        # destructive opposite of a cancel. Refuse instead.
+        live_name = Path(live).name if live else "an unknown checkout"
+        return {"ok": False, "code": "stage_changed", "error": (
+            "the live checkout changed while you were confirming: "
+            f"{live_name} is running now, not {real.name} — refresh the "
+            "fleet and retry"
+        )}
     if same_as_running and _staged_target() is None:
         # Nothing staged: pointing at the checkout already running is a no-op on
         # EVERY host. This guard sits before the cancel below so that a drivable
@@ -4056,9 +5635,20 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
             # been completed or re-pointed since the entry check, and cancelling
             # a stage that no longer exists would delete a pointer someone else
             # just wrote.
-            if _staged_target() is None:
+            pending_now = _staged_target()
+            if pending_now is None:
                 return {"ok": False, "code": "already_live",
                         "error": f"{real.name} is already the live gateway"}
+            if expected_staged is not None and not _same_path(expected_staged,
+                                                              pending_now):
+                # The stage moved between the entry check and the lock: this
+                # cancel was confirmed against a different target, so acting
+                # would discard a stage the operator never saw.
+                return {"ok": False, "code": "stage_changed", "error": (
+                    "the staged cutover changed while you were confirming: "
+                    f"{Path(pending_now).name} is staged now, not "
+                    f"{Path(expected_staged).name} — refresh the fleet and retry"
+                )}
             # Re-pin the RUNNING checkout rather than deleting the pointer.
             # Deleting only means "stay here" when the running image is the
             # installed build; if this checkout was itself selected by an earlier
@@ -4131,32 +5721,56 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
         )}
 
     kcbin = real / ".venv" / "bin" / "kirocrew"
-    if not kcbin.is_file():
-        return {"ok": False, "code": "missing_venv", "error": (
-            f"{real.name} has no .venv/bin/kirocrew — Provision it first "
-            "(row menu \u2192 Provision) before making it live"
-        )}
-    # A present-but-non-executable binary is worse than a missing one: the
-    # drop-in gets written and the old gateway is stopped, but the replacement
-    # can never start (systemd ExecStart requires +x) — leaving NO gateway
-    # running. Gate on the exec bit with a DISTINCT, actionable code.
-    if not os.access(kcbin, os.X_OK):
-        return {"ok": False, "code": "venv_not_executable", "error": (
-            f"{real.name} has a non-executable .venv/bin/kirocrew — run "
-            "`chmod +x` on it or re-Provision the worktree before making it "
-            "live (a non-executable binary stops the live gateway but cannot "
-            "start the replacement, leaving no gateway running)"
-        )}
     dist_index = real / "src" / "kiro_crew" / "static" / "dist" / "index.html"
-    if not dist_index.is_file():
-        return {"ok": False, "code": "missing_dist", "error": (
-            f"{real.name} has no built dashboard "
-            "(src/kiro_crew/static/dist/index.html) — run Pull+Build first; "
-            "cutover without a built dist serves a broken dashboard"
-        )}
+
+    def _validate_artifacts_sync() -> tuple[str, str] | None:
+        """Check the CLI binary and built dist on the executor thread.
+
+        Returns ``(code, error)`` when a required artifact is absent or
+        non-executable, ``None`` when both are present and the binary is
+        executable.  Running off the event loop prevents a slow or
+        network-backed filesystem from stalling all gateway requests.
+        """
+        if not kcbin.is_file():
+            return ("missing_venv", (
+                f"{real.name} has no .venv/bin/kirocrew — Provision it first "
+                "(row menu \u2192 Provision) before making it live"
+            ))
+        # A present-but-non-executable binary is worse than a missing one: the
+        # drop-in gets written and the old gateway is stopped, but the
+        # replacement can never start (systemd ExecStart requires +x) — leaving
+        # NO gateway running.  Gate on the exec bit with a DISTINCT, actionable
+        # code.
+        if not os.access(kcbin, os.X_OK):
+            return ("venv_not_executable", (
+                f"{real.name} has a non-executable .venv/bin/kirocrew — run "
+                "`chmod +x` on it or re-Provision the worktree before making "
+                "it live (a non-executable binary stops the live gateway but "
+                "cannot start the replacement, leaving no gateway running)"
+            ))
+        if not dist_index.is_file():
+            return ("missing_dist", (
+                f"{real.name} has no built dashboard "
+                "(src/kiro_crew/static/dist/index.html) — run Pull+Build "
+                "first; cutover without a built dist serves a broken dashboard"
+            ))
+        return None
+
+    # Early probe: surface an obvious missing-artifact error before reaching
+    # the plan or the lock.  Not authoritative — a concurrent provision or
+    # rebuild can change these artifacts between this check and the cutover
+    # lock below.  The authoritative re-validation happens inside the lock.
+    _loop = asyncio.get_running_loop()
+    artifact_err = await _loop.run_in_executor(
+        subprocess_executor(), _validate_artifacts_sync
+    )
+    if artifact_err is not None:
+        code, msg = artifact_err
+        return {"ok": False, "code": code, "error": msg}
 
     try:
-        plan = _make_live_plan(real, kcbin, svc=svc if can_restart else None)
+        plan = _make_live_plan(real, kcbin, svc=svc if can_restart else None,
+                               foreground=foreground)
     except live_target.InvalidTarget as exc:
         return {"ok": False, "code": "unsafe_path", "error": (
             "refusing make-live: the worktree path cannot be used as a live "
@@ -4195,6 +5809,16 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
                 "a cutover has been scheduled; the gateway is restarting — "
                 "retry after it comes back"
             )}
+        # Re-validate artifacts inside the lock: a concurrent provision or
+        # rebuild may have changed the binary or dist between the early probe
+        # above and now.  The cutover commits the exact state on disk at this
+        # moment, so these are the artifacts it actually stages.
+        artifact_err = await _loop.run_in_executor(
+            subprocess_executor(), _validate_artifacts_sync
+        )
+        if artifact_err is not None:
+            code, msg = artifact_err
+            return {"ok": False, "code": code, "error": msg}
         # Snapshot the prior live target BEFORE staging so a failed cutover can
         # be rolled back — a persisted pointer would otherwise silently activate
         # on the NEXT unrelated restart. Staging itself is atomic (temp file +
@@ -4267,15 +5891,42 @@ async def _make_live(path: str, dry_run: bool = False) -> dict:
                     "rolled_back": await _unwind(),
                     "error": _redact(str(exc))}
 
-        # Nothing bounces the gateway on this host, so the cutover is STAGED and
-        # the operator finishes it. Reported as a success with the exact command,
-        # not a failure: the pointer is written and correct, and the next start
-        # of the gateway — however it happens — comes up on the new target.
-        # Deliberately NOT latched as committed: no restart is pending, so a
-        # subsequent cutover to a different worktree must stay allowed.
+        # Nothing MANAGED bounces the gateway on this host. When the foreground
+        # last resort is usable it finishes the cutover below; otherwise the
+        # cutover is STAGED and the operator finishes it — reported as a success
+        # with the exact command, not a failure: the pointer is written and
+        # correct, and the next start of the gateway — however it happens —
+        # comes up on the new target. The staged-only outcome is deliberately
+        # NOT latched as committed: no restart is pending, so a subsequent
+        # cutover to a different worktree must stay allowed.
         if not can_restart:
             _LIVE_WORKTREE = None
             _LIVE_CHECK_AT = 0.0
+            if foreground is not None:
+                # Capture identity BEFORE establishing the restart, mirroring
+                # the drivable path: the detached bounce can tear this process
+                # down at any moment after the spawn.
+                start_id = await foreground.start_id()
+                restarted, fg_err = await foreground.restart_detached()
+                if restarted:
+                    # A restart IS pending now — latch exactly as the drivable
+                    # path does, so no further cutover mutates the pointer
+                    # while the detached `kirocrew restart` is acting on it.
+                    _MAKE_LIVE_COMMITTED = True
+                    return {"ok": True, "cutover": True, "target": str(real),
+                            "plan": plan, "start_id": start_id}
+                # FAIL SAFE: the spawn was never established, so nothing has
+                # been signalled and the gateway is untouched. The pointer
+                # stays staged (it is written and correct) and the operator
+                # gets the exact status-quo advisory. Rolling the pointer back
+                # here would be strictly worse: it would turn "finish with one
+                # command" into "start over".
+                logger.warning(
+                    "foreground restart could not be established (%s); "
+                    "falling back to the manual-restart advisory", fg_err,
+                )
+                plan = {**plan, "restart": "manual",
+                        "manual_restart": _manual_restart_command()}
             return {"ok": True, "cutover": True, "staged_only": True,
                     "target": str(real), "plan": plan,
                     "manual_restart": _manual_restart_command(),
@@ -4335,7 +5986,20 @@ async def api_dev_fleet_make_live(request: web.Request) -> web.Response:
     dry_run = body.get("dry_run")
     if dry_run is not None and not isinstance(dry_run, bool):
         return web.json_response({"error": "dry_run must be a boolean"}, status=400)
-    return web.json_response(await _make_live(path, dry_run is True))
+    expected_staged = body.get("expected_staged")
+    if expected_staged is not None and (
+        not isinstance(expected_staged, str)
+        or not expected_staged
+        or "\x00" in expected_staged
+    ):
+        return web.json_response(
+            {"code": "invalid_expected_staged",
+             "error": "expected_staged must be a non-empty string "
+                      "without NUL bytes"}, status=400
+        )
+    return web.json_response(
+        await _make_live(path, dry_run is True, expected_staged=expected_staged)
+    )
 
 
 # =============================================================================
@@ -4378,7 +6042,20 @@ def create_app() -> web.Application:
 
 
 def main() -> int:
-    """Entry point when run as a module by the app backend system."""
+    """Entry point when run as a module by the app backend system.
+
+    Install the platform context FIRST. This runs as its own subprocess
+    (``python -m ...`` spawned by the app backend launcher), so unlike an
+    in-gateway import it inherits no installed context. Without this, the first
+    code path that reads the context -- e.g. the sandbox floor resolved while
+    wrapping this app's own ``git worktree`` scan -- calls ``current_context()``
+    cold. On a non-standalone edition that raises ``PlatformCompositionError``
+    ("no installed context but profile resolved to ..."), whose message then
+    surfaces verbatim in the UI as an opaque sandbox error. ``boot_platform`` is
+    idempotent and, like the CLI entry point, fails CLOSED: a non-standalone
+    profile that cannot compose its companion aborts here rather than serving a
+    backend with no security overlay or credential redaction.
+    """
     boot_platform(KiroCrewConfig.load())
     app = create_app()
     logger.info("Dev Fleet backend starting on 127.0.0.1:%d", PORT)

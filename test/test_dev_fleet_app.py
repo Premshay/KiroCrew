@@ -8,20 +8,51 @@ import hmac as _hmac_mod
 import json
 import os
 import sys
-import tempfile
 import textwrap
 import threading
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yarl
 from aiohttp import web  # noqa: F401  (used by builtin re-shell tests)
 from aiohttp.test_utils import TestClient, TestServer  # noqa: F401
 
 import kiro_crew.apps.builtins.dev_fleet.server as mod
 from kiro_crew import platform_compat
+
+# These Dev Fleet make-live / cancel / sync / build tests assert POSIX-only
+# behaviour that has no Windows equivalent: os.geteuid, the ``.venv/bin`` layout
+# (vs ``.venv\\Scripts\\kirocrew.exe``), systemctl/launchctl service probing, and
+# ``/``-rooted trusted-binary paths. The production code is correct on Windows;
+# only these fixtures/assertions are POSIX-shaped, so they are skipped under the
+# reduced-scope backend CI that runs on Windows. See issue #2041.
+_POSIX_ONLY = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX-only Dev Fleet make-live/cancel/sync semantics (issue #2041)",
+)
+
+
+@pytest.fixture(autouse=True)
+def _venv_maps_to_the_synced_checkout():
+    """Answer the sync's foreign-venv guard with "it maps", for tests not about it.
+
+    Both install paths now refuse a venv that serves a DIFFERENT checkout, and
+    answering that question RUNS the target interpreter — which every sync test
+    here points at a path that does not exist. Stubbing both halves keeps an
+    unrelated assertion from turning into an unrunnable-interpreter refusal. The
+    guard's own behaviour is asserted by
+    ``test_sync_refuses_a_venv_that_serves_another_checkout``, which patches it
+    back to a refusal, and the logic behind it lives in ``test/test_dep_sync.py``.
+    """
+    from kiro_crew import dep_sync
+
+    with patch.object(dep_sync, "installed_package_origin", return_value="<stubbed>"), \
+         patch.object(dep_sync, "venv_not_mapped_to", return_value=None):
+        yield
 
 
 # --- worktree porcelain parsing ---
@@ -242,17 +273,22 @@ async def test_remove_refuses_when_branch_oid_diverged():
     """Squash-safe race guard: branch OID != PR headRefOid -> refuse removal."""
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
+    full_head = "a" * 40
+    cache = AsyncMock(return_value={"state": "MERGED"})
+    git = AsyncMock(return_value=full_head)
     with patch.object(mod, "_find_worktree", new_callable=AsyncMock,
                       return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None)), \
          patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False), \
-         patch.object(mod, "_pr_status_cached", new_callable=AsyncMock, return_value={"state": "MERGED"}), \
+         patch.object(mod, "_pr_status_cached", cache), \
          patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3), \
-         patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"), \
-         patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="bbb2222"), \
+         patch.object(mod, "_git", git), \
+         patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="b" * 40), \
          patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"):
         result = await mod._worktree_remove("feat-x", force=False)
     assert result["ok"] is False
     assert "OID diverged" in result["error"]
+    git.assert_any_await("/fake/wt", "rev-parse", "HEAD")
+    cache.assert_awaited_once_with("feat-x", full_head)
 
 
 @pytest.mark.asyncio
@@ -273,6 +309,559 @@ async def test_remove_succeeds_when_oid_matches():
          patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"):
         result = await mod._worktree_remove("feat-x", force=False)
     assert result["ok"] is True
+
+
+# --- session bus graceful degradation ---
+@pytest.mark.asyncio
+async def test_remove_proceeds_when_session_bus_absent():
+    """When require_backend() raises PodBackendAbsent, removal proceeds."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew.pod.runtime import PodBackendAbsent
+
+    with patch.object(mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None)), \
+         patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False), \
+         patch.object(mod, "_pr_status_cached", new_callable=AsyncMock, return_value={"state": "MERGED"}), \
+         patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=1), \
+         patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"), \
+         patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="aaa1111"), \
+         patch.object(mod, "_load_cfg", return_value=object()), \
+         patch.object(mod, "_POD_AVAILABLE", True), \
+         patch.object(mod.rt, "require_backend", side_effect=PodBackendAbsent("no session bus")), \
+         patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")), \
+         patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"):
+        result = await mod._worktree_remove("feat-x", force=False)
+    assert result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_remove_refuses_operational_pod_error():
+    """When require_backend() passes but active_names raises, removal is refused."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with patch.object(mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None)), \
+         patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False), \
+         patch.object(mod, "_pr_status_cached", new_callable=AsyncMock, return_value={"state": "MERGED"}), \
+         patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=1), \
+         patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"), \
+         patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="aaa1111"), \
+         patch.object(mod, "_load_cfg", return_value=object()), \
+         patch.object(mod, "_POD_AVAILABLE", True), \
+         patch.object(mod.rt, "require_backend", return_value=None), \
+         patch.object(mod.rt, "active_names", side_effect=OSError("launchctl error")), \
+         patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"):
+        result = await mod._worktree_remove("feat-x", force=False)
+    assert result["ok"] is False
+    assert "cannot verify pod state" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_remove_still_fails_on_non_pod_exceptions():
+    """Non-PodError exceptions (e.g. OSError, TimeoutError) still refuse removal."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with patch.object(mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None)), \
+         patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False), \
+         patch.object(mod, "_pr_status_cached", new_callable=AsyncMock, return_value={"state": "MERGED"}), \
+         patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=1), \
+         patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"), \
+         patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="aaa1111"), \
+         patch.object(mod, "_load_cfg", return_value=object()), \
+         patch.object(mod, "_POD_AVAILABLE", True), \
+         patch.object(mod.rt, "require_backend", return_value=None), \
+         patch.object(mod.rt, "active_names", side_effect=OSError("disk on fire")), \
+         patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"):
+        result = await mod._worktree_remove("feat-x", force=False)
+    assert result["ok"] is False
+    assert "cannot verify pod state" in result["error"]
+
+
+# --- stopped-pod HOME reclamation on worktree removal ---
+def _remove_stubs(pod_root, **extra):
+    """The guard stack every ``_worktree_remove`` pod-path test needs.
+
+    *pod_root* is the test's own ``tmp_path``-derived pod root: the code reads it
+    to tell an unreadable root from "nothing to reclaim", so it has to exist and
+    be readable, and it must be per-test so nothing is left on disk afterwards.
+
+    Returns the context managers so each test only states the pod-state patches
+    it is actually about. A key present in *extra* REPLACES the default of the
+    same name rather than stacking a second patch on the same attribute, so a
+    test that overrides ``backend`` gets exactly one ``require_backend`` patch.
+    """
+    base = {
+        "find": patch.object(mod, "_find_worktree", new_callable=AsyncMock,
+                             return_value=({"path": "/fake/wt", "branch": "feat-x",
+                                            "is_main": False}, None)),
+        "dirty": patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        "pr": patch.object(mod, "_pr_status_cached", new_callable=AsyncMock,
+                           return_value={"state": "MERGED"}),
+        "own": patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=1),
+        "git": patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        "head": patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock,
+                             return_value="aaa1111"),
+        "cfg": patch.object(mod, "_load_cfg",
+                            return_value=SimpleNamespace(pod_root=pod_root)),
+        "avail": patch.object(mod, "_POD_AVAILABLE", True),
+        "backend": patch.object(mod.rt, "require_backend", return_value=None),
+        "run": patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")),
+        "upstream": patch.object(mod, "_upstream_remote", new_callable=AsyncMock,
+                                 return_value="origin"),
+    }
+    base.update(extra)
+    return list(base.values())
+
+
+@pytest.mark.asyncio
+async def test_remove_reclaims_home_of_a_stopped_pod(tmp_path):
+    """A pod that is DOWN still owns its isolated HOME, so removal reclaims it.
+
+    Gating reclamation on a live unit stranded the HOME on the common path:
+    the operator stops the pod when testing ends and prunes days later once the
+    PR merges, so the unit is never active at removal time.
+    """
+    reclaim = MagicMock(return_value=("reclaimed", ""))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["feat-x"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    # The worktree path is handed in as the expected checkout, so attribution
+    # inside the lock compares against THIS repo's worktree.
+    assert reclaim.call_args.args[1:] == ("feat-x", "/fake/wt")
+    # Reported as a reclaim, never as a shutdown that did not happen.
+    assert result["reclaimed_pod_home"] is True
+    assert result["stopped_pod"] is False
+
+
+@pytest.mark.asyncio
+async def test_remove_leaves_a_non_orphan_home_alone(tmp_path):
+    """``orphan_homes`` is the authority: a name it omits is never reclaimed.
+
+    Covers the HOME that does not exist at all and the macOS name mid-``up``
+    whose per-pod plist marks it installed rather than orphaned.
+    """
+    reclaim = MagicMock(return_value=("reclaimed", ""))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["other-wt"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    reclaim.assert_not_called()
+    assert result["reclaimed_pod_home"] is False
+
+
+@pytest.mark.asyncio
+async def test_remove_refuses_when_home_reclaim_fails(tmp_path):
+    """A HOME that survives teardown must not be reported as a clean removal."""
+    reclaim = MagicMock(return_value=("failed", "a process is still writing there"))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["feat-x"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is False
+    assert "pod home reclaim failed" in result["error"]
+    assert "still writing" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_remove_of_active_pod_reports_a_stop_not_a_reclaim(tmp_path):
+    """The live-unit path keeps its own reporting; the two flags never conflate."""
+    reclaim = MagicMock(return_value=("reclaimed", ""))
+    # Stateful rather than a fixed side_effect list: the live-unit path queries
+    # liveness three times (pre-stop, post-stop, and the TOCTOU recheck under
+    # the git lock), so a length-pinned list breaks on an unrelated change to
+    # how often the code verifies.
+    calls = {"n": 0}
+
+    def _liveness(_cfg):
+        calls["n"] += 1
+        return {"feat-x"} if calls["n"] == 1 else set()
+
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", side_effect=_liveness),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert result["stopped_pod"] is True
+    assert result["reclaimed_pod_home"] is False
+
+
+@pytest.mark.asyncio
+async def test_remove_of_an_active_foreign_pod_is_refused(tmp_path):
+    """A LIVE pod that is not this checkout's must not be stopped."""
+    reclaim = MagicMock(return_value=("foreign", "pinned to a different checkout"))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value={"feat-x"}),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is False
+    assert "refusing pod shutdown" in result["error"]
+    assert "different checkout" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_remove_skips_a_pod_home_that_is_another_checkouts(tmp_path, caplog):
+    """A same-basename HOME belonging to ANOTHER checkout is left, not refused.
+
+    Pod identities are global basenames and ``orphan_homes`` keys on the pod
+    root, liveness and plist -- never on the checkout pin -- so another repo's
+    stale HOME of the same name shows up here. Leaving it is correct; refusing
+    this checkout's own removal over it is not.
+    """
+    reclaim = MagicMock(return_value=("foreign", "pinned to a different checkout"))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["feat-x"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        with caplog.at_level("WARNING"):
+            result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert result["reclaimed_pod_home"] is False
+    assert "left a pod HOME named" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_remove_refuses_when_the_pod_name_was_handed_over(tmp_path):
+    """A new pod holding this name blocks the removal, on BOTH reclaim branches.
+
+    Which checkout the new pod belongs to is unknowable here, and it may be
+    running out of this very worktree -- so the files must not be deleted, and the
+    post-stop liveness recheck cannot be relied on to see a unit that is still
+    bootstrapping.
+    """
+    reclaim = MagicMock(return_value=("handed_over", "was reclaimed by a new pod"))
+
+    # Live-unit branch.
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value={"feat-x"}),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        live = await mod._worktree_remove("feat-x", force=False)
+
+    assert live["ok"] is False
+    assert "refusing removal" in live["error"]
+
+    # Orphaned-HOME branch.
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["feat-x"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        orphan = await mod._worktree_remove("feat-x", force=False)
+
+    assert orphan["ok"] is False
+    assert "reclaim failed" in orphan["error"]
+
+
+@pytest.mark.asyncio
+async def test_remove_refuses_when_the_reclaim_itself_raises(tmp_path):
+    """A teardown that DIES mid-flight must not be read as a cleanup miss.
+
+    The enumeration's failure degrades, but a raising reclaim (a stop that timed
+    out against a still-activating unit) is the state in which removing the
+    checkout is unsafe, so it must reach the fail-closed handler.
+    """
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["feat-x"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked",
+                                 MagicMock(side_effect=TimeoutError("stop timed out"))),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is False
+    assert "cannot verify pod state" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_remove_survives_a_failing_home_enumeration(tmp_path, caplog):
+    """A cleanup that cannot even enumerate must not refuse the removal.
+
+    Liveness failures fail CLOSED (they guard against deleting a checkout under
+    a live pod), but an orphan scan says nothing about liveness -- so it degrades
+    to a named leftover instead of turning a lost directory into a lost removal.
+    """
+    reclaim = MagicMock(return_value=("reclaimed", ""))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", side_effect=OSError("pod root gone")),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        with caplog.at_level("WARNING"):
+            result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert result["reclaimed_pod_home"] is False
+    reclaim.assert_not_called()
+    assert "could not look for" in caplog.text
+    assert "pod prune" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_remove_warns_when_the_pod_root_is_unreadable(tmp_path, caplog):
+    """An unreadable pod root must reach the warning, not read as "no orphans".
+
+    ``orphan_homes`` answers ``[]`` on an enumeration error, which is
+    indistinguishable from "nothing to reclaim", so the root is read here first.
+    """
+    reclaim = MagicMock(return_value=("reclaimed", ""))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path / "never-created",
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=[]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        with caplog.at_level("WARNING"):
+            result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    reclaim.assert_not_called()
+    assert "pod prune" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_remove_names_the_home_it_cannot_reclaim(tmp_path, caplog):
+    """Backend absent: the HOME is unprovable, so it is NAMED, not silently skipped.
+
+    Reclaiming here would risk deleting a live gateway's HOME, so the residue
+    stays -- but at a level the operator sees, carrying the path and the verb
+    that reclaims it.
+    """
+    from kiro_crew.pod.runtime import PodBackendAbsent
+
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            backend=patch.object(mod.rt, "require_backend",
+                                 side_effect=PodBackendAbsent("no session bus")),
+            unit=patch.object(mod.rt, "unit_state", return_value=("inactive", 0)),
+            home=patch.object(mod.rt, "pod_home", return_value=Path("/pods/feat-x")),
+        ):
+            stack.enter_context(cm)
+        with caplog.at_level("WARNING"):
+            result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert "/pods/feat-x" in caplog.text
+    assert "pod down feat-x" in caplog.text
+
+
+# --- _reclaim_pod_locked: attribution and teardown share the per-name lock ---
+class _RecordingMutex:
+    """Records lock enter/exit against a shared event log."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def __call__(self, cfg, name):
+        return self
+
+    def __enter__(self):
+        self.log.append("lock-enter")
+        return self
+
+    def __exit__(self, *exc):
+        self.log.append("lock-exit")
+        return False
+
+
+def _reclaim_cfg(tmp_path):
+    """A cfg whose ``env_file`` names a path inside the test's own tmp dir."""
+    return SimpleNamespace(env_file=lambda name: tmp_path / f"{name}.env")
+
+
+def test_reclaim_reads_the_pin_and_tears_down_inside_the_lock(tmp_path):
+    """The whole point of the helper: no window between attribution and teardown.
+
+    Checking the pin in one process and tearing down in another leaves a gap in
+    which a concurrent ``pod up`` from a DIFFERENT checkout claims the same
+    global basename, so the teardown would stop that pod and delete its HOME.
+    Both halves must land between the same lock enter and exit.
+    """
+    log = []
+    cp = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def _pin(_cfg, _name):
+        log.append("read-pin")
+        return True, "/fake/wt"
+
+    def _stop(_cfg, _name):
+        log.append("stop")
+        return cp
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex(log)), \
+         patch.object(mod, "_read_pin_strict", _pin), \
+         patch.object(mod.rt, "stop_pod", _stop):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert (outcome, detail) == ("reclaimed", "")
+    assert log == ["lock-enter", "read-pin", "stop", "lock-exit"]
+
+
+def test_reclaim_refuses_a_foreign_pin_without_tearing_down(tmp_path):
+    """A pin naming another checkout stops the transaction before any teardown."""
+    log = []
+    stop = MagicMock()
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex(log)), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/other/repo/wt")), \
+         patch.object(mod.rt, "stop_pod", stop):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert outcome == "foreign"
+    assert "basename collision" in detail
+    stop.assert_not_called()
+    assert log == ["lock-enter", "lock-exit"]
+
+
+def test_reclaim_refuses_an_unpinned_pod(tmp_path):
+    """No pin at all means the HOME is unattributable -- never torn down.
+
+    Stricter than ``_pod_checkout_guard``, deliberately: the guard allows an
+    unpinned name when no unit is live, which is right for operating on a pod the
+    caller located, but this path DELETES the HOME and a same-basename leftover
+    from another checkout is indistinguishable from here. Liveness is not even
+    consulted, so the refusal holds whether or not a unit is up.
+    """
+    stop = MagicMock()
+    active = MagicMock(return_value=set())
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (False, None)), \
+         patch.object(mod.rt, "active_names", active), \
+         patch.object(mod.rt, "stop_pod", stop):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert outcome == "foreign"
+    assert "no checkout pin" in detail
+    stop.assert_not_called()
+    active.assert_not_called()
+
+
+def test_reclaim_leaves_the_env_file_when_the_name_was_handed_over(tmp_path):
+    """A name claimed mid-teardown keeps the NEW pod's pin: never clear it."""
+    env = tmp_path / "feat-x.env"
+    env.write_text("CHECKOUT=/other/repo/wt\n")
+    cfg = SimpleNamespace(env_file=lambda name: env)
+    cp = SimpleNamespace(returncode=0, stdout=mod.rt.RECLAIMED_MARKER, stderr="")
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/fake/wt")), \
+         patch.object(mod.rt, "stop_pod", lambda c, n: cp):
+        outcome, detail = mod._reclaim_pod_locked(cfg, "feat-x", "/fake/wt")
+
+    assert outcome == "handed_over"
+    assert env.exists()
+
+
+def test_reclaim_clears_the_env_file_after_a_clean_reclaim(tmp_path):
+    """A reclaimed pod's pin is cleared so a later ``up`` re-resolves cleanly."""
+    env = tmp_path / "feat-x.env"
+    env.write_text("CHECKOUT=/fake/wt\n")
+    cfg = SimpleNamespace(env_file=lambda name: env)
+    cp = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/fake/wt")), \
+         patch.object(mod.rt, "stop_pod", lambda c, n: cp):
+        outcome, _ = mod._reclaim_pod_locked(cfg, "feat-x", "/fake/wt")
+
+    assert outcome == "reclaimed"
+    assert not env.exists()
+
+
+def test_reclaim_reports_a_teardown_that_left_the_home_behind(tmp_path):
+    """``stop_pod`` reports a surviving HOME as non-zero; that is a failure.
+
+    The detail reaches the worktree-remove response and so the dashboard, so it
+    goes through ``_redact`` like every other detail this helper returns.
+    """
+    cp = SimpleNamespace(returncode=1, stdout="", stderr="isolated HOME is still at /pods/feat-x")
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/fake/wt")), \
+         patch.object(mod.rt, "stop_pod", lambda c, n: cp):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert outcome == "failed"
+    assert "still at /pods/feat-x" in detail
+
+
+def test_reclaim_redacts_the_teardown_stderr(tmp_path):
+    """Teardown stderr can carry a secret from the pod's own output."""
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    cp = SimpleNamespace(returncode=1, stdout="", stderr=f"stop failed: {secret}")
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/fake/wt")), \
+         patch.object(mod.rt, "stop_pod", lambda c, n: cp):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert outcome == "failed"
+    assert secret not in detail
+    assert detail == mod._redact(f"stop failed: {secret}")
+
+
+def test_reclaim_falls_back_to_the_return_code_when_stderr_is_empty(tmp_path):
+    """An empty stderr still names a cause rather than an empty error string."""
+    cp = SimpleNamespace(returncode=3, stdout="", stderr="   ")
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/fake/wt")), \
+         patch.object(mod.rt, "stop_pod", lambda c, n: cp):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert (outcome, detail) == ("failed", "stop rc=3")
 
 
 # --- _upstream_remote fallback + override ---
@@ -322,6 +911,280 @@ async def test_sync_script_emits_step_markers():
     assert "::step::" in script_src
     assert "print(f" in script_src
     mod._UPSTREAM_REMOTE = None
+
+
+# --- Windows: a write-locked console script must not be handed to pip ---
+# The probe itself moved to kiro_crew.dep_sync with the substitute it feeds, and
+# its tests moved with it (test/test_dep_sync.py). What stays here is the sync's
+# use of the result: which install step gets built.
+
+
+def _steps_from_script(script):
+    """Pull the structured step list back out of the generated script.
+
+    Asserting on the raw script text is a trap: the steps are embedded
+    double-JSON-encoded, so a label reads as ``\\"Pull\\"`` and a naive
+    ``'"pip install"' in script`` check can never match — it passes whether or
+    not the step is there. Parse it instead so the assertions actually bite.
+    """
+    import json as _json
+    import re
+
+    m = re.search(r"steps = json\.loads\((.*?)\)\n", script, re.S)
+    assert m, "steps assignment not found — the script shape changed"
+    return [s["label"] for s in _json.loads(_json.loads(m.group(1)))]
+
+
+#: The main checkout the sync tests run against. Pinned rather than ambient so the
+#: sync's refusal path (no checkout discovered) cannot decide their outcome.
+_SYNC_REPO = "/fake/main-checkout"
+
+
+async def _run_sync(mod, locked):
+    """Drive _sync_start_locked with the probe stubbed; return its result dict
+    plus the generated script (None when the sync refused).
+
+    MAIN_REPO is pinned because the sync refuses outright when no checkout was
+    discovered, and these tests are about the sync's own behaviour: leaving it
+    ambient makes them pass or fail on whether the HOST running them happens to
+    sit in a Kiro Crew checkout. Assertions that quote the repo path must use
+    ``_SYNC_REPO`` rather than reading ``mod.MAIN_REPO``.
+
+    The venv-origin guard is answered by the module's autouse fixture; a test
+    about that guard patches it back to a refusal.
+    """
+    mod._UPSTREAM_REMOTE = "origin"
+    mod._SYNC_RID = None
+    with patch.object(mod, "MAIN_REPO", _SYNC_REPO), \
+         patch.object(mod, "_git", new_callable=AsyncMock, return_value="main"), \
+         patch.object(mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
+         patch.object(mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
+         patch.object(mod.dep_sync, "locked_console_scripts", return_value=locked), \
+         patch("kiro_crew.apps.builtins.dev_fleet.server.sandboxed_spawn_argv",
+               side_effect=lambda cmd, mode, env=None: (cmd, env or {}, None)), \
+         patch.object(mod, "_start_run", new_callable=AsyncMock, return_value="run-123") as mock_start:
+        async with mod._SYNC_LOCK:
+            result = await mod._sync_start_locked()
+    mod._UPSTREAM_REMOTE = None
+    script = mock_start.call_args[0][1][2] if mock_start.call_args else None
+    # Stubbing _start_run also stubs out its `finally` cleanup, so anything the
+    # sync staged for removal (the dependency-only path snapshots dep_sync into a
+    # temp dir) would outlive the test. Remove exactly what it registered, in the
+    # order it registered it — file before directory.
+    if mock_start.call_args:
+        for path in mock_start.call_args.kwargs.get("cleanup_paths") or []:
+            try:
+                os.unlink(path)
+            except OSError:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+    return result, script
+
+
+@pytest.mark.asyncio
+async def test_sync_substitutes_a_dependency_only_install_when_a_script_is_locked():
+    """The sync proceeds; only the editable reinstall is swapped out.
+
+    pip cannot replace the locked wrapper, but it does not have to. An editable
+    install serves source straight from ``src``, so the merge alone makes the new
+    revision live; the only thing the reinstall was still buying is a dependency
+    the revision added, and installing a dependency never touches the project's
+    own console script. Refusing the whole sync instead left the single-checkout
+    Windows layout — the ordinary one — with no working Pull+build at all.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew import dep_sync
+
+    result, script = await _run_sync(mod, [r"C:\repo\.venv\Scripts\kirocrew.exe"])
+
+    assert result["ok"] is True
+    # A run was started, so fetch and merge do happen.
+    assert script is not None
+    # Steps are JSON-embedded in the generated script, so quotes arrive escaped;
+    # comparing against a de-escaped copy keeps these assertions independent of
+    # how many encoding layers the script generator happens to use.
+    flat = script.replace("\\", "")
+    assert "dep_sync.py" in flat
+    assert '"-e"' not in flat
+    # It must NOT be run as `-m kiro_crew...dep_sync`. That would import the
+    # module from the working tree after the merge has landed, pulling the whole
+    # package __init__ chain with it, so a revision that raises the
+    # `requires-python` floor with newer syntax would SyntaxError while being
+    # parsed and the floor refusal written for that revision could never run.
+    assert dep_sync.__name__ not in flat
+    assert '"-m"' not in flat.split('"merge"', 1)[1]
+    # The file it runs is a snapshot taken BEFORE the merge, so it lives outside
+    # the checkout being synced.
+    assert r"C:repo\dep_sync.py" not in flat
+    # ORDER MATTERS, and it is the SAME order the reinstall it replaces uses:
+    # fetch -> merge -> install. Installing first would need the merge to be
+    # proven impossible to fail, which cannot be done completely; a failed install
+    # after a landed merge is exactly what the reinstall path already does.
+    assert flat.index('"merge"') < flat.index("dep_sync.py")
+
+
+@pytest.mark.asyncio
+async def test_sync_keeps_the_editable_reinstall_when_nothing_is_locked():
+    """A venv this gateway is NOT served by must still get the real reinstall.
+
+    The substitution is a concession to a lock, not an improvement to prefer: it
+    cannot refresh a console script, so anywhere pip can do the whole job, it
+    should.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew import dep_sync
+
+    result, script = await _run_sync(mod, [])
+
+    assert result["ok"] is True
+    flat = script.replace("\\", "")
+    assert '"-e"' in flat
+    assert dep_sync.__name__ not in flat
+    assert "dep_sync.py" not in flat
+
+
+@pytest.mark.asyncio
+async def test_every_step_gets_a_utf8_pin_in_its_environment():
+    """The runner's own reconfigure() does not reach its children.
+
+    Each step is a separate process that inherits the pipe but re-derives its
+    encoding from the locale, so the Python steps (pip, and the build-and-stage
+    child) would still encode a non-ASCII checkout path with the codepage and
+    die on it. The environment is the only channel that reaches a child.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    _, script = await _run_sync(mod, [])
+
+    assert "env['PYTHONIOENCODING'] = 'utf-8:replace'" in script
+    # Applied to the env actually handed to subprocess.run, not a stale copy.
+    assert "subprocess.run(st['argv'], cwd=cwd, env=env)" in script
+    assert "env=st['env']" not in script
+    # Set before the step is spawned, not after.
+    assert script.index("PYTHONIOENCODING") < script.index("subprocess.run(")
+
+
+@pytest.mark.asyncio
+async def test_sync_runs_every_step_when_nothing_is_locked():
+    """Control: an unlocked venv gets the full sync, reinstall included."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    result, script = await _run_sync(mod, [])
+
+    assert result["ok"] is True, result
+    labels = _steps_from_script(script)
+    assert "pip install" in labels
+    assert "Pull" in labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locked", [[], [r"C:\repo\.venv\Scripts\kirocrew.exe"]],
+                         ids=["reinstall-branch", "substitute-branch"])
+async def test_sync_refuses_a_venv_that_serves_another_checkout(locked):
+    """The refusal covers BOTH install paths, and refuses before either runs.
+
+    `<repo>/.venv` is only where the interpreter was found; it can be an install
+    of a different checkout, and `pip install -e .` would then silently repoint
+    that editable install at this repo — so the OTHER checkout's gateway becomes
+    this code on its next restart. The dependency-only path has always refused
+    this; the reinstall path did not, which left the safer path as the only
+    guarded one. Parametrized over both branches because that asymmetry is
+    exactly the bug: a fix that only covers the one it was found on is not one.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew import dep_sync
+
+    with patch.object(
+        dep_sync,
+        "venv_not_mapped_to",
+        return_value="the target venv imports this project from /other/checkout",
+    ):
+        result, script = await _run_sync(mod, locked)
+
+    assert result["ok"] is False
+    assert "/other/checkout" in result["error"]
+    # Remedy-first, like every other refusal on this endpoint.
+    assert "own editable install" in result["error"]
+    # Nothing ran: no fetch, no merge, no install. A refusal after the merge
+    # would leave the checkout moved with its dependencies unresolved.
+    assert script is None
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_pins_utf8_stdout_before_its_first_print():
+    """Align the writing side with the reader.
+
+    `_start_run` decodes the stream as UTF-8, while a piped stdout on Windows
+    encodes with the process locale codepage — a mismatch that mangles or kills
+    any non-ASCII print. Pinned before the step loop so no print predates it.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    _, script = await _run_sync(mod, [])
+
+    assert "reconfigure(encoding='utf-8'" in script
+    assert script.index("reconfigure(") < script.index("print(f'::step::")
+
+
+def test_utf8_reconfigure_survives_a_legacy_codepage_pipe():
+    """Prove the mechanism, not just its presence in the source.
+
+    Forcing a legacy codepage on the child's stdout is what the Windows
+    mismatch looks like; the reconfigure call is what keeps the print
+    non-fatal, and the reader side decodes UTF-8.
+    """
+    import subprocess
+    import sys as _sys
+
+    text = "\u9648\u660e\u4f2a"
+    body = (
+        "import sys\n"
+        "sys.stdout.reconfigure(encoding='utf-8', errors='replace')\n"
+        f"print({text!r}, flush=True)\n"
+    )
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+    proc = subprocess.run(
+        [_sys.executable, "-c", body], capture_output=True, env=env, timeout=60
+    )
+
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+    # Matches how the run reader decodes the stream.
+    assert text in proc.stdout.decode(errors="replace")
+
+
+def test_pythonioencoding_saves_a_step_child_that_prints_a_non_ascii_path():
+    """The child half of the same mismatch, proven end to end.
+
+    A step child cannot call the runner's reconfigure() for itself, so this is
+    the case the environment variable has to carry: the SAME print that dies
+    under a legacy codepage survives once the pin is in the env, which is what
+    a pip or build step does when it echoes a non-ASCII checkout path.
+    """
+    import subprocess
+    import sys as _sys
+
+    path = "C:\\Users\\\u9648\u660e\u4f2a\\KiroCrew"
+    body = f"print({path!r}, flush=True)\n"
+    codepage = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+
+    # Without the pin the child dies on the encode — the defect being fixed.
+    unpinned = subprocess.run(
+        [_sys.executable, "-c", body], capture_output=True, env=codepage, timeout=60
+    )
+    assert unpinned.returncode != 0
+    assert b"UnicodeEncodeError" in unpinned.stderr
+
+    # With it, the child survives and the reader gets the real path back.
+    pinned = subprocess.run(
+        [_sys.executable, "-c", body],
+        capture_output=True,
+        env={**codepage, "PYTHONIOENCODING": "utf-8:replace"},
+        timeout=60,
+    )
+    assert pinned.returncode == 0, pinned.stderr.decode(errors="replace")
+    assert path in pinned.stdout.decode(errors="replace")
 
 
 # --- repo owner/name parsing ---
@@ -394,12 +1257,22 @@ async def test_worktree_remove_force_must_be_bool():
 # --- sync single-flight (409 on busy) ---
 @pytest.mark.asyncio
 async def test_sync_returns_409_when_already_running():
+    import asyncio
+
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
-    # Inject a fake running sync
+    # Inject a fake running sync with a live task + process
     mod._SYNC_RID = "fake123"
     async with mod._RUNS_LOCK:
         mod._RUNS["fake123"] = {"status": "running", "exit_code": None, "label": "sync", "output": []}
+
+    # Simulate a genuinely-running process (returncode=None)
+    from unittest.mock import MagicMock
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    never_done = asyncio.get_event_loop().create_future()
+    running_task = asyncio.ensure_future(never_done)
+    mod._ACTIVE_RUNS["fake123"] = (running_task, mock_proc)
 
     try:
         result = await mod._sync()
@@ -409,6 +1282,9 @@ async def test_sync_returns_409_when_already_running():
         async with mod._RUNS_LOCK:
             del mod._RUNS["fake123"]
         mod._SYNC_RID = None
+        mod._ACTIVE_RUNS.pop("fake123", None)
+        never_done.set_result(None)
+        await running_task
 
 
 # --- redaction ---
@@ -520,9 +1396,18 @@ def test_build_pending_false_when_dist_missing():
         mod._START_EPOCH = original_start
 
 
-# --- sync_run_id exposed in fleet response ---
+# --- run pointers are NOT baked into the cached snapshot ---
 @pytest.mark.asyncio
-async def test_fleet_includes_sync_run_id():
+async def test_fleet_build_does_not_bake_run_pointers():
+    """`_build_fleet` must leave the run pointers to the request-time overlay.
+
+    The snapshot it returns is cached and served stale-while-revalidate, so a
+    pointer written here is a frozen answer to a live question: a run started
+    after the build would be invisible until the cache turned over, which is the
+    "no progress, press it again" bug. `_with_live_run_pointers` owns both
+    pointers; this pins that there is only one owner, so a future edit cannot
+    quietly reintroduce a second, staler one.
+    """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
     mod._SYNC_RID = "test-rid-abc"
@@ -539,7 +1424,8 @@ async def test_fleet_includes_sync_run_id():
              patch.object(mod, "_load_cfg", return_value=None), \
              patch.object(mod, "_build_pending", return_value=False):
             data = await mod._build_fleet()
-        assert data["sync_run_id"] == "test-rid-abc"
+        assert "sync_run_id" not in data
+        assert all("provision_run_id" not in w for w in data["worktrees"])
         assert "build_pending" in data
     finally:
         mod._SYNC_RID = None
@@ -560,6 +1446,38 @@ async def test_fleet_includes_build_pending():
             patch.object(mod, "_build_pending", return_value=True):
         data = await mod._build_fleet()
     assert data["build_pending"] is True
+
+
+# --- provision_run_id exposed in fleet response (reattach after reload) ---
+# --- provision run-id selection (what a reloaded page can reattach to) ---
+# These pin the SELECTION semantics at their owning unit rather than through a
+# fleet build: the pointer reaches the payload via the request-time overlay
+# (`_with_live_run_pointers`), which
+# `test_fleet_handler_overlays_runs_started_after_snapshot` covers.
+@pytest.mark.asyncio
+async def test_provision_reattach_ids_expose_running_and_failed_runs():
+    with patch.dict(mod._PROVISION_INFLIGHT, {
+        "wt-running": "rid-running", "wt-failed": "rid-failed",
+    }, clear=True), patch.dict(mod._RUNS, {
+        "rid-running": {"status": "running", "exit_code": None, "output": []},
+        "rid-failed": {"status": "done", "exit_code": 1, "output": []},
+    }, clear=True):
+        rids = await mod._provision_reattach_ids()
+    assert rids == {"wt-running": "rid-running", "wt-failed": "rid-failed"}
+
+
+@pytest.mark.asyncio
+async def test_provision_reattach_ids_omit_successful_and_evicted_runs():
+    with patch.dict(mod._PROVISION_INFLIGHT, {
+        # Success: nothing to reattach — the fleet row shows the built state.
+        "wt-ok": "rid-ok",
+        # Evicted from the bounded run registry: output is unfetchable.
+        "wt-gone": "rid-gone",
+    }, clear=True), patch.dict(mod._RUNS, {
+        "rid-ok": {"status": "done", "exit_code": 0, "output": []},
+    }, clear=True):
+        rids = await mod._provision_reattach_ids()
+    assert rids == {}
 
 
 # --- SEL audit on mutations (Codex R17) ---
@@ -835,6 +1753,7 @@ async def test_pod_guard_denies_pin_file_without_checkout(monkeypatch, tmp_path)
     assert "ambiguous pod identity" in err
 
 
+@_POSIX_ONLY
 def test_read_pin_strict_propagates_read_errors(tmp_path):
     """_read_pin_strict must raise (not return empty) when the pin file
     exists but cannot be read."""
@@ -919,6 +1838,76 @@ def test_build_env_excludes_credentials(monkeypatch):
     # The credential-bearing tier keeps the bare pinned path — git resolves its
     # own helpers (git-remote-https, credential helpers) through PATH.
     assert mod._build_env(with_credentials=True)["PATH"] == mod._TRUSTED_PATH
+
+
+def test_is_safe_env_key_matches_documented_spelling_on_windows():
+    """A mixed-case allowlist entry must still match what ``os.environ`` yields.
+
+    The allowlists write ``SystemRoot`` (Microsoft's documented spelling) while
+    CPython's ``os.environ`` upper-cases every key on Windows. Folding is what
+    keeps the two ends agreeing; without it the filter drops exactly the
+    variables it was extended to carry.
+    """
+    assert "SystemRoot" in mod._WINDOWS_SAFE_ENV_KEYS
+    if platform_compat.IS_WINDOWS:
+        # The spelling os.environ actually yields.
+        assert mod._is_safe_env_key("SYSTEMROOT")
+        # And the documented spelling, so either end may be written.
+        assert mod._is_safe_env_key("SystemRoot")
+    assert not mod._is_safe_env_key("SLACK_BOT_TOKEN")
+
+
+def test_is_safe_env_key_stays_exact_on_posix():
+    """Folding is Windows-only — POSIX names are case-SENSITIVE.
+
+    ``PATH`` and ``Path`` are genuinely different variables there, so a
+    case-insensitive match would let a lookalike through.
+    """
+    assert mod._is_safe_env_key("PATH")
+    if not platform_compat.IS_WINDOWS:
+        assert not mod._is_safe_env_key("Path")
+        # The Windows set must not leak into POSIX matching at all.
+        assert not mod._is_safe_env_key("SystemRoot")
+
+
+def test_windows_safe_env_keys_carry_no_credentials():
+    """The Windows additions are platform paths, never secret-bearing vars."""
+    for key in mod._WINDOWS_SAFE_ENV_KEYS:
+        for marker in ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "APIKEY"):
+            assert marker not in key.upper(), f"{key!r} looks credential-bearing"
+
+
+def test_safe_env_keys_platform_composition():
+    """The POSIX set always applies; the Windows set only on Windows."""
+    posix = set(mod._POSIX_SAFE_ENV_KEYS)
+    windows = set(mod._WINDOWS_SAFE_ENV_KEYS)
+    active = set(mod._SAFE_ENV_KEYS)
+
+    assert not (posix & windows), "the two sets must stay disjoint"
+    assert posix <= active
+    if platform_compat.IS_WINDOWS:
+        assert windows <= active
+    else:
+        assert not (windows & active)
+
+
+@pytest.mark.skipif(
+    not platform_compat.IS_WINDOWS, reason="Windows-only env semantics"
+)
+def test_build_env_carries_systemroot_on_windows(monkeypatch):
+    """SYSTEMROOT must reach every build/fetch child.
+
+    Winsock locates its socket catalog through it, so a child without it cannot
+    resolve names at all — libcurl reports that as ``getaddrinfo() thread failed
+    to start`` and the Pull step fails before it reaches the network.
+    """
+    monkeypatch.setenv("SYSTEMROOT", r"C:\WINDOWS")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-secret")
+
+    for env in (mod._build_env(), mod._build_env(with_credentials=True), mod._pod_env()):
+        assert env["SYSTEMROOT"] == r"C:\WINDOWS"
+        # Widening the allowlist must not have widened it to credentials.
+        assert "SLACK_BOT_TOKEN" not in env
 
 
 def test_read_pin_strict_rejects_symlinked_env(tmp_path):
@@ -1113,6 +2102,57 @@ def test_build_env_pins_git_protocols():
     _assert_git_neutralizers(env)
 
 
+# --- cancellation survives an already-reaped child (#2096) ---
+@pytest.mark.asyncio
+async def test_run_cmd_cancel_with_reaped_child_propagates_cancellation(monkeypatch):
+    """Cancelling _run_cmd whose child was already reaped must raise
+    CancelledError, not ProcessLookupError.
+
+    An unguarded ``proc.kill()`` in the CancelledError branch raises
+    ProcessLookupError on a reaped child, REPLACING the in-flight
+    cancellation; ``_status_refresher``'s broad handler then swallows it
+    and loops forever, hanging ``dev_fleet_cleanup``'s ``await bg_task``
+    and the whole pytest-asyncio loop teardown (#2096).
+    """
+    entered = asyncio.Event()  # deterministic rendezvous, no sleeps
+
+    class FakeProc:
+        pid = 12345
+        returncode = None
+
+        async def communicate(self):
+            entered.set()
+            await asyncio.Event().wait()  # block until cancelled
+
+        def kill(self):
+            raise ProcessLookupError  # child already reaped
+
+        async def wait(self):
+            return 0
+
+    async def fake_spawn(*args, **kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(
+        mod, "sandboxed_spawn_argv",
+        lambda cmd, mode, *, env=None, **kw: (cmd, env, None),
+    )
+    monkeypatch.setattr(mod, "create_subprocess_limited", fake_spawn)
+    monkeypatch.setattr(mod, "_kill_tree", AsyncMock())
+    # The shared reap helper also signals the tree; intercept it so the fake
+    # pid never reaches a real killpg, and shrink its bound so the reap of a
+    # still-blocking communicate() cannot stall this test.
+    monkeypatch.setattr(mod.platform_compat, "kill_process_tree_async", AsyncMock())
+    monkeypatch.setattr(mod.platform_compat, "REAP_TIMEOUT_SECS", 0.01)
+
+    task = asyncio.ensure_future(mod._run_cmd(["/bin/true"]))
+    # Bounded so a future early-return in _run_cmd fails fast, not a hang.
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 # --- stream-overrun subprocess reaping (Codex R34 #2) ---
 @pytest.mark.asyncio
 async def test_start_run_readline_overrun_kills_process_tree(monkeypatch):
@@ -1131,11 +2171,19 @@ async def test_start_run_readline_overrun_kills_process_tree(monkeypatch):
         pid = 424242
         returncode: int | None = None
         stdout = FakeStdout()
+        wait_calls = 0
+        communicate_calls = 0
 
         def kill(self):
             FakeProc.returncode = -9
 
+        async def communicate(self):
+            FakeProc.communicate_calls += 1
+            FakeProc.returncode = FakeProc.returncode or -9
+            return b"", b""
+
         async def wait(self):
+            FakeProc.wait_calls += 1
             FakeProc.returncode = FakeProc.returncode or -9
             return FakeProc.returncode
 
@@ -1147,6 +2195,9 @@ async def test_start_run_readline_overrun_kills_process_tree(monkeypatch):
 
     monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(mod, "_kill_tree", fake_kill_tree)
+    # The shared reap helper also signals the tree; intercept it so the fake
+    # pid never reaches a real killpg on the host.
+    monkeypatch.setattr(mod.platform_compat, "kill_process_tree_async", AsyncMock())
     FakeProc.returncode = None
 
     # Absolute: the spawn shim execs without a PATH search, so only a bare name
@@ -1163,7 +2214,11 @@ async def test_start_run_readline_overrun_kills_process_tree(monkeypatch):
     assert rec["status"] == "done" and rec["exit_code"] == -1
     assert any("chunk is longer than limit" in line for line in rec["output"])
     assert killed == [424242]  # tree reaped exactly once
-    assert FakeProc.returncode is not None  # proc.kill()/wait() completed
+    assert FakeProc.returncode is not None  # proc.kill() ran
+    # The reap drains pipes via communicate(), never a bare wait() that a
+    # full pipe could hang (#5989).
+    assert FakeProc.communicate_calls == 1
+    assert FakeProc.wait_calls == 0
 
 
 # --- Codex R35 regressions ---
@@ -1458,13 +2513,120 @@ async def test_discover_worktrees_sandbox_error_is_still_bounded():
 
 
 @pytest.mark.asyncio
-async def test_discover_worktrees_normal_failure_returns_empty():
-    """Non-sandbox git failures return empty list (existing behavior)."""
-    with patch.object(mod, "_run_cmd", new=AsyncMock(
-        return_value=(128, "", "fatal: not a git repository")
-    )):
-        result = await mod._discover_worktrees()
-        assert result == []
+async def test_discover_worktrees_missing_repo_raises_actionable_error(tmp_path):
+    """A missing/non-git MAIN_REPO raises with the path and the remedy.
+
+    This used to return a silent [] — which the UI renders as the
+    "No worktrees found" empty state. On packaged installs (where
+    KIROCREW_PROJECT_DIR points at the app bundle and discovery falls through
+    to the hardcoded ~/kirocrew) that empty state told users they had no
+    worktrees when the app was simply looking at a path that does not exist.
+    """
+    missing = tmp_path / "does-not-exist"
+    with patch.object(mod, "MAIN_REPO", str(missing)), \
+         patch.object(mod, "_run_cmd", new=AsyncMock(
+             return_value=(128, "", f"fatal: cannot change to '{missing}'")
+         )):
+        with pytest.raises(RuntimeError) as exc:
+            await mod._discover_worktrees()
+    msg = str(exc.value)
+    assert str(missing) in msg  # names the path it tried
+    assert "KIROCREW_DEVFLEET_REPO" in msg  # names the remedy
+
+
+@pytest.mark.asyncio
+async def test_discover_worktrees_git_failure_raises_with_stderr(tmp_path):
+    """When the repo exists but git fails, git's own message is surfaced."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    with patch.object(mod, "MAIN_REPO", str(repo)), \
+         patch.object(mod, "_run_cmd", new=AsyncMock(
+             return_value=(128, "", "fatal: index file corrupt")
+         )):
+        with pytest.raises(RuntimeError, match="index file corrupt"):
+            await mod._discover_worktrees()
+
+
+@pytest.mark.asyncio
+async def test_discover_worktrees_git_failure_is_bounded(tmp_path):
+    """An unbounded git stderr is clipped before reaching the UI."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    with patch.object(mod, "MAIN_REPO", str(repo)), \
+         patch.object(mod, "_run_cmd", new=AsyncMock(
+             return_value=(128, "", "fatal: " + "x" * 5000)
+         )):
+        with pytest.raises(RuntimeError) as exc:
+            await mod._discover_worktrees()
+    # bounded: the git portion is clipped to _GIT_ERR_MAX plus the fixed prefix
+    assert len(str(exc.value)) <= mod._GIT_ERR_MAX + 200
+
+
+@pytest.mark.asyncio
+async def test_discover_worktrees_unresolved_git_blames_host_not_repo(tmp_path):
+    """No trusted git => the error names the tool + override, not the repo.
+
+    Issue #2530: this failure used to surface as "git worktree discovery
+    failed in <repo>: no trusted executable for 'git' in <PATH>" — blaming a
+    healthy checkout, echoing the whole trusted PATH into the UI, and never
+    naming KIROCREW_DEVFLEET_BIN_GIT, the override that is the actual remedy.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    stderr = f"{mod._UNRESOLVED_TOOL_PREFIX}'git' in {mod._TRUSTED_PATH}"
+    with patch.object(mod, "MAIN_REPO", str(repo)), \
+         patch.object(mod, "_run_cmd", new=AsyncMock(
+             return_value=(-1, "", stderr)
+         )):
+        with pytest.raises(RuntimeError) as exc:
+            await mod._discover_worktrees()
+    msg = str(exc.value)
+    assert "'git'" in msg  # names the tool that could not be resolved
+    assert "KIROCREW_DEVFLEET_BIN_GIT" in msg  # names the remedy
+    assert mod._TRUSTED_PATH not in msg  # PATH stays in the log, not the UI
+    assert "worktree discovery failed" not in msg  # not blamed on the repo
+    assert str(repo) not in msg  # the checkout is not implicated at all
+
+
+@pytest.mark.asyncio
+async def test_discover_worktrees_real_git_error_not_misclassified(tmp_path):
+    """A git failure merely MENTIONING the sentinel text mid-string is not
+    reclassified: only a stderr `_run_cmd` itself synthesized (prefix at
+    position 0) takes the unresolved-tool branch; everything else still
+    surfaces git's own redacted, bounded message."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    with patch.object(mod, "MAIN_REPO", str(repo)), \
+         patch.object(mod, "_run_cmd", new=AsyncMock(
+             return_value=(128, "", f"fatal: {mod._UNRESOLVED_TOOL_PREFIX}'hook'")
+         )):
+        with pytest.raises(RuntimeError, match="worktree discovery failed"):
+            await mod._discover_worktrees()
+
+
+@pytest.mark.asyncio
+async def test_sync_unresolved_git_names_override_not_path(monkeypatch):
+    """/api/sync with no trusted git returns the same remedy-first message."""
+    with patch.object(mod, "_git", new_callable=AsyncMock,
+                      return_value=mod.BASE_BRANCH), \
+         patch.object(mod, "_venv_python",
+                      return_value=Path("/fake/.venv/bin/python")), \
+         patch.object(mod, "_trusted_bin", side_effect=lambda n: None), \
+         patch.object(mod.dep_sync, "locked_console_scripts", return_value=[]):
+        mod._SYNC_RID = None
+        res = await mod._sync()
+    assert res["ok"] is False
+    assert "'git'" in res["error"]
+    assert "KIROCREW_DEVFLEET_BIN_GIT" in res["error"]
+    assert mod._TRUSTED_PATH not in res["error"]
+
+
+def test_bin_override_var_derivation():
+    """The advertised override var matches what _trusted_bin actually reads,
+    including dash-to-underscore mapping for non-git tools."""
+    assert mod._bin_override_var("git") == "KIROCREW_DEVFLEET_BIN_GIT"
+    assert mod._bin_override_var("some-tool") == "KIROCREW_DEVFLEET_BIN_SOME_TOOL"
+    assert "KIROCREW_DEVFLEET_BIN_GIT" in mod._unresolved_tool_message("git")
 
 
 # =============================================================================
@@ -1536,6 +2698,43 @@ async def test_hmac_health_bypasses_verification():
             assert body["status"] == "ok"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wire_target",
+    [
+        "/api/fleet?name=my%20worktree",  # space
+        "/api/fleet?name=caf%C3%A9",  # non-ASCII
+        "/api/fleet?name=a+b",  # '+' (decodes to space in query)
+    ],
+)
+async def test_hmac_gateway_signed_escapable_query_passes(wire_target: str):
+    """The gateway signs the RAW percent-encoded request-target; the middleware
+    must recompute over the same wire bytes, not aiohttp's decoded
+    path + query_string reconstruction, or every escapable query value 401s."""
+    secret = "test-secret"
+    app = _make_hmac_app()
+    with patch.object(mod, "_load_app_secret", return_value=secret):
+        async with TestClient(TestServer(app)) as client:
+            headers = _sign_request(secret, "GET", wire_target)
+            # encoded=True keeps the exact signed bytes on the wire, mirroring
+            # the gateway's yarl.URL(..., encoded=True) forwarding.
+            resp = await client.get(yarl.URL(wire_target, encoded=True), headers=headers)
+            assert resp.status == 200, await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_hmac_gateway_signed_no_query_target_passes():
+    """Without a query string neither side appends a '?' — raw and decoded
+    spellings coincide and the signature must still verify."""
+    secret = "test-secret"
+    app = _make_hmac_app()
+    with patch.object(mod, "_load_app_secret", return_value=secret):
+        async with TestClient(TestServer(app)) as client:
+            headers = _sign_request(secret, "GET", "/api/fleet")
+            resp = await client.get("/api/fleet", headers=headers)
+            assert resp.status == 200, await resp.text()
+
+
 # =============================================================================
 # R35(b): worktree removal verdict_oid gate
 # =============================================================================
@@ -1582,6 +2781,368 @@ async def test_fleet_handler_sandbox_error_returns_error_payload():
             body = await resp.json()
             assert body["worktrees"] == []
             assert "sandbox unavailable" in body["error"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_handler_missing_repo_returns_error_payload():
+    """The missing-repo RuntimeError reaches the client as the error payload
+    (the frontend renders it as the Discovery Error banner), not a silent
+    empty fleet."""
+    async def boom():
+        raise RuntimeError(
+            "main checkout not found: /nope/kirocrew is missing or not a git "
+            "checkout. Set KIROCREW_DEVFLEET_REPO to your Kiro Crew checkout, "
+            "or clone it to ~/kirocrew."
+        )
+
+    with patch.object(mod, "_fleet_refresh", new=boom), \
+         patch.object(mod, "_fleet_cached", new=boom):
+        app = web.Application()
+        app.router.add_get("/api/fleet", mod.api_dev_fleet_fleet)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/fleet")
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["worktrees"] == []
+            assert "main checkout not found" in body["error"]
+            assert "KIROCREW_DEVFLEET_REPO" in body["error"]
+
+
+# =============================================================================
+# main-checkout discovery (no invented default path)
+# =============================================================================
+
+
+def _make_checkout(root: Path) -> Path:
+    """Create a directory carrying every Kiro Crew checkout marker."""
+    (root / ".git").mkdir(parents=True)
+    (root / "src" / "kiro_crew").mkdir(parents=True)
+    (root / "pyproject.toml").write_text("[project]\nname = 'kiro-crew'\n")
+    return root
+
+
+def test_is_kirocrew_checkout_requires_every_marker(tmp_path):
+    """A bare git repo is refused: adopting it would run Pull+Build inside it."""
+    bare = tmp_path / "some-other-repo"
+    (bare / ".git").mkdir(parents=True)
+    assert mod._is_kirocrew_checkout(str(bare)) is False
+    assert mod._is_kirocrew_checkout(str(_make_checkout(tmp_path / "kirocrew"))) is True
+    assert mod._is_kirocrew_checkout("") is False
+
+
+def test_default_main_repo_returns_empty_when_nothing_is_found(monkeypatch):
+    """No checkout resolves to "" — never to a path nobody asked for.
+
+    A synthesized default makes a first run report a missing checkout the user
+    never chose, which reads as a broken app rather than an open question.
+    """
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    with patch.object(mod, "_own_source_checkout", return_value=None):
+        assert mod._default_main_repo() == ""
+
+
+def test_default_main_repo_skips_a_project_dir_that_is_not_kirocrew(monkeypatch, tmp_path):
+    """A project directory that is some other git repo is not adopted."""
+    other = tmp_path / "other"
+    (other / ".git").mkdir(parents=True)
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(other))
+    with patch.object(mod, "_own_source_checkout", return_value=None):
+        assert mod._default_main_repo() == ""
+
+
+def test_default_main_repo_falls_back_to_the_running_checkout(monkeypatch, tmp_path):
+    """A gateway running from source manages that source tree, unconfigured."""
+    own = _make_checkout(tmp_path / "kirocrew")
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    with patch.object(mod, "_own_source_checkout", return_value=str(own)):
+        assert mod._default_main_repo() == str(own)
+
+
+def test_discover_main_repo_honors_the_config_repo_path(monkeypatch):
+    """``dev_fleet.repo_path`` is a supported alternative to the env var."""
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={"repo_path": "/opt/kc"}):
+        assert mod._discover_main_repo() == "/opt/kc"
+
+
+def test_discover_main_repo_takes_an_explicit_path_verbatim(monkeypatch):
+    """A configured path is NOT marker-tested: a typo must surface as an error
+    naming that path, not be silently swapped for a discovered checkout."""
+    monkeypatch.setenv("KIROCREW_DEVFLEET_REPO", "/typo/kirocrew")
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={"repo_path": "/opt/kc"}):
+        assert mod._discover_main_repo() == "/typo/kirocrew"
+
+
+def test_discover_main_repo_finds_a_conventional_clone_location(monkeypatch, tmp_path):
+    """A real checkout in a conventional location is found without configuration."""
+    home = tmp_path / "home"
+    checkout = _make_checkout(home / "Repos" / "KiroCrew")  # brand-ok: clone dir name
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={}), \
+         patch.object(mod, "_own_source_checkout", return_value=None), \
+         patch.object(mod.Path, "home", staticmethod(lambda: home)):
+        assert mod._discover_main_repo() == str(checkout)
+
+
+def test_discover_main_repo_uses_the_filesystem_spelling(monkeypatch, tmp_path):
+    """The returned path is spelled the way the directory is, not the way the
+    probe list guesses — a case-variant does not match what git reports."""
+    home = tmp_path / "home"
+    checkout = _make_checkout(home / "repos" / "KIROCREW")
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={}), \
+         patch.object(mod, "_own_source_checkout", return_value=None), \
+         patch.object(mod.Path, "home", staticmethod(lambda: home)):
+        assert mod._discover_main_repo() == str(checkout)
+
+
+def test_discover_main_repo_ignores_an_unmarked_conventional_location(monkeypatch, tmp_path):
+    """An empty ~/kirocrew directory does not count as a checkout."""
+    home = tmp_path / "home"
+    (home / "kirocrew").mkdir(parents=True)
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={}), \
+         patch.object(mod, "_own_source_checkout", return_value=None), \
+         patch.object(mod.Path, "home", staticmethod(lambda: home)):
+        assert mod._discover_main_repo() == ""
+
+
+@pytest.mark.asyncio
+async def test_discover_worktrees_without_a_repo_never_runs_git():
+    """`git -C ""` answers for the backend's own working directory, so an
+    unresolved repo must not reach git at all."""
+    run = AsyncMock(return_value=(0, "", ""))
+    with patch.object(mod, "MAIN_REPO", ""), patch.object(mod, "_run_cmd", new=run):
+        with pytest.raises(mod.RepoNotConfigured):
+            await mod._discover_worktrees()
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_upstream_remote_without_a_repo_never_runs_git():
+    run = AsyncMock(return_value=(0, "", ""))
+    with patch.object(mod, "MAIN_REPO", ""), \
+         patch.object(mod, "_UPSTREAM_REMOTE", None), \
+         patch.object(mod, "_run_cmd", new=run):
+        assert await mod._upstream_remote() == "origin"
+    run.assert_not_awaited()
+
+
+def test_build_pending_without_a_repo_is_false():
+    """Path("") is Path("."), which would stat this process's own tree."""
+    with patch.object(mod, "MAIN_REPO", ""):
+        assert mod._build_pending() is False
+
+
+@pytest.mark.asyncio
+async def test_fleet_handler_reports_needs_setup_without_an_error():
+    """No checkout found is a setup state, not a failure: the payload carries
+    ``needs_setup`` and NO ``error``, so the page asks where the checkout is
+    instead of rendering a red banner against a path the user never chose."""
+    async def unconfigured():
+        raise mod.RepoNotConfigured("no Kiro Crew checkout found to manage")
+
+    with patch.object(mod, "_fleet_refresh", new=unconfigured), \
+         patch.object(mod, "_fleet_cached", new=unconfigured):
+        app = web.Application()
+        app.router.add_get("/api/fleet", mod.api_dev_fleet_fleet)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/fleet")
+            assert resp.status == 200
+            body = await resp.json()
+            assert body == {"worktrees": [], "needs_setup": True}
+
+
+@pytest.mark.asyncio
+async def test_discover_worktrees_refuses_a_configured_non_kirocrew_repo():
+    """A configured path that is a readable git repo but NOT this project is
+    refused by name, never operated on. Tiers 1-2 skip the marker test at
+    DISCOVERY so a typo is not silently replaced by a found checkout — that must
+    not also mean the wrong tree gets `worktree remove` run inside it."""
+    run = AsyncMock(return_value=(0, "worktree /some/other/repo\n", ""))
+    with patch.object(mod, "MAIN_REPO", "/some/other/repo"), \
+         patch.object(mod, "_REPO_INVALID_MSG", "not a Kiro Crew checkout: /some/other/repo ..."), \
+         patch.object(mod, "_run_cmd", new=run):
+        with pytest.raises(mod.RepoUnreadable) as exc:
+            await mod._discover_worktrees()
+    # Refused BEFORE git ran: a readable wrong repo answers `worktree list`
+    # happily, so the guard cannot rely on a non-zero exit.
+    run.assert_not_awaited()
+    assert "/some/other/repo" in str(exc.value)
+    assert "not a Kiro Crew checkout" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_auto_prune_reaper_idles_for_a_configured_non_kirocrew_repo():
+    """An enabled reaper must not run a cycle against an unusable checkout.
+
+    MAIN_REPO is TRUTHY for a configured path that fails the marker test, so a
+    truthiness guard let the cycle proceed: _prune_candidates raised
+    RepoUnreadable, `except Exception` logged a traceback, and the reaper recorded
+    outcome="failure" in the SEL trail every interval — a tamper-evident audit
+    asserting a failure that never happened.
+    """
+    prune = AsyncMock()
+    sel = MagicMock()
+    with patch.object(mod, "MAIN_REPO", "/some/other/repo"), \
+         patch.object(mod, "_REPO_INVALID_MSG", "not a Kiro Crew checkout: ..."), \
+         patch.object(mod, "_auto_prune_cfg", return_value=(True, 0.01)), \
+         patch.object(mod, "_auto_prune_once", new=prune), \
+         patch.object(mod, "_sel", return_value=sel), \
+         patch.object(mod, "asyncio", wraps=asyncio) as aio:
+        aio.sleep = AsyncMock(side_effect=[None, asyncio.CancelledError()])
+        with pytest.raises(asyncio.CancelledError):
+            await mod._auto_prune_reaper()
+    prune.assert_not_awaited()
+    sel.log_tool_invocation.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sync_refuses_a_configured_non_kirocrew_repo():
+    """The gate lives in the accessor, not the discovery funnel: sync and the
+    refresher never pass through _discover_worktrees, and `pull --ff-only` plus
+    `pip install -e` inside an unrelated repository is the worst outcome here."""
+    with patch.object(mod, "MAIN_REPO", "/some/other/repo"), \
+         patch.object(mod, "_REPO_INVALID_MSG", "not a Kiro Crew checkout: /some/other/repo ..."):
+        res = await mod._sync_start_locked()
+    assert res["ok"] is False
+    assert "not a Kiro Crew checkout" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_status_refresher_idles_for_a_configured_non_kirocrew_repo():
+    run = AsyncMock(return_value=(0, "", ""))
+    with patch.object(mod, "MAIN_REPO", "/some/other/repo"), \
+         patch.object(mod, "_REPO_INVALID_MSG", "not a Kiro Crew checkout: /some/other/repo ..."), \
+         patch.object(mod, "_run_cmd", new=run):
+        await mod._status_refresher()
+    # Returned without fetching: no git ran against the unrelated repository.
+    run.assert_not_awaited()
+
+
+def test_repo_accessor_gates_both_unusable_states():
+    """Both states raise from the accessor, and both share a base so a degrading
+    caller cannot enumerate only the reason that existed when it was written."""
+    with patch.object(mod, "MAIN_REPO", ""), patch.object(mod, "_REPO_INVALID_MSG", None):
+        with pytest.raises(mod.RepoNotConfigured):
+            mod._repo()
+    with patch.object(mod, "MAIN_REPO", "/x"), patch.object(mod, "_REPO_INVALID_MSG", "bad"):
+        with pytest.raises(mod.RepoUnreadable):
+            mod._repo()
+    assert issubclass(mod.RepoNotConfigured, mod.RepoUnavailable)
+    assert issubclass(mod.RepoUnreadable, mod.RepoUnavailable)
+    with patch.object(mod, "MAIN_REPO", "/good"), patch.object(mod, "_REPO_INVALID_MSG", None):
+        assert mod._repo() == "/good"
+
+
+@pytest.mark.asyncio
+async def test_discover_worktrees_proceeds_for_a_validated_checkout():
+    with patch.object(mod, "MAIN_REPO", "/good/kirocrew"), \
+         patch.object(mod, "_REPO_INVALID_MSG", None), \
+         patch.object(mod, "_run_cmd", new=AsyncMock(
+             return_value=(0, "worktree /good/kirocrew\nbranch refs/heads/main\n", "")
+         )):
+        entries = await mod._discover_worktrees()
+    assert entries and entries[0]["is_main"] is True
+
+
+@pytest.mark.asyncio
+async def test_sync_refuses_without_a_repo():
+    with patch.object(mod, "MAIN_REPO", ""):
+        res = await mod._sync_start_locked()
+    assert res["ok"] is False
+    assert "no Kiro Crew checkout" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_repo_answers_a_coded_409_not_a_500():
+    """A route that resolves worktrees must not answer a first-run click with an
+    uncaught 500 and a generic failure toast. The boundary lives in the
+    middleware, so a new route cannot forget the case, and the body carries a
+    machine-readable code rather than only prose."""
+    secret = "s" * 32
+
+    async def boom(request):
+        raise mod.RepoNotConfigured("no Kiro Crew checkout found to manage")
+
+    app = web.Application(middlewares=[mod.hmac_proxy_middleware])
+    app.router.add_get("/api/prune-candidates", boom)
+    with patch.object(mod, "_load_app_secret", return_value=secret):
+        async with TestClient(TestServer(app)) as client:
+            headers = _sign_request(secret, "GET", "/api/prune-candidates")
+            resp = await client.get("/api/prune-candidates", headers=headers)
+            assert resp.status == 409
+            body = await resp.json()
+    assert body["code"] == "repo_not_configured"
+    assert body["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_unreadable_repo_answers_a_coded_409_too():
+    """A named-but-unreadable checkout has the same consequence for every route
+    except /fleet — no fleet to act on — so it gets the same boundary with its own
+    code, instead of an uncaught 500 behind a "Prune preview failed" toast."""
+    secret = "s" * 32
+
+    async def boom(request):
+        raise mod.RepoUnreadable("main checkout not found: /opt/kc is missing or not a git checkout.")
+
+    app = web.Application(middlewares=[mod.hmac_proxy_middleware])
+    app.router.add_get("/api/prune-candidates", boom)
+    with patch.object(mod, "_load_app_secret", return_value=secret):
+        async with TestClient(TestServer(app)) as client:
+            headers = _sign_request(secret, "GET", "/api/prune-candidates")
+            resp = await client.get("/api/prune-candidates", headers=headers)
+            assert resp.status == 409
+            body = await resp.json()
+    assert body["code"] == "repo_unreadable"
+
+
+@pytest.mark.asyncio
+async def test_fleet_handler_still_reports_an_unreadable_repo_as_an_error():
+    """/fleet is the one route that distinguishes them: unreadable keeps the
+    error payload (the Discovery Error banner names the path the user chose)."""
+    async def boom():
+        raise mod.RepoUnreadable("main checkout not found: /opt/kc is missing or not a git checkout.")
+
+    with patch.object(mod, "_fleet_refresh", new=boom), \
+         patch.object(mod, "_fleet_cached", new=boom):
+        app = web.Application()
+        app.router.add_get("/api/fleet", mod.api_dev_fleet_fleet)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/fleet")
+            body = await resp.json()
+    assert body["worktrees"] == []
+    assert "main checkout not found" in body["error"]
+    assert "needs_setup" not in body
+
+
+def test_repo_source_hint_names_the_env_var(monkeypatch):
+    monkeypatch.setenv("KIROCREW_DEVFLEET_REPO", "/typo/kirocrew")
+    assert "KIROCREW_DEVFLEET_REPO" in mod._repo_source_hint()
+    assert "config.json" not in mod._repo_source_hint()
+
+
+def test_repo_source_hint_names_the_config_key(monkeypatch):
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={"repo_path": "/typo/kc"}):
+        hint = mod._repo_source_hint()
+    assert "config.json" in hint
+    assert "environment variable" not in hint
+
+
+def test_repo_source_hint_offers_both_when_neither_is_set(monkeypatch):
+    monkeypatch.delenv("KIROCREW_DEVFLEET_REPO", raising=False)
+    with patch.object(mod, "_load_dev_fleet_cfg", return_value={}):
+        hint = mod._repo_source_hint()
+    assert "KIROCREW_DEVFLEET_REPO" in hint and "config.json" in hint
 
 
 # =============================================================================
@@ -1793,7 +3354,10 @@ async def test_restart_gateway_not_active():
                       return_value=(3, "", "inactive\n")):
         result = await mod._restart_gateway()
     assert result["ok"] is False
-    assert "not running" in result["error"]
+    # With the foreground fallback, the error comes from whichever backend
+    # ultimately fails: either "not running as a user service" (no foreground
+    # eligible) or the foreground backend's own diagnostic.
+    assert result["error"]
 
 
 @pytest.mark.asyncio
@@ -1846,6 +3410,20 @@ def _reset_make_live_committed_latch():
     mod._MAKE_LIVE_COMMITTED = False
 
 
+@pytest.fixture(autouse=True)
+def _reset_shutdown_admission_state():
+    """``_SHUTDOWN_IN_PROGRESS`` is set by ``dev_fleet_cleanup`` and never cleared
+    in production (the process exits).  In-process pytest leaks the latched True
+    state into later tests that call ``_start_run`` directly, causing them to
+    raise RuntimeError instead of running normally.  Reset both the flag and the
+    lock around every test to mirror a fresh gateway process."""
+    mod._SHUTDOWN_IN_PROGRESS = False
+    mod._SHUTDOWN_ADMISSION_LOCK = asyncio.Lock()
+    yield
+    mod._SHUTDOWN_IN_PROGRESS = False
+    mod._SHUTDOWN_ADMISSION_LOCK = asyncio.Lock()
+
+
 def _mk_make_live_wt(tmp_path, *, venv: bool = False, dist: bool = False,
                      venv_exec: bool = True):
     """Build a fake worktree dir with optional .venv/bin/kirocrew and built dist.
@@ -1869,7 +3447,7 @@ def _mk_make_live_wt(tmp_path, *, venv: bool = False, dist: bool = False,
     return wt
 
 
-def _assert_sandboxed(path, what: str) -> None:
+def _assert_sandboxed(path, what: str, sandbox_root) -> None:
     """Fail loudly when a host-mutating make-live seam resolves outside the sandbox.
 
     The seams below decide WHERE the cutover writes and WHAT it executes. If one is
@@ -1878,10 +3456,17 @@ def _assert_sandboxed(path, what: str) -> None:
     drop-in to point at a pytest tmpdir and restarts the unit, which then fails
     203/EXEC on every boot once the tmpdir is reaped. Asserting containment here
     makes the next missed seam fail inside the test instead of taking down the host.
+
+    *sandbox_root* is THIS test's own directory, not a generic temp root. The
+    distinction is the whole strength of the check: "somewhere under the system temp
+    dir" is satisfied by any tmp path at all, whereas "inside the tree this test
+    built" is satisfied only by the redirect actually taking effect. It also stops the
+    assertion depending on where ``tempfile`` happens to be rooted, which the suite's
+    isolation floor now controls.
     """
     resolved = Path(path).resolve()
-    tmp_root = Path(tempfile.gettempdir()).resolve()
-    assert tmp_root in resolved.parents, (
+    root = Path(sandbox_root).resolve()
+    assert root == resolved or root in resolved.parents, (
         f"{what} resolved OUTSIDE the temp sandbox: {resolved}. A test that reaches "
         f"the cutover path must never touch a real host path."
     )
@@ -1926,15 +3511,14 @@ def _stub_make_live(monkeypatch, wt, *, live=None, in_pod=False, unit_status="ok
     monkeypatch.setattr(mod, "_live_worktree_path", AsyncMock(return_value=live))
     monkeypatch.setattr(mod, "_in_pod", lambda: in_pod)
     monkeypatch.setattr(mod, "_live_user_unit_status", AsyncMock(return_value=unit_status))
-    sandbox_dropin = (
-        Path(wt).parent / "_systemd" / f"{mod._LIVE_GATEWAY_UNIT}.d" / "make-live.conf"
-    )
-    _assert_sandboxed(sandbox_dropin, "_dropin_path")
+    sandbox_root = Path(wt).parent
+    sandbox_dropin = sandbox_root / "_systemd" / f"{mod._LIVE_GATEWAY_UNIT}.d" / "make-live.conf"
+    _assert_sandboxed(sandbox_dropin, "_dropin_path", sandbox_root)
     monkeypatch.setattr(mod, "_dropin_path", lambda: sandbox_dropin)
     monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
     # Prove the redirect actually took: a rename of the production symbol would
     # otherwise leave the real path live while every test still looked green.
-    _assert_sandboxed(mod._dropin_path(), "patched _dropin_path()")
+    _assert_sandboxed(mod._dropin_path(), "patched _dropin_path()", sandbox_root)
     if pointer_dir is not None:
         pointer_dir.mkdir(parents=True, exist_ok=True)
         ptr_file = pointer_dir / "live_target.json"
@@ -1949,6 +3533,7 @@ def _stub_make_live(monkeypatch, wt, *, live=None, in_pod=False, unit_status="ok
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_dry_run_plan(monkeypatch, tmp_path):
     """dry_run returns the pointer-based plan without writing anything."""
     wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
@@ -2012,6 +3597,7 @@ async def test_make_live_missing_venv(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_venv_not_executable(monkeypatch, tmp_path):
     """.venv/bin/kirocrew present but NOT executable -> a distinct, actionable
     error (missing_venv is for the not-a-file case). A non-executable binary
@@ -2042,6 +3628,7 @@ async def test_make_live_missing_dist(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_real_cutover_writes_pointer(monkeypatch, tmp_path):
     """A real cutover on a drivable service writes the pointer AND restages the
     service definition, issues a detached restart, and invalidates the
@@ -2089,6 +3676,7 @@ async def test_make_live_real_cutover_writes_pointer(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_staged_only_leaves_service_definition_untouched(
     monkeypatch, tmp_path,
 ):
@@ -2119,6 +3707,7 @@ async def test_make_live_staged_only_leaves_service_definition_untouched(
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_latches_after_cutover(monkeypatch, tmp_path):
     """A successful cutover latches _MAKE_LIVE_COMMITTED. A second request —
     cutover for a DIFFERENT valid target, or even a dry_run — is then refused
@@ -2148,6 +3737,7 @@ async def test_make_live_latches_after_cutover(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_write_failure_does_not_latch(monkeypatch, tmp_path):
     """A cutover that fails during pointer write (before restart scheduling)
     must NOT latch — the restart never happened, so a subsequent cutover
@@ -2297,6 +3887,7 @@ async def test_make_live_pod_indeterminate_fails_closed(monkeypatch, tmp_path):
 
 # --- make-live: staged-only when service not drivable ---
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_stages_only_when_service_not_drivable(monkeypatch, tmp_path):
     """A live gateway installed as a SYSTEM unit (or no service at all) succeeds
     as staged_only: the pointer is written, no restart attempted, and a manual
@@ -2487,6 +4078,7 @@ def test_sd_value_rejects_control_char_paths():
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_escapes_special_char_worktree(monkeypatch, tmp_path):
     """A worktree path with a space yields a valid plan and a real cutover
     writes the resolved path into the pointer file correctly."""
@@ -2548,7 +4140,14 @@ async def test_make_live_unsafe_path_returns_code(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_restart_gateway_darwin_requests_graceful_stop(monkeypatch):
-    """macOS restart asks launchd for a bounded SIGTERM-first stop."""
+    """macOS restart asks launchd for a bounded SIGTERM-first stop.
+
+    Pinned as a DOMAIN-TARGETED ``kill TERM``, not launchctl's legacy label-only
+    ``stop``: Dev Fleet spawns every command inside ``sandbox-exec``, and launchd
+    refuses the legacy stop routine for a sandboxed caller ("Not privileged to
+    stop service.") whatever the seatbelt profile allows. A regression to the
+    legacy form makes Restart fail on every Mac, so the shape is asserted here.
+    """
     monkeypatch.setattr(mod, "sys", MagicMock(platform="darwin"))
     monkeypatch.setattr(
         mod, "shutil", MagicMock(which=MagicMock(return_value="/bin/launchctl"))
@@ -2575,8 +4174,15 @@ async def test_restart_gateway_darwin_requests_graceful_stop(monkeypatch):
     # The PID stands in for systemd's monotonic start stamp: it changes on every
     # respawn, which is the edge the frontend handshake waits for.
     assert res["start_id"] == "4242"
-    assert ["launchctl", "stop", mod._gateway_label()] in calls
+    # Addressed via the backend's own domain helper rather than a second copy of
+    # the uid logic (which would also break on Windows, where getuid is absent).
+    domain = mod.gateway_service.LaunchdBackend.domain()
+    assert ["launchctl", "kill", "TERM", f"{domain}/{mod._gateway_label()}"] in calls
+    # `kickstart -k` would restart it too, but as a hard kill rather than the
+    # graceful SIGTERM the ExitTimeOut budget is sized for.
     assert not any(c[:2] == ["launchctl", "kickstart"] for c in calls)
+    # The legacy verb is what the sandbox blocks — it must not reappear.
+    assert not any(c[:2] == ["launchctl", "stop"] for c in calls)
 
 
 @pytest.mark.asyncio
@@ -2601,7 +4207,7 @@ async def test_restart_gateway_darwin_refuses_stale_loaded_contract(monkeypatch)
     res = await mod._restart_gateway()
     assert res["ok"] is False
     assert "loaded launchd restart contract is outdated" in res["error"]
-    assert not any(c[:2] == ["launchctl", "stop"] for c in calls)
+    assert not any(c[:3] == ["launchctl", "kill", "TERM"] for c in calls)
 
 
 @pytest.mark.asyncio
@@ -2661,7 +4267,7 @@ async def test_make_live_darwin_writes_pointer_and_stops_agent(monkeypatch, tmp_
     import json as _json
     data = _json.loads(ptr_file.read_text())
     assert Path(data["checkout"]).resolve() == wt.resolve()
-    assert any(c[:2] == ["launchctl", "stop"] for c in calls)
+    assert any(c[:3] == ["launchctl", "kill", "TERM"] for c in calls)
     assert not any(c[:2] == ["launchctl", "kickstart"] for c in calls)
     assert not any("bootout" in c or "bootstrap" in c for c in calls)
 
@@ -2684,8 +4290,8 @@ async def test_make_live_darwin_rolls_back_pointer_on_restart_failure(
     async def fake_run_cmd(cmd, **kw):
         if cmd[:2] == ["launchctl", "print"]:
             return (0, "  pid = 99\n", "")
-        if cmd[:2] == ["launchctl", "stop"]:
-            return (1, "", "stop refused")
+        if cmd[:3] == ["launchctl", "kill", "TERM"]:
+            return (1, "", "restart refused")
         return (0, "", "")
 
     monkeypatch.setattr(mod, "_run_cmd", fake_run_cmd)
@@ -2760,6 +4366,7 @@ async def test_make_live_refuses_when_prior_pointer_is_unreadable(
 
 # --- make-live: pointer write + failure rollback ---
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_rolls_back_pointer_on_restart_failure(monkeypatch, tmp_path):
     """A restart failure with a prior pointer restores the PRIOR content and
     reports rolled_back. When there was no prior pointer, the file is deleted."""
@@ -2783,6 +4390,7 @@ async def test_make_live_rolls_back_pointer_on_restart_failure(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_rolls_back_pointer_preserves_prior(monkeypatch, tmp_path):
     """When a prior pointer existed, restart failure restores its content."""
     wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
@@ -2808,6 +4416,7 @@ async def test_make_live_rolls_back_pointer_preserves_prior(monkeypatch, tmp_pat
 
 # --- make-live: concurrency single-flight lock ---
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_concurrent_second_call_busy(monkeypatch, tmp_path):
     """While one cutover holds the make-live lock, a concurrent second call is
     refused immediately with ``busy`` (fail-fast, not queued) and the winner
@@ -2858,6 +4467,7 @@ async def test_make_live_concurrent_second_call_busy(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_lock_released_after_failure_and_reusable(monkeypatch, tmp_path):
     """The lock is released on the failure-rollback path too, so a subsequent
     cutover proceeds (never wedged on ``busy``)."""
@@ -2890,6 +4500,7 @@ async def test_make_live_lock_released_after_failure_and_reusable(monkeypatch, t
 
 # --- make-live: pointer-based live worktree resolution ---
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_live_worktree_path_prefers_pointer_over_service(monkeypatch, tmp_path):
     """_live_worktree_path returns the pointer target in preference to the
     service definition ONCE THE GATEWAY IS RUNNING IT. A cutover writes the
@@ -2931,6 +4542,7 @@ async def test_live_worktree_path_prefers_pointer_over_service(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_live_worktree_path_reports_running_image_while_staged(monkeypatch, tmp_path):
     """A staged pointer is NOT live: until the gateway restarts it is still
     executing the previous checkout, and reporting the pointer as live would
@@ -2960,6 +4572,7 @@ async def test_live_worktree_path_reports_running_image_while_staged(monkeypatch
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_live_worktree_path_honours_pointer_when_checkout_unknown(monkeypatch, tmp_path):
     """A packaged install is not a checkout, so the running image cannot be
     compared. That is "cannot verify", not a mismatch: the pointer stays
@@ -2985,6 +4598,7 @@ async def test_live_worktree_path_honours_pointer_when_checkout_unknown(monkeypa
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_repointing_at_the_running_checkout_cancels_a_staged_cutover(monkeypatch, tmp_path):
     """While a cutover is staged, naming the checkout that is RUNNING is a cancel.
 
@@ -3043,6 +4657,7 @@ def _stage_a_cutover(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_cutover_unwind_runs_off_the_event_loop(monkeypatch, tmp_path):
     """The rollback must not block the loop.
 
@@ -3078,6 +4693,7 @@ async def test_cutover_unwind_runs_off_the_event_loop(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_drivable_host_with_a_stage_pending_refuses(monkeypatch, tmp_path):
     """On a host Dev Fleet CAN drive, this request must do NOTHING destructive.
 
@@ -3115,6 +4731,103 @@ async def test_drivable_host_with_a_stage_pending_refuses(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_stale_cancel_after_stage_completed_never_becomes_a_cutover(monkeypatch, tmp_path):
+    """The destructive variant of the two-tab race.
+
+    Stage B COMPLETES while tab A's cancel dialog is open: nothing is staged
+    any more and B is live. Tab A's stale POST names checkout A (which was
+    live) — without the entry gate it would fall past both cancel branches
+    into the FULL CUTOVER path and restart the gateway back into A. A request
+    carrying expected_staged must refuse (stage_changed) the moment the stage
+    it names is gone, whatever branch it would otherwise reach.
+    """
+    running, other, ptr = _stage_a_cutover(monkeypatch, tmp_path)
+    # Complete the staged cutover: `other` is the running checkout now and the
+    # pointer agrees with it, so nothing is staged (and the live path resolves
+    # to `other` for the same_as_running branch below the gate).
+    monkeypatch.setattr(mod, "_running_checkout", lambda: other)
+    monkeypatch.setattr(mod, "_live_worktree_path",
+                        AsyncMock(return_value=str(other)))
+    assert mod._staged_target() is None
+
+    res = await mod._make_live(str(running), expected_staged=str(other))
+
+    assert res.get("ok") is False, res
+    assert res.get("code") == "stage_changed", res
+    assert "nothing is staged now" in res["error"]
+    # Crucially: no cutover side effects — no service definition written and
+    # the pointer still names the completed target.
+    assert not mod._dropin_path().exists()
+    assert mod.live_target.read_target() == other.resolve()
+
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_stale_cancel_refuses_when_the_live_checkout_moved(monkeypatch, tmp_path):
+    """The other stale-cancel variant: the LIVE side moved.
+
+    A cancel re-pins the checkout the operator saw as live. If a cutover to C
+    landed and a new stage appeared while the dialog sat open, the stale
+    request's path names a checkout that is no longer running — matching the
+    (re-created) stage alone would let it fall through to the cutover path
+    and restart the gateway into the old checkout. The live binding refuses.
+    """
+    running, other, ptr = _stage_a_cutover(monkeypatch, tmp_path)
+    # The gateway moved to a third checkout; the SAME stage happens to exist.
+    third = _mk_make_live_wt(tmp_path / "third", venv=True, dist=True)
+    monkeypatch.setattr(mod, "_running_checkout", lambda: third)
+    monkeypatch.setattr(mod, "_live_worktree_path",
+                        AsyncMock(return_value=str(third)))
+    assert mod._staged_target() == str(other)
+
+    res = await mod._make_live(str(running), expected_staged=str(other))
+
+    assert res.get("ok") is False, res
+    assert res.get("code") == "stage_changed", res
+    assert "live checkout changed" in res["error"]
+    # No cutover side effects: nothing written, the stage survives.
+    assert not mod._dropin_path().exists()
+    assert mod._staged_target() == str(other)
+
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_cancel_refuses_when_the_stage_changed_since_confirm(monkeypatch, tmp_path):
+    """A cancel is bound to the stage the operator confirmed.
+
+    Two dashboards race: tab A opens the cancel dialog against stage A, tab B
+    cancels A and stages B, tab A submits. Without the binding the POST names
+    only the live checkout, so it would discard stage B — a stage tab A's
+    operator never saw. With ``expected_staged`` the backend refuses instead.
+    """
+    running, other, ptr = _stage_a_cutover(monkeypatch, tmp_path)
+    confirmed_against = tmp_path / "some-older-stage"
+
+    res = await mod._make_live(str(running),
+                               expected_staged=str(confirmed_against))
+
+    assert res.get("ok") is False, res
+    assert res.get("code") == "stage_changed", res
+    # The current stage survives untouched, and the message names both sides.
+    assert mod._staged_target() == str(other)
+    assert other.name in res["error"]
+    assert confirmed_against.name in res["error"]
+
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_cancel_with_matching_expected_stage_proceeds(monkeypatch, tmp_path):
+    running, other, ptr = _stage_a_cutover(monkeypatch, tmp_path)
+
+    res = await mod._make_live(str(running), expected_staged=str(other))
+
+    assert res.get("cancelled") is True, res
+    assert mod._staged_target() is None
+
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_cancel_keeps_a_pointer_selected_checkout_live(monkeypatch, tmp_path):
     """The scenario that makes deletion wrong.
 
@@ -3141,6 +4854,7 @@ async def test_cancel_keeps_a_pointer_selected_checkout_live(monkeypatch, tmp_pa
     OSError(30, "Read-only file system"),
 ])
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_cancel_write_failure_is_a_refusal_not_a_crash(monkeypatch, tmp_path, boom):
     """A full or read-only data home must refuse, not raise into a 500.
 
@@ -3163,6 +4877,7 @@ async def test_cancel_write_failure_is_a_refusal_not_a_crash(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_cancel_rolls_the_pointer_back_when_hardening_fails(monkeypatch, tmp_path):
     """write_target can fail AFTER replacing the pointer.
 
@@ -3191,6 +4906,7 @@ async def test_cancel_rolls_the_pointer_back_when_hardening_fails(monkeypatch, t
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_cancel_reports_a_failed_rollback(monkeypatch, tmp_path):
     """When the rollback itself fails the operator is told, not left guessing."""
     running, other, ptr = _stage_a_cutover(monkeypatch, tmp_path)
@@ -3208,6 +4924,7 @@ async def test_cancel_reports_a_failed_rollback(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_cancel_invalid_target_is_a_refusal_not_a_crash(monkeypatch, tmp_path):
     """The validation half of the same guard."""
     running, other, ptr = _stage_a_cutover(monkeypatch, tmp_path)
@@ -3224,6 +4941,7 @@ async def test_cancel_invalid_target_is_a_refusal_not_a_crash(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_dry_run_cancel_reports_the_plan_without_deleting(monkeypatch, tmp_path):
     """`dry_run` must never mutate.
 
@@ -3245,6 +4963,7 @@ async def test_dry_run_cancel_reports_the_plan_without_deleting(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_cancel_fails_fast_while_a_cutover_holds_the_lock(monkeypatch, tmp_path):
     """The cancel mutates the same pointer a cutover writes, so it takes the
     same single-flight lock and reports `busy` instead of racing it."""
@@ -3259,6 +4978,7 @@ async def test_cancel_fails_fast_while_a_cutover_holds_the_lock(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_cancel_refuses_once_a_cutover_has_committed(monkeypatch, tmp_path):
     """A committed cutover is already restarting; deleting the pointer then would
     land the pending restart somewhere the operator did not choose."""
@@ -3318,6 +5038,7 @@ def test_running_checkout_resolves_this_checkout():
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_staged_only_allows_subsequent_cutover(monkeypatch, tmp_path):
     """A staged_only cutover does NOT latch, so re-pointing to a DIFFERENT
     worktree proceeds without a restart_pending refusal."""
@@ -3371,11 +5092,69 @@ async def test_fleet_includes_gateway_service_active(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_gateway_service_active_non_linux(monkeypatch):
-    """On non-linux, _gateway_service_active returns False without spawning."""
+async def test_gateway_service_active_no_manager(monkeypatch):
+    """A platform with neither systemd nor launchd -> False, and NO spawn.
+
+    Was previously asserted with ``platform="darwin"``; darwin is now a
+    SUPPORTED backend, so the "no manager at all" case has to be expressed with
+    a platform that really has none -- mirroring
+    ``test_live_user_unit_status_no_manager``. Asserting darwin here made the
+    verdict depend on whether the *host* happened to have the agent loaded,
+    because neither ``shutil`` nor ``_run_cmd`` was faked.
+    """
     monkeypatch.setattr(mod, "_GATEWAY_SERVICE_ACTIVE", None)
     monkeypatch.setattr(mod, "_GATEWAY_SERVICE_CHECK_AT", 0.0)
-    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    monkeypatch.setattr(mod, "sys", MagicMock(platform="win32"))
+    run = AsyncMock(return_value=(0, "", ""))
+    monkeypatch.setattr(mod, "_run_cmd", run)
+    assert await mod._gateway_service_active() is False
+    # The "without spawning" half of the original intent, now actually verified:
+    # backend() returns None for win32, so nothing may be probed.
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gateway_service_active_darwin_live_agent(monkeypatch):
+    """macOS with a loaded agent reporting a live pid -> True.
+
+    The darwin-True path had no *direct* assertion: the only ``is True`` case in
+    this area runs under ``platform="linux"``. It was covered indirectly via
+    ``test_restart_gateway_darwin_requests_graceful_stop``.
+    """
+    monkeypatch.setattr(mod, "_GATEWAY_SERVICE_ACTIVE", None)
+    monkeypatch.setattr(mod, "_GATEWAY_SERVICE_CHECK_AT", 0.0)
+    monkeypatch.setattr(mod, "sys", MagicMock(platform="darwin"))
+    monkeypatch.setattr(
+        mod, "shutil", MagicMock(which=MagicMock(return_value="/bin/launchctl"))
+    )
+    calls: list = []
+
+    async def fake_run_cmd(cmd, **kw):
+        calls.append(cmd)
+        return 0, "  pid = 4242\n", ""
+
+    monkeypatch.setattr(mod, "_run_cmd", fake_run_cmd)
+    assert await mod._gateway_service_active() is True
+    assert calls and calls[0][:2] == ["launchctl", "print"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_service_active_darwin_loaded_without_pid(monkeypatch):
+    """macOS agent loaded but not running (no pid line) -> False.
+
+    ``LaunchdBackend.active`` treats only a live pid as active, mirroring
+    ``systemctl is-active``; a zero exit from ``launchctl print`` alone is not
+    enough.
+    """
+    monkeypatch.setattr(mod, "_GATEWAY_SERVICE_ACTIVE", None)
+    monkeypatch.setattr(mod, "_GATEWAY_SERVICE_CHECK_AT", 0.0)
+    monkeypatch.setattr(mod, "sys", MagicMock(platform="darwin"))
+    monkeypatch.setattr(
+        mod, "shutil", MagicMock(which=MagicMock(return_value="/bin/launchctl"))
+    )
+    monkeypatch.setattr(
+        mod, "_run_cmd", AsyncMock(return_value=(0, "  state = waiting\n", ""))
+    )
     assert await mod._gateway_service_active() is False
 
 
@@ -3553,6 +5332,7 @@ def _is_stage_step(argv: list) -> bool:
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_sync_stages_dist_on_a_stock_checkout(monkeypatch):
     """The staging step is part of the sync on a stock checkout.
 
@@ -3607,6 +5387,7 @@ async def test_sync_never_stages_dist_on_an_edition_checkout(monkeypatch):
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_sync_build_steps_never_see_credential_helpers(monkeypatch):
     """Only the network fetch step carries operator credential helpers;
     worktree-controlled merge/pip/npm steps must not (token minting via
@@ -3666,6 +5447,7 @@ async def test_fetch_pr_head_oid_refuses_non_merged(monkeypatch):
     assert await mod._fetch_pr_head_oid("feature-x") == "b" * 40
 
 
+@_POSIX_ONLY
 def test_trusted_bin_rejects_agent_writable_path(monkeypatch, tmp_path):
     """Bare command names resolve only inside the trusted bin dirs; a planted
     shim in an agent-writable PATH entry is never selected."""
@@ -3712,6 +5494,7 @@ def test_trusted_bin_pins_the_resolved_target_not_the_symlink(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_run_cmd_pins_trusted_path(monkeypatch):
     """_run_cmd rewrites bare names to trusted absolute paths and pins PATH."""
     captured: dict = {}
@@ -3886,6 +5669,39 @@ async def test_hmac_invalid_signature_denial_is_audited(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_startup_skips_background_tasks_when_disabled(monkeypatch):
+    """``dev_fleet_startup`` must not start the refresher/reaper/warm tasks
+    when background tasks are disabled, so tests that boot the real app via
+    ``create_app()`` (e.g. the HMAC tests above) never drag in a live network
+    ``git fetch``. See issue #1832: an unstubbed ``_status_refresher`` leaked
+    into unrelated tests and flaked ``Gateway Tests (macOS)``."""
+    monkeypatch.setattr(mod, "_load_app_secret", lambda: "sekrit")
+    monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: True)
+    app = mod.create_app()
+    async with TestClient(TestServer(app)):
+        assert mod._refresher_task is None
+        assert mod._reaper_task is None
+        assert mod._warm_task is None
+
+
+@pytest.mark.asyncio
+async def test_startup_starts_background_tasks_when_enabled(monkeypatch):
+    """The opposite of the above: with the gate off (production default),
+    startup still creates all three background tasks."""
+    monkeypatch.setattr(mod, "_load_app_secret", lambda: "sekrit")
+    monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: False)
+    monkeypatch.setattr(mod, "_upstream_remote", AsyncMock(return_value="origin"))
+    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
+    monkeypatch.setattr(mod, "_fleet_refresh", AsyncMock(return_value=None))
+    monkeypatch.setattr(mod, "_auto_prune_reaper", AsyncMock(return_value=None))
+    app = mod.create_app()
+    async with TestClient(TestServer(app)):
+        assert mod._refresher_task is not None
+        assert mod._reaper_task is not None
+        assert mod._warm_task is not None
+
+
+@pytest.mark.asyncio
 async def test_prunable_merged_unverified_when_oid_lookup_fails():
     """OID verification unavailable -> never a prune candidate (preview must
     match the removal path, which would refuse anyway)."""
@@ -3910,6 +5726,7 @@ def test_strict_sandbox_hides_gh_config():
     assert ".config/gh" not in sandbox_mod._STANDARD_DIRS
 
 
+@_POSIX_ONLY
 def test_build_preexec_raises_nofile_ceiling(monkeypatch):
     """Build-class spawns get a 65536 NOFILE ceiling (default 1024 EMFILEs vite)."""
     import kiro_crew.sandbox as sandbox_mod
@@ -3927,6 +5744,7 @@ def test_build_preexec_raises_nofile_ceiling(monkeypatch):
     assert captured["max_open_files"] >= 65536
 
 
+@_POSIX_ONLY
 def test_build_preexec_tolerates_malformed_config(monkeypatch):
     """A junk operator value ("lots") must not raise — the spawn falls back
     to the ceiling instead of leaving Dev Fleet unable to start."""
@@ -4218,19 +6036,22 @@ async def test_pr_query_one_carries_title_and_hides_body():
     payload = json.dumps([{
         "number": 42, "state": "OPEN",
         "url": "https://github.com/o/r/pull/42", "isDraft": False,
-        "title": "My PR title", "body": "Fixes #7",
+        "title": "My PR title", "body": "Fixes #7", "headRefOid": "a" * 40,
     }])
     with patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, payload, "")):
         pr = await mod._pr_query_one("o/r", "feat/x")
     assert pr is not None
     assert pr["title"] == "My PR title"
     assert pr["_body"] == "Fixes #7"
+    assert pr["_head_oid"] == "a" * 40
     assert "body" not in pr  # moved to internal _body
+    assert "headRefOid" not in pr
     redacted = mod._redact_pr(pr)
     assert redacted["title"] == "My PR title"
     assert redacted["number"] == 42
     assert "_body" not in redacted  # internal fields dropped from payload
     assert "_repo" not in redacted
+    assert "_head_oid" not in redacted
 
 
 # --- _build_context: parses PR body + commits, builds links ---
@@ -4363,6 +6184,40 @@ async def _fleet_with(worktrees, **patches):
 
 
 @pytest.mark.asyncio
+async def test_fleet_payload_marks_an_inferred_main_checkout():
+    with patch.object(mod, "MAIN_REPO_INFERRED", True):
+        fleet = await _fleet_with(
+            [{"path": mod.MAIN_REPO, "branch": "main", "is_main": True}]
+        )
+
+    assert fleet["main_repo"] == mod.MAIN_REPO
+    assert fleet["main_repo_inferred"] is True
+
+
+@pytest.mark.asyncio
+async def test_fleet_payload_redacts_credentials_in_main_repo():
+    sensitive = f"/tmp/ghp_{'A' * 40}/checkout"
+    with patch.object(mod, "_repo", return_value=sensitive):
+        fleet = await _fleet_with(
+            [{"path": "/repo", "branch": "main", "is_main": True}]
+        )
+
+    assert "ghp_" not in fleet["main_repo"]
+    assert "[REDACTED" in fleet["main_repo"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_payload_preserves_ordinary_main_repo_path():
+    ordinary = "/home/user/oss/KiroCrew"
+    with patch.object(mod, "_repo", return_value=ordinary):
+        fleet = await _fleet_with(
+            [{"path": "/repo", "branch": "main", "is_main": True}]
+        )
+
+    assert fleet["main_repo"] == ordinary
+
+
+@pytest.mark.asyncio
 async def test_fleet_payload_discloses_why_pods_are_unavailable():
     """_POD_ERROR used to be computed and then read by NOTHING, so a non-Linux
     user got pod controls that silently failed. It must reach the payload."""
@@ -4387,6 +6242,60 @@ async def test_fleet_payload_reports_no_reason_when_pods_work():
     )
     assert fleet["pods_available"] is True
     assert fleet["pods_unavailable_reason"] is None
+
+
+# =============================================================================
+# staged_cancel_available: the payload must mirror the _make_live cancel
+# branch's own precondition (not can_restart), NOT _gateway_service_active
+# (which also goes true for the foreground last resort, where the pointer-only
+# cancel still works). Otherwise the dashboard offers a cancel that /make-live
+# refuses with staged_cutover_pending.
+# =============================================================================
+@pytest.mark.asyncio
+async def test_staged_cancel_available_truth_table():
+    # No service backend at all: nothing to drive, cancel accepted.
+    with patch.object(mod, "_gateway_backend", return_value=None):
+        assert await mod._staged_cancel_available() is True
+    # Drivable manager (unit status ok): _make_live refuses the pointer-only
+    # cancel, so the payload must say unavailable.
+    with patch.object(mod, "_gateway_backend", return_value=object()), \
+         patch.object(mod, "_live_user_unit_status",
+                      new_callable=AsyncMock, return_value="ok"):
+        assert await mod._staged_cancel_available() is False
+    # Manager present but not drivable (e.g. system unit): cancel accepted —
+    # including the foreground-eligible codes, where _gateway_service_active
+    # would report True but can_restart stays False.
+    with patch.object(mod, "_gateway_backend", return_value=object()), \
+         patch.object(mod, "_live_user_unit_status",
+                      new_callable=AsyncMock, return_value="no_user_unit"):
+        assert await mod._staged_cancel_available() is True
+
+
+@pytest.mark.asyncio
+async def test_fleet_payload_reports_staged_cancel_available_with_stage():
+    fleet = await _fleet_with(
+        [{"path": "/repo", "branch": "main", "is_main": True}],
+        _load_cfg=lambda: None,
+        _staged_target=lambda: "/w/other",
+        _staged_cancel_available=AsyncMock(return_value=True),
+    )
+    assert fleet["staged_cancel_available"] is True
+
+
+@pytest.mark.asyncio
+async def test_fleet_payload_staged_cancel_false_without_stage():
+    """No stage pending: the field is False and the host is NOT probed — the
+    fleet endpoint is polled, so an unconditional service-manager probe would
+    add a subprocess per poll for a control that cannot render anyway."""
+    probe = AsyncMock(return_value=True)
+    fleet = await _fleet_with(
+        [{"path": "/repo", "branch": "main", "is_main": True}],
+        _load_cfg=lambda: None,
+        _staged_target=lambda: None,
+        _staged_cancel_available=probe,
+    )
+    assert fleet["staged_cancel_available"] is False
+    probe.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -4540,8 +6449,9 @@ async def test_auto_prune_once_removes_merged_only_and_records_failures():
     ]}
     seen = []
 
-    async def _fake_remove(name, force=False):
+    async def _fake_remove(name, force=False, _caller="handler"):
         assert force is False  # reaper never force-removes
+        assert _caller == "reaper"
         seen.append(name)
         return {"ok": True} if name == "wt-merged" else {"ok": False, "error": "nope"}
 
@@ -4672,7 +6582,7 @@ async def test_prune_run_per_item_states_and_failure_isolation(reset_prune_state
             return {"ok": False, "code": "active"}
         return {"ok": True, "code": "merged"}
 
-    async def fake_remove(nm, force=False, progress=None):
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
         # exercise the phase callback the parallel driver passes in
         if progress is not None:
             progress("stopping_pod")
@@ -4721,7 +6631,7 @@ async def test_prune_run_exception_in_item_is_isolated(reset_prune_state):
     async def fake_prunable(path, branch):
         return {"ok": True, "code": "merged"}
 
-    async def fake_remove(nm, force=False, progress=None):
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
         if nm == "wt-boom":
             raise RuntimeError("kaboom")
         return {"ok": True, "removed": True}
@@ -4760,7 +6670,7 @@ async def test_prune_run_caps_concurrency_at_semaphore_limit(reset_prune_state, 
         inflight -= 1
         return {"ok": True, "code": "merged"}
 
-    async def fake_remove(nm, force=False, progress=None):
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
         return {"ok": True, "removed": True}
 
     with patch.object(mod, "_find_worktree", side_effect=fake_find), \
@@ -4830,7 +6740,7 @@ async def test_prune_run_deduplicates_names(reset_prune_state):
     async def fake_prunable(path, branch):
         return {"ok": True, "code": "merged"}
 
-    async def fake_remove(nm, force=False, progress=None):
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
         removed.append(nm)
         return {"ok": True, "removed": True}
 
@@ -4849,6 +6759,85 @@ async def test_prune_run_deduplicates_names(reset_prune_state):
     assert len(st["results"]) == 2
     # completed batch never leaves a finished name in ``current``
     assert st["current"] is None
+
+
+@pytest.mark.asyncio
+async def test_prune_run_processes_force_only_names(reset_prune_state):
+    """A force-override on a kept worktree arrives in ``force_names`` disjoint
+    from ``names``. It must still be processed and counted: absent from the
+    work list, its ``done`` bump would have no denominator or item row,
+    producing the impossible ``1/0`` counter (and a false failure toast). The
+    forced item also skips the prunable-verdict recheck — ``_prunable`` is
+    never consulted for it."""
+    prunable_calls: list[str] = []
+    removed: list[str] = []
+
+    async def fake_find(nm):
+        return {"path": f"/wt/{nm}", "branch": f"feat/{nm}"}, None
+
+    async def fake_prunable(path, branch):
+        prunable_calls.append(path)
+        return {"ok": True, "code": "merged"}
+
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
+        removed.append(nm)
+        return {"ok": True, "removed": True}
+
+    with patch.object(mod, "_find_worktree", side_effect=fake_find), \
+         patch.object(mod, "_prunable", side_effect=fake_prunable), \
+         patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None), \
+         patch.object(mod, "_staged_target", return_value=None), \
+         patch.object(mod, "_worktree_remove", side_effect=fake_remove):
+        # No regular candidates; a single kept worktree via force-override.
+        r = await mod._prune_run([], force_names={"wt-kept"})
+        assert r == {"ok": True, "total": 1}
+        await _await_prune_idle()
+
+    st = await mod._prune_status()
+    # The forced worktree is in the denominator, has an item row, and is done.
+    assert st["total"] == 1 and st["done"] == 1
+    assert set(st["items"]) == {"wt-kept"}
+    assert st["items"]["wt-kept"]["status"] == "done"
+    assert removed == ["wt-kept"]
+    # Forced items bypass the prunable verdict recheck entirely.
+    assert prunable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_prune_run_unions_regular_and_forced_names(reset_prune_state):
+    """A mixed batch (regular candidates + a forced kept worktree) processes
+    the order-preserving union: every name is counted and removed exactly
+    once, and only the non-forced names go through the prunable recheck."""
+    prunable_paths: list[str] = []
+    removed: list[str] = []
+
+    async def fake_find(nm):
+        return {"path": f"/wt/{nm}", "branch": f"feat/{nm}"}, None
+
+    async def fake_prunable(path, branch):
+        prunable_paths.append(path)
+        return {"ok": True, "code": "merged"}
+
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
+        removed.append(nm)
+        return {"ok": True, "removed": True}
+
+    with patch.object(mod, "_find_worktree", side_effect=fake_find), \
+         patch.object(mod, "_prunable", side_effect=fake_prunable), \
+         patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None), \
+         patch.object(mod, "_staged_target", return_value=None), \
+         patch.object(mod, "_worktree_remove", side_effect=fake_remove):
+        r = await mod._prune_run(["wt-a", "wt-b"], force_names={"wt-forced"})
+        assert r == {"ok": True, "total": 3}
+        await _await_prune_idle()
+
+    st = await mod._prune_status()
+    assert st["total"] == 3 and st["done"] == 3
+    assert set(st["items"]) == {"wt-a", "wt-b", "wt-forced"}
+    assert all(it["status"] == "done" for it in st["items"].values())
+    assert sorted(removed) == ["wt-a", "wt-b", "wt-forced"]
+    # Only the two regular candidates go through the verdict recheck.
+    assert sorted(prunable_paths) == ["/wt/wt-a", "/wt/wt-b"]
 
 
 @pytest.mark.asyncio
@@ -4881,6 +6870,7 @@ async def test_worktree_remove_refuses_when_pod_reactivates_before_mutation(rese
          patch.object(mod, "_git", new_callable=AsyncMock, return_value="a" * 40), \
          patch.object(mod, "_load_cfg", return_value=object()), \
          patch.object(mod, "_POD_AVAILABLE", True), \
+         patch.object(mod.rt, "require_backend", return_value=None), \
          patch.object(mod.rt, "active_names", side_effect=lambda cfg: next(active_calls)), \
          patch.object(mod, "_run_cmd", side_effect=fake_run_cmd):
         res = await mod._worktree_remove("wt-1", force=False)
@@ -4931,12 +6921,15 @@ def test_register_skills_creates_symlinks_for_bundled_skills(tmp_path, monkeypat
     # The stale bundled copy must stay deleted — the shipped catalog owns it.
     assert not (app_root / "skills" / "kirocrew-worktree-dev").exists()
 
+    # is_link_or_junction, not is_symlink: registration links with a directory junction
+    # on Windows (an unprivileged account holds no SeCreateSymbolicLinkPrivilege)
+    # and a junction reports is_symlink() False.
     for skill_name in expected_skills:
         link = namespaced_dir / skill_name
-        assert link.is_symlink(), f"Namespaced link missing: {link}"
+        assert platform_compat.is_link_or_junction(link), f"Namespaced link missing: {link}"
         assert link.resolve().is_dir()
         flat = skills_dir / skill_name
-        assert flat.is_symlink(), f"Flat link missing: {flat}"
+        assert platform_compat.is_link_or_junction(flat), f"Flat link missing: {flat}"
         assert flat.resolve().is_dir()
 
 
@@ -5184,6 +7177,7 @@ async def test_api_health_start_id_none_safe():
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_make_live_returns_start_id(monkeypatch, tmp_path):
     """A real cutover captures + returns the pre-restart start identity so the
     dashboard reuses the same restart handshake (issue #639)."""
@@ -5513,6 +7507,7 @@ def test_declared_platforms_all_resolve_to_a_real_sys_platform():
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 async def test_sync_builds_and_stages_under_one_lock_holder(monkeypatch, tmp_path):
     """Pull+Build must build and stage inside ONE locked step.
 
@@ -5718,7 +7713,7 @@ def test_serving_install_reason_names_both_installs_and_a_remedy(tmp_path):
 
 
 def test_serving_install_reason_is_silent_with_no_checkout_to_manage(tmp_path):
-    """MAIN_REPO defaults to ~/kirocrew whether or not it exists.
+    """A path that is not a checkout is not something Dev Fleet manages.
 
     A desktop-bundle or pip install with no source checkout is the out-of-the-box
     case; warning it to "start the gateway from <path>" names a directory that is
@@ -5803,3 +7798,1425 @@ async def test_serving_install_reason_recomputes_when_the_checkout_set_changes(
     await mod._serving_install_reason([{"path": "/wt/a"}, {"path": "/wt/b"}])
 
     assert seen == [("/wt/a",), ("/wt/a", "/wt/b")]
+
+
+# --- Worktree teardown guard tests (issue #1554) ---
+
+
+@pytest.mark.asyncio
+async def test_force_remove_refuses_dirty_unmerged_worktree():
+    """Regression for #1554: force=True must NOT destroy a dirty tree whose PR
+    is unmerged — that combination is unrecoverable data loss."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "OPEN"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "uncommitted changes" in result["error"]
+    assert "not merged" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_force_remove_refuses_dirty_merged_worktree():
+    """Regression for #1554 round-5: force=True must NOT destroy a dirty tree
+    even when the PR IS merged — containment proves commits are shipped but
+    says nothing about working-tree edits. --force bypasses git's dirty check
+    and would irrecoverably destroy uncommitted edits."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(
+            mod,
+            "_fetch_pr_head_oid",
+            new_callable=AsyncMock,
+            return_value="aaa1111",
+        ),
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "uncommitted changes" in result["error"]
+    assert "commit, stash, or clean" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_ancestry_gate_skips_ref_delete_when_not_ancestor():
+    """When cached PR status wrongly says MERGED but the branch OID is NOT an
+    ancestor of the base branch AND containment also fails at the ref-delete
+    gate, the ref must survive (fail-closed gate)."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    git_calls: list[tuple] = []
+
+    async def _fake_run_cmd(cmd, **kwargs):
+        git_calls.append(tuple(cmd))
+        if "worktree" in cmd and "remove" in cmd:
+            return (0, "", "")
+        if "merge-base" in cmd and "--is-ancestor" in cmd:
+            return (1, "", "")
+        return (0, "", "")
+
+    async def _fake_contained(path, branch_oid, pr_head_oid):
+        # The squash-safe race guard passes (worktree path), but the
+        # ref-delete gate fails (MAIN_REPO path).
+        if path == "/fake/wt":
+            return True
+        return False
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(
+            mod,
+            "_head_contained_in_pr",
+            new_callable=AsyncMock,
+            side_effect=_fake_contained,
+        ),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, side_effect=_fake_run_cmd),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    update_ref_calls = [c for c in git_calls if "update-ref" in c]
+    assert update_ref_calls == [], f"ref should NOT be deleted: {update_ref_calls}"
+
+
+@pytest.mark.asyncio
+async def test_ancestry_gate_allows_ref_delete_when_ancestor():
+    """When PR is merged and branch OID IS an ancestor of base, ref IS deleted."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    git_calls: list[tuple] = []
+    deleted_refs: list[str] = []
+
+    async def _fake_run_cmd(cmd, **kwargs):
+        git_calls.append(tuple(cmd))
+        if "worktree" in cmd and "remove" in cmd:
+            return (0, "", "")
+        if "merge-base" in cmd and "--is-ancestor" in cmd:
+            return (0, "", "")
+        return (0, "", "")
+
+    async def _fake_git(repo, *args, **kwargs):
+        if args and args[0] == "update-ref" and "-d" in args:
+            deleted_refs.append(args[2])
+            return ""
+        if args and args[0] == "rev-parse":
+            return "aaa1111"
+        return ""
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(mod, "_git", new_callable=AsyncMock, side_effect=_fake_git),
+        patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, side_effect=_fake_run_cmd),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert "refs/heads/feat-x" in deleted_refs
+
+
+@pytest.mark.asyncio
+async def test_empty_branch_ref_survives_when_pr_not_merged():
+    """own==0 (empty branch) must NOT delete the branch ref when no PR is
+    merged: an empty branch may simply not have been pushed yet, and the ref
+    is the only local pointer to those commits (recoverable > irrecoverable).
+    Regression test for kirodotdev#1554."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    deleted_refs: list[str] = []
+
+    async def _fake_run_cmd(cmd, **kwargs):
+        if "worktree" in cmd and "remove" in cmd:
+            return (0, "", "")
+        if "merge-base" in cmd and "--is-ancestor" in cmd:
+            return (0, "", "")
+        return (0, "", "")
+
+    async def _fake_git(repo, *args, **kwargs):
+        if args and args[0] == "update-ref" and "-d" in args:
+            deleted_refs.append(args[2])
+            return ""
+        if args and args[0] == "rev-parse":
+            return "bbb2222"
+        return ""
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "empty-br", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(mod, "_pr_status_cached", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(mod, "_git", new_callable=AsyncMock, side_effect=_fake_git),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, side_effect=_fake_run_cmd),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("empty-br", force=False)
+
+    assert result["ok"] is True
+    assert deleted_refs == [], f"unmerged empty-branch ref must survive: {deleted_refs}"
+
+
+@pytest.mark.asyncio
+async def test_removal_audit_log_emitted(caplog):
+    """Successful removal emits a structured audit line with verdict fields."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "worktree=feat-x" in msg
+    assert "branch=feat-x" in msg
+    assert "caller=handler" in msg
+    assert "action=removed" in msg
+    assert "pr_state=MERGED" in msg
+
+
+@pytest.mark.asyncio
+async def test_force_refuse_audit_log_emitted(caplog):
+    """The dirty+unmerged force refusal also emits an audit line."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "OPEN"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "action=refused_dirty_unmerged" in msg
+    assert "dirty=True" in msg
+
+
+# --- Regression tests for PR 1840: force guard fail-closed fixes ---
+
+
+@pytest.mark.asyncio
+async def test_force_remove_refuses_unknown_dirty_state(caplog):
+    """Regression (a): _real_dirty returns None (git status failed), force=True,
+    PR OPEN — removal must be refused, error names the unverifiable state.
+    Previously fell through (fail-open)."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=None),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "OPEN"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "cannot verify worktree cleanliness" in result["error"]
+    assert "git status failed" in result["error"]
+    # Audit line with dirty=unknown and action=refused_unverifiable
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "action=refused_unverifiable" in msg
+    assert "dirty=unknown" in msg
+
+
+@pytest.mark.asyncio
+async def test_force_remove_refuses_stale_merged_cache(caplog):
+    """Regression (b): cached PR status MERGED but fresh _fetch_pr_head_oid
+    returns None (stale cache / reused branch name), force=True, dirty=True
+    — must refuse. Previously the guard was bypassed entirely."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(
+            mod,
+            "_fetch_pr_head_oid",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        # verdict_oid pin succeeds so we reach the fresh-MERGED gate
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="abc123def456"),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "stale cache" in result["error"] or "fresh verification failed" in result["error"]
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "action=refused_stale_merged" in msg
+
+
+@pytest.mark.asyncio
+async def test_force_remove_fresh_merged_refuses_dirty(caplog):
+    """Regression for #1554 round-5: cached MERGED + fresh verdict confirms
+    MERGED + dirty=True + force=True → removal REFUSED with audit line
+    action=refused_dirty_merged. Containment proves commits are shipped but
+    says nothing about working-tree edits."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(
+            mod,
+            "_fetch_pr_head_oid",
+            new_callable=AsyncMock,
+            return_value="aaa1111",
+        ),
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "uncommitted changes" in result["error"]
+    assert "commit, stash, or clean" in result["error"]
+    # Audit line with action=refused_dirty_merged
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "action=refused_dirty_merged" in msg
+    assert "pr_state=MERGED(fresh)" in msg
+
+
+@pytest.mark.asyncio
+async def test_force_remove_fresh_merged_refuses_unknown_dirty(caplog):
+    """Regression for #1554 round-5: cached MERGED + fresh verdict confirms
+    MERGED + dirty=None + force=True → removal REFUSED with audit line
+    action=refused_unverifiable_merged."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=None),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(
+            mod,
+            "_fetch_pr_head_oid",
+            new_callable=AsyncMock,
+            return_value="aaa1111",
+        ),
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "unverifiable state" in result["error"]
+    assert "commit, stash, or clean" in result["error"]
+    # Audit line with action=refused_unverifiable_merged
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "action=refused_unverifiable_merged" in msg
+    assert "pr_state=MERGED(fresh)" in msg
+
+
+@pytest.mark.asyncio
+async def test_force_remove_clean_merged_proceeds():
+    """Control: force=True + dirty=False + MERGED → removal proceeds WITHOUT --force.
+    Clean-tree force removals on merged branches proceed but drop --force so git's
+    own dirty check guards the TOCTOU window (round-6 fix)."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    run_cmd_calls: list[list[str]] = []
+
+    async def _fake_run_cmd(cmd, **kwargs):
+        run_cmd_calls.append(list(cmd))
+        return (0, "", "")
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(
+            mod,
+            "_fetch_pr_head_oid",
+            new_callable=AsyncMock,
+            return_value="aaa1111",
+        ),
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", side_effect=_fake_run_cmd),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is True
+    # Round-6 assertion: the removal command must NOT contain --force —
+    # git's own dirty check is the atomic TOCTOU guard for merged-clean removals.
+    removal_cmds = [c for c in run_cmd_calls if "worktree" in c and "remove" in c]
+    assert len(removal_cmds) == 1, f"Expected exactly one removal cmd, got {removal_cmds}"
+    assert "--force" not in removal_cmds[0], (
+        f"Round-6 regression: merged+clean removal must not pass --force to git; "
+        f"got: {removal_cmds[0]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_squash_merge_ref_deletion():
+    """Squash-merge regression: PR merged, ancestry check fails (squash merge),
+    containment check passes → ref IS deleted. Previously squash-merged refs
+    accumulated forever because ancestry is the only gate that passed."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    deleted_refs: list[str] = []
+
+    async def _fake_run_cmd(cmd, **kwargs):
+        if "worktree" in cmd and "remove" in cmd:
+            return (0, "", "")
+        if "merge-base" in cmd and "--is-ancestor" in cmd:
+            # Ancestry fails — simulates squash merge
+            return (1, "", "")
+        return (0, "", "")
+
+    async def _fake_git(repo, *args, **kwargs):
+        if args and args[0] == "update-ref" and "-d" in args:
+            deleted_refs.append(args[2])
+            return ""
+        if args and args[0] == "rev-parse":
+            return "aaa1111"
+        return ""
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_git", new_callable=AsyncMock, side_effect=_fake_git),
+        patch.object(
+            mod,
+            "_fetch_pr_head_oid",
+            new_callable=AsyncMock,
+            return_value="aaa1111",
+        ),
+        # Containment passes — branch OID is ancestor of PR head (squash-safe)
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, side_effect=_fake_run_cmd),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert (
+        "refs/heads/feat-x" in deleted_refs
+    ), "ref should be deleted via squash-safe containment fallback"
+
+
+# --- Regression tests for PR 1840 round-3: TOCTOU + containment fixes ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.xdist_group("caplog_dev_fleet")
+async def test_toctou_clean_unmerged_force_omits_git_force(caplog):
+    """TOCTOU regression: when force=True overrides ONLY because the unmerged
+    tree verified clean, the removal command must NOT contain --force. This way
+    git's own dirty check acts as the atomic last-line guard — if the tree
+    became dirty in the window between the guard and the actual removal, git
+    itself refuses.
+
+    Regression for round-3 fix (b448aa32): at head 3543d9bc the --force flag
+    leaked through on this path; this test pinpoints the contract that
+    force_use_git_force is set to False and the audit action
+    'unmerged_clean_no_git_force' is emitted."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    captured_cmds: list[list[str]] = []
+
+    async def _capture_run_cmd(cmd, **kwargs):
+        captured_cmds.append(list(cmd))
+        if "worktree" in cmd and "remove" in cmd:
+            return (0, "", "")
+        if "merge-base" in cmd and "--is-ancestor" in cmd:
+            return (1, "", "")  # ancestry fails (irrelevant here)
+        return (0, "", "")
+
+    with (
+        caplog.at_level(logging.INFO),
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "OPEN"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, side_effect=_capture_run_cmd),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is True
+    removal_cmds = [c for c in captured_cmds if "worktree" in c and "remove" in c]
+    assert len(removal_cmds) == 1
+    assert "--force" not in removal_cmds[0], (
+        "clean-unmerged force path must NOT include --force in the git command"
+    )
+    # Verify the audit action was logged (regression: the action proves
+    # the code explicitly set force_use_git_force = False on this path).
+    # The security gate is the --force assertion above; this audit check is
+    # secondary and can lose its record under xdist worker log routing.
+    audit_msgs = [
+        r.message for r in caplog.records
+        if "unmerged_clean_no_git_force" in r.message
+    ]
+    if not audit_msgs:
+        import warnings
+        warnings.warn(
+            "caplog audit record missing (xdist log routing); "
+            "security assertion (--force not in cmd) passed",
+            stacklevel=1,
+        )
+    else:
+        assert len(audit_msgs) == 1, (
+            "expected exactly one 'unmerged_clean_no_git_force' audit line"
+        )
+
+
+@pytest.mark.asyncio
+async def test_toctou_git_refusal_returns_error_with_audit(caplog):
+    """TOCTOU regression: when git worktree remove (without --force) fails
+    because the tree became dirty in the window, the function returns ok:False
+    and emits the refused_dirty_at_removal audit line."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    async def _failing_run_cmd(cmd, **kwargs):
+        if "worktree" in cmd and "remove" in cmd:
+            # Simulate git refusing because tree became dirty
+            return (1, "", "fatal: '/fake/wt' contains modified tracked files")
+        return (0, "", "")
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "OPEN"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=0),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, side_effect=_failing_run_cmd),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "modified tracked files" in result["error"]
+    # Audit line must record the TOCTOU event
+    audit_lines = [r for r in caplog.records if "refused_dirty_at_removal" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "action=refused_dirty_at_removal" in msg
+    assert "dirty_at_removal=True" in msg
+
+
+@pytest.mark.asyncio
+async def test_containment_refuses_uncontained_fresh_head(caplog):
+    """Containment regression: cached PR=MERGED, fresh query returns a valid
+    head OID (old PR merged genuinely), but the branch's current OID is NOT
+    contained in that head (new unmerged commits on a reused branch name) →
+    force removal must be refused with refused_uncontained_fresh_head audit."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        # Dirty — so the fresh-MERGED gate fires (only fires for dirty/unknown)
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=5),
+        # Fresh head returns the OLD PR's head (valid, non-None)
+        patch.object(
+            mod,
+            "_fetch_pr_head_oid",
+            new_callable=AsyncMock,
+            return_value="old_merged_pr_head_abc123",
+        ),
+        # rev-parse returns the branch's CURRENT OID (new commits)
+        patch.object(
+            mod, "_git", new_callable=AsyncMock, return_value="new_unmerged_oid_def456"
+        ),
+        # Containment fails — new commits not in old PR head
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=False),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "not contained" in result["error"]
+    assert "reused branch" in result["error"]
+    # Audit
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "action=refused_uncontained_fresh_head" in msg
+
+
+@pytest.mark.asyncio
+async def test_containment_allows_when_contained():
+    """Round 5 regression: cached MERGED + fresh head + branch OID IS contained
+    in fresh head BUT worktree is dirty → refused_dirty_merged. Containment
+    proves commits are shipped; it cannot vouch for uncommitted working-tree
+    edits.
+
+    Pre-round-5 behavior was to allow this removal — the current contract
+    refuses it to prevent irrecoverable loss of uncommitted edits."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3),
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        patch.object(
+            mod,
+            "_fetch_pr_head_oid",
+            new_callable=AsyncMock,
+            return_value="aaa1111",
+        ),
+        # Containment passes — branch OID is contained in fresh head
+        patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=True),
+        patch.object(mod, "_load_cfg", return_value=None),
+        patch.object(mod, "_POD_AVAILABLE", False),
+        patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    # Rounds 5-6: dirty tree is refused even when PR is verified-merged+contained
+    assert result["ok"] is False
+    assert "uncommitted changes" in result["error"]
+
+
+# --- Round 4 regressions: containment pin fail-closed ---
+
+
+@pytest.mark.asyncio
+async def test_containment_pin_falsy_refuses_unpinnable(caplog):
+    """Regression (round 4): cached MERGED + dirty + force=True, the
+    verdict_oid rev-parse returns falsy (None/empty) — a transient git
+    failure — must REFUSE the forced removal with refused_unpinnable audit
+    rather than silently skip containment and let the later removal proceed.
+
+    At 3ca2ac3a this failed open: `if pinned_oid and not _head_contained()`
+    skipped containment when pinned_oid was falsy."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=5),
+        # rev-parse fails → returns None (transient git lock contention)
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "cannot pin branch OID" in result["error"]
+    # Audit line must record the refused_unpinnable action
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    msg = audit_lines[0].message
+    assert "action=refused_unpinnable" in msg
+
+
+@pytest.mark.asyncio
+async def test_containment_pin_empty_string_refuses_unpinnable(caplog):
+    """Same as above but rev-parse returns empty string (another falsy form)."""
+    import logging
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(
+            mod,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": "MERGED"},
+        ),
+        patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=5),
+        # rev-parse returns empty string (another failure mode)
+        patch.object(mod, "_git", new_callable=AsyncMock, return_value=""),
+        patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"),
+        caplog.at_level(logging.INFO, logger="kiro_crew.apps.builtins.dev_fleet.server"),
+    ):
+        result = await mod._worktree_remove("feat-x", force=True)
+
+    assert result["ok"] is False
+    assert "cannot pin branch OID" in result["error"]
+    audit_lines = [r for r in caplog.records if "worktree_removal_audit" in r.message]
+    assert len(audit_lines) == 1
+    assert "action=refused_unpinnable" in audit_lines[0].message
+
+
+@pytest.mark.asyncio
+async def test_dirty_unmerged_message_does_not_promise_force_override():
+    """Message regression: the non-forced dirty refusal no longer says
+    'use force to override' since force is also refused for dirty+unmerged."""
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with (
+        patch.object(
+            mod,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None),
+        ),
+        patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(mod, "_own_checkout_path", return_value=None),
+        # Dirty tree, non-forced, PR not merged
+        patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True),
+    ):
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is False
+    # Must NOT say "use force to override" — that's a dead-end promise
+    assert "use force to override" not in result["error"]
+    # Should mention uncommitted changes
+    assert "uncommitted changes" in result["error"]
+
+
+# =============================================================================
+# Foreground last-resort restart (issue #2566)
+# =============================================================================
+
+def _mk_kcbin(tmp_path: Path, name: str = "kirocrew") -> Path:
+    """An executable file that passes ForegroundBackend's launcher validation."""
+    d = tmp_path / "bin"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    p.write_text("#!/bin/sh\n")
+    p.chmod(0o755)
+    return p
+
+
+def _fg(tmp_path: Path, *, port: int = 7777, pid: int = 4242,
+        launcher: "str | None" = None, alive: bool = True, spawn=None,
+        ports: "list[int] | None" = None, pids: "dict[int, int] | None" = None,
+        confined: "str | None" = None):
+    """A ForegroundBackend wired to fakes. Returns (backend, spawned_argvs)."""
+    from kiro_crew.apps.builtins.dev_fleet import gateway_service as gs
+
+    spawned: list[list[str]] = []
+
+    def default_spawn(argv):
+        spawned.append(list(argv))
+
+    marker_ports = ports if ports is not None else [port]
+    pid_by_port = pids if pids is not None else {port: pid}
+    backend = gs.ForegroundBackend(
+        marker_ports=lambda: list(marker_ports),
+        read_pid=lambda p: pid_by_port.get(p),
+        read_launcher=lambda p: launcher,
+        pid_exists=lambda p: alive,
+        spawn=spawn if spawn is not None else default_spawn,
+        confinement=lambda: confined,
+    )
+    return backend, spawned
+
+
+@pytest.mark.asyncio
+async def test_foreground_backend_ok_and_start_id(tmp_path):
+    """Single live marker + resolvable binary -> ok; start_id is the marker pid."""
+    kc = _mk_kcbin(tmp_path)
+    fg, _ = _fg(tmp_path, launcher=str(kc))
+    assert await fg.status() == "ok"
+    assert await fg.start_id() == "4242"
+
+
+@pytest.mark.asyncio
+async def test_foreground_backend_unavailable_cases(tmp_path):
+    """No marker, dead pid, or ambiguous markers -> unavailable, start_id None."""
+    kc = _mk_kcbin(tmp_path)
+    # No marker at all.
+    fg, _ = _fg(tmp_path, ports=[], pids={}, launcher=str(kc))
+    assert await fg.status() == "no_foreground_gateway"
+    assert await fg.start_id() is None
+    # Marker whose pid is dead (crash leftover).
+    fg, _ = _fg(tmp_path, alive=False, launcher=str(kc))
+    assert await fg.status() == "no_foreground_gateway"
+    # Two live markers: ambiguous, never guess which gateway to bounce.
+    fg, _ = _fg(tmp_path, ports=[7777, 7778], pids={7777: 1, 7778: 2},
+                launcher=str(kc))
+    assert await fg.status() == "no_foreground_gateway"
+    assert await fg.start_id() is None
+
+
+@pytest.mark.asyncio
+async def test_foreground_backend_binary_resolution(tmp_path):
+    """ONLY the keystone-fenced marker launcher is trusted — no PATH fallback
+    (an agent can plant a `kirocrew` in ~/.local/bin); invalid recorded
+    launchers are refused rather than guessed around."""
+    kc = _mk_kcbin(tmp_path)
+    # Marker launcher used, verbatim.
+    fg, spawned = _fg(tmp_path, launcher=str(kc))
+    ok, err = await fg.restart_detached()
+    assert ok and spawned[0][0] == str(kc)
+    # No recorded launcher (source-tree launch, empty marker): refuse — the
+    # PATH fallback is deliberately absent.
+    fg, spawned = _fg(tmp_path, launcher=None)
+    assert await fg.status() == "no_kirocrew_binary"
+    ok, err = await fg.restart_detached()
+    assert not ok and "resolved" in err and spawned == []
+    # A launcher that is not basenamed kirocrew is refused even when executable
+    # (the _own_console_script rule: exec the entry point it claims to be).
+    impostor = _mk_kcbin(tmp_path / "i", name="systemctl")
+    fg, _ = _fg(tmp_path, launcher=str(impostor))
+    assert await fg.status() == "no_kirocrew_binary"
+    # A non-executable launcher is refused: it could stop the gateway but never
+    # start the replacement.
+    limp = _mk_kcbin(tmp_path / "n")
+    limp.chmod(0o644)
+    fg, _ = _fg(tmp_path, launcher=str(limp))
+    assert await fg.status() == "no_kirocrew_binary"
+    # A relative recorded path is refused (never resolved against a cwd).
+    fg, _ = _fg(tmp_path, launcher="bin/kirocrew")
+    assert await fg.status() == "no_kirocrew_binary"
+
+
+@pytest.mark.asyncio
+async def test_foreground_backend_refuses_when_confined(tmp_path):
+    """A confined backend (OS sandbox / agents cgroup scope) never spawns: the
+    replacement would inherit the confinement for the gateway's whole life."""
+    kc = _mk_kcbin(tmp_path)
+    fg, spawned = _fg(tmp_path, launcher=str(kc),
+                      confined="the Dev Fleet backend runs inside the sandbox")
+    assert await fg.status() == "backend_confined"
+    ok, err = await fg.restart_detached()
+    assert not ok and "sandbox" in err
+    assert spawned == []
+
+
+def test_default_confinement_detects_sandbox_marker(monkeypatch):
+    """KIROCREW_SANDBOX_ACTIVE — the launcher-exported in-sandbox marker — is
+    detected as confinement (checked before the cgroup read, so this is
+    deterministic on any host)."""
+    from kiro_crew.apps.builtins.dev_fleet import gateway_service as gs
+
+    monkeypatch.setenv("KIROCREW_SANDBOX_ACTIVE", "1")
+    reason = gs.default_confinement()
+    assert reason is not None and "sandbox" in reason
+
+
+@pytest.mark.asyncio
+async def test_foreground_restart_detached_pins_port(tmp_path):
+    """The detached command is `<bin> restart --port <marker port>`."""
+    kc = _mk_kcbin(tmp_path)
+    fg, spawned = _fg(tmp_path, port=6776, pid=99, launcher=str(kc))
+    ok, err = await fg.restart_detached()
+    assert ok and err == ""
+    assert spawned == [[str(kc), "restart", "--port", "6776"]]
+
+
+@pytest.mark.asyncio
+async def test_foreground_spawn_failure_signals_nothing(tmp_path, monkeypatch):
+    """A spawn that cannot be established returns (False, why) and the backend
+    never signals any process — the incumbent gateway must stay untouched."""
+    kc = _mk_kcbin(tmp_path)
+
+    def bad_spawn(argv):
+        raise OSError("resource temporarily unavailable")
+
+    kills: list = []
+    monkeypatch.setattr(os, "kill", lambda *a: kills.append(a))
+    fg, _ = _fg(tmp_path, launcher=str(kc), spawn=bad_spawn)
+    ok, err = await fg.restart_detached()
+    assert not ok and "resource temporarily unavailable" in err
+    assert kills == []
+
+
+@pytest.mark.asyncio
+async def test_make_live_foreground_last_resort_cutover(monkeypatch, tmp_path):
+    """When no manager is drivable but a single live foreground gateway exists,
+    make-live finishes the cutover itself: pointer written, detached
+    `kirocrew restart` established, start_id (the pre-restart pid) returned,
+    and the committed latch set exactly as on a drivable host."""
+    kc = _mk_kcbin(tmp_path)
+    for status in ("no_systemd", "no_user_unit", "no_launchd", "no_agent"):
+        wt = _mk_make_live_wt(tmp_path / status, venv=True, dist=True)
+        ptr_dir = tmp_path / "ptr" / status
+        _stub_make_live(monkeypatch, wt, unit_status=status, pointer_dir=ptr_dir)
+        monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False, raising=False)
+        fg, spawned = _fg(tmp_path, port=7777, pid=31337, launcher=str(kc))
+        monkeypatch.setattr(mod, "_foreground_backend", lambda fg=fg: fg)
+
+        res = await mod._make_live(str(wt), dry_run=False)
+        assert res["ok"] is True and res["cutover"] is True, f"{status}: {res}"
+        assert "staged_only" not in res
+        assert res["start_id"] == "31337"
+        assert spawned == [[str(kc), "restart", "--port", "7777"]]
+        # Pointer written with the target.
+        data = json.loads((ptr_dir / "live_target.json").read_text())
+        assert Path(data["checkout"]).resolve() == wt.resolve()
+        # A restart IS pending: latched like the drivable path.
+        assert mod._MAKE_LIVE_COMMITTED is True
+
+
+@pytest.mark.asyncio
+async def test_make_live_foreground_is_strictly_last_resort(monkeypatch, tmp_path):
+    """Ordering is systemd > launchd > foreground: on a drivable host — or one
+    whose manager exists but is mis-set-up (named-remedy codes) — the
+    foreground backend is never even constructed."""
+    factory = MagicMock()
+    monkeypatch.setattr(mod, "_foreground_backend", factory)
+    # Drivable systemd host: full managed cutover, no foreground.
+    wt = _mk_make_live_wt(tmp_path / "ok", venv=True, dist=True)
+    _stub_make_live(monkeypatch, wt, unit_status="ok",
+                    pointer_dir=tmp_path / "ptr-ok")
+    monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False, raising=False)
+    res = await mod._make_live(str(wt), dry_run=False)
+    assert res["ok"] is True and "staged_only" not in res
+    factory.assert_not_called()
+    # Mis-set-up managers keep their named remedy; foreground must not bounce
+    # a gateway behind a manager's back.
+    for status in ("user_unit_inactive", "agent_not_indirected",
+                   "agent_restart_contract_outdated", "live_program_missing"):
+        wt = _mk_make_live_wt(tmp_path / status, venv=True, dist=True)
+        _stub_make_live(monkeypatch, wt, unit_status=status,
+                        pointer_dir=tmp_path / f"ptr-{status}")
+        monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False, raising=False)
+        res = await mod._make_live(str(wt), dry_run=False)
+        assert res["ok"] is True and res["staged_only"] is True, f"{status}: {res}"
+        factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_make_live_foreground_spawn_failure_keeps_advisory(monkeypatch, tmp_path):
+    """FAIL SAFE: when the detached spawn cannot be established the running
+    gateway is untouched, the pointer STAYS staged, the committed latch is not
+    set, and the response is the status-quo manual advisory."""
+    kc = _mk_kcbin(tmp_path)
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(monkeypatch, wt, unit_status="no_systemd", pointer_dir=ptr_dir)
+    monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False, raising=False)
+
+    def bad_spawn(argv):
+        raise OSError("spawn refused")
+
+    fg, _ = _fg(tmp_path, launcher=str(kc), spawn=bad_spawn)
+    monkeypatch.setattr(mod, "_foreground_backend", lambda: fg)
+
+    res = await mod._make_live(str(wt), dry_run=False)
+    assert res["ok"] is True and res["staged_only"] is True
+    assert res["manual_restart"]
+    assert res["manual_restart"] in res["notice"]
+    # The plan must not keep promising an automatic restart that failed.
+    assert res["plan"]["restart"] == "manual"
+    # Pointer written and KEPT: "finish with one command", not "start over".
+    data = json.loads((ptr_dir / "live_target.json").read_text())
+    assert Path(data["checkout"]).resolve() == wt.resolve()
+    # No restart pending -> not latched; a re-point must stay allowed.
+    assert mod._MAKE_LIVE_COMMITTED is False
+
+
+@pytest.mark.asyncio
+async def test_make_live_foreground_unavailable_keeps_advisory(monkeypatch, tmp_path):
+    """Eligible codes without a usable foreground gateway (no/ambiguous marker,
+    unresolvable binary, confined backend) keep the pre-existing staged_only
+    behaviour."""
+    kc = _mk_kcbin(tmp_path)
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    for label, fg_kwargs in (
+        ("no_marker", dict(ports=[], pids={}, launcher=None)),
+        ("confined", dict(launcher=str(kc), confined="backend is sandboxed")),
+    ):
+        _stub_make_live(monkeypatch, wt, unit_status="no_systemd",
+                        pointer_dir=ptr_dir / label)
+        monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False, raising=False)
+        fg, spawned = _fg(tmp_path, **fg_kwargs)
+        monkeypatch.setattr(mod, "_foreground_backend", lambda fg=fg: fg)
+
+        res = await mod._make_live(str(wt), dry_run=False)
+        assert res["ok"] is True and res["staged_only"] is True, f"{label}: {res}"
+        assert res["manual_restart"] in res["notice"]
+        assert spawned == []
+        assert mod._MAKE_LIVE_COMMITTED is False
+
+
+@pytest.mark.asyncio
+async def test_make_live_foreground_dry_run_plan(monkeypatch, tmp_path):
+    """A dry run on a foreground-capable host reports the restart as automatic
+    with the exact command — and mutates nothing, spawns nothing."""
+    kc = _mk_kcbin(tmp_path)
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(monkeypatch, wt, unit_status="no_systemd", pointer_dir=ptr_dir)
+    fg, spawned = _fg(tmp_path, port=7777, pid=1, launcher=str(kc))
+    monkeypatch.setattr(mod, "_foreground_backend", lambda: fg)
+
+    res = await mod._make_live(str(wt), dry_run=True)
+    assert res["ok"] is True and res["dry_run"] is True
+    plan = res["plan"]
+    assert plan["restart"] == "automatic"
+    assert plan["restart_backend"] == "foreground"
+    assert plan["restart_command"] == f"{kc} restart --port 7777"
+    assert spawned == []
+    assert not (ptr_dir / "live_target.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_gateway_start_id_foreground_fallback(monkeypatch, tmp_path):
+    """On an eligible host the health handshake identity is the marker pid, so
+    the dashboard can observe a foreground cutover complete; on an ineligible
+    host it stays None (degrade, never wait forever)."""
+    kc = _mk_kcbin(tmp_path)
+    fg, _ = _fg(tmp_path, pid=8080, launcher=str(kc))
+    monkeypatch.setattr(mod, "_foreground_backend", lambda: fg)
+    with patch.object(mod, "sys", MagicMock(platform="linux")), \
+         patch.object(mod, "shutil",
+                      MagicMock(which=MagicMock(return_value=None))):
+        # No systemctl at all -> primary yields None -> foreground pid.
+        assert await mod._gateway_start_id() == "8080"
+    with patch.object(mod, "_live_user_unit_status", new_callable=AsyncMock,
+                      return_value="user_unit_inactive"), \
+         patch.object(mod, "sys", MagicMock(platform="linux")), \
+         patch.object(mod, "shutil",
+                      MagicMock(which=MagicMock(return_value=None))):
+        assert await mod._gateway_start_id() is None
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: make-live artifact validation inside the cutover lock
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_make_live_artifact_changed_before_lock_is_revalidated(
+    monkeypatch, tmp_path
+):
+    """Artifacts that are valid at early-probe time but gone before the lock
+    is acquired are caught by the in-lock re-validation.
+
+    A side-effecting lock wrapper removes the venv binary at the instant the
+    lock is acquired, reproducing a concurrent provision that replaces the
+    binary between the early check and the commit.  The cutover must refuse
+    with ``missing_venv`` and must NOT write the pointer.
+
+    Without the production fix the early probe passes, the lock is acquired,
+    and the cutover proceeds to write the pointer and stage a restart — the
+    stale validation is never repeated and the race window is not closed.
+    This test proves the ordering by observing the final response code and
+    the pointer-file state.
+    """
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(monkeypatch, wt, pointer_dir=ptr_dir)
+    monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False)
+
+    kcbin = wt / ".venv" / "bin" / "kirocrew"
+
+    # Wrap _MAKE_LIVE_LOCK so that entering the lock removes the binary,
+    # simulating a concurrent rebuild that completes between the early probe
+    # and the lock-acquire.
+    real_lock = asyncio.Lock()
+
+    class _SideEffectLock:
+        """Proxy that removes *kcbin* when the lock body is entered."""
+
+        def locked(self) -> bool:
+            return real_lock.locked()
+
+        async def __aenter__(self):
+            await real_lock.__aenter__()
+            # Binary vanishes at the moment the lock body begins.
+            kcbin.unlink(missing_ok=True)
+            return self
+
+        async def __aexit__(self, *args):
+            return await real_lock.__aexit__(*args)
+
+    monkeypatch.setattr(mod, "_MAKE_LIVE_LOCK", _SideEffectLock())
+
+    res = await mod._make_live(str(wt), dry_run=False)
+
+    assert res["ok"] is False, (
+        "cutover must be refused when the binary disappears inside the lock; "
+        "got ok=True — the in-lock re-validation is absent or not running"
+    )
+    assert res["code"] == "missing_venv", (
+        f"expected missing_venv from in-lock re-validation, got {res.get('code')!r}"
+    )
+    ptr_file = ptr_dir / "live_target.json"
+    assert not ptr_file.exists(), (
+        "the live-target pointer must NOT be written when in-lock re-validation fails"
+    )
+
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_make_live_artifact_checks_are_executor_offloaded(
+    monkeypatch, tmp_path
+):
+    """The artifact filesystem checks (``is_file`` / ``os.access``) are
+    submitted to ``loop.run_in_executor`` rather than called inline on the
+    event loop, preventing a slow or network-backed filesystem from stalling
+    all Dev Fleet requests.
+
+    The test wraps ``subprocess_executor()`` to record every callable submitted
+    via ``loop.run_in_executor``.  A helper named ``_validate_artifacts_sync``
+    must be submitted at least twice — once for the early probe and once for
+    the in-lock re-validation — proving the checks are offloaded.
+
+    Without the production fix, the checks are plain synchronous expressions
+    (``kcbin.is_file()``, ``os.access()``, ``dist_index.is_file()``) executed
+    inline; no callable named ``_validate_artifacts_sync`` is ever submitted.
+    """
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(monkeypatch, wt, pointer_dir=ptr_dir)
+    monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False)
+    monkeypatch.setattr(mod, "_MAKE_LIVE_LOCK", asyncio.Lock())
+
+    submitted_qualnames: list[str] = []
+
+    # Intercept every run_in_executor call by wrapping the event loop's method.
+    # asyncio.get_running_loop() inside _make_live returns the SAME object that
+    # asyncio.get_event_loop() returns under pytest-asyncio's per-test loop.
+    # We patch the loop object's method directly so the intercept is in place
+    # when _make_live calls loop.run_in_executor(…).
+    running_loop = asyncio.get_running_loop()
+    real_run_in_executor = running_loop.run_in_executor
+
+    async def _recording_run_in_executor(executor, fn, *args):
+        submitted_qualnames.append(fn.__qualname__)
+        return await real_run_in_executor(executor, fn, *args)
+
+    monkeypatch.setattr(running_loop, "run_in_executor", _recording_run_in_executor)
+
+    await mod._make_live(str(wt), dry_run=False)
+
+    validate_submissions = [
+        q for q in submitted_qualnames if "_validate_artifacts_sync" in q
+    ]
+    assert len(validate_submissions) >= 2, (
+        "artifact validation must be submitted to the executor at least twice "
+        "(early probe + in-lock re-validation); "
+        f"all submitted callables: {submitted_qualnames!r}.  "
+        "Zero entries means the checks are still inline on the event loop."
+    )

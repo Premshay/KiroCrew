@@ -7,8 +7,31 @@ import { i18nT } from '../i18n/t'
 /* ── Shared UI primitives ── */
 
 export function Card({ children, className = '', ...rest }: Omit<React.ComponentPropsWithoutRef<'div'>, 'dangerouslySetInnerHTML'>) {
+  // Written narrow-first, like the rest of the layout: the unprefixed inset is
+  // the phone one (10px horizontal, 20px vertical) and `md:` widens it. Only the
+  // HORIZONTAL value changes, because horizontal is the axis a phone cannot
+  // spare and a vertical change would move every card's height. This inset
+  // stacks on the page gutter — the budget both serve is in
+  // website/docs/page-layout.md.
+  //
+  // A caller that sets padding OWNS that axis, and the base inset for it is
+  // dropped rather than merged. This is not a convenience: the base inset is
+  // breakpoint-scoped (`md:px-5`) and twMerge only collapses classes colliding
+  // at the SAME breakpoint, so a caller's bare `p-3` would sit BESIDE `md:px-5`
+  // and the card would silently widen back to 20px from `md` up. Dropping the
+  // base is what makes `p-3` mean 12px at every width, the way a reader of that
+  // call site would assume.
+  //
+  // Deciding it from the final string, at render time, is deliberate: a lexical
+  // test cannot see a computed `className={cond ? 'p-3' : ''}`, and two such
+  // `Card` call sites already exist. `md:`-prefixed overrides need no help —
+  // they collide with the base at their own breakpoint, so twMerge resolves them.
+  const owned = className.split(/\s+/)
+  const ownsX = owned.some((c) => /^(?:p|px)-/.test(c))
+  const ownsY = owned.some((c) => /^(?:p|py)-/.test(c))
+  const inset = [ownsX ? '' : 'px-2 md:px-5', ownsY ? '' : 'py-5'].filter(Boolean).join(' ')
   return (
-    <div className={twMerge('card-glow border border-border bg-card rounded-lg p-5 mb-4 animate-rise shadow-sm transition-all', className)} {...rest}>
+    <div className={twMerge(`card-glow border border-border bg-card rounded-lg ${inset} mb-4 animate-rise shadow-sm transition-all`, className)} {...rest}>
       {children}
     </div>
   )
@@ -18,6 +41,27 @@ export function CardTitle({ children, className, ...rest }: Omit<React.Component
   return <h3 className={twMerge("text-sm font-semibold tracking-tight text-text-strong mb-3.5 flex items-center gap-2", className)} {...rest}>{children}</h3>
 }
 
+/**
+ * `danger` colours the LABEL unconditionally, not on `:hover`.
+ *
+ * A touch viewport never produces `hover`, so the previous
+ * `text-text hover:text-danger` rendered a destructive button identically to
+ * the non-destructive buttons beside it on a phone — the same class of defect
+ * as a hover-revealed control: the affordance existed only under a pointer
+ * (#3937). Found on the Channels page at 390px, where `Close` (which dismisses
+ * every agent in the channel) sat in a wrapped header row beside the frequent
+ * `3 agents` and `Clear Context` buttons at identical visual weight.
+ *
+ * Hover still does something on a pointer device — it brings up the border and
+ * a subtle fill — so the desktop affordance is not lost, only made
+ * unnecessary for recognising the control.
+ *
+ * This satisfies the enabled≠disabled invariant `ui.test.tsx` pins: that
+ * assertion exists because an idle label in `text-muted` reads as greyed out,
+ * and `text-danger` is emphatically not that. The assertion was written against
+ * the `text-text` token because that was the only foreground a Btn then had;
+ * it now checks the invariant it states.
+ */
 export const Btn = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttributes<HTMLButtonElement> & { danger?: boolean; primary?: boolean }>(
   ({ children, danger, primary, className, ...rest }, ref) => (
     <button
@@ -26,8 +70,8 @@ export const Btn = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttribute
         primary
           ? 'bg-accent text-accent-fg border-accent hover:bg-accent-hover hover:shadow-[0_0_12px_var(--accent-glow)]'
           : danger
-            ? 'border-border bg-transparent text-muted hover:text-danger hover:border-danger'
-            : 'border-border bg-transparent text-muted hover:text-text hover:border-border-strong hover:bg-bg-hover'
+            ? 'border-border bg-transparent text-danger hover:border-danger hover:bg-danger-subtle'
+            : 'border-border bg-transparent text-text hover:border-border-strong hover:bg-bg-hover'
       }`, className)}
       {...rest}
     >
@@ -39,7 +83,14 @@ export const Btn = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttribute
 export function SendBtn({ children, onClick, disabled, style, className, ...rest }: { children: React.ReactNode } & Omit<React.ComponentPropsWithoutRef<'button'>, 'children' | 'dangerouslySetInnerHTML'>) {
   return (
     <button
-      className={twMerge("btn-sweep bg-accent text-accent-fg border-none rounded-lg px-4 h-9 text-sm font-semibold cursor-pointer hover:bg-accent-hover hover:shadow-[0_0_20px_var(--accent-glow)] disabled:opacity-30 disabled:cursor-not-allowed transition-all font-body", className)}
+      // `min-h-9`, not `h-9`. A fixed height around inline content clips the
+      // label instead of growing for it: at a narrow width a two-line label
+      // needs ~40px and `h-9` gives it 36, so 12px of text is cut off — and the
+      // labels here are translated into 12 languages, so the width at which one
+      // wraps is not the one it was designed at. Growing leaves the row's
+      // heights uneven, which is the lesser defect: uneven is legible, clipped
+      // is not.
+      className={twMerge("btn-sweep bg-accent text-accent-fg border-none rounded-lg px-4 min-h-9 text-sm font-semibold cursor-pointer hover:bg-accent-hover hover:shadow-[0_0_20px_var(--accent-glow)] disabled:opacity-30 disabled:cursor-not-allowed transition-all font-body", className)}
       onClick={onClick}
       disabled={disabled}
       style={style}
@@ -99,7 +150,7 @@ export const Input = React.forwardRef<HTMLInputElement, React.InputHTMLAttribute
   ({ className = '', ...props }, ref) => (
     <input
       ref={ref}
-      className={twMerge('bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-none flex-1 transition-colors focus-ring', className)}
+      className={twMerge('bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-none flex-1 min-w-0 transition-colors focus-ring', className)}
       {...props}
     />
   )
@@ -338,8 +389,21 @@ export function PanelSectionHeader({ label, count, trailing, className }: {
 
 export function PageHeader({ title, subtitle, actions }: { title: React.ReactNode; subtitle?: string; actions?: React.ReactNode }) {
   return (
-    <div className="flex items-end justify-between gap-4 px-6 pt-2 pb-3" data-testid="page-header">
-      <div>
+    // 16px below `md`, the SAME gutter as the page content container, so the title
+    // shares its left edge with the cards and rows it labels. That shared edge is
+    // the page's content column, and the title belongs to the content -- not to the
+    // chrome above it.
+    //
+    // The top bar is now held to the same line rather than exempted from it: its
+    // hamburger's box is `pl-2` + `p-2` = 16px, plus a 2.5px transform that pulls
+    // the glyph's artwork onto the line too (`Menu` does not fill its own box).
+    // An earlier round instead moved THIS header out to meet a 20px top bar, which
+    // read worse -- the title then sat inside the cards directly beneath it. The
+    // defect was always in the chrome, not in the content column.
+    //
+    // Measured budget and the full rationale: website/docs/page-layout.md.
+    <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2 px-4 md:px-6 pt-2 pb-3" data-testid="page-header">
+      <div className="min-w-0">
         <div className="text-2xl font-bold tracking-tight text-text-strong" data-testid="page-title">{title}</div>
         {subtitle && <div className="text-muted text-sm mt-1" data-testid="page-subtitle">{subtitle}</div>}
       </div>
@@ -348,7 +412,7 @@ export function PageHeader({ title, subtitle, actions }: { title: React.ReactNod
   )
 }
 
-export function Toggle({ checked, onChange, disabled, label }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string }) {
+export function Toggle({ checked, onChange, disabled, label, describedBy, tone = 'accent' }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string; describedBy?: string; tone?: 'accent' | 'muted' }) {
   return (
     <div
       role="switch"
@@ -358,10 +422,18 @@ export function Toggle({ checked, onChange, disabled, label }: { checked: boolea
       // class, neither of which reaches the accessibility tree.
       aria-disabled={disabled || undefined}
       aria-label={label}
+      // Ties a consequence the caller renders NEXT to the switch (rather than as
+      // its description) into the switch's own accessible description, so an AT
+      // user hears it before acting rather than discovering it by exploring.
+      aria-describedby={describedBy}
       tabIndex={disabled ? -1 : 0}
       onClick={() => !disabled && onChange(!checked)}
       onKeyDown={e => { if (!disabled && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); onChange(!checked) } }}
-      className={`w-9 h-5 rounded-full relative transition-colors shrink-0 cursor-pointer ${disabled ? 'opacity-40 cursor-not-allowed' : ''} ${checked ? 'bg-accent' : 'bg-border'}`}
+      // `muted` is for a LIST of switches, where an accent fill on every row
+      // shouts and duplicates a state the row's own grouping already carries.
+      // The knob position still reads the state, so nothing is lost by dropping
+      // the hue. Accent stays the default so a lone switch keeps its emphasis.
+      className={`w-9 h-5 rounded-full relative transition-colors shrink-0 cursor-pointer ${disabled ? 'opacity-40 cursor-not-allowed' : ''} ${checked ? (tone === 'muted' ? 'bg-border-strong' : 'bg-accent') : 'bg-border'}`}
     >
       <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
     </div>
@@ -536,6 +608,11 @@ export function Slider({
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
         onPointerLeave={onPointerLeave}
+        // outline-none is CORRECT here and must stay: the knob below already
+        // carries the replacement cue (`group-focus-visible:ring-2`), which
+        // points at the current value instead of boxing the whole track. Letting
+        // the global :focus-visible outline through as well would paint two
+        // indicators on one control.
         className={`group relative h-[18px] flex items-center select-none touch-none outline-none ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
       >
         {/* groove */}
@@ -603,7 +680,7 @@ export function Slider({
   )
 }
 
-/** Shared styled <select> — use instead of raw <select> in pages (page-layout-pattern). */
+/** Bare themed checkbox. Pairs with a caller-supplied label. */
 export const Checkbox = React.forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>(
   ({ style, ...rest }, ref) => (
     <input
@@ -616,20 +693,11 @@ export const Checkbox = React.forwardRef<HTMLInputElement, React.InputHTMLAttrib
 )
 Checkbox.displayName = 'Checkbox'
 
-export const Select = React.forwardRef<HTMLSelectElement, React.SelectHTMLAttributes<HTMLSelectElement>>(
-  ({ className, style, children, ...rest }, ref) => (
-    <select
-      ref={ref}
-      className={className}
-      style={{
-        background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8,
-        padding: '9px 8px', fontSize: 12.5, color: 'var(--text)', outline: 'none',
-        cursor: 'pointer', flexShrink: 0, ...style,
-      }}
-      {...rest}
-    >
-      {children}
-    </select>
-  )
-)
-Select.displayName = 'Select'
+/* There is deliberately no `Select` here any more.
+ *
+ * This module used to export one, and it wrapped a native `<select>`: the closed
+ * trigger picked up the theme, but the OPEN popup was drawn by the OS, so it
+ * ignored every theme token and could not be styled per row. Dropdowns now go
+ * through `ui/select.tsx` (Radix) via `SimpleSelect` / `SettingsSelect`, or
+ * `SearchableSelect` when the list is long enough to need a filter box.
+ * See website/docs/page-layout.md. */

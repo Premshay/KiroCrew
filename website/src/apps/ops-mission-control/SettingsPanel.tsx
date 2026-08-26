@@ -60,6 +60,7 @@ import { Badge, Btn, Card, CardTitle, Input, SendBtn, Toggle } from '../../compo
 import { i18nT } from '../../i18n/t'
 import { fmtUnit } from '../../i18n/format'
 import SegmentedControl from '../../components/SegmentedControl'
+import SimpleSelect from '../../components/SimpleSelect'
 import {
   opsApi,
   type AutonomyRule,
@@ -72,6 +73,7 @@ import {
   type SlackOutStatus,
   type SweepWindows,
 } from './api'
+import { useImeGuard } from '../../hooks/useImeGuard'
 
 /** Module-level frozen empty so the render-time fallback is referentially stable. */
 const EMPTY_COMPANIONS: readonly CompanionInfo[] = Object.freeze([])
@@ -97,6 +99,7 @@ function ProviderRow({
    */
   fencedIdentity?: { label: string; settingsKey: string; value: string; help: string }
 }) {
+  const ime = useImeGuard()
   const queryClient = useQueryClient()
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({})
   const [configDrafts, setConfigDrafts] = useState<Record<string, string>>({})
@@ -205,9 +208,7 @@ function ProviderRow({
               value={identityDraft ?? fencedIdentity.value}
               placeholder="—"
               onChange={(e) => setIdentityDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') commitIdentity()
-              }}
+              {...ime.bindEnter({ onEnter: commitIdentity })}
             />
             <SendBtn
               disabled={
@@ -630,6 +631,7 @@ function SharedMemoryCard({
   onSave: (updates: Record<string, unknown>) => void
   saving: boolean
 }) {
+  const ime = useImeGuard()
   // Local drafts, seeded from the server and re-seeded while untouched — the same shape
   // as the Slack channel field, so a background /state refresh cannot clobber typing.
   const serverRemote = status?.remote ?? ''
@@ -748,9 +750,7 @@ function SharedMemoryCard({
               setRemoteTouched(true)
               setRemote(e.target.value)
             }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') saveRemote()
-            }}
+            {...ime.bindEnter({ onEnter: saveRemote })}
           />
           {/* An explicit Save, not a commit on blur. Tabbing out of a half-pasted URL
               would repoint the whole team's repo, and the backend's branch/length
@@ -772,9 +772,7 @@ function SharedMemoryCard({
               setBranchTouched(true)
               setBranch(e.target.value)
             }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') saveBranch()
-            }}
+            {...ime.bindEnter({ onEnter: saveBranch })}
           />
           <SendBtn disabled={!branchDirty || saving} onClick={saveBranch}>
             {i18nT('apps.opsMissionControl.settingsPanel.save')}
@@ -875,6 +873,7 @@ function OnCallScheduleCard({
   roster?: RotationRoster
   syncReady: boolean
 }) {
+  const ime = useImeGuard()
   const queryClient = useQueryClient()
   // From the ROSTER, not from provider config. The login moved onto the keystone floor
   // (`policy_store.OPERATOR_ONLY_KEYS`) because it is an input to the authorization decision —
@@ -967,9 +966,7 @@ shifts:
                 setTouched(true)
                 setLogin(e.target.value)
               }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') commit()
-              }}
+              {...ime.bindEnter({ onEnter: commit })}
             />
             <SendBtn disabled={!dirty || loginMutation.isPending} onClick={commit}>
               {i18nT('apps.opsMissionControl.settingsPanel.save')}
@@ -1101,6 +1098,7 @@ function HeartbeatCard({
   onSave: (updates: Record<string, unknown>) => void
   saving: boolean
 }) {
+  const ime = useImeGuard()
   // Drafts in MINUTES, because the backend's seconds are a storage unit and nobody tunes a
   // 12-hour window by typing 43200. Re-seeded from the server while untouched, the same
   // shape as every other field here, so a background /state refresh cannot clobber typing.
@@ -1174,11 +1172,7 @@ function HeartbeatCard({
               setStaleTouched(true)
               setStale(e.target.value)
             }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                save('stale_after_secs', staleSecs, () => setStaleTouched(false))
-              }
-            }}
+            {...ime.bindEnter({ onEnter: () => save('stale_after_secs', staleSecs, () => setStaleTouched(false)) })}
           />
           <span className="text-muted shrink-0">{i18nT('apps.opsMissionControl.settingsPanel.min')}</span>
           <SendBtn
@@ -1200,13 +1194,11 @@ function HeartbeatCard({
               setNeedsHumanTouched(true)
               setNeedsHuman(e.target.value)
             }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                save('needs_human_stale_after_secs', needsHumanSecs, () =>
-                  setNeedsHumanTouched(false),
-                )
-              }
-            }}
+            {...ime.bindEnter({
+              onEnter: () => save('needs_human_stale_after_secs', needsHumanSecs, () =>
+                setNeedsHumanTouched(false),
+              ),
+            })}
           />
           <span className="text-muted shrink-0">{i18nT('apps.opsMissionControl.settingsPanel.min')}</span>
           <SendBtn
@@ -1327,26 +1319,23 @@ function ActRulesCard({
         </p>
       ) : (
         <div className="flex flex-col gap-2 mt-3">
-          <label className="flex items-center gap-2 text-[13px]" htmlFor="omc-rule-source">
+          {/* A div, not a label: SimpleSelect renders a button, so `htmlFor`/`id` no
+              longer associate and the visible heading's own key becomes the aria-label
+              instead. "Choose a source" stays SELECTABLE (re-picking it clears `source`
+              and re-disables Grant), which is what `clearLabel` is for. */}
+          <div className="flex items-center gap-2 text-[13px]">
             <span className="w-44 shrink-0 text-muted">
               {i18nT('apps.opsMissionControl.settingsPanel.signal_source')}
             </span>
-            <select
-              id="omc-rule-source"
-              className="bg-bg-elevated border border-border rounded px-2 py-1 text-[13px]"
+            <SimpleSelect
+              options={eligible.map((p) => p.id)}
+              optionLabels={eligible.map((p) => p.display_name)}
               value={source}
-              onChange={(e) => setSource(e.target.value)}
-            >
-              <option value="">
-                {i18nT('apps.opsMissionControl.settingsPanel.choose_a_source')}
-              </option>
-              {eligible.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.display_name}
-                </option>
-              ))}
-            </select>
-          </label>
+              onChange={setSource}
+              clearLabel={i18nT('apps.opsMissionControl.settingsPanel.choose_a_source')}
+              aria-label={i18nT('apps.opsMissionControl.settingsPanel.signal_source')}
+            />
+          </div>
           {/* Input BOTH nested and bound by htmlFor/id, matching the Slack channel row —
               jsx-a11y/label-has-for wants both forms and still warns because `Input` is a
               wrapper it cannot see through. Same warning as the eight existing rows here. */}
@@ -1396,6 +1385,9 @@ export default function SettingsPanel() {
   const rotationQuery = useQuery({
     queryKey: ['ops-mission-control', 'rotation'],
     queryFn: () => opsApi.rotation(),
+    // settingsMutation sends a replace-all PUT from this cache; finite staleTime
+    // lets focus-refetch fire here (global default is Infinity).
+    staleTime: 30_000,
   })
 
   // Slack status rides on /state (it depends on live gateway state, not config

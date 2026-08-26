@@ -1,7 +1,8 @@
 ---
 name: pod-e2e
-description: "Run end-to-end tests (backend API + frontend Playwright) for a KiroCrew feature worktree against an ISOLATED throwaway pod instance, without touching the live gateway. Use when asked to e2e-test / smoke-test / verify a worktree's feature hands-off, run API + browser tests on a pod, or prove a new backend route + UI work together. NOT for testing the live instance."
+description: "ONLY for developing Kiro Crew itself -- if the project you are working on is anything else, ignore this skill: it drives Kiro Crew's own pod tooling, which does not exist in another repository. Runs end-to-end tests (backend API + frontend Playwright) for a Kiro Crew feature worktree against an ISOLATED throwaway pod instance, without touching the live gateway. Use when asked to e2e-test / smoke-test / verify a Kiro Crew worktree's feature hands-off, run API + browser tests on a pod, or prove a new backend route + UI work together. NOT for testing the live instance, and NOT a general-purpose e2e or smoke-test skill."
 triggers: e2e test, smoke test, pod test, verify worktree, test pod, run e2e, end to end
+repo_scope: src/kiro_crew
 ---
 
 # pod-e2e — test a worktree against an isolated full-stack pod
@@ -9,7 +10,8 @@ triggers: e2e test, smoke test, pod test, verify worktree, test pod, run e2e, en
 A worktree's full stack (backend API **and** frontend SPA) runs as **one process
 on one port** — exactly like a Docker container. The `kirocrew pod` CLI is the
 only interface you need: spin one up, get a `{base_url, token}` handle, test
-against it, tear it down to zero residue. The live gateway is **never touched**.
+against it, tear it down and have the teardown VERIFIED. The live gateway is
+**never touched**.
 
 ## Quickstart — run the bundled e2e suite
 
@@ -48,7 +50,8 @@ kirocrew pod up <wt> --json
 curl -s "$base_url/api/<anything>?token=$token"      # backend API
 #    open  $base_url/?token=$token  in Playwright     # frontend SPA (same port)
 
-# 3. destroy it — zero residue, live gateway untouched
+# 3. destroy it — deletes the HOME and verifies it is gone (nonzero if not),
+#    live gateway untouched
 kirocrew pod down <wt>
 ```
 
@@ -57,7 +60,7 @@ Other verbs: `ls` (list running pods) · `status <wt>` · `token <wt>` · `url <
 
 **Isolation guarantees** (enforced by the pod runtime):
 own `KIROCREW_HOME`, own port, **no tunnel** (can't grab the real Slack identity),
-`--no-crons`, and cleanup on stop.
+`--no-crons`, and cleanup on `pod down`.
 A pod can **never** collide with the live gateway and many can run at once.
 
 **Resource ceilings are Linux-only.** On Linux the unit sets cgroup
@@ -68,11 +71,17 @@ covers one process's address space, not resident memory, and the gateway spawns
 agent subprocesses that each get their own limit). So on a Mac a runaway pod can
 starve the machine; every other isolation property above still holds.
 
-**Teardown differs too.** Linux reaps the pod's isolated HOME from the unit's
-`ExecStopPost`, so it happens whatever stopped the service. launchd has no
-post-stop hook, so `pod down` does it — meaning a pod killed without an explicit
-`down` (host crash, force-reboot) leaves its HOME behind on macOS. `pod ls` reports those
-(reclaim each with `pod down <name>`).
+**Teardown belongs to `pod down`, on both platforms.** It stops the service,
+waits for the process tree to drain, deletes the isolated HOME, and verifies the
+directory is gone — a HOME that survives is reported as a failure, never as zero
+residue. Nothing reclaims from a post-stop service hook: systemd would run one
+before the final kill of the pod's cgroup (racing the pod's own subprocesses) and
+on the stop half of a restart. So a pod that goes away WITHOUT a `down` (host
+crash, force-reboot, a raw `systemctl --user stop`) leaves its HOME behind on
+either OS; `pod ls` reports those (reclaim each with `pod down <name>`).
+
+This is also what makes a **seeded** pod home survive `systemctl --user restart`
+and `Restart=on-failure` instead of silently reverting to a blank instance.
 
 ## Bundled suite (quick path)
 
@@ -130,7 +139,10 @@ green). Flags:
    phase — so it can never show a previous run's rows. The rest of the artifact
    dir DOES persist across runs, so check timestamps before trusting an old
    screenshot.
-7. **stop** — `kirocrew pod down <wt>` (zero residue). Skipped if `--keep` or if
+7. **stop** — `kirocrew pod down <wt>`: stops the service, waits for its process
+   tree to drain, deletes the isolated HOME, and verifies it is gone — a HOME that
+   survives fails the command rather than being reported as zero residue. Skipped
+   if `--keep` or if
    the pod was already up.
 
 ## The test manifest (`.pod-test.sh`)

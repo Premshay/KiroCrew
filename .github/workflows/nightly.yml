@@ -174,13 +174,29 @@ jobs:
     secrets: inherit
 
   # ── Linux desktop publish ─────────────────────────────────────────────
-  # Publishes the built AppImage to the distribution CDN (versioned key +
+  # Publishes the built AppImages to the distribution CDN (versioned key +
   # latest alias). Its own lane beside publish-cli, deliberately NOT inside
   # sign-and-notarize.yml: the Linux artifact takes no part in the macOS
   # trust chain, and needing only build-desktop means neither a wheel nor a
   # macOS signing failure can block it (per-platform releases).
-  publish-linux:
-    name: Publish Linux Desktop (nightly channel)
+  #
+  # ONE JOB PER ARCH, not a matrix over `arch`: each arch owns a distinct S3
+  # key, feed file and alias, and separate jobs keep the per-arch publish
+  # status visible in the run graph.
+  #
+  # Scope of that separation, stated precisely because the obvious reading is
+  # wrong: it decouples the PUBLISH steps, not the BUILDS. Both publishers
+  # still `needs: build-desktop`, which is the reusable-workflow caller job
+  # aggregating BOTH matrix legs, so a failed arm64 build skips the x64
+  # publish too. That is deliberate for now -- the versioned S3 keys are
+  # immutable, so publishing half a release and then discovering the other
+  # arch never built is the worse failure -- but it does mean a broken arm64
+  # build can hold up an x64 release, which was not true before this lane
+  # existed. True per-arch publish independence needs the publishers to run
+  # past a partial build failure and let their own artifact download decide;
+  # tracked in #2645 rather than reshaped here.
+  publish-linux-appimage-x64:
+    name: Publish Linux appimage (nightly channel · x64)
     needs: [version, build-desktop]
     permissions:
       contents: read
@@ -190,9 +206,132 @@ jobs:
     with:
       channel: nightly
       version: ${{ needs.version.outputs.nightly_version }}
+      arch: x64
+      format: appimage
       publish: true
-      appimage_artifact: build-linux-x64
-    secrets: inherit
+      build_artifact: build-linux-x64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  publish-linux-appimage-arm64:
+    name: Publish Linux appimage (nightly channel · arm64)
+    needs: [version, build-desktop]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-linux.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      arch: arm64
+      format: appimage
+      publish: true
+      build_artifact: build-linux-arm64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  publish-linux-deb-x64:
+    name: Publish Linux deb (nightly channel · x64)
+    needs: [version, build-desktop]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-linux.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      arch: x64
+      format: deb
+      publish: true
+      build_artifact: build-linux-x64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  publish-linux-deb-arm64:
+    name: Publish Linux deb (nightly channel · arm64)
+    needs: [version, build-desktop]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-linux.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      arch: arm64
+      format: deb
+      publish: true
+      build_artifact: build-linux-arm64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  publish-linux-rpm-x64:
+    name: Publish Linux rpm (nightly channel · x64)
+    needs: [version, build-desktop]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-linux.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      arch: x64
+      format: rpm
+      publish: true
+      build_artifact: build-linux-x64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  publish-linux-rpm-arm64:
+    name: Publish Linux rpm (nightly channel · arm64)
+    needs: [version, build-desktop]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-linux.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      arch: arm64
+      format: rpm
+      publish: true
+      build_artifact: build-linux-arm64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+
+  # ── Windows installer publish ─────────────────────────────────────────
+  # Depends on build-windows rather than build-desktop: the installer is
+  # Authenticode-signed DURING its build (an NSIS installer compresses its own
+  # already-signed executables), so it comes from that lane's artifact.
+  #
+  # build-windows carries soft_fail, which means its job `result` is `success`
+  # even when the build failed and uploaded nothing. This job therefore does
+  # not trust the result: publish-windows.yml probes for the artifact and skips
+  # cleanly when it is absent. That keeps a Windows-only failure from blocking
+  # the mac and Linux lanes, which is the same per-platform independence
+  # soft_fail exists to protect.
+  publish-windows-x64:
+    name: Publish Windows Desktop (nightly channel · x64)
+    needs: [version, build-windows]
+    permissions:
+      contents: read
+      # A called workflow cannot exceed the caller job's grants, so the probe's
+      # actions:read has to be granted here too or the lane 403s.
+      actions: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-windows.yml
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      publish: true
+      installer_artifact: build-windows-x64
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
 
   # ── Docker image publish ──────────────────────────────────────────────
   # Builds the multi-arch gateway image FROM THE SAME WHEEL publish-cli

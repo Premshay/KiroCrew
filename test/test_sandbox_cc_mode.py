@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import pytest
+
+import kiro_crew.sandbox as _sb_mod
 from kiro_crew.sandbox import (
     _AGENT_DENIED_ENV_KEYS,
     _CC_DIRS,
@@ -19,6 +22,16 @@ from kiro_crew.sandbox import (
     scrub_env,
     wrap_argv,
 )
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_sandbox_env(monkeypatch):
+    """Prevent the 'already inside sandbox' passthrough on sandboxed hosts."""
+    monkeypatch.delenv("KIROCREW_SANDBOX_ACTIVE", raising=False)
+    monkeypatch.setattr(
+        _sb_mod, "_KIRO_INTERNAL_SETTINGS_PATH",
+        "/nonexistent/kirocrew-test/amazon-internal.json",
+    )
 
 
 class TestCcDirsList:
@@ -205,6 +218,8 @@ class TestAgentDeniedEnvKeys:
         assert "SLACK_BOT_TOKEN" in _AGENT_DENIED_ENV_KEYS
         assert "SLACK_APP_TOKEN" in _AGENT_DENIED_ENV_KEYS
         assert "KIROCREW_OWNER_ID" in _AGENT_DENIED_ENV_KEYS
+        assert "FEISHU_APP_ID" in _AGENT_DENIED_ENV_KEYS
+        assert "FEISHU_APP_SECRET" in _AGENT_DENIED_ENV_KEYS
 
     def test_cc_launcher_scrubs_agent_creds(self):
         """cc launcher script's ENV_PREFIXES list contains the cred keys."""
@@ -281,10 +296,22 @@ class TestChannelCredentialIsolation:
     """Gateway-only channel credentials never reach agent subprocesses."""
 
     def test_denylist_covers_loader_credentials(self):
-        from kiro_crew.config.loader import _CREDENTIAL_KEYS
+        """Every gateway-owned credential key is agent-denied.
 
-        missing = set(_CREDENTIAL_KEYS) - set(_AGENT_DENIED_ENV_KEYS)
+        ``KIRO_API_KEY`` is the one deliberate exception: it is the AGENT's own
+        model credential, not a gateway-owned channel token — kiro-cli reads it
+        from its own environment, so denying it would break model auth in a
+        post-scrub container. The spawn paths re-inject it explicitly
+        (``config.loader.inject_kiro_cli_api_key``) instead of letting it ride
+        the inherited environ.
+        """
+        from kiro_crew.config.loader import _CREDENTIAL_KEYS, CRED_KIRO_API_KEY
+
+        missing = set(_CREDENTIAL_KEYS) - set(_AGENT_DENIED_ENV_KEYS) - {CRED_KIRO_API_KEY}
         assert not missing, f"loader credential keys not in agent denylist: {sorted(missing)}"
+        # The carve-out stays exactly one key wide and never joins the denylist:
+        # a denied KIRO_API_KEY would strip the agent's own credential.
+        assert CRED_KIRO_API_KEY not in _AGENT_DENIED_ENV_KEYS
 
     def test_scrub_env_strips_channel_secrets(self, monkeypatch):
         for key, value in _FAKE_CHANNEL_ENV.items():

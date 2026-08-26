@@ -1,8 +1,11 @@
 import { formatShortcut, IS_MAC, shortcutLabel } from '../../hooks/useKeyboardShortcuts'
-import { SHORTCUT_GROUPS, ShortcutRow, KeyCapSequence, groupShortcuts, shortcutGroupLabel, useShortcutPrefs } from '../../components/ShortcutsModal'
+import { SHORTCUT_GROUPS, ShortcutRow, KeyCapSequence, GlobalHotkeyRow, PANEL_TOGGLE_LABEL_KEY, groupShortcuts, shortcutGroupLabel, useShortcutPrefs } from '../../components/ShortcutsModal'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsButtonGroup } from '../../components/settings'
 import { useQuickSearchShortcut } from '../../hooks/useQuickSearchShortcut'
+import { usePanelToggleShortcuts } from '../../hooks/usePanelToggleShortcuts'
+import { useGlobalHotkey } from '../../hooks/useGlobalHotkey'
 import { formatChordKeys, type QuickSearchMode } from '../../lib/quickSearchShortcut'
+import { PANEL_TOGGLE_IDS } from '../../lib/panelToggleShortcuts'
 import { Btn } from '../../components/ui'
 
 import { i18nT } from '../../i18n/t'
@@ -58,6 +61,57 @@ function SearchEverywhereConfig() {
 }
 
 /**
+ * Editor for the three panel-toggle shortcuts (left sidebar, session list, side
+ * panel). Each row records a new chord (recording defers persistence, so the
+ * current binding stays live until a valid chord lands; Escape cancels) or
+ * clears the binding to unbound. Backed by {@link usePanelToggleShortcuts}.
+ */
+function PanelToggleConfig() {
+  const { bindings, recordingId, startRecording, cancelRecording, clear } = usePanelToggleShortcuts()
+  return (
+    <>
+      {PANEL_TOGGLE_IDS.map(id => {
+        const chord = bindings[id]
+        const recording = recordingId === id
+        const caps = chord ? formatChordKeys(chord) : []
+        return (
+          <div key={id} className="flex items-center justify-between gap-2 py-1.5 px-2 rounded-md">
+            {/* A div, not a span: the label and the button caption are separate
+                catalog units, and a block label ends the inline text run so the
+                i18n render gate never sees them joined into one string. */}
+            <div className="text-[13px] text-text">{i18nT(PANEL_TOGGLE_LABEL_KEY[id])}</div>
+            <span className="flex items-center gap-2">
+              <Btn
+                onClick={recording ? cancelRecording : () => startRecording(id)}
+                aria-label={i18nT('pages.settings.shortcutsPanel.record_prompt')}
+                className={recording ? 'border-accent text-accent' : ''}
+              >
+                {recording ? (
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-accent animate-pulse" aria-hidden="true" />
+                    {i18nT('pages.settings.shortcutsPanel.record_prompt')}
+                  </span>
+                ) : caps.length > 0 ? (
+                  <span className="flex items-center gap-1"><KeyCapSequence caps={caps} plus /></span>
+                ) : (
+                  i18nT('pages.settings.shortcutsPanel.record_prompt')
+                )}
+              </Btn>
+              {chord && !recording && (
+                <Btn onClick={() => clear(id)} aria-label={i18nT('pages.settings.shortcutsPanel.clear_shortcut')}>
+                  {i18nT('pages.settings.shortcutsPanel.clear_shortcut')}
+                </Btn>
+              )}
+            </span>
+          </div>
+        )
+      })}
+      <div className="text-[12px] text-muted px-2 pt-1">{i18nT('pages.settings.shortcutsPanel.custom_hint')}</div>
+    </>
+  )
+}
+
+/**
  * Settings → Shortcuts. Same data + preference state as the Alt+K
  * `ShortcutsModal` (shared primitives from ShortcutsModal.tsx), presented in
  * the standard Settings layout: a `SettingsSection` header per shortcut group
@@ -66,6 +120,7 @@ function SearchEverywhereConfig() {
  */
 export function ShortcutsPanel() {
   const { enabled, macCtrl, toggle, toggleMacCtrl } = useShortcutPrefs()
+  const globalHotkey = useGlobalHotkey()
 
   return (
     <div className="max-w-2xl">
@@ -86,13 +141,17 @@ export function ShortcutsPanel() {
           />
         )}
       </SettingsCard>
-      {SHORTCUT_GROUPS.map(group => {
+      {SHORTCUT_GROUPS.map((group, gi) => {
         const entries = groupShortcuts(group, macCtrl)
         if (entries.length === 0) return null
         return (
           <div key={group}>
             <SettingsSection title={shortcutGroupLabel(group)} />
-            <SettingsCard>
+            {/* Ordinal from the full group list, not the rendered subset: a gap
+                where a group rendered null only stretches the stagger, while a
+                compacted ordinal would shift every later card's delay whenever a
+                group toggles. */}
+            <SettingsCard index={gi + 1}>
               {entries.map(s => (
                 <ShortcutRow key={s.id} label={shortcutLabel(s)} keys={formatShortcut(s).split(' + ')} />
               ))}
@@ -101,9 +160,22 @@ export function ShortcutsPanel() {
         )
       })}
       <SettingsSection title={i18nT('pages.settings.shortcutsPanel.search')} />
-      <SettingsCard>
+      <SettingsCard index={SHORTCUT_GROUPS.length + 1}>
         <SearchEverywhereConfig />
       </SettingsCard>
+      <SettingsSection title={i18nT('pages.settings.shortcutsPanel.panel_toggles')} />
+      <SettingsCard index={SHORTCUT_GROUPS.length + 2}>
+        <PanelToggleConfig />
+      </SettingsCard>
+      {globalHotkey && (
+        <div>
+          <SettingsSection title={i18nT('components.shortcutsModal.desktop_app')} />
+          <SettingsCard>
+            <GlobalHotkeyRow />
+            <div className="text-[12px] text-muted px-2 pb-1">{i18nT('components.shortcutsModal.global_hotkey_hint')}</div>
+          </SettingsCard>
+        </div>
+      )}
     </div>
   )
 }

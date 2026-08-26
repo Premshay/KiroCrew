@@ -47,7 +47,9 @@ boot holding the chosen adapter for every extension point, plus three carriers:
 | `mcp_tooling` | adapter | `DefaultMcpToolingProvider` (all methods empty) | enterprise MCP server + skills + provider MCP scopes |
 | `agent_catalog` | adapter | `DefaultAgentCatalogProvider` (`builtin_agents()` → `[]`) | edition agent-catalog rows |
 | `prompt_sources` | adapter | `DefaultPromptSourceProvider` (`prompt_source_roots()` → `[]`) | edition prompt/SOP roots |
+| `import_sources` | adapter | `DefaultImportSourceProvider` (`import_sources()` → `[]`) | edition onboarding-import sources |
 | `capability_manager` | adapter | `DefaultCapabilityManager` (`available()` → `False`) | operations-based external package manager: MCP servers, skills, agent packages, and client plugins |
+| `external_access` | adapter | `DefaultExternalAccessPolicy` (`admits_registry()` / `admits_cloud_deployment()` → `True`) | allowlist installable content to an internal registry; withhold cloud deployment |
 | `registry` | adapter | `DefaultAppRegistryPolicy` (public-forge baseline) | internal git hosts |
 | `apps_loader` | adapter | `DefaultAppsLoader` (OSS builtins) | internal app sources (code-reviewer; team_manager/mimir follow-on) |
 | `package_manager` | adapter | **RESERVED** — `DefaultPackageManager`; installs are inline in `cli_doctor.py` (use `CapabilityManager`) | — (slot inert) |
@@ -58,6 +60,35 @@ boot holding the chosen adapter for every extension point, plus three carriers:
 | `jail` | adapter | `DefaultJailProvider` (no-op, never jails) | enterprise process isolation |
 | `feature_apps` | tuple | **RESERVED** — `()`; apps register via `apps_loader` (provenance record only) | — (slot inert) |
 
+> `external_access` note — three surfaces the core offers unconditionally, none of
+> which had a composition point. Two are installable-content registries: skill
+> discovery (skills.sh) and MCP server discovery (the official registry) hardcoded
+> their public provider at registration time, so a managed deployment could not
+> restrict where installable code came from without patching the core. The third is
+> **cloud deployment**: `kiro_crew/deploy/` provisions S3, CloudFront, IAM roles and
+> a reaper Lambda in the operator's own account and carried no capability gate at
+> all — `capabilities.publish`, which bounds publish-provider destinations, does not
+> reach it.
+>
+> `admits_registry(kind, name, api_base)` is consulted in both `_build_registry()`
+> functions; a refused provider is never registered, so it is ABSENT rather than
+> failing per request and no later install path is left to gate.
+> `admits_cloud_deployment(target)` is consulted by `deploy/handlers.py`: the read
+> at `GET /api/deploy/config` reports `cloudDeploymentEnabled` so the frontend hides
+> the console instead of rendering one whose every button 403s, and every mutating
+> route is wrapped at registration so a new endpoint is gated by being listed rather
+> than by remembering an in-handler check. Read endpoints stay open deliberately —
+> a 403 on `config` would leave the page unable to explain itself.
+>
+> Both decisions take the concrete target as well as a label, because a name is
+> self-chosen while the URL or target determines where bytes go; an allowlist pinned
+> to the target stops admitting a provider that repoints at a different host.
+> `_shared.py::admits_registry` / `admits_cloud_deployment` are the single call
+> points: they deny on a composed-adapter error (reaching that fallback means an
+> operator intended to restrict something), let `PlatformCompositionError`
+> propagate, and SEL-audit **both** outcomes — a log carrying only denials cannot
+> show whether the permitted path was ever taken.
+
 > `registry` note — the public `DefaultAppRegistryPolicy` encodes the
 > public-forge baseline and ships no internal-host set. The enterprise companion
 > re-adds the internal git host (and any further internal git hosts) via its
@@ -66,6 +97,14 @@ boot holding the chosen adapter for every extension point, plus three carriers:
 Core code reads adapters directly when it has the context, or via
 `current_context()` for module-level functions (e.g. `hooks.py` deny path).
 `current_context()` lazily builds the standalone default if boot has not run.
+
+`installed_context()` returns the INSTALLED context or `None` as a bare
+attribute read — it never resolves, never raises, and does no I/O. Use it ONLY
+where the answer for "no context" is already the conservative one (the
+exempt-host lookup below is the one such caller), because it skips the config
+load and entry-point discovery that `current_context()` performs on every call
+while unbooted. A caller that must honour a companion's policy has to go through
+`current_context()` and take the fail-closed `PlatformCompositionError`.
 
 ## Boot sequence
 
@@ -353,12 +392,22 @@ delegates to that same global. Wired sites:
   `getattr(policy, "exempt_exact_hosts", None)` (a pre-method companion adapter
   degrades to the empty set) and is NEVER sourced from `config.json` — an
   agent-writable exemption would be a hole in the redaction ceiling, so the
-  companion adapter is the only supplier. Degrade semantics are INVERTED vs
-  `redact_via_context`'s baseline-redact fallback: a `PlatformCompositionError`
-  propagates fail-closed, but any other adapter failure degrades to
+  companion adapter is the only supplier. EVERY failure degrades to
   `frozenset()` — the empty set means MORE redaction (every host runs the
-  heuristics), the safe direction; NO logging on the degrade path (runs inside
-  the stdio MCP servers). **Deferred-import exception:** `security` reads the set
+  heuristics), the safe direction, and stricter than any companion-supplied list
+  could be; NO logging on the degrade path (runs inside the stdio MCP servers).
+  The set is read via `installed_context()`, so a process with no installed
+  context takes that same empty set WITHOUT resolving one: resolving would load
+  config and discover entry points per call, and on a non-standalone profile
+  `current_context()` never memoizes its fail-closed verdict, so a per-line
+  caller (`_pump_stderr` redacting backend stderr) would re-pay that synchronous
+  I/O for every line on the gateway event loop. This is deliberately INVERTED vs
+  `redact_via_context`, which must keep propagating: that seam SUBSTITUTES a
+  companion's redaction for the baseline, so a missing context there would fail
+  OPEN, whereas here it fails STRICTER. Because this lookup only ever RELAXES the
+  heuristics, it can never be the reason a credential reaches a log — the
+  credential pass (`redact_credentials`) is independent of it and unchanged by a
+  missing context. **Deferred-import exception:** `security` reads the set
   through a FUNCTION-LOCAL import of `kiro_crew.platform.context` (the `sel.py`
   pattern), so the CPP import-direction invariant holds — `platform/defaults.py`
   imports `security` at module load, and `security` never reaches `platform` at
@@ -559,10 +608,10 @@ delegates to that same global. Wired sites:
   by the time a jail backend probes it.
 
 
-### Amazon-edition seam additions (v1, no `CONTRACT_VERSION` bump)
+### Edition seam additions (v1, no `CONTRACT_VERSION` bump)
 
-Existing-Protocol methods added / wired so the Amazon companion can re-introduce
-dropped MeshClaw behavior without the core importing it. All are v1 additions (a
+Existing-Protocol methods added / wired so a companion can re-introduce behavior
+the public fork dropped without the core importing it. All are v1 additions (a
 `Default*` no-op reproduces today's OSS behavior exactly — a standalone process
 is byte-identical) with no `CONTRACT_VERSION` bump.
 
@@ -572,6 +621,18 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
 - `AppsLoader.registry_rows() -> List[Dict]` — ADD-only merged by
   `apps/registry.py::_load_registry_file` after bundled `app-registry.json`
   (same-`name` core row wins). Default `[]`.
+- `AppsLoader.default_registries() -> List[Dict]` — external app registries the
+  edition pins, merged with the operator's `config.registries` by
+  `apps/registry.py::_effective_registries`, which is the single list every
+  registry consumer reads (index fetch/refresh, the trusted-host allowlist, row
+  lookup, install, the blob-proxy allowlist). Rows are the field shape of
+  `ExternalRegistryConfig` (`{name, repo, branch, trust}`). Unlike
+  `registry_rows`, the **edition row wins** a `name` collision — and when the two
+  rows name DIFFERENT repositories, **neither** is served, because the index cache
+  is keyed by name and the displaced row's cache would otherwise be read under the
+  winner's identity. Merged at the
+  consumption sites, never inside `KiroCrewConfig`, so a config save can never
+  persist an edition default into the operator's file. Default `[]`.
 - `DashboardContributor.on_user_message(app, message)` — fired once per user
   message by `dashboard/chat_handlers.py::api_chat` before the turn, inside a
   fail-safe `safe_context_call`. OBSERVER only. Default no-op.
@@ -580,10 +641,18 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   existence-checked). Default `[]`.
 - `AgentCatalogProvider.builtin_agents() -> List[Dict[str, Any]]` — ADD-only
   agent-catalog rows merged by `agent_discovery.list_agents()` AFTER the on-disk
-  `~/.kiro/agents` scan (via `_with_edition_agents`, through
+  scan of `~/.kiro/agents` and, when the caller supplies a `project_dir`,
+  `<project>/.kiro/agents` (via `_with_edition_agents`, through
   `safe_context_call`), de-duped by name so an on-disk agent of the same name
-  wins. Each row is a plain dict of `AgentInfo` fields (`name` required;
-  `filename`/`description`/`model`/`skills`/`mcp_servers`/`source`/`package`
+  wins. Within the on-disk scan a **project** agent shadows a user-level one of
+  the same name (and the shadowing is logged), mirroring kiro-cli — which resolves
+  `--agent` against its cwd first, and which Kiro Crew spawns with the session's
+  project directory as that cwd, so the project entry is the one that would
+  actually run. Kiro Crew's legacy `<project>/.kiro/*.agent-spec.json` convention is
+  deliberately NOT scanned here (only the Slack handler opts into it): kiro-cli
+  cannot activate such a name, and this list is a dispatch surface. Each row is a
+  plain dict of `AgentInfo` fields (`name` required;
+  `filename`/`description`/`model`/`skills`/`mcp_servers`/`source`/`package`/`scope`
   optional). **EXECUTABLE INVARIANT:** every returned row MUST be spawnable —
   the edition guarantees a resolvable agent config exists for its `name`
   (materialized under `~/.kiro/agents` or otherwise resolvable by the ACP
@@ -639,7 +708,21 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   searching those roots — a row outside them lists but 404s on tree/detail, so an
   edition satisfying both Protocols MUST keep them consistent; the core enforces
   this at runtime — `collect_skills_blocking` logs a loud warning for any listed
-  row outside every `extra_skills()` root);
+  row outside every `extra_skills()` root. Two further constraints bind the keys
+  an edition may hand out. **A root the core already keys itself is not
+  `package/` territory:** `~/.kiro/skills`, the data home skills dir, configured
+  `skills.extra_paths`, and the active project's `.kiro/skills` are keyed
+  `kiro-user/`, `kiro-workspace/`, or unprefixed, so advertising one of them from
+  `extra_skills()` (legitimate — it makes the loader index it) does NOT also
+  expose it under `package/`; `_edition_package_roots()` computes that difference
+  once and both catalog enumeration and path resolution read it, so the two
+  cannot drift. **Resolution is exact-first and refuses ambiguity:** a
+  `package/<name>` request prefers `<root>/<name>/SKILL.md` over a nested
+  `<root>/<Pkg>/<name>/SKILL.md`, and when two DISTINCT files tie within a tier
+  it resolves to `None` — HTTP 404, with the competing candidates logged — rather
+  than picking one, because the key cannot express which was meant (paths that
+  merely symlink to the same file are not a tie). An edition that wants both of
+  two same-named skills reachable MUST therefore key them distinguishably);
   `async install_mcp/uninstall_mcp(server_id)`,
   `async install_skill/uninstall_skill(package)`,
   `async install_agent/uninstall_agent(package)` → `CapabilityResult(ok, message)`
@@ -788,6 +871,24 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   companion returns its resolved package prompt roots. **Split out of
   `McpToolingProvider` into its own Protocol** (a distinct concern). v1 addition;
   `Default` returns `[]`.
+- `ImportSourceProvider.import_sources() -> List[ImportSource]` — WIRED:
+  `onboarding_import._sources()` unions the returned descriptors over the core
+  builtins for every scan, apply, and id-validation path, so a registered source
+  is accepted by `/api/onboarding/import/*` and rendered by the import wizard with
+  no core branching. Default `[]`, so the public edition offers only the foreign
+  agents it ships. One descriptor carries id, display name, root resolution, and
+  the agent's own managed MCP server names, so a registration cannot
+  half-work; a malformed one (no id, a reserved id, no
+  resolvable root, an id that reuses a builtin, a traversing `home_dir`, or a
+  `stale_mcp_binaries` entry naming a shared runtime) is dropped with a warning
+  rather than shadowing a builtin or reclaiming unrelated MCP servers. A
+  descriptor names neither a reader nor a layout: the engine does all reading, so a
+  registered source cannot bypass the content gates inside the engine's readers.
+  `superseded` is a separate opt-in: only an agent this product REPLACES has its
+  leftover MCP entries reclaimed from the user's global provider config, because a
+  live foreign agent's servers are still in use. A registered source is read as an
+  install of this product's own on-disk layout — a predecessor, a rename, or a
+  fork. v1 addition; `Default` returns `[]`.
 
 **`McpToolingProvider` is intentionally scoped to MCP tooling only** —
 `extra_mcp_servers()`, `extra_skills()`, and `extra_mcp_scopes()`. The former
@@ -854,7 +955,7 @@ new module/class names.
     deny-by-default, a `PlatformCompositionError` is re-raised. The public
     Default cannot raise, so standalone never reaches the fallback.
   - `DashboardContributor.on_token_consumed(user_id, channel, session_exp,
-    thread_ts)` — fired in `dashboard/token_auth.py` after `bind_token_ip` on the
+    thread_ts)` — fired in `dashboard/token_auth.py` after `bind_token_peer` on the
     first (non-cookie) exchange, with `channel`/`thread_ts` read from the token's
     signed `extra` payload. OBSERVER only; the anchor a challenge auth-window
     opens on. Default no-op. `safe_context_call(fallback=None)` re-raises

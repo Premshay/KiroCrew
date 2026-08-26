@@ -54,8 +54,11 @@ function stateWithApproval(meta: Record<string, unknown> = {}): Partial<RootStat
             tool_input: '{"command":"ls /tmp"}',
             is_read_only: '1',
             tool_title: 'Running: ls /tmp',
+            is_shell: '1',
             full_command: 'ls /tmp',
             base_command: 'ls',
+            trust_command_grantable: '1',
+            trust_base_grantable: '1',
             tool_call_id: 'tc-1',
           },
           ...meta,
@@ -260,8 +263,24 @@ describe('ChatInput approval flow', () => {
     expect(buttons.some(b => b.textContent?.includes('ls') && b.textContent?.includes('commands'))).toBe(true)
   })
 
-  it('detects shell command from tool_title prefix', () => {
+  it('chat surface offers all three trust tiers for a shell command (regression guard)', () => {
+    // The channels surface deliberately drops the command-scoped tiers
+    // (hasCommand={false}); the chat surface must keep every tier — a future
+    // change must not silently strip trust_command / trust_base here (#4421).
     const store = createTestStore(stateWithApproval())
+    renderWithProviders(<ChatInput {...defaultProps} />, { store })
+    fireEvent.click(screen.getByText('Trust'))
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(3)
+    expect(items.some(b => b.textContent?.includes('ls /tmp'))).toBe(true)          // trust_command
+    expect(items.some(b => b.textContent?.includes('commands'))).toBe(true)         // trust_base
+    expect(items.some(b => b.textContent?.includes('Trust all tools'))).toBe(true)  // trust
+  })
+
+  it('uses the server shell flag instead of the display title', () => {
+    const state = stateWithApproval()
+    state.chat!.messages[1].meta!.tool_title = 'harmless display title'
+    const store = createTestStore(state)
     renderWithProviders(<ChatInput {...defaultProps} />, { store })
     fireEvent.click(screen.getByText('Trust'))
     // Should show base command option (only for shell)
@@ -273,6 +292,7 @@ describe('ChatInput approval flow', () => {
     const state = stateWithApproval()
     const msg = state.chat!.messages[1]
     msg.meta!.tool_title = 'TaskeiGetTask'
+    msg.meta!.is_shell = ''
     msg.meta!.full_command = 'TaskeiGetTask'
     msg.meta!.base_command = 'TaskeiGetTask'
     msg.content = 'TaskeiGetTask'
@@ -281,6 +301,18 @@ describe('ChatInput approval flow', () => {
     fireEvent.click(screen.getByText('Trust'))
     const buttons = screen.getAllByRole('menuitem')
     expect(buttons.some(b => b.textContent?.includes('commands'))).toBe(false)
+  })
+
+  it('hides trust when the server cannot prove a command scope', () => {
+    const state = stateWithApproval()
+    const meta = state.chat!.messages[1].meta!
+    delete meta.trust_command_grantable
+    delete meta.trust_base_grantable
+    const store = createTestStore(state)
+    renderWithProviders(<ChatInput {...defaultProps} />, { store })
+    expect(screen.queryByRole('button', { name: 'Trust' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Allow once' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Reject' })).toBeInTheDocument()
   })
 })
 
@@ -605,7 +637,65 @@ describe('ChatInput unattended-source approvals', () => {
     renderWithProviders(<ChatInput {...defaultProps} />, { store })
     fireEvent.click(screen.getByText('Allow once'))
     await waitFor(() => {
-      expect(screen.getByRole('status')).toHaveTextContent(/That approval expired/i)
+      expect(screen.getByRole('status')).toHaveTextContent(/approval request expired/i)
+    })
+  })
+})
+
+
+/**
+ * Regression: a steered user message must NOT remove or deadlock the approval
+ * bar. The user must be able to steer the agent AND still answer a pending
+ * approval (#1667).
+ */
+describe('ChatInput approval bar survives a steered user message (#1667)', () => {
+  it('approval bar remains visible after a steered message is appended via sseChatMessage', async () => {
+    const store = createTestStore(stateWithApproval())
+    renderWithProviders(<ChatInput {...defaultProps} />, { store })
+    // Verify the approval bar is shown initially
+    await waitFor(() => expect(screen.getByText(/Waiting for approval/)).toBeInTheDocument())
+    expect(screen.getByText('Allow once')).toBeInTheDocument()
+
+    // Dispatch a steered user message (simulates the steer_push WS echo)
+    const { sseChatMessage: sseCM } = await import('../store/chatSlice')
+    store.dispatch(sseCM({ slot: 'slot-1', role: 'user', content: 'also check /var', meta: { steer: true } }))
+
+    // The approval bar must still be visible and functional
+    expect(screen.getByText(/Waiting for approval/)).toBeInTheDocument()
+    expect(screen.getByText('Allow once')).toBeInTheDocument()
+    expect(screen.getByText('Trust')).toBeInTheDocument()
+    expect(screen.getByText('Reject')).toBeInTheDocument()
+  })
+
+  it('approval buttons still resolve the same approval_id after a steer', async () => {
+    const store = createTestStore(stateWithApproval())
+    renderWithProviders(<ChatInput {...defaultProps} />, { store })
+    await waitFor(() => expect(screen.getByText('Allow once')).toBeInTheDocument())
+
+    // Dispatch the steer
+    const { sseChatMessage: sseCM } = await import('../store/chatSlice')
+    store.dispatch(sseCM({ slot: 'slot-1', role: 'user', content: 'try another approach', meta: { steer: true } }))
+
+    // Click Allow once — it must still call with the original approval_id
+    fireEvent.click(screen.getByText('Allow once'))
+    await waitFor(() => {
+      expect(api.resolveApproval).toHaveBeenCalledWith('ap-123', 'approve')
+    })
+  })
+
+  it('approval bar remains after an optimistic steer bubble via appendSlotMessage', async () => {
+    const store = createTestStore(stateWithApproval())
+    renderWithProviders(<ChatInput {...defaultProps} />, { store })
+    await waitFor(() => expect(screen.getByText('Allow once')).toBeInTheDocument())
+
+    // Dispatch the optimistic steer bubble (client-side, before WS echo)
+    const { appendSlotMessage: asm } = await import('../store/chatSlice')
+    store.dispatch(asm({ slot: 'slot-1', message: { role: 'user', content: 'steer text', cls: 'msg msg-u', meta: { steer: true, optimistic: true } } }))
+
+    // Bar must remain
+    await waitFor(() => {
+      expect(screen.getByText(/Waiting for approval/)).toBeInTheDocument()
+      expect(screen.getByText('Allow once')).toBeInTheDocument()
     })
   })
 })

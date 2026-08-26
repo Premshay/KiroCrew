@@ -3,8 +3,8 @@ import { Zap, FolderOpen, ChevronRight, TriangleAlert } from 'lucide-react'
 import Modal from './Modal'
 import { Input, Btn } from './ui'
 import ProjectPicker from './ProjectPicker'
+import SimpleSelect from './SimpleSelect'
 import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
-import FolderGlyph from './FolderGlyph'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { resolveFolderProjectDir } from '../utils/folderAgent'
 import { ChatFolder } from '../types'
@@ -80,8 +80,6 @@ export default function FolderConfigModal({
 }: Props) {
   const [draft, setDraft] = useState<FolderConfigDraft>(EMPTY)
   const [pickerOpen, setPickerOpen] = useState(false)
-  // Open/closed state of the live folder preview — pure visual, never saved.
-  const [previewOpen, setPreviewOpen] = useState(false)
   // The backend rejects a free-typed project_dir (not absolute / not an existing
   // directory / sensitive path) with a 400. Submit used to be fire-and-forget,
   // so a rejection closed the modal and threw the whole draft away with no
@@ -158,13 +156,22 @@ export default function FolderConfigModal({
   const canSubmit = trimmedName.length > 0
 
   // A folder can reference an agent that is no longer installed (uninstalled or
-  // renamed). Without an <option> for it the select falls back to showing the
+  // renamed). Without an option for it the select falls back to showing the
   // first entry — "None" — and Save would then write default_agent:'' and
   // silently destroy the folder's configuration. Keep the orphan selectable so
   // it round-trips, flagged so the user knows why it isn't running.
   const orphanAgent = draft.defaultAgent && !installedAgents.some(a => a.name === draft.defaultAgent)
     ? draft.defaultAgent
     : ''
+
+  // Values and display labels as two PARALLEL arrays, orphan first so it keeps
+  // the position its <option> held. The '' ("None" / "Inherit (x)") row is
+  // SimpleSelect's `clearLabel` rather than a member of these arrays.
+  const agentNames = installedAgents.map(a => a.name)
+  const agentOptions = orphanAgent ? [orphanAgent, ...agentNames] : agentNames
+  const agentOptionLabels = orphanAgent
+    ? [i18nT('components.folderConfigModal.agent_not_installed', { agent: orphanAgent }), ...agentNames]
+    : agentNames
 
   const submit = useCallback(async () => {
     if (!canSubmit || saving) return
@@ -241,39 +248,23 @@ export default function FolderConfigModal({
             </span>
           </div>
 
-          {/* Preview + name. Centre-aligned so the glyph's optical centre
-           *  lines up with the input's. */}
-          <div className="flex items-center gap-3">
-            {/* Live preview: renders the actual sidebar FolderGlyph with the
-             *  draft color, and clicking toggles the open/closed state so the
-             *  user can try both while picking. Presentational toy plus
-             *  preview — no draft state rides on the open flag. */}
-            <button
-              type="button"
-              data-testid="folder-config-preview"
-              title={i18nT('components.folderConfigModal.folder_preview')}
-              aria-label={i18nT('components.folderConfigModal.folder_preview')}
-              aria-pressed={previewOpen}
-              onClick={() => setPreviewOpen(o => !o)}
-              className="shrink-0 w-14 h-14 grid place-items-center rounded-[10px] bg-bg-elevated border border-border cursor-pointer transition-colors hover:border-accent"
-            >
-              <FolderGlyph color={draft.color || undefined} size={34} open={previewOpen} className="shrink-0 text-muted" />
-            </button>
-            <label htmlFor="folder-config-name-input" className="flex-1 min-w-0 flex flex-col gap-1.5">
-              <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.name')}</span>
-              <Input
-                ref={nameRef}
-                id="folder-config-name-input"
-                className="w-full"
-                data-testid="folder-config-name"
-                placeholder={i18nT('components.folderConfigModal.name_placeholder')}
-                value={draft.name}
-                onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
-                {...ime.composition}
-                onKeyDown={e => { if (e.key === 'Enter' && !ime.isComposing(e)) { e.preventDefault(); submit() } }}
-              />
-            </label>
-          </div>
+          {/* Name. The folder's identity mark is a palette color, applied to
+           *  the swatch row below — there is no per-folder icon to preview,
+           *  so the name input owns the full width. */}
+          <label htmlFor="folder-config-name-input" className="flex flex-col gap-1.5">
+            <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.name')}</span>
+            <Input
+              ref={nameRef}
+              id="folder-config-name-input"
+              className="w-full"
+              data-testid="folder-config-name"
+              placeholder={i18nT('components.folderConfigModal.name_placeholder')}
+              value={draft.name}
+              onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
+              {...ime.bindComposition()}
+              onKeyDown={e => { if (e.key === 'Enter' && ime.claimEnter(e)) submit() }}
+            />
+          </label>
 
           {/* Color — always visible, compact. Leading "no color" swatch
            *  doubles as the remove affordance, so there is no separate reset
@@ -324,8 +315,8 @@ export default function FolderConfigModal({
                   : i18nT('components.folderConfigModal.project_dir_placeholder')}
                 value={draft.projectDir}
                 onChange={e => setDraft(d => ({ ...d, projectDir: e.target.value }))}
-                {...ime.composition}
-                onKeyDown={e => { if (e.key === 'Enter' && !ime.isComposing(e)) { e.preventDefault(); submit() } }}
+                {...ime.bindComposition()}
+                onKeyDown={e => { if (e.key === 'Enter' && ime.claimEnter(e)) submit() }}
               />
               <Btn ref={browseRef} data-testid="folder-config-browse" onClick={() => setPickerOpen(true)}>
                 <FolderOpen size={13} /> {i18nT('components.folderConfigModal.browse')}
@@ -338,32 +329,28 @@ export default function FolderConfigModal({
             )}
           </div>
 
-          {/* Default agent */}
-          <label htmlFor="folder-config-agent-select" className="flex flex-col gap-1.5">
+          {/* Default agent. SimpleSelect renders a <button>, not a <select>, so
+           *  this block is a plain div like the project-directory one above and
+           *  the heading's own key doubles as the control's aria-label — an
+           *  external <label htmlFor> cannot associate with it. Its popup
+           *  portals at z-[9999], above the modal's z-[101], the same way
+           *  ProjectPicker's does below. */}
+          <div className="flex flex-col gap-1.5">
             <span className="flex items-center gap-1.5 text-[11.5px] font-semibold text-muted">
               <Zap size={12} className="shrink-0" /> {i18nT('components.folderConfigModal.default_agent')}
             </span>
-            <select
-              id="folder-config-agent-select"
-              data-testid="folder-config-agent"
-              className="bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm outline-none cursor-pointer focus-ring"
+            <SimpleSelect
+              aria-label={i18nT('components.folderConfigModal.default_agent')}
+              options={agentOptions}
+              optionLabels={agentOptionLabels}
+              clearLabel={globalDefaultAgent
+                ? i18nT('components.folderConfigModal.inherit_named', { agent: globalDefaultAgent })
+                : i18nT('components.folderConfigModal.none')}
               value={draft.defaultAgent}
-              onChange={e => setDraft(d => ({ ...d, defaultAgent: e.target.value }))}
-            >
-              <option value="">
-                {globalDefaultAgent
-                  ? i18nT('components.folderConfigModal.inherit_named', { agent: globalDefaultAgent })
-                  : i18nT('components.folderConfigModal.none')}
-              </option>
-              {orphanAgent && (
-                <option value={orphanAgent}>
-                  {i18nT('components.folderConfigModal.agent_not_installed', { agent: orphanAgent })}
-                </option>
-              )}
-              {installedAgents.map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
-            </select>
+              onChange={v => setDraft(d => ({ ...d, defaultAgent: v }))}
+            />
             <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.default_agent_hint')}</span>
-          </label>
+          </div>
         </div>
       </Modal>
 

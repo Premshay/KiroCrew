@@ -2,8 +2,13 @@ import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, waitFor } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
+import { releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { safeSetItem } from '../utils/safeStorage'
 import ChatInput from '../components/ChatInput'
+import { PREVIEW_STRIP_H, stubStripHeights } from './stripHeights'
+
+// The composer's own drag floor.
+const INPUT_DRAG_MIN_H = 93
 import { SlotProvider } from '../providers/SlotContext'
 import type { PasteBlock } from '../utils/pasteTokens'
 
@@ -24,6 +29,10 @@ const defaultProps = {
 
 beforeEach(() => {
   vi.restoreAllMocks()
+  // After restoreAllMocks: it would otherwise undo the layout stub. jsdom does
+  // no layout, and the composer MEASURES its strips, so a strip with no stubbed
+  // box measures 0 and reads as no strip at all.
+  stubStripHeights()
   localStorage.clear()
   touchEnv.touch = false
   mobileEnv.mobile = false
@@ -61,14 +70,61 @@ describe('ChatInput', () => {
       expect(screen.getByPlaceholderText(/Gateway offline/)).toBeInTheDocument()
     })
 
-    it('uses a native file-input label so mobile browsers open the picker', () => {
+    it('makes the mobile + control open the native file picker directly', () => {
+      mobileEnv.mobile = true
       renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
-      fireEvent.click(screen.getByRole('button', { name: 'Add files & options' }))
 
-      const input = screen.getByLabelText('Attach files')
-      const uploadLabel = screen.getByText('Upload file').closest('label')
-      expect(uploadLabel).toHaveAttribute('for', input.id)
-      expect(input).not.toHaveClass('hidden')
+      const input = screen.getAllByLabelText('Attach files').find((element) => element.tagName === 'INPUT')
+      const mobilePlus = screen.getByTitle('Attach files').closest('label')
+      expect(input).toBeDefined()
+      expect(mobilePlus).toHaveAttribute('for', input?.id)
+      expect(screen.queryByRole('button', { name: 'Add files & options' })).not.toBeInTheDocument()
+      expect(screen.queryByText('Upload file')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('above-composer stacking order', () => {
+    // The tip / folder-suggestion band must stay flush against the input box:
+    // options belong with the transcript above it, never between it and the
+    // composer. DOCUMENT_POSITION_FOLLOWING === 4.
+    const FOLLOWING = Node.DOCUMENT_POSITION_FOLLOWING
+
+    it('renders aboveComposer below the options row and above the textarea', () => {
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          aboveComposer={<div data-testid="tip-band">tip</div>}
+          followUpOptions={['first option', 'second option']}
+          onFollowUpSelect={vi.fn()}
+        />
+      )
+      const option = screen.getByRole('button', { name: 'first option' })
+      const tip = screen.getByTestId('tip-band')
+      const textarea = screen.getByLabelText('Message input')
+
+      expect(option.compareDocumentPosition(tip) & FOLLOWING).toBe(FOLLOWING)
+      expect(tip.compareDocumentPosition(textarea) & FOLLOWING).toBe(FOLLOWING)
+    })
+
+    it('keeps aboveComposer below the knowledge chip', () => {
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          aboveComposer={<div data-testid="tip-band">tip</div>}
+          knowledgeChip={<div data-testid="knowledge-chip">ctx</div>}
+        />
+      )
+      const chip = screen.getByTestId('knowledge-chip')
+      const tip = screen.getByTestId('tip-band')
+
+      expect(chip.compareDocumentPosition(tip) & FOLLOWING).toBe(FOLLOWING)
+    })
+
+    it('still renders aboveComposer when the options row is absent', () => {
+      renderWithProviders(
+        <ChatInput {...defaultProps} aboveComposer={<div data-testid="tip-band">tip</div>} />
+      )
+      expect(screen.getByTestId('tip-band')).toBeInTheDocument()
     })
 
     it('makes the touch-device + control open the native file picker directly in a wide viewport', () => {
@@ -236,6 +292,21 @@ describe('ChatInput', () => {
       }
     })
 
+    it('consumes the swallowed Enter so no newline lands in the draft', () => {
+      // The reported symptom: pick a candidate, press Enter to send, and the draft
+      // gains a line break instead. The guard is allowed to decline the submit; it is
+      // not allowed to let the textarea's default action edit the text. `fireEvent`
+      // returns false when a handler called preventDefault.
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="你好" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.compositionStart(ta)
+      fireEvent.compositionEnd(ta)
+      const notCancelled = fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+      expect(notCancelled).toBe(false)
+      expect(onSend).not.toHaveBeenCalled()
+    })
+
     it('does not call onSend on Enter when sendOnEnter is false', () => {
       const onSend = vi.fn()
       renderWithProviders(<ChatInput {...defaultProps} value="test" onSend={onSend} sendOnEnter="ctrl-enter" />)
@@ -307,12 +378,13 @@ describe('ChatInput', () => {
       expect(screen.getByText('Screenshot')).toBeInTheDocument()
     })
 
-    it('opening the menu exposes a native label for the file input', () => {
+    it('opening the menu and clicking "Upload file" triggers the hidden file input click', () => {
+      const clickSpy = vi.spyOn(HTMLInputElement.prototype, 'click')
       renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
       fireEvent.click(screen.getByTitle('Add files & options'))
-      const input = screen.getByLabelText('Attach files')
-      const uploadLabel = screen.getByText('Upload file').closest('label')
-      expect(uploadLabel).toHaveAttribute('for', input.id)
+      fireEvent.click(screen.getByText('Upload file'))
+      expect(clickSpy).toHaveBeenCalled()
+      clickSpy.mockRestore()
     })
 
     it('disables the + menu button when uploading', () => {
@@ -497,16 +569,17 @@ describe('ChatInput', () => {
       localStorage.setItem('mc-input-height', '150')
       const { container } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
       const wrapper = container.firstElementChild as HTMLElement
-      // With files: minHeight should be INPUT_DRAG_MIN_H (93) + FILE_PREVIEW_H (81) = 174
-      expect(wrapper.style.minHeight).toBe('174px')
+      // The drag floor plus whatever the strip MEASURED -- not a restatement of
+      // a predicted constant, which is what this used to assert.
+      expect(wrapper.style.minHeight).toBe(`${INPUT_DRAG_MIN_H + PREVIEW_STRIP_H}px`)
     })
 
     it('uses base minHeight when no files attached and manually sized', () => {
       localStorage.setItem('mc-input-height', '150')
       const { container } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={[]} />)
       const wrapper = container.firstElementChild as HTMLElement
-      // Without files: minHeight should be INPUT_DRAG_MIN_H (93)
-      expect(wrapper.style.minHeight).toBe('93px')
+      // No strip mounted, so it measures nothing and reserves nothing.
+      expect(wrapper.style.minHeight).toBe(`${INPUT_DRAG_MIN_H}px`)
     })
 
     it('wrapper uses flex-col layout for proper space distribution with file strip', () => {
@@ -521,16 +594,14 @@ describe('ChatInput', () => {
       const wrapper = screen.getByTestId('input-wrapper')
       expect(wrapper.style.height).toBe('200px')
       rerender(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
-      // 200 + FILE_PREVIEW_H (81) = 281
-      expect(wrapper.style.height).toBe('281px')
+      expect(wrapper.style.height).toBe(`${200 + PREVIEW_STRIP_H}px`)
     })
 
     it('shrinks wrapper height when files are removed with manual sizing', () => {
-      localStorage.setItem('mc-input-height', '281')
+      localStorage.setItem('mc-input-height', String(200 + PREVIEW_STRIP_H))
       const { rerender } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
       rerender(<ChatInput {...defaultProps} pendingFiles={[]} />)
       const wrapper = screen.getByTestId('input-wrapper')
-      // 281 - FILE_PREVIEW_H (81) = 200
       expect(wrapper.style.height).toBe('200px')
     })
   })
@@ -1059,6 +1130,20 @@ describe('ChatInput', () => {
       expect(ta).not.toHaveFocus()
     })
 
+    it('skips exactly one autofocus after a keyboard-driven switch released the composer (macOS chord chaining)', () => {
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} autoFocusKey="A" />)
+      const ta = screen.getByLabelText('Message input')
+      ta.blur()
+      // A keyboard jump armed the release: this switch's autofocus is
+      // skipped so the next chord is not input-gated dead on macOS.
+      releaseComposerForKeyboardSwitch()
+      rerender(<ChatInput {...defaultProps} autoFocusKey="B" />)
+      expect(ta).not.toHaveFocus()
+      // One-shot: the next switch (pointer-driven — no release) focuses again.
+      rerender(<ChatInput {...defaultProps} autoFocusKey="C" />)
+      expect(ta).toHaveFocus()
+    })
+
     it('does not focus on a touch device, even when the key changes', () => {
       // Tapping a session on a phone/tablet must not pop the soft keyboard.
       touchEnv.touch = true
@@ -1176,6 +1261,51 @@ describe('ChatInput', () => {
     })
   })
 
+  describe('a staged session reference does not arm the mid-turn button', () => {
+    // Regression guard for a dead click this feature briefly introduced. A
+    // staged reference correctly enables the IDLE send button, but the mid-turn
+    // split button must stay out of it: its steer mode refuses a payload of refs
+    // alone, so enabling it produced an enabled primary button whose press did
+    // nothing. Before session refs existed, an empty composer mid-turn rendered
+    // the stop button — that is the behaviour to preserve.
+    const refProps = (overrides: Record<string, unknown> = {}) => ({
+      ...defaultProps,
+      value: '',
+      pendingSessions: [{ key: 'chat-9', title: 'Release notes', messages: 12 }],
+      isRunning: true,
+      canSteer: true,
+      onStop: vi.fn(),
+      onSend: vi.fn(),
+      onSteer: vi.fn(),
+      ...overrides,
+    })
+
+    it('renders the stop button, not the split send button, with only a ref staged', () => {
+      renderWithProviders(<ChatInput {...refProps()} />)
+      expect(screen.queryByTestId('busy-send-button')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('busy-send-caret')).not.toBeInTheDocument()
+    })
+
+    it('still shows the chip so the reference is visibly staged, not lost', () => {
+      renderWithProviders(<ChatInput {...refProps()} />)
+      expect(screen.getByTestId('session-ref-chip')).toHaveAttribute('data-session-ref', 'chat-9')
+    })
+
+    it('arms the mid-turn button again as soon as there is real text to steer', () => {
+      renderWithProviders(<ChatInput {...refProps({ value: 'also look at this' })} />)
+      expect(screen.getByTestId('busy-send-button')).toBeInTheDocument()
+    })
+
+    it('does enable the IDLE send button with only a ref staged', () => {
+      const p = refProps({ isRunning: false, canSteer: false })
+      renderWithProviders(<ChatInput {...p} />)
+      const send = screen.getByLabelText('Send')
+      expect(send).not.toBeDisabled()
+      fireEvent.click(send)
+      expect(p.onSend).toHaveBeenCalledTimes(1)
+    })
+  })
+
   describe('split send button while running (steer default)', () => {
     const runningProps = () => ({
       ...defaultProps,
@@ -1214,7 +1344,9 @@ describe('ChatInput', () => {
       renderWithProviders(<ChatInput {...p} />)
       fireEvent.click(screen.getByTestId('busy-send-caret'))
       fireEvent.click(screen.getByTestId('busy-send-mode-queue'))
-      expect(localStorage.getItem('mc-busy-send-mode')).toBe('queue')
+      // The test store has no active slot, so the write lands on the slot-less
+      // sentinel key; the unscoped legacy key is a read-only migration source.
+      expect(localStorage.getItem('mc-busy-send-mode:no-slot')).toBe('queue')
       const main = screen.getByTestId('busy-send-button')
       expect(main).toHaveAttribute('aria-label', 'Queue message')
       fireEvent.click(main)

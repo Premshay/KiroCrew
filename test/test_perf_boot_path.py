@@ -163,9 +163,9 @@ class TestOtelSdkImportIsDeferred:
 class TestConfigDirMemo:
     """``config_dir()`` is called from 323 sites and measured 94.9us per call —
     a ``Path.resolve()`` + ``mkdir`` and, on the default path, a breadcrumb
-    read/write plus the leftover-archive sweep, every time."""
+    read/write, every time."""
 
-    def test_repeat_calls_do_not_redo_breadcrumb_or_sweep(
+    def test_repeat_calls_do_not_redo_breadcrumb(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
@@ -173,27 +173,20 @@ class TestConfigDirMemo:
         monkeypatch.setattr(paths, "_resolved_home", None)
         monkeypatch.setattr(paths, "_config_dir_memo", None, raising=False)
 
-        calls = {"breadcrumb": 0, "sweep": 0}
+        calls = {"breadcrumb": 0}
         real_breadcrumb = paths._write_recovery_breadcrumb
-        real_sweep = paths._sweep_ungated_archive_leftovers
 
         def _breadcrumb(d: Path) -> None:
             calls["breadcrumb"] += 1
             real_breadcrumb(d)
 
-        def _sweep() -> None:
-            calls["sweep"] += 1
-            real_sweep()
-
         monkeypatch.setattr(paths, "_write_recovery_breadcrumb", _breadcrumb)
-        monkeypatch.setattr(paths, "_sweep_ungated_archive_leftovers", _sweep)
 
         first = paths.config_dir()
         for _ in range(50):
             assert paths.config_dir() == first
 
         assert calls["breadcrumb"] == 1, "breadcrumb write must be once per resolution"
-        assert calls["sweep"] == 1, "archive sweep must be once per resolution"
 
     def test_override_change_is_honoured(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -327,7 +320,6 @@ class _CountingDb:
         self._db = db
         self.select_sources = 0
         self.last_seen_execute = 0
-        self.last_seen_executemany = 0
 
     def execute(self, sql, *args, **kwargs):
         if "FROM sources WHERE id" in sql:
@@ -335,12 +327,6 @@ class _CountingDb:
         if "SET last_seen" in sql:
             self.last_seen_execute += 1
         return self._db.execute(sql, *args, **kwargs)
-
-    def executemany(self, sql, seq, *args, **kwargs):
-        seq = list(seq)
-        if "SET last_seen" in sql:
-            self.last_seen_executemany += 1
-        return self._db.executemany(sql, seq, *args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._db, name)
@@ -382,7 +368,7 @@ class TestFolderWatcherScanQueryCount:
 
         # First pass records every file so the second pass takes the unchanged
         # (last_seen-only) branch for all of them.
-        async def _ingest(file_path, source_id, namespace, props, old_ids, root: str = ""):
+        async def _ingest(file_path, source_id, namespace, props, old_ids, root: str = "", **kw):
             return ["item-" + Path(file_path).name], "done"
 
         fw._ingest_file = _ingest  # type: ignore[assignment]
@@ -391,8 +377,18 @@ class TestFolderWatcherScanQueryCount:
 
         counting = _CountingDb(store.db)
         # ``KnowledgeStore.db`` is a read-only property backed by a per-thread
-        # connection; the scan runs on this thread, so swap the thread-local.
+        # connection. This wrapper covers the on-loop pause reads; the batched
+        # write now runs on a worker connection and is observed at its method
+        # boundary below instead.
         store._thread_local.conn = counting
+        batch_sizes: list[int] = []
+        original_flush = fw._flush_last_seen
+
+        def _counting_flush(batch):
+            batch_sizes.append(len(batch))
+            original_flush(batch)
+
+        fw._flush_last_seen = _counting_flush  # type: ignore[method-assign]
         await fw.scan_source(source)
 
         assert counting.select_sources <= 2, (
@@ -402,7 +398,9 @@ class TestFolderWatcherScanQueryCount:
         assert counting.last_seen_execute == 0, (
             "last_seen touches must be batched, not issued one per file"
         )
-        assert counting.last_seen_executemany == 1
+        assert batch_sizes == [n_files], (
+            "all unchanged-file last_seen touches must land in one worker batch"
+        )
 
     @pytest.mark.asyncio
     async def test_last_seen_is_still_written(self, tmp_path: Path) -> None:
@@ -419,7 +417,7 @@ class TestFolderWatcherScanQueryCount:
         pipeline._dedup_enabled = False
         fw = FolderWatcher(store, pipeline)
 
-        async def _ingest(file_path, source_id, namespace, props, old_ids, root: str = ""):
+        async def _ingest(file_path, source_id, namespace, props, old_ids, root: str = "", **kw):
             return ["item-1"], "done"
 
         fw._ingest_file = _ingest  # type: ignore[assignment]
@@ -586,3 +584,33 @@ class TestChannelPresetsReadIsCached:
 
         resp = await handlers_channel.api_channel_presets(MagicMock())
         assert json.loads(resp.body)["presets"] == [{"id": "b"}, {"id": "c"}]
+
+
+# ── Optional MCP servers stay off the CLI import graph ─────────────────────
+
+
+class TestOptionalMcpServersAreNotImportedByTheCli:
+    """`kirocrew gateway` boots through ``cli``, so a module-scope import of an
+    optional, default-OFF subsystem runs on every gateway start and every other
+    command that will never dispatch to it. Each MCP server module is therefore
+    loaded inside its own dispatch branch.
+
+    An in-process ``sys.modules`` check cannot see this — pytest has already
+    imported the package — so the assertion runs in a clean interpreter.
+    """
+
+    def test_importing_cli_does_not_pull_the_mcp_server_modules(self) -> None:
+        got = _probe(
+            "import json, sys\n"
+            "import kiro_crew.cli\n"
+            "print(json.dumps({\n"
+            "    'dashboard': 'kiro_crew.mcp_dashboard' in sys.modules,\n"
+            "    'computer': 'kiro_crew.mcp_computer' in sys.modules,\n"
+            "}))\n"
+        )
+        assert got["dashboard"] is False, (
+            "kiro_crew.mcp_dashboard is imported at cli module scope — move it "
+            "into the mcp-dashboard dispatch branch (importlib) so a "
+            "default-disabled server costs gateway boot nothing"
+        )
+        assert got["computer"] is False

@@ -63,7 +63,7 @@
 
 import { describe, it, expect } from 'vitest'
 
-import { CATALOGS as RUNTIME_CATALOGS } from './index'
+import { CATALOGS as RUNTIME_CATALOGS } from './catalogs'
 import { DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES } from './languages'
 // One definition of the checks, shared with `check-source-strings.mjs`, which runs the
 // same predicates at ZERO tolerance over the values a branch changed. Two copies would
@@ -85,7 +85,12 @@ const GENERATED = new Set(SUPPORTED_LANGUAGES.filter(l => l.devOnly).map(l => l.
  * Raising a number is the reviewable act. It means new malformed copy shipped.
  */
 const CEILINGS: Record<string, number> = {
-  'unbalanced-delimiter': 160,
+  // 168, not 160, because a twelfth catalog inherits the English fragments that
+  // are unbalanced AT SOURCE (`'Findings ('` + N + `')'`). Measured: all 14
+  // unbalanced Korean values carry exactly the English value's own delta and none
+  // introduce an imbalance of their own, so the +8 is arithmetic on a defect
+  // Phase 3 repairs by de-fragmenting the key, not new bad copy.
+  'unbalanced-delimiter': 168,
   'odd-quote-count': 27,
   'edge-whitespace': 15,
   'doubled-space': 10,

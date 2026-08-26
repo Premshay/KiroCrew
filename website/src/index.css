@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 /* ── Script fallback faces ──
-   zh-CN, ja, hi and bn have no font coverage otherwise: every family in --font-body
+   zh-CN, ja, ko, hi and bn have no font coverage otherwise: every family in --font-body
    and --mono below covers Latin only, so those scripts fall through to the
    browser's per-script fallback, which picks a face per character and silently
    mismatches. CJK punctuation makes it visible — Unicode uses one code point for
@@ -57,9 +57,9 @@
                  U+FE30-FE4F, U+FF00-FFEF;
 }
 /* Japanese and Simplified Chinese share Han code points but not always glyph
-   forms. A separate alias lets html:lang(ja) select Japanese faces without
-   changing the SC default used by zh-CN. Kana joins the Han ranges so Japanese
-   punctuation and syllabaries come from the same face. */
+   forms. A separate alias lets :lang(ja) select Japanese faces without
+   changing the SC aliases used by :lang(zh-CN). Kana joins the Han ranges so
+   Japanese punctuation and syllabaries come from the same face. */
 @font-face {
   font-family: 'KC Japanese Fallback';
   font-style: normal; font-weight: 400;
@@ -87,10 +87,42 @@
                  U+31C0-31FF, U+3200-32FF, U+3300-33FF, U+3400-4DBF, U+4E00-9FFF,
                  U+F900-FAFF, U+FE30-FE4F, U+FF00-FFEF;
 }
+/* Korean needs its own alias for a different reason than Japanese does: Hangul
+   (U+AC00-D7AF and the Jamo blocks) is absent from the SC and JP faces' coverage
+   in practice, so leaving a Simplified alias in front for :lang(ko) puts an alias
+   that cannot draw Hangul ahead of one that can, and the browser resolves each
+   syllable from the OS cascade instead. The Han ranges are claimed too — Korean
+   copy is Hangul-only, but a quoted 한자 in user content should draw the Korean
+   glyph form, not the Simplified one. */
+@font-face {
+  font-family: 'KC Korean Fallback';
+  font-style: normal; font-weight: 400;
+  src: local('Apple SD Gothic Neo'), local('AppleSDGothicNeo-Regular'),
+       local('Malgun Gothic'), local('MalgunGothic'), local('Noto Sans CJK KR'),
+       local('NotoSansCJKkr-Regular'), local('Noto Sans KR'), local('NotoSansKR-Regular'),
+       local('Source Han Sans KR'), local('SourceHanSansKR-Regular'),
+       local('Nanum Gothic'), local('NanumGothic');
+  unicode-range: U+1100-11FF, U+2E80-2EFF, U+2F00-2FDF, U+3000-303F, U+3130-318F,
+                 U+3200-32FF, U+3300-33FF, U+3400-4DBF, U+4E00-9FFF, U+A960-A97F,
+                 U+AC00-D7AF, U+D7B0-D7FF, U+F900-FAFF, U+FE30-FE4F, U+FF00-FFEF;
+}
+@font-face {
+  font-family: 'KC Korean Fallback';
+  font-style: normal; font-weight: 700;
+  src: local('Apple SD Gothic Neo Bold'), local('AppleSDGothicNeo-Bold'),
+       local('Malgun Gothic Bold'), local('MalgunGothic-Bold'),
+       local('Noto Sans CJK KR Bold'), local('NotoSansCJKkr-Bold'),
+       local('Noto Sans KR Bold'), local('NotoSansKR-Bold'),
+       local('Source Han Sans KR Bold'), local('SourceHanSansKR-Bold'),
+       local('Nanum Gothic Bold'), local('NanumGothic-Bold');
+  unicode-range: U+1100-11FF, U+2E80-2EFF, U+2F00-2FDF, U+3000-303F, U+3130-318F,
+                 U+3200-32FF, U+3300-33FF, U+3400-4DBF, U+4E00-9FFF, U+A960-A97F,
+                 U+AC00-D7AF, U+D7B0-D7FF, U+F900-FAFF, U+FE30-FE4F, U+FF00-FFEF;
+}
 /* Monospace Han, for code and CLI surfaces. Rarely installed on a stock machine;
-   when absent 'KC Han Fallback' follows it in --script-fallbacks-mono, so Han in a
-   code block draws from a proportional face — the same pairing the browser's own
-   fallback produces today, and better than a missing glyph. */
+   when absent 'KC Han Fallback' follows it in the :lang(zh-CN) mono token, so Han in
+   a code block draws from a proportional face — the same pairing the browser's
+   own fallback produces today, and better than a missing glyph. */
 @font-face {
   font-family: 'KC Han Mono Fallback';
   font-style: normal; font-weight: 400;
@@ -128,6 +160,26 @@
                  U+F900-FAFF, U+FE30-FE4F, U+FF00-FFEF;
 }
 @font-face {
+  font-family: 'KC Korean Mono Fallback';
+  font-style: normal; font-weight: 400;
+  src: local('D2Coding'), local('D2Coding-Regular'), local('Sarasa Mono K'),
+       local('SarasaMonoK-Regular'), local('Noto Sans Mono CJK KR'),
+       local('NotoSansMonoCJKkr-Regular');
+  unicode-range: U+1100-11FF, U+2E80-2EFF, U+2F00-2FDF, U+3000-303F, U+3130-318F,
+                 U+3200-32FF, U+3300-33FF, U+3400-4DBF, U+4E00-9FFF, U+A960-A97F,
+                 U+AC00-D7AF, U+D7B0-D7FF, U+F900-FAFF, U+FE30-FE4F, U+FF00-FFEF;
+}
+@font-face {
+  font-family: 'KC Korean Mono Fallback';
+  font-style: normal; font-weight: 700;
+  src: local('D2Coding Bold'), local('D2Coding-Bold'), local('Sarasa Mono K Bold'),
+       local('SarasaMonoK-Bold'), local('Noto Sans Mono CJK KR Bold'),
+       local('NotoSansMonoCJKkr-Bold');
+  unicode-range: U+1100-11FF, U+2E80-2EFF, U+2F00-2FDF, U+3000-303F, U+3130-318F,
+                 U+3200-32FF, U+3300-33FF, U+3400-4DBF, U+4E00-9FFF, U+A960-A97F,
+                 U+AC00-D7AF, U+D7B0-D7FF, U+F900-FAFF, U+FE30-FE4F, U+FF00-FFEF;
+}
+@font-face {
   font-family: 'KC Devanagari Fallback';
   font-style: normal; font-weight: 400;
   src: local('Noto Sans Devanagari'), local('NotoSansDevanagari-Regular'), local('Nirmala UI'),
@@ -156,26 +208,97 @@
   unicode-range: U+0980-09FF;
 }
 
+/* ─── OpenDyslexic (SIL-OFL) ── accessibility built-in ───
+   Registered as its own font-family so the a11y font never leaks into
+   var(--mono) consumers: proportional variants live under 'OpenDyslexic',
+   the monospace face under 'OpenDyslexicMono'. useZoom's MONO_OVERRIDE map
+   points --mono at OpenDyslexicMono when the user selects opendyslexic.
+
+   Italic and BoldItalic are bundled so <em>, blockquotes, and markdown
+   ***bold-italic*** render as drawn glyphs — synthesized italic on OpenDyslexic
+   destroys the weighted-bottom/asymmetric-shape properties dyslexic readers
+   pick this font for. Family-name isolation means italic never resolves inside
+   <code> blocks: var(--mono) reads 'OpenDyslexicMono' which has no italic face
+   declared, so italic inside code stays synthesized (same as JetBrains Mono).
+*/
+@font-face {
+  font-family: 'OpenDyslexic';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/opendyslexic/OpenDyslexic-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'OpenDyslexic';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/opendyslexic/OpenDyslexic-Bold.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'OpenDyslexic';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/opendyslexic/OpenDyslexic-Italic.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'OpenDyslexic';
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/opendyslexic/OpenDyslexic-BoldItalic.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'OpenDyslexicMono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/opendyslexic/OpenDyslexicMono-Regular.woff2') format('woff2');
+}
+
 /* ── Design tokens ── */
 /* Shared across all themes */
 :root {
   /* Single source of truth for the script fallbacks. Every declaration of
      --font-body / --mono — here, in the theme blocks below, and the ones built in
      hooks/useTheme.tsx and hooks/useZoom.ts — references these by name instead of
-     repeating the list. Locale-specific overrides below swap regional Han faces
-     without changing any consumer stack. They lead each stack; unicode-range is
-     what makes leading safe. */
+     repeating the list. Regional Han aliases are NOT in the untagged default:
+     a leading Simplified Chinese face would force Japanese (and other untagged
+     CJK) through the wrong glyph forms. html:lang(zh-CN/ja/ko) below swap
+     isolated regional faces for that UI language. A bare :lang(zh) is avoided
+     — it also matches zh-TW/zh-HK. They lead each stack; unicode-range is what
+     makes leading safe. */
+  --script-fallbacks:'KC Devanagari Fallback','KC Bengali Fallback';
+  --script-fallbacks-mono:'KC Devanagari Fallback','KC Bengali Fallback';
+  /* An installed theme pack fills --theme-font-sans / --theme-font-mono with its
+     own faces (see hooks/themeCss.ts). Reading them here means code surfaces
+     follow a pack's monospace face without the user having to switch the whole UI
+     to monospace, and the pack's proportional face is already in place on first
+     paint rather than swapping in when the preference effect runs. Unfilled, each
+     var() falls back to the built-in stack. */
+  --font-body:var(--theme-font-sans, var(--script-fallbacks),'Space Grotesk',-apple-system,BlinkMacSystemFont,sans-serif);
+  --mono:var(--theme-font-mono, var(--script-fallbacks-mono),'JetBrains Mono',ui-monospace,SFMono-Regular,monospace);
+  --radius-sm:6px;--radius-md:8px;--radius-lg:12px;--radius-xl:16px;
+}
+html:lang(zh-CN) {
+  /* Isolated Simplified aliases for Chinese UI. Not :lang(zh): that also
+     matches zh-TW / zh-HK / zh-Hant. Document-level only — :root/--font-body
+     and useZoom already resolve var(--script-fallbacks) on <html>. */
   --script-fallbacks:'KC Han Fallback','KC Devanagari Fallback','KC Bengali Fallback';
   --script-fallbacks-mono:'KC Han Mono Fallback','KC Han Fallback','KC Devanagari Fallback','KC Bengali Fallback';
-  --font-body:var(--script-fallbacks),'Space Grotesk',-apple-system,BlinkMacSystemFont,sans-serif;
-  --mono:var(--script-fallbacks-mono),'JetBrains Mono',ui-monospace,SFMono-Regular,monospace;
-  --radius-sm:6px;--radius-md:8px;--radius-lg:12px;--radius-xl:16px;
 }
 html:lang(ja) {
   /* Never retain the SC aliases here. If no named Japanese face is installed,
      falling through lets the browser use its lang-aware Japanese fallback. */
   --script-fallbacks:'KC Japanese Fallback','KC Devanagari Fallback','KC Bengali Fallback';
   --script-fallbacks-mono:'KC Japanese Mono Fallback','KC Japanese Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+}
+html:lang(ko) {
+  /* Never retain the SC or JP aliases here. Neither draws Hangul, so leaving one
+     in front only delays resolution to the browser's lang-aware Korean fallback. */
+  --script-fallbacks:'KC Korean Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+  --script-fallbacks-mono:'KC Korean Mono Fallback','KC Korean Fallback','KC Devanagari Fallback','KC Bengali Fallback';
 }
 /* Dark theme shadows */
 :root,[data-theme="dark"],[data-theme="monokai-dark"],[data-theme="solarized-dark"],[data-theme="amber-dark"],[data-theme="nord-dark"],[data-theme="dracula-dark"],[data-theme="rosepine-dark"],[data-theme="catppuccin-dark"],[data-theme="tokyonight-dark"],[data-theme="gruvbox-dark"],[data-theme="ice-dark"]{
@@ -548,7 +671,7 @@ html:lang(ja) {
   --chrome:rgba(250,244,237,.95);
   --text:#575279;--text-strong:#26233a;--muted:#716c7f;--muted-fg:#000;--muted-strong:#797593;
   --border:#e0d8d0;--border-strong:#d0c8c0;--border-hover:#b0a8a0;
-  --accent:#d7827e;--accent-fg:#fff;--accent-hover:#e09490;--accent-subtle:rgba(215,130,126,.12);
+  --accent:#d7827e;--accent-fg:#000;--accent-hover:#e09490;--accent-subtle:rgba(215,130,126,.12);
   --accent-glow:rgba(215,130,126,.15);--ring:#d7827e;
   --ok:#56949f;--ok-fg:#000;--ok-subtle:rgba(86,148,159,.1);
   --warn:#ea9d34;--warn-fg:#000;--warn-subtle:rgba(234,157,52,.1);
@@ -811,11 +934,11 @@ html:lang(ja) {
   --chrome:rgba(255,255,255,.98);
   --text:#1c1c1e;--text-strong:#000000;--muted:#6f6f74;--muted-fg:#000;--muted-strong:#636366;
   --border:#d1d1d6;--border-strong:#c7c7cc;--border-hover:#aeaeb2;
-  --accent:#007aff;--accent-fg:#fff;--accent-hover:#0a84ff;--accent-subtle:rgba(0,122,255,.12);
+  --accent:#007aff;--accent-fg:#000;--accent-hover:#0a84ff;--accent-subtle:rgba(0,122,255,.12);
   --accent-glow:rgba(0,122,255,.15);--ring:#007aff;
   --ok:#34c759;--ok-fg:#000;--ok-subtle:rgba(52,199,89,.1);
   --warn:#ff9500;--warn-fg:#000;--warn-subtle:rgba(255,149,0,.1);
-  --danger:#ff3b30;--danger-fg:#fff;--danger-subtle:rgba(255,59,48,.1);
+  --danger:#ff3b30;--danger-fg:#000;--danger-subtle:rgba(255,59,48,.1);
   --info:#5ac8fa;--info-fg:#000;
   --aim:#af52de;--aim-fg:#fff;--aim-subtle:rgba(175,82,222,.12);
   --clarify:#ff9500;--clarify-subtle:rgba(255,149,0,.06);
@@ -865,8 +988,8 @@ html:lang(ja) {
   --accent:#8e48ff;--accent-fg:#ffffff;--accent-hover:#7a35e0;--accent-subtle:rgba(142,72,255,.12);
   --accent-glow:rgba(142,72,255,.15);--ring:#8e48ff;
   --ok:#008543;--ok-subtle:rgba(0,133,67,.12);
-  --warn:#a38a00;--warn-subtle:rgba(163,138,0,.1);
-  --danger:#d92544;--danger-subtle:rgba(217,37,68,.1);
+  --warn:#a38a00;--warn-fg:#000;--warn-subtle:rgba(163,138,0,.1);
+  --danger:#d92544;--danger-fg:#fff;--danger-subtle:rgba(217,37,68,.1);
   --info:#285092;
   --aim:#8041e6;--aim-subtle:rgba(128,65,230,.12);
   --clarify:#a38a00;--clarify-subtle:rgba(163,138,0,.06);
@@ -913,11 +1036,11 @@ html:lang(ja) {
   --chrome:rgba(239,240,242,.95);
   --text:#5c6370;--text-strong:#2b2d30;--muted:#666b74;--muted-strong:#6f737a;
   --border:#c8cad0;--border-strong:#b0b3ba;--border-hover:#9a9da6;
-  --accent:#5a8fd4;--accent-hover:#4a7dc0;--accent-subtle:rgba(90,143,212,.12);
+  --accent:#5a8fd4;--accent-fg:#000;--accent-hover:#4a7dc0;--accent-subtle:rgba(90,143,212,.12);
   --accent-glow:rgba(90,143,212,.15);--ring:#5a8fd4;
   --ok:#369b43;--ok-subtle:rgba(54,155,67,.1);
-  --warn:#b5a300;--warn-subtle:rgba(181,163,0,.1);
-  --danger:#db3b3b;--danger-subtle:rgba(219,59,59,.1);
+  --warn:#b5a300;--warn-fg:#000;--warn-subtle:rgba(181,163,0,.1);
+  --danger:#db3b3b;--danger-fg:#000;--danger-subtle:rgba(219,59,59,.1);
   --info:#5a8fd4;
   --aim:#9333ea;--aim-subtle:rgba(147,51,234,.12);
   --clarify:#b5a300;--clarify-subtle:rgba(181,163,0,.06);
@@ -1073,7 +1196,7 @@ html:lang(ja) {
   --accent:#5e54d9;--accent-fg:#fff;--accent-hover:#4f46c4;--accent-subtle:rgba(94,84,217,.10);
   --accent-glow:rgba(94,84,217,.18);--ring:#5e54d9;
   --ok:#059669;--ok-fg:#fff;--ok-subtle:rgba(5,150,105,.1);
-  --warn:#d97706;--warn-fg:#fff;--warn-subtle:rgba(217,119,6,.1);
+  --warn:#d97706;--warn-fg:#000;--warn-subtle:rgba(217,119,6,.1);
   --danger:#dc2626;--danger-fg:#fff;--danger-subtle:rgba(220,38,38,.1);
   --info:#4f46e5;--info-fg:#fff;
   --aim:#7c3aed;--aim-fg:#fff;--aim-subtle:rgba(124,58,237,.10);
@@ -1125,7 +1248,7 @@ html:lang(ja) {
   --accent:#4b5563;--accent-fg:#fff;--accent-hover:#1f2937;--accent-subtle:rgba(75,85,99,.12);
   --accent-glow:rgba(75,85,99,.18);--ring:#6b7280;
   --ok:#16a34a;--ok-fg:#fff;--ok-subtle:rgba(22,163,74,.1);
-  --warn:#ca8a04;--warn-fg:#fff;--warn-subtle:rgba(202,138,4,.1);
+  --warn:#ca8a04;--warn-fg:#000;--warn-subtle:rgba(202,138,4,.1);
   --danger:#dc2626;--danger-fg:#fff;--danger-subtle:rgba(220,38,38,.1);
   --info:#2563eb;--info-fg:#fff;
   --aim:#7c3aed;--aim-fg:#fff;--aim-subtle:rgba(124,58,237,.1);
@@ -1163,10 +1286,22 @@ html:lang(ja) {
      Scoped with :has() so the onboarding and welcome views, which legitimately
      grow past the viewport, keep their document scroll. */
   body:has([data-testid="dashboard-shell"]){overflow:hidden}
-  /* Global focus ring for keyboard navigation */
-  /* TESTING: disabled to check scroll bug */
-  /* :focus-visible{outline:2px solid var(--accent);outline-offset:2px} */
+  /* Global focus ring for keyboard navigation. Keyed on `:focus-visible` rather
+     than `:focus` so a pointer click never paints it — the ring is drawn only
+     for the keyboard and AT interactions that have no other cue to where focus
+     sits. `outline` is used (not border/box-shadow) because it is painted
+     outside the box and so cannot shift layout. */
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   @media(prefers-reduced-motion:reduce){*:not([data-virtuoso-scroller] *),*::before,*::after{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
+  /* The rule above zeroes animation-DURATION but not animation-DELAY, and both
+     `animate-rise` and `animate-chip-hop` use fill-mode `backwards` — so a
+     stagger-delayed element (Overview stat tiles, Settings cards, follow-up
+     option chips) would sit fully invisible for its whole delay when the user
+     asked for no motion. Zero the delay for those entrances specifically;
+     `!important` is required to beat the inline `animationDelay` the stagger
+     ladder sets. Deliberately scoped to them rather than zeroing every
+     animation delay globally. */
+  @media(prefers-reduced-motion:reduce){.animate-rise,.animate-chip-hop{animation-delay:0s !important}}
   ::selection{background:var(--accent-subtle);color:var(--text-strong)}
   .bg-accent::selection{background:rgba(255,255,255,.25);color:white}
   ::-webkit-scrollbar{width:6px;height:6px}
@@ -1187,13 +1322,6 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
              radial-gradient(ellipse at 80% 20%,color-mix(in srgb,var(--accent) 3%,transparent) 0%,transparent 50%),
              radial-gradient(ellipse at 50% 80%,color-mix(in srgb,var(--accent) 3%,transparent) 0%,transparent 50%)}
 
-/* ── Nav brand glow pseudo-elements ── */
-.nav-brand-glow::before{content:'';position:absolute;inset:-48px 0 0 0;
-  background:radial-gradient(ellipse at 50% 50%,var(--accent-glow) 0%,var(--accent-subtle) 40%,transparent 70%);
-  opacity:.8;pointer-events:none;animation:brand-glow 5s ease-in-out infinite alternate}
-.nav-brand-glow::after{content:'';position:absolute;bottom:0;left:16px;right:16px;height:1px;
-  background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.3}
-
 /* ── App icons (two-color, theme-reactive) ──
    Idle: muted structure + accent detail. Lit (selected OR hovered inside a
    .group container): accent structure + text detail. Icons are inlined SVGs
@@ -1212,8 +1340,13 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 
 /* ── Streaming highlight (shimmer sweep on trailing words) ── */
 .streaming-glow{background:linear-gradient(90deg,transparent 0%,var(--accent-glow) 40%,var(--accent-glow) 100%);border-radius:2px;padding:0 8px 0 2px;margin:0 -2px;position:relative;overflow:hidden}
-.streaming-glow::before{content:'';position:absolute;inset:0;border-radius:inherit;background:linear-gradient(90deg,transparent 25%,color-mix(in srgb,var(--accent) 50%,transparent) 50%,transparent 75%);background-size:250% 100%;animation:stream-sweep 2.5s ease-in-out infinite;-webkit-mask:linear-gradient(90deg,transparent 0%,black 40%,black 100%);mask:linear-gradient(90deg,transparent 0%,black 40%,black 100%)}
-@keyframes stream-sweep{0%{background-position:150% 0}100%{background-position:-50% 0}}
+/* Animates transform (compositable) rather than background-position, which repaints every
+   frame. The layer stays the size of the box: the gradient is transparent across its outer
+   quarters, so a 25% translate never carries anything visible past the box edge and no
+   clipping is needed -- which matters because this is an inline span that can wrap.
+   `alternate` reverses each cycle so the loop has no restart jump. */
+.streaming-glow::before{content:'';position:absolute;inset:0;border-radius:inherit;background:linear-gradient(90deg,transparent 25%,color-mix(in srgb,var(--accent) 50%,transparent) 50%,transparent 75%);will-change:transform;animation:stream-sweep 2.5s ease-in-out infinite alternate;-webkit-mask:linear-gradient(90deg,transparent 0%,black 40%,black 100%);mask:linear-gradient(90deg,transparent 0%,black 40%,black 100%)}
+@keyframes stream-sweep{0%{transform:translateX(-25%)}100%{transform:translateX(25%)}}
 
 /* ── Streaming caret ──
    Blinking cursor appended after a streaming assistant message. Rendered
@@ -1269,40 +1402,17 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
   .ft-anim-smooth .ft-word{opacity:1;transition:none}
 }
 
-/* ── Streaming block: height grow (code/diff) + per-line rise (diff) ──
+/* ── Streaming block: height grow (code/diff) ──
    SmoothResize wraps streaming code/diff blocks and eases their height as new
    lines arrive instead of snapping. The block's own 8px margin is relocated
    onto the `.ft-resize` wrapper (and zeroed on the child) so overflow:hidden
-   during the height animation doesn't swallow inter-block spacing. DiffBlock
-   rows additionally rise+fade in while the diff is still streaming
-   (`.ft-stream-block` scope) — gated so completed / history-reloaded diffs
-   render statically and never re-animate on a virtualizer re-mount. */
+   during the height animation doesn't swallow inter-block spacing. */
 .msg-content .ft-resize{margin:8px 0}
 .msg-content .ft-resize .code-block,.msg-content .ft-resize .diff-block{margin:0}
-@keyframes ft-line-rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
-.ft-stream-block .ft-drow{animation:ft-line-rise .5s cubic-bezier(.4,0,.2,1) both}
 @media (prefers-reduced-motion:reduce){
   .ft-resize{transition:none!important}
-  .ft-stream-block .ft-drow{animation:none}
 }
 
-/* ── Shimmer bar ── */
-.think-bar{width:48px;height:3px;border-radius:2px;
-  background:linear-gradient(90deg,var(--border),var(--accent),var(--border));
-  background-size:200% 100%;animation:shimmer 1.5s ease-in-out infinite}
-.activity-viewer{background:var(--bg)}
-.subagent-pane{border:1px solid var(--border);border-radius:6px;margin:4px;position:relative}
-.subagent-pane.focused{border-color:var(--accent)}
-.subagent-pane-body{max-height:200px;overflow-y:auto}
-.status-running{animation:pulse 1.5s infinite}
-.status-tool{opacity:0.9}
-.status-done{opacity:0.7}
-.status-error{opacity:0.9}
-
-/* ── Sidebar running indicator (skeleton line) ── */
-.pulse-bar-sm{display:block;padding:2px 0}
-.pulse-bar-sm::before{content:'';display:block;height:8px;border-radius:3px;background:var(--accent-subtle);width:70%;animation:skel-pulse 1.5s ease-in-out infinite}
-@keyframes skel-pulse{0%,100%{opacity:.4}50%{opacity:.8}}
 /* Update card: indeterminate download segment sweeps across the track.
    translateX is relative to the segment's own width (w-1/4 of the track), so
    -100%..400% covers off-left to off-right for a 25% segment. */
@@ -1326,11 +1436,13 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 @keyframes csb-a{0%,30%{opacity:1;transform:translateY(0) scale(1)}38%{opacity:0;transform:translateY(-3px) scale(.6)}45%,82%{opacity:0;transform:translateY(3px) scale(.6)}90%,100%{opacity:1;transform:translateY(0) scale(1)}}
 @keyframes csb-b{0%,30%{opacity:0;transform:translateY(3px) scale(.6)}38%{opacity:0;transform:translateY(3px) scale(.6)}45%{opacity:1;transform:translateY(-2px) scale(1)}55%{opacity:1;transform:translateY(0) scale(1)}82%{opacity:1;transform:translateY(0) scale(1)}90%{opacity:0;transform:translateY(-3px) scale(.6)}100%{opacity:0;transform:translateY(3px) scale(.6)}}
 
-/* ── Kiro themes: the ghost-pose loader icons ──
-   The icons come from the themeBranding `loaderIcons` seam (see ChatFooter); they
-   are brand ASSETS rendered as <img> (the use-lucide-icons brand-mark exception
-   requires that), so they are themed from here rather than by editing the art.
-   This is the pattern a new theme follows: register the artwork, then style it. */
+/* ── The ghost-pose loader icons ──
+   These are the DEFAULT loader artwork for every theme (see ChatFooter's
+   DEFAULT_ICONS); a theme replaces them through the themeBranding `loaderIcons`
+   seam. They are brand ASSETS rendered as <img> (the use-lucide-icons brand-mark
+   exception requires that), so they are themed from here rather than by editing
+   the art. This is the pattern a new theme follows: register the artwork, then
+   style it. */
 .csb4 .lyr>.kp{width:100%;height:100%;object-fit:contain}
 /* The outline is a REAL vector stroke baked into each pose asset (black, scaled
    per-viewBox so all 8 render at the same 1px), not a CSS effect. Chained
@@ -1341,14 +1453,11 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
    The stroke is in the shared asset, so it applies on both palettes — on the
    dark surface a black edge against a near-black background is imperceptible,
    which is why no dark-theme override is needed. */
-@keyframes grow{0%{width:15%}50%{width:45%}100%{width:60%}}
 @property --glow-strength{syntax:'<number>';inherits:false;initial-value:0}
 @keyframes approval-glow{0%,100%{--glow-strength:0}50%{--glow-strength:1}}
 .approval-glow{--glow-strength:0;animation:approval-glow 2.5s ease-in-out infinite;box-shadow:0 0 0 1.5px color-mix(in srgb, var(--warn) calc(var(--glow-strength) * 55%), transparent),0 0 14px 1px color-mix(in srgb, var(--warn) calc(var(--glow-strength) * 40%), transparent)}
 @keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
 .animate-shimmer{animation:shimmer 2s ease-in-out infinite}
-@keyframes slide-in-right{0%{transform:translateX(100%);opacity:0}100%{transform:translateX(0);opacity:1}}
-.animate-slide-in-right{animation:slide-in-right .2s ease-out}
 @keyframes hourglass-flip{
   0%,40%{transform:rotate(0deg)}
   50%,90%{transform:rotate(180deg)}
@@ -1400,6 +1509,89 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 .msg-content .diff-block>pre{padding:0}
 .msg-content .diff-block,.msg-content .code-block{margin:8px 0}
 
+/* Pierre surfaces (@pierre/diffs). One hook for every code/diff render:
+   the library reads these custom properties, so the theme pack's mono face
+   (--mono resolves through --theme-font-mono) and the app's code size apply
+   to all Pierre surfaces at once. */
+/* Pierre surfaces (@pierre/diffs). One hook for every code/diff render:
+   the library reads these custom properties, so the theme pack's mono face
+   (--mono resolves through --theme-font-mono) and the app's code size apply
+   to all Pierre surfaces at once. */
+.pierre-surface{
+  --diffs-font-family:var(--mono);
+  --diffs-header-font-family:var(--mono);
+  --diffs-font-size:13px;
+}
+/* Pin Pierre's canvas to the app theme's surface token. Must target the HOST
+   element from the outer tree: the Shiki theme injects --diffs-*-bg in a
+   `:host` rule inside the shadow root, which beats values merely INHERITED
+   from .pierre-surface — but outer-tree rules matching the host element beat
+   `:host` rules. Every derived tint (context rows, separators, add/del
+   washes) is color-mixed from the canvas, so the surface follows theme packs
+   while token colors stay with the Shiki theme pair in src/pierre/config.ts. */
+.pierre-surface diffs-container{
+  --diffs-light-bg:var(--bg);
+  --diffs-dark-bg:var(--bg);
+  background-color:var(--bg);
+}
+/* Inline value cells (tool details / tool-request inputs) sit on their own
+   row surface: fully transparent so the host row's background shows through.
+   Pierre drops the `className` prop on the floor, so the class must live on a
+   WRAPPER element (hence the descendant selector); declared last to win the
+   tie with the base host rule above. */
+.pierre-transparent diffs-container{
+  --diffs-light-bg:transparent;
+  --diffs-dark-bg:transparent;
+  background-color:transparent;
+}
+/* Chat diff blocks slot patch-level controls into Pierre's header metadata
+   area. The shadow template puts the slot AFTER the +/- counts; the metadata
+   row is a flex container and slotted nodes are light DOM, so ordering the
+   slotted element first keeps the counts pinned to the right edge no matter
+   how many buttons a block carries. */
+.diff-block [slot='header-metadata']{order:-1}
+/* Same flip for the file-change rows below a message: Open + diffstat cells
+   sit left of Pierre's own +/- counts, which stay rightmost. */
+.fcc-row [slot='header-metadata']{order:-1}
+/* Workspace tree (@pierre/trees): map the dashboard theme tokens onto the
+   tree's override properties so it follows every theme pack, not the
+   library's default palette. */
+.pierre-tree,
+.pierre-tree file-tree-container,
+file-tree-container{
+  --trees-bg-override:var(--bg);
+  background-color:var(--bg);
+  --trees-bg-muted-override:var(--bg-elevated);
+  --trees-fg-override:var(--text);
+  --trees-fg-muted-override:var(--muted);
+  --trees-border-color-override:var(--border);
+  --trees-accent-override:var(--accent);
+  --trees-selected-bg-override:var(--bg-hover);
+  --trees-selected-fg-override:var(--text-strong);
+  --trees-selected-focused-border-color-override:var(--accent);
+  --trees-focus-ring-color-override:var(--accent);
+  --trees-search-bg-override:var(--bg-elevated);
+  --trees-search-fg-override:var(--text);
+  --trees-input-bg-override:var(--bg-elevated);
+  --trees-indent-guide-bg-override:var(--border);
+  --trees-scrollbar-thumb-override:var(--border-strong);
+  --trees-font-family-override:var(--font-body);
+  --trees-font-size-override:12.5px;
+  --trees-padding-inline-override:0px;
+  --trees-git-added-color-override:var(--diff-add-text);
+  --trees-git-deleted-color-override:var(--diff-del-text);
+  --trees-git-modified-color-override:var(--warn);
+  --trees-git-untracked-color-override:var(--info);
+  --trees-git-renamed-color-override:var(--accent);
+  --trees-git-ignored-color-override:var(--muted);
+  --trees-status-added-override:var(--diff-add-text);
+  --trees-status-deleted-override:var(--diff-del-text);
+  --trees-status-modified-override:var(--warn);
+  --trees-status-untracked-override:var(--info);
+  --trees-status-renamed-override:var(--accent);
+  --trees-status-ignored-override:var(--muted);
+}
+
 /* Auto-sizing message-edit bubble. A hidden::after mirror, fed by
    the data-replicated-value attribute, drives the single grid track so the
    overlapping <textarea> grows with its own content in BOTH dimensions —
@@ -1417,20 +1609,6 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 .scroll-fade:hover::-webkit-scrollbar-thumb{background:var(--border)}
 .scroll-fade{scrollbar-width:thin;scrollbar-color:transparent transparent}
 .scroll-fade:hover{scrollbar-color:var(--border) transparent}
-
-/* ── Zigzag rule (diff "unchanged lines" separator) ──
- * A tiling chevron painted as a CSS mask over currentColor (the BrandGlyph
- * pattern from components/BrandIcon.tsx), so it follows the theme's hunk tint
- * and no SVG element lives in TSX (AUTOSDE use-lucide-icons). The data URI is
- * quoted — commas break an unquoted url() token and the mask silently fails. */
-.zigzag-rule{
-  flex:1 1 0%;min-width:0;height:7px;background-color:currentColor;
-  -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='7'%3E%3Cpath d='M0 5.5 L4 1.5 L8 5.5' fill='none' stroke='black' stroke-width='1.2'/%3E%3C/svg%3E");
-  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='7'%3E%3Cpath d='M0 5.5 L4 1.5 L8 5.5' fill='none' stroke='black' stroke-width='1.2'/%3E%3C/svg%3E");
-  -webkit-mask-repeat:repeat-x;mask-repeat:repeat-x;
-  -webkit-mask-position:left center;mask-position:left center;
-  -webkit-mask-size:8px 7px;mask-size:8px 7px;
-}
 
 /* ── Overlay auto-hiding vertical scrollbar ──
  * Reveals the thumb only on hover and overlays the content so it never
@@ -1472,6 +1650,155 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
   color:var(--muted)}
 .top-bar-pill:hover{border-color:var(--border-strong)}
 
+/* ── Topbar layout: search first, sides take the remainder ──
+   THREE tracks. The search width is a function of the WINDOW only
+   (`clamp(240px, 22vw, 480px)`); the two side groups split whatever is left.
+   Because both side tracks are the same `minmax(0,1fr)`, they are always equal,
+   so the search is exactly window-centred by construction — no measurement, no
+   ResizeObserver, no absolutely-positioned overlay to keep clear of.
+
+   The side tracks deliberately have NO floor: they are pure remainder, and each
+   group re-lays-out its own contents against the width it was handed
+   (`container-type: inline-size` below). Content never pushes back on the track,
+   which is why the search can no longer be squeezed out of existence.
+
+   The invariant that replaces the per-track floor is a property of the search
+   width function: for every desktop width, (W - 48 - clamp(240,22vw,480)) / 2
+   must stay above a group's icons-only width. Pinned by
+   test/App.test.tsx (searchWidth).
+
+   The 22vw factor is not a taste call. It is solved backwards from the rung
+   thresholds below: the widest readout tier needs 518px and its rung fires at
+   530px, so keeping the live readings at 1440 (the modal desktop width) requires
+   the side track to clear 531, hence a centre track no wider than 330 there. The
+   48px is the header's own `pl-3 pr-3` plus the two 12px track gaps -- chrome the
+   side tracks never get, and omitting it from the arithmetic is what first put
+   this factor 2vw too high.
+
+   A wider centre buys a bigger inert trigger by evicting live data, which is the
+   priority inversion this change exists to remove -- and above 1400px it would
+   also make the search WIDER than the layout it replaces, which reserved a
+   mirrored gutter and left the trigger 376px at 1440.
+
+   Centred in the header's CONTENT BOX, which is the window centre only when the
+   header's padding is symmetric. It is not on a frameless Electron window: the
+   macOS traffic lights and the Windows caption overlay are cleared with
+   `padding-left:84px` / `padding-right:142px` below, so the centre shifts by half
+   that inset. That is deliberate -- the inset is occupied by native controls, so
+   centring in the space the row can actually use is what reads as centred -- but
+   it means "window-centred" holds only for the plain browser dashboard.  */
+.topbar{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) clamp(240px, 22vw, 480px) minmax(0,1fr);
+  align-items:center;
+  gap:12px}
+/* Mobile: the centre track holds the trigger in its icon-only form rather than
+   the full-width one, sized `auto` so the track costs only the icon. The side
+   tracks stay the same `minmax(0,1fr)` pair as on desktop, so the trigger is
+   window-centred at every width -- one placement for the control instead of a
+   jump to the left edge at 767px, which read as the button having been shoved
+   there under width pressure.
+
+   It stays a grid child of its own -- NOT a third sibling inside the actions
+   group, which would put three action controls in one horizontal row
+   (website/AUTOSDE.yaml max-two-buttons-per-row) -- and that also keeps the
+   three tracks matched to three children, so the actions group cannot land in
+   the centre track by auto-placement. */
+@media (max-width:767px){
+  .topbar{grid-template-columns:minmax(0,1fr) auto minmax(0,1fr)}
+}
+
+/* Each side group is a size-query container. Inline-size containment also stops
+   the group contributing its content width to the track it sits in, which is
+   exactly the semantics wanted here: the track is sized by the window, and the
+   contents adapt to it. */
+.tb-left,.tb-right{container-type:inline-size;min-width:0;display:flex;align-items:center;overflow:hidden}
+.tb-left{justify-content:flex-start;gap:.5rem}
+/* The actions group ends flush with the header's own padding edge, and the
+   notification bell's unread badge is deliberately offset 4px past the button's
+   top-right corner (`-top-1 -right-1` in App.tsx). `overflow:hidden` clipped
+   exactly that overhang, squaring the badge's right edge off and cutting into a
+   two-digit count.
+   The padding reserves the overhang INSIDE the clip box (which is the padding
+   box), and the equal negative margin puts the outer box back where it was, so
+   the bell does not move, the header does not change height, and the group's
+   CONTENT box -- what the @container ladder below queries -- keeps the width the
+   track gives it. Deliberately NOT `overflow-clip-margin`: WebKit does not
+   implement it, so on every iOS browser that spelling would leave the badge
+   clipped exactly as before. The reserve is 2px MORE than the badge's 4px offset,
+   not equal to it: a flush 4px left the badge body exactly on the clip boundary,
+   so sub-pixel rounding and the badge's glow shadow still squared its top and
+   right edges. The 2px slack clears the box; keep both values equal, and only as
+   large as needed, since more lets real content escape into the header's padding. */
+.tb-right{justify-content:flex-end;gap:.375rem;padding:6px 6px 0 0;margin:-6px -6px 0 0}
+
+/* Both side tracks are `minmax(0,1fr)` at EVERY width, and that is load-bearing
+   for the containment above, not just for centring. A side track sized `auto`
+   asks its item for a content size, and an inline-size container has none to
+   give: when the narrow rule made the identity track `auto`, the track collapsed
+   to that group's own padding -- 16px measured, `16px 28px 298px` for the three
+   tracks -- and `overflow:hidden` clipped the 36px menu button down to an 8px
+   sliver, leaving a phone with no visible route to the nav at all. Only the
+   centre track, whose item is not a size container, may be `auto`. Pinned by
+   test/topbarMenuButtonNarrow.test.ts. */
+
+/* The collapse ladder. Each rung is keyed off the GROUP's own width, so it
+   responds to the space actually handed to it rather than to a viewport
+   breakpoint that cannot know what the group currently holds (usage pill
+   present or not, resource posture firing, extension segments registered).
+   Rungs drop cheapest-first: metric numbers, then the credit counter, then the
+   feedback labels, then the readouts entirely. */
+/* Thresholds are the MEASURED content width of the rung above, plus a small
+   margin: the rung must fire before the group gets narrower than its contents,
+   because flex children would otherwise absorb the difference by squeezing their
+   own text. Measured in capture/topbar-search-variants.tsx — full 518px, without
+   the metric numbers 382px, without the credit counter 330px, icons-only 139px. */
+@container (max-width:530px){ .tb-drop-metrics{display:none} }
+@container (max-width:392px){ .tb-drop-usage{display:none} }
+@container (max-width:340px){ .tb-drop-feedback{display:none} }
+/* Terminal rung: the capsule keeps only its first child, the connection dot.
+   The rungs above name the built-in readouts one by one, but the capsule is also
+   an extension slot (`getCapsuleSegments`) whose registered segments cannot be
+   enumerated here, so the floorless track needs one rung that bounds the group
+   whatever it holds. Structural (`> *:not(:first-child)`) rather than by class
+   for exactly that reason. Budget documented in docs/extension-seams.md. */
+@container (max-width:200px){ .tb-capsule > *:not(:first-child){display:none} }
+/* The counterpart: a form that exists ONLY on the narrow rungs (e.g. the metric
+   readout's icon stand-in). Both forms ship in the DOM because the rung is a
+   container query — no JS branch here can observe the group's own width. */
+@container (min-width:531px){ .tb-narrow-only{display:none} }
+
+/* The identity group's own rung. The group holds the nav button (phone only) plus
+   the crew switcher -- active-crew chip, the pinned chips, then the dropdown --
+   and the dropdown TRAILS the chips, so it is the control that leaves the clip
+   box first when the group runs out of room. Losing it would leave a phone with
+   no way to switch crews at all.
+   Measured in the group's own CONTENT box, which is what a container query reads
+   and is 16px narrower than its track on a phone (`px-2` on the group): nav
+   button + gap + a `Local` chip + gap + dropdown = 139px, so the rung fires just
+   above that. Dropping the chip NAMES buys ~43px each and keeps every chip, its
+   state icon and its unread badge on screen; each chip carries the crew name in
+   `aria-label`/`title`, so nothing becomes unreachable.
+   Scoped to `.tb-left` because the chip markup is shared with the full-width
+   strip bar, which is not in this group and has room for its labels.
+   Deliberately NOT `display:none` on the chip row: the dropdown's aggregate
+   unread badge counts a pinned crew only when its chip is measured as cut off,
+   and a display:none row measures as zero-width chips at offset zero -- read as
+   "on screen", which would silently swallow their unread. */
+@container (max-width:152px){ .tb-left .tb-drop-crew-name{display:none} }
+/* Terminal rung for the identity group, the counterpart of the capsule's
+   dot-only one: below this the active-crew chip goes too and the group keeps just
+   the nav button and the dropdown -- which still names the crew on screen, with a
+   radio check on its row. The threshold is the WIDEST icons-only form, not the
+   narrowest: an icon-only chip is 30px bare but ~56px carrying an unread badge,
+   so bounding it at the bare width would let a badge push the dropdown out at
+   exactly the moment there is unread to reach. 36 + 8 + 56 + 4 + 24 = 128.
+   The pinned chip row is left in the flow rather than hidden, for the
+   measurement reason above: `min-width:0` lets it shrink to nothing on its own,
+   and shrinking (unlike `display:none`) is what its own measurement reads as cut
+   off, so those crews' unread rolls into the aggregate badge. */
+@container (max-width:128px){ .tb-left .tb-crew-active-chip{display:none} }
+
 /* ── Topbar glass ── */
 .topbar-glass{
   background:color-mix(in srgb, var(--chrome) 74%, transparent);
@@ -1493,9 +1820,38 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 /* ── Frameless Electron window (Windows) ──
    titleBarOverlay places native caption controls (min/max/close) in a 138px
    overlay strip at the top-right of the window. Inset the header's right side
-   so interactive elements (bell, settings, actions) stay clear of the overlay.
-   Keep 138px in sync with WIN_CAPTION_OVERLAY_WIDTH in src/lib/electron.ts. */
-.win-electron header.topbar-glass{padding-right:142px}
+   so interactive elements (bell, settings, actions) stay clear of the overlay,
+   and mark the header as a drag region so the integrated menu row still moves
+   the window — with an explicit no-drag opt-out for every interactive control,
+   including the titlebar app-menu triggers below.
+   Keep 142px in sync with WIN_CAPTION_OVERLAY_WIDTH in src/lib/electron.ts. */
+.win-electron header.topbar-glass{
+  padding-right:142px;
+  -webkit-app-region:drag;
+}
+.win-electron header.topbar-glass button,
+.win-electron header.topbar-glass a,
+.win-electron header.topbar-glass input,
+.win-electron header.topbar-glass [role="button"],
+.win-electron .win-titlebar-menu{
+  -webkit-app-region:no-drag;
+}
+.win-titlebar-menu-item{
+  border:0;
+  background:transparent;
+  font-family:inherit;
+  cursor:default;
+  transition:background-color .12s ease,color .12s ease;
+}
+
+/* ── Frameless Electron window (Linux) ──
+   The main process injects a caption-control cluster (min/max/close, three
+   36px buttons) at the window's top-right (#electron-linux-controls in
+   electron/main.js). Inset the header's right side so interactive elements
+   stay clear of it. Keep 108px in sync with LINUX_CAPTION_CONTROLS_WIDTH in
+   src/lib/electron.ts. Applied only when the window is actually frameless
+   (runtime decision — see isLinuxFramelessElectron). */
+.linux-electron header.topbar-glass{padding-right:112px}
 /* Embedded remote pane (option B): the pane is a separate document loaded in an
    iframe, so its SPA can't see Electron — `isMacElectron` is false inside it and
    the `.mac-electron` rule never applies. The parent relays whether it is a
@@ -1511,6 +1867,73 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
    chips are clickable, hoverable, and drag-reorderable. Ignored in browsers. */
 .side-panel-strip,.side-panel-strip *{-webkit-app-region:no-drag}
 
+/* Focus-mode edge triggers. 10px is deliberately tight: a wider strip opened the
+   chrome on pointer travel that was merely passing near the edge, and overshooting
+   a 10px target is cheap because the edge-slam path (App.tsx mouseout handler)
+   opens the overlay anyway when the pointer exits the window through that edge.
+
+   The size is CONSTANT. An earlier version shrank the strip to 8px on reveal so it
+   would stop covering the top of the revealed header's controls, and that produced
+   a hover feedback loop: the strip resized out from under a stationary pointer,
+   which fired mouseleave, which started the close grace, which closed the chrome,
+   which grew the strip back under the pointer, which re-opened it — flickering
+   indefinitely without the user moving the mouse. Anything that changes the hit
+   target under a resting pointer can oscillate like that, so the strip is instead
+   COVERED by the chrome it summons (z-61 against the chrome's z-62): while the
+   chrome is up, hover and clicks land on the header or rail, which keeps them open
+   through their own surface handlers, and nothing resizes. */
+.focus-peek-top{height:10px}
+.focus-peek-rail{width:10px}
+
+/* no-drag only while the chrome is HIDDEN. While it is shown the drag surface is
+   the header (Windows/Linux, below) or the .host-drag-strip gap strips (macOS,
+   App.tsx), and a no-drag strip laid over the band's top 10px could only subtract
+   from it. Hidden, the injected drag bar is collapsed to 0 anyway, so this is a
+   backstop rather than load-bearing. */
+body.mc-focus-mode:not(.mc-focus-chrome) .focus-peek-top{-webkit-app-region:no-drag}
+body.mc-focus-mode:not(.mc-focus-rail) .focus-peek-rail{-webkit-app-region:no-drag}
+
+/* The revealed header is a window-drag surface in its empty regions on Windows
+   and frameless Linux, where the class-driven region resolves reliably. macOS is
+   deliberately EXCLUDED (:not below): every drag mechanism attached to the shell
+   — this class-toggled rule on the transformed header, a full-width mount strip,
+   in-shell gap strips — failed to register with the native window on the desktop
+   app, so macOS drag is carried entirely by .host-drag-strip elements rendered
+   OUTSIDE the shell (see the pane-stack strips in App.tsx), and a transformed
+   drag-marked header must not exist in the document to interfere. */
+body.mc-focus-mode.mc-focus-chrome .win-electron header.topbar-glass,
+body.mc-focus-mode.mc-focus-chrome .linux-electron header.topbar-glass{-webkit-app-region:drag}
+
+/* Focus mode: the peeked chrome FLOATS over content instead of sitting above a
+   flat background, which is a different rendering problem from the docked case.
+   .topbar-glass is `color-mix(in srgb, var(--chrome) 74%, transparent)` — 26%
+   see-through. Docked there is nothing behind it but --bg, so that reads as a
+   tint; as an overlay the transcript shows straight through the blur and the
+   header's own text becomes hard to read. Opaque while floating.
+   The reduced-transparency / high-contrast fallbacks further down force an opaque
+   background with !important, so they still win — which is the same answer. */
+body.mc-focus-mode header.topbar-glass{background:var(--chrome)}
+
+/* The drop shadows are gated on the surface actually being ON SCREEN. Both the
+   header and the rail stay MOUNTED and slide out of view, so an always-on shadow
+   keeps painting its tail into the content: this shadow reaches 28px past the
+   box, and a header translated up by its own 42px leaves that tail sitting over
+   the top of the transcript as a permanent smudge. */
+body.mc-focus-mode.mc-focus-chrome header.topbar-glass{
+  box-shadow:0 10px 28px -10px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.10)}
+body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
+  box-shadow:0 10px 28px -10px rgba(0,0,0,.5)}
+
+/* Draggable title-bar strips laid over a remote-instance pane. The pane is a
+   cross-origin iframe, so the host's injected #electron-drag-bar can't reach
+   into it and the blanket marks the whole iframe no-drag — the pane's header
+   can't move the window. InstancesViewport renders these strips (positioned by
+   the gaps the pane reports) AFTER the iframe, so they re-add a drag region in
+   the pane header's control-free gaps. pointer-events:none so the strip never
+   intercepts a click; app-region drag is honored regardless. Ignored in
+   browsers (no native window). */
+.host-drag-strip{position:absolute;top:0;height:42px;-webkit-app-region:drag;pointer-events:none;z-index:2}
+
 /* Scrollbar-free scroll container (used by the side panel tab strip — the
    strip scrolls horizontally but a visible scrollbar under the chips reads
    as clutter). Referenced before Tailwind ever defined it; real rules here. */
@@ -1525,6 +1948,22 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 /* ── Table row striping ── */
 .table-striped tbody tr:nth-child(even){background:var(--card-hl)}
 
+/* ── Follow-up option chip width cap ──
+   An option label is a full user-voice instruction and can run to hundreds of
+   characters. Capped at roughly half the default composer width so at least
+   two options stay side by side and no single chip owns the whole strip; the
+   label itself clamps to two lines. Lives here because the same value is
+   applied to both the chip button and its split-button wrapper. */
+/* Chip width cap. Relative to the row, not an absolute number: a fixed cap
+   cannot know how wide the composer is, and a cap wider than half the row makes
+   the two-column wrap arithmetically impossible (flex breaks the line on the
+   hypothetical main size, before any shrinking). `calc(50% - 0.1875rem)` is half
+   the row minus half of the layouts' `gap-1.5`, so exactly two chips fit; the
+   18rem floor keeps a full-sentence label readable on a narrow window (a bare
+   50% would give ~174px chips on a phone), and the 26rem ceiling preserves the
+   pre-existing rendering on wide screens. */
+.followup-chip{max-width:min(100%,clamp(18rem,calc(50% - 0.1875rem),26rem))}
+
 /* ── Skeleton shimmer placeholder ── */
 .skeleton{
   background:linear-gradient(90deg,var(--bg-elevated) 25%,var(--bg-hover) 50%,var(--bg-elevated) 75%);
@@ -1533,7 +1972,14 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 
 /* ── Consistent focus ring ── */
 .focus-ring{transition:border-color 0.2s,box-shadow 0.2s}
-.focus-ring:focus{outline:none;border-color:var(--ring);
+/* Keyed on `:focus-visible` for the same reason as the global ring: a pointer
+   click on one of these (cards, list rows, template tiles) leaves no ring.
+   Text inputs are the exception the UA makes for us — they match
+   `:focus-visible` even on a click, since keyboard input is expected next — so
+   the treatment below still appears where it is a typing affordance.
+   `outline:none` opts out of the global ring in favour of this border + glow,
+   and the extra class raises specificity so the two never stack. */
+.focus-ring:focus-visible{outline:none;border-color:var(--ring);
   box-shadow:0 0 0 3px var(--accent-subtle),0 0 20px color-mix(in srgb,var(--accent) 8%,transparent)}
 
 /* ── Syntax highlighting (highlight.js) ── */
@@ -1565,35 +2011,54 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
    without fighting hover/active background states, which now use the standard
    neutral tokens (hover:bg-bg-hover, bg-accent-subtle when active). */
 .session-row{--_sc:var(--session-color,transparent);--session-muted:var(--muted)}
+/* Reveal-in-sidebar confirmation: an accent outline the reveal handler holds
+   briefly and then fades (ChatSidebar reveal effect, issue #912). Outline, not
+   background, because the revealed row is usually the active one and already
+   carries the accent-subtle background. No transition declared here on
+   purpose: the row's own Tailwind transition-all animates outline-color, and
+   declaring any transition longhand/shorthand at this higher specificity
+   would strip transition-all while the flash is up, making hover styles snap
+   on exactly the row the reveal highlighted. The fade is a color transition
+   (not an animation), so the global reduced-motion animation kill-switch
+   above leaves the confirmation visible. JS removes the classes after the
+   fade completes (REVEAL_FLASH_FADE_MS in ChatSidebar.tsx covers it). */
+.session-row.session-reveal-flash{outline:2px solid var(--accent);outline-offset:-2px}
+.session-row.session-reveal-flash-fade{outline-color:transparent}
 .session-row.session-colored{position:relative}
+/* Flush against the row's left edge, and inset vertically by exactly the row's
+   corner radius — so the bar spans (row height - 2 * radius) and its ends stop
+   where the rounded corners begin, instead of poking into the curve. The inset
+   reads --radius-md because that is what the row's own `rounded-md` resolves to;
+   a theme pack that redefines the radius therefore moves the bar's ends with it
+   rather than leaving a hardcoded 8px that no longer matches the corner. */
 .session-row.session-colored::before{
   content:"";
   position:absolute;
-  left:5px;
-  top:6px;
-  bottom:6px;
-  width:3px;
-  border-radius:2px;
+  left:0;
+  top:var(--radius-md);
+  bottom:var(--radius-md);
+  width:2px;
+  border-radius:999px;
   background:var(--_sc);
 }
-/* Bar-plus-gradient idle decoration: solid 3px bar starting at 5px from the
-   row's edge, then a soft gradient extending further right to give the row a
-   "lit from the left" feel. Single pseudo-element, doesn't interact with the
-   row's main background so hover/active Tailwind tokens still win. */
+/* Bar-plus-gradient idle decoration: the same flush bar, then a soft gradient
+   extending further right to give the row a "lit from the left" feel. Single
+   pseudo-element, doesn't interact with the row's main background so hover and
+   active Tailwind tokens still win. */
 .session-row.session-colored.session-gradient::before{
   content:"";
   position:absolute;
-  left:5px;
-  top:6px;
-  bottom:6px;
+  left:0;
+  top:var(--radius-md);
+  bottom:var(--radius-md);
   width:40px;
-  border-radius:2px;
+  border-radius:999px;
   pointer-events:none;
   background:linear-gradient(
     to right,
     var(--_sc) 0px,
-    var(--_sc) 3px,
-    color-mix(in srgb,var(--_sc) 28%,transparent) 3px,
+    var(--_sc) 2px,
+    color-mix(in srgb,var(--_sc) 28%,transparent) 2px,
     transparent 100%
   );
 }
@@ -1641,54 +2106,6 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 }
 ::highlight(mc-find-current) {
   background-color: var(--search-highlight-current);
-}
-
-/* Line reveal — a `path/to/file.py:447` chip in the transcript opens the file in
-   the side panel and flashes line 447; `file.md:10-16` flashes the whole span.
-   Monaco decoration classes (not the CSS Custom Highlight API), so unlike
-   ::highlight() these DO honor box properties, which is what allows the gutter
-   bar. --accent-subtle is theme-defined for all palettes and is the same wash
-   flashCommentRow uses, so the two "here is what you clicked" signals read as one
-   idea. Held ~1.8s, then faded out over ~1s. */
-.mc-line-reveal {
-  background-color: var(--accent-subtle, rgba(99, 102, 241, 0.25));
-  animation: var(--mc-line-reveal-anim, mc-line-reveal-out)
-             var(--mc-line-reveal-fade, 1000ms) ease-out
-             var(--mc-line-reveal-hold, 1800ms) forwards;
-}
-.mc-line-reveal-gutter {
-  border-left: 2px solid var(--accent);
-  margin-left: 3px;
-  animation: var(--mc-line-reveal-gutter-anim, mc-line-reveal-gutter-out)
-             var(--mc-line-reveal-fade, 1000ms) ease-out
-             var(--mc-line-reveal-hold, 1800ms) forwards;
-}
-/* An ANIMATION, not a transition. A transition cannot fade this out: clearing the
-   decoration removes Monaco's DOM node outright, and a removed element does not
-   animate — which is why this used to disappear in a single frame despite
-   carrying `transition: background-color`. So the class fades ITSELF on a delay
-   and useLineReveal only clears the (by then invisible) decoration afterwards.
-   Both timings come from that module as custom properties, so these fallbacks
-   apply only if the properties are somehow unset.
-
-   The `-b` aliases are byte-identical on purpose. Monaco reuses a rendered line
-   node when the overlay HTML is unchanged, so a repeat reveal would otherwise
-   inherit the finished animation and stay transparent; useLineReveal alternates
-   the requested name between reveals, and changing `animation-name` is what
-   restarts it. Global `prefers-reduced-motion` (above) zeroes animation-DURATION
-   but not the delay, so this degrades to "hold, then switch off" rather than
-   losing the hold. */
-@keyframes mc-line-reveal-out {
-  to { background-color: transparent; }
-}
-@keyframes mc-line-reveal-out-b {
-  to { background-color: transparent; }
-}
-@keyframes mc-line-reveal-gutter-out {
-  to { border-left-color: transparent; }
-}
-@keyframes mc-line-reveal-gutter-out-b {
-  to { border-left-color: transparent; }
 }
 
 /* Anchored-comment highlights on the markdown / text artifact body are drawn
@@ -1750,31 +2167,67 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
   .mobile-sessions-overlay .sidebar-resize-handle { display: none !important; }
 }
 
-/* ── Diff panel header: theme-conditional bg/border to match Monaco vs/vs-dark ── */
-.diff-panel-header {
-  background-color: #ffffff;
-  border-color: #e5e5e5;
-}
-[data-theme*="dark"] .diff-panel-header {
-  background-color: #1e1e1e;
-  border-color: #333333;
+/* Composer text must reach WebKit's 16px standard focus size on touch devices.
+   When a field takes focus WebKit scales the viewport by
+   clampTo(16 / fontSize, minimumScale, maximumScale), so anything computing
+   below 16px zooms. The 16 is the hardcoded webViewStandardFontSize:
+   https://github.com/WebKit/WebKit/blob/f010ba868212b2113ca0727ce46f06273cb5fd0a/Source/WebKit/UIProcess/API/ios/WKWebViewIOS.mm#L1752
+   The textarea and paste mirror share this hook to keep their font metrics
+   aligned; pointer: coarse leaves desktop typography unchanged.
+
+   The placeholder stays at the desktop size because the zoom scale is computed
+   from the FIELD's font-size, not this pseudo-element's — so holding the hint
+   at 0.875rem costs no zoom protection and keeps it on one line. At 16px the
+   hint wraps, and an empty composer cannot grow to show the second line: a
+   placeholder contributes nothing to scrollHeight, so applyHeight pins the box
+   at INPUT_MIN_H and the wrapped line is clipped.
+
+   The field selector repeats the attribute to reach specificity (0,2,0). Tailwind's
+   `.text-sm` on the same element is (0,1,0), so a single `[data-composer-typo]`
+   would only TIE and win on source order — leaving the fix inert on device, with
+   no test able to see it, if the utilities are ever emitted after this file. The
+   repeat is used instead of qualifying by element because the hook is on the
+   composer's <textarea> and on the paste mirror's <div>, and the mirror's font
+   metrics must track the field's. */
+@media (pointer: coarse) {
+  [data-composer-typo][data-composer-typo] { font-size: 16px; }
+  [data-composer-typo]::placeholder { font-size: 0.875rem; }
 }
 
-/* ── Monaco find widget: prevent clipping and ensure buttons are visible ── */
-.monaco-editor .find-widget {
-  max-width: calc(100% - 28px) !important;
-}
-.monaco-editor .sticky-widget {
-  background-color: var(--vscode-editorStickyScroll-background, var(--color-chrome)) !important;
-  opacity: 1 !important;
-}
-.monaco-editor .find-widget .monaco-inputbox {
-  flex: 1 1 auto !important;
-  min-width: 50px !important;
-}
-.monaco-editor .find-widget .find-actions,
-.monaco-editor .find-widget .replace-actions {
-  flex-shrink: 0 !important;
+/* ── Why there is deliberately NO app-wide 16px field rule here ──
+   The composer rule above is scoped to one hook on purpose. A generalised version was
+   written and withdrawn: CSS can only SET a size, never floor one, so a rule broad
+   enough to reach every field SHRINKS the ones deliberately larger (measured: the
+   artifact rename field's `text-2xl`), while any narrower selector list misses the next
+   field written with an arbitrary value, an `!important` modifier or an inline style.
+   Do not re-add one — `noPageZoom.test.ts` fails if a blanket element rule reappears.
+   Full reasoning, and what a correct fix would need instead, live in the page-zoom
+   section of website/docs/page-layout.md and in issue #6001. */
+
+/* ── The shell is not a zoomable document ──
+   `pan-x pan-y` allows exactly the two behaviours the app needs from the browser
+   on touch -- scrolling either axis -- and withholds the two it does not:
+   pinch page zoom and double-tap zoom. Both magnify a `position: fixed` /
+   `h-dvh` shell, which has no scroll axis to reach whatever the magnification
+   pushed off the visual viewport, so the topbar, composer and drawer all leave
+   at once with no gesture but a second pinch to bring them back.
+
+   `touch-action` is declared on the ROOT because the browser intersects the
+   values from the hit-test target up to the root before deciding which native
+   gesture to run: putting it here restricts every descendant with one rule and
+   cannot be undone lower down -- which is why the image viewer, the one surface
+   that must magnify, owns its pinch as a transform of its own rather than
+   asking for `pinch-zoom` back (see Lightbox in MarkdownRenderer.tsx).
+
+   Existing `touch-action: none` handles (resize separators, drag rows) are
+   unaffected: `none` is strictly narrower, so the intersection is still `none`.
+
+   Pointer-fine devices keep the browser's full gesture set -- ctrl+wheel and
+   the trackpad pinch are a desktop convention this has no business changing.
+   The viewport meta in index.html and the `gesturestart` suppression in
+   utils/pageZoom.ts cover the engines this rule does not reach. */
+@media (pointer: coarse) {
+  html { touch-action: pan-x pan-y; }
 }
 
 /* ── Liquid-glass design system ──
@@ -1877,6 +2330,31 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
 }
 
+/* ── No-backdrop-filter fallback (issue #1817) ──
+ * Every glass surface gets ALL of its real opacity from backdrop-filter: the
+ * background tints are 3-8% alpha (.glass-surface) or a transparent color-mix
+ * (.topbar-glass, .notif-material). Where the engine does not support the
+ * property — older Chromium/Electron builds where it was flag-gated, or Linux
+ * builds compiled without it — the blur declaration is dropped at parse time
+ * and only the near-invisible tint remains, i.e. a transparent panel
+ * (issue #1817, Linux AppImage).
+ *
+ * Mirror of the prefers-reduced-transparency fallback below so there is ONE
+ * degradation story: solid themed background, borders/shadows untouched so
+ * panels stay delimited. !important is required — the dark-theme and :hover
+ * glass rules outrank these selectors on specificity, and Tailwind hover
+ * utilities outrank .notif-material — and it matches the a11y overrides,
+ * which stay later in source order so they still win when both apply.
+ * Test BOTH prefixes: Electron/Chromium historically supported one or the
+ * other. Scoped to the glass classes: platforms with working backdrop-filter
+ * never match this query and keep the glass look. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .topbar-glass,.glass-surface{ background:var(--bg) !important }
+  /* Floating notification cards (NotificationFeed mac variant) sit OVER page
+     content, so they solidify to the card color, not the page background. */
+  .notif-material{ background:var(--card) !important }
+}
+
 /* ── TIER1 a11y: reduced motion / transparency / contrast ── */
 @media (prefers-reduced-motion: reduce){
   *,*::before,*::after{ transition-duration:0.01ms !important; scroll-behavior:auto !important }
@@ -1942,3 +2420,64 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
    every other label in the app (everything else inherits letter-spacing:normal
    from body). Do not promote any of this to an unscoped rule. */
 html[data-font-family="mono"] .rail-community-links{ letter-spacing:-0.05em; word-spacing:-2.5px; gap:3px }
+
+/* OpenDyslexicMono (data-font-family="opendyslexic" in CLI mode) is measured
+   ~22% wider than JetBrains Mono at 12px (advance 8.784 vs 7.20 for capital 'S'
+   from fontTools on the shipped .woff2). The rail budget above therefore has
+   less slack under opendyslexic than under mono, and the "Report issue" button
+   may truncate to an ellipsis on very narrow rails.
+   No opendyslexic-specific tightening rule is applied: -0.05em / -2.5px are
+   metrically tuned for JetBrains Mono's advance and would misfire on
+   OpenDyslexicMono, and negative tracking on a legibility font actively fights
+   the readability properties a user picking OpenDyslexic came for. The
+   button's `text-ellipsis` on `Report issue` handles overflow gracefully;
+   a dedicated rule can be added later if visual QA shows truncation matters. */
+
+/* Cut-edge rule on the pinned-crew chip row. The row is a single nowrap line with
+   overflow:hidden so the trailing dropdown stays against the last chip (see
+   InstanceTabBar.CrewChipRow), which means the chip at the boundary is cut rather
+   than dropped, and that cut needs saying.
+
+   It is said with a 1px rule AT the boundary, not with an alpha fade ACROSS the
+   last pixels. A chip's unread badge is its trailing element, so any cut reaches
+   the badge first: a fade there does not soften an edge, it dissolves the count —
+   an 18px ramp is wider than the 16px badge, so at the rungs where the crew name
+   has already collapsed the whole glyph goes. Nothing about the count is lost to
+   the cut either way: it is already rolled into the dropdown trigger's aggregate
+   badge, whose roll-up counts exactly the crews whose chips measured as cut.
+
+   `::after` so the rule takes no layout: the row is sized from the space the
+   trigger leaves, and an in-flow 1px would feed its own clip measurement. */
+.crew-chip-row[data-cut='true']::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  right: 0;
+  width: 1px;
+  background: var(--border);
+  pointer-events: none;
+}
+
+/* Reserve a transcript image's EXACT display box before its bytes decode.
+   The loaded layout follows the replaced-element min/max rules, which
+   BACK-PROPAGATE a max-height cap into the width (a tall screenshot capped at
+   60vh also narrows). Neither width/height attributes nor a bare aspect-ratio
+   reproduce that transfer: with either, max-height clamps the height while the
+   width stays at max-width, leaving the image letterboxed centered inside a
+   full-width border band. Spelling the native resolution out here — rather
+   than as a per-image inline style string — keeps the CSS in the stylesheet
+   (the i18n gate reads inline template literals as copy) and leaves the
+   component passing only NUMBERS via the two custom properties below.
+   --mc-img-cap comes from the mode class; the intrinsic size comes from the
+   learned natural dimensions. */
+.mc-img-reserve {
+  --mc-img-cap: 60vh;
+  width: min(
+    calc(var(--mc-img-w) * 1px),
+    calc(var(--mc-img-cap) * (var(--mc-img-w) / var(--mc-img-h)))
+  );
+  height: auto;
+  aspect-ratio: var(--mc-img-w) / var(--mc-img-h);
+}
+.mc-img-reserve-compact { --mc-img-cap: 180px; }

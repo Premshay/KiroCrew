@@ -1,27 +1,28 @@
 /**
- * /notifications?id=<ts> deep-link contract.
+ * Deep link: /notifications?note=<ts> opens one notification directly.
  *
- * A push notification's tap-through lands on the full page with the note's
- * store id (its ts — the same key the ack/delete APIs use) in the `id` query
- * param. The page must open that notification's detail as if the row were
- * tapped (so it acks), fetch the list when the deep link lands on a cold
- * store, and degrade to the plain page when the id matches nothing even in a
- * fresh fetch (expired or cleared away) — never crash, never hang on a
- * missing note.
+ * External pushers (issue #2018: an ntfy bridge relaying the WS notification
+ * stream) hard-code the `note` param in their Click URLs, so these tests pin
+ * the page's side of that contract:
+ *
+ * - a valid id routes through the SAME select path as a tapped row (detail
+ *   opens, auto-ack fires, feed row scrolls into view on desktop);
+ * - the param is consumed with a history replace, so a re-render/back does not
+ *   re-select and re-ack;
+ * - the feed loads asynchronously, so an id that arrives before the feed must
+ *   still resolve once the store fills;
+ * - an unknown/expired id degrades to the plain page: nothing selected, no ack,
+ *   no error surface.
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { screen, waitFor } from '@testing-library/react'
+import { act, screen, waitFor } from '@testing-library/react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { renderWithProviders, createTestStore } from './helpers'
-import NotificationsPage from '../pages/NotificationsPage'
-import { api } from '../api/client'
+import NotificationsPage, { NOTE_DEEP_LINK_PARAM } from '../pages/NotificationsPage'
+import { addNotification } from '../store/notificationsSlice'
 import type { RootState } from '../store'
 import type { Notification } from '../types'
-
-let mobile = false
-vi.mock('../hooks/useIsMobile', () => ({
-  useIsMobile: () => mobile,
-}))
 
 vi.mock('../api/client', () => ({
   api: {
@@ -38,6 +39,7 @@ vi.mock('../components/MarkdownRenderer', () => ({
   Lightbox: () => null,
 }))
 
+// happy-dom shims
 Object.defineProperty(window, 'matchMedia', {
   writable: true,
   value: vi.fn().mockImplementation((query: string) => ({
@@ -49,93 +51,175 @@ Object.defineProperty(window, 'matchMedia', {
   })),
 })
 globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} } as unknown as typeof ResizeObserver
+// The test DOM does not scroll; the spy is how the desktop scroll-into-view
+// behavior is observable at all under the test environment.
+const scrollSpy = vi.fn()
+Element.prototype.scrollIntoView = scrollSpy
 
-// A real bus ts: microsecond ISO-8601 with an offset, so the test exercises
-// the characters (+, :) that must survive the query param round-trip encoded.
-const TS = '2026-08-07T10:00:00.123456+00:00'
-const note: Notification = {
-  kind: 'cron', ts: TS, title: 'Cron Result', body: 'cron body text', acked: false,
-}
+const mkN = (ts: string, title: string, acked = false): Notification => ({
+  kind: 'cron', ts, title, body: `body for ${title}`, acked,
+})
 
 function stateWith(notifs: Notification[]): Partial<RootState> {
   return { notifications: { items: notifs } as RootState['notifications'] }
 }
 
-const routeFor = (id: string) => `/notifications?id=${encodeURIComponent(id)}`
+/** Renders the live router search string plus a back-navigation probe so
+ *  tests can assert both consumption AND that it used a history REPLACE:
+ *  with replace the deep-link entry no longer exists, so going back is a
+ *  no-op at history index 0; with a push, back would restore `?note=`. */
+function LocationProbe() {
+  const loc = useLocation()
+  const navigate = useNavigate()
+  return (
+    <div>
+      <div data-testid="location-search">{loc.search}</div>
+      <button data-testid="history-back" onClick={() => navigate(-1)}>back</button>
+    </div>
+  )
+}
 
 beforeEach(() => {
   localStorage.clear()
-  mobile = false
-  vi.mocked(api.notifications).mockClear().mockResolvedValue({ notifications: [] })
-  vi.mocked(api.ackNotification).mockClear()
+  scrollSpy.mockClear()
 })
 
-describe('NotificationsPage ?id= deep link', () => {
-  it('desktop: opens the detail for the linked notification and acks it', async () => {
-    const store = createTestStore(stateWith([note]))
-    renderWithProviders(<NotificationsPage />, { store, route: routeFor(TS) })
-
-    // Detail panel open: its Close control exists and the no-selection empty
-    // state is gone.
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: /Close/ })).toBeInTheDocument()
-    })
-    expect(screen.queryByText('Select a notification')).not.toBeInTheDocument()
-    // Same path as tapping the row: the note acks.
-    await waitFor(() => {
-      expect(store.getState().notifications.items[0].acked).toBe(true)
-    })
-    expect(api.ackNotification).toHaveBeenCalledWith(TS)
-    // Warm store: the id resolved locally, so no immediate confirming GET
-    // fires (the reconciling settle fetch runs seconds later, past this
-    // test's lifetime).
-    expect(api.notifications).not.toHaveBeenCalled()
-  })
-
-  it('mobile: opens the full-width detail view directly', async () => {
-    mobile = true
-    const store = createTestStore(stateWith([note]))
-    renderWithProviders(<NotificationsPage />, { store, route: routeFor(TS) })
-
-    // The mobile detail card is identified by its Back button (the feed is
-    // hidden while a note is selected).
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Back' })).toBeInTheDocument()
-    })
-  })
-
-  it('cold store: fetches the list and then opens the linked detail', async () => {
-    vi.mocked(api.notifications).mockResolvedValue({ notifications: [note] })
-    const store = createTestStore()
-    renderWithProviders(<NotificationsPage />, { store, route: routeFor(TS) })
-
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: /Close/ })).toBeInTheDocument()
-    })
-    expect(api.notifications).toHaveBeenCalled()
-  })
-
-  it('expired id: renders the plain page without crashing', async () => {
-    vi.mocked(api.notifications).mockResolvedValue({ notifications: [note] })
-    const store = createTestStore(stateWith([note]))
+describe('NotificationsPage deep link (?note=<ts>)', () => {
+  it('selects, acks, and scrolls the matching notification into view', async () => {
+    const target = mkN('2026-05-29T10:01:00Z', 'Deploy Finished')
+    const store = createTestStore(stateWith([
+      mkN('2026-05-29T10:00:00Z', 'Cron Result', true),
+      target,
+    ]))
     renderWithProviders(<NotificationsPage />, {
-      store, route: routeFor('2026-01-01T00:00:00.000000+00:00'),
+      store,
+      route: `/notifications?${NOTE_DEEP_LINK_PARAM}=${encodeURIComponent(target.ts)}`,
     })
 
-    // The confirmed miss leaves the page in its normal no-selection state.
+    // Detail panel open: the empty-state placeholder is gone and the title
+    // renders twice (feed row + detail header).
     await waitFor(() => {
-      expect(api.notifications).toHaveBeenCalled()
+      expect(screen.queryByText('Select a notification')).not.toBeInTheDocument()
+      expect(screen.getAllByText('Deploy Finished').length).toBeGreaterThan(1)
     })
-    expect(screen.getByText('Select a notification')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Close/ })).not.toBeInTheDocument()
-    expect(api.ackNotification).not.toHaveBeenCalled()
+    // Auto-ack via the shared select path (optimistic store flip).
+    expect(store.getState().notifications.items.find(n => n.ts === target.ts)?.acked).toBe(true)
+    // Desktop: feed row scrolled into view.
+    expect(scrollSpy).toHaveBeenCalled()
   })
 
-  it('no param: nothing selected, no fetch beyond the page default', () => {
-    const store = createTestStore(stateWith([note]))
-    renderWithProviders(<NotificationsPage />, { store, route: '/notifications' })
+  it('consumes the param (history replace) so a re-render does not re-select', async () => {
+    const target = mkN('2026-05-29T10:01:00Z', 'Deploy Finished')
+    const store = createTestStore(stateWith([target]))
+    renderWithProviders(<><NotificationsPage /><LocationProbe /></>, {
+      store,
+      route: `/notifications?${NOTE_DEEP_LINK_PARAM}=${encodeURIComponent(target.ts)}`,
+    })
 
+    await waitFor(() => {
+      expect(screen.getByTestId('location-search').textContent).toBe('')
+    })
+    // Close the detail; the consumed param must not re-select it.
+    const back = await screen.findByRole('button', { name: /close/i })
+    act(() => { back.click() })
+    await waitFor(() => {
+      expect(screen.getByText('Select a notification')).toBeInTheDocument()
+    })
+    // REPLACE (not push): the deep-link history entry is gone, so navigating
+    // back must neither restore ?note= nor re-select/re-ack. A push-based
+    // consume would fail here by returning to the param'd entry.
+    act(() => { screen.getByTestId('history-back').click() })
+    await waitFor(() => {
+      expect(screen.getByTestId('location-search').textContent).toBe('')
+      expect(screen.getByText('Select a notification')).toBeInTheDocument()
+    })
+  })
+
+  it('resolves a deep link that arrives before the feed has loaded', async () => {
+    const target = mkN('2026-05-29T10:01:00Z', 'Late Arrival')
+    const store = createTestStore(stateWith([]))
+    renderWithProviders(<NotificationsPage />, {
+      store,
+      route: `/notifications?${NOTE_DEEP_LINK_PARAM}=${encodeURIComponent(target.ts)}`,
+    })
+
+    // Feed still empty: nothing selected yet, page renders plainly.
     expect(screen.getByText('Select a notification')).toBeInTheDocument()
-    expect(api.notifications).not.toHaveBeenCalled()
+
+    // The slow fetch (or a WS row) delivers the note; the pending deep link
+    // must resolve now rather than having been dropped at first render.
+    act(() => { store.dispatch(addNotification(target)) })
+    await waitFor(() => {
+      expect(screen.queryByText('Select a notification')).not.toBeInTheDocument()
+      expect(screen.getAllByText('Late Arrival').length).toBeGreaterThan(1)
+    })
+    expect(store.getState().notifications.items.find(n => n.ts === target.ts)?.acked).toBe(true)
+  })
+
+  it('an explicit tap disarms a pending deep link (user intent wins)', async () => {
+    const rowA = mkN('2026-05-29T10:00:00Z', 'Tapped By User', true)
+    const target = mkN('2026-05-29T10:01:00Z', 'Late Target')
+    const store = createTestStore(stateWith([rowA]))
+    renderWithProviders(<NotificationsPage />, {
+      store,
+      route: `/notifications?${NOTE_DEEP_LINK_PARAM}=${encodeURIComponent(target.ts)}`,
+    })
+
+    // User taps a row while the deep-link target is still unmatched.
+    act(() => { screen.getByText('Tapped By User').click() })
+    await waitFor(() => {
+      expect(screen.getAllByText('Tapped By User').length).toBeGreaterThan(1)
+    })
+
+    // The target now arrives; it must NOT steal the selection or auto-ack.
+    act(() => { store.dispatch(addNotification(target)) })
+    await waitFor(() => {
+      expect(screen.getByText('Late Target')).toBeInTheDocument()
+    })
+    expect(screen.getAllByText('Tapped By User').length).toBeGreaterThan(1)
+    expect(store.getState().notifications.items.find(n => n.ts === target.ts)?.acked).toBe(false)
+  })
+
+  it('expands a collapsed group_key stack hiding the deep-linked note', async () => {
+    // Two same-day notes share a group_key: the feed collapses them to the
+    // newest head, so the older target renders no row until expanded.
+    const head = { ...mkN('2026-05-29T10:05:00Z', 'Stack Head', true), group_key: 'ci' }
+    const target = { ...mkN('2026-05-29T10:01:00Z', 'Stacked Target'), group_key: 'ci' }
+    const store = createTestStore(stateWith([target, head]))
+    renderWithProviders(<NotificationsPage />, {
+      store,
+      route: `/notifications?${NOTE_DEEP_LINK_PARAM}=${encodeURIComponent(target.ts)}`,
+    })
+
+    // Selection + ack happen regardless of stacking (page-level resolve)…
+    await waitFor(() => {
+      expect(store.getState().notifications.items.find(n => n.ts === target.ts)?.acked).toBe(true)
+    })
+    // …and the feed expands the stack so the target's row exists and scrolls.
+    await waitFor(() => {
+      expect(screen.getAllByText('Stacked Target').length).toBeGreaterThan(1)
+      expect(scrollSpy).toHaveBeenCalled()
+    })
+  })
+
+  it('degrades quietly to the plain page for an unknown/expired id', async () => {
+    const bystander = mkN('2026-05-29T10:00:00Z', 'Cron Result')
+    const store = createTestStore(stateWith([bystander]))
+    renderWithProviders(<><NotificationsPage /><LocationProbe /></>, {
+      store,
+      route: `/notifications?${NOTE_DEEP_LINK_PARAM}=does-not-exist`,
+    })
+
+    // Param consumed even though nothing matched.
+    await waitFor(() => {
+      expect(screen.getByTestId('location-search').textContent).toBe('')
+    })
+    // Plain page: feed rendered, nothing selected, no ack fired, no scroll.
+    // The bystander is seeded UNACKED so the assertion can actually fail if a
+    // regression acks something on an unknown id.
+    expect(screen.getByText('Cron Result')).toBeInTheDocument()
+    expect(screen.getByText('Select a notification')).toBeInTheDocument()
+    expect(store.getState().notifications.items.find(n => n.ts === bystander.ts)?.acked).toBe(false)
+    expect(scrollSpy).not.toHaveBeenCalled()
   })
 })

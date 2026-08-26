@@ -10,11 +10,12 @@ is present in a dev environment but missing from ``setup.cfg``
 Hermetic — no network, no package installation, pure AST + configparser.
 
 Scope: only core kiro_crew modules (excludes apps/builtins/, knowledge/,
-workflows/, aidlc/ sub-trees which have their own dependency management).
+workflows/ sub-trees which have their own dependency management).
 
 The historical PyYAML gap and the opentelemetry
 gap both would have been caught by this gate on day one.
 """
+
 from __future__ import annotations
 
 import ast
@@ -61,10 +62,13 @@ _EXCLUDED_SUBTREES: tuple[str, ...] = (
     "apps/builtins/",
     "knowledge/",
     "workflows/",
-    "aidlc/",
     # Fork-only artifact-deploy reaper Lambda payload; boto3/botocore come
     # from the AWS Lambda runtime, not core startup imports.
     "deploy/skills/",
+    # Builtin skill scripts are standalone CLI tools with sibling imports
+    # (e.g. preflight.py imports push_guard.py via sys.path); they are not
+    # core startup code and have no bearing on pip install requirements.
+    "builtin_skills/",
 )
 
 
@@ -93,9 +97,16 @@ def _parse_install_requires() -> set[str]:
         if not line or line.startswith("#"):
             continue
         # Strip version specifiers and markers
-        dist_name = line.split(">=")[0].split("<=")[0].split("==")[0].split(
-            "!="
-        )[0].split("<")[0].split(">")[0].split(";")[0].strip()
+        dist_name = (
+            line.split(">=")[0]
+            .split("<=")[0]
+            .split("==")[0]
+            .split("!=")[0]
+            .split("<")[0]
+            .split(">")[0]
+            .split(";")[0]
+            .strip()
+        )
         normalized = dist_name.lower().replace("_", "-")
         import_name = _DIST_TO_IMPORT.get(normalized, dist_name.replace("-", "_"))
         declared.add(import_name)
@@ -112,15 +123,13 @@ def _is_in_try_except_importerror(node: ast.stmt, tree: ast.Module) -> bool:
                 handler.type is None  # bare except
                 or (
                     isinstance(handler.type, ast.Name)
-                    and handler.type.id
-                    in ("ImportError", "ModuleNotFoundError", "Exception")
+                    and handler.type.id in ("ImportError", "ModuleNotFoundError", "Exception")
                 )
                 or (
                     isinstance(handler.type, ast.Tuple)
                     and any(
                         isinstance(elt, ast.Name)
-                        and elt.id
-                        in ("ImportError", "ModuleNotFoundError", "Exception")
+                        and elt.id in ("ImportError", "ModuleNotFoundError", "Exception")
                         for elt in handler.type.elts
                     )
                 )
@@ -157,7 +166,7 @@ def _pyproject_text() -> str:
 def test_pyproject_declares_optional_dependencies_dynamic():
     """``optional-dependencies`` MUST be in pyproject's ``[project] dynamic``.
 
-    The extras (voice/desktop/dev/otlp) live in setup.cfg
+    The extras (voice/dev/otlp) live in setup.cfg
     ``[options.extras_require]``. Once a ``[project]`` table exists, setuptools
     ignores setup.cfg metadata for any field not declared dynamic — so dropping
     this entry silently strips EVERY extra from the built metadata. pip then
@@ -167,9 +176,7 @@ def test_pyproject_declares_optional_dependencies_dynamic():
     omission also broke the published wheel's ``kirocrew[voice]`` install path.
     """
     text = _pyproject_text()
-    dynamic_lines = [
-        ln for ln in text.splitlines() if ln.strip().startswith("dynamic")
-    ]
+    dynamic_lines = [ln for ln in text.splitlines() if ln.strip().startswith("dynamic")]
     assert dynamic_lines, "pyproject.toml [project] declares no `dynamic` field"
     joined = " ".join(dynamic_lines)
     assert "optional-dependencies" in joined, (
@@ -187,11 +194,13 @@ def test_declared_extras_match_setup_cfg():
     cfg.read(_setup_cfg_path())
     assert cfg.has_section("options.extras_require")
     extras = set(cfg.options("options.extras_require"))
-    # These four are referenced by docs, CI, and the Makefile; losing any of
+    # These three are referenced by docs, CI, and the Makefile; losing any of
     # them breaks a documented install path.
-    assert {"otlp", "voice", "desktop", "dev"} <= extras, (
-        f"expected the documented extras to exist in setup.cfg; got {sorted(extras)}"
-    )
+    assert {
+        "otlp",
+        "voice",
+        "dev",
+    } <= extras, f"expected the documented extras to exist in setup.cfg; got {sorted(extras)}"
 
 
 def _extra_requirements(extra: str) -> list[str]:
@@ -273,15 +282,13 @@ def _collect_unguarded_imports(filepath: pathlib.Path) -> list[tuple[str, str]]:
                     handler.type is None
                     or (
                         isinstance(handler.type, ast.Name)
-                        and handler.type.id
-                        in ("ImportError", "ModuleNotFoundError", "Exception")
+                        and handler.type.id in ("ImportError", "ModuleNotFoundError", "Exception")
                     )
                     or (
                         isinstance(handler.type, ast.Tuple)
                         and any(
                             isinstance(elt, ast.Name)
-                            and elt.id
-                            in ("ImportError", "ModuleNotFoundError", "Exception")
+                            and elt.id in ("ImportError", "ModuleNotFoundError", "Exception")
                             for elt in handler.type.elts
                         )
                     )
@@ -296,9 +303,7 @@ def _collect_unguarded_imports(filepath: pathlib.Path) -> list[tuple[str, str]]:
                             imports_to_check.append((alias.name.split(".")[0], stmt))
                     elif isinstance(stmt, ast.ImportFrom):
                         if stmt.module and stmt.level == 0:
-                            imports_to_check.append(
-                                (stmt.module.split(".")[0], stmt)
-                            )
+                            imports_to_check.append((stmt.module.split(".")[0], stmt))
             # else: guarded, skip all body imports
 
         for root, stmt in imports_to_check:
@@ -360,7 +365,8 @@ def test_noop_recorder_when_otel_missing(monkeypatch):
         k
         for k in list(sys.modules)
         if k.startswith("opentelemetry")
-        or k in (
+        or k
+        in (
             "kiro_crew.metrics.provider",
             "kiro_crew.metrics.recorder",
             "kiro_crew.metrics.local_exporter",

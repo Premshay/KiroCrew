@@ -3,6 +3,7 @@ import { XCircle, AlertTriangle, CheckCircle, RefreshCw, Hourglass, Check, BookO
 import { api } from '../../api/client'
 import { Card, CardTitle, Btn, SendBtn, Input, Badge, EmptyState } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
+import SimpleSelect from '../../components/SimpleSelect'
 import { esc } from '../../api/helpers'
 import VectorMemoryCard from './VectorMemoryCard'
 import EmbeddingModelCard from './EmbeddingModelCard'
@@ -16,6 +17,10 @@ export default function MemoryTab({ refreshTrigger }: { refreshTrigger: number }
   const [pref, setPref] = useState(''); const [proj, setProj] = useState(''); const [hist, setHist] = useState('')
   const [prefSaved, setPrefSaved] = useState(false); const [projSaved, setProjSaved] = useState(false); const [histSaved, setHistSaved] = useState(false)
   const [lessons, setLessons] = useState<Lesson[]>([]); const [rule, setRule] = useState(''); const [cat, setCat] = useState('knowledge')
+  const [lessonFeedback, setLessonFeedback] = useState<{
+    tone: 'info' | 'warning' | 'error'
+    text: string
+  } | null>(null)
   const [idleHours, setIdleHours] = useState(3); const [maxDays, setMaxDays] = useState(90); const [settingsSaved, setSettingsSaved] = useState(false)
   const [migrated, setMigrated] = useState(false)
   const [vectorActive, setVectorActive] = useState(false)
@@ -70,6 +75,39 @@ export default function MemoryTab({ refreshTrigger }: { refreshTrigger: number }
     setConsolidating(false)
     scheduleClear(() => setConsolidateMsg(''), 4000)
   }
+  const addLesson = async () => {
+    if (!rule) return
+    setLessonFeedback(null)
+    const result = await api.createLesson(rule, cat)
+    if (result.outcome === 'inserted' || result.outcome === 'enriched') {
+      setRule('')
+      await loadLessons()
+      return
+    }
+    if (result.outcome === 'unchanged') {
+      setRule('')
+      setLessonFeedback({
+        tone: 'info',
+        text: i18nT('pages.overview.memoryTab.lesson_already_stored'),
+      })
+      return
+    }
+    if (result.outcome === 'deduped') {
+      setLessonFeedback({
+        tone: 'warning',
+        text: i18nT('pages.overview.memoryTab.lesson_already_covered', {
+          reason: result.reason,
+        }),
+      })
+      return
+    }
+    setLessonFeedback({
+      tone: 'error',
+      text: i18nT('pages.overview.memoryTab.lesson_not_saved', {
+        reason: result.reason,
+      }),
+    })
+  }
   return (<>
     {/* Graph/vector internals live on the Developer page (Memory tab); this
         surface is the user-facing browser: settings, preferences, projects,
@@ -107,10 +145,29 @@ export default function MemoryTab({ refreshTrigger }: { refreshTrigger: number }
       <Card><CardTitle>{i18nT('pages.overview.memoryTab.lessons')} <InfoTip text={i18nT('pages.overview.memoryTab.persistent_lessons_injected_into_every_session_a')} /></CardTitle>
       <div className="flex gap-2 items-center flex-wrap mb-3">
         <Input placeholder={i18nT('pages.overview.memoryTab.rule_e_g_always_use_tabs_not_spaces')} style={{ flex: 2 }} value={rule} onChange={e => setRule(e.target.value)} />
-        <select className="bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-none cursor-pointer appearance-none transition-colors focus-ring" style={{ flex: '0 0 140px' }} value={cat} onChange={e => setCat(e.target.value)}>
-          <option value="knowledge">{i18nT('pages.overview.memoryTab.knowledge')}</option><option value="tool">{i18nT('pages.overview.memoryTab.tool')}</option><option value="preference">{i18nT('pages.overview.memoryTab.preference')}</option>
-        </select>
-        <SendBtn onClick={async () => { if (!rule) return; await api.createLesson(rule, cat); setRule(''); loadLessons() }}>{i18nT('pages.overview.memoryTab.add')}</SendBtn>
+        <SimpleSelect
+          aria-label={i18nT('pages.overview.memoryTab.category')}
+          style={{ flex: '0 0 140px' }}
+          options={['knowledge', 'tool', 'preference']}
+          optionLabels={[i18nT('pages.overview.memoryTab.knowledge'), i18nT('pages.overview.memoryTab.tool'), i18nT('pages.overview.memoryTab.preference')]}
+          value={cat}
+          onChange={setCat}
+        />
+        <SendBtn onClick={addLesson}>{i18nT('pages.overview.memoryTab.add')}</SendBtn>
+        {lessonFeedback && (
+          <span
+            role={lessonFeedback.tone === 'error' ? 'alert' : 'status'}
+            className={`text-[13px] ${
+              lessonFeedback.tone === 'error'
+                ? 'text-danger'
+                : lessonFeedback.tone === 'warning'
+                  ? 'text-warn'
+                  : 'text-muted'
+            }`}
+          >
+            {lessonFeedback.text}
+          </span>
+        )}
       </div>
       <table className="w-full border-collapse table-striped"><thead><tr><SortableHeader label={i18nT('pages.overview.memoryTab.rule')} sortKey="rule" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.category')} sortKey="category" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.when')} sortKey="ts" sort={lessonSort} onToggle={toggleLessonSort} /><th aria-label={i18nT('pages.overview.memoryTab.actions')} className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium"></th></tr></thead>
         <tbody>{lessons.length === 0 ? <tr><td colSpan={4}><EmptyState icon={<BookOpen className="lucide-inline" />} title={i18nT('pages.overview.memoryTab.no_lessons_yet')} subtitle={i18nT('pages.overview.memoryTab.lessons_empty_subtitle')} /></td></tr> : sortedLessons.map((l) => (

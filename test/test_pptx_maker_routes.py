@@ -39,6 +39,7 @@ from unittest import mock
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase
 
+from conftest import make_dir_link
 from kiro_crew.apps.builtins.pptx_maker.backend import engine, paths, provision, routes
 
 # An AKIA-shaped access key ID. The canonical AWS documentation example, so it is
@@ -744,6 +745,26 @@ class TestRedactArtifactHelper(unittest.TestCase):
     def test_the_bitmap_probe_accepts_a_real_raster(self) -> None:
         blob = base64.b64encode(b"\x89PNG\r\n\x1a\n" + _raster_body(64)).decode()
         self.assertIsNotNone(routes._scanned_bitmap_bytes(blob)[0])
+
+    def test_the_signature_check_accepts_every_bitmap_format(self) -> None:
+        # The pre-existing accept-set: PNG/JPEG/GIF/BMP and real WebP via the
+        # shared sniffer, plus the retained offset-4 ftyp check for HEIC/AVIF.
+        for raw in (
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
+            b"\xff\xd8\xff\xe0" + b"\x00" * 12,
+            b"GIF87a" + b"\x00" * 10,
+            b"GIF89a" + b"\x00" * 10,
+            b"BM" + b"\x00" * 14,
+            b"RIFF\x10\x00\x00\x00WEBPVP8 ",
+            b"\x00\x00\x00\x18ftypheic" + b"\x00" * 8,
+        ):
+            self.assertTrue(routes._has_bitmap_signature(raw), raw)
+
+    def test_a_bare_riff_container_is_no_longer_a_bitmap(self) -> None:
+        # The old local table matched any RIFF container, so a WAVE audio blob
+        # counted as a bitmap. The shared sniffer requires WebP's form tag at
+        # offset 8 — this tightening is the intended fix, not a regression.
+        self.assertFalse(routes._has_bitmap_signature(b"RIFF\x24\x00\x00\x00WAVEfmt "))
 
 
 class TestConfigRoutes(_RoutesFixture):
@@ -1739,7 +1760,6 @@ class TestReadArtifactWorker(unittest.TestCase):
         for bad in (".js", ".mjs", ".html.js", ".sh", ".py", ".wasm", ".xhtml", ".svgz"):
             self.assertNotIn(bad, routes.SERVED_SUFFIXES)
 
-    @unittest.skipUnless(hasattr(os, "symlink"), "needs symlinks")
     def test_an_intermediate_directory_swapped_after_resolution_is_refused(self) -> None:
         """The check-to-use window `O_NOFOLLOW` alone does NOT close.
 
@@ -1754,6 +1774,11 @@ class TestReadArtifactWorker(unittest.TestCase):
         exactly the window a real racing writer has. `safe_read_file_bytes_nolink`
         closes it by validating the OPENED DESCRIPTOR's real path against
         `within_root`, so the inode checked is the inode read.
+
+        The link is made through ``make_dir_link`` so Windows uses a junction: a
+        directory symlink there needs a privilege an unelevated shell lacks, and
+        the escape it models — an intermediate reparse point the containment check
+        must catch — is identical either way.
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "decks"
@@ -1777,7 +1802,7 @@ class TestReadArtifactWorker(unittest.TestCase):
                 def resolve_then_swap(deck_id: str, subpath: str):
                     resolved = real_resolve(deck_id, subpath)
                     shutil.rmtree(deck / "compose")
-                    (deck / "compose").symlink_to(outside, target_is_directory=True)
+                    make_dir_link(deck / "compose", outside)
                     return resolved
 
                 with mock.patch.object(

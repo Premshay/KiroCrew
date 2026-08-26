@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react'
-import { Hourglass, ClipboardList, ClipboardCheck, RefreshCw, CheckCircle, XCircle, Square, Sparkles, FileText, Settings, X, MessageSquare, Pencil, Clock, Pause, Play, RotateCcw, Plus } from 'lucide-react'
+import { Hourglass, ClipboardList, ClipboardCheck, RefreshCw, CheckCircle, XCircle, Square, Sparkles, FileText, Settings, X, MessageSquare, Pencil, Clock, Pause, Play, RotateCcw, Plus, PanelLeftOpen, Zap } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAppSelector, useAppDispatch } from '../store'
 import { setPendingInput, switchSlot } from '../store/chatSlice'
 import { api } from '../api/client'
 import type { TaskRunnerStatus, ProjectRun } from '../types'
-import { SendBtn, Btn, Checkbox, Input } from '../components/ui'
+import { SendBtn, Btn, Checkbox, Input, Badge } from '../components/ui'
 import ResizeHandle from '../components/ResizeHandle'
 import { useColumnResize, type CollapseConfig } from '../hooks/useColumnResize'
+import { useIsMobile } from '../hooks/useIsMobile'
 import AgentSelector from '../components/AgentSelector'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import ProjectDetailPage from './ProjectDetailPage'
@@ -17,10 +18,17 @@ import {
 } from './projectsLayout'
 
 import { i18nT } from '../i18n/t'
+import { useImeGuard } from '../hooks/useImeGuard'
 type Mode = 'compose' | 'spec' | 'yaml'
 
 // Module-level so the resize hook's memoised resolver isn't invalidated every render.
-const RAIL_COLLAPSE: CollapseConfig = { width: COLLAPSED_RAIL_WIDTH, storageKey: RAIL_COLLAPSED_KEY }
+// `whenNarrow` because this page implements the whole mobile drill-down
+// below (full-width rail, detail steps aside, collapse on select). A page
+// that only got the strip would hand the user an expand button that leads
+// straight back into the squeeze.
+const RAIL_COLLAPSE: CollapseConfig = {
+  width: COLLAPSED_RAIL_WIDTH, storageKey: RAIL_COLLAPSED_KEY, whenNarrow: true,
+}
 
 
 function TextInputPanel({ text, setText, rows, placeholder, accept, onUpload, onRun, onPlan, disabled, isPlanning, onCancel, planError, banner }: {
@@ -44,6 +52,7 @@ function TextInputPanel({ text, setText, rows, placeholder, accept, onUpload, on
 }
 
 export default function ProjectsPage() {
+  const ime = useImeGuard()
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -70,18 +79,61 @@ export default function ProjectsPage() {
   const [editNameValue, setEditNameValue] = useState('')
   const [refined, setRefined] = useState('')
   const [autoApprove, setAutoApprove] = useState(false)
+  // Compose-panel auto-approve intent. Distinct from `autoApprove` above, which
+  // is the run-detail toggle (bound to the selected run's live grant via the
+  // sync effect below). This one is a per-session, compose-scoped intent — the
+  // user declares "trust the tool calls of the next Run I kick off from here"
+  // BEFORE any plan exists. Slice 2 threads this into the auto-run path via a
+  // ref captured at click time (see `pendingAutoApproveRef`) so the sync effect
+  // cannot clobber it, and it never leaks across runs.
+  const [composeAutoApprove, setComposeAutoApprove] = useState(false)
   const [refineStatus, setRefineStatus] = useState<string>('idle')
   const [refineError, setRefineError] = useState('')
   const mountedRef = useRef(true)
   const loadingRef = useRef(false)
   const appliedRef = useRef<string | null>(null)
   const autoRunRef = useRef<string | null>(null)
+  // Compose-time auto-approve intent, keyed to the ORIGINATING task_id so it
+  // is structurally per-run. Written atomically alongside `autoRunRef` inside
+  // `doPlan`'s planTask-success branch; read by the auto-run useEffect only
+  // when `pending.taskId === selectedRun.task_id`, falling back to `false`
+  // otherwise. This solves three failure modes:
+  //   1) sync-effect race — the ref is a slot the sync effect never touches;
+  //   2) stale-`true` leak across sequential runs — cleared on read;
+  //   3) leak via a status-fetch failure + subsequent URL-triggered auto-run
+  //      on a DIFFERENT task — the URL trigger overwrites `autoRunRef` but
+  //      the stored `taskId` still points to the aborted originating run,
+  //      so the id-match falls through to `false` (GPT reviewer Issue B).
+  const pendingAutoApproveRef = useRef<{ taskId: string; autoApprove: boolean } | null>(null)
   const activePlanRef = useRef(false)
   // Run rail geometry — a real resizable column with drag-past-minimum collapse,
   // the same primitive Issue Radar's rail uses.
   const rail = useColumnResize(
     RAIL_WIDTH_KEY, loadRailWidth, MIN_RAIL_WIDTH, MAX_RAIL_WIDTH, RAIL_COLLAPSE, loadRailCollapsed,
   )
+  const isMobile = useIsMobile()
+  // On a phone the rail and the pane beside it cannot share the width, so the two
+  // become a drill-down, the same shape WebhooksPage uses: the rail opens
+  // full-width to browse, and picking a run collapses it back to the strip and
+  // hands the screen to the detail. Without this, expanding the rail to choose a
+  // run drops the detail back into the ~124px squeeze this page just fixed, and
+  // the only ways out are a 6px drag handle or arrow keys.
+  const mobileRailOpen = isMobile && !rail.collapsed
+  // Collapsed while narrow: the rail becomes a bar ACROSS THE TOP rather than a
+  // strip down the side. A left/right split has to give the information pane the
+  // FULL width on a phone: horizontal is the only axis with nothing to spare, and
+  // a strip keeps spending it, while vertical room is what a phone can give.
+  // This is a body-text rule in EVERY language, not a CJK one — the cost is
+  // measured in how much width the prose column gets. What differs is only the
+  // symptom: Latin refuses to break below its longest word and overflows, while
+  // scripts that break per character collapse into a ribbon at the same width and
+  // report no overflow at all.
+  const railBar = isMobile && rail.collapsed
+  const selectRun = useCallback((next: ProjectRun | null) => {
+    setSelectedRun(next)
+    setEditingName(false)
+    if (isMobile) rail.collapse()
+  }, [isMobile, rail.collapse])
 
   useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false } }, [])
 
@@ -151,19 +203,32 @@ export default function ProjectsPage() {
   }, [searchParams, setSearchParams, load])
 
   useEffect(() => { sessionStorage.setItem('tr-mode', mode) }, [mode])
+  // Reset the compose-panel auto-approve intent whenever the user switches
+  // mode. The checkbox is only rendered inside `mode === 'compose'`, but
+  // `composeAutoApprove` is component-scoped state that would otherwise
+  // survive a mode change — silently governing `handleRun` calls from the
+  // spec/yaml Run buttons where no checkbox is on screen. Resetting on mode
+  // change ensures the intent cannot outlive its visible control. See Fable
+  // Design/UX review Issue C (2026-08-18).
+  useEffect(() => { setComposeAutoApprove(false) }, [mode])
 
   // Auto-execute when a planned run is selected via ?autoRun=true
   useEffect(() => {
     const id = autoRunRef.current
     if (!id || !selectedRun || selectedRun.task_id !== id || selectedRun.status !== 'planned') return
     autoRunRef.current = null
-    // Auto-run is a programmatic launch, NOT an affirmative per-run trust grant for
-    // THIS run — always pass false. (Per-run trust requires an explicit dashboard
-    // toggle + manual Execute.) Passing the component-wide `autoApprove` here would
-    // also race the sync effect below and could leak a stale `true` from a
-    // previously-selected run onto this one. Workspace is fixed at plan time
-    // (planTask baked it into work_dir), so execute never re-sends it.
-    api.executePlan(selectedRun.task_id, agent, false).then(r => { if (r.ok) load() })
+    // Read + clear the intent. Consume ONLY if the stored task_id matches the
+    // run we're about to execute — a URL trigger for a different task cannot
+    // inherit trust granted for the aborted originating run. Cleared before
+    // read to keep the "consumed exactly once" invariant regardless of match.
+    const pending = pendingAutoApproveRef.current
+    pendingAutoApproveRef.current = null
+    const composeAutoApproveIntent = pending?.taskId === selectedRun.task_id
+      ? pending.autoApprove
+      : false
+    // Workspace is fixed at plan time (planTask baked it into work_dir), so
+    // execute never re-sends it.
+    api.executePlan(selectedRun.task_id, agent, composeAutoApproveIntent).then(r => { if (r.ok) load() })
   }, [selectedRun, agent, load])
   // Sync the per-run auto-approve toggle from the selected run (default false).
   // Reflect only a LIVE trust grant (not stale persisted intent), so resuming a
@@ -174,12 +239,31 @@ export default function ProjectsPage() {
   useEffect(() => { sessionStorage.setItem('tr-spec', specText) }, [specText])
   useEffect(() => { sessionStorage.setItem('tr-yaml', yamlText) }, [yamlText])
 
-  const doPlan = async (input: string, source: string, spec: string | undefined, autoRun: boolean) => {
+  const doPlan = async (
+    input: string,
+    source: string,
+    spec: string | undefined,
+    autoRun: boolean,
+    composeAutoApproveIntent: boolean = false,
+  ) => {
     setIsPlanning(true); setPlanError(''); sessionStorage.setItem('tr-planning', '1'); activePlanRef.current = true
     try {
       const r = await api.planTask(input, source, spec, agent, workspaceDir)
       if (r.ok) {
-        if (autoRun && r.task_id) autoRunRef.current = r.task_id
+        if (autoRun && r.task_id) {
+          autoRunRef.current = r.task_id
+          // Guard the ref-write with the SAME planTask-success branch as
+          // `autoRunRef`, keyed to the originating task_id. A URL-triggered
+          // auto-run for a DIFFERENT task (see auto-run useEffect above)
+          // cannot inherit trust from this run — the id mismatch falls
+          // through to false. See fc-01 + GPT Issue B in `.review/findings.md`.
+          pendingAutoApproveRef.current = { taskId: r.task_id, autoApprove: composeAutoApproveIntent }
+          // Only reset the compose checkbox once the plan actually took.
+          // A failed plan leaves the box ticked so the user's retry keeps
+          // the grant — otherwise a silent retry after `planTask` failure
+          // would drop the intent (Fable UX review Issue D).
+          setComposeAutoApprove(false)
+        }
         const d = await api.taskRunnerStatus()
         setData(d)
         const planned = d.runs?.find((run: ProjectRun) => run.task_id === r.task_id)
@@ -189,13 +273,41 @@ export default function ProjectsPage() {
     } finally { sessionStorage.removeItem('tr-planning'); activePlanRef.current = false; if (mountedRef.current) setIsPlanning(false) }
   }
 
-  const generatePlan = (input: string, source: string, spec?: string) => doPlan(input, source, spec, false)
+  const generatePlan = (input: string, source: string, spec?: string) => {
+    // Clear the compose auto-approve checkbox before the plan starts.
+    //
+    // The Plan -> Review -> Execute path cannot carry compose intent:
+    // `handleRun` -> `doPlan(autoRun=true)` captures composeAutoApprove via
+    // `capturedComposeIntent`, but `generatePlan` -> `doPlan(autoRun=false)`
+    // does not, and the resulting Execute button reads `autoApprove` (the
+    // detail-row sync state, seeded from the run's LIVE grant which is 0
+    // for a freshly-planned run). If the checkbox stayed visibly ticked, a
+    // "hands-off" user would click Execute expecting an unattended run and
+    // stall on the first approval prompt.
+    //
+    // Fable UX Round 4 (2026-08-19) Concern 1 — clear the compose checkbox
+    // here so the trust decision is deliberately re-affirmed at Execute
+    // time via the detail-row toggle.
+    setComposeAutoApprove(false)
+    return doPlan(input, source, spec, false)
+  }
 
   const cancelPlan = async () => {
     try { await api.cancelPlan() } finally { setIsPlanning(false); sessionStorage.removeItem('tr-planning') }
   }
 
-  const handleRun = (input: string, source: string) => doPlan(input, source, '', true)
+  const handleRun = (input: string, source: string) => {
+    // Capture the compose-time intent to a local, NOT to
+    // `pendingAutoApproveRef`. The ref-write and the checkbox reset both
+    // live inside `doPlan`'s planTask-success branch so:
+    //   1) a failed plan leaves the ref at its default null, closing the
+    //      URL-triggered-auto-run leak (Spock fc-01 + GPT Issue B);
+    //   2) a failed plan leaves the checkbox ticked so the user's retry
+    //      still honours the grant (Fable UX Issue D — the previous
+    //      handleRun cleared the box unconditionally at click).
+    const capturedComposeIntent = composeAutoApprove
+    doPlan(input, source, '', true, capturedComposeIntent)
+  }
 
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -258,14 +370,38 @@ export default function ProjectsPage() {
             tabIndex={0}
             aria-label={i18nT('pages.projectsPage.open_project', { name })}
             className={`flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer transition-all ${isActive ? 'bg-accent/15 border border-accent/40' : 'hover:bg-bg-elevated border border-transparent'}`}
-            onClick={() => { setSelectedRun(r); setEditingName(false) }}
-            onKeyDown={e => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setSelectedRun(r); setEditingName(false) } }}
+            onClick={() => selectRun(r)}
+            onKeyDown={e => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); selectRun(r) } }}
           >
             <span className="text-[14px]">{icon}</span>
             <div className="flex-1 min-w-0">
               <div className="text-[13px] font-semibold text-text-strong truncate">{name}</div>
               <div className="text-[11px] text-muted">{r.task_id} · {r.completed}/{r.steps} · {r.running ? 'running' : r.status}</div>
             </div>
+            {/* Auto-approve indicator. Gated on the LIVE grant (matches the
+                run-detail toggle sync effect at line 225: "Reflect only a
+                LIVE trust grant (not stale persisted intent)") so a paused
+                run whose grant expired doesn't assert active trust. Rail
+                cards live inside a ~220px sidebar column, so this badge is
+                deliberately icon-only — the accessible label is carried by
+                `aria-label` and `title`. Uses the shared `Badge` primitive
+                (variant='warn' = amber pill) per GPT 5.6 Round 4 review
+                (2026-08-19: "hand-rolled status pills bypass the required
+                Badge primitive"). A wider detail-page badge in
+                ProjectDetailPage keeps the text visible above the `sm`
+                viewport breakpoint. */}
+            {(r.auto_approve_remaining_secs ?? 0) > 0 && (
+              <Badge
+                variant="warn"
+                role="img"
+                className="shrink-0 text-[11px]"
+                aria-label={i18nT('pages.projectsPage.auto_approve_tool_calls')}
+                title={i18nT('pages.projectsPage.auto_approve_tool_calls')}
+                data-testid="auto-approve-badge"
+              >
+                <Zap className="lucide-inline" />
+              </Badge>
+            )}
             <div className="w-10 h-1 bg-bg-elevated rounded-full overflow-hidden shrink-0">
               <div className={`h-full rounded-full ${r.status === 'failed' ? 'bg-danger' : 'bg-accent'}`} style={{ width: `${pct}%` }} />
             </div>
@@ -276,14 +412,43 @@ export default function ProjectsPage() {
     </div>
   )
 
+  // Mode selection swaps the entire form below it, and the labels are localized:
+  // `Depuis une spécification` (fr) measures 157px at 13px where three
+  // side-by-side segments get ~51px each, so a segmented row cannot hold them at
+  // phone width. Narrow renders the modes as a vertical list of full-width
+  // choices; the segmented row returns at `sm:`, where it fits.
+  const modeRowClass = (on: boolean) =>
+    [
+      'flex items-center gap-2 min-h-10 px-3 py-2 rounded-md border-[1.5px] text-left',
+      'text-[13px] font-semibold transition-all cursor-pointer',
+      'sm:flex-1 sm:justify-center sm:min-h-0 sm:py-1.5 sm:text-center sm:border-transparent',
+      on
+        ? 'border-accent bg-accent-subtle text-accent sm:bg-accent sm:text-accent-fg sm:shadow-sm'
+        : 'border-border text-muted hover:text-text hover:bg-bg-elevated',
+      anyPlanning ? 'opacity-50 cursor-not-allowed' : '',
+    ].join(' ')
+
+  const ModeDot = ({ on }: { on: boolean }) => (
+    <span
+      aria-hidden
+      className={`shrink-0 grid place-items-center size-3.5 rounded-full border-[1.5px] sm:hidden ${
+        on ? 'border-accent' : 'border-border-strong'
+      }`}
+    >
+      {on && <span className="size-2 rounded-full bg-accent" />}
+    </span>
+  )
+
   const composePanel = (
-    <div className="px-5 py-4">
-      <div className="flex items-center gap-1 mb-4">
-        <button onClick={() => setMode('compose')} disabled={anyPlanning} className={`px-3 py-1.5 rounded-md text-[13px] font-semibold transition-all ${mode === 'compose' ? 'bg-accent text-accent-fg shadow-sm' : 'text-muted hover:text-text hover:bg-bg-elevated'} ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`}><Sparkles className="lucide-inline" /> {i18nT('pages.projectsPage.compose')}</button>
-        <button onClick={() => setMode('spec')} disabled={anyPlanning} className={`px-3 py-1.5 rounded-md text-[13px] font-semibold transition-all ${mode === 'spec' ? 'bg-accent text-accent-fg shadow-sm' : 'text-muted hover:text-text hover:bg-bg-elevated'} ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`}><FileText className="lucide-inline" /> {i18nT('pages.projectsPage.from_spec')}</button>
-        <button onClick={() => setMode('yaml')} disabled={anyPlanning} className={`px-3 py-1.5 rounded-md text-[13px] font-semibold transition-all ${mode === 'yaml' ? 'bg-accent text-accent-fg shadow-sm' : 'text-muted hover:text-text hover:bg-bg-elevated'} ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`}><Settings className="lucide-inline" /> {i18nT('pages.projectsPage.from_yaml')}</button>
+    <div className="px-4 md:px-6 py-4">
+      <div className="flex flex-col sm:flex-row items-stretch gap-1.5 sm:gap-1 mb-4">
+        <button onClick={() => setMode('compose')} disabled={anyPlanning} aria-pressed={mode === 'compose'} className={modeRowClass(mode === 'compose')}><ModeDot on={mode === 'compose'} /><Sparkles className="lucide-inline" /> {i18nT('pages.projectsPage.compose')}</button>
+        <button onClick={() => setMode('spec')} disabled={anyPlanning} aria-pressed={mode === 'spec'} className={modeRowClass(mode === 'spec')}><ModeDot on={mode === 'spec'} /><FileText className="lucide-inline" /> {i18nT('pages.projectsPage.from_spec')}</button>
+        <button onClick={() => setMode('yaml')} disabled={anyPlanning} aria-pressed={mode === 'yaml'} className={modeRowClass(mode === 'yaml')}><ModeDot on={mode === 'yaml'} /><Settings className="lucide-inline" /> {i18nT('pages.projectsPage.from_yaml')}</button>
       </div>
-      <div className="flex gap-2 items-center mb-3">
+      {/* Wraps at phone width: two labelled controls on one line push the
+          workspace field off the right edge otherwise. */}
+      <div className="flex flex-wrap gap-2 items-center mb-3">
         <span className="text-[13px] text-muted font-medium">{i18nT('pages.projectsPage.agent')}</span>
         <AgentSelector agents={agents} defaultAgent={defaultAgentName} value={agent} onChange={(name) => setAgent(name)} />
         <span className="text-[13px] text-muted font-medium ml-2">{i18nT('pages.projectsPage.workspace')}</span>
@@ -295,18 +460,27 @@ export default function ProjectsPage() {
           placeholder={defaultWorkspaceDir || i18nT('pages.projectsPage.default_workspace_folder')}
           title={i18nT('pages.projectsPage.root_folder_for_a_new_plan_leave_blank_to_use_th')}
           disabled={anyPlanning}
-          className={`min-w-[200px] px-2.5 py-1.5 text-[13px] font-mono ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`}
+          // Keeps its 200px floor at every width so a row that cannot fit it
+          // WRAPS the field onto its own line, where `flex-1` gives it the full
+          // width. Letting it shrink instead would keep it on the line as an
+          // unusable sliver. From `sm` up the row has the room, so the field
+          // returns to its natural size.
+          className={`min-w-[200px] flex-1 sm:flex-initial px-2.5 py-1.5 text-[13px] font-mono ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`}
         />
       </div>
       {mode === 'compose' ? (
         <div className="space-y-3">
           <textarea aria-label={i18nT('pages.projectsPage.describe_your_task')} className="w-full bg-bg-elevated border border-border rounded-md px-3 py-2.5 text-text text-sm font-body outline-none transition-colors focus-ring resize-y min-h-[80px]" rows={3} placeholder={i18nT('pages.projectsPage.describe_your_task_2')} value={userInput} onChange={e => setUserInput(e.target.value)} disabled={isRefining || anyPlanning} />
-          <div className="flex gap-2 items-center">
-            {!isRefining && <button className={`btn-sweep bg-accent text-accent-fg border-none rounded-lg px-4 h-9 text-sm font-semibold cursor-pointer hover:bg-accent-hover transition-all font-body ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={refine} disabled={!userInput.trim() || anyPlanning}><Sparkles className="lucide-inline" /> {i18nT('pages.projectsPage.refine_into_spec')}</button>}
-            {!isRefining && <button className={`px-4 h-9 rounded-md border border-accent bg-transparent text-accent text-sm font-semibold cursor-pointer font-body hover:bg-accent hover:text-accent-fg transition-all ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => generatePlan(userInput, 'text')} disabled={!userInput.trim() || anyPlanning}>{anyPlanning ? <Hourglass className="lucide-inline" /> : <ClipboardList className="lucide-inline" />} {i18nT('pages.projectsPage.plan')}</button>}
-            {!isRefining && <button className={`px-4 h-9 rounded-lg border-none bg-ok text-ok-fg text-sm font-semibold cursor-pointer font-body hover:brightness-110 transition-all ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => handleRun(userInput, 'text')} disabled={!userInput.trim() || anyPlanning}><Play className="lucide-inline" /> {i18nT('pages.projectsPage.run')}</button>}
+          <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+            {!isRefining && <button className={`btn-sweep bg-accent text-accent-fg border-none rounded-lg inline-flex flex-wrap items-center justify-center gap-x-1.5 px-4 py-1.5 min-h-9 text-sm font-semibold cursor-pointer hover:bg-accent-hover transition-all font-body ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={refine} disabled={!userInput.trim() || anyPlanning}><Sparkles className="lucide-inline" /> {i18nT('pages.projectsPage.refine_into_spec')}</button>}
+            {!isRefining && <button className={`inline-flex flex-wrap items-center justify-center gap-x-1.5 px-4 py-1.5 min-h-9 rounded-md border border-accent bg-transparent text-accent text-sm font-semibold cursor-pointer font-body hover:bg-accent hover:text-accent-fg transition-all ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => generatePlan(userInput, 'text')} disabled={!userInput.trim() || anyPlanning}>{anyPlanning ? <Hourglass className="lucide-inline" /> : <ClipboardList className="lucide-inline" />} {i18nT('pages.projectsPage.plan')}</button>}
+            {!isRefining && <label className="flex items-center gap-1.5 text-[12px] text-muted cursor-pointer select-none" title={i18nT('pages.projectsPage.run_unattended_auto_approve_this_run_s_tool_call')}>
+              <Checkbox checked={composeAutoApprove} onChange={e => setComposeAutoApprove(e.target.checked)} disabled={anyPlanning} />
+              {i18nT('pages.projectsPage.auto_approve_tool_calls')}
+            </label>}
+            {!isRefining && <button className={`inline-flex flex-wrap items-center justify-center gap-x-1.5 px-4 py-1.5 min-h-9 rounded-lg border-none bg-ok text-ok-fg text-sm font-semibold cursor-pointer font-body hover:brightness-110 transition-all ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => handleRun(userInput, 'text')} disabled={!userInput.trim() || anyPlanning}><Play className="lucide-inline" /> {i18nT('pages.projectsPage.run')}</button>}
             {isRefining && <>
-              <button className="px-4 h-9 rounded-md border border-border bg-transparent text-muted text-sm cursor-pointer font-body hover:text-danger hover:border-danger transition-all" onClick={async () => { await api.refineCancel(); setRefineStatus('cancelled') }}><Square className="lucide-inline" /> {i18nT('pages.projectsPage.cancel')}</button>
+              <button className="inline-flex flex-wrap items-center justify-center gap-x-1.5 px-4 py-1.5 min-h-9 rounded-md border border-border bg-transparent text-muted text-sm cursor-pointer font-body hover:text-danger hover:border-danger transition-all" onClick={async () => { await api.refineCancel(); setRefineStatus('cancelled') }}><Square className="lucide-inline" /> {i18nT('pages.projectsPage.cancel')}</button>
               <span className="text-accent text-[13px]">{i18nT('pages.projectsPage.refining')}</span>
               {/* Shimmer bar rather than a pulsing label: the motion lives in a
                   placeholder shape, and the text stays legible while it runs. */}
@@ -320,10 +494,10 @@ export default function ProjectsPage() {
               <textarea aria-label={i18nT('pages.projectsPage.refined_spec')} className="w-full bg-bg-elevated border border-border rounded-md px-3 py-2.5 text-text text-sm font-mono outline-none transition-colors focus-ring resize-y min-h-[120px]" rows={8} value={refined} onChange={e => setRefined(e.target.value)} readOnly={isRefining} />
               {refineError && <div className="text-danger mt-1 text-[13px]">{i18nT('pages.projectsPage.error')} {refineError}</div>}
               {!isRefining && refined && (
-                <div className="flex gap-2 mt-2">
-                  <button className={`btn-sweep bg-accent text-accent-fg border-none rounded-lg px-4 h-9 text-sm font-semibold cursor-pointer hover:bg-accent-hover transition-all font-body ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => generatePlan(refined, 'spec')} disabled={anyPlanning}><ClipboardList className="lucide-inline" /> {i18nT('pages.projectsPage.plan_from_spec')}</button>
-                  <button className={`px-4 h-9 rounded-lg border-none bg-ok text-ok-fg text-sm font-semibold cursor-pointer font-body hover:brightness-110 transition-all ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => handleRun(refined, 'spec')} disabled={anyPlanning}><Play className="lucide-inline" /> {i18nT('pages.projectsPage.run')}</button>
-                  <button className={`px-4 h-9 rounded-md border border-border bg-transparent text-muted text-sm cursor-pointer font-body hover:text-text hover:border-border-strong transition-all ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => { setRefined(''); setRefineStatus('idle'); setRefineError('') }} disabled={anyPlanning}><X className="lucide-inline" /> {i18nT('pages.projectsPage.discard')}</button>
+                <div className="flex flex-col sm:flex-row gap-2 mt-2">
+                  <button className={`btn-sweep bg-accent text-accent-fg border-none rounded-lg inline-flex flex-wrap items-center justify-center gap-x-1.5 px-4 py-1.5 min-h-9 text-sm font-semibold cursor-pointer hover:bg-accent-hover transition-all font-body ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => generatePlan(refined, 'spec')} disabled={anyPlanning}><ClipboardList className="lucide-inline" /> {i18nT('pages.projectsPage.plan_from_spec')}</button>
+                  <button className={`inline-flex flex-wrap items-center justify-center gap-x-1.5 px-4 py-1.5 min-h-9 rounded-lg border-none bg-ok text-ok-fg text-sm font-semibold cursor-pointer font-body hover:brightness-110 transition-all ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => handleRun(refined, 'spec')} disabled={anyPlanning}><Play className="lucide-inline" /> {i18nT('pages.projectsPage.run')}</button>
+                  <button className={`inline-flex flex-wrap items-center justify-center gap-x-1.5 px-4 py-1.5 min-h-9 rounded-md border border-border bg-transparent text-muted text-sm cursor-pointer font-body hover:text-text hover:border-border-strong transition-all ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => { setRefined(''); setRefineStatus('idle'); setRefineError('') }} disabled={anyPlanning}><X className="lucide-inline" /> {i18nT('pages.projectsPage.discard')}</button>
                 </div>
               )}
             </div>
@@ -344,17 +518,17 @@ export default function ProjectsPage() {
   // under the pointer the moment the first run appears, and the main column owns
   // its own padding rather than inheriting page gutters.
   return (
-    <div className="flex h-full bg-bg text-text">
+    <div className={`flex h-full bg-bg text-text ${railBar ? 'flex-col' : ''}`}>
       {rail.collapsed ? (
-        <CollapsedRail width={rail.width} onExpand={rail.expand} />
+        <CollapsedRail width={rail.width} onExpand={rail.expand} horizontal={railBar} />
       ) : (
-        <aside style={{ width: rail.width }} className="flex-shrink-0 flex flex-col min-h-0 border-r border-border">
+        <aside style={{ width: mobileRailOpen ? '100%' : rail.width }} className="flex-shrink-0 flex flex-col min-h-0 border-r border-border">
           <div className="shrink-0 h-11 px-3 flex items-center gap-2 border-b border-border">
             <ClipboardCheck className="lucide-inline text-accent" />
             <span className="text-[13px] font-semibold text-text-strong truncate min-w-0">{i18nT('pages.projectsPage.task_runner')}</span>
           </div>
           <div className="shrink-0 px-3 pt-3">
-            <button onClick={() => setSelectedRun(null)} className="w-full px-3 py-2 rounded-lg text-[13px] font-semibold border cursor-pointer transition-all text-accent bg-accent/10 border-accent/30 hover:bg-accent/20"><Plus className="lucide-inline" /> {i18nT('pages.projectsPage.new_task')}</button>
+            <button onClick={() => selectRun(null)} className="w-full px-3 py-2 rounded-lg text-[13px] font-semibold border cursor-pointer transition-all text-accent bg-accent/10 border-accent/30 hover:bg-accent/20"><Plus className="lucide-inline" /> {i18nT('pages.projectsPage.new_task')}</button>
           </div>
           <div className="flex-1 min-h-0 overflow-y-auto p-3">
             {runs.length > 0
@@ -364,22 +538,34 @@ export default function ProjectsPage() {
         </aside>
       )}
 
-      {/* Drag handle — resize the run rail. Dragging well past the minimum collapses it. */}
-      <ResizeHandle
-        handleProps={rail.handleProps}
-        label={i18nT('pages.projectsPage.resize_sidebar')}
-        onNudge={rail.nudge}
-        value={rail.width}
-        min={MIN_RAIL_WIDTH}
-        max={MAX_RAIL_WIDTH}
-      />
+      {/* Drag handle — resize the run rail. Dragging well past the minimum collapses it.
+          Hidden on a phone, as on WebhooksPage: 6px is not a touch target, a stray
+          touch mid-scroll would flip the whole screen to the rail, and beside a
+          full-width rail it is what makes the row overflow. The drill-down covers
+          the same ground there — the strip expands, and picking a run collapses it. */}
+      {!isMobile && (
+        <ResizeHandle
+          handleProps={rail.handleProps}
+          label={i18nT('pages.projectsPage.resize_sidebar')}
+          onNudge={rail.nudge}
+          value={rail.width}
+          min={MIN_RAIL_WIDTH}
+          max={MAX_RAIL_WIDTH}
+        />
+      )}
 
-      <main className="flex-1 min-w-0 min-h-0 flex flex-col">
+      <main className={`flex-1 min-w-0 min-h-0 flex-col ${mobileRailOpen ? 'hidden' : 'flex'}`}>
         {selectedRun ? (
           <>
             <div className="px-4 py-2 flex items-center gap-2 border-b border-border shrink-0">
               {editingName ? (
-                <input aria-label={i18nT('pages.projectsPage.project_name')} className="text-[13px] font-semibold bg-transparent border border-accent rounded px-1 py-0 text-text-strong outline-none min-w-[120px]" autoFocus maxLength={200} value={editNameValue} onChange={e => setEditNameValue(e.target.value)} onBlur={() => { const v = editNameValue.trim(); if (v && v !== (selectedRun.name || selectedRun.spec_name || '')) { api.renameTaskRun(selectedRun.task_id, v).then(load).catch(() => {}) }; setEditingName(false) }} onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); else if (e.key === 'Escape') setEditingName(false) }} />
+                <input aria-label={i18nT('pages.projectsPage.project_name')} className="text-[13px] font-semibold bg-transparent border border-accent rounded px-1 py-0 text-text-strong outline-none min-w-[120px] focus-ring" autoFocus maxLength={200} value={editNameValue} onChange={e => setEditNameValue(e.target.value)} {...ime.bindComposition({ onBlur: () => { const v = editNameValue.trim(); if (v && v !== (selectedRun.name || selectedRun.spec_name || '')) { api.renameTaskRun(selectedRun.task_id, v).then(load).catch(() => {}) }; setEditingName(false) } })} onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    // Early-return BEFORE the blur: a committing IME Enter must not commit.
+                    if (ime.isComposing(e)) return
+                    ;(e.target as HTMLInputElement).blur()
+                  } else if (e.key === 'Escape') setEditingName(false)
+                }} />
               ) : (
                 <span
                   role="button"
@@ -411,7 +597,7 @@ export default function ProjectsPage() {
                 <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all" onClick={async () => { await api.deleteTaskRun(selectedRun.task_id); setSelectedRun(null); load() }}><X className="lucide-inline" /> {i18nT('pages.projectsPage.discard')}</button>
               </>}
               {selectedRun.status === 'planning' && <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all" onClick={async () => { await api.cancelPlan(); setSelectedRun(null) }}><X className="lucide-inline" /> {i18nT('pages.projectsPage.cancel')}</button>}
-              {selectedRun.running && <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-warning hover:border-warning transition-all" onClick={async () => { await api.pauseTaskRun(selectedRun.task_id); load() }}><Pause className="lucide-inline" /> {i18nT('pages.projectsPage.pause')}</button>}
+              {selectedRun.running && <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-warn hover:border-warn transition-all" onClick={async () => { await api.pauseTaskRun(selectedRun.task_id); load() }}><Pause className="lucide-inline" /> {i18nT('pages.projectsPage.pause')}</button>}
               {selectedRun.running && <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all" onClick={async () => { await api.cancelTaskRunner(selectedRun.task_id); load() }}><Square className="lucide-inline" /> {i18nT('pages.projectsPage.cancel')}</button>}
               {!selectedRun.running && selectedRun.status !== 'planned' && selectedRun.status !== 'planning' && <>
                 {selectedRun.status === 'paused' && (
@@ -456,7 +642,34 @@ export default function ProjectsPage() {
 /** The rail turned on its side: app mark plus the name rotated, and the whole
  * strip is the button that reopens it. Mirrors Issue Radar's collapsed rail so a
  * collapsed column looks the same wherever you meet one. */
-function CollapsedRail({ width, onExpand }: { width: number; onExpand?: () => void }) {
+function CollapsedRail({ width, onExpand, horizontal = false }: {
+  width: number
+  onExpand?: () => void
+  /** Lay the collapsed rail across the TOP instead of down the left edge. Set
+   * while narrow, where the strip's width is the one thing the pane beside it
+   * cannot spare. */
+  horizontal?: boolean
+}) {
+  if (horizontal) {
+    return (
+      <aside className="w-full flex-shrink-0 px-2 pt-2">
+        <div className="overflow-hidden rounded-xl border border-border-strong bg-bg-elevated shadow-sm">
+          <Btn
+            onClick={onExpand}
+            title={i18nT('pages.projectsPage.expand_sidebar')}
+            aria-label={i18nT('pages.projectsPage.expand_sidebar')}
+            className="w-full justify-start gap-2 px-3 py-2 rounded-none border-none text-muted hover:text-text hover:bg-bg-hover focus-ring"
+          >
+            <ClipboardCheck size={16} className="flex-shrink-0 text-accent" />
+            <span className="min-w-0 truncate text-[13px] font-medium tracking-[.02em] text-text">
+              {i18nT('pages.projectsPage.task_runner')}
+            </span>
+            <PanelLeftOpen size={15} className="ml-auto flex-shrink-0" />
+          </Btn>
+        </div>
+      </aside>
+    )
+  }
   return (
     <aside style={{ width }} className="flex-shrink-0 flex flex-col min-h-0 py-2 px-1">
       <div className="flex-1 min-h-0 flex flex-col overflow-hidden rounded-xl border border-border-strong bg-bg-elevated shadow-sm">

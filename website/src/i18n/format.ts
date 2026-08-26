@@ -18,9 +18,13 @@
  * two are used side by side without ceremony: formatting happens inside
  * `.map()` callbacks, in comparator functions passed to `.sort()`, and in plain
  * helper modules with no component around them — all positions a hook cannot
- * legally go. A language switch remounts the tree (`<App>` is keyed on the
- * active language in `main.tsx`), so a function that reads the language at call
- * time re-evaluates on switch without subscribing to anything.
+ * legally go. A language switch repaints the tree (`LanguageProvider` re-renders
+ * via `cloneElement` after the catalog swap — an update, not a remount), so a
+ * function that reads the language at call time re-evaluates on switch without
+ * subscribing to anything. The one shape that repaint cannot reach is a
+ * `React.memo` boundary, whose props-equality bailout swallows it —
+ * `MemoI18nSubscriptionRatchet.test.ts` pins the subscription every such
+ * boundary needs.
  *
  * ## Why `localeMatcher: 'lookup'`
  *
@@ -41,11 +45,12 @@
  * ## Known limitations, stated explicitly
  *
  *  1. **`Intl.DurationFormat` is NOT used**, because it does not exist on the
- *     runtime this ships to: `typeof Intl.DurationFormat === 'undefined'` on
- *     Node 20 (the CI and Electron baseline). `fmtUnit` uses `NumberFormat`
- *     with `style: 'unit'` instead, which is Baseline and covers every duration
- *     shape this app renders (a single value plus a unit). Revisit when the
- *     Electron floor reaches a Chromium with `DurationFormat`.
+ *     minimum supported runtime: `typeof Intl.DurationFormat === 'undefined'`
+ *     on Node 22 (the contributor floor; CI and Electron run Node 24, which
+ *     has it). `fmtUnit` uses `NumberFormat` with `style: 'unit'` instead,
+ *     which is Baseline and covers every duration shape this app renders (a
+ *     single value plus a unit). Revisit when the supported floor reaches a
+ *     runtime with `DurationFormat`.
  *  2. **Locale-formatted digits are not machine-readable.** `hi` groups as
  *     `12,34,567` (Indian grouping) and `bn` renders `১২,৩৪,৫৬৭` in Bengali
  *     digits by default — correct for display, catastrophic for a CSS length, a
@@ -191,7 +196,18 @@ export type FormatUnit =
 
 export function fmtUnit(value: number, unit: FormatUnit, options?: NumberOptions): string {
   if (!Number.isFinite(value)) return '—'
-  return fmtNumber(value, { style: 'unit', unit, unitDisplay: 'narrow', ...options })
+  // A quantity is one atom: never let a line break fall between the number and
+  // its unit, or inside the digit grouping. CLDR does not guarantee this for us
+  // and is not even self-consistent about it — measured with `narrow`, en emits
+  // `5,289MB` (no separator at all), fr uses U+202F, ru uses U+00A0 for bytes but
+  // a plain U+0020 for hours, and de uses U+0020 for MB yet U+00A0 for GB. zh-CN
+  // uses a plain U+0020, which is a UAX #14 break opportunity, so `1,280 GB`
+  // could render with `GB` orphaned on its own line while the same value in
+  // English could not. Promoting every plain space in the formatted quantity to
+  // U+00A0 (class GL: breaks prohibited on both sides) makes the behaviour the
+  // same in all 12 locales. Only plain spaces are touched; U+202F and U+00A0 are
+  // already non-breaking.
+  return fmtNumber(value, { style: 'unit', unit, unitDisplay: 'narrow', ...options }).replace(/ /g, '\u00A0')
 }
 
 /**
@@ -211,7 +227,7 @@ export function fmtUnit(value: number, unit: FormatUnit, options?: NumberOptions
  * put a stray gap in `6分钟 38秒`.
  *
  * `Intl.DurationFormat` would do all of this in one call and is deliberately
- * not used: it is `undefined` on the Node 20 / Electron baseline (see
+ * not used: it is `undefined` on the Node 22 contributor floor (see
  * limitation 1 in the file header).
  *
  * Every part passed is RENDERED, including zeros. That is deliberate: several

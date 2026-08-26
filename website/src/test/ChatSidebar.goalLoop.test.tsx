@@ -8,7 +8,8 @@
  * Progress comes from chat.goalLoops, keyed by the BARE slot key (autonudge.py
  * `binding_key_for` strips the `dashboard:` prefix). Presence in the map IS
  * "looping": inactive loops are dropped on the way into the store, so a loop
- * that hit max_cycles leaves no residue here.
+ * that hit max_cycles leaves no residue here. An actively-looping slot also
+ * counts as "In progress" for the session filter, like a live workflow run.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render } from '@testing-library/react'
@@ -176,5 +177,74 @@ describe('chat sidebar — goal-loop progress subtitle', () => {
     expect(queryByTitle(UNREAD_DOT_TITLE)).toBeTruthy()
     expect(getByText('final answer')).toBeTruthy()
     expect(queryByText(/^Loop/)).toBeNull()
+  })
+
+  it('a looping slot passes the "In progress" session filter despite running=false', () => {
+    // A loop spends its idle gaps with running=false (turn ended, waiting for
+    // the next nudge). The row still says "Loop N/M", so the filter — and its
+    // count — must keep surfacing it, mirroring the dynamic-workflow rule.
+    // Pre-activate the filter via its persisted toggle (read at mount).
+    localStorage.setItem('mc-session-running-only', '1')
+    const slots = [
+      { key: 'k-loop', title: 'loop session', running: false, messages: 5 },
+      { key: 'k-idle', title: 'idle session', running: false, messages: 2 },
+    ]
+    const { getByText, queryByText } = renderSidebar(
+      slots,
+      { goalLoops: { 'k-loop': { cycle_count: 10, max_cycles: 40 } } },
+    )
+    expect(getByText('loop session')).toBeTruthy() // kept: active loop counts as in-progress
+    expect(queryByText('idle session')).toBeNull() // filtered out: genuinely idle
+  })
+})
+
+describe('chat sidebar — interrupted goal loop', () => {
+  const STALLED_TITLE = 'Goal loop armed — last turn was interrupted; resume the chat or wait for the next cycle'
+
+  it('renders a static warn dot and "interrupted" when the loop session sits behind Resume', () => {
+    // The reported bug: the turn died on a transient model error (trailing
+    // error row → summary interrupted=true) and the pill kept pulsing as if a
+    // cycle were executing — for up to idle_secs, until the next fire.
+    const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, interrupted: true, last_message: 'cycle output' }]
+    const { getByText, getByTitle, container } = renderSidebar(
+      slots,
+      { goalLoops: { k: { cycle_count: 47, max_cycles: 72 } } },
+    )
+    expect(getByText(/Loop 47\/72 — interrupted/)).toBeTruthy()
+    const pill = getByTitle(STALLED_TITLE)
+    expect(pill).toBeTruthy()
+    // The pulse MEANS "work is happening" — it moved from the old inline dot to
+    // the status-gutter Goal glyph, which must be STATIC (warn) here, not pulsing.
+    const glyph = container.querySelector('.lucide-goal')
+    expect(glyph).toBeTruthy()
+    expect(glyph!.classList.contains('animate-pulse')).toBe(false)
+    expect(container.querySelector('[title="Goal loop · cycle 47 of 72"]')).toBeNull()
+  })
+
+  it('keeps the pulse mid-turn — a trailing error row is superseded once a new turn runs', () => {
+    const slots = [{ key: 'k', title: 'loop', running: true, messages: 5, interrupted: false }]
+    const { getByText, getByTitle, container } = renderSidebar(
+      slots,
+      { activeSlot: 'k', goalLoops: { k: { cycle_count: 47, max_cycles: 72 } }, slotStatusDetail: { k: { text: 'Reading gateway.log' } } },
+      { activeSlotProp: 'k' },
+    )
+    expect(getByText('Loop 47/72')).toBeTruthy()
+    expect(getByTitle('Goal loop · cycle 47 of 72')).toBeTruthy()
+    // Pulse lives on the gutter Goal glyph now (moved off the inline subtitle dot).
+    expect(container.querySelector('.lucide-goal.animate-pulse')).toBeTruthy()
+  })
+
+  it('keeps the pulse while a subagent wave is executing on the loop\'s behalf', () => {
+    // interrupted only describes the parent turn; children still working means
+    // the loop IS working.
+    const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, interrupted: true }]
+    const { getByText, container } = renderSidebar(slots, {
+      goalLoops: { k: { cycle_count: 9, max_cycles: 24 } },
+      slotActivity: { k: { toolLog: [], subagents: { a: sa('running') } } },
+    })
+    expect(getByText(/1 agent running/)).toBeTruthy()
+    // The loop outranks the sub-agent count in the gutter, and a running child
+    // means the loop is working — so the gutter Goal glyph pulses.
+    expect(container.querySelector('.lucide-goal.animate-pulse')).toBeTruthy()
   })
 })

@@ -88,9 +88,10 @@ async def test_claude_runtime_uses_bound_session_set_model():
     ):
         await runtime.create_session(mcp_servers=[])
 
-    runtime._send_and_await.assert_awaited_once_with(
-        METHOD_SESSION_NEW,
-        {"cwd": "/tmp", "mcpServers": [], "_meta": {"claudeCode": {"options": {}}}},
+        runtime._send_and_await.assert_awaited_once_with(
+            METHOD_SESSION_NEW,
+            {"cwd": "/tmp", "mcpServers": [], "_meta": {"claudeCode": {"options": {}}}},
+            timeout=90.0,
     )
     set_model.assert_awaited_once_with("fast")
     set_option.assert_not_awaited()
@@ -148,7 +149,7 @@ async def test_claude_runtime_spawn_uses_claude_adapter_protocol(monkeypatch, tm
 
     assert wrapped == {
         "argv": ["claude-agent-acp"],
-        "is_kiro_cli": False,
+        "is_kiro_cli": None,
         "mode": "auto",
         "strip_python_env": True,
     }

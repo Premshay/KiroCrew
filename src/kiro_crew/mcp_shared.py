@@ -20,8 +20,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from kiro_crew import platform_compat
-from kiro_crew.config.loader import KiroCrewConfig, config_dir
+from kiro_crew.acp.types import JSONRPC_METHOD_NOT_FOUND
+from kiro_crew.config.loader import KiroCrewConfig, config_dir, read_local_secret
 from kiro_crew.dashboard.origin import parse_dashboard_url
+from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_caller import (
     CallerContext,
     caller_identity_capability,
@@ -36,6 +38,35 @@ from kiro_crew.validation import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The component name this PROCESS presents on loopback gateway requests as
+# ``X-Internal-Caller``. Set exactly once by ``run_mcp_stdio_loop`` from the
+# server name it is handed, BEFORE any request is served — so every MCP stdio
+# server (kirocrew-core, kirocrew-dashboard, kirocrew-cron, kirocrew-computer)
+# self-identifies without per-server wiring, and a future server gets it for
+# free. ``None`` outside an MCP server process (CLI, tests), in which case the
+# request helpers send no caller header at all rather than inventing an
+# identity. The header is ATTRIBUTION for the gateway's audit log (SEL
+# ``source`` — see ``chat_folders._audit_origin``), never authorization: the
+# ``X-Internal-Secret`` handshake alone authenticates the request (#3503).
+_internal_caller_name: str | None = None
+
+
+def set_internal_caller(name: str | None) -> None:
+    """Declare this process's component identity for internal HTTP requests.
+
+    ``None`` un-declares it — used by ``run_mcp_stdio_loop``'s teardown to
+    restore the prior value, so repeated loops in one process (the test
+    suite) cannot leak one server's identity into the next test's requests.
+    """
+    global _internal_caller_name
+    _internal_caller_name = name
+
+
+def internal_caller() -> str | None:
+    """The declared component identity for internal HTTP requests, if any."""
+    return _internal_caller_name
+
 
 # Max tools/call requests buffered while a tool worker is busy.
 # Overflow gets an immediate JSON-RPC busy error instead of silence.
@@ -333,10 +364,12 @@ def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
         _host, port = parse_dashboard_url(cfg.dashboard.url)
         api_base = f"http://localhost:{port}"
 
-        # Read internal secret for auth
+        # Credential for the port this function DIALS (parsed just above), not for
+        # whichever gateway an ambient lookup would name -- those can differ on a
+        # multi-gateway host, which is the desync being closed.
         secret = ""
         try:
-            secret = (config_dir() / ".local_secret").read_text().strip()
+            secret = read_local_secret(port)
         except Exception:
             pass
 
@@ -437,7 +470,7 @@ def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
             headers=headers,
         )
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with loopback_urlopen(req, timeout=5) as resp:
                 policy = json.loads(resp.read())
         except urllib.error.HTTPError as http_exc:
             # 404 = "agent not resolved" (gateway side hasn't registered
@@ -670,7 +703,7 @@ def _read_message(stdin) -> dict[str, Any] | None:
                     continue
                 body = b"".join(chunks)
                 return json.loads(body.decode("utf-8"))
-            except (ValueError, json.JSONDecodeError):
+            except ValueError:
                 continue
         # Bare JSON line (backwards compat)
         try:
@@ -709,6 +742,14 @@ def run_mcp_stdio_loop(
     ``dup2`` on fd 1 — see the ``_stdout_fd`` comment block. It is released on
     exit so repeated loops in one process (the test suite) cannot leak fds.
     """
+    # Declare this process's identity for loopback requests FIRST — tool calls
+    # dispatched below reach the gateway through mcp_core's request helpers,
+    # which attach it as ``X-Internal-Caller`` so the audit log can name the
+    # component (not just "an internal caller") behind each write. Restored on
+    # exit, like the fd snapshot below, so repeated loops in one process (the
+    # test suite) cannot leak one server's identity into later requests.
+    _prior_caller = internal_caller()
+    set_internal_caller(server_name)
     snapshot_stdout_fd()
     try:
         _run_stdio_dispatch_loop(
@@ -719,6 +760,7 @@ def run_mcp_stdio_loop(
             advertise_caller_identity=advertise_caller_identity,
         )
     finally:
+        set_internal_caller(_prior_caller)
         release_stdout_fd()
 
 
@@ -1012,12 +1054,15 @@ def _run_stdio_dispatch_loop(
         if method == "initialize":
             _caps: dict[str, Any] = {"tools": {"listChanged": False}}
             if advertise_caller_identity:
-                # Pooled-operation opt-in: gatewayd pools ONLY backends that
-                # advertise the caller-identity extension (others fall back
-                # to per-session spawn). Advertising is what makes the
-                # per-call ``_meta.kirocrew.caller`` path live end-to-end —
-                # without it the dispatch loop's caller slot never receives
-                # gateway-authored metadata.
+                # Pooled-operation opt-in for IDENTITY, not for pooling:
+                # gatewayd injects the per-call ``_meta.kirocrew.caller`` block
+                # only into a backend that advertised this capability, and
+                # nothing declines to POOL one that did not (see
+                # ``rewriter.UNPOOLABLE_SERVERS``, which is empty and documents
+                # exactly that). So NOT advertising does not buy a per-session
+                # spawn -- it buys a shared process whose dispatch-loop caller
+                # slot never receives gateway-authored metadata, which is how a
+                # session-scoped tool silently degrades to unattached behaviour.
                 _caps["experimental"] = caller_identity_capability()
             respond(
                 req_id,
@@ -1138,4 +1183,11 @@ def _run_stdio_dispatch_loop(
                 )
                 _worker_thread.start()
         elif req_id is not None:
-            respond(req_id, None, error={"code": -32601, "message": f"Unknown method: {method}"})
+            respond(
+                req_id,
+                None,
+                error={
+                    "code": JSONRPC_METHOD_NOT_FOUND,
+                    "message": f"Unknown method: {method}",
+                },
+            )

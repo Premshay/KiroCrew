@@ -11,7 +11,7 @@ Usage:
     from kiro_crew.cron_script import Skip, Done
 
     def run(ctx):
-        data = ctx.call_tool("kirocrew-core", "browse_search", {"query": "..."})
+        data = ctx.call_tool("kirocrew-core", "local_knowledge_search", {"query": "..."})
         if not ready(data):
             raise Skip()  # silent, retry next tick
         ctx.notify("Done: " + summary)
@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -39,11 +38,15 @@ from typing import TYPE_CHECKING, Any
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import config_dir, read_local_secret
 from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.github_runner import prevalidated_gh_env
+from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.port_resolution import resolve_serving_port
 from kiro_crew.sandbox import (
     _AGENT_DENIED_ENV_KEYS,
     SandboxUnavailableError,
     cgroup_scope_argv,
-    resource_limit_preexec,
+    popen_limited,
+    run_limited,
     wrap_argv,
 )
 from kiro_crew.security import is_sensitive_path, redact
@@ -197,6 +200,36 @@ def _kill_proc_group(proc: subprocess.Popen) -> None:
         pass
 
 
+def _drain_after_kill(proc: subprocess.Popen, job_id: str | None) -> None:
+    """Reap a SIGKILLed child's pipes without leaking fds or hijacking the result.
+
+    ``communicate(timeout=5)`` can ITSELF raise ``TimeoutExpired``: the child
+    outlived the group kill (uninterruptible I/O, or no pgid resolved so only
+    ``proc.kill()`` was tried), or another process inherited the write end of
+    the pipe and holds it open, so EOF never arrives. Waiting longer cannot help
+    once SIGKILL has been sent, and the caller has already decided the outcome —
+    so swallow that one exception rather than letting it displace the caller's
+    ``raise`` / ``return``. Closing the pipes has to happen either way:
+    ``Popen._communicate`` closes them as a side effect of reaching EOF, which
+    is exactly the path not taken here, and nothing else ever closes them.
+    """
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Post-kill drain timed out (5s) for cron %s (pid %s); the child "
+            "outlived SIGKILL or another process holds the pipe — closing pipes",
+            job_id, proc.pid,
+        )
+    finally:
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+
 if TYPE_CHECKING:
     from kiro_crew.cron import CronJob
 
@@ -246,7 +279,14 @@ class ScriptContext:
     _secret: str = ""
 
     def __post_init__(self) -> None:
-        self._port = int(os.environ.get("KIROCREW_PORT", "5476"))
+        # The parent injects the port it minted the credential for. Preferring it
+        # keeps credential and dial target from one resolution; KIROCREW_PORT is the
+        # fallback for a directly-constructed context and is 5476 on a --port auto
+        # gateway, which is a SIBLING rather than this instance.
+        self._port = int(
+            os.environ.pop("_KIROCREW_DIAL_PORT", "")
+            or os.environ.get("KIROCREW_PORT", "5476")
+        )
         # Secret injected via temp file (not inherited env) to prevent privilege escalation.
         # Pop env var and unlink file immediately so fn(ctx) cannot access the secret directly.
         secret_file = os.environ.pop("_KIROCREW_SECRET_FILE", "")
@@ -341,7 +381,7 @@ class ScriptContext:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with loopback_urlopen(req, timeout=60) as resp:
                 return json.loads(resp.read())
         except Exception as exc:
             logger.warning("ScriptContext._post(%s) failed: %s", path, exc)
@@ -369,13 +409,12 @@ class McpToolClient:
             mode="w+", prefix="mcp-stderr-", suffix=".log", delete=False
         )
         try:
-            self._proc = subprocess.Popen(
+            self._proc = popen_limited(
                 sandboxed_argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=self._stderr_file,
                 text=True,
-                preexec_fn=resource_limit_preexec(),
             )
         except Exception:
             self._stderr_file.close()
@@ -548,17 +587,46 @@ def resolve_script_path(script_path: str) -> tuple[str, str]:
     return str(file_path), func_name
 
 
-def _resolve_internal_secret() -> str:
+def _resolve_internal_secret(port: int) -> str:
     """Internal secret for ScriptContext HTTP calls (e.g. notify -> /api/send-message).
 
-    The gateway generates its secret at startup and writes it to
-    ``config_dir()/.local_secret``; the ``KIROCREW_INTERNAL_SECRET`` env var is
-    normally unset, so fall back to the file via the shared
-    ``config.loader.read_local_secret`` helper (single home for that read).
-    Without this the sandbox sends an empty ``X-Internal-Secret`` and every
-    code-cron notify gets HTTP 403.
+    The gateway generates its secret at startup and publishes it per listener as
+    ``run/gateway-<port>.secret`` (with ``config_dir()/.local_secret`` as the
+    home-wide fallback); the ``KIROCREW_INTERNAL_SECRET`` env var is normally unset,
+    so fall back to the file via the shared ``config.loader.read_local_secret``
+    helper (single home for that read). Without this the sandbox sends an empty
+    ``X-Internal-Secret`` and every code-cron notify gets HTTP 403.
+
+    Takes the ALREADY-RESOLVED dial port rather than resolving its own. The caller
+    resolves the port ONCE and passes the same value here and into
+    ``_KIROCREW_DIAL_PORT``. Resolving twice -- once for the credential, once for the
+    child -- is a TOCTOU: a ``--port auto`` gateway that binds between the two calls
+    would mint the credential for one port and tell the child to dial another, and
+    the mismatched credential 403s the callback. One resolution makes that
+    unrepresentable, which is what the ``_KIROCREW_DIAL_PORT`` mechanism promised.
     """
-    return os.environ.get("KIROCREW_INTERNAL_SECRET", "") or read_local_secret()
+    env_secret = os.environ.get("KIROCREW_INTERNAL_SECRET", "")
+    if env_secret:
+        return env_secret
+    return read_local_secret(port)
+
+
+def _resolve_dial_port() -> int:
+    """The ONE port this cron dials, used for both the credential and the child.
+
+    The parent mints the credential and the child sends it, so a second independent
+    resolution in the child is exactly how the two diverge: ``ScriptContext`` reads
+    ``KIROCREW_PORT``, which is 5476 on a ``--port auto`` gateway, while the parent
+    would have minted for the real ephemeral port -- credential for one gateway,
+    request to another. One resolution, injected as ``_KIROCREW_DIAL_PORT``, makes
+    that mismatch unrepresentable.
+
+    Delegates to :func:`resolve_serving_port`, the shared gateway-side resolver that
+    prefers ``KIROCREW_BOUND_PORT`` over an inherited ``KIROCREW_PORT`` -- the cron
+    scheduler runs inside the gateway, so the bound port is ground truth and a
+    sibling-naming ``KIROCREW_PORT`` must not win.
+    """
+    return resolve_serving_port()
 
 
 def run_script_sandboxed(
@@ -607,6 +675,11 @@ def run_script_sandboxed(
 
     fd, launcher_path = tempfile.mkstemp(suffix=".py", prefix="kirocrew_cron_")
     sandbox_cleanup: str | None = None
+    # Resolve the dial port ONCE: the credential written below and the
+    # _KIROCREW_DIAL_PORT the child dials must come from the same resolution, or a
+    # --port auto bind between two resolutions would pair a credential with the
+    # wrong port and 403 the callback.
+    dial_port = _resolve_dial_port()
     # Write secret to temp file for ScriptContext (scrubbed from env)
     secret_fd, secret_path = tempfile.mkstemp(prefix="kirocrew_secret_")
     try:
@@ -624,7 +697,7 @@ def run_script_sandboxed(
             # unlinks the secret + launcher (otherwise the fd leaks and temp
             # files persist).
             platform_compat.restrict_to_owner(secret_path)
-            os.write(secret_fd, _resolve_internal_secret().encode())
+            os.write(secret_fd, _resolve_internal_secret(dial_port).encode())
         finally:
             os.close(secret_fd)
         try:
@@ -639,12 +712,20 @@ def run_script_sandboxed(
         # are never inherited; the internal secret is passed via the 0600 file.
         clean_env = _clean_cron_env()
         clean_env["_KIROCREW_SECRET_FILE"] = secret_path
+        # The child must dial the gateway the credential above was minted for:
+        # same dial_port, resolved once above, not a second resolution here.
+        clean_env["_KIROCREW_DIAL_PORT"] = str(dial_port)
+        # Pre-resolve gh OUTSIDE the sandbox and pin its identity for the
+        # child: the sandbox's single-uid user namespace maps every root-owned
+        # path component to the overflow uid, so the child's own ownership
+        # walk refuses ANY gh on the host. Empty when the host has no usable
+        # gh -- scripts that never call gh are unaffected either way.
+        clean_env.update(prevalidated_gh_env())
 
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
-        proc = subprocess.Popen(
+        proc = popen_limited(
             sandboxed_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=clean_env, start_new_session=True,
-            preexec_fn=resource_limit_preexec(),
         )
         _register_proc(job_id, proc)
         try:
@@ -654,7 +735,7 @@ def run_script_sandboxed(
                 # Popen.communicate does not kill the child on timeout
                 # (unlike subprocess.run) — clean up before re-raising.
                 _kill_proc_group(proc)
-                proc.communicate()
+                _drain_after_kill(proc, job_id)
                 raise
         finally:
             cancelled = _unregister_proc(job_id, proc)
@@ -662,8 +743,25 @@ def run_script_sandboxed(
             return {"status": "cancelled", "error": "Cancelled by user"}
 
         if proc.returncode != 0 and not stdout.strip():
-            error_text = stderr[:500] or f"exit {proc.returncode}"
-            error_text = redact(error_text)
+            # Report the TERMINAL stderr context, not the head. A process that
+            # dies hard leaves its diagnosis LAST -- the traceback is the final
+            # thing written -- while whatever a startup path logged first (a
+            # data-home migration warning, a deprecation notice, an import
+            # banner) sits in front of it. Bounding from the head therefore
+            # reports the noise and truncates the cause, and the operator reads
+            # a cron failure whose message describes something that did not kill
+            # the job.
+            #
+            # ``rstrip`` first so a trailing newline does not spend part of the
+            # budget, and so an all-whitespace stderr still falls through to the
+            # exit-code fallback rather than reporting blank text.
+            #
+            # Redact the WHOLE stream before bounding: slicing first would cut
+            # a credential that straddles the 500-char boundary in half, and
+            # ``redact`` cannot recognise the surviving fragment, so it would
+            # reach logs and the persisted ``last_error`` unmasked.
+            tail = redact(stderr.rstrip())
+            error_text = tail[-500:] if tail else f"exit {proc.returncode}"
             return {"status": "error", "error": error_text}
 
         try:
@@ -671,7 +769,10 @@ def run_script_sandboxed(
         except (json.JSONDecodeError, IndexError):
             return {
                 "status": "error",
-                "error": f"Bad output: {redact(stdout[:200])}",
+                # Redact the complete stdout BEFORE truncating: slicing first
+                # could cut a credential at the boundary, leaving its unredacted
+                # head in the diagnostic.
+                "error": f"Bad output: {redact(stdout)[:200]}",
             }
     except subprocess.TimeoutExpired:
         return {"status": "error", "error": f"Script timed out after {timeout}s"}
@@ -695,18 +796,6 @@ _MAX_COMMAND_OUTPUT = 65536  # 64KB cap
 # carries verbatim.
 _SANDBOX_UNAVAILABLE_PREFIX = "❌ Cron could not run in an OS sandbox: "
 
-# Git-for-Windows ships sh/bash under these dirs but only Git Bash itself puts
-# them on PATH — a gateway launched from PowerShell / a shortcut / the desktop
-# app inherits a registry PATH that has Git\cmd (git.exe) but no shell. Probe
-# the standard install roots so a command cron works regardless of how the
-# gateway was started.
-_WINDOWS_GIT_SHELL_DIRS = (
-    r"C:\Program Files\Git\bin",
-    r"C:\Program Files\Git\usr\bin",
-    r"C:\Program Files (x86)\Git\bin",
-    r"C:\Program Files (x86)\Git\usr\bin",
-)
-
 
 def _resolve_command_shell() -> str | None:
     """Return an absolute path to a POSIX shell for ``sh -c`` command crons.
@@ -714,22 +803,98 @@ def _resolve_command_shell() -> str | None:
     Command crons are authored as POSIX shell one-liners (and vetted by
     ``mcp_cron._vet_shell_command`` under POSIX quoting), so cmd.exe is NOT a
     substitute — a missing shell must fail loudly rather than silently changing
-    the command language. On POSIX ``sh`` is always present; on Windows it is
-    absent from a normal (non-Git-Bash) PATH, so also probe the Git-for-Windows
-    install roots. Returns ``None`` when no POSIX shell can be found.
+    the command language. Returns ``None`` when no POSIX-strict shell can be
+    found, which makes the caller refuse the job with a legible error.
+
+    Windows always returns ``None``: neither shipped option preserves the
+    language the vet gate assumed. Verified on a Git-for-Windows install —
+    ``sh.exe -c 'echo test.a{w,w}s'`` prints ``test.aws test.aws``, i.e. it IS
+    bash and performs brace expansion, which is exactly how
+    ``cat ~/.a{w,w}s/credentials`` hides a credential path from a gate that
+    tokenizes the stored string once. Command crons are therefore unavailable on
+    Windows by design; ``script`` crons (whose body is scanned in full) are the
+    supported path there.
     """
 
-    for name in ("bash", "sh"):
-        found = shutil.which(name)
-        if found:
-            return found
+    # On Windows there is no shipped shell whose language matches what
+    # mcp_cron._vet_shell_command was written against: cmd.exe is not POSIX at
+    # all, and Git-for-Windows's sh.exe IS bash. Refuse rather than route the
+    # vetted string through a shell that widens its language.
     if platform_compat.IS_WINDOWS:
-        for directory in _WINDOWS_GIT_SHELL_DIRS:
-            for name in ("bash.exe", "sh.exe"):
-                candidate = Path(directory) / name
-                if candidate.is_file():
-                    return str(candidate)
+        return None
+    # POSIX: NEVER consult PATH (shutil.which("sh")). PATH may contain an
+    # agent-writable directory that precedes /bin — an agent can plant
+    # ``~/.local/bin/sh`` that fingerprints the probe input, passes the strict
+    # test, then does something different when called with the real cron. Even
+    # inside `cc`-mode isolation the agent-planted binary runs, and `cc` leaves
+    # ``.ssh`` reachable, so this is a private-key-exposure vector. Instead,
+    # walk a small fixed list of trusted system shell paths (never a bash
+    # fallback: bash brace expansion hides `cat ~/.a{w,w}s/credentials` from
+    # the tokenizer). Some hosts (macOS /bin/sh is bash-in-POSIX-mode) still
+    # perform brace expansion under the `sh` name, so PROBE the candidate:
+    # dash / ash / a real POSIX sh preserve the literal; bash-in-any-mode fails.
+    for candidate in ("/bin/sh", "/usr/bin/sh"):
+        if os.path.isfile(candidate) and _shell_is_posix_strict(candidate):
+            return candidate
     return None
+
+
+# Per-shell-path memoization for the POSIX-strict probe. The probe itself
+# spawns a child, so caching it means each candidate is fingerprinted at most
+# once per gateway process; a subsequent command cron with the same resolved
+# shell does no extra work.
+_POSIX_STRICT_CACHE: dict[str, bool] = {}
+
+
+def _shell_is_posix_strict(shell: str) -> bool:
+    """Return True iff *shell* refuses brace expansion (POSIX-sh semantics).
+
+    Runs ``<shell> -c 'echo x.{a,a}'`` in an OS sandbox (strict tier, cron env)
+    and requires the OUTPUT to be the literal ``x.{a,a}``. dash / ash / a real
+    POSIX sh preserve it; bash (including macOS's ``/bin/sh`` which is
+    bash-in-POSIX-mode) expands to ``x.a x.a``. Refusing an expanding shell is
+    the only reliable defense: the vet gate (``mcp_cron._vet_shell_command``)
+    tokenizes the stored string once, so any downstream re-expansion silently
+    widens what a legitimate deny-list can see.
+
+    The probe is SANDBOX-ROUTED as a defense-in-depth belt on the fixed
+    trusted-path lookup in ``_resolve_command_shell``. If a future change ever
+    widens that resolver to consult PATH again, the sandbox wrap here still
+    denies an agent-planted shim the un-isolated execution it would need.
+    """
+
+    cached = _POSIX_STRICT_CACHE.get(shell)
+    if cached is not None:
+        return cached
+    sandbox_cleanup: str | None = None
+    try:
+        argv, sandbox_cleanup = wrap_argv(
+            [shell, "-c", "echo x.{a,a}"], mode="strict"
+        )
+        # Same discipline as every other sandbox-routed spawn in this module
+        # (test_every_routed_spawn_applies_resource_limits / _cgroup_scope): the
+        # probe is a child process, so it observes the same fork-bomb / RSS
+        # ceilings as a real command cron. run_limited applies them after exec,
+        # and is a no-op on Windows where there are no POSIX rlimits.
+        argv = cgroup_scope_argv(argv)
+        proc = run_limited(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_clean_cron_env(),
+        )
+        result = proc.returncode == 0 and proc.stdout.strip() == "x.{a,a}"
+    except (OSError, subprocess.SubprocessError, SandboxUnavailableError):
+        result = False
+    finally:
+        if sandbox_cleanup:
+            try:
+                os.unlink(sandbox_cleanup)
+            except OSError:
+                pass
+    _POSIX_STRICT_CACHE[shell] = result
+    return result
 
 
 def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None = None) -> dict:
@@ -743,8 +908,11 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
             "status": "error",
             "output": (
                 "❌ No POSIX shell available to run this command cron. Command "
-                "crons are executed with `sh -c`; install Git for Windows (which "
-                "ships bash) or put sh/bash on PATH, then retry."
+                "crons execute with `sh -c` under POSIX-sh semantics (what the "
+                "storage-time vet gate assumes); Windows ships no such shell "
+                "(Git for Windows's sh.exe is bash and would widen the language "
+                "past the vet). Use a script cron or an LLM `message` cron on "
+                "this platform, or run the gateway under POSIX."
             ),
             "exit_code": -1,
         }
@@ -770,10 +938,9 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
         sandboxed_argv, sandbox_cleanup = wrap_argv(argv, mode="cc")
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
         clean_env = _clean_cron_env()
-        proc = subprocess.Popen(
+        proc = popen_limited(
             sandboxed_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=clean_env, start_new_session=True,
-            preexec_fn=resource_limit_preexec(),
         )
         if job_id:
             _register_proc(job_id, proc)
@@ -783,7 +950,7 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
                 output, stderr_out = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 _kill_proc_group(proc)
-                proc.communicate()
+                _drain_after_kill(proc, job_id)
                 return {"status": "error", "output": f"❌ Command timed out after {timeout}s", "exit_code": -1}
         finally:
             if job_id:
@@ -795,7 +962,13 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
         if proc.returncode != 0:
             output = f"⚠️ Exit code {proc.returncode}\n\n{output}"
             if stderr_out:
-                output += f"\n\nstderr:\n{stderr_out[:1000]}"
+                # A command that dies hard leaves its diagnosis last: report the
+                # stderr tail, not the head, so a chatty startup warning can't
+                # displace the terminal error. Redact the complete stderr BEFORE
+                # truncating: slicing first could cut off a credential's
+                # detectable prefix (e.g. the scheme of a token-bearing URL),
+                # letting the raw secret tail through redaction.
+                output += f"\n\nstderr:\n{redact(stderr_out.rstrip())[-1000:]}"
         return {
             "status": "ok" if proc.returncode == 0 else "error",
             "output": output,

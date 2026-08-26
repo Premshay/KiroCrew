@@ -1,16 +1,32 @@
-const { app, BaseWindow, BrowserWindow, WebContentsView, shell, dialog, Tray, Menu, nativeImage, nativeTheme, Notification, ipcMain, webContents, session, desktopCapturer, systemPreferences, screen } = require("electron");
+const { app, BaseWindow, BrowserWindow, WebContentsView, shell, dialog, Tray, Menu, nativeImage, nativeTheme, Notification, ipcMain, webContents, session, desktopCapturer, systemPreferences, screen, crashReporter } = require("electron");
 const Store = require("electron-store");
 const fs = require("fs");
 const os = require("os");
-const { spawn, execFile } = require("child_process");
+const { spawn, execFile, execFileSync } = require("child_process");
 const path = require("path");
 const http = require("http");
 
 const { findKirocrewBin } = require("./find-bin");
+const { buildGatewayEnvironment, gatewayBytecodeEnvironment } = require("./gateway-env");
+const { resolveGatewayPath } = require("./mac-env");
+const {
+  findMissingBundleParts,
+  describeIncompleteBundle,
+  shouldReclassifyAsInstalling,
+  currentAttemptLog,
+  SPAWN_MARKER,
+} = require("./bundle-integrity");
 const { findConfiguredDashboardPort } = require("./data-home");
 const { createTokenRetryHandler } = require("./token-retry");
+const { createRendererRecovery } = require("./renderer-recovery");
 const { classifyAuthBlock, defaultedPort } = require("./gateway-auth-hint");
+const { exitImmersiveModes } = require("./blocking-prompt");
+const { armSplashHistoryClear } = require("./splash-history");
+const { hideToTray, cancelPendingTrayHide } = require("./hide-to-tray");
+const { attachHtmlFullScreen } = require("./html-fullscreen");
+const { shouldRetryLocalTokenMint, tokenMintRetryDelayMs, TOKEN_MINT_MAX_RETRIES } = require("./token-acquire");
 const { createDisplayMediaHandler } = require("./display-media");
+const { applyFocusModeChrome } = require("./focus-chrome");
 const {
   createPermissionRequestHandler,
   createPermissionCheckHandler,
@@ -18,27 +34,68 @@ const {
 const { createWindowOpenHandler, openExternalSafely } = require("./external-scheme");
 const { resolveThemeSource } = require("./native-theme");
 const { initAutoUpdate } = require("./auto-update");
+const { makeUpdaterLogger } = require("./update-logger");
 const {
   classifyBundleLocation,
   containingDirForBundle,
   shouldOfferRelocation,
   describeLocation,
 } = require("./bundle-location");
-const { stopGatewayGracefully: _stopGatewayGracefully, forceStopPort, classifyPortOwner } = require("./gateway-stop");
-const { waitForGateway, describeGatewayFailure, tailLines, isPortInUse } = require("./gateway-wait");
+const {
+  stopGatewayGracefully: _stopGatewayGracefully,
+  forceStopPort,
+  classifyPortOwner,
+  isKirocrewCommand,
+} = require("./gateway-stop");
+const {
+  windowsGatewayExecutablePaths,
+  windowsListenPids,
+  windowsProcessCommand,
+  windowsTaskkill,
+} = require("./windows-port");
+const {
+  gatewayWaitTimeoutMs,
+  waitForGateway,
+  describeGatewayFailure,
+  tailLines,
+  isPortInUse,
+} = require("./gateway-wait");
 const { describeSandboxProfileNeed } = require("./sandbox-profile");
 const { sanitizeWindowState, captureWindowState } = require("./window-state");
+const {
+  DEFAULT_GLOBAL_HOTKEY,
+  createSummonHandler,
+  bindGlobalHotkey,
+  unregisterGlobalHotkey,
+  currentGlobalHotkey,
+  setGlobalHotkeyLogger,
+} = require("./global-hotkey");
 const { createLivenessMonitor } = require("./gateway-liveness");
-const { chooseRecoveryStrategy } = require("./gateway-recovery");
+const {
+  chooseRecoveryStrategy,
+  classifyAdoptedGateway,
+  waitForServiceRebind,
+  waitForProcessExit,
+  snapshotPortPids,
+  incumbentSnapshotBlocksRespawn,
+  unrecoverableGatewayDialog,
+} = require("./gateway-recovery");
 const { capturePySpyDump } = require("./pyspy-dump");
-const { createMetricsRecorder } = require("./perf-metrics");
-const { identityFamily, decideGatewayAction, FAMILY_META, HEALTH_IDENTITY_PATH } = require("./instance-guard");
+const { createMetricsRecorder, profilingEnabled } = require("./perf-metrics");
+const { createPierrePerfLog } = require("./pierre-perf-log");
+const { identityFamily, decideGatewayAction, classifyGatewayReadiness, FAMILY_META, HEALTH_IDENTITY_PATH, READY_PATH } = require("./instance-guard");
 const { initMochi, shutdownMochi } = require("./mochi/index");
+const { borrowSessionToken } = require("./mochi-session-token");
+const { initCrewCompanion, shutdownCrewCompanion } = require("./crew-companion/index");
 const { clampZoomFactor, stepZoomFactor } = require("./zoom");
 const { createBrowserViewManager, isUntrustedContents } = require("./browser-view");
-// chooseControlTransport is exercised by the routing layer (see Stage 6 notes),
-// not here — main.js only owns the plane and its gate.
-const { canAgentControl, createControlPlane, OWNER } = require("./browser-control");
+const {
+  canAgentControl,
+  isLoopbackUrl,
+  mayBootstrapView,
+  createControlPlane,
+  OWNER,
+} = require("./browser-control");
 const { createBrowserOps } = require("./browser-ops");
 const { createAgentCommandChannel } = require("./browser-agent-channel");
 const { secretCandidates } = require("./home-dir");
@@ -60,6 +117,14 @@ function readInternalSecret() {
   return "";
 }
 const { buildMenuTemplate } = require("./app-menu");
+const { serializeMenuItems, executeMenuItem } = require("./windows-menu-model");
+const {
+  paintTitleBarOverlay,
+  paintAllTitleBarOverlays,
+  SYMBOL_DARK: WINDOWS_TITLEBAR_SYMBOL_DARK,
+  SYMBOL_LIGHT: WINDOWS_TITLEBAR_SYMBOL_LIGHT,
+  OVERLAY_BACKGROUND: WINDOWS_TITLEBAR_BACKGROUND,
+} = require("./windows-titlebar");
 
 // ── Persistent settings for remote tunnel mode ──
 
@@ -72,6 +137,20 @@ const {
 
 const { migrateRemoteHostConfig, getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
 
+const { seedRenamedStore } = require("./store-rename");
+
+const { isLocalGatewayEnabled, setLocalGatewayEnabled, classifyStartFailure } = require("./local-gateway");
+
+const { initNativeLogging } = require("./native-logging");
+
+// Carry settings across the npm `name` rename, by writing the new store's file
+// BEFORE electron-store opens it. Order is load-bearing: construction writes the
+// defaults, after which the file always exists and the seed can never run. It only
+// ever writes a file that does not exist, so it cannot overwrite anything.
+seedRenamedStore(app.getPath("userData"), {
+  log: (m) => console.log(`store migration: ${m}`),
+});
+
 const store = new Store({
   defaults: {
     remoteHost: "",                        // LEGACY — migrated to remoteHosts
@@ -79,19 +158,30 @@ const store = new Store({
     remoteHosts: {},                       // { [port]: { host, binPath, remotePort?, remotePath? } }
     sshTimeoutMs: 20000,
     windowState: null,                     // persisted main-window geometry (see window-state.js)
+    globalHotkey: null,                    // system-wide summon accelerator: null = platform default, "" = disabled, string = custom (see global-hotkey.js)
     lastNudgedVersion: "",                 // last update version announced via native notification (nudge once per version)
     themeAccent: "",                       // user's resolved theme accent hex; injected into the boot splash
-    updateChannel: "",                     // "" = follow build stamp; "insider"|"stable" = user opt-in (Settings > About)
+    updateChannel: "",                     // "" = follow the stable default; "insider"|"stable" = user opt-in (Settings > About)
+    autoDownloadUpdates: true,             // ON by default: a discovered update downloads in the background and installs on the next quit. false = notify only, download on request (Settings > About)
+    runLocalGateway: true,                 // false = act as a pure client; never start a gateway on this machine
+    linuxFrameless: null,                  // Linux window chrome: true = frameless, false = native frame, null = follow the desktop environment (see linux-frame.js)
   },
 });
 
-// The PRE-SPAWN read home (see home-dir.js for the full contract): whichever
-// directory's config.json governs this launch under the backend's migration
-// rules -- legacy ~/.kirocrew when it exists (the backend force-copies it
-// over ~/.kiro/crew, marker or not), canonical otherwise. Parity with
-// config/paths.py is gated by test/fixtures/home-resolution-cases.json.
-// Boot-time WRITES (mkdir, pycache prefix) use canonicalHome() instead --
-// writing into the legacy dir re-arms the migration every launch (#483).
+
+// Read ONCE at launch, because the setting takes effect on the next launch.
+// startGateway() is also the recovery path for a gateway that died mid-session,
+// so re-reading the store there would let a flip made minutes ago refuse to
+// replace a gateway this session is still using — stranding the user with no
+// backend and no way back short of a relaunch. The error dialog's
+// "turn it on and retry" action is the one thing that may change this, since
+// that IS the user asking for a gateway right now.
+let runLocalGateway = isLocalGatewayEnabled(store);
+
+// The data home whose config.json governs this launch (see home-dir.js): a
+// valid KIROCREW_HOME override, else the default ~/.kiro/crew -- mirroring the
+// backend resolver in config/paths.py. Boot-time WRITES (mkdir, pycache prefix)
+// use canonicalHome() so an override is honored without a stray write.
 const { resolveHome, canonicalHome } = require("./home-dir");
 const { fetchLocalToken: fetchTokenFromHome } = require("./local-token");
 const KIROCREW_HOME = resolveHome();
@@ -109,8 +199,7 @@ function resolvePort() {
   // No env override — derive the gateway port from config.json. The fork's
   // DashboardConfig has no `dashboard.port` key; the port lives in
   // `dashboard.url` (see backend cli_server.resolve_client_port /
-  // dashboard/origin.parse_dashboard_url). A real legacy home is checked first
-  // because the backend migration makes legacy data authoritative on conflict.
+  // dashboard/origin.parse_dashboard_url). Read it from the resolved data home.
   const configuredPort = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
   if (configuredPort) return configuredPort;
   console.debug("No usable dashboard.url port in the data home, falling back to 5476");
@@ -126,10 +215,33 @@ if (migrateRemoteHostConfig(store, PORT)) {
 }
 const HEALTH_URL = `${BACKEND_URL}/api/status`;
 const POLL_INTERVAL_MS = 500;
-const MAX_WAIT_MS = 30_000; // 30s max wait for backend
 const IS_MAC = process.platform === "darwin";
-const IS_WIN = process.platform === "win32";
+const IS_WINDOWS = process.platform === "win32";
+const IS_WIN = IS_WINDOWS;
+const WINDOWS_TITLEBAR_MENU_IDS = new Set([
+  "file-menu",
+  "edit-menu",
+  "view-menu",
+  "connection-menu",
+  "window-menu",
+  "help-menu",
+]);
+const IS_LINUX = process.platform === "linux";
+// Whether Linux windows drop the native frame so the dashboard's 42px header
+// can double as the title bar (as on macOS/Windows) instead of stacking under
+// the WM's own decoration. Decided ONCE at launch from the desktop
+// environment plus the operator override, because every window in the process
+// must agree (see linux-frame.js for the full contract).
+const { decideLinuxFrame, applyWindowControl } = require("./linux-frame");
+const LINUX_FRAME_DECISION = IS_LINUX
+  ? decideLinuxFrame({ env: process.env, override: store.get("linuxFrameless") })
+  : null;
+const LINUX_FRAMELESS = !!(LINUX_FRAME_DECISION && LINUX_FRAME_DECISION.frameless);
 const DEFAULT_THEME_ACCENT = "#8E48FF";
+// Loading-screen status for a refused spawn on a bundle that is still being
+// written. Deliberately not "Gateway failed": nothing failed, so the line must
+// not contradict the dialog that follows.
+const INSTALLING_STATUS = "Finishing installation…";
 const THEME_ACCENT_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 
 function currentThemeAccent() {
@@ -139,10 +251,12 @@ function currentThemeAccent() {
 
 
 // The dashboard view fills the whole content area on all platforms. On macOS
-// the window is frameless (titleBarStyle:"hidden") and the dashboard's own
-// 42px header doubles as the title bar: an injected drag region makes it
-// draggable and the native traffic lights are inset into it (see
-// positionTrafficLights).
+// and Windows the dashboard's own 42px header doubles as the title bar. macOS
+// insets native traffic lights; Windows overlays its native caption controls
+// and renders application-menu triggers inside the header. On Linux the window
+// is frameless (frame:false) on desktops that prefer client-side decorations —
+// same injected drag region, with an injected caption-control cluster instead
+// of native controls (see linux-frame.js).
 
 const { validateRemoteSettings } = require("./validation");
 const { attachContextMenu } = require("./context-menu");
@@ -177,8 +291,33 @@ if (IS_WIN) {
 if (!app.requestSingleInstanceLock()) {
   app.exit(0);
 } else {
+  // Arm native diagnostic capture as the FIRST thing the winning instance does:
+  // early enough that Chromium still reads the logging switches (it reads them
+  // during initialization, so a call after app-ready is accepted and ignored),
+  // but strictly INSIDE the lock-won branch. A rejected second instance must not
+  // reach this: it would rotate `chromium.log` out from under the primary — the
+  // primary's open fd follows the renamed inode, and the genuine previous
+  // generation is destroyed — so double-clicking the icon of a running app would
+  // wipe exactly the retained evidence this capture exists to keep. `app.exit(0)`
+  // above is synchronous, so placing it here is what makes that unreachable
+  // rather than merely unlikely.
+  //
+  // `gatewayLogPath` is a hoisted function declaration needing only the modules
+  // required at the top of this file, so calling it here reuses its logs-dir
+  // resolution (including the tmpdir fallback) rather than duplicating it.
+  initNativeLogging({
+    logsDir: path.dirname(gatewayLogPath()),
+    appendSwitch: (name, value) => app.commandLine.appendSwitch(name, value),
+    startCrashReporter: (opts) => crashReporter.start(opts),
+    fs,
+    log: (m) => glog(m),
+  });
+
   app.on("second-instance", () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
+      // Relaunching the app is a request for the window back; it must win over
+      // a hide still deferred to the fullscreen exit (see hide-to-tray.js).
+      cancelPendingTrayHide(mainWindow);
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
       mainWindow.focus();
@@ -189,15 +328,38 @@ if (!app.requestSingleInstanceLock()) {
 let mainWindow = null;
 let tray = null;
 let gatewayProcess = null;
-// True only when WE spawned the bundled backend on this flavor's port. False on
-// the reuse path — i.e. a gateway was already answering when we booted, which is
-// exactly the remote-tunnel setup (localhost:<port> is an SSH forward to a
-// remote gateway) and also the "dev ran `kirocrew gateway` in a terminal" case.
-// Recovery must NEVER kill or respawn a gateway we did not spawn: the port-holder
-// is someone else's process (our SSH tunnel, a manual gateway), and the correct
-// fix on a dropped tunnel is to re-probe and reconnect once it heals, not to
-// force-stop the port or spawn a (nonexistent, in remote mode) local backend.
-let weSpawnedGateway = false;
+// How the gateway on this flavor's port was obtained — ONE mutually-exclusive
+// state (previously three module-level booleans that encoded it redundantly and
+// could drift out of sync). Vocabulary + the recovery-strategy mapping live in
+// gateway-recovery.js (chooseRecoveryStrategy / classifyAdoptedGateway); assign
+// at exactly one place per outcome.
+//   "none"           — no gateway yet, or the reuse path could NOT positively
+//                      identify the port-holder as a local Kiro Crew process
+//                      (remote SSH tunnel, manual/external gateway, probe
+//                      failure). Recovery must NEVER kill or respawn it: the
+//                      port-holder is someone else's process, and the correct
+//                      fix on a dropped tunnel is to re-probe and reconnect
+//                      once it heals, not to force-stop the port or spawn a
+//                      (nonexistent, in remote mode) local backend.
+//   "spawned"        — WE spawned the bundled backend on this flavor's port;
+//                      recovery may kill + respawn it.
+//   "reused-local"   — reuse path, holder POSITIVELY identified as a local
+//                      same-family Kiro Crew process (same-family /api/health
+//                      + a "kirocrew" LISTEN owner). An adopted local gateway
+//                      that dies will never come back on its own, so recovery
+//                      must wait BOUNDED and then respawn — never the
+//                      indefinite tunnel-heal wait, which leaves the shell
+//                      dead until the user manually relaunches.
+//   "reused-service" — like "reused-local", but the holder was SERVICE-
+//                      classified (PPID = init: a real launchd/systemd unit —
+//                      or an orphan, which reparents to init and is
+//                      indistinguishable at classify time). If that gateway
+//                      later releases the port, a real service manager may be
+//                      about to respawn it, so recovery must offer a bounded
+//                      rebind grace before spawning locally — spawning
+//                      immediately races the manager for the bind and one side
+//                      dies with EADDRINUSE.
+let gatewayOwnership = "none";
 // Post-handoff backend liveness monitor (primary window only). Detects a wedged
 // gateway — alive TCP socket, frozen event loop — that the spawn 'exit' watcher
 // can't, since the process never exits. See gateway-liveness.js.
@@ -252,6 +414,12 @@ function glog(line) {
   console.log(`[gateway-launch] ${line}`);
 }
 
+// Highlight-churn history for the renderer-crash post-mortem. Module scope
+// because the reports arrive on an ipcMain channel while the flush happens in
+// the window's render-process-gone handler. Holds only plain numbers, bounded to
+// its capacity, and writes nothing until a crash.
+const pierrePerfLog = createPierrePerfLog();
+
 // ── Cross-app gateway ownership (shared ~/.kiro/crew, shared port) ─────────
 // The nightly app and the production app are different bundles sharing one
 // data home and one port, so the port is the mutex. When a gateway is already
@@ -275,6 +443,28 @@ function fetchHealthInfo(healthUrl = `${BACKEND_URL}${HEALTH_IDENTITY_PATH}`) {
   });
 }
 
+// Is the answering gateway actually SERVING, or draining after /api/shutdown?
+// /api/status and /api/health both stay 200 through a graceful drain, so they
+// cannot make this call — /api/ready flips to 503 with `shutting_down: true`
+// the moment shutdown_event is set (see handlers/core.py api_ready). Resolves
+// to a classifyGatewayReadiness verdict; never rejects (probe failures map to
+// "unknown", which adopts — fail-open like every other ambiguity in the guard).
+function fetchGatewayReadiness(readyUrl = `${BACKEND_URL}${READY_PATH}`) {
+  return new Promise((resolve) => {
+    const req = http.get(readyUrl, { timeout: 2000 }, (res) => {
+      let body = "";
+      res.on("data", (c) => { body += c; });
+      res.on("end", () => {
+        let payload = null;
+        try { payload = JSON.parse(body); } catch { /* non-JSON body — classify on status alone */ }
+        resolve(classifyGatewayReadiness(res.statusCode, payload));
+      });
+    });
+    req.on("error", () => resolve("unknown"));
+    req.on("timeout", () => { req.destroy(); resolve("unknown"); });
+  });
+}
+
 // Ask the OTHER channel app to quit through its normal lifecycle (its
 // before-quit stops its own gateway). Never kill the gateway out from under
 // its shell — the shell's exit watcher would treat that as a crash.
@@ -292,17 +482,79 @@ function quitOtherApp(appName) {
 // Function declarations are hoisted, so the helpers defined further down this
 // file are available here.
 //
-// On Windows there is no lsof/ps, so classifyPortOwner returns "unknown" and
-// the caller reuses the port rather than force-killing an owner it cannot
-// identify. A Windows-native netstat/taskkill owner probe is a follow-up
-// (tracked separately) — it needs runtime verification on real Windows.
+function isTrustedWindowsGatewayCommand(command) {
+  const gatewayBin = findKirocrewBin(
+    fs,
+    os,
+    path,
+    process.resourcesPath,
+    __dirname
+  );
+  return isKirocrewCommand(command, {
+    trustedExecutablePaths: windowsGatewayExecutablePaths(gatewayBin),
+  });
+}
+
 function probeGatewayPortOwner(port) {
+  if (IS_WIN) {
+    return classifyPortOwner(port, {
+      getListenPids: windowsListenPids,
+      getCommand: windowsProcessCommand,
+      isKirocrew: isTrustedWindowsGatewayCommand,
+      log: glog,
+    });
+  }
   return classifyPortOwner(port, {
     getListenPids: _lsofListenPids,
     getCommand: _psCommand,
     getPpid: _psPpid,
     log: glog,
   });
+}
+
+// Is `pid` still running? Signal 0 probes without delivering: ESRCH means dead,
+// EPERM means alive but not ours (still holding its locks) — treat as alive.
+function _pidAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return !!(e && e.code === "EPERM"); }
+}
+
+// Best-effort capture of the PIDs LISTENing on our port, for the incumbent-exit
+// wait below. It must happen while the port is still bound: after it clears,
+// neither lsof nor netstat can name the draining process.
+function snapshotGatewayPortPids(port) {
+  return snapshotPortPids({
+    port,
+    isWindows: IS_WIN,
+    getWindowsPids: windowsListenPids,
+    getPosixPids: _lsofListenPids,
+  });
+}
+
+// A snapshot the probe could not take blocks an automatic respawn only where a
+// working probe is guaranteed (see incumbentSnapshotBlocksRespawn).
+function unverifiedIncumbent(pids) {
+  return incumbentSnapshotBlocksRespawn({ pids, isWindows: IS_WIN });
+}
+
+// A draining gateway releases its LISTEN socket EARLY but holds the exclusive
+// gateway.lock flock until the process exits (turn drain + session flush run
+// after the socket closes). Spawning on "port is free" alone races that lock:
+// the replacement is refused and exits, then the incumbent exits — no gateway.
+// Wait (bounded) for the captured incumbent pids to die before spawning; the
+// kernel releases the flock atomically on exit. On timeout, spawn anyway and
+// let the child's own honest lock-refusal error surface through the existing
+// gatewayStartFailure watcher — better than silently hanging here forever.
+async function waitForIncumbentExit(pids, label) {
+  const verdict = await waitForProcessExit({
+    pids,
+    isAlive: _pidAlive,
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+  });
+  if (verdict === "timeout") {
+    glog(`${label}: incumbent gateway process still alive after the exit grace (port already free) — spawning anyway; a lock refusal will surface via the start-failure watcher`);
+  }
+  return verdict;
 }
 
 // Budget: the other app's graceful gateway stop runs up to 15s
@@ -332,7 +584,7 @@ async function waitForPortFree(maxWaitMs = 30000) {
   }
 }
 
-async function resolveGatewayConflict() {
+async function resolveGatewayConflict(rebindDepth = 0) {
   const health = await fetchHealthInfo();
   // A remote host configured for THIS port means the user deliberately pointed
   // this app at a gateway on another machine, so the local holder is a tunnel
@@ -344,9 +596,84 @@ async function resolveGatewayConflict() {
   const localOwner = remoteHost ? "foreign" : await probeGatewayPortOwner(PORT);
   const decision = decideGatewayAction(app.getVersion(), health, { localOwner });
   if (decision.action === "reuse") {
+    // Adopt-or-wait: the /api/status probe that got us here stays 200 while the
+    // backend DRAINS after POST /api/shutdown, so "answering" is not "serving".
+    // Adopting a draining gateway strands the shell: seconds later the process
+    // exits and nothing ever answers this port again (a relaunch arriving
+    // seconds into a graceful stop reads "reusing existing gateway" and then
+    // goes dark). Only a positive shutting-down verdict refuses; every ambiguity
+    // (legacy gateway, probe failure) keeps the historical adopt behavior.
+    // A configured remote host is exempt: its port-holder is a tunnel by
+    // construction, so "wait for the port to clear, then spawn fresh" can never
+    // apply — adopting and letting the reconnect path wait out the remote
+    // restart is the only correct move there.
+    let adoptedDraining = false;
+    const readiness = remoteHost ? "unknown" : await fetchGatewayReadiness();
+    if (readiness === "shutting-down") {
+      glog(`gateway on :${PORT} answers but /api/ready reports shutting-down — refusing to adopt a draining gateway`);
+      sendStatus("Waiting for the previous gateway to exit…");
+      // Capture the draining process NOW, while it still owns the LISTEN
+      // socket — needed below to wait out its gateway.lock after the port clears.
+      const drainingPids = await snapshotGatewayPortPids(PORT);
+      if (unverifiedIncumbent(drainingPids)) {
+        glog(`drain: could not capture the incumbent PID on :${PORT} — refusing an automatic respawn that could race gateway.lock`);
+        return "probe-failed";
+      }
+      if (await waitForPortFree()) {
+        if (localOwner === "service") {
+          // A SERVICE-classified holder that released its port may be mid-restart
+          // (kirocrew restart bounces the launchd/systemd unit): the manager is
+          // about to respawn it, and spawning now races that rebind — one side
+          // exits with EADDRINUSE. But orphans (reparented to init) classify as
+          // service too and have no manager to respawn them, so don't exempt —
+          // grace-wait: adopt a rebind, spawn only if the port stays free.
+          sendStatus("Waiting for the gateway to restart…");
+          const verdict = await waitForServiceRebind({
+            isPortBound: async () => (await probeGatewayPortOwner(PORT)) !== "none",
+            sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+          });
+          if (verdict === "rebound") {
+            // Whatever re-bound the port has NOT been validated: it could be a
+            // foreign process, a different-family gateway, or another draining
+            // gateway. Do not assert "reuse" — re-run the full decision table
+            // (identity + readiness) against the new holder. Depth-capped: one
+            // re-entry per boot; a second rebind-into-drain falls through to
+            // the adopt-anyway path rather than looping.
+            if (rebindDepth < 1) {
+              glog(`service rebind: :${PORT} re-bound within the grace window — re-validating the new holder`);
+              return resolveGatewayConflict(rebindDepth + 1);
+            }
+            glog(`service rebind: :${PORT} re-bound again at depth ${rebindDepth} — treating as adopt-anyway to avoid a validation loop`);
+          } else {
+            glog(`service rebind: :${PORT} stayed free past the grace window (no manager respawned it) — spawning fresh`);
+          }
+        }
+        if (localOwner !== "service" || (await probeGatewayPortOwner(PORT)) === "none") {
+          // Port free ≠ lock free: wait for the draining process itself to
+          // exit so the replacement is not refused by the singleton lock.
+          await waitForIncumbentExit(drainingPids, "drain");
+          glog(`drain complete: :${PORT} released — spawning a fresh gateway`);
+          return "spawn";
+        }
+      }
+      // The drain is stuck holding the socket past the graceful-stop budget.
+      // Spawning now would only hit EADDRINUSE, and evicting is not ours to do
+      // (we did not spawn this gateway). Adopt as before — loudly — and let the
+      // liveness recovery below handle its eventual death with a bounded wait.
+      glog(`drain wait timed out — :${PORT} still held; adopting anyway (recovery will respawn if it dies)`);
+      adoptedDraining = true;
+    }
     glog(`reusing existing gateway on :${PORT} (${decision.reason}) — bundled backend NOT spawned`);
-    weSpawnedGateway = false; // reuse path — recovery must not kill/respawn a gateway we don't own
-    sendStatus("Gateway already running ✓");
+    // Reuse path — recovery must not kill/respawn a gateway we don't own. A
+    // same-family gateway held by a local Kiro Crew process is OURS in spirit
+    // even though we didn't spawn it: if it dies, no tunnel will resurrect it,
+    // so recovery may respawn after a bounded wait. Anything less positively
+    // identified (tunnel, no visible owner, probe failure) keeps the
+    // never-respawn external classification ("none").
+    gatewayOwnership = classifyAdoptedGateway({ reason: decision.reason, localOwner });
+    // A gateway we adopted mid-drain is not a success to celebrate: recovery
+    // may immediately retract it. Keep the status neutral for that case.
+    sendStatus(adoptedDraining ? "Connecting to the existing gateway…" : "Gateway already running ✓");
     return "reuse";
   }
   const other = FAMILY_META[decision.otherFamily];
@@ -452,6 +779,25 @@ function startGateway() {
   glog(`launch: port=${PORT} home=${KIROCREW_HOME} packaged=${app.isPackaged} resourcesPath=${process.resourcesPath || "(none)"} log=${gatewayLogPath()}`);
   sendStatus("Checking if gateway is running…");
   return new Promise((resolve) => {
+    // Both branches below funnel through here, so the client-only choice cannot
+    // be honoured on one path and ignored on the other. A takeover reaches it
+    // too: quitting the other channel's app frees the port on this machine, and
+    // that is not a request to run a gateway here.
+    //
+    // With nothing to spawn there is no exit code and no log to wait for, so the
+    // reason is reported as a fail-fast failure rather than left to time out.
+    // The error dialog's Retry re-enters this function, which is what makes
+    // "bring the connection up, then retry" work without a relaunch.
+    const spawnUnlessClientOnly = () => {
+      if (runLocalGateway) {
+        spawnGateway(resolve);
+        return;
+      }
+      glog(`no gateway on :${PORT} and local gateway is off — not starting one`);
+      sendStatus("No gateway is answering…");
+      gatewayStartFailure = { disabled: true, port: PORT };
+      resolve(false);
+    };
     checkBackend()
       .then(async () => {
         // A gateway is already listening on this port. Same-family, dev, and
@@ -459,16 +805,23 @@ function startGateway() {
         // channel app triggers the takeover prompt.
         const outcome = await resolveGatewayConflict();
         if (outcome === "reuse") { resolve(true); return; }
+        if (outcome === "probe-failed") {
+          gatewayStartFailure = {
+            error: `could not verify the previous gateway process on port ${PORT}`,
+          };
+          resolve(false);
+          return;
+        }
         if (outcome === "abort") {
           isQuitting = true;
           app.quit();
           resolve(false);
           return;
         }
-        spawnGateway(resolve);
+        spawnUnlessClientOnly();
       })
       .catch(() => {
-        spawnGateway(resolve);
+        spawnUnlessClientOnly();
       });
   });
 }
@@ -496,12 +849,10 @@ function resolveProjectDir() {
 }
 
 function spawnGateway(resolve) {
-        // Pre-create the backend's POST-migration data root so the pycache
-        // prefix below has a live target. Deliberately NOT resolveHome():
-        // that answers "which config content governs this launch" and can be
-        // the legacy dir -- pre-creating or writing into ~/.kirocrew re-arms
-        // the backend's legacy migration on every launch (issue #483 class).
-        // The gateway creates/owns its home and .local_secret regardless.
+        // Pre-create the backend's data root so the pycache prefix below has a
+        // live target. Honor a KIROCREW_HOME override, else the default home
+        // (canonicalHome()). The gateway creates/owns its home and
+        // .local_secret regardless.
         const kirocrewDir = process.env.KIROCREW_HOME || canonicalHome();
         try {
           fs.mkdirSync(kirocrewDir, { recursive: true, mode: 0o700 });
@@ -514,6 +865,36 @@ function spawnGateway(resolve) {
         let execState = "executable";
         try { fs.accessSync(bin, fs.constants.X_OK); } catch (e) { execState = `NOT-EXECUTABLE(${e.code})`; }
         glog(`no gateway on :${PORT} — spawning bundled backend: bin=${bin} bundled=${bundled} ${execState}`);
+
+        // Refuse to exec a bundled interpreter whose stdlib is only partly on
+        // disk. The installer extracts backend-dist/ incrementally and starts the
+        // app as it finishes (runAfterFinish), so a launch inside that window
+        // finds python.exe present but late-alphabet stdlib packages missing --
+        // the interpreter then dies on `from urllib.parse import ...` from inside
+        // pathlib, which reads as a corrupt install rather than an unfinished one.
+        //
+        // This is PREVENTIVE and unsound; the launch-log backstop in the failure
+        // handler is sound but after-the-fact. They cover different halves, so
+        // neither replaces the other: refusing before spawn() keeps a doomed
+        // interpreter from running module-scope work against the user's live data
+        // home (it creates the home and .local_secret, and writes bytecode caches)
+        // and from failing in messier ways than ModuleNotFoundError while
+        // extraction is still writing underneath it -- the backstop only ever
+        // explains a crash that already happened.
+        if (bundled) {
+          const backendRoot = path.resolve(path.dirname(bin), "..");
+          const missingParts = findMissingBundleParts(fs, path, backendRoot);
+          if (missingParts.length) {
+            const errMsg = describeIncompleteBundle(missingParts);
+            glog(`spawn REFUSED: incomplete bundle at ${backendRoot} — missing: ${missingParts.join(", ")}`);
+            gatewayStartFailure = { error: errMsg, incompleteBundle: true, bundled: true };
+            // Neutral status: nothing failed, the install has not finished.
+            sendStatus(INSTALLING_STATUS);
+            resolve(false);
+            return;
+          }
+        }
+
         sendStatus("Starting gateway…");
 
         // Linux AppImage only: this process is about to exec the backend with no
@@ -550,13 +931,34 @@ function spawnGateway(resolve) {
         // served on.
         const { KIROCREW_PORT: _ignored, ...cleanEnv } = process.env;
 
+        // macOS: a GUI-launched .app inherits launchd's minimal environment, so
+        // cleanEnv.PATH is typically /usr/bin:/bin:/usr/sbin:/sbin. Recover the
+        // user's configured PATH from the launchd user domain and APPEND the
+        // directories it adds, so agent shell tools and MCP servers can resolve
+        // user-installed CLIs instead of reporting "command not found" for a
+        // binary that works in Terminal (issue #2367). No-op off darwin, when
+        // the domain is unset, or when it adds nothing — in which case
+        // gatewayPath is null and the inherited environment is left untouched.
+        //
+        // This only fixes the environment of a Gateway spawned FROM HERE.
+        // Already-running Gateway/ACP/MCP children keep the environment they
+        // were started with, so changing the domain still needs a Gateway
+        // restart to take effect.
+        const gatewayPath = resolveGatewayPath({
+          execFileSync,
+          basePath: cleanEnv.PATH || "",
+        });
+        if (gatewayPath) {
+          glog(`PATH recovered from launchd domain: +${gatewayPath.added.length} dir(s) appended`);
+        }
+
         // Tee the child's stdout+stderr straight to the launch log via a file
         // descriptor — no JS pipe to drain, no backpressure on a long-running
         // child. This is what surfaces a Python traceback / dylib load error /
         // "killed: 9" on a recipient's machine.
         let childOut = "ignore";
         try { childOut = fs.openSync(gatewayLogPath(), "a"); } catch (e) { glog(`WARN could not open child log fd: ${e.message}`); }
-        glog("---- spawning gateway; child stdout+stderr follows ----");
+        glog(SPAWN_MARKER);
         gatewayStartFailure = null; // re-arm for this spawn attempt
 
         // Bind handlers to THIS child via a captured reference, not the
@@ -581,14 +983,24 @@ function spawnGateway(resolve) {
             spawnBin = pyExe;
             spawnArgs = ["-s", "-m", "kiro_crew", ...spawnArgs];
           } else {
-            // Bundled layout is present but python.exe is missing/corrupted.
-            // Surface this as a clear error instead of letting spawn() hang or
-            // emit a cryptic ENOENT for the .cmd shim.
-            const errMsg = `Bundled Python interpreter not found at ${pyExe}. `
-              + `The installation may be corrupted — reinstall the app.`;
-            glog(`spawn ERROR: ${errMsg}`);
-            gatewayStartFailure = { error: errMsg };
-            sendStatus(`Gateway failed: ${errMsg}`);
+            // The .cmd shim is here but python.exe is not. That is the same
+            // extraction race as the incomplete-stdlib case above, caught one
+            // wave earlier — bin/ lands before the interpreter — so it gets the
+            // same "still installing, retry" framing.
+            //
+            // A mid-extraction tree and a permanently truncated one are
+            // indistinguishable at this instant, so this deliberately reads the
+            // ambiguity as transient. Mid-extraction is the common state (every
+            // install and update passes through it) and the costs are asymmetric:
+            // guessing "installing" wrongly costs a retry, after which the copy's
+            // "if this persists, reinstall" gives the right instruction anyway,
+            // while guessing "corrupted" wrongly sends the user to reinstall a
+            // bundle that needed a few more seconds — the harm this whole path
+            // exists to prevent, and not undoable once done.
+            const errMsg = describeIncompleteBundle([]);
+            glog(`spawn REFUSED: bundled interpreter absent at ${pyExe} — install likely still extracting`);
+            gatewayStartFailure = { error: errMsg, incompleteBundle: true, bundled: true };
+            sendStatus(INSTALLING_STATUS);
             resolve(false);
             return;
           }
@@ -600,27 +1012,33 @@ function spawnGateway(resolve) {
           // without this every app launch opens a persistent console window
           // beside the Electron app. Ignored on POSIX.
           windowsHide: true,
-          env: {
+          env: buildGatewayEnvironment({
             ...cleanEnv,
+            // Overrides the inherited PATH only when the launchd domain
+            // actually contributed a directory (see resolveGatewayPath above);
+            // otherwise this spreads nothing and cleanEnv.PATH stands.
+            ...(gatewayPath ? { PATH: gatewayPath.path } : {}),
             // Windows source layout puts agents/ + skills/ at the repo root
             // (two levels up from electron/), so resolve by markers there.
             // macOS/Linux keep the original one-level-up path unchanged.
             KIROCREW_PROJECT_DIR: IS_WIN ? resolveProjectDir() : path.resolve(__dirname, ".."),
-            // Keep CPython bytecode caches OUT of the signed app bundle.
-            // Without this, the embedded interpreter writes __pycache__/*.pyc
-            // next to the bundled sources on first import, breaking the
-            // codesign seal ("a sealed resource is missing or invalid") --
-            // Gatekeeper then fails the installed app, and Squirrel's
-            // installer can trip over the corrupted target during updates.
-            // CPython creates the directory tree on demand (PEP 3147 /
-            // sys.pycache_prefix). Inherited by every Python child the
-            // gateway spawns (app servers run on the same interpreter), so
-            // the whole process tree stays out of the bundle.
-            PYTHONPYCACHEPREFIX: path.join(kirocrewDir, "cache", "pycache"),
-          },
+            // macOS code signing seals the app tree and Linux packages may be
+            // read-only, so those platforms redirect runtime bytecode. Windows
+            // consumes checked-hash pycs generated during packaging instead;
+            // avoiding the redirected-cache population is the main cold-start
+            // win on a freshly installed, Defender-scanned bundle.
+            ...gatewayBytecodeEnvironment(
+              process.platform,
+              path.join(kirocrewDir, "cache", "pycache"),
+              app.isPackaged,
+            ),
+          }),
         });
         gatewayProcess = child;
-        weSpawnedGateway = true; // we own this child — recovery may kill+respawn it
+        // We own this child — recovery may kill+respawn it. Ownership
+        // transitioned: any stale adopted/service classification must not
+        // outlive the spawn.
+        gatewayOwnership = "spawned";
         // The child inherits its own dup of the fd; close our copy so it doesn't leak.
         if (typeof childOut === "number") { try { fs.closeSync(childOut); } catch { /* ignore */ } }
 
@@ -628,13 +1046,19 @@ function spawnGateway(resolve) {
           // ENOENT = bin not found on disk; EACCES = present but not executable.
           glog(`spawn ERROR code=${err.code || "?"} msg=${err.message}`);
           if (gatewayProcess !== child) return; // stale child we already replaced
-          gatewayStartFailure = { error: err.message };
+          gatewayStartFailure = { error: err.message, bundled };
           sendStatus(`Gateway failed: ${err.message}`);
           resolve(false);
         });
         child.on("exit", (code, signal) => {
           glog(`gateway child exited code=${code} signal=${signal}`);
-          if (signal === "SIGKILL") {
+          // macOS only. The hint is the right first thing to say there, but on
+          // Windows this signalCode is produced by OUR OWN teardown -- Node maps
+          // both .kill("SIGTERM") and .kill("SIGKILL") onto TerminateProcess --
+          // so an ungated hint prints a mac remedy on every wedge recovery and
+          // every fallback stop, in the very log the unrecoverable-gateway dialog
+          // tells the user to read.
+          if (signal === "SIGKILL" && IS_MAC) {
             glog("HINT: SIGKILL on a freshly-spawned bundled binary almost always means macOS Gatekeeper blocked an unsigned/quarantined nested executable. On the recipient's Mac run: xattr -cr <path to KiroCrew.app>");
           }
           // Only the CURRENT child may mutate the shared state. A stale child's
@@ -647,32 +1071,28 @@ function spawnGateway(resolve) {
           // user-initiated Retry clears it so a re-probe can genuinely succeed.
           // Guard: preserve the root cause from the 'error' handler if it fired
           // first (Node fires both 'error' then 'exit' on spawn failure).
-          if (!gatewayStartFailure) gatewayStartFailure = { code, signal };
+          if (!gatewayStartFailure) gatewayStartFailure = { code, signal, bundled };
           gatewayProcess = null;
         });
         resolve(true);
 }
 
 /**
- * Gracefully stop the embedded gateway and await its exit (POST /api/shutdown
- * -> SIGTERM -> SIGKILL). Core logic lives in gateway-stop.js for testability;
- * this thin wrapper binds the module-level child process + config.
+ * Gracefully stop the embedded gateway and await its exit: POST /api/shutdown,
+ * then on POSIX SIGTERM -> SIGKILL, and on Windows a tree kill (no real signals
+ * there, so the escalation is scope rather than force — see gateway-stop.js).
+ * Core logic lives in gateway-stop.js for testability; this thin wrapper binds
+ * the module-level child process + config.
  *
  * Uses call-time home resolution (secretCandidates) rather than the boot-time
- * KIROCREW_HOME pin, because on the migration launch the boot-time dir may
- * have been deleted by the backend — the secret lives in whichever candidate
- * still exists at shutdown time.
+ * KIROCREW_HOME pin, so a KIROCREW_HOME change between boot and shutdown is
+ * honored when locating the secret.
  */
 async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
   const proc = gatewayProcess;
   if (!proc || proc.exitCode !== null) { gatewayProcess = null; return; }
   console.log("Stopping gateway gracefully...");
-  // Resolve the secret location at call time: try each candidate in order
-  // (canonical first, legacy second) so graceful stop works even when the
-  // boot-time home was moved/deleted during migration.
-  // Resolve the secret location at call time: a migration may have moved or
-  // deleted the boot-time home, and a partial migration can leave BOTH a
-  // canonical and a legacy `.local_secret`. Collect every readable candidate
+  // Resolve the secret location at call time. Collect every readable candidate
   // value and let gateway-stop POST each one — the gateway answers 200 only to
   // the secret it actually loaded, so a stale copy can't force a hard SIGTERM.
   const candidates = secretCandidates();
@@ -689,8 +1109,81 @@ async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
     kirocrewHome,
     secrets,
     timeoutMs,
+    // Windows fallback scope: when /api/shutdown does not take, a single-pid kill
+    // frees the port but leaves the gateway's detached kiro-cli / MCP / app-server
+    // children alive and reparented, holding the data home's locks. Windows has no
+    // process group to signal, so the tree kill is the only way to take them with
+    // the parent. Gated on the same identity check the port sweep uses, so a
+    // recycled pid is refused rather than killed.
+    //
+    // TIMEOUTS ARE PINNED, not defaulted. windowsTaskkill's defaults are sized for
+    // the interactive port sweep (8s PowerShell + 5s WMIC + 10s taskkill = 23s),
+    // which exceeds stopGatewayGracefully's own deadline of timeoutMs + 3000. The
+    // tree kill is awaited rather than pre-empted -- cutting it short would kill
+    // the parent alone and orphan the tree -- so it is the BUDGET that has to fit:
+    // 3+2+5 = 10s, comfortably inside 18s, and still generous for probes that
+    // normally answer in well under a second.
+    killTreeFn: killGatewayTreeOnWindowsBounded,
   });
   gatewayProcess = null;
+}
+
+/**
+ * Tree-kill the gateway pid on Windows for the SHUTDOWN path only, with the
+ * timeouts that path's deadline can afford.
+ *
+ * windowsTaskkill's DEFAULTS (8s PowerShell + 5s WMIC + 10s taskkill = 23s) suit
+ * a caller with no deadline, but exceed stopGatewayGracefully's own
+ * timeoutMs + 3000. The kill is awaited rather than pre-empted — cutting it short
+ * would kill the parent alone and orphan the very descendants it exists to reap —
+ * so the BUDGET is what has to fit: 3+2+5 = 10s, inside 18s, and still generous
+ * for probes that normally answer in well under a second.
+ *
+ * Do NOT reuse this anywhere without such a deadline: shorter probe timeouts only
+ * make an early fallback to the parent-only kill MORE likely, which is the outcome
+ * the tree kill exists to prevent. Unbounded callers use
+ * killGatewayProcessTree().
+ */
+function killGatewayTreeOnWindowsBounded(pid) {
+  return windowsTaskkill(pid, {
+    isTrustedCommand: isTrustedWindowsGatewayCommand,
+    getCommandFn: (probePid) => windowsProcessCommand(probePid, {
+      powershellTimeoutMs: 3000,
+      wmicTimeoutMs: 2000,
+    }),
+    timeoutMs: 5000,
+  });
+}
+
+/**
+ * Kill a gateway child and, on Windows, everything it spawned.
+ *
+ * POSIX needs no tree walk here: the signal reaches the gateway, which reaps its
+ * own children on the way out. Windows has neither — no signal semantics (Node
+ * maps every name onto TerminateProcess) and no process group — so the detached
+ * kiro-cli / MCP / app-server descendants survive a single-pid kill, reparented
+ * and still holding the data home's locks.
+ *
+ * Falls back to the single-pid kill whenever the tree kill refuses (identity
+ * probe unavailable, or a recycled pid): losing the descendants is a leak, while
+ * losing the parent too would leave a live gateway behind a caller that believes
+ * it is gone.
+ */
+async function killGatewayProcessTree(proc, signal) {
+  if (!proc || proc.exitCode !== null) return;
+  const killPid = () => {
+    try { proc.kill(signal); } catch (e) { glog(`${signal} failed: ${e && e.message}`); }
+  };
+  if (!IS_WIN || !proc.pid) { killPid(); return; }
+  try {
+    // windowsTaskkill's OWN defaults: this path has no deadline to fit, so the
+    // identity probe gets its full budget rather than the shutdown path's
+    // shortened one.
+    await windowsTaskkill(proc.pid, { isTrustedCommand: isTrustedWindowsGatewayCommand });
+  } catch (e) {
+    glog(`tree kill refused (${e && e.message}) — falling back to a single-pid kill`);
+    killPid();
+  }
 }
 
 /** Best-effort synchronous-ish stop for the before-quit path (can't await). */
@@ -729,8 +1222,8 @@ function fetchRemoteToken(port) {
 }
 
 async function fetchLocalToken(backendUrl = BACKEND_URL) {
-  // Re-resolve the authoritative home at call time: migration may move or pin
-  // the live secret after Electron starts. Send exactly that one secret to the
+  // Re-resolve the authoritative home at call time so a KIROCREW_HOME change
+  // after Electron starts is honored. Send exactly that one secret to the
   // gateway's literal IPv4 bind address; never probe alternate homes/addresses.
   return fetchTokenFromHome({
     backendUrl,
@@ -741,6 +1234,25 @@ async function fetchLocalToken(backendUrl = BACKEND_URL) {
   });
 }
 
+/**
+ * Resolve a gateway credential for Mochi's poller, trying the same paths (in
+ * the same order) the main window itself would: the local secret first
+ * (same machine, unchanged), then an explicitly configured SSH remote host
+ * for this port (unchanged), then — new — the session the main window has
+ * ALREADY established. That third path only runs when the first two come
+ * back empty, so an ordinary same-machine or SSH-remote install never
+ * reaches it at all. See mochi-session-token.js for why it exists and why it
+ * cannot weaken auth: it only ever hands back a credential a genuine prior
+ * authentication already produced.
+ */
+async function fetchMochiGatewayAuth(backendUrl = BACKEND_URL) {
+  const localValue = await fetchLocalToken(backendUrl);
+  if (localValue) return { value: localValue, viaCookie: false };
+  const { token: remoteValue } = await fetchRemoteToken(new URL(backendUrl).port);
+  if (remoteValue) return { value: remoteValue, viaCookie: false };
+  const borrowed = await borrowSessionToken({ electronSession: session.defaultSession, backendUrl });
+  return borrowed ? { value: borrowed, viaCookie: true } : { value: "" };
+}
 
 function checkBackend(healthUrl = HEALTH_URL) {
   return new Promise((resolve, reject) => {
@@ -762,7 +1274,13 @@ function waitForBackend(targetWin, healthUrl = HEALTH_URL, { watchSpawn = false 
     getFailure: watchSpawn ? (() => gatewayStartFailure) : (() => null),
     isWindowAlive: () => !targetWin?.isDestroyed(),
     onStatus: (msg) => { try { targetWin?.webContents?.send("status", msg); } catch { /* window gone */ } },
-    maxWaitMs: MAX_WAIT_MS,
+    // Windows may spend well past the ordinary deadline importing a newly
+    // installed bundled Python tree. Keep showing live splash progress only for
+    // the gateway child we spawned; exits still fail immediately via getFailure.
+    maxWaitMs: gatewayWaitTimeoutMs({
+      platform: process.platform,
+      watchSpawn: watchSpawn && gatewayOwnership === "spawned",
+    }),
     pollIntervalMs: POLL_INTERVAL_MS,
   });
 }
@@ -863,6 +1381,9 @@ function syncNativeTheme(view, win) {
       mode = parsed.mode || "";
     } catch { return; }
     nativeTheme.themeSource = resolveThemeSource(pref, mode);
+    if (mode === "dark" || mode === "light") {
+      updateWindowsTitleBarOverlay(win, mode);
+    }
   }).catch(() => {});
 }
 
@@ -939,10 +1460,26 @@ function setupWindowContents(win, backendUrl) {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      // The SPA reserves header space for the injected Linux caption controls
+      // only when the window is actually frameless -- a runtime decision
+      // (desktop environment + override), not a platform constant, so it is
+      // carried to the preload explicitly (read back via process.argv there).
+      additionalArguments: LINUX_FRAMELESS ? ["--kc-linux-frameless"] : [],
     },
   });
   view.setBackgroundColor("#00000000");
   win.contentView.addChildView(view);
+
+  // Keep the boot splash / token prompt out of reachable navigation history:
+  // once the dashboard commits, prune the transient shell entries so mouse
+  // button 4 (Chromium's built-in history-back) cannot land the user on a
+  // dead-end loading.html with no way forward. Armed once per window; covers
+  // boot, the gateway reconnect/recovery re-paints, and the renderer-driven
+  // token-prompt handoff. See splash-history.js and #5538.
+  armSplashHistoryClear(view.webContents, {
+    isAlive: () => !win.isDestroyed() && !view.webContents.isDestroyed(),
+    log: glog,
+  });
 
   // Clean up views when window is closed
   win.on("closed", () => {
@@ -973,8 +1510,40 @@ function setupWindowContents(win, backendUrl) {
     if (win.isDestroyed() || view.webContents.isDestroyed()) return;
     view.webContents.send("fullscreen-changed", win.isFullScreen());
   };
-  win.on("enter-full-screen", () => { updateViewBounds(); sendFullScreen(); });
-  win.on("leave-full-screen", () => { updateViewBounds(); sendFullScreen(); });
+  // Fullscreen transitions fire before the window finishes reflowing, so the
+  // synchronous updateViewBounds() in the handlers below can read a pre-reflow
+  // content rect — the same stale-getContentBounds hazard the did-finish-load
+  // settle pass below documents. Observed on Linux, where the in-window menu
+  // bar's ~28px is reclaimed only after `leave-full-screen`, leaving the view
+  // taller than the window and clipping bottom-anchored rows until some other
+  // resize. Keep the synchronous call (already correct where reflow is
+  // immediate) and follow it with bounded deferred recomputes so the settled
+  // bounds win: a quick pass for the common fast reflow and a late backstop
+  // matching the startup settle delay for slow window managers. Re-reading
+  // bounds on an already-correct window is a no-op, so this runs on every
+  // platform rather than behind a process.platform gate. updateViewBounds()
+  // itself no-ops on a destroyed window; the timers are also cleared on
+  // "closed" so nothing fires into a torn-down window.
+  let fullscreenSettleTimers = [];
+  const scheduleFullscreenSettle = () => {
+    for (const t of fullscreenSettleTimers) clearTimeout(t);
+    fullscreenSettleTimers = [250, 1500].map((ms) => setTimeout(updateViewBounds, ms));
+  };
+  win.on("closed", () => { for (const t of fullscreenSettleTimers) clearTimeout(t); });
+  win.on("enter-full-screen", () => { updateViewBounds(); sendFullScreen(); scheduleFullscreenSettle(); });
+  win.on("leave-full-screen", () => { updateViewBounds(); sendFullScreen(); scheduleFullscreenSettle(); });
+  // DOM fullscreen (an inline <video>'s fullscreen button, the media viewer) is
+  // a SEPARATE pair of events from the two above, raised on the WebContents
+  // rather than the window. Without this bridge the element goes :fullscreen
+  // inside a WebContentsView still clamped to the un-fullscreened window, so
+  // nothing visibly happens. `enter-full-screen` above then re-runs
+  // updateViewBounds() so the view grows into the new content rect.
+  //
+  // Parked on the window (same pattern as _mcBrowserPanels) because
+  // persistMainWindowState() must ask whether the CURRENT fullscreen is one the
+  // bridge raised: a video's fullscreen is not a window preference and must not
+  // be what a quit mid-playback relaunches into.
+  win._mcHtmlFullScreen = attachHtmlFullScreen({ win, webContents: view.webContents });
   // The initial updateViewBounds() above runs before win.show() and before the
   // dashboard finishes loading, so getContentBounds() can return a pre-layout
   // size — leaving the WebContentsView mis-sized (content overflows / gets cut
@@ -1036,6 +1605,15 @@ function setupWindowContents(win, backendUrl) {
     const existing = browserPanels.get(id);
     if (existing || !create) return existing || null;
 
+    // `agentAct` is the HUMAN panel's own "Let the agent act" control (it owns the
+    // LIGHT/CDP handoff surfaced in the Browser panel), NOT the agent's
+    // authorization to drive the page. That authorization is Browser Mode — the
+    // Settings toggle the agent command-channel dispatch now honors directly (see
+    // `entry.gate`). So a fresh entry starts with the human control OFF; a mounted
+    // panel sets it authoritatively via `browser:set-agent-act`. It is deliberately
+    // NO LONGER seeded from a per-session consent set: that set — and the gate that
+    // read it — are gone, because gating the built-in view behind a second grant
+    // gated a strictly weaker capability than Browser Mode already authorizes.
     const entry = { id, agentAct: false };
     entry.manager = createBrowserViewManager({
       createView: () =>
@@ -1098,9 +1676,25 @@ function setupWindowContents(win, backendUrl) {
         console.warn(`[browser-control] ${id} ${event} ${JSON.stringify(detail)}`);
       },
     });
+    // The gate the control plane consults on every owner transition — for both
+    // the agent command channel and the human panel wiring. It reduces to the
+    // VIEW PRECONDITION, because authorization to drive the built-in browser is
+    // Browser Mode (the Settings toggle), the agent's keystone-level grant.
+    //
+    // Precedent (src/kiro_crew/security.py ~line 4236): Browser Mode is documented
+    // as keystone-level authorization — "Presence alone is the authorization" —
+    // and in attach mode it authorizes driving the operator's OWN running,
+    // logged-in browser. The agent's browser_* tools only exist while Browser Mode
+    // is on. Gating this isolated embedded Electron view behind a SECOND
+    // per-session grant therefore gated a strictly WEAKER capability than the
+    // toggle already authorizes; that inconsistency is removed by passing
+    // agentActEnabled:true rather than the per-session flag. (canAgentControl's
+    // loopback exemption is now redundant — nothing is gated on a per-session
+    // grant — so no URL is passed here; the function + its tests stay in
+    // browser-control.js as documented there.)
     entry.gate = () =>
       canAgentControl({
-        agentActEnabled: entry.agentAct,
+        agentActEnabled: true,
         viewOpen: entry.manager.getState().open,
       });
 
@@ -1120,6 +1714,40 @@ function setupWindowContents(win, backendUrl) {
   win._mcBrowserPanel = browserPanel;
   win._mcBrowserPanels = browserPanels;
   win._mcDestroyBrowserPanel = destroyBrowserPanel;
+  // Chat sessions this window hosts that MAY host a browser panel, whether or
+  // not one is mounted right now.
+  //
+  // This is what makes the built-in browser the default. The agent command
+  // channel only long-polls the gateway for the session keys it reports (see
+  // listPanelIds), and the gateway's command bus treats "a key was polled for"
+  // as "a live panel exists" — so a chat whose Browser tab was never opened had
+  // NO key, the bus answered NoPanelError, and the very first "open this page"
+  // fell back to the Playwright mirror. Reporting the session keys here keeps the
+  // on-demand bootstrap in `dispatch` reachable.
+  //
+  // Reachability is simply "the active slots the renderer declares" (see the
+  // `browser:track-session` IPC + ChatPage's tracking effect). It grants NOTHING:
+  // authorization to drive the built-in browser is Browser Mode itself — the
+  // Settings toggle, whose presence is the agent's keystone-level grant and
+  // without which the browser_* tools do not exist. There is therefore no longer
+  // a separate per-session consent set to keep alongside this one; the two sets
+  // that used to coexist (durable-consent + transient-reachability) collapse to
+  // this single reachability set. Kept SEPARATE from `browserPanels` on purpose:
+  // closing the panel destroys its entry (see `browser:close`), and a session
+  // must stay reachable across that so the next request re-opens natively.
+  const reachableSessions = new Set();
+  win._mcReachableSessions = reachableSessions;
+
+  // NOTE: there is deliberately no did-navigate "revoke consent on reload"
+  // handler here anymore. It existed ONLY to reset the per-session grant when the
+  // dashboard document reloaded (a granted background slot must not be re-seeded
+  // as agent-controlled). With the per-session grant removed — Browser Mode is
+  // the agent's authorization, and it does not reset on a dashboard repaint —
+  // there is nothing consent-shaped left to revoke, and releasing the agent's
+  // LIGHT control just because the dashboard reloaded would wrongly interrupt a
+  // still-authorized agent. Reachability is re-declared by the renderer's tracking
+  // effect on mount (and pruned by its cleanup on slot change), so it needs no
+  // reload sweep either.
 
   // ── Agent command channel ──
   // The agent's `browser_*` MCP calls originate in the Python gateway, which has
@@ -1136,31 +1764,88 @@ function setupWindowContents(win, backendUrl) {
     fetchFn: (url, init) => fetch(url, init),
     getGatewayUrl: () => win._mcBackendUrl,
     getSecret: () => readInternalSecret(),
-    // Only panels that actually exist can be driven; an empty list parks the
-    // poller instead of spinning.
-    listPanelIds: () => [...browserPanels.keys()],
+    // The idle host-presence heartbeat must fire ONLY when the gateway is truly
+    // on this machine. A loopback URL is necessary but NOT sufficient: a REMOTE
+    // gateway reached over a tunnel also presents as localhost, so additionally
+    // require that no remote host is configured for THIS window's port (each
+    // window has its own `port` from its backendUrl; the module-global PORT is
+    // only the primary window's, so a secondary remote window would otherwise
+    // read the wrong config and leak the local secret over its tunnel).
+    isGatewayLocal: () =>
+      isLoopbackUrl(win._mcBackendUrl) && !getRemoteHostConfig(store, port)?.host,
+    // Panels that exist PLUS sessions that may host one on demand. Reporting a
+    // key is what registers it with the gateway's command bus, so a declared-but-
+    // unmounted session must appear here or its first navigate can never arrive.
+    // An empty list parks the poller instead of spinning.
+    listPanelIds: () => {
+      // Never report a key to a gateway that is not on THIS machine.
+      //
+      // This channel authenticates with the local internal secret, so the only
+      // gateway that can accept it is a local one. When the window is connected
+      // to a REMOTE gateway, `_mcBackendUrl` IS that remote host, and polling it
+      // would push the local secret through the tunnel to be rejected 403 —
+      // forever, since the poller retries, making the remote append one SEL
+      // denial per attempt without bound.
+      //
+      // This was unreachable while only CONSENTED sessions were reported (a
+      // remote-connected window usually had none, and an empty list parks the
+      // poller). Reporting every active slot removed that accident, so the
+      // condition is now explicit. Parking is also the correct behaviour on a
+      // remote host: it has no Electron view to drive, and the mirror is the
+      // right transport there. Fails closed — an unset or unparseable URL is
+      // not loopback, so it reports nothing.
+      if (!isLoopbackUrl(win._mcBackendUrl)) return [];
+      return [...new Set([...browserPanels.keys(), ...reachableSessions])];
+    },
     dispatch: async (sessionKey, op, args) => {
-      const entry = browserPanel(sessionKey, { create: false });
+      // Proves the op crossed the bus into THIS Electron process (drain worked
+      // and a native panel is being driven). Refusals below throw and are logged
+      // by the channel's onError; a dispatch with no following error is a success.
+      console.warn(`[browser-cmdbus] dispatch op=${op} session=${sessionKey}`);
+      // A `navigate` may CREATE the panel it needs, so the agent's first
+      // "open this page" can reach the native view instead of falling back to the
+      // Playwright mirror. Any other op has no page to act on until one exists, so
+      // it still requires a live panel.
+      const bootstrapping = op === "navigate";
+      const entry = browserPanel(sessionKey, { create: bootstrapping });
       if (!entry) throw new Error(`no native browser panel for session ${sessionKey}`);
       // A `navigate` is what BOOTSTRAPS the view, and the ORDER here matters.
       // `canAgentControl` refuses with `no-browser-view` when nothing is open, so
       // acquiring LIGHT first would refuse before any bootstrap could run — the
       // agent's very first "open this page" would fall back to Playwright and
-      // never reach the native browser, defeating the point of routing natively.
+      // never reach the native browser.
       //
-      // Authorization is still enforced first and separately: agent-act must
-      // already be granted. Only the "a view exists" precondition is satisfied by
-      // creating one, never the permission itself.
-      if (op === "navigate" && !entry.manager.getWebContents()) {
+      // Authorization is Browser Mode itself (see `entry.gate`) — the agent's
+      // browser_* tools only exist while it is on — so NO per-session grant is
+      // required here. Only the "a view exists" precondition is satisfied by
+      // creating one; the view precondition is still enforced, never bypassed.
+      if (bootstrapping && !entry.manager.getWebContents()) {
         const pre = entry.gate();
-        if (!pre || !pre.agentActEnabled) {
-          throw new Error("browser control refused: agent-act-not-authorized");
+        // `mayBootstrapView` tolerates ONLY the absent-view refusal this branch is
+        // about to satisfy by opening a view. It is a named, tested predicate
+        // because the inline version of it shipped broken — it read a property the
+        // gate never returns, making the verdict a constant that refused every
+        // native bootstrap. Every OTHER refusal still stops the bootstrap.
+        if (!mayBootstrapView(pre)) {
+          throw new Error(`browser control refused: ${pre.reason}`);
         }
         // `manager.navigate` creates the view when none is open and applies the
-        // same non-web URL guard as the CDP path.
+        // same http/https-only guard as the CDP path and the human's own control.
         const opened = entry.manager.navigate(String((args && args.url) || ""));
         if (opened && opened.refused) {
           return { ok: false, code: "bad_url", error: `refused non-web URL: ${args && args.url}` };
+        }
+        // The view now exists in THIS process but the dashboard owns layout, so
+        // without a rect it would be composited nowhere and the user would see an
+        // empty panel. Tell the SPA to surface the Browser panel for this session
+        // so it mounts, measures and reports bounds (see useNativeBrowser).
+        try {
+          view.webContents.send("browser:agent-opened", {
+            panelId: sessionKey,
+            url: (opened && opened.url) || String((args && args.url) || ""),
+          });
+        } catch {
+          // A torn-down dashboard view must not fail the navigation itself.
         }
         // Take LIGHT now that a view exists, so ownership is recorded for the ops
         // that follow and the same gate runs against the real post-open state.
@@ -1171,7 +1856,7 @@ function setupWindowContents(win, backendUrl) {
         return { ok: true, url: (opened && opened.url) || String((args && args.url) || "") };
       }
       // The agent is acting unattended, so it must hold LIGHT — and taking it
-      // runs the same gate (agent-act authorization) as any other transition.
+      // runs the same gate (the view precondition; authorization is Browser Mode).
       const taken = await entry.control.setOwner(OWNER.LIGHT, entry.gate());
       if (taken.refused) throw new Error(`browser control refused: ${taken.refused}`);
       return dispatchBrowserOp(entry, op, args);
@@ -1183,12 +1868,16 @@ function setupWindowContents(win, backendUrl) {
 
   attachContextMenu(view.webContents);
 
-  // Keep the native traffic lights centered in the zoom-scaled header row.
+  // Keep native window controls centered in the zoom-scaled header row.
   // "zoom-changed" covers pinch / ctrl+wheel gestures; the View-menu zoom
   // items call positionTrafficLights explicitly (see zoomItem in the menu).
   if (IS_MAC) {
     positionTrafficLights(win);
     view.webContents.on("zoom-changed", () => setTimeout(() => positionTrafficLights(win), 0));
+  }
+  if (IS_WINDOWS) {
+    updateWindowsTitleBarOverlay(win);
+    view.webContents.on("zoom-changed", () => setTimeout(() => updateWindowsTitleBarOverlay(win), 0));
   }
 
   // The frameless macOS window emits system-context-menu for the drag region;
@@ -1208,17 +1897,19 @@ function setupWindowContents(win, backendUrl) {
   view.webContents.on("page-title-updated", (e) => { e.preventDefault(); applyTitle(); });
 
   view.webContents.on("did-finish-load", () => {
-    // macOS + Windows + Linux (non-native-frame): the frameless window needs
-    // an injected drag region so the dashboard header can move the window.
-    // On macOS titleBarStyle:"hidden" makes the whole window frameless; on
-    // Windows titleBarOverlay provides caption controls but no drag area.
+    // Frameless platforms need an injected drag region so the dashboard
+    // header can move the window. On macOS titleBarStyle:"hidden" makes the
+    // whole window frameless; on Windows titleBarOverlay provides caption
+    // controls but no drag area; on Linux frame:false (when the desktop
+    // environment prefers client-side decorations) removes the WM-provided
+    // drag surface entirely, so without this bar the window is undraggable.
     // The drag bar is pointer-events:none so clicks pass through to the SPA;
     // interactive controls are marked no-drag so they remain clickable.
-    if (IS_MAC || IS_WIN) {
+    if (IS_MAC || IS_WIN || LINUX_FRAMELESS) {
       view.webContents.insertCSS(`
         #electron-drag-bar {
           position: fixed;
-          top: 0; left: 0; right: ${IS_WIN ? '138px' : '0'};
+          top: 0; left: 0; right: ${IS_WIN ? '138px' : LINUX_FRAMELESS ? '108px' : '0'};
           height: 42px;
           -webkit-app-region: drag;
           z-index: 99999;
@@ -1228,6 +1919,25 @@ function setupWindowContents(win, backendUrl) {
         [role="button"], [tabindex], iframe {
           -webkit-app-region: no-drag;
         }
+        /* Focus mode (see website/src/hooks/useFocusMode.ts) hides the dashboard
+           header, so this bar would be a 42px drag region sitting on top of the
+           content focus mode just reclaimed -- the session title, the sidebar
+           toggles, the transcript. pointer-events:none does NOT save that: a
+           drag region is resolved by the compositor before hit-testing, so the
+           band stops answering hover and swallows the press.
+           An app-region:no-drag child DOES subtract (this bar is prepended to
+           body, so it comes FIRST in tree order and every later no-drag element
+           wins), which is what keeps buttons clickable -- but there is nothing to
+           hang that on for the transcript itself.
+           So the region collapses with the header, and comes back with it: the
+           renderer sets mc-focus-chrome while the header is on screen, which is
+           when the bar is the drag surface the user expects. */
+        body.mc-focus-mode #electron-drag-bar {
+          height: 0;
+        }
+        body.mc-focus-mode.mc-focus-chrome #electron-drag-bar {
+          height: 42px;
+        }
       `);
       view.webContents.executeJavaScript(`
         if (!document.getElementById('electron-drag-bar')) {
@@ -1236,6 +1946,106 @@ function setupWindowContents(win, backendUrl) {
           document.body.prepend(bar);
         }
       `);
+    }
+    // Frameless Linux has no OS-painted caption controls (macOS keeps traffic
+    // lights, Windows keeps titleBarOverlay), so inject a minimal
+    // minimize / maximize / close cluster into the header's top-right corner.
+    // Same injection mechanism as the drag bar; actions round-trip through the
+    // preload's windowControl bridge to applyWindowControl in this process.
+    // The 108px drag-bar inset above keeps the drag region from covering it.
+    if (LINUX_FRAMELESS) {
+      view.webContents.insertCSS(`
+        #electron-linux-controls {
+          position: fixed;
+          top: 0; right: 0;
+          height: 42px;
+          display: flex;
+          align-items: stretch;
+          z-index: 100000;
+          -webkit-app-region: no-drag;
+        }
+        #electron-linux-controls button {
+          position: relative;
+          width: 36px;
+          border: 0;
+          background: transparent;
+          color: var(--text, #e2e8f0);
+          opacity: 0.55;
+          cursor: default;
+          -webkit-app-region: no-drag;
+        }
+        #electron-linux-controls button:hover { opacity: 1; background: rgba(128,128,128,0.18); }
+        #electron-linux-controls button.close:hover { background: #e81123; color: #fff; }
+        /* The control marks are CSS-drawn (borders/pseudo-elements), not font
+           glyphs: U+2013/U+25A1/U+2715 render at inconsistent sizes or as
+           tofu boxes depending on the distro's font set. */
+        #electron-linux-controls button::before {
+          content: "";
+          position: absolute;
+          top: 50%; left: 50%;
+          transform: translate(-50%, -50%);
+        }
+        #electron-linux-controls button.minimize::before {
+          width: 10px; height: 0;
+          border-top: 1px solid currentColor;
+        }
+        #electron-linux-controls button.maximize::before {
+          width: 9px; height: 9px;
+          border: 1px solid currentColor;
+        }
+        /* Maximized: the "restore" mark — two offset squares. */
+        #electron-linux-controls.is-maximized button.maximize::before {
+          width: 7px; height: 7px;
+          transform: translate(-70%, -30%);
+        }
+        #electron-linux-controls.is-maximized button.maximize::after {
+          content: "";
+          position: absolute;
+          top: 50%; left: 50%;
+          width: 7px; height: 7px;
+          transform: translate(-30%, -70%);
+          border: 1px solid currentColor;
+          border-bottom: 0;
+          border-left: 0;
+        }
+        #electron-linux-controls button.close::before {
+          width: 12px; height: 0;
+          border-top: 1px solid currentColor;
+          transform: translate(-50%, -50%) rotate(45deg);
+        }
+        #electron-linux-controls button.close::after {
+          content: "";
+          position: absolute;
+          top: 50%; left: 50%;
+          width: 12px; height: 0;
+          border-top: 1px solid currentColor;
+          transform: translate(-50%, -50%) rotate(-45deg);
+        }
+      `);
+      view.webContents.executeJavaScript(`
+        if (!document.getElementById('electron-linux-controls')) {
+          const wrap = document.createElement('div');
+          wrap.id = 'electron-linux-controls';
+          const mk = (cls, label, action) => {
+            const b = document.createElement('button');
+            b.className = cls;
+            b.setAttribute('aria-label', label);
+            // Caption controls are window chrome, not page content: native
+            // caption buttons are never in the tab order, so keep these out
+            // of it too (WM shortcuts cover keyboard users).
+            b.tabIndex = -1;
+            b.addEventListener('click', () => window.kirocrew?.windowControl?.(action));
+            return b;
+          };
+          wrap.append(
+            mk('minimize', 'Minimize', 'minimize'),
+            mk('maximize', 'Maximize', 'maximize-toggle'),
+            mk('close', 'Close', 'close'),
+          );
+          document.body.prepend(wrap);
+        }
+      `);
+      syncLinuxMaximizeState(win, view);
     }
     // Sync window background to theme color (visible in tab bar padding area)
     view.webContents.executeJavaScript(
@@ -1277,6 +2087,16 @@ function setupWindowContents(win, backendUrl) {
 // factor: the header's on-screen height is 42 * zoomFactor, so both the x
 // inset and the vertical centering scale with it.
 const HEADER_CSS_PX = 42;
+
+// Repaint one window's Windows caption-control overlay for the resolved theme.
+// The painting itself (guards, zoom scaling, and the swallow of the framed
+// windows Electron throws on) lives in ./windows-titlebar so it is unit
+// testable without an Electron runtime.
+function updateWindowsTitleBarOverlay(win, mode) {
+  if (!IS_WINDOWS) return;
+  const resolvedMode = mode || (nativeTheme.shouldUseDarkColors ? "dark" : "light");
+  paintTitleBarOverlay(win, resolvedMode, HEADER_CSS_PX);
+}
 // Visible AppKit traffic-light control height (fixed; does not scale with zoom).
 const TRAFFIC_LIGHT_NATIVE_H = 12;
 // AppKit anchors the button GROUP a few px below the naive top inset, so the
@@ -1315,6 +2135,53 @@ function windowForWebContents(wc) {
   return null;
 }
 
+// Keep the injected Linux caption cluster's maximize button in sync with the
+// window's real state: the native control it replaces flips between a
+// "maximize" and a "restore" mark, and screen-reader users get the matching
+// verb. Renderer-side the state is just a class on the cluster (the restore
+// mark is CSS-drawn off `.is-maximized` — see the insertCSS block in
+// setupWindowContents). Fire-and-forget: a mid-teardown window rejects the
+// executeJavaScript promise, which is fine to drop.
+function syncLinuxMaximizeState(win, view) {
+  const push = () => {
+    if (win.isDestroyed() || view.webContents.isDestroyed()) return;
+    const maxed = win.isMaximized();
+    view.webContents.executeJavaScript(`
+      {
+        const wrap = document.getElementById('electron-linux-controls');
+        if (wrap) {
+          wrap.classList.toggle('is-maximized', ${maxed});
+          const b = wrap.querySelector('button.maximize');
+          if (b) b.setAttribute('aria-label', ${maxed} ? 'Restore' : 'Maximize');
+        }
+      }
+    `).catch(() => {});
+  };
+  // Called from did-finish-load, which re-fires on every reload: register the
+  // window listeners once and only re-push the current state afterwards.
+  if (!win._mcLinuxMaximizeSyncArmed) {
+    win._mcLinuxMaximizeSyncArmed = true;
+    win.on("maximize", push);
+    win.on("unmaximize", push);
+  }
+  push();
+}
+
+// Persist the main window's state (geometry + fullscreen + Keep on Top) to the
+// store. Module-level so both createWindow()'s geometry listeners and the View
+// menu's Keep on Top toggle can trigger a save. No-op while mainWindow is
+// absent/destroyed (captureWindowState returns null).
+function persistMainWindowState() {
+  const s = captureWindowState(mainWindow, {
+    // A fullscreen the DOM-fullscreen bridge raised for a `<video>` is the app's
+    // doing, not the user's preference, so it must never be the state we relaunch
+    // into after a quit or crash mid-playback. The bridge is the only thing that
+    // knows which transitions are its own.
+    transientFullScreen: mainWindow?._mcHtmlFullScreen?.raisedWindow() === true,
+  });
+  if (s) store.set("windowState", s);
+}
+
 function createWindow() {
   // Restore the saved geometry so quitting from native fullscreen (or any size)
   // comes back correctly. Without this the window is always rebuilt at the
@@ -1340,20 +2207,34 @@ function createWindow() {
   // macOS: titleBarStyle:"hidden" + native traffic lights inset into it.
   // Windows: titleBarStyle:"hidden" + titleBarOverlay puts native caption
   //   controls (minimize/maximize/close) in an overlay strip synced to theme.
-  // Linux: Electron ignores titleBarStyle, so it keeps the native frame.
+  // Linux: frame:false on desktops that expect client-side decorations,
+  //   native frame elsewhere (see linux-frame.js). titleBarStyle is ignored
+  //   by Electron on Linux, so the explicit frame flag is the mechanism.
   if (IS_MAC) opts.titleBarStyle = "hidden";
-  if (IS_WIN) {
+  if (IS_WINDOWS) {
     opts.titleBarStyle = "hidden";
+    opts.autoHideMenuBar = true;
     opts.titleBarOverlay = {
-      color: nativeTheme.shouldUseDarkColors ? "#0f1117" : "#f8fafc",
-      symbolColor: nativeTheme.shouldUseDarkColors ? "#e2e8f0" : "#1e293b",
-      height: 42,
+      color: WINDOWS_TITLEBAR_BACKGROUND,
+      symbolColor: nativeTheme.shouldUseDarkColors
+        ? WINDOWS_TITLEBAR_SYMBOL_DARK
+        : WINDOWS_TITLEBAR_SYMBOL_LIGHT,
+      height: HEADER_CSS_PX,
     };
   }
-  // Window + taskbar icon (Windows only): running unpackaged (`electron .`)
-  // otherwise shows the default Electron icon. macOS takes its icon from the
-  // .app bundle and Linux from the .desktop/AppImage, so leave those untouched.
-  if (IS_WIN) {
+  if (LINUX_FRAMELESS) {
+    opts.frame = false;
+    // A visible menu bar under a frameless window re-creates the stacked-bars
+    // problem (#3606); removing it entirely would take the app menu — and with
+    // it the discoverable path to windowing actions — away. Auto-hide keeps it
+    // out of the resting chrome while Alt still reveals it.
+    opts.autoHideMenuBar = true;
+  }
+  // Window + taskbar icon: the explicit BrowserWindow icon is required on
+  // Linux too. Some GNOME/AppImage launches do not associate the generated
+  // desktop entry with the live window and otherwise fall back to Electron's
+  // generic X icon. macOS takes its icon from the .app bundle.
+  if (IS_WIN || IS_LINUX) {
     const iconFile = identityFamily(app.getVersion()) === "nightly"
       && fs.existsSync(path.join(__dirname, "icon-nightly.png"))
       ? "icon-nightly.png" : "icon.png";
@@ -1367,11 +2248,18 @@ function createWindow() {
   // fullscreen when we quit in fullscreen. The width/height above become the
   // normal frame to return to on exit.
   if (state.fullScreen) opts.fullscreen = true;
+  // Restore the Keep on Top preference (View menu checkbox). Constructor
+  // option, not a post-create setAlwaysOnTop(), so the window never flashes
+  // at normal z-order first.
+  if (state.alwaysOnTop) opts.alwaysOnTop = true;
   if (typeof state.x === "number" && typeof state.y === "number") {
     opts.x = state.x;
     opts.y = state.y;
   }
   mainWindow = new BaseWindow(opts);
+  if (IS_WINDOWS && typeof mainWindow.setMenuBarVisibility === "function") {
+    mainWindow.setMenuBarVisibility(false);
+  }
 
   setupWindowContents(mainWindow, BACKEND_URL);
 
@@ -1379,10 +2267,7 @@ function createWindow() {
   // keeps the last good size + fullscreen flag. captureWindowState() uses
   // getNormalBounds(), so we store the restore size, never the fullscreen frame.
   let saveTimer = null;
-  const persist = () => {
-    const s = captureWindowState(mainWindow);
-    if (s) store.set("windowState", s);
-  };
+  const persist = persistMainWindowState;
   const persistDebounced = () => {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(persist, 400);
@@ -1404,10 +2289,86 @@ function createWindow() {
     onNavigate(httpCode).catch((err) => console.error("Token retry failed:", err));
   });
 
+  // Renderer-crash self-healing. Without this a dead renderer leaves the window
+  // mapped but permanently BLACK — the SPA and its top tab strip both lived in
+  // that process, so the user is left with no UI and no way back short of
+  // quitting. Re-load through the same fresh-token path `did-navigate` uses, so
+  // recovery also survives a gateway secret that rotated while we were down.
+  // Bounded (see renderer-recovery.js): repeated deaths inside the window stop
+  // the loop instead of spinning on a broken build.
+  const rendererRecovery = createRendererRecovery({
+    isQuitting: () => isQuitting,
+    log: glog,
+    // Snapshot every Electron process at the moment of death. A macOS crash
+    // report names the thread that aborted but NOT what the process had grown
+    // to, so without this a post-mortem cannot tell "renderer hit a memory
+    // ceiling" from "renderer was pegged on CPU" — the two hypotheses this
+    // window's black-screen crashes leave open. Totals plus the worst offender
+    // keep it to one log line.
+    describeProcesses: () => {
+      const metrics = app.getAppMetrics() || [];
+      let totalCpu = 0;
+      let totalMb = 0;
+      let worst = null;
+      for (const m of metrics) {
+        const cpu = (m.cpu && m.cpu.percentCPUUsage) || 0;
+        const mb = ((m.memory && m.memory.workingSetSize) || 0) / 1024;
+        totalCpu += cpu;
+        totalMb += mb;
+        if (!worst || mb > worst.mb) worst = { type: m.type, pid: m.pid, mb, cpu };
+      }
+      const parts = [
+        `procs=${metrics.length}`,
+        `totalCpu=${totalCpu.toFixed(1)}%`,
+        `totalWorkingSet=${Math.round(totalMb)}MB`,
+      ];
+      if (worst) {
+        parts.push(
+          `largest=${worst.type}:${worst.pid}@${Math.round(worst.mb)}MB/${worst.cpu.toFixed(1)}%`
+        );
+      }
+      return parts.join(" ");
+    },
+    reload: () => {
+      if (mainWindow.isDestroyed()) return;
+      (async () => {
+        let token = await fetchLocalToken(BACKEND_URL);
+        if (!token) ({ token } = await fetchRemoteToken(PORT));
+        if (mainWindow.isDestroyed()) return;
+        mainWindow.webContents.loadURL(
+          token ? `${BACKEND_URL}?token=${token}` : BACKEND_URL
+        );
+      })().catch((err) => glog(`renderer recovery reload failed: ${err && err.message}`));
+    },
+    onGiveUp: ({ reason }) => {
+      // Deliberately log-only. Reloading again is the thing we must NOT do here
+      // (that is the loop this budget exists to stop), and the window is already
+      // showing the failure — it is blank. The log line is what tells a human
+      // WHY it stayed blank, which a silent give-up would not.
+      glog(`renderer recovery exhausted (reason=${reason}); leaving the window as-is`);
+    },
+  });
+  mainWindow.webContents.on("render-process-gone", (_e, details) => {
+    // Flush the highlight history FIRST so the log reads in causal order: what
+    // the highlighter was doing, then the death and what the processes had grown
+    // to. Unconditional -- this is the moment the buffer was kept for, and it is
+    // also the one moment the write cost is justified. An empty flush is itself
+    // informative: no highlighting in the last two minutes points away from the
+    // Pierre worker pool as the cause.
+    for (const line of pierrePerfLog.flush()) glog(line);
+    rendererRecovery.handleGone(details || {});
+  });
+
   mainWindow.on("close", (e) => {
     if (!isQuitting) {
       e.preventDefault();
-      mainWindow.hide();
+      // Not a quit — hide to the tray. On macOS this MUST leave a native
+      // fullscreen Space first, or the Space is orphaned as a black surface and
+      // the window later re-shows at a degenerate frame (see hide-to-tray.js).
+      // The hide is deferred to `leave-full-screen` in that case; the existing
+      // geometry listener fires on the same event, so the persisted state
+      // truthfully records the window as windowed at its normal bounds.
+      hideToTray(mainWindow);
       return;
     }
     // Real quit — capture the final geometry synchronously before teardown so
@@ -1420,20 +2381,51 @@ function createWindow() {
 }
 
 function createTray() {
+  // A tray gesture asking for the window back must first disarm any hide that
+  // hideToTray() deferred to the fullscreen exit, or the show is undone moments
+  // later when the exit completes (see hide-to-tray.js CANCELLATION).
+  const showFromTray = () => {
+    cancelPendingTrayHide(mainWindow);
+    mainWindow?.show();
+  };
   // Nightly ships its own icon (night-sky variant) so the menu-bar presence
   // matches the Dock identity; app.name was set channel-aware at boot.
   const nightly = identityFamily(app.getVersion()) === "nightly";
   const iconFile = nightly && fs.existsSync(path.join(__dirname, "icon-nightly.png"))
     ? "icon-nightly.png" : "icon.png";
-  const iconPath = path.join(__dirname, iconFile);
-  const icon = nativeImage.createFromPath(iconPath).resize({ width: 18, height: 18 });
+  let icon;
+  const templatePath = path.join(__dirname, "trayTemplate.png");
+  if (IS_MAC && fs.existsSync(templatePath)) {
+    // macOS menu-bar icons are template images: a monochrome (black +
+    // alpha) glyph the system recolors for light/dark/tinted menu bars.
+    // Passing the full-colour icon here renders it as-is, which clashes
+    // with neighbouring status items and loses contrast on tinted bars.
+    // The asset ships at 18px with an @2x retina variant that
+    // createFromPath picks up via the DPI-suffix convention, so no
+    // resize. setTemplateImage is explicit even though the *Template
+    // filename convention already implies it. The stable and nightly
+    // glyphs share one silhouette (the channels differ only in field
+    // colour), so a single template asset serves both; channel identity
+    // stays on the Dock icon and app.name.
+    icon = nativeImage.createFromPath(templatePath);
+    icon.setTemplateImage(true);
+  } else {
+    // Other platforms render tray icons literally, so keep the
+    // channel-aware full-colour icon (nightly identity stays visible).
+    // Reaching here on macOS means the template asset did not ship;
+    // the menu bar silently regresses to the colour icon, so leave a
+    // signal for whoever debugs the packaging.
+    if (IS_MAC) console.warn("tray: trayTemplate.png missing, falling back to colour icon");
+    icon = nativeImage.createFromPath(path.join(__dirname, iconFile))
+      .resize({ width: 18, height: 18 });
+  }
   tray = new Tray(icon);
   tray.setToolTip(app.name);
   // Each connection opens as its own window on every platform (native window
   // tabs were removed with the single-surface shell redesign).
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: `Show ${app.name}`, click: () => mainWindow?.show() },
+      { label: `Show ${app.name}`, click: showFromTray },
       { type: "separator" },
       { label: "New Connection Window…", click: () => openNewConnectionWindow() },
       { type: "separator" },
@@ -1442,7 +2434,7 @@ function createTray() {
       { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
     ])
   );
-  tray.on("click", () => mainWindow?.show());
+  tray.on("click", showFromTray);
 }
 
 // ── Remote host settings ──
@@ -1579,11 +2571,23 @@ function fadeLoadingScreen(wc, timeoutMs = 8000) {
  *
  * @param {Electron.BaseWindow} parentWin
  * @param {{title:string, message:string, logTail:string, logPath:string,
- *          portConflict:boolean, port:number}} opts
+ *          portConflict:boolean, port:number, noRetry?:boolean}} opts
  * @returns {Promise<'retry'|'force-retry'|'reveal'|'quit'>}
  */
 function showGatewayErrorDialog(parentWin, opts) {
-  const { title, message, logTail, logPath, portConflict } = opts;
+  const {
+    title,
+    message,
+    logTail,
+    logPath,
+    portConflict,
+    noRetry = false,
+    localGatewayOff = false,
+    primaryAction: configuredPrimaryAction,
+    primaryLabel: configuredPrimaryLabel,
+    showQuitButton: configuredShowQuitButton,
+  } = opts;
+  const showQuitButton = configuredShowQuitButton ?? !noRetry;
   return new Promise((resolve) => {
     const dark = nativeTheme.shouldUseDarkColors;
     const hasParent = parentWin && !parentWin.isDestroyed();
@@ -1600,9 +2604,20 @@ function showGatewayErrorDialog(parentWin, opts) {
     const esc = (s) => String(s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     // The primary action depends on whether the port is held: a plain retry
-    // can't clear a port conflict, so offer force-stop instead.
-    const primaryAction = portConflict ? "force-retry" : "retry";
-    const primaryLabel = portConflict ? "Force-stop &amp; Retry" : "Retry";
+    // can't clear a port conflict, so offer force-stop instead. A TERMINAL
+    // caller (one that quits on every action) passes noRetry — showing a
+    // "Retry" button it would ignore contradicts the dialog's own message.
+    const primaryAction = configuredPrimaryAction
+      || (noRetry ? "quit" : (portConflict ? "force-retry" : "retry"));
+    const primaryLabel = configuredPrimaryLabel
+      || (noRetry ? "Quit" : (portConflict ? "Force-stop & Retry" : "Retry"));
+    // A client-only install whose remote is unreachable needs an in-app way to
+    // change its mind: Settings lives inside the dashboard, which a gateway has
+    // to serve, so the page holding the switch is exactly what it cannot reach.
+    // Retry stays primary because restoring the remote is the likelier fix.
+    const enableButton = (localGatewayOff && !noRetry)
+      ? `<button class="cancel" onclick="act('enable-retry')">Start Local Gateway</button>`
+      : "";
     const fg = dark ? "#e2e8f0" : "#1e293b";
     const muted = dark ? "#94a3b8" : "#64748b";
     const html = `<!DOCTYPE html><html><head><style>
@@ -1628,9 +2643,10 @@ function showGatewayErrorDialog(parentWin, opts) {
       <div class="pathline">${esc(logPath)}</div>
       <pre class="log">${esc(logTail || "(launch log is empty)")}</pre>
       <div class="row">
-        <button class="ok" onclick="act('${primaryAction}')">${primaryLabel}</button>
+        <button class="ok" onclick="act('${primaryAction}')">${esc(primaryLabel)}</button>
+        ${enableButton}
         <button class="cancel" onclick="act('reveal')">Reveal Log</button>
-        <button class="cancel" onclick="act('quit')">Quit</button>
+        ${showQuitButton ? '<button class="cancel" onclick="act(\'quit\')">Quit</button>' : ""}
       </div>
       <script>
         function act(a){ document.title = 'mc-action:' + a; window.close(); }
@@ -1709,6 +2725,19 @@ function _psPpid(pid) {
  * @returns {Promise<{killed:number, freed:boolean, survivors:number[]}>}
  */
 function forceStopGatewayPort(port) {
+  if (IS_WIN) {
+    return forceStopPort(port, {
+      getListenPids: windowsListenPids,
+      getCommand: windowsProcessCommand,
+      kill: (pid) => windowsTaskkill(pid, {
+        isTrustedCommand: isTrustedWindowsGatewayCommand,
+      }),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      isKirocrew: isTrustedWindowsGatewayCommand,
+      failClosedOnProbeError: true,
+      log: glog,
+    });
+  }
   return forceStopPort(port, {
     getListenPids: _lsofListenPids,
     getCommand: _psCommand,
@@ -1759,10 +2788,20 @@ async function recoverWedgedGateway(win) {
   // fell through to showUnrecoverableGatewayError, which QUIT the app on any
   // button (that was the "crash on Retry"). Instead: leave the tunnel alone and
   // re-probe until it heals, then reconnect.
-  if (chooseRecoveryStrategy({ weSpawnedGateway }) === "reconnect") {
+  const strategy = chooseRecoveryStrategy({ gatewayOwnership });
+  if (strategy === "reconnect") {
     glog("liveness: backend unresponsive on a gateway we did not spawn (remote tunnel / external gateway) — waiting for it to recover instead of killing the port");
     if (!win || win.isDestroyed() || isQuitting) return;
     return reconnectExternalGateway(win);
+  }
+  // An ADOPTED local same-family gateway (reuse path, but the holder was a
+  // local Kiro Crew process) gets neither the kill (we don't own it) nor the
+  // indefinite tunnel wait (nothing external will bring it back): bounded
+  // wait, then respawn once the port clears on its own.
+  if (strategy === "reconnect-bounded") {
+    glog("liveness: backend unresponsive on an adopted local Kiro Crew gateway — bounded wait, then respawn");
+    if (!win || win.isDestroyed() || isQuitting) return;
+    return reconnectOrRespawnAdoptedGateway(win);
   }
   glog("liveness: backend unresponsive — force-killing wedged gateway and restarting");
   // Capture the frozen stack from OUTSIDE the wedged process BEFORE the kill.
@@ -1777,11 +2816,18 @@ async function recoverWedgedGateway(win) {
       log: (m) => glog(`liveness: ${m}`),
     }).catch((e) => glog(`liveness: py-spy capture threw: ${e && e.message}`));
   }
-  try { if (gatewayProcess) gatewayProcess.kill("SIGKILL"); } catch (e) { glog(`SIGKILL failed: ${e && e.message}`); }
+  // TREE-scoped on Windows. This path deliberately skips /api/shutdown (it runs on
+  // the frozen loop), so it is the one trigger where nothing else reaps the
+  // gateway's detached kiro-cli / MCP children -- and the port sweep below cannot
+  // cover for it, because a single-pid kill FREES the port, after which the sweep
+  // finds no owner and its own /T taskkill is never reached. Awaited so the tree is
+  // gone before the respawn, and it falls back to the pid kill on any refusal.
+  await killGatewayProcessTree(gatewayProcess, "SIGKILL");
   gatewayProcess = null;
   let freed = true;
   let foreignHolder = false;
-  try { ({ freed, foreignHolder } = await forceStopGatewayPort(PORT)); }
+  let probeFailed = false;
+  try { ({ freed, foreignHolder, probeFailed = false } = await forceStopGatewayPort(PORT)); }
   catch (e) {
     // We couldn't even probe the port (lsof failed to exec). Don't silently
     // assume freed — let the respawn's bind be the arbiter, but say so loudly.
@@ -1793,8 +2839,10 @@ async function recoverWedgedGateway(win) {
   // recovered — show the honest error path so the user learns a restart (or
   // freeing the other app) is required.
   if (!freed) {
-    glog(`liveness: port still held after force-stop (${foreignHolder ? "foreign holder" : "unkillable wedge"}); surfacing restart-required`);
-    return showUnrecoverableGatewayError(win, PORT);
+    const reason = probeFailed ? "probe failed"
+      : (foreignHolder ? "foreign holder" : "unkillable wedge");
+    glog(`liveness: port not confirmed free after force-stop (${reason}); surfacing restart-required`);
+    return showUnrecoverableGatewayError(win, PORT, { probeFailed });
   }
   gatewayStartFailure = null; // re-arm so waitForGateway doesn't fail-fast on the kill we just did
   await startGateway(); // spawn a fresh child before re-waiting
@@ -1831,26 +2879,136 @@ async function reconnectExternalGateway(win) {
   return showLoadingThenConnect(win, BACKEND_URL);
 }
 
+// How long recovery waits for an ADOPTED local gateway to answer again before
+// concluding it is gone for good. A local gateway's plausible comebacks (a
+// long GC pause, a graceful drain we adopted mid-flight finishing + something
+// relaunching it) resolve well inside this; a tunnel-style multi-minute outage
+// cannot happen to a process on this machine.
+const ADOPTED_RECOVERY_WAIT_MS = 30_000;
+
 /**
- * Terminal state: a wedged gateway is holding the port and cannot be killed
- * (uninterruptible kernel sleep — e.g. a blocking close() on a dead socket).
- * No respawn can succeed until the OS reaps it, which only a restart guarantees.
- * Tell the user plainly instead of looping a doomed retry.
+ * Recover an ADOPTED local same-family gateway (reuse path, port held by a
+ * local Kiro Crew process we did not spawn). We must not kill the holder — but
+ * unlike a tunnel, a dead local gateway will never come back on its own, so the
+ * indefinite reconnectExternalGateway loop is exactly the observed failure:
+ * adopt a draining gateway, classify its death as "remote tunnel", and wait
+ * forever for a comeback a local process cannot make. Instead: re-probe for
+ * a bounded interval; if the backend answers, reconnect; otherwise wait for
+ * the port to clear (the dying process releasing its socket) and spawn our
+ * own backend.
+ * If the port never clears, the holder is alive-but-unresponsive and not ours
+ * to kill — surface the honest restart-required dialog instead of spinning.
  */
-async function showUnrecoverableGatewayError(win, port) {
+async function reconnectOrRespawnAdoptedGateway(win) {
+  const wc = win.webContents;
+  try { wc.loadFile(path.join(__dirname, "loading.html")); } catch { /* window may be mid-teardown */ }
+  if (!win || win.isDestroyed() || isQuitting) return;
+  win.show();
+  sendStatus("Gateway stopped responding — waiting for it to recover…");
+  const deadline = Date.now() + ADOPTED_RECOVERY_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (!win || win.isDestroyed() || isQuitting) return;
+    let healthy = false;
+    try { await checkBackend(HEALTH_URL); healthy = true; } catch { /* still down */ }
+    if (healthy) {
+      glog("liveness: adopted local gateway answering again — reconnecting");
+      gatewayStartFailure = null;
+      return showLoadingThenConnect(win, BACKEND_URL);
+    }
+    await new Promise((r) => setTimeout(r, 2500));
+  }
+  if (!win || win.isDestroyed() || isQuitting) return;
+  glog(`liveness: adopted local gateway did not recover within ${ADOPTED_RECOVERY_WAIT_MS}ms — waiting for :${PORT} to clear, then spawning our own backend`);
+  sendStatus("Waiting for the previous gateway to exit…");
+  // Capture the incumbent NOW, while it may still own the LISTEN socket —
+  // needed below to wait out its gateway.lock after the port clears.
+  const incumbentPids = await snapshotGatewayPortPids(PORT);
+  if (unverifiedIncumbent(incumbentPids)) {
+    glog(`liveness: could not capture the incumbent PID on :${PORT} — refusing an automatic respawn that could race gateway.lock`);
+    return showUnrecoverableGatewayError(win, PORT, { probeFailed: true });
+  }
+  if (!(await waitForPortFree())) {
+    glog(`liveness: :${PORT} still held by a process we did not spawn — surfacing port-held instead of waiting forever`);
+    // No stop was attempted on this path (the holder is not ours to evict), so
+    // the "wedged, restart your computer" copy would be false — use the honest
+    // port-held variant: quit the holder and relaunch.
+    return showUnrecoverableGatewayError(win, PORT, "held");
+  }
+  if (!win || win.isDestroyed() || isQuitting) return;
+  if (gatewayOwnership === "reused-service") {
+    // The dead gateway was SERVICE-classified: a real launchd/systemd unit is
+    // (or may be) about to respawn it, and spawning immediately races that
+    // rebind for the port. Orphans classify as service too but nothing rebinds
+    // them — so grace-wait: reconnect to a rebind, spawn only on a quiet port.
+    glog(`liveness: adopted gateway was service-managed — waiting a bounded grace for its manager to respawn it before spawning our own`);
+    sendStatus("Waiting for the gateway to restart…");
+    const verdict = await waitForServiceRebind({
+      isPortBound: async () => (await probeGatewayPortOwner(PORT)) !== "none",
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
+    if (win.isDestroyed() || isQuitting) return;
+    if (verdict === "rebound") {
+      // Validate the new holder through the SAME identity table the boot path
+      // uses — owner probe + /api/health family check + readiness — not a
+      // weaker ad-hoc test: a cross-family gateway that rebinds here must hit
+      // the same takeover guard as at boot, not get silently reconnected to.
+      const owner = await probeGatewayPortOwner(PORT);
+      const health = await fetchHealthInfo();
+      const decision = decideGatewayAction(app.getVersion(), health, { localOwner: owner });
+      const readiness = await fetchGatewayReadiness();
+      if (decision.action === "reuse" && readiness !== "shutting-down") {
+        glog(`liveness: service manager re-bound :${PORT} (owner=${owner}, reason=${decision.reason}, readiness=${readiness}) — reconnecting to the restarted gateway`);
+        gatewayOwnership = classifyAdoptedGateway({ reason: decision.reason, localOwner: owner });
+        gatewayStartFailure = null;
+        return showLoadingThenConnect(win, BACKEND_URL);
+      }
+      glog(`liveness: :${PORT} was re-bound by an unusable holder (owner=${owner}, action=${decision.action}, readiness=${readiness}) — cannot reconnect or spawn over it`);
+      return showUnrecoverableGatewayError(win, PORT, "held");
+    }
+    glog(`liveness: :${PORT} stayed free past the rebind grace — no manager respawned it; spawning our own backend`);
+  }
+  // Port free ≠ lock free: the incumbent may still be flushing sessions while
+  // holding gateway.lock. Wait for the process itself before spawning.
+  await waitForIncumbentExit(incumbentPids, "liveness");
+  sendStatus("Starting a fresh gateway…");
+  gatewayStartFailure = null;
+  await startGateway(); // spawn a fresh child (port is confirmed free)
+  if (win.isDestroyed() || isQuitting) return;
+  return showLoadingThenConnect(win, BACKEND_URL);
+}
+
+/**
+ * Terminal state, three variants:
+ *  - "wedged" (default): a force-stop was actually attempted and the holder
+ *    survived it (uninterruptible kernel sleep). Only a machine restart clears
+ *    it, and the copy says so.
+ *  - "held": port ${port} is occupied by a process this app will not evict
+ *    (an unresponsive previous gateway, a foreign process, or a cross-family
+ *    gateway that grabbed the port). No stop was attempted — telling the user
+ *    to reboot would be false and needlessly heavy; quitting the holder and
+ *    relaunching suffices.
+ *  - probeFailed: ownership could not be verified, so no process was terminated.
+ *    Ask the user to reopen first and restart only if the port remains blocked.
+ */
+async function showUnrecoverableGatewayError(win, port, options = {}) {
+  const { variant = "wedged", probeFailed = false } = typeof options === "string"
+    ? { variant: options }
+    : options;
   if (!win || win.isDestroyed()) return;
   let logTail = "";
   try { logTail = tailLines(fs.readFileSync(gatewayLogPath(), "utf8"), 60); } catch { /* no log yet */ }
   const action = await showGatewayErrorDialog(win, {
-    title: `Kiro Crew — backend stuck on port ${port}`,
-    message: `The Kiro Crew backend is wedged and cannot be stopped — it is in an `
-      + `uninterruptible state and is still holding port ${port}, so it can't be `
-      + `force-stopped or restarted in place. Restart your computer to clear it. `
-      + `(This is a known backend hang; see the launch log below for the cause.)`,
+    ...unrecoverableGatewayDialog({
+      port,
+      variant,
+      probeFailed,
+      isPrimaryWindow: win === mainWindow,
+    }),
     logTail,
     logPath: gatewayLogPath(),
-    portConflict: false, // hide "Force-stop & Retry" — it cannot work here
     port,
+    // This caller is terminal and quits on every action.
+    noRetry: true,
   });
   if (win.isDestroyed()) return;
   if (action === "reveal") {
@@ -1872,19 +3030,30 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
   try {
     await waitForBackend(win, healthUrl, { watchSpawn: backendUrl === BACKEND_URL });
     if (win.isDestroyed()) return;
-    let token = await fetchLocalToken(backendUrl);
-    if (!token) ({ token } = await fetchRemoteToken(new URL(backendUrl).port));
-    if (win.isDestroyed()) return;
 
-    if (token) {
-      // Hold the boot reveal until it has both finished its animation and the
-      // gateway is ready, then fade out and hand off to the dashboard.
-      await fadeLoadingScreen(wc);
+    // Acquire a dashboard token, retrying a transient warmup 403 on our OWN
+    // gateway. A gateway we just (re)started regenerates its .local_secret at
+    // boot, so right after /api/status answers the local mint can 403 briefly
+    // while the secret settles. For a foreign gateway (SSH forward / external)
+    // the secret is on the remote host and the local mint can never succeed, so
+    // that case falls straight through to the prompt (see shouldRetryLocalTokenMint).
+    // The healthy path mints on attempt 0 and returns immediately — no added latency.
+    for (let attempt = 0; ; attempt++) {
+      let token = await fetchLocalToken(backendUrl);
+      if (!token) ({ token } = await fetchRemoteToken(new URL(backendUrl).port));
       if (win.isDestroyed()) return;
-      wc.loadURL(`${backendUrl}?token=${token}`);
-      if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
-    } else {
-      // Fallback — check if gateway allows unauthenticated access
+
+      if (token) {
+        // Hold the boot reveal until it has both finished its animation and the
+        // gateway is ready, then fade out and hand off to the dashboard.
+        await fadeLoadingScreen(wc);
+        if (win.isDestroyed()) return;
+        wc.loadURL(`${backendUrl}?token=${token}`);
+        if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
+        return;
+      }
+
+      // No token — check if the gateway allows unauthenticated access.
       const status = await new Promise((resolve) => {
         http.get(backendUrl, (res) => {
           res.resume();
@@ -1892,30 +3061,56 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
         }).on("error", () => resolve(0));
       });
       if (win.isDestroyed()) return;
-      if (status === 403) {
-        // The page has to say WHICH machine to mint on. A gateway we did not
-        // spawn (an `ssh -L` forward, or an externally-started one) has its own
-        // .local_secret, so our CLI can only mint against it FROM that machine;
-        // pointing the user at this one would send them where the gateway is
-        // not. Reuse the boot-time port-owner probe rather than guessing.
-        //
-        // NOTE `URL.port` is "" for a default-port URL (http://host/ on :80).
-        // Left empty it would look up the wrong remote-host entry, probe no
-        // port at all, and let the page fall back to :5476 — i.e. describe and
-        // submit to a gateway that isn't the one we just got a 403 from.
-        const promptPort = defaultedPort(backendUrl);
-        const remoteHost = getRemoteHostConfig(store, promptPort)?.host || "";
-        const localOwner = remoteHost ? "foreign" : await probeGatewayPortOwner(promptPort);
-        const kind = classifyAuthBlock({ localOwner, remoteHost });
-        glog(`token prompt: kind=${kind} owner=${localOwner} port=${promptPort} host=${remoteHost || "(none)"}`);
-        if (win.isDestroyed()) return;
-        wc.loadFile(path.join(__dirname, "token-prompt.html"), {
-          query: { port: promptPort, kind, host: remoteHost },
-        });
-      } else {
+
+      if (status !== 403) {
+        // Not an auth block — the gateway serves without a token.
         wc.loadURL(backendUrl);
         if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
+        return;
       }
+
+      // 403: classify WHICH machine to mint on. A gateway we did not spawn (an
+      // `ssh -L` forward, or an externally-started one) has its own
+      // .local_secret, so our CLI can only mint against it FROM that machine;
+      // pointing the user at this one would send them where the gateway is not.
+      // Reuse the boot-time port-owner probe rather than guessing.
+      //
+      // NOTE `URL.port` is "" for a default-port URL (http://host/ on :80).
+      // Left empty it would look up the wrong remote-host entry, probe no port
+      // at all, and let the page fall back to :5476 — i.e. describe and submit
+      // to a gateway that isn't the one we just got a 403 from.
+      const promptPort = defaultedPort(backendUrl);
+      const remoteHost = getRemoteHostConfig(store, promptPort)?.host || "";
+      const localOwner = remoteHost ? "foreign" : await probeGatewayPortOwner(promptPort);
+      const kind = classifyAuthBlock({ localOwner, remoteHost });
+
+      // Our own gateway may still be warming up its regenerated secret — retry
+      // the mint with backoff before giving up. A foreign gateway can't be
+      // minted against locally, so never spin on it: fall through to the prompt.
+      if (shouldRetryLocalTokenMint({ kind, attempt })) {
+        glog(`token mint: transient 403 on own gateway (kind=${kind}, attempt=${attempt + 1}/${TOKEN_MINT_MAX_RETRIES + 1}) — retrying after backoff`);
+        await new Promise((r) => setTimeout(r, tokenMintRetryDelayMs(attempt)));
+        if (win.isDestroyed()) return;
+        continue;
+      }
+
+      glog(`token prompt: kind=${kind} owner=${localOwner} port=${promptPort} host=${remoteHost || "(none)"}`);
+      if (win.isDestroyed()) return;
+      // token-prompt.html replaces the dashboard inside THIS window's
+      // WebContentsView (win.webContents is the view's, see setupWindowContents).
+      // In fullscreen/kiosk the traffic lights + app menu are hidden, so the
+      // user was trapped with no way out but force-kill. Drop immersive modes
+      // first, which restores Close / Cmd-Q as the exit.
+      //
+      // Deliberately NO in-page exit: the window is a BaseWindow, so a
+      // `window.close()` in the page would destroy the VIEW and leave a blank
+      // shell behind. A keyboard exit has to go through the main process
+      // (windowForWebContents) to close the host window.
+      exitImmersiveModes(win);
+      wc.loadFile(path.join(__dirname, "token-prompt.html"), {
+        query: { port: promptPort, kind, host: remoteHost },
+      });
+      return;
     }
   } catch (err) {
     if (win.isDestroyed()) return;
@@ -1933,10 +3128,60 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     // recoverable case: the spawn dies with "address already in use" and a plain
     // retry can't help (the holder is still there). Detect it and offer to
     // force-stop the stuck KiroCrew process. Only meaningful for OUR own port.
-    const portConflict = failedToStart && backendUrl === BACKEND_URL && isPortInUse(logTail);
+    // Nothing was spawned in the client-only case, so it is classified before
+    // the port-conflict probe — see classifyStartFailure for why the log tail
+    // cannot be trusted to mean "a holder exists right now".
+    // The pre-spawn check cannot be complete: extraction order within a package
+    // is not ours to control, so a spawn can still die on a stdlib import that
+    // was a moment away from existing. The interpreter's own traceback settles
+    // what no filesystem probe could, so a missing-stdlib crash is reclassified
+    // here as an unfinished install rather than reported as a defect.
+    //
+    // Requires the tail to be free of a bound-port report. The launch log is
+    // append-only across launches, so a stdlib traceback left by an EARLIER run
+    // would otherwise relabel today's "address already in use" exit as
+    // "installing" and hide the force-stop path — the port holder is still
+    // there, so Retry alone would loop. When both signals appear, the port
+    // conflict is the actionable one. This guard applies only to the log-sniffed
+    // path; a pre-spawn refusal sets `incompleteBundle` explicitly and keeps
+    // outranking a stale port line, since nothing was spawned in that case.
+    const failureRecord = shouldReclassifyAsInstalling({
+      failedToStart,
+      failure: err.failure,
+      logTail,
+      // Scoped to THIS attempt, like the crash match itself: a bound-port line
+      // left by an earlier launch must not suppress a genuine current stdlib
+      // crash. The port-conflict branch below keeps using the whole tail, since
+      // its own guard is about not offering force-stop for a port nothing holds.
+      portInUseInLog: isPortInUse(currentAttemptLog(logTail)),
+      bundled: !!(err.failure && err.failure.bundled),
+    })
+      ? { ...err.failure, incompleteBundle: true }
+      : err.failure;
+    const failureKind = classifyStartFailure({
+      failedToStart,
+      failure: failureRecord,
+      isOwnPort: backendUrl === BACKEND_URL,
+      portInUseInLog: isPortInUse(logTail),
+    });
+    const localGatewayOff = failureKind === "client-only";
+    const portConflict = failureKind === "port-conflict";
 
     let title, message;
-    if (portConflict) {
+    if (failureKind === "installing") {
+      // The bundled backend is still being written to disk, so the honest
+      // framing is "not ready yet" and Retry is the whole remedy. Use the
+      // unfinished-install copy rather than err.message: on the reclassified
+      // path err.message is the interpreter's own exit report, which is what
+      // this branch exists to stop showing as the headline.
+      title = "Kiro Crew — installation still finishing";
+      message = err.failure?.incompleteBundle ? err.message : describeIncompleteBundle([]);
+    } else if (localGatewayOff) {
+      // Nothing failed here — the app was told not to start a gateway and the
+      // port is silent. "Failed to start" would send the user hunting a crash.
+      title = `Kiro Crew — no gateway on port ${PORT}`;
+      message = err.message;
+    } else if (portConflict) {
       title = `Kiro Crew — port ${PORT} already in use`;
       message = `Another Kiro Crew gateway is already using port ${PORT} (it may be wedged). `
         + `Force-stop it and retry, or quit. From a terminal you can also run: `
@@ -1953,26 +3198,35 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     // Loop so "Reveal Log" can re-show the dialog after opening Finder.
     for (;;) {
       const action = await showGatewayErrorDialog(win, {
-        title, message, logTail, logPath, portConflict, port: PORT,
+        title, message, logTail, logPath, portConflict, port: PORT, localGatewayOff,
       });
       if (win.isDestroyed()) return;
       if (action === "reveal") {
         try { shell.showItemInFolder(logPath); } catch { /* best effort */ }
         continue; // re-show the dialog
       }
+      if (action === "enable-retry") {
+        // The user is asking for a gateway now, from the one surface they can
+        // still reach. Persist it so the next launch agrees, and lift this
+        // session's snapshot so the retry below actually spawns.
+        setLocalGatewayEnabled(store, true);
+        runLocalGateway = true;
+        glog("local gateway turned back on from the error dialog");
+      }
       if (action === "force-retry") {
         let freed = true;
-        try { ({ freed } = await forceStopGatewayPort(PORT)); }
+        let probeFailed = false;
+        try { ({ freed, probeFailed = false } = await forceStopGatewayPort(PORT)); }
         catch (e) { glog(`force-stop: port probe failed (${e && e.message}); letting retry's bind confirm`); }
         if (win.isDestroyed()) return;
         if (!freed) {
           // The port is still held — by an unkillable wedge or a foreign app.
           // Either way a retry would just re-hit "address already in use", so
           // tell the user a restart is required rather than looping the failure.
-          return showUnrecoverableGatewayError(win, PORT);
+          return showUnrecoverableGatewayError(win, PORT, { probeFailed });
         }
       }
-      if (action === "retry" || action === "force-retry") {
+      if (action === "retry" || action === "force-retry" || action === "enable-retry") {
         gatewayStartFailure = null; // let the retry genuinely re-probe
         // If our own spawned gateway is confirmed gone (or we just force-stopped
         // the port holder), respawn before re-waiting. For a timeout (child may
@@ -2002,6 +3256,9 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
 
 async function openNewConnectionWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  // Reachable from the tray menu during the deferred fullscreen-exit hide; the
+  // pending hide would otherwise take the parent away from under the modal.
+  cancelPendingTrayHide(mainWindow);
   mainWindow.show();
 
   const css = await getModalCSS();
@@ -2044,18 +3301,28 @@ async function openNewConnectionWindow() {
     };
     // Same platform-conditional chrome as the main window (see createWindow):
     // frameless + inset traffic lights on macOS, titleBarOverlay on Windows,
-    // native frame elsewhere (Linux).
+    // frame:false on CSD-preferring Linux desktops, native frame elsewhere.
     if (IS_MAC) connOpts.titleBarStyle = "hidden";
-    if (IS_WIN) {
+    if (IS_MAC) connOpts.trafficLightPosition = trafficLightPositionForZoom(1);
+    if (IS_WINDOWS) {
       connOpts.titleBarStyle = "hidden";
+      connOpts.autoHideMenuBar = true;
       connOpts.titleBarOverlay = {
-        color: nativeTheme.shouldUseDarkColors ? "#0f1117" : "#f8fafc",
-        symbolColor: nativeTheme.shouldUseDarkColors ? "#e2e8f0" : "#1e293b",
-        height: 42,
+        color: WINDOWS_TITLEBAR_BACKGROUND,
+        symbolColor: nativeTheme.shouldUseDarkColors
+          ? WINDOWS_TITLEBAR_SYMBOL_DARK
+          : WINDOWS_TITLEBAR_SYMBOL_LIGHT,
+        height: HEADER_CSS_PX,
       };
     }
-    if (IS_MAC) connOpts.trafficLightPosition = trafficLightPositionForZoom(1);
+    if (LINUX_FRAMELESS) {
+      connOpts.frame = false;
+      connOpts.autoHideMenuBar = true; // same rationale as createWindow
+    }
     const connWin = new BaseWindow(connOpts);
+    if (IS_WINDOWS && typeof connWin.setMenuBarVisibility === "function") {
+      connWin.setMenuBarVisibility(false);
+    }
 
     setupWindowContents(connWin, backendUrl);
 
@@ -2213,6 +3480,12 @@ process.on("unhandledRejection", (reason) => {
 });
 
 app.whenReady().then(async () => {
+  // The frame decision's `reason` exists for support bundles: "why does my
+  // window (not) have a native frame" is answerable from the gateway log
+  // without asking the user for their desktop environment.
+  if (LINUX_FRAME_DECISION) {
+    glog(`linux frame decision: frameless=${LINUX_FRAME_DECISION.frameless} reason=${LINUX_FRAME_DECISION.reason}`);
+  }
   // Debug-only per-process metrics recorder. No-ops unless KIROCREW_DEBUG is set,
   // so a normal install pays nothing; when on, it writes a bounded rolling
   // artifact next to the gateway log for `kirocrew desktop metrics` to read.
@@ -2274,11 +3547,20 @@ app.whenReady().then(async () => {
   // from the dock/tray-only state; surfaces the window before navigating.
   // `_mcView` marks every window that hosts a dashboard (setupWindowContents),
   // which skips modal prompt BrowserWindows that have no SPA to navigate.
-  const openSettingsPage = (tab) => {
-    const win = [BaseWindow.getFocusedWindow(), mainWindow].find(
+  // Resolve the dashboard WINDOW (not WebContents): the focused one, falling
+  // back to the main window so menu items still work from the dock/tray-only
+  // state. `_mcView` marks every window that hosts a dashboard
+  // (setupWindowContents), which skips modal prompt BrowserWindows.
+  const focusedDashboardWindow = () =>
+    [BaseWindow.getFocusedWindow(), mainWindow].find(
       (w) => w && !w.isDestroyed() && w._mcView
     );
+  const openSettingsPage = (tab) => {
+    const win = focusedDashboardWindow();
     if (!win) return;
+    // The window may be mid deferred-hide (still visible, still focusable);
+    // opening settings on it is a request to keep it, not lose it 2s later.
+    cancelPendingTrayHide(win);
     if (win.isMinimized()) win.restore();
     win.show();
     win.focus();
@@ -2286,6 +3568,21 @@ app.whenReady().then(async () => {
     if (wc && !wc.isDestroyed()) {
       wc.send("navigate", tab ? `/settings?tab=${tab}` : "/settings");
     }
+  };
+  // View > Keep on Top: flip always-on-top on the focused dashboard window,
+  // then reconcile the checkbox with the window's ACTUAL state (read back) so
+  // the checkmark cannot drift if the platform refuses or another code path
+  // changes it. Persisted so the pinned window survives a relaunch.
+  const toggleAlwaysOnTop = () => {
+    const win = focusedDashboardWindow();
+    if (!win) return;
+    try {
+      win.setAlwaysOnTop(!win.isAlwaysOnTop());
+      const menu = Menu.getApplicationMenu();
+      const item = menu && menu.getMenuItemById("keep-on-top");
+      if (item) item.checked = win.isAlwaysOnTop();
+    } catch { /* window mid-teardown */ }
+    persistMainWindowState();
   };
   const appMenu = Menu.buildFromTemplate(
     buildMenuTemplate({
@@ -2299,6 +3596,10 @@ app.whenReady().then(async () => {
       zoomActualSize: zoomItem((wc) => wc.setZoomFactor(1)),
       zoomIn: zoomItem((wc) => wc.setZoomFactor(stepZoomFactor(wc.getZoomFactor(), +1))),
       zoomOut: zoomItem((wc) => wc.setZoomFactor(stepZoomFactor(wc.getZoomFactor(), -1))),
+      // Menu is built before createWindow(), so seed the checkbox from the
+      // same persisted state createWindow() restores from.
+      alwaysOnTop: !!(store.get("windowState") || {}).alwaysOnTop,
+      toggleAlwaysOnTop,
       openNewConnectionWindow: () => openNewConnectionWindow(),
       renameCurrentWindow: () => renameCurrentWindow(),
       promptRemoteHost: () => promptRemoteHost(),
@@ -2308,12 +3609,69 @@ app.whenReady().then(async () => {
   );
   Menu.setApplicationMenu(appMenu);
 
+  // Windows renders the menu surface in the custom titlebar so pointer hover
+  // can switch between top-level menus. Native Menu.popup() captures input on
+  // Windows and prevents that Zed-style interaction. Commands still execute
+  // through Electron's MenuItems, preserving roles and accelerator behavior.
+  ipcMain.handle("app-menu:items", (event, id) => {
+    if (!IS_WINDOWS || !WINDOWS_TITLEBAR_MENU_IDS.has(id)) return [];
+    const item = appMenu.getMenuItemById(id);
+    const win = windowForWebContents(event.sender);
+    if (!item || !item.submenu || !win || win.isDestroyed()) return [];
+    return serializeMenuItems(item.submenu);
+  });
+
+  ipcMain.on("app-menu:execute", (event, id, index) => {
+    if (!IS_WINDOWS || !WINDOWS_TITLEBAR_MENU_IDS.has(id) || !Number.isInteger(index)) return;
+    const topLevelItem = appMenu.getMenuItemById(id);
+    const win = windowForWebContents(event.sender);
+    if (!win || win.isDestroyed()) return;
+    // `event.sender`, not `event`: role items dispatch off the third click
+    // argument as a WebContents (`webContentsMethod(focusedWebContents)`), and
+    // the titlebar menu can only be clicked while its own renderer has focus,
+    // so the sender IS the focused WebContents the native menu would resolve.
+    executeMenuItem(topLevelItem, index, win, event.sender);
+  });
+
   // DevTools gate: renderer sends dev-mode state, we toggle menu visibility.
   ipcMain.on("dev-mode-changed", (_event, enabled) => {
     const menu = Menu.getApplicationMenu();
     const item = menu && menu.getMenuItemById("devtools-toggle");
     if (item) item.visible = !!enabled;
   });
+
+  // System-wide summon hotkey: shows + focuses the dashboard from anywhere,
+  // launching a window when none exists. The handler and IPC surface are set
+  // up here; the actual registration happens after the boot path's
+  // createWindow() below, so a keypress cannot race window creation and
+  // produce two windows. Torn down on will-quit; the binding persists in the
+  // store (`globalHotkey`) so the user can rebind or disable it via the
+  // config file (Connection > Open Config File). A stored value that cannot be
+  // bound falls back to the default; a default that another app already owns
+  // degrades to no hotkey — logged, never fatal (see global-hotkey.js).
+  setGlobalHotkeyLogger(glog);
+  const summonDashboard = createSummonHandler({
+    // The focused dashboard window when there is one, else the main window,
+    // else ANY surviving dashboard window (`_mcView` marks the windows that
+    // host a dashboard — see focusedDashboardWindow above). The main window is
+    // hidden, not destroyed, on close, so createWindow() is a last resort.
+    getWindow: () =>
+      [BaseWindow.getFocusedWindow(), mainWindow, ...BaseWindow.getAllWindows()].find(
+        (w) => w && !w.isDestroyed() && w._mcView
+      ) || null,
+    createWindow: () => createWindow(),
+    // A global shortcut fires while ANOTHER app is frontmost; on macOS the
+    // window rises without keyboard focus unless the app steals activation.
+    focusApp: () => {
+      if (IS_MAC) app.focus({ steal: true });
+    },
+  });
+  // The shortcuts UI reads what is ACTUALLY bound (registration can degrade
+  // to the default or to nothing), so it never advertises a dead chord.
+  ipcMain.handle("global-hotkey:get", () => ({
+    accelerator: currentGlobalHotkey(),
+    default: DEFAULT_GLOBAL_HOTKEY,
+  }));
 
   // The renderer reports the user's resolved theme accent whenever it changes
   // (see useTheme.tsx). Persist a validated hex so the NEXT launch's boot splash
@@ -2322,6 +3680,46 @@ app.whenReady().then(async () => {
     if (typeof hex === "string" && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(hex)) {
       store.set("themeAccent", hex);
     }
+  });
+
+  // Focus mode: the renderer reports whether the dashboard header is currently
+  // on screen, and the native macOS traffic lights follow it.
+  //
+  // Driven from here because AppKit paints them at a WINDOW coordinate, not in
+  // the DOM — nothing the renderer hides moves them, so with the header gone they
+  // were left floating over the sessions sidebar and the chat title row, clipping
+  // both. Hiding them is what lets focus mode reclaim the whole top row on macOS
+  // instead of reserving 42px for controls the user did not ask to keep.
+  //
+  // Resolved from the SENDER's own window, never a broadcast: a connection window
+  // running the same SPA must not hide the main window's buttons. Skipped in
+  // fullscreen, where macOS owns the buttons itself (they live in the auto-hiding
+  // menu-bar overlay) and there is no title bar to hide them from.
+  // `positionTrafficLights` is re-asserted on the way back because a visibility
+  // round-trip can drop the custom inset.
+  ipcMain.on("focus-mode-chrome", (event, visible) => {
+    if (!IS_MAC) return;
+    const win = windowForWebContents(event.sender);
+    if (!win) return;
+    // applyFocusModeChrome (focus-chrome.js) also re-declares the renderer's
+    // draggable regions after the native change: setWindowButtonVisibility
+    // mutates the titlebar styleMask and DROPS the declared regions, which is
+    // why every renderer-side drag surface for the peeked header went dead on
+    // macOS while the CSS was provably correct.
+    applyFocusModeChrome(win, visible, { positionTrafficLights });
+  });
+
+  // Caption controls for the frameless Linux window (see the injected
+  // #electron-linux-controls cluster in setupWindowContents). Resolved from
+  // the SENDER's own window -- never a broadcast -- so a connection window's
+  // close button cannot touch the main window. Actions outside the
+  // applyWindowControl allowlist are no-ops. Gated on LINUX_FRAMELESS: on
+  // framed windows the native controls own these verbs, and no button that
+  // sends this message is ever injected there.
+  ipcMain.on("window-control", (event, action) => {
+    if (!LINUX_FRAMELESS) return;
+    const win = windowForWebContents(event.sender);
+    if (win) applyWindowControl(win, action);
   });
 
   // The renderer reports its dark/light mode PREFERENCE whenever it changes (see
@@ -2335,21 +3733,20 @@ app.whenReady().then(async () => {
     }
   });
 
-  // Windows titleBarOverlay color sync: when the resolved dark/light mode
-  // changes, update the overlay background and symbol colors to match. The
-  // renderer sends the resolved mode ("dark" | "light") after any theme change.
+  // Windows titleBarOverlay symbol sync: when the resolved dark/light mode
+  // changes, repaint every window's caption glyphs to match. The renderer sends
+  // the resolved mode ("dark" | "light") after any theme change. Shares
+  // ./windows-titlebar with the load/focus path (syncNativeTheme) so every
+  // window converges on the same transparent, zoom-aware overlay instead of two
+  // handlers racing with different colors — and the loop CONTINUES past the
+  // framed modal windows Electron throws on, so a theme switch with a dialog
+  // open cannot leave the windows behind it painted for the old theme.
   ipcMain.on("titlebar-overlay-theme", (_event, mode) => {
-    if (!IS_WIN) return;
-    const dark = mode === "dark";
-    const color = dark ? "#0f1117" : "#f8fafc";
-    const symbolColor = dark ? "#e2e8f0" : "#1e293b";
-    for (const win of BaseWindow.getAllWindows()) {
-      try {
-        if (typeof win.setTitleBarOverlay === "function") {
-          win.setTitleBarOverlay({ color, symbolColor, height: 42 });
-        }
-      } catch { /* window mid-teardown */ }
-    }
+    if (!IS_WINDOWS) return;
+    const resolvedMode = mode === "dark" || mode === "light"
+      ? mode
+      : (nativeTheme.shouldUseDarkColors ? "dark" : "light");
+    paintAllTitleBarOverlays(BaseWindow.getAllWindows(), resolvedMode, HEADER_CSS_PX);
   });
 
   // Dock/taskbar badge (RFC notification bus Phase 4): renderer pushes its
@@ -2359,6 +3756,15 @@ app.whenReady().then(async () => {
   ipcMain.on("badge:set", (_event, count) => {
     app.setBadgeCount(clampBadgeCount(count));
   });
+
+  // Local-gateway switch for Settings > Developer. The choice lives in the
+  // app's own electron-store config, which page JS cannot reach, so the
+  // renderer round-trips through these handlers. Both resolve with the stored
+  // value so the toggle renders what was actually written. Reading it at launch
+  // (startGateway) rather than here is what gives the setting its next-launch
+  // semantics: flipping it never touches the gateway currently running.
+  ipcMain.handle("local-gateway:get", () => isLocalGatewayEnabled(store));
+  ipcMain.handle("local-gateway:set", (_event, enabled) => setLocalGatewayEnabled(store, enabled));
 
   // Native zoom bridge for the Settings > Display "Zoom Level" stepper.
   // A renderer cannot touch Chromium's per-origin zoom itself, so it
@@ -2439,6 +3845,26 @@ app.whenReady().then(async () => {
   // The dashboard renderer is the authority on whether the agent is authorized
   // to act (it owns that toggle), so it pushes the flag; the main process keeps
   // it per panel and evaluates the gate itself on every transition.
+  ipcMain.handle("browser:track-session", (event, panelId, tracked) => {
+    // Reachability, and now the ONLY session-declaration channel. The renderer
+    // declares its active chat slot here so the agent command channel polls for
+    // it (see listPanelIds) and the agent's first navigate can arrive and be
+    // JUDGED by the gate — which is now just the view precondition, since Browser
+    // Mode is the authorization. Grants nothing on its own.
+    const owner = windowForWebContents(event.sender);
+    const set = owner && owner._mcReachableSessions;
+    const id = typeof panelId === "string" ? panelId.trim() : "";
+    if (!set || !id) return { ok: false };
+    if (tracked) set.add(id);
+    else set.delete(id);
+    // The tracked-slot set just changed. Nudge the agent command channel to
+    // re-read it NOW so a freshly declared key is polled (and thus registered on
+    // the gateway bus) within submit's brief wait window, instead of only after
+    // the current long-poll ends (up to ~25s) -- the cold-start race that
+    // dropped a fresh session's first navigate to the Playwright mirror.
+    if (owner._mcAgentChannel) owner._mcAgentChannel.poke();
+    return { ok: true };
+  });
   ipcMain.handle("browser:set-agent-act", async (event, panelId, enabled) => {
     const p = panelFor(event, panelId);
     if (!p) return { ok: false };
@@ -2556,8 +3982,41 @@ app.whenReady().then(async () => {
     }
   });
 
+  // Pierre highlight-churn reports (src/lib/pierrePerf.ts). Buffered in memory
+  // and flushed to the log only when the renderer dies -- see pierre-perf-log.js
+  // for why nothing is written in steady state (glog has no rotation, so a line
+  // every few seconds would grow the user's log without bound).
+  //
+  // The payoff: every future renderer crash carries the two minutes of
+  // highlighter activity that preceded it, on a normal install, with no env var
+  // set ahead of time.
+  //
+  // KIROCREW_DEBUG additionally logs each window as it arrives, for watching a
+  // live reproduction instead of reading a post-mortem. Checked per message so
+  // toggling the variable needs no rebuild.
+  ipcMain.on("pierre-perf", (_event, w) => {
+    // Only the primary renderer's activity belongs in this buffer. The channel is
+    // reachable from any window that loads the shared preload (companion panels,
+    // secondary dashboards), but the flush is triggered by THIS window's
+    // render-process-gone -- so accepting a sibling's reports would file its
+    // highlighting under the primary renderer's crash history and point the
+    // post-mortem at the wrong process. Mis-attributed evidence is worse than
+    // none, because it is acted upon.
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (_event.sender !== mainWindow.webContents) return;
+    if (!pierrePerfLog.record(w)) return;
+    if (!profilingEnabled(process.env)) return;
+    const line = pierrePerfLog.lastLine();
+    if (line) glog(line);
+  });
+
   createTray();
   const win = createWindow();
+  // Bind the summon hotkey only now that the main window exists: registering
+  // earlier would let a keypress during boot race createWindow() and open a
+  // second window. Still within app ready — the OS-level chord works from the
+  // first frame the user can see.
+  bindGlobalHotkey(store.get("globalHotkey"), summonDashboard);
 
   // Wired BEFORE the awaited gateway boot ON PURPOSE. preload.js exposes
   // window.updateAPI unconditionally, so Settings > About renders a live Check
@@ -2604,18 +4063,31 @@ app.whenReady().then(async () => {
     Notification,
     getFlavor: () => "stable",
     getChannelPreference: () => store.get("updateChannel", ""),
-    // Once-per-version nudge: tell the user an update exists; downloading and
-    // installing stay in Settings > About (the in-app dot guides them there).
-    notifyUpdateFound: (version) => {
+    // ON by default (see the store defaults). The updater reads this per
+    // discovery, so a Settings toggle takes effect on the next check.
+    getAutoDownloadPreference: () => store.get("autoDownloadUpdates", true) !== false,
+    // Once-per-version nudge. The copy has to match what actually happens next,
+    // so it branches on the mode the updater already decided and passed in --
+    // re-reading the store here could disagree with that decision if the
+    // preference changed between the two reads.
+    notifyUpdateFound: (version, { autoDownload = false } = {}) => {
       if (!version || store.get("lastNudgedVersion", "") === version) return;
       store.set("lastNudgedVersion", version);
       try {
         const n = new Notification({
           title: `${app.name} update available`,
-          body: `Version ${version} is ready. Open Settings > About to download and install.`,
+          body: autoDownload
+            // Names the opt-out. This notification is where an existing user
+            // first learns the default flipped, so it is the one place that
+            // must not assert the new behaviour without saying how to decline
+            // it -- the consent-mode sibling already points at the same panel.
+            ? `Version ${version} is downloading and will install the next time you quit. `
+              + "Manage in Settings > About."
+            : `Version ${version} is ready. Open Settings > About to download and install.`,
         });
         n.on("click", () => {
           if (mainWindow && !mainWindow.isDestroyed()) {
+            cancelPendingTrayHide(mainWindow);
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.show();
             mainWindow.focus();
@@ -2646,6 +4118,7 @@ app.whenReady().then(async () => {
       recoverWedgedGateway(mainWindow).catch((e) => glog(`post-install-failure recovery failed: ${e && e.message}`));
     },
     onUpdateState: broadcastUpdateState,
+    log: makeUpdaterLogger(glog),
     });
   } catch (e) {
     glog(`auto-update init failed — continuing WITHOUT auto-update: ${(e && e.stack) || e}`);
@@ -2683,6 +4156,21 @@ app.whenReady().then(async () => {
     updater.check();
     return { ok: true, info: updaterInfo() };
   });
+  // Auto-download opt-out. Turning it ON re-checks so a version already
+  // discovered this session starts downloading now instead of waiting up to
+  // four hours for the next poll. Turning it OFF keeps any bytes already
+  // fetched -- discarding a verified stage would leave the user with nothing to
+  // show for the transfer -- but it DOES disarm the install-on-quit for a stage
+  // that was downloaded automatically, so the update the user just declined
+  // does not land on their next quit. An explicit Install still applies it.
+  ipcMain.handle("update:set-auto-download", (_e, enabled) => {
+    if (typeof enabled !== "boolean") {
+      return { ok: false, error: `invalid value: ${typeof enabled}` };
+    }
+    store.set("autoDownloadUpdates", enabled);
+    if (enabled) updater.check();
+    return { ok: true, info: updaterInfo() };
+  });
 
   await startGateway();
   await showLoadingThenConnect(win);
@@ -2693,9 +4181,27 @@ app.whenReady().then(async () => {
   // be answering before we ask it whether Mochi is on, and the pet page is
   // loaded from the gateway origin. Best-effort -- a failure here must never
   // block the dashboard, so everything is inside a catch that only logs.
-  initMochi({ backendUrl: BACKEND_URL, fetchLocalToken, glog });
+  initMochi({
+    backendUrl: BACKEND_URL,
+    fetchGatewayAuth: fetchMochiGatewayAuth,
+    glog,
+    getMainWindow: () => mainWindow,
+  });
+  // Same shape and the same best-effort contract: the companion's windows follow
+  // the app's enabled state, and a failure here must never block the dashboard.
+  try {
+    initCrewCompanion({ backendUrl: BACKEND_URL, fetchLocalToken, glog });
+  } catch (err) {
+    glog(`crew-companion: init failed — ${err && err.message}`);
+  }
 
   app.on("activate", () => {
+    // An activate landing while hideToTray() is still waiting out the
+    // fullscreen-exit animation must win over the pending hide: the window is
+    // still visible at this point, so the isVisible() guard below would skip
+    // the show and the deferred hide would then take the window away — the
+    // user clicked the Dock icon and watched the window vanish.
+    cancelPendingTrayHide(mainWindow);
     if (!mainWindow?.isVisible()) mainWindow?.show();
   });
 });
@@ -2705,7 +4211,14 @@ app.on("before-quit", () => {
   // Flush the final metrics window before the gateway teardown begins.
   try { if (desktopMetricsRecorder) desktopMetricsRecorder.stop(); } catch { /* best effort */ }
   shutdownMochi();
+  try { shutdownCrewCompanion(); } catch { /* best effort */ }
   stopGateway();
+});
+
+// Release ONLY our own summon accelerator (never unregisterAll — Mochi's
+// shortcuts are torn down by its own quit path above).
+app.on("will-quit", () => {
+  unregisterGlobalHotkey();
 });
 
 app.on("window-all-closed", () => {

@@ -11,9 +11,10 @@ Temporary (blank-slate): no memory reads, no memory writes, no persistence.
 Incognito: memory reads allowed but writes blocked; persists an ephemeral
     conversation log that is discarded on close.
 
-Both modes are tracked via bounded LRU dicts (``_thread_temporary`` and
-``_thread_incognito``, keyed by session_key).  Use :func:`_is_slack_restricted`
-to check whether a Slack session should skip memory writes.
+Both modes live in :mod:`kiro_crew.messaging.privacy_mode`, keyed by session key,
+so a second channel inherits the same machinery; the names in this module are
+thin Slack-facing wrappers over it.  Use :func:`_is_slack_restricted` to check
+whether a Slack session should skip memory writes.
 """
 
 from __future__ import annotations
@@ -25,24 +26,23 @@ import os
 import re
 import time
 import uuid
-from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from kiro_crew.session_map import SessionMap
+    from kiro_crew.dashboard.state import DashboardState
 
 from kiro_crew.acp.client import AcpError, AcpProcessDied, AcpPromptBusy, AcpTimeoutError
 from kiro_crew.acp.types import STOP_REASON_CANCELLED, STOP_REASON_END_TURN
+from kiro_crew.agent_discovery import project_agent_files, project_agent_name
 from kiro_crew.config.loader import (
     ACTIVATION_REVIEW,
     ConfigReadError,
     KiroCrewConfig,
     config_path,
-    read_config_for_update,
-    write_config_atomically,
+    update_config_locked,
 )
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.context import (
@@ -51,12 +51,13 @@ from kiro_crew.context import (
     compress_thread_history,
     window_for_provider_client,
 )
-from kiro_crew.cron import (
-    CronService,
-    CronStoreBusy,
-    compute_next_run_ts,
-    format_schedule,
-    get_local_tz,
+from kiro_crew.cron import CronService
+from kiro_crew.dashboard.chat_utils import (
+    expire_slack_options,
+    mint_options_token,
+    options_control_is_stale,
+    remember_slack_options,
+    run_config_write,
 )
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import ConversationLog, HistoryConsolidator
@@ -67,9 +68,21 @@ from kiro_crew.hooks import (
     safe_read_file_bytes,
     validate_file_path,
 )
-from kiro_crew.llm_helpers import record_interaction_event, save_conversation_turn
+from kiro_crew.llm_helpers import (
+    record_interaction_event,
+    save_conversation_turn_off_loop,
+)
+from kiro_crew.messaging import auto_title, privacy_mode
+from kiro_crew.messaging.commands import (
+    cron_command_reply,
+    spawn_command_reply,
+    task_command_reply,
+)
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import canonical_key
+from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
+from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
+from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
 from kiro_crew.platform import current_context
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
@@ -83,6 +96,8 @@ from kiro_crew.providers.base import (
 from kiro_crew.safety_override import (
     SafetyOverride,
     apply_config_duration,
+    describe_grant_lifetime,
+    describe_new_grant,
     grant_declared_yolo,
     safety_override,
 )
@@ -95,26 +110,29 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionClosingError, SessionManager
+from kiro_crew.session_map import SessionMap
 from kiro_crew.slack.blocks import build_working_blocks, deprecation_warning_block
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.format import (
     SLACK_MSG_LIMIT,
     TRUNCATION_NOTICE,
     _convert_tables,
+    extract_options,
+    render_one_for_slack,
     split_message,
     strip_thinking_tags,
-    to_slack_mrkdwn,
 )
+from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.slack.sessions_view import (
     _SESSIONS_DEFAULT_LIMIT,
     _build_sessions_blocks,
-    _collect_recent_sessions,
+    _collect_recent_sessions_off_loop,
 )
 from kiro_crew.stats import Stats
 from kiro_crew.subagent import SubagentManager
 from kiro_crew.task import Task
 from kiro_crew.taskrunner import TaskRunner
-from kiro_crew.voice_reply import VALID_PROVIDERS
+from kiro_crew.voice_reply import DEFAULT_PROVIDER, VALID_PROVIDERS
 from kiro_crew.voice_reply import is_available as _tts_available
 from kiro_crew.voice_reply import validate_length_scale as _validate_length_scale
 from kiro_crew.voice_reply import voice_reply as _voice_reply_fn
@@ -491,44 +509,15 @@ class StatusReactionController:
 # Trust/YOLO state
 # trust: auto-approve tools for a specific session (via Trust button)
 # yolo: auto-approve all tools globally for all sessions (via !yolo on command, owner-only)
-_trusted_sessions: set[str] = set()
+#: Re-exported from the shared per-session trust set so Slack and every channel
+#: read ONE grant. Kept under this name because interactions.py, the dashboard's
+#: approval-mode reset and the Slack suites all reach it here.
+_trusted_sessions = _shared_trusted_sessions
 # Deprecated alias kept for import compatibility. `!yolo on` is an AD-HOC
 # grant, so it now uses the SAME duration as the dashboard picker and the API
 # (agent.yolo_duration, default 6h) — a per-surface TTL made the behavior
 # unpredictable without buying security. Read the live value, never this.
 _YOLO_TTL_SECS = SafetyOverride._ADHOC_TTL_DEFAULT
-
-
-def _fmt_duration(secs: int) -> str:
-    """Render an ad-hoc TTL for a user-facing message (e.g. "6h", "30min")."""
-    if secs % 3600 == 0:
-        return f"{secs // 3600}h"
-    return f"{secs // 60}min"
-
-
-_NO_EXPIRY_TEXT = "stays on until Kiro Crew restarts"
-
-
-def describe_grant_lifetime() -> str:
-    """Describe the LIVE grant's lifetime truthfully.
-
-    A grant can have no timed expiry at all, in which case ``remaining_secs()``
-    is -1. Claiming such a grant "auto-expires" would tell the operator the
-    skip-every-approval mode disarms itself when it never does.
-    """
-    so = safety_override()
-    if not so.is_active():
-        return "off"
-    if so.is_permanent:
-        return _NO_EXPIRY_TEXT
-    return f"{max(0, so.remaining_secs()) // 60}min remaining"
-
-
-def describe_new_grant(result_ttl: int) -> str:
-    """Describe the lifetime of a grant that was just created."""
-    if result_ttl <= 0:
-        return _NO_EXPIRY_TEXT
-    return f"auto-expires in {_fmt_duration(result_ttl)}"
 
 
 # Allowed user IDs for Slack access (set by gateway at startup).
@@ -554,8 +543,13 @@ class _VoiceConfig:
     default_pitch: str = "+0%"
     aws_profile: str = ""
     region: str = ""
-    # TTS provider: "polly" (default, AWS) or "piper" (local neural TTS).
-    provider: str = "polly"
+    # TTS provider. Defaults to the LOCAL provider (Piper), matching
+    # ``voice_reply.DEFAULT_PROVIDER``. It used to default to "polly" here,
+    # which meant enabling voice reply without naming a provider silently sent
+    # text to a paid AWS service under whatever the ambient credential chain
+    # resolved to. Sourced from the single constant so the two cannot drift
+    # again.
+    provider: str = DEFAULT_PROVIDER
     # Piper-specific (ignored when provider="polly"):
     piper_binary: str = ""
     piper_model: str = ""
@@ -606,60 +600,46 @@ _thread_projects: dict[str, str] = {}
 # Guard set for _hydrate_thread_overrides to avoid repeated I/O per session.
 _hydrated_sessions: set[str] = set()
 
-# Set via !temporary modifier — thread-scoped temporary (blank-slate) mode.
-# Bounded LRU to prevent unbounded growth in long-running bots.
-_THREAD_TEMPORARY_MAX = 10_000
-_thread_temporary: OrderedDict[str, None] = OrderedDict()
+# The privacy-mode machinery lives in ``messaging.privacy_mode`` so a second
+# channel gets the same trackers, the same durable flag and the same audit rather
+# than a second copy of them. The names below are the Slack-facing spellings the
+# ~45 enforcement sites in this package (and the dashboard) already import; each
+# is a thin wrapper. The two LRU dicts are ALIASES of the shared objects, not
+# copies — a caller (or a test fixture) that mutates one is mutating the tracker
+# the shared module reads.
+_thread_temporary = privacy_mode._temporary
+_thread_incognito = privacy_mode._incognito
 
-
-def _mark_temporary(key: str) -> None:
-    """Add key to the bounded LRU temporary-thread tracker."""
-    _thread_temporary[key] = None
-    _thread_temporary.move_to_end(key)
-    if len(_thread_temporary) > _THREAD_TEMPORARY_MAX:
-        _thread_temporary.popitem(last=False)
-
-
-def is_thread_temporary(session_key: str) -> bool:
-    """Public check — used by API handlers to gate memory writes."""
-    return session_key in _thread_temporary
-
+_mark_temporary = privacy_mode.mark_temporary
+_mark_incognito = privacy_mode.mark_incognito
+is_thread_temporary = privacy_mode.is_temporary
+is_thread_incognito = privacy_mode.is_incognito
 
 _RESTRICTED_WRITE_MSG = "Memory writes are not allowed in this session mode."
 
-
-_THREAD_INCOGNITO_MAX = 10_000
-_thread_incognito: OrderedDict[str, None] = OrderedDict()
-
-
-def _mark_incognito(key: str) -> None:
-    """Add key to the bounded LRU incognito-thread tracker."""
-    _thread_incognito[key] = None
-    _thread_incognito.move_to_end(key)
-    if len(_thread_incognito) > _THREAD_INCOGNITO_MAX:
-        _thread_incognito.popitem(last=False)
-
-
-def is_thread_incognito(session_key: str) -> bool:
-    """Public check — used by API handlers."""
-    return session_key in _thread_incognito
+_INCOGNITO_TOKEN_RE = privacy_mode.INCOGNITO_TOKEN_RE
+_TEMPORARY_TOKEN_RE = privacy_mode.TEMPORARY_TOKEN_RE
 
 
 def _is_slack_restricted(session_key: str) -> bool:
-    """Return True if this Slack session should skip memory writes."""
-    return session_key in _thread_temporary or session_key in _thread_incognito
+    """Return True if this Slack session should skip memory writes.
+
+    The predicate itself is namespace-agnostic (see
+    :func:`kiro_crew.messaging.privacy_mode.is_restricted`); the Slack spelling
+    survives because this package's enforcement sites are named for it.
+    """
+    return privacy_mode.is_restricted(session_key)
 
 
 def _conv_state_map(sessions: object) -> "SessionMap | None":
     """Return the SessionManager's canonical SessionMap, or None.
 
-    v1c-B: the per-conversation ``temporary``/``incognito`` flags are persisted
-    on the session entry via the SAME ``SessionMap`` instance the
-    ``SessionManager`` owns (so writes stay consistent — no second instance can
-    clobber them on save). Test doubles without ``_session_map`` return None, in
-    which case callers fall back to the in-memory LRU dicts only.
+    Thin wrapper over :func:`kiro_crew.messaging.privacy_mode.conv_state_map`,
+    which documents why requiring the real class (rather than any attribute) is
+    load-bearing for a test double.
     """
-    return getattr(sessions, "_session_map", None)
+    sm = privacy_mode.conv_state_map(sessions)
+    return sm if isinstance(sm, SessionMap) else None
 
 
 def _hydrate_conv_flags(sessions: object, session_key: str) -> None:
@@ -669,27 +649,12 @@ def _hydrate_conv_flags(sessions: object, session_key: str) -> None:
     or incognito stays so across a gateway restart (the in-memory LRU is rebuilt
     from the durable ``SessionMap`` entry).
     """
-    sm = _conv_state_map(sessions)
-    if sm is None:
-        return
-    if sm.get_flag(session_key, "temporary"):
-        _mark_temporary(session_key)
-    if sm.get_flag(session_key, "incognito"):
-        _mark_incognito(session_key)
-
-
-_INCOGNITO_TOKEN_RE = re.compile(r"(?<!\S)!incognito(?!\S)", re.IGNORECASE)
+    privacy_mode.hydrate(sessions, session_key)
 
 
 def _strip_incognito_token(text: str) -> tuple[str, bool]:
     """Remove standalone ``!incognito`` token from *text*."""
-    new, n = _INCOGNITO_TOKEN_RE.subn("", text)
-    if not n:
-        return text, False
-    return " ".join(new.split()), True
-
-
-_TEMPORARY_TOKEN_RE = re.compile(r"(?<!\S)!temporary(?!\S)", re.IGNORECASE)
+    return privacy_mode.strip_token(text, privacy_mode.MODE_INCOGNITO)
 
 
 def _strip_temporary_token(text: str) -> tuple[str, bool]:
@@ -699,10 +664,44 @@ def _strip_temporary_token(text: str) -> tuple[str, bool]:
     was present.  The cleaned text has the token removed and excess
     whitespace collapsed.
     """
-    new, n = _TEMPORARY_TOKEN_RE.subn("", text)
-    if not n:
-        return text, False
-    return " ".join(new.split()), True
+    return privacy_mode.strip_token(text, privacy_mode.MODE_TEMPORARY)
+
+
+async def _apply_privacy_mode(
+    mode: str,
+    session_key: str,
+    user_id: str,
+    channel: str,
+    slack: SlackClientOps,
+    sessions: SessionManager,
+    reply_ts: str,
+) -> None:
+    """Mark a session as *mode* and notify the user (idempotent).
+
+    Everything platform-shaped is a callback into this module, which is what lets
+    the shared applier own the ordering (mark before any await, then the durable
+    flag, then the audit, then the notice).
+    """
+
+    async def _notify(message: str) -> None:
+        await slack.post_message(channel, message, reply_ts)
+
+    async def _on_applied(_mode: str) -> None:
+        # Register thread so follow-up messages pass the in_active_thread
+        # gate in mention/observe channels without needing another @mention.
+        # reply_ts is the bare Slack thread_ts; session_key may be namespaced.
+        sessions.set_slack_link(session_key, reply_ts, channel)
+
+    await privacy_mode.apply_mode(
+        mode,
+        session_key,
+        source="slack",
+        caller=user_id,
+        resources=f"{channel}:{session_key}",
+        sessions=sessions,
+        notify=_notify,
+        on_applied=_on_applied,
+    )
 
 
 async def _apply_temporary_modifier(
@@ -714,28 +713,8 @@ async def _apply_temporary_modifier(
     reply_ts: str,
 ) -> None:
     """Mark a session as temporary and notify the user (idempotent)."""
-    if session_key in _thread_temporary:
-        return
-    _mark_temporary(session_key)
-    # v1c-B: persist on the session entry (durable across restart).
-    _sm = _conv_state_map(sessions)
-    if _sm is not None:
-        _sm.set_flag(session_key, "temporary", True)
-    sel().log_api_access(
-        caller=user_id,
-        operation="slack.temporary_mode",
-        outcome="allowed",
-        source="slack",
-        resources=f"{channel}:{session_key}",
-    )
-    # Register thread so follow-up messages pass the in_active_thread
-    # gate in mention/observe channels without needing another @mention.
-    # reply_ts is the bare Slack thread_ts; session_key may be namespaced.
-    sessions.set_slack_link(session_key, reply_ts, channel)
-    await slack.post_message(
-        channel,
-        "🔒 Temporary mode ON — this thread won't read or save memory.",
-        reply_ts,
+    await _apply_privacy_mode(
+        privacy_mode.MODE_TEMPORARY, session_key, user_id, channel, slack, sessions, reply_ts
     )
 
 
@@ -748,26 +727,8 @@ async def _apply_incognito_modifier(
     reply_ts: str,
 ) -> None:
     """Mark a session as incognito and notify the user (idempotent)."""
-    if session_key in _thread_incognito:
-        return
-    _mark_incognito(session_key)
-    # v1c-B: persist on the session entry (durable across restart).
-    _sm = _conv_state_map(sessions)
-    if _sm is not None:
-        _sm.set_flag(session_key, "incognito", True)
-    sel().log_api_access(
-        caller=user_id,
-        operation="slack.incognito_mode",
-        outcome="allowed",
-        source="slack",
-        resources=f"{channel}:{session_key}",
-    )
-    # reply_ts is the bare Slack thread_ts; session_key may be namespaced.
-    sessions.set_slack_link(session_key, reply_ts, channel)
-    await slack.post_message(
-        channel,
-        "🕶️ Incognito mode ON — this thread can read memory but won't save anything.",
-        reply_ts,
+    await _apply_privacy_mode(
+        privacy_mode.MODE_INCOGNITO, session_key, user_id, channel, slack, sessions, reply_ts
     )
 
 
@@ -795,44 +756,37 @@ async def maybe_apply_privacy_modifiers(
     - *only_modifier* — True when the message was nothing but the modifier(s);
       the caller MUST then return without starting an LLM turn.
 
-    Mirrors native's original inline ordering exactly, including the early
-    return between ``!temporary`` and ``!incognito`` when nothing remains.
+    Slack's TWO texts are why this drives ``privacy_mode``'s primitives rather
+    than its single-text ``strip_and_apply``: only *cmd_text* decides whether the
+    message was nothing BUT a modifier, while *text* is what reaches the model.
+    Ordering (temporary, then incognito) and the early return as soon as nothing
+    remains match the shipped behaviour.
     """
-    cmd_stripped, had_temporary = _strip_temporary_token(cmd_text)
-    if had_temporary:
-        await _apply_temporary_modifier(session_key, user_id, channel, slack, sessions, reply_ts)
+    for mode, pattern in (
+        (privacy_mode.MODE_TEMPORARY, _TEMPORARY_TOKEN_RE),
+        (privacy_mode.MODE_INCOGNITO, _INCOGNITO_TOKEN_RE),
+    ):
+        cmd_stripped, had_mode = privacy_mode.strip_token(cmd_text, mode)
+        if not had_mode:
+            continue
+        await _apply_privacy_mode(mode, session_key, user_id, channel, slack, sessions, reply_ts)
         cmd_text = cmd_stripped
-        text = _TEMPORARY_TOKEN_RE.sub("", text)
+        text = pattern.sub("", text)
         text = " ".join(text.split()) or text  # collapse whitespace
         if not cmd_text:
-            # Message was *only* "!temporary" with no remaining content.
-            return text, cmd_text, True
-
-    cmd_stripped, had_incognito = _strip_incognito_token(cmd_text)
-    if had_incognito:
-        await _apply_incognito_modifier(session_key, user_id, channel, slack, sessions, reply_ts)
-        cmd_text = cmd_stripped
-        text = _INCOGNITO_TOKEN_RE.sub("", text)
-        text = " ".join(text.split()) or text
-        if not cmd_text:
+            # Message was *only* the modifier(s), with no remaining content.
             return text, cmd_text, True
 
     return text, cmd_text, False
 
 
-# Tracks Slack threads that already have a title (auto or manual).
-# Bounded LRU to prevent unbounded growth in long-running bots.
-
-_TITLED_THREADS_MAX = 10_000
-_titled_threads: OrderedDict[str, str | None] = OrderedDict()
-
-
-def _mark_titled(key: str, kind: str | None = None) -> None:
-    """Add key to the bounded LRU title tracker."""
-    _titled_threads[key] = kind
-    _titled_threads.move_to_end(key)
-    if len(_titled_threads) > _TITLED_THREADS_MAX:
-        _titled_threads.popitem(last=False)
+# Auto-titling lives in ``messaging.auto_title`` so both Slack paths and a second
+# channel share ONE claim tracker: two turns that resolved to the same session key
+# cannot then title it twice. The names below are the Slack-facing spellings this
+# package's call sites already use; ``_titled_threads`` is an ALIAS of the shared
+# tracker, not a copy.
+_titled_threads = auto_title._titled
+_mark_titled = auto_title.mark_titled
 
 
 # Background tasks kept alive to prevent GC mid-execution.
@@ -844,6 +798,18 @@ def cancel_background_tasks() -> None:
     for t in _background_tasks:
         t.cancel()
     _background_tasks.clear()
+
+
+def track_background_task(task: "asyncio.Task[Any]") -> None:
+    """Hold a strong reference to *task* until it finishes.
+
+    Both halves matter: without the reference the loop may collect a running task
+    mid-flight, and without the registration :func:`cancel_background_tasks`
+    cannot stop it at shutdown. The transport dispatcher shares this set so a
+    fire-and-forget turn it starts is torn down with the gateway too.
+    """
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 # Review mode: stores draft text keyed by "channel|thread_ts|uuid" for button/modal
@@ -937,19 +903,16 @@ def _get_agent_for_session(session_key: str) -> str:
 
 
 def _discover_project_agents(project_dir: str | None) -> list[Path]:
-    """Return agent JSON files from <project_dir>/.kiro/ and .kiro/agents/."""
-    if not project_dir:
-        return []
-    if is_sensitive_path(project_dir):
-        return []
-    kiro_dir = Path(project_dir) / ".kiro"
-    if not kiro_dir.is_dir():
-        return []
-    specs = list(kiro_dir.glob("*.agent-spec.json"))
-    agents_dir = kiro_dir / "agents"
-    if agents_dir.is_dir():
-        specs.extend(agents_dir.glob("*.json"))
-    return sorted(specs, key=lambda f: f.stem)
+    """Return agent JSON files from <project_dir>/.kiro/ and .kiro/agents/.
+
+    Delegates to :func:`agent_discovery.project_agent_files`, the one implementation
+    now shared with the dashboard picker, ``spawn_run`` validation and per-turn agent
+    resolution. ``include_legacy=True`` is passed HERE and only here: Slack's
+    ``*.agent-spec.json`` convention predates ``.kiro/agents/`` and is kept for
+    continuity, but kiro-cli cannot activate such a name, so no dispatch surface may
+    offer it.
+    """
+    return project_agent_files(project_dir, include_legacy=True)
 
 
 def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None:
@@ -958,21 +921,17 @@ def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None
     Searches project-local .kiro/ first (if project_dir set), then ~/.kiro/agents/.
     Returns the resolved name, or None if not found.
     """
-    # Project-local agents take priority
+    # Project-local agents take priority — kiro-cli resolves --agent against its
+    # cwd before the user-level dir, so a project agent is the one that would run.
+    # Prefilter on the FILENAME first: this runs on the event loop, and reading
+    # every spec to compare its declared name stalls Slack and the gateway on a
+    # checkout with many agents or slow storage. At most the one matching file is
+    # read, to return the name it declares.
     for spec in _discover_project_agents(project_dir):
-        if spec.stem == name or spec.stem.replace(".agent-spec", "") == name:
-            # Fallback must strip the ".agent-spec" suffix: the match arm
-            # accepts both "<name>" and "<name>.agent-spec", so returning the
-            # raw stem would yield "<name>.agent-spec" — a name that won't
-            # resolve downstream. Use the cleaned stem in every fallback branch.
-            fallback = spec.stem.removesuffix(".agent-spec")
-            raw = safe_read_file_bytes(str(spec))
-            if raw is None:
-                return fallback
-            try:
-                return json.loads(raw.decode("utf-8")).get("name", fallback)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return fallback
+        stem = spec.stem.removesuffix(".agent-spec")
+        if stem != name and spec.stem != name:
+            continue
+        return project_agent_name(spec)
 
     agents_dir = kiro_agents_dir()
     jsons = (
@@ -1075,15 +1034,19 @@ def _set_default_agent(name: str) -> None:
     path = config_path()
     if is_sensitive_path(str(path)):
         raise ValueError(f"Refusing to write to sensitive path: {path}")
+
+    def _apply(data: dict) -> dict:
+        data.setdefault("agent", {})["default_agent"] = name
+        return data
+
     try:
-        data = read_config_for_update(path)
+        # Locked read-modify-write: holds the sidecar advisory lock so a
+        # concurrent config writer (dashboard PATCH, CLI, the boot-time meta
+        # refresh) cannot land between this read and write and get reverted.
+        update_config_locked(path, mutate=_apply)
     except ConfigReadError as e:
         # Fail closed: writing back a {} baseline would drop every other setting.
         raise ValueError(f"Failed to read config: {e}") from e
-    data.setdefault("agent", {})["default_agent"] = name
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_config_atomically(path, data)
     except OSError as e:
         raise ValueError(f"Failed to write config: {e}") from e
     _cached_default_agent = name
@@ -1098,20 +1061,25 @@ def _persist_channel_config(
     path = config_path()
     if is_sensitive_path(str(path)):
         raise ValueError(f"Refusing to write to sensitive path: {path}")
+
+    def _apply(data: dict) -> dict:
+        slack_data = data.setdefault("slack", {})
+        channels = slack_data.setdefault("channels", {})
+        ch = channels.setdefault(channel_id, {})
+        if activation is not None:
+            ch["activation"] = activation
+        if agent is not None:
+            ch["agent"] = agent
+        return data
+
     try:
-        data = read_config_for_update(path)
+        # Locked read-modify-write (see _set_default_agent): without the
+        # sidecar lock, a `!channel always` racing any other config writer
+        # could be silently reverted by the loser's stale snapshot.
+        update_config_locked(path, mutate=_apply)
     except ConfigReadError as e:
         # Fail closed: writing back a {} baseline would drop every other setting.
         raise ValueError(f"Failed to read config: {e}") from e
-    slack_data = data.setdefault("slack", {})
-    channels = slack_data.setdefault("channels", {})
-    ch = channels.setdefault(channel_id, {})
-    if activation is not None:
-        ch["activation"] = activation
-    if agent is not None:
-        ch["agent"] = agent
-    try:
-        write_config_atomically(path, data)
     except OSError as e:
         raise ValueError(f"Failed to write config: {e}") from e
 
@@ -1199,11 +1167,11 @@ def set_orch_cfg(cfg: KiroCrewConfig) -> None:
 def load_voice_reply_config(cfg: "KiroCrewConfig | None" = None) -> None:
     """Populate the live voice state (``_vc``) from config's ``voice_reply``.
 
-    Callable without a Slack orchestrator: this historically ran only inside
-    ``set_orch_cfg`` on the Slack startup path, so a dashboard-only gateway
-    (no Slack tokens) never loaded persisted voice settings — every restart
-    silently reset TTS to disabled while the dashboard's PUT kept reporting
-    success. The dashboard server now calls this at app build.
+    Callable without a Slack orchestrator: ``set_orch_cfg`` runs only on the
+    Slack startup path, so the dashboard app builders call this directly at
+    boot. Without that call a dashboard-only gateway (no Slack tokens) never
+    restores persisted voice settings — every restart silently resets TTS to
+    disabled while the dashboard's settings PUT keeps reporting success.
     """
     # Load voice_reply defaults from config
     _vr: dict = cfg.raw.get("voice_reply", {}) if (cfg is not None and hasattr(cfg, "raw")) else {}
@@ -1231,15 +1199,22 @@ def load_voice_reply_config(cfg: "KiroCrewConfig | None" = None) -> None:
     # Validate provider on load — a typo (e.g. "ploly") would otherwise pass
     # through and only fail at synthesis time, after the user has already sent
     # a voice memo expecting a voice reply.
-    _provider = _vr.get("provider", "polly")
+    #
+    # Both the absent-key default and the invalid-value fallback resolve to the
+    # LOCAL provider. They previously resolved to "polly", so a config that
+    # enabled voice reply without naming a provider — or that named one with a
+    # typo — reached a paid AWS service with no operator decision behind it.
+    # Falling back to local is also the safer half of the pair: a wrong local
+    # provider costs nothing and degrades to a "TTS isn't configured" notice.
+    _provider = _vr.get("provider", DEFAULT_PROVIDER)
     if _provider not in VALID_PROVIDERS:
         logger.warning(
             "voice_reply.provider %r not in %s, defaulting to %r",
             _provider,
             sorted(VALID_PROVIDERS),
-            "polly",
+            DEFAULT_PROVIDER,
         )
-        _provider = "polly"
+        _provider = DEFAULT_PROVIDER
     _vc.provider = _provider
     _vc.piper_binary = _vr.get("piper_binary", "")
     _vc.piper_model = _vr.get("piper_model", "")
@@ -1296,7 +1271,11 @@ def disable_yolo() -> None:
     if not safety_override().is_active():
         return
     safety_override().deactivate("slack")
-    _trusted_sessions.clear()
+    # Through the shared revoke, which undoes BOTH halves of each grant. Dropping
+    # only the in-memory mapping leaves every granted session's approval_policy at
+    # "auto", and a subagent reads that policy rather than the mapping, so a later
+    # spawn would inherit a trust this call just revoked.
+    clear_trusted_sessions()
     logger.info("YOLO mode OFF")
 
 
@@ -1318,7 +1297,7 @@ def is_slack_session_trusted(session_key: str) -> bool:
     (distinct from global YOLO). Populated by the Trust button on both the
     native and messaging-transport approval prompts.
     """
-    return bool(session_key) and session_key in _trusted_sessions
+    return is_session_trusted(session_key)
 
 
 def add_trusted_session(session_key: str, sessions: "SessionManager | None" = None) -> None:
@@ -1328,18 +1307,7 @@ def add_trusted_session(session_key: str, sessions: "SessionManager | None" = No
     supplied, sets its approval policy to ``auto`` so spawned subagents inherit
     the trust (they read the parent's approval policy, not the in-memory set).
     """
-    if not session_key:
-        return
-    _trusted_sessions.add(session_key)
-    if sessions is not None:
-        try:
-            sessions.set_approval_policy(session_key, "auto")
-        except Exception:
-            logger.warning(
-                "Failed to propagate trust approval policy for %s",
-                session_key,
-                exc_info=True,
-            )
+    _add_trusted_session(session_key, sessions)
 
 
 def is_allowed_user(user_id: str) -> bool:
@@ -1484,7 +1452,9 @@ async def _handle_slash_command(
                     channel, f"YOLO mode is already on ({describe_grant_lifetime()}).", reply_ts
                 )
         elif len(parts) >= 2 and parts[1].lower() == "renew":
-            result = safety_override().renew("slack")
+            # renew() audits fail-closed with a synchronous SEL write; keep
+            # that filesystem I/O off the event loop.
+            result = await asyncio.to_thread(safety_override().renew, "slack")
             if result.renewed:
                 sel().log_api_access(
                     caller=user_id,
@@ -1669,7 +1639,7 @@ async def _handle_slash_command(
         agent_name = parts[1]
         if agent_name.lower() in ("default", "off"):
             try:
-                _set_default_agent("")
+                await run_config_write(_set_default_agent, "")
             except ValueError as e:
                 await slack.post_message(channel, f"❌ {e}", reply_ts)
                 return ""
@@ -1693,7 +1663,7 @@ async def _handle_slash_command(
             )
             return ""
         try:
-            _set_default_agent(resolved)
+            await run_config_write(_set_default_agent, resolved)
         except ValueError as e:
             await slack.post_message(channel, f"❌ {e}", reply_ts)
             return ""
@@ -2037,7 +2007,7 @@ async def _handle_slash_command(
                     )
                     return ""
                 agent_name = resolved
-            _persist_channel_config(channel, agent=agent_name)
+            await run_config_write(_persist_channel_config, channel, agent=agent_name)
             _reload_orch_cfg()
             sel().log_api_access(
                 caller=user_id,
@@ -2059,7 +2029,7 @@ async def _handle_slash_command(
             )
             return ""
 
-        _persist_channel_config(channel, activation=subcmd)
+        await run_config_write(_persist_channel_config, channel, activation=subcmd)
         _reload_orch_cfg()
         sel().log_api_access(
             caller=user_id,
@@ -2148,11 +2118,14 @@ def build_timing_footer(
     if client is not None:
         try:
             ctx_pct = round(client.context_usage_pct())
-            ctx_icon = (
-                "🔴"
-                if ctx_pct >= 70
-                else "🟠" if ctx_pct >= 50 else "🟡" if ctx_pct >= 30 else "🟢"
-            )
+            if ctx_pct >= 70:
+                ctx_icon = "🔴"
+            elif ctx_pct >= 50:
+                ctx_icon = "🟠"
+            elif ctx_pct >= 30:
+                ctx_icon = "🟡"
+            else:
+                ctx_icon = "🟢"
             footer_text = f"Finished in {duration} · {ctx_icon} ctx {ctx_pct}%"
         except Exception:
             logger.debug("Failed to retrieve context usage", exc_info=True)
@@ -2168,12 +2141,18 @@ def _append_footer_actions(
     thread_ts: str | None,
     linked_session_key: str | None,
     dashboard_state: object | None,
+    staleness_token: str | None = None,
 ) -> list[dict]:
-    """Append OPTIONS checkboxes and/or Link to Dashboard button to footer blocks."""
+    """Append OPTIONS checkboxes and/or Link to Dashboard button to footer blocks.
+
+    *staleness_token* must be minted by the caller, which is async and can do the
+    transcript read off the event loop. Absent it the control posts untokened and
+    clicks on it are honoured unconditionally.
+    """
     if options:
         from kiro_crew.slack.format import build_options_blocks
 
-        footer_blocks.extend(build_options_blocks(options))
+        footer_blocks.extend(build_options_blocks(options, staleness_token=staleness_token))
     if thread_ts and not linked_session_key and dashboard_state:
         from kiro_crew.slack.format import build_link_dashboard_button
 
@@ -2254,7 +2233,7 @@ async def _handle_compact_command(
             # another timeout, or the graceful "timed out" branch is
             # unreachable and a slow-but-healthy session gets destroyed.
             await asyncio.wait_for(provider.compact(), timeout=120)
-            cr = await provider.wait_for_compaction(timeout=120.0)
+            cr = await provider.wait_for_compaction()
             if cr["type"] == "completed":
                 # ``summary`` is model-facing compacted context, not a
                 # user-facing receipt. Never publish its orchestration text.
@@ -2275,11 +2254,17 @@ async def _handle_compact_command(
                 await slack.post_message(channel, "❌ Compaction failed unexpectedly.", reply_ts)
             except Exception:
                 logger.debug("Failed to post compact error for %s", session_key, exc_info=True)
+            # Drop the wedged native conversation, NOT the session's channel
+            # identity: the map entry carries the thread linkage that
+            # ``get_session_for_thread`` routes every later reply through, so a
+            # full ``destroy`` would fork this thread into a fresh session with
+            # none of its context. Housekeeping never unlinks (see
+            # ``SessionMap.prune`` and ``SessionManager._recycle_held``).
             try:
-                await sessions.destroy(session_key)
+                await sessions.discard_conversation(session_key)
             except Exception:
                 logger.warning(
-                    "Failed to destroy session %s after compact failure",
+                    "Failed to discard conversation %s after compact failure",
                     session_key,
                     exc_info=True,
                 )
@@ -2414,7 +2399,9 @@ async def maybe_handle_keyword_command(
         if spawn_reply:
             await slack.post_message(channel, spawn_reply, reply_ts)
             if conversation_log and not _is_slack_restricted(session_key):
-                save_conversation_turn(
+                # Offloaded via the shared choke point -- see
+                # save_conversation_turn_off_loop for why every async caller must.
+                await save_conversation_turn_off_loop(
                     conversation_log,
                     session_key,
                     text,
@@ -2427,11 +2414,13 @@ async def maybe_handle_keyword_command(
 
     # ── Task runner: "run <spec-path>" ──
     if task_runner:
-        run_reply = await _handle_run_command(text, task_runner, slack, channel, reply_ts)
+        run_reply = await _handle_run_command(
+            text, task_runner, slack, channel, reply_ts, session_key=session_key
+        )
         if run_reply:
             await slack.post_message(channel, run_reply, reply_ts)
             if conversation_log and not _is_slack_restricted(session_key):
-                save_conversation_turn(
+                await save_conversation_turn_off_loop(
                     conversation_log,
                     session_key,
                     text,
@@ -2444,11 +2433,13 @@ async def maybe_handle_keyword_command(
 
     # ── Natural language cron: intercept wakeup patterns ──
     if cron_service:
-        cron_reply = await _handle_cron_command(text, cron_service, channel, reply_ts)
+        cron_reply = await _handle_cron_command(
+            text, cron_service, channel, reply_ts, user_id=user_id
+        )
         if cron_reply:
             await slack.post_message(channel, cron_reply, reply_ts)
             if conversation_log and not _is_slack_restricted(session_key):
-                save_conversation_turn(
+                await save_conversation_turn_off_loop(
                     conversation_log,
                     session_key,
                     text,
@@ -2469,6 +2460,8 @@ async def maybe_route_linked_thread(
     channel: str,
     slack: SlackClientOps,
     reply_ts: str,
+    target_slot: Any | None = None,
+    route_pinned: bool = False,
 ) -> bool:
     """Route a Slack message to a linked dashboard slot, if one is linked.
 
@@ -2481,14 +2474,26 @@ async def maybe_route_linked_thread(
     unauthorized user was denied. Returns ``False`` when normal routing should
     continue: no dashboard state, no linked slot, or a ``!``-bang command
     (which is intentionally allowed to fall through to normal handling).
+
+    *route_pinned* makes *target_slot* authoritative instead of resolving the
+    thread's CURRENT owner. An OPTIONS answer is accepted against the
+    conversation that asked the question, but the dispatch runs as a separate
+    task -- so re-resolving here would let a link, relink or unlink landing in
+    between deliver that answer into a different conversation. Pinning is
+    tri-state on purpose: a pinned ``None`` means "this answer belongs to no
+    slot", so a thread linked AFTER acceptance cannot capture a native answer
+    either.
     """
     if not (_dashboard_state and hasattr(_dashboard_state, "get_linked_slot")):
         return False
-    # The dashboard _slack_to_slot map is keyed by the bare Slack thread_ts
-    # (reply_ts), NOT the namespaced session key — look up with reply_ts so
-    # canonical ``slack:<ts>`` session keys still hit linked slots. session_key
-    # is kept for the SEL logging below.
-    _linked_slot = _dashboard_state.get_linked_slot(reply_ts)
+    if route_pinned:
+        _linked_slot = target_slot
+    else:
+        # The dashboard _slack_to_slot map is keyed by the bare Slack thread_ts
+        # (reply_ts), NOT the namespaced session key — look up with reply_ts so
+        # canonical ``slack:<ts>`` session keys still hit linked slots. session_key
+        # is kept for the SEL logging below.
+        _linked_slot = _dashboard_state.get_linked_slot(reply_ts)
     if not _linked_slot:
         return False
 
@@ -2523,12 +2528,29 @@ async def maybe_route_linked_thread(
     if not _linked_slot.running:
         from kiro_crew.dashboard.chat import _run_chat
 
-        _chat_task = asyncio.create_task(_run_chat(_dashboard_state, _linked_slot, text))  # type: ignore[arg-type]
+        _chat_task = asyncio.create_task(
+            _run_chat(
+                _dashboard_state,  # type: ignore[arg-type]
+                _linked_slot,
+                text,
+                _directive_user_origin=True,
+            )
+        )
         _linked_slot.task = _chat_task
         _dashboard_state._background_tasks.add(_chat_task)  # type: ignore[attr-defined]
         _chat_task.add_done_callback(_dashboard_state._background_tasks.discard)  # type: ignore[attr-defined]
     else:
-        _linked_slot.queue_append(text)
+        # circular import: session_control pulls in dashboard modules at module level.
+        from kiro_crew.dashboard.session_control import containment_meta
+
+        # Stamp the admission-time containment (#5911). A linked slot records
+        # linked=True here, so its own channel's queued messages keep draining;
+        # only a constraint that appears AFTER this enqueue drops the entry.
+        _linked_slot.queue_append(
+            text,
+            meta=containment_meta(_dashboard_state, _linked_slot),  # type: ignore[arg-type]
+            directive_user_origin=True,
+        )
     _dashboard_state.push_slots_update()  # type: ignore[attr-defined]
     sel().log_tool_invocation(
         session_key=session_key,
@@ -2562,6 +2584,9 @@ async def handle_message(
     channel_agent: str | None = None,
     user_display_name: str | None = None,
     action_context: str | None = None,
+    target_slot_name: str | None = None,
+    route_pinned: bool = False,
+    asker_key: str | None = None,
     from_trusted_bot: bool = False,
     channel_activation: str | None = None,
     had_voice_input: bool = False,
@@ -2612,8 +2637,27 @@ async def handle_message(
     _agent = _thread_agents.get(session_key) or channel_agent or _get_default_agent() or None
 
     # ── Linked thread intercept: route to dashboard slot if linked ──
-    if await maybe_route_linked_thread(text, session_key, user_id, channel, slack, reply_ts):
+    # Resolved from the NAME captured when the answer was accepted, not from the
+    # thread's current owner: the name survives a link change, a live slot object
+    # would not tell us whether it is still the right destination. A pinned name
+    # that no longer resolves falls through to normal handling rather than
+    # inventing a target.
+    _target_slot = None
+    if route_pinned and target_slot_name and _dashboard_state:
+        _target_slot = getattr(_dashboard_state, "_slots", {}).get(target_slot_name)
+
+    if await maybe_route_linked_thread(
+        text,
+        session_key,
+        user_id,
+        channel,
+        slack,
+        reply_ts,
+        target_slot=_target_slot,
+        route_pinned=route_pinned,
+    ):
         return
+
     logger.info(
         "🔍 handle_message: thread_ts=%s msg_ts=%s → session_key=%s channel=%s",
         thread_ts,
@@ -2628,7 +2672,7 @@ async def handle_message(
         if hook_result.action == HOOK_REPLY:
             await slack.post_message(channel, hook_result.text, reply_ts)
             if conversation_log and not _is_slack_restricted(session_key):
-                save_conversation_turn(
+                await save_conversation_turn_off_loop(
                     conversation_log,
                     session_key,
                     text,
@@ -2799,6 +2843,31 @@ async def handle_message(
         channel_agent=channel_agent,
     ):
         return
+
+    # A new turn supersedes whatever question the previous one ended on, so any
+    # OPTIONS control still live in this thread stops being answerable.
+    #
+    # Placed HERE, below every short-circuit above, because only a message that
+    # actually starts a turn supersedes anything. ``status``, a permission
+    # denial, a modifier-only message, a hook's canned reply and the keyword
+    # commands all answer and return WITHOUT running the agent, so the
+    # conversation has not moved and the pending question is still the one being
+    # waited on. Expiring for those spends a LIVE control and leaves valid
+    # choices unanswerable — the exact inverse of the stale click this lifecycle
+    # exists to prevent. The denial case matters most: an unauthorized caller in
+    # the thread must not be able to destroy the owner's pending question.
+    # Keeping this at one point below the short-circuits, rather than guarding
+    # each of them, means a shortcut added later inherits the right behaviour.
+    #
+    # Resolve the OWNING session, not the ``slack:<ts>`` key derived above: the
+    # control is recorded under whichever session owns the thread, and for a
+    # dashboard-linked thread that is its ``dashboard:chat-N`` key — the same
+    # distinction the linked-thread lookup relies on. Expiring under the wrong
+    # key silently no-ops and leaves the control clickable.
+    await expire_slack_options(
+        cast("DashboardState | None", get_dashboard_state()),
+        sessions.get_session_for_thread(reply_ts) or session_key,
+    )
 
     status_ctrl = StatusReactionController(
         slack,
@@ -2989,14 +3058,36 @@ async def handle_message(
     # namespaced session key. A self-linked Slack thread resolves to our own
     # canonical key (no-op rewrite); a dashboard-linked thread resolves to its
     # ``dashboard:chat-N`` key.
-    linked_session_key = sessions.get_session_for_thread(reply_ts)
-    if linked_session_key and linked_session_key != session_key:
+    # Read the thread's owner ONCE and keep it truthful. Three separate decisions
+    # below consume it -- whether to re-route this turn, whether to CLAIM the
+    # thread, and whether to mirror into a dashboard slot -- and a pinned answer
+    # needs a different answer for each. Falsifying this single value to steer all
+    # three is what made the pin land wrong three times running.
+    thread_owner_key = sessions.get_session_for_thread(reply_ts)
+    # Mirror/footer value: a pinned answer belongs to the conversation that ASKED,
+    # not to whoever owns the thread now, so it mirrors nowhere. (A pinned asker
+    # that *does* hold a slot never reaches here -- maybe_route_linked_thread
+    # already delivered the turn into that slot and returned.)
+    linked_session_key = None if route_pinned else thread_owner_key
+    if route_pinned:
+        # A pinned answer names its own conversation, so the thread's CURRENT
+        # owner has no say -- rewriting the key here is what let a pinned answer
+        # land in whoever took the thread over in the meantime.
+        #
+        # Suppressing that rewrite is only half of it. A pinned asker that holds no
+        # slot -- a cron or native conversation -- would otherwise be left running
+        # under the bare Slack thread key, which for a cron asker is a DIFFERENT
+        # conversation: the answer would open a new session and take the thread
+        # mapping with it. So the asker becomes the session key outright.
+        if asker_key:
+            session_key = asker_key
+    elif thread_owner_key and thread_owner_key != session_key:
         logger.info(
             "🔗 Slack thread %s linked to dashboard session %s — routing there",
             session_key,
-            linked_session_key,
+            thread_owner_key,
         )
-        session_key = linked_session_key
+        session_key = thread_owner_key
 
     client: LLMProvider | None = None
     try:
@@ -3008,13 +3099,28 @@ async def handle_message(
             session_key, agent=_agent, channel_id=channel
         )
         _acquired = True
+        # Expire AGAIN now the turn is serialized — see the same call in
+        # transport_dispatch. The pass earlier in this function runs before
+        # `get_or_create` waits its turn, so two messages arriving together both
+        # clear the OLD control and neither clears the NEW one the first turn
+        # posts on its way out, leaving live buttons for a superseded question.
+        await expire_slack_options(
+            cast("DashboardState | None", get_dashboard_state()),
+            sessions.get_session_for_thread(reply_ts) or session_key,
+        )
         if is_new:
             await sessions.set_channel(session_key, channel)
-        if not linked_session_key:
+        if thread_owner_key is None and not route_pinned:
             # Self-link: thread index maps the bare Slack thread_ts to this
             # session's canonical key. reply_ts (not session_key) is the true
             # Slack timestamp — storing the namespaced key as slack_thread_ts
             # would corrupt reply routing.
+            #
+            # A PINNED answer never claims the thread, however empty the index
+            # looks. Pinning exists so an accepted click cannot mutate thread
+            # routing: a cron or native asker claiming the thread here would
+            # evict its real owner, and every later human reply would land in
+            # the cron conversation instead.
             sessions.set_slack_link(session_key, reply_ts, channel)
         logger.info(
             "🔍 session state: key=%s is_new=%s resumed=%s",
@@ -3087,9 +3193,10 @@ async def handle_message(
 
             # Fallback thread metadata: when thread_parent_text is unavailable
             # (e.g. fetch_message failed), try conversations.replies to get parent info.
-            # Note: requires channels:history (public) or groups:history (private, Level 3
-            # High Risk on Amazon Slack). Gracefully degrades — if scope is missing, thread
-            # context is simply skipped.
+            # Note: requires channels:history (public) or groups:history (private). Both
+            # ship in the manifest, but installs created before groups:history was added
+            # need a reinstall to gain it. Gracefully degrades — if scope is missing,
+            # thread context is simply skipped.
             _thread_meta: str | None = None
             if (
                 is_new
@@ -3611,7 +3718,7 @@ async def handle_message(
             except Exception:
                 logger.debug("Failed to delete thinking placeholder", exc_info=True)
         if conversation_log and not _is_slack_restricted(session_key):
-            save_conversation_turn(
+            await save_conversation_turn_off_loop(
                 conversation_log,
                 session_key,
                 text,
@@ -3630,11 +3737,33 @@ async def handle_message(
             thinking_accumulated += ("\n\n" if thinking_accumulated else "") + inline_thinking
 
     actually_streamed = use_slack_stream and bool(stream_ts)
-    final_text = (
-        to_slack_mrkdwn(accumulated, keep_tables=actually_streamed) if accumulated else _NO_RESPONSE
-    )
+    # render_one_for_slack normalises ANSI and redacts BEFORE converting, then
+    # again after. Converting first (as this did) let to_slack_mrkdwn's ANSI strip
+    # reassemble a credential the escapes had broken up, and let its 39,000-char
+    # self-truncation cut one in half before the regex below could match it.
+    # keep_tables is forced here because Slack's rich streaming renderer draws
+    # tables itself when the stream actually started.
+    #
+    # _render_redacted carries whether that internal redaction fired. It is
+    # load-bearing, not informational: the answer has ALREADY been posted
+    # incrementally, and the only thing that replaces the visible copy is the
+    # final-update condition below. The outer passes cannot supply that signal
+    # any more, because by the time they run the render has already cleaned the
+    # text and they find nothing left to redact.
+    # Extract the OPTIONS tag from the RAW accumulated text, BEFORE rendering.
+    # It is a plain-text marker at the very end of the turn, so rendering first
+    # makes the controls hostage to the render's size ceiling: a >39,000-char
+    # answer ending in [OPTIONS: ...] is truncated, the tag goes with the tail,
+    # and the buttons silently never appear. Matches the ordering used by the
+    # cron, subagent-completion and dashboard-mirror paths.
+    _body_text, options = extract_options(accumulated) if accumulated else ("", [])
 
-    # Scan for URL exfiltration before posting to Slack (link previews auto-fetch)
+    _render = render_one_for_slack(_body_text, keep_tables=actually_streamed)
+    final_text = _render.text or _NO_RESPONSE
+    _render_redacted = _render.redacted
+
+    # Second pass at the boundary: the decorator seam below can still introduce
+    # text, and these warning lists drive the final chat_update decision.
     final_text, exfil_warnings = redact_exfiltration_urls(final_text)
     for w in exfil_warnings:
         logger.warning("Exfiltration URL redacted in response: %s", w)
@@ -3642,10 +3771,7 @@ async def handle_message(
     for w in cred_warnings:
         logger.warning("Credential redacted in response: %s", w)
 
-    # Extract OPTIONS buttons from response and post as Block Kit
-    from kiro_crew.slack.format import extract_options
-
-    clean_text, options = extract_options(final_text)
+    clean_text = final_text
 
     # Outbound-reply decorator seam (Default: identity, OSS-identical). The model
     # has finished speaking, so this is the outbound half of an active
@@ -3712,7 +3838,7 @@ async def handle_message(
         logger.info("Review mode: ephemeral draft sent to %s in %s", user_id, channel)
         # Persist conversation (draft counts as a turn)
         if conversation_log and not _is_slack_restricted(session_key):
-            save_conversation_turn(
+            await save_conversation_turn_off_loop(
                 conversation_log,
                 session_key,
                 text,
@@ -3740,11 +3866,17 @@ async def handle_message(
     if use_slack_stream and stream_ts:
         # Rich AI renderer is now locked in by stop_stream above.
         # Only overwrite via chat_update when redaction modified the text —
-        # either per-chunk during streaming (_stream_had_redaction) or caught
-        # by the final scan (exfil_warnings/cred_warnings). The security
-        # invariant requires the final visible message reflect the redacted
-        # accumulated text; all other cases leave the rich render intact.
-        if _stream_had_redaction or exfil_warnings or cred_warnings:
+        # either per-chunk during streaming (_stream_had_redaction), inside the
+        # final render (_render_redacted), or caught by the post-decorator scan
+        # (exfil_warnings/cred_warnings). The security invariant requires the
+        # final visible message reflect the redacted accumulated text; all other
+        # cases leave the rich render intact.
+        #
+        # _render_redacted is the one that catches an ANSI-obfuscated credential:
+        # the per-chunk StreamRedactor sees raw chunks and does not strip escapes,
+        # so it can miss one that only becomes matchable after normalisation —
+        # and the post-decorator scan sees text the render has already cleaned.
+        if _stream_had_redaction or _render_redacted or exfil_warnings or cred_warnings:
             fallback_text = _convert_tables(clean_text) if clean_text else _NO_RESPONSE
             await _safe_final_update(
                 slack, channel, stream_ts, fallback_text or _NO_RESPONSE, reply_ts
@@ -3763,7 +3895,10 @@ async def handle_message(
     # reads reasoning → answer. Otherwise (the stream started before any
     # reasoning arrived) fall back to a post after the answer.
     if thinking_accumulated and _show_thinking:
-        thinking_mrkdwn = to_slack_mrkdwn(thinking_accumulated)
+        # thinking_accumulated is built from raw event text and, unlike the answer
+        # stream, has no StreamRedactor upstream -- so this render is its ONLY
+        # redaction. Ordering matters most here for that reason.
+        thinking_mrkdwn = render_one_for_slack(thinking_accumulated).text
         thinking_mrkdwn, exfil_warnings = redact_exfiltration_urls(thinking_mrkdwn)
         for w in exfil_warnings:
             logger.warning("Exfiltration URL redacted in thinking: %s", w)
@@ -3790,17 +3925,127 @@ async def handle_message(
         except Exception:
             logger.debug("Failed to delete empty thinking placeholder", exc_info=True)
 
+    # Persist the turn BEFORE posting anything that invites an answer to it.
+    # The control below carries a staleness token derived from this session's last
+    # persisted transcript row, so posting it while this turn is still unwritten
+    # would stamp it with the PREVIOUS turn's position -- and these two rows
+    # landing straight afterwards would read as the conversation having moved on,
+    # refusing the very click the control was posted for.
+    #
+    # Durability-before-invitation is also right on its own terms: a question
+    # about a turn that has no record is not answerable after a restart.
+    _skip_writes = _is_slack_restricted(session_key)
+    _turn_row_ts: str | None = None
+    if conversation_log and not _skip_writes:
+        # The per-turn hot path: two appends every turn, so this is where the
+        # ~12ms of loop time was paid most often.
+        _turn_row_ts = await save_conversation_turn_off_loop(
+            conversation_log,
+            session_key,
+            text,
+            accumulated,
+            source_thread=session_key,
+            source_user=user_id,
+            agent=_agent,
+        )
+
     # ── Timing footer ──
     elapsed = time.monotonic() - _t0
     footer_blocks, footer_text = build_timing_footer(elapsed, client)
+    # Gated on `options` alone. A top-level Slack message has no ``thread_ts``, so
+    # gating on it left every root-thread control untokened -- unprotected on
+    # exactly the path a restart strands. ``reply_ts`` is the thread this control
+    # actually lands in (``thread_ts or msg_ts``), and ``session_key`` is the
+    # conversation that ran this turn: resolving the asker from the thread instead
+    # would name whoever owns it at mint time, so a link landing mid-turn would
+    # stamp the control with a session that never asked the question.
+    #
+    # The position comes from the row this turn WROTE, not from re-reading the
+    # tail. The session permit is released well above here, so a queued second
+    # turn can persist in between; a re-read would then hand this control the
+    # NEWER turn's position and a click on it -- by then obsolete -- would read as
+    # current and be accepted. Minting from our own row also means no I/O and no
+    # await here at all. No row (restricted session, or no log) means no provable
+    # position, so the control posts untokened and its clicks are honoured.
+    _options_token = (
+        mint_options_token(
+            cast("DashboardState | None", _dashboard_state),
+            session_key,
+            _turn_row_ts,
+        )
+        if options and _turn_row_ts
+        else None
+    )
     footer_blocks = _append_footer_actions(
         footer_blocks,
         options,
         thread_ts,
         linked_session_key,
         _dashboard_state,
+        _options_token,
     )
-    await slack.post_blocks(channel, footer_blocks, footer_text, reply_ts)
+    _footer_ts = await slack.post_blocks(channel, footer_blocks, footer_text, reply_ts)
+    if options and _footer_ts:
+        # Remember this turn's OPTIONS control so the next turn can strike it
+        # through once the conversation has moved past the question it asked.
+        #
+        # Resolved ONCE and reused by the cleanup below. The record and the
+        # expiry have to agree on the owner key or they can never pair up: a
+        # thread linked to a dashboard mid-turn changes owner, so recording under
+        # the key this turn started with files the control where the next turn's
+        # expiry will not look. Reading it twice would reopen the same split if a
+        # link landed in between.
+        _options_owner = sessions.get_session_for_thread(reply_ts) or session_key
+        try:
+
+            remember_slack_options(
+                cast("DashboardState | None", get_dashboard_state()),
+                _options_owner,
+                PostedOptions(
+                    channel=channel,
+                    ts=_footer_ts,
+                    choices=tuple(options),
+                    blocks=tuple(footer_blocks),
+                    text=footer_text,
+                ),
+            )
+        except Exception:
+            logger.debug("Failed to record OPTIONS control", exc_info=True)
+
+        # The conversation can move on while post_blocks is in flight -- a queued
+        # message can acquire the permit this turn already released and run a whole
+        # turn underneath us. The control we just posted would then be asking a
+        # question nobody is on any more.
+        #
+        # Judged by the SAME predicate the click paths use, against the token that
+        # went out on the control. That is the whole point of minting it: the
+        # question "has this conversation moved past this control" has one answer,
+        # computed one way, whether it is asked here or when a click arrives.
+        #
+        # Cosmetic. A click on a superseded control is refused on its own terms, so
+        # failing to strike it through leaves the thread untidy, not unsafe.
+        _superseded = _options_token is not None and await options_control_is_stale(
+            cast("DashboardState | None", get_dashboard_state()),
+            _options_token,
+            reply_ts,
+        )
+        if _superseded:
+            try:
+                # Narrowed to OUR footer's ts, never a session-wide drain: the
+                # very turn that superseded us can finish while we were awaiting
+                # post_blocks and record its OWN live control on this session, and
+                # draining the slot would strike that newer question through --
+                # silencing the one the conversation is now waiting on.
+                await expire_slack_options(
+                    cast("DashboardState | None", get_dashboard_state()),
+                    _options_owner,
+                    ts=_footer_ts,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to expire OPTIONS control superseded mid-post",
+                    exc_info=True,
+                )
 
     # ── Voice reply (fire-and-forget, non-blocking) ──
     # Triggers when: (a) user has opted in globally or per-thread via !voice,
@@ -3866,18 +4111,9 @@ async def handle_message(
                 )
 
     # ── Update task banner with final state ──
-    # ── Persist conversation history ──
-    _skip_writes = _is_slack_restricted(session_key)
+    # History was persisted earlier, above the OPTIONS control, so that the
+    # control's staleness token names this turn rather than the one before it.
     if conversation_log and not _skip_writes:
-        save_conversation_turn(
-            conversation_log,
-            session_key,
-            text,
-            accumulated,
-            source_thread=session_key,
-            source_user=user_id,
-            agent=_agent,
-        )
         if consolidator and _stop_reason != STOP_REASON_CANCELLED:
             consolidator.maybe_consolidate(session_key)
 
@@ -3901,43 +4137,30 @@ async def handle_message(
         except Exception:
             logger.debug("Failed to mirror Slack message to dashboard", exc_info=True)
     # ── Auto-title Slack thread (fire-and-forget) ──
-    # Claim-early-unclaim-on-failure pattern: mark titled immediately to prevent
-    # duplicate tasks from concurrent messages. If the background task fails or
-    # returns SKIP, it unclaims the key so the next message retries. A message
-    # arriving between claim and unclaim is intentionally skipped (no duplicate).
-    if not _had_error and session_key not in _titled_threads and not _skip_writes:
-        _mark_titled(session_key)  # claim early to prevent duplicate tasks
-        _t = asyncio.create_task(
-            _maybe_auto_title_slack(
-                slack, sessions, channel, session_key, conversation_log, text, accumulated
+    # Claim-early-unclaim-on-failure pattern: ``try_claim`` checks and marks in one
+    # synchronous step, so concurrent messages (and the transport path, which
+    # claims through the same shared tracker) cannot both fire a task. If the
+    # background task fails or returns SKIP, it unclaims the key so the next
+    # message retries. A message arriving between claim and unclaim is
+    # intentionally skipped (no duplicate).
+    if not _had_error and not _skip_writes and auto_title.try_claim(session_key):
+        track_background_task(
+            asyncio.create_task(
+                _maybe_auto_title_slack(
+                    slack, sessions, channel, session_key, conversation_log, text, accumulated
+                )
             )
         )
-        _background_tasks.add(_t)
-        _t.add_done_callback(_background_tasks.discard)
 
 
 # ── Slack thread auto-title ─────────────────────────────────────────────
+#
+# The turn, the claim tracker, the tool-free stream, the prompt and the
+# title-cleaning rules all live in ``messaging.auto_title``. Slack supplies the
+# one thing that is genuinely per-channel — renaming the Slack thread itself.
 
-_auto_title_lock: asyncio.Lock | None = None
-
-
-def _get_auto_title_lock() -> asyncio.Lock:
-    """Lazily create the lock inside a running event loop."""
-    global _auto_title_lock
-    if _auto_title_lock is None:
-        _auto_title_lock = asyncio.Lock()
-    return _auto_title_lock
-
-
-def _build_title_prompt(user_msg: str, assistant_msg: str) -> str:
-    """Build title prompt using f-string to avoid str.format() KeyError on curly braces."""
-    return (
-        "You are a session naming agent. Given the conversation below, decide if the topic "
-        "is clear enough to name.\n\n"
-        "If YES: reply with ONLY a short title (3-6 words). No quotes, no punctuation.\n"
-        "If NO (too vague, just greetings, or unclear topic): reply with exactly SKIP\n\n"
-        f"user: {user_msg}\nassistant: {assistant_msg}"
-    )
+_get_auto_title_lock = auto_title.get_lock
+_build_title_prompt = auto_title.build_title_prompt
 
 
 async def _maybe_auto_title_slack(
@@ -3950,67 +4173,20 @@ async def _maybe_auto_title_slack(
     assistant_text: str,
 ) -> None:
     """Generate and set a Slack thread title after the first response."""
-    try:
-        from kiro_crew.session import BACKGROUND_KEY
 
-        prompt = _build_title_prompt(user_text[:200], assistant_text[:200])
-        async with _get_auto_title_lock():
-            client, _, _ = await sessions.get_or_create(BACKGROUND_KEY)
-            title = ""
-            try:
-
-                async def _stream_title() -> str:
-                    t = ""
-                    async for event in client.stream(prompt):
-                        if event.kind == EVENT_TEXT_CHUNK:
-                            t += event.text
-                        elif event.kind == EVENT_PERMISSION_REQUEST:
-                            sel().log_api_access(
-                                caller="system",
-                                operation="auto_title.tool_rejected",
-                                outcome="denied",
-                                source="slack",
-                                resources=str(event.request_id),
-                            )
-                            await client.reject_tool(event.request_id)
-                        elif event.kind == EVENT_COMPLETE:
-                            break
-                    return t
-
-                title = await asyncio.wait_for(_stream_title(), timeout=30)
-            finally:
-                sessions.release(BACKGROUND_KEY)
-
-        title = title.split("\n")[0].strip("\"'. \t")
-        title = title.replace("<", "").replace(">", "")  # neutralize Slack mrkdwn links
-        if not title or title.upper() == "SKIP":
-            _titled_threads.pop(session_key, None)  # allow retry on next exchange
-            return
-        title, _ = redact_exfiltration_urls(title)
-        title, _ = redact_credentials(title)
-        title = title[:80]
-
-        if _titled_threads.get(session_key) == "manual":
-            return  # manual title was set while we were streaming
+    async def _set_thread_title(title: str) -> None:
         await slack.set_thread_title(channel, session_key, title)
-        if conversation_log:
-            try:
-                await asyncio.to_thread(conversation_log.set_title, session_key, title)
-            except Exception:
-                logger.debug(
-                    "Failed to set conversation log title for %s", session_key, exc_info=True
-                )
-        sel().log_api_access(
-            caller="system",
-            operation="slack.thread_auto_title",
-            outcome="allowed",
-            source="slack",
-            resources=f"{channel}:{session_key}",
-        )
-        logger.info("Slack thread auto-titled: %s → %r", session_key, title)
-    except Exception:
-        _titled_threads.pop(session_key, None)  # allow retry on transient failure
-        logger.debug("Slack thread auto-title failed for %s", session_key, exc_info=True)
+
+    await auto_title.maybe_auto_title(
+        sessions,
+        conversation_log,
+        session_key,
+        user_text,
+        assistant_text,
+        source="slack",
+        resources=f"{channel}:{session_key}",
+        set_channel_title=_set_thread_title,
+    )
 
 
 async def _reject_orphaned_tool(provider: LLMProvider, request_id: "str | int") -> None:
@@ -4273,6 +4449,9 @@ async def handle_interaction(
                     error="not_thread_owner",
                 )
                 return None
+            # Imported at call time on purpose: tests patch
+            # ``kiro_crew.session.SessionMap`` to drive the fail-closed path, and
+            # only a call-time rebind observes that patch.
             from kiro_crew.session import SessionMap
 
             session_key = thread_ts
@@ -4294,12 +4473,12 @@ async def handle_interaction(
                     error="session_map_lookup_failed",
                 )
                 return None
-            _trusted_sessions.add(session_key)
-            # Propagate to subagents: the subagent loop reads
-            # get_approval_policy(parent)=="auto" (see subagent.py), so the
-            # in-memory _trusted_sessions set alone never reaches them.
-            if sessions is not None:
-                sessions.set_approval_policy(session_key, "auto")
+            # Through the shared grant, which owns BOTH halves: the in-memory
+            # mapping the driver reads and the parent approval_policy a subagent
+            # reads (see subagent.py). Poking the container directly is what let a
+            # revoke clear one half and leave the other, so the two are no longer
+            # separable at a call site.
+            add_trusted_session(session_key, sessions)
             logger.info("Trust mode ON (late click) for session %s", session_key)
             sel().log_api_access(
                 caller=user_id,
@@ -4339,9 +4518,7 @@ async def handle_interaction(
                 del _pending_approvals[key]
                 return _ACTION_REJECT
             elif pending.session_key:
-                _trusted_sessions.add(pending.session_key)
-                if sessions is not None:
-                    sessions.set_approval_policy(pending.session_key, "auto")
+                add_trusted_session(pending.session_key, sessions)
                 logger.info("Trust mode ON for session %s", pending.session_key)
             else:
                 logger.warning(
@@ -4473,64 +4650,13 @@ def _build_approval_blocks(event: LLMEvent, is_dm: bool = True, source: str = ""
     return blocks
 
 
-async def _remove_all_jobs(cron_service: CronService) -> str:
-    """Remove all cron jobs and return a summary (event-loop-safe)."""
-    jobs = cron_service.list_jobs(include_disabled=True)
-    if not jobs:
-        return "No cron jobs to remove."
-    lines = []
-    for j in jobs:
-        # j.name is free-form user/LLM-supplied text reaching a Slack reply and
-        # the persisted conversation log — redact it like the `cron list` branch
-        # does for j.message (j.id is a generated UUID, left as-is).
-        safe_name, _ = redact_credentials(redact_exfiltration_urls(j.name)[0])
-        lines.append(f"- `{j.id}` — {safe_name}")
-    # One batch lock/reload/save, offloaded to a worker thread — never parks the
-    # Slack gateway loop. A transiently-contended store yields the same retryable
-    # "busy" reply as the single-job remove/pause/resume paths rather than
-    # aborting the Slack message handler.
-    try:
-        await cron_service.remove_jobs([j.id for j in jobs])
-    except CronStoreBusy:
-        return "⏳ Cron store busy — try again in a moment."
-    return f"✅ Removed {len(lines)} cron job(s):\n" + "\n".join(lines)
-
-
 def _handle_spawn_command(text: str, manager: SubagentManager, session_key: str = "") -> str | None:
     """Intercept spawn/bg keyword commands. Returns reply or None."""
-    t = text.strip()
-    low = t.lower()
-
-    for prefix in ("spawn ", "bg "):
-        if low.startswith(prefix):
-            return _do_spawn(t[len(prefix) :].strip(), manager, session_key)
-    return None
-
-
-def _do_spawn(task: str, manager: SubagentManager, session_key: str = "") -> str | None:
-    """Execute a spawn command. Returns reply string."""
-    if not task:
-        return None
-
-    # "spawn list" / "spawn status"
-    if task.lower() in ("list", "status"):
-        running = manager.running
-        if not running:
-            return "No subagents running."
-        lines = ["*Running subagents:*"]
-        for a in running:
-            elapsed = int(time.time() - a.started)
-            lines.append(f"🔹 `{a.id}` | {elapsed}s | {a.task[:60]}")
-        return "\n".join(lines)
-
-    info = manager.spawn(task, parent_session_key=session_key)
-    if not info:
-        return f"⚠️ Subagent capacity reached ({manager.max_concurrent}). Try again later."
-    return f"🚀 Spawned subagent `{info.id}`\n_{task[:100]}_"
+    return spawn_command_reply(text, manager, session_key)
 
 
 async def _handle_cron_command(
-    text: str, cron_service: CronService, channel: str, thread_ts: str
+    text: str, cron_service: CronService, channel: str, thread_ts: str, user_id: str = ""
 ) -> str | None:
     """Handle cron keyword commands. Returns reply or None.
 
@@ -4538,89 +4664,14 @@ async def _handle_cron_command(
     event-loop-safe ``*_async`` variants instead of parking the Slack gateway
     loop on the store lock; a contended store yields a "busy, retry" reply
     rather than a stall.
+
+    ``user_id`` is the Slack caller, threaded through so the destructive
+    branches can attribute their SEL audit events to the human who issued
+    the command (per-caller identity, matching the dashboard/MCP/CLI paths).
     """
-    t = text.strip().lower()
-    parts = t.split()
-
-    if len(parts) < 2 or parts[0] != "cron":
-        return None
-
-    action = parts[1]
-
-    if action == "list":
-        jobs = cron_service.list_jobs(include_disabled=True)
-        if not jobs:
-            return "No cron jobs scheduled."
-        lines = ["*Your cron jobs:*"]
-        now = time.time()
-        tz_name, _ = get_local_tz()
-        for j in jobs:
-            status = "✅" if j.enabled else "⏸️"
-            sched = format_schedule(j.schedule, tz_name=j.timezone or tz_name)
-            sched, _ = redact_credentials(redact_exfiltration_urls(sched)[0])
-            last = ""
-            if j.last_status == "ok":
-                last = " ✓"
-            elif j.last_status == "error":
-                last = " ❌"
-            nxt = compute_next_run_ts(j, now=now)
-            next_part = ""
-            if nxt is not None:
-                delta = nxt - now
-                if delta >= 86400:
-                    d = int(delta // 86400)
-                    h = int((delta % 86400) // 3600)
-                    rel = f"in {d}d {h}h"
-                elif delta >= 3600:
-                    h = int(delta // 3600)
-                    m = int((delta % 3600) // 60)
-                    rel = f"in {h}h {m}m"
-                elif delta > 0:
-                    m = int(delta // 60)
-                    rel = f"in {m}m" if m >= 1 else "in <1m"
-                else:
-                    rel = "now"
-                next_part = f" | ⏭ {rel}"
-            safe_msg, _ = redact_credentials(redact_exfiltration_urls(j.message)[0])
-            safe_msg = safe_msg[:50]
-            lines.append(f"{status} `{j.id}` | `{sched}` | {safe_msg}{last}{next_part}")
-        return "\n".join(lines)
-
-    if len(parts) < 3:
-        return None
-
-    job_id = parts[2]
-
-    if action == "remove":
-        if job_id == "all":
-            return await _remove_all_jobs(cron_service)
-        try:
-            removed = await cron_service.remove_job_async(job_id)
-        except CronStoreBusy:
-            return "⏳ Cron store busy — try again in a moment."
-        if removed:
-            return f"✅ Removed cron job `{job_id}`"
-        return f"❌ Job `{job_id}` not found"
-
-    if action == "pause":
-        try:
-            paused = await cron_service.enable_job_async(job_id, enabled=False)
-        except CronStoreBusy:
-            return "⏳ Cron store busy — try again in a moment."
-        if paused:
-            return f"⏸️ Paused cron job `{job_id}`"
-        return f"❌ Job `{job_id}` not found"
-
-    if action == "resume":
-        try:
-            resumed = await cron_service.enable_job_async(job_id, enabled=True)
-        except CronStoreBusy:
-            return "⏳ Cron store busy — try again in a moment."
-        if resumed:
-            return f"▶️ Resumed cron job `{job_id}`"
-        return f"❌ Job `{job_id}` not found"
-
-    return None
+    # ``source``/``caller`` carry #5428's attribution into the shared remove-all
+    # audit: the hoist moved the audit's home, not its contract.
+    return await cron_command_reply(text, cron_service, source="slack", caller=user_id)
 
 
 async def _handle_run_command(
@@ -4629,56 +4680,21 @@ async def _handle_run_command(
     slack: SlackClientOps,
     channel: str,
     thread_ts: str,
+    *,
+    session_key: str = "",
 ) -> str | None:
-    """Intercept 'run <path>' keyword commands. Returns reply or None."""
-    t = text.strip()
-    low = t.lower()
+    """Intercept 'run <path>' keyword commands. Returns reply or None.
 
-    if low.startswith("project run "):
-        t = "task run " + t[12:]
-        low = t.lower()
+    ``slack`` / ``channel`` / ``thread_ts`` are unused and were already unused
+    before the reply text was hoisted; they stay because this is the positional
+    shape ``maybe_handle_keyword_command`` and several suites call.
 
-    if not low.startswith("task run "):
-        return None
-
-    arg = t[9:].strip()
-    if not arg:
-        return None
-
-    # "run status"
-    if arg.lower() == "status":
-        status = runner.status()
-        if not status.get("running") and not status.get("status"):
-            return "No task running."
-        return (
-            f"*Task Runner*\n"
-            f"Status: {status.get('status', 'idle')}\n"
-            f"Steps: {status.get('completed', 0)}/{status.get('steps', 0)}\n"
-            f"Current: step {status.get('current_step', 0)}"
-        )
-
-    # "run cancel"
-    if arg.lower() == "cancel":
-        if not runner.running:
-            return "No task running."
-        runner.cancel()
-        return "🛑 Task cancelled."
-
-    # "task run <spec-path>" — start a task
-    if runner.running:
-        return "⚠️ Task runner is already running. Use `task run cancel` first."
-
-    from pathlib import Path
-
-    spec_path = Path(arg).expanduser()
-    if not spec_path.exists():
-        return f"❌ Spec file not found: `{spec_path}`"
-
-    try:
-        await runner.start_background(spec_path, source="chat")
-    except Exception as exc:
-        return f"❌ Failed to start: {exc}"
-    return f"🚀 Task started: `{spec_path.name}`\nUse `task run status` to check progress."
+    ``session_key`` is what lets a task that later blocks on an approval report back
+    to the conversation the operator is watching, instead of only to the owner DM.
+    Keyword-only with a default so the ~25 existing positional call sites are
+    unchanged; omitting it reproduces the old owner-DM-only behaviour exactly.
+    """
+    return await task_command_reply(text, runner, session_key=session_key)
 
 
 async def _handle_sessions_command(
@@ -4694,7 +4710,8 @@ async def _handle_sessions_command(
 ) -> None:
     """Handle the ``sessions`` keyword in DMs.
 
-    Delegates to :func:`kiro_crew.slack.sessions_view._collect_recent_sessions`
+    Delegates to
+    :func:`kiro_crew.slack.sessions_view._collect_recent_sessions_off_loop`
     and :func:`kiro_crew.slack.sessions_view._build_sessions_blocks` so the
     keyword, the ``/<command> sessions`` slash command, and the App Home Tab
     all render the same Block Kit content with the same Resume button wiring.
@@ -4704,7 +4721,7 @@ async def _handle_sessions_command(
     # the access attempt would be invisible to the security pipeline.
     # Mirrors the slash and Home Tab error-path patterns.
     try:
-        rows = _collect_recent_sessions(sessions, limit=_SESSIONS_DEFAULT_LIMIT)
+        rows = await _collect_recent_sessions_off_loop(sessions, limit=_SESSIONS_DEFAULT_LIMIT)
     except Exception as exc:
         # Redact-then-truncate: redact() first so credential / exfil
         # patterns aren't split mid-string by the truncation step.

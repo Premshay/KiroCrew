@@ -17,17 +17,26 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:  # POSIX only; pods are refused on hosts without it (require_backend)
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+from kiro_crew.atomic_write import atomic_write
+from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.platform_compat import IS_LINUX, IS_MACOS
 from kiro_crew.pod import launchd
 from kiro_crew.pod import provision as prov
 from kiro_crew.pod import unit as unit_mod
 from kiro_crew.pod.config import PodConfig
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # Pod names become systemd instance names and path segments; keep them strict.
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,60}$")
@@ -37,6 +46,16 @@ class PodError(RuntimeError):
     """A pod operation could not be completed (bad name, no worktree, mint failed…)."""
 
 
+class PodBackendAbsent(PodError):
+    """The pod service manager is provably not running on this host.
+
+    Raised only from branches where the backend is demonstrably absent (e.g.
+    Linux with no session bus socket and no DBUS_SESSION_BUS_ADDRESS). Callers
+    that need to distinguish 'backend absent, no pods possible' from 'backend
+    present but erroring' can catch this subclass specifically.
+    """
+
+
 def validate_name(name: str) -> str:
     if not name or not _NAME_RE.match(name):
         raise PodError(f"invalid pod name {name!r}")
@@ -44,28 +63,52 @@ def validate_name(name: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Per-pod env file (pinned CHECKOUT= / PORT= / SEED=). Values are single-quoted
-# on write and unquoted on read; unknown keys are preserved on merge.
+# Per-pod env file (pinned CHECKOUT= / PORT= / SEED= / APPROVAL=). Values are
+# single-quoted on write and unquoted on read; unknown keys are preserved on
+# merge.
 # --------------------------------------------------------------------------- #
+
+# Approval modes a pod's gateway may boot with, mirroring the choices on
+# ``kirocrew gateway --approval``. This tuple is the ENFORCEMENT point: the env
+# file is hand-editable, so ``boot`` re-validates against it instead of trusting
+# whatever ``pod up`` wrote. The top-level ``cli.py`` repeats the literal for its
+# argparse ``choices`` because that parser deliberately imports no pod module at
+# startup; argparse is the UX layer, this tuple is the invariant.
+APPROVAL_MODES: tuple[str, ...] = ("reads", "yolo", "interactive")
+
+# Truthy spellings accepted for the boolean ``CRONS=`` key. ``pod up --crons``
+# writes ``"1"``; the others are accepted because the env file is hand-editable
+# and these are the obvious alternatives. Anything else is treated as OFF, which
+# is the pre-existing ``--no-crons`` behavior and the safer of the two.
+CRONS_TRUE: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+
 def read_env_file(cfg: PodConfig, name: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    f = cfg.env_file(name)
+    """Parsed ``KEY='value'`` pairs for pod *name*, ``{}`` on any ``OSError``.
+
+    Fail-OPEN by design, which bounds who may use it: a missing pod, an
+    unreadable pods dir and a comments-only file all yield the same empty
+    mapping, so a caller that must tell "absent" from "exists but cannot be
+    positively read" MUST NOT read the pin through here — see
+    ``dev_fleet._read_pin_strict``, which propagates the failure instead.
+    """
     try:
-        if f.exists():
-            for ln in f.read_text().splitlines():
-                ln = ln.strip()
-                if not ln or ln.startswith("#") or "=" not in ln:
-                    continue
-                key, val = ln.split("=", 1)
-                raw = val.strip()
-                # Strip a single matched surrounding quote pair only (the form
-                # write_env_file emits), so a value that legitimately contains a
-                # quote is not mangled.
-                if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
-                    raw = raw[1:-1]
-                out[key.strip()] = raw
+        text = cfg.env_file(name).read_text()
     except OSError:
-        pass
+        return {}
+    out: dict[str, str] = {}
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        key, val = ln.split("=", 1)
+        raw = val.strip()
+        # Strip a single matched surrounding quote pair only (the form
+        # write_env_file emits), so a value that legitimately contains a quote is
+        # not mangled.
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            raw = raw[1:-1]
+        out[key.strip()] = raw
     return out
 
 
@@ -76,15 +119,35 @@ def write_env_file(cfg: PodConfig, name: str, updates: dict[str, str]) -> None:
     newlines, so a multi-line value would not round-trip. ``--seed`` is
     user-supplied, so reject a newline-bearing value loudly (fail-closed) rather
     than silently writing an un-parseable file.
+
+    **Written atomically**, because readers are deliberately lock-free: ``boot``
+    reads this file without taking the mutex (so ``pod up`` can hold it across
+    the health wait without deadlocking against the process it waits for). An
+    in-place truncating rewrite therefore has a window where a reader — a
+    ``Restart=`` re-exec, say — sees a partial or empty file. A dropped
+    ``APPROVAL`` is not a benign default: ``boot`` leaves ``approval_mode``
+    unset, which falls through to ``cfg.agent.approval_mode`` and lands on
+    auto-approve, the LEAST restrictive outcome. Temp-file + rename means an
+    unlocked reader sees either the old file or the new one, never a torn one.
+
+    The merge additionally re-acquires :func:`pod_name_mutex`, which every
+    mutating pod path already holds at its call site. That is defense in depth
+    for direct callers rather than a fix for a live race, and it mirrors what
+    ``start_pod`` / ``stop_pod`` already do; reentrancy is what makes
+    re-acquiring it inside an outer transaction safe.
     """
-    data = read_env_file(cfg, name)
-    data.update(updates)
-    for key, val in data.items():
+    for key, val in updates.items():
         if "\n" in val or "\r" in val:
             raise PodError(f"pod env value for {key!r} must be single-line")
-    cfg.pods_dir.mkdir(parents=True, exist_ok=True)
-    body = "".join(f"{k}='{v}'\n" for k, v in data.items())
-    cfg.env_file(name).write_text(body)
+    with pod_name_mutex(cfg, name):
+        data = read_env_file(cfg, name)
+        data.update(updates)
+        for key, val in data.items():
+            if "\n" in val or "\r" in val:
+                raise PodError(f"pod env value for {key!r} must be single-line")
+        cfg.pods_dir.mkdir(parents=True, exist_ok=True)
+        body = "".join(f"{k}='{v}'\n" for k, v in data.items())
+        atomic_write(cfg.env_file(name), body, newline="")
 
 
 def pin_checkout(cfg: PodConfig, name: str, checkout: Path) -> None:
@@ -106,8 +169,8 @@ def _git_worktrees(ref: Path) -> dict[str, Path]:
         cp = subprocess.run(
             ["git", "-C", str(ref), "worktree", "list", "--porcelain"],
             capture_output=True,
-            text=True,
             timeout=10,
+            **UTF8_TEXT,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -168,8 +231,9 @@ def resolve_checkout(
 
 
 # --------------------------------------------------------------------------- #
-# Port derivation. POSIX ``cksum`` is a specific CRC that is NOT zlib.crc32, so
-# we shell the same binary rather than reimplement it and risk drifting the port.
+# Port derivation. POSIX ``cksum`` is a specific CRC that is NOT zlib.crc32.
+# Implementing that standard algorithm here keeps existing pod ports stable while
+# making a fresh Windows install independent of an external POSIX executable.
 # --------------------------------------------------------------------------- #
 def _pinned_port(cfg: PodConfig, name: str) -> int | None:
     """A ``PORT=`` pinned in the pod's env file wins over derivation."""
@@ -179,16 +243,39 @@ def _pinned_port(cfg: PodConfig, name: str) -> int | None:
     return None
 
 
+def _posix_cksum(data: bytes) -> int:
+    """Return the CRC printed by POSIX ``cksum`` for *data*.
+
+    POSIX folds the byte length into the CRC, least-significant byte first, then
+    complements the result.  Keep the bitwise form small and auditable; pod names
+    are at most 64 bytes, so a lookup table would add complexity without useful
+    performance.
+    """
+    crc = 0
+
+    def _fold_byte(current: int, byte: int) -> int:
+        current ^= byte << 24
+        for _ in range(8):
+            current = (
+                ((current << 1) ^ 0x04C11DB7) if current & 0x80000000 else current << 1
+            ) & 0xFFFFFFFF
+        return current
+
+    for byte in data:
+        crc = _fold_byte(crc, byte)
+    length = len(data)
+    while length:
+        crc = _fold_byte(crc, length & 0xFF)
+        length >>= 8
+    return (~crc) & 0xFFFFFFFF
+
+
 def derive_port(cfg: PodConfig, name: str) -> int:
     """Resolve pod *name*'s port: pinned ``PORT=`` else ``base + (cksum % 199) + 1``."""
     pinned = _pinned_port(cfg, name)
     if pinned is not None:
         return pinned
-    try:
-        out = subprocess.run(["cksum"], input=name, capture_output=True, text=True, timeout=5)
-        cks = int(out.stdout.split()[0])
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
-        raise PodError(f"cksum failed for {name!r}: {exc}") from exc
+    cks = _posix_cksum(name.encode("utf-8"))
     return cfg.base_port + (cks % 199) + 1
 
 
@@ -291,13 +378,11 @@ def require_systemd() -> None:
             "Use `./dev-backend.sh` to preview a worktree on this platform."
         )
     if shutil.which("systemctl") is None:
-        raise PodError(
-            "pods require `systemctl --user`, but no `systemctl` was found on PATH."
-        )
+        raise PodError("pods require `systemctl --user`, but no `systemctl` was found on PATH.")
     if not has_session_bus():
         uid = getattr(os, "getuid", lambda: -1)()
         user = os.environ.get("USER") or os.environ.get("LOGNAME") or str(uid)
-        raise PodError(
+        raise PodBackendAbsent(
             f"no `systemd --user` session bus for uid {uid} "
             f"(looked for {session_bus_socket()}).\n"
             "Pods are systemd --user units, so one is required.\n"
@@ -419,115 +504,384 @@ RECLAIMED_MARKER = "pod-name-reclaimed-by-new-pod"
 # service manager it is talking to — and so the launchd-only teardown obligation
 # (below) cannot be forgotten at one call site and honoured at another.
 # --------------------------------------------------------------------------- #
-def pod_name_mutex(cfg: PodConfig, name: str):
-    """Per-name lifecycle mutex for callers composing multi-step transactions.
+_MUTEX_STATE = threading.local()
 
-    The CLI wraps `up` (pin -> plist -> bootstrap) and `down` (stop -> sweep ->
-    env unlink) in this so per-name METADATA moves atomically with the service
-    operations — the review-blocking down/up races all lived in those seams.
-    Reentrant with the acquisition inside start_pod/stop_pod. On Linux the unit
-    (ExecStopPost) owns teardown ordering, so this is a no-op there.
+
+@contextlib.contextmanager
+def pod_name_mutex(cfg: PodConfig, name: str):
+    """Serialize this pod's lifecycle transactions per name, on every platform.
+
+    ``down`` and ``up`` are independent entry points (the CLI, and Dev Fleet which
+    shells out to it) with no other per-name coordination. Both platforms reclaim
+    the isolated HOME on the ``down`` path, so both have the same race: a
+    stop that has just confirmed the service gone races a concurrent start, whose
+    checkout pin and service definition the stop's sweep would then delete. An
+    exclusive flock on a sibling lock file makes each whole transaction (pin +
+    definition + start on the up side; stop + drain + HOME sweep + env unlink on
+    the down side) atomic with respect to the same name.
+
+    **Reentrant within a thread** so the CLI can hold it across a transaction
+    while :func:`start_pod` / :func:`stop_pod` re-acquire it internally (their own
+    protection for direct callers): flock is per open-file-description, so a naive
+    second acquisition in the same thread would deadlock against itself.
+
+    Advisory and cooperative by design: every mutating path routes through here.
+    Without ``fcntl`` it degrades to a no-op, which only unit tests reach — pods
+    are refused on those hosts. The lock file is deliberately never deleted:
+    unlinking a lock file another process may be opening reintroduces the race the
+    lock exists to close.
     """
-    if IS_MACOS:
-        return launchd.pod_mutex(cfg, name)
-    return contextlib.nullcontext()
+    if fcntl is None:
+        yield
+        return
+    held = getattr(_MUTEX_STATE, "held", None)
+    if held is None:
+        held = _MUTEX_STATE.held = {}
+    key = f"{cfg.unit_prefix}@{name}"
+    if held.get(key, 0):
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
+    cfg.pods_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = cfg.pods_dir / f"{key}.lock"
+    with open(lock_file, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        held[key] = 1
+        try:
+            yield
+        finally:
+            held[key] = 0
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _write_and_load_unit(cfg: PodConfig) -> subprocess.CompletedProcess | None:
+    """Render the template unit AND load it, or leave nothing behind.
+
+    The single writer of the unit file, because the invariant it maintains has to
+    hold for EVERY writer: *a unit file present on disk has been loaded by
+    systemd.* :func:`kiro_crew.pod.unit.unit_is_current` reads the file, but what
+    systemd executes is the definition it loaded — so a writer that renders the
+    current hookless template and then fails to reload leaves a file that reads
+    "current" in front of a cached definition still carrying the destructive
+    ``ExecStopPost``. :func:`start_pod` then skips its refresh and boots the pod
+    under that cached definition, whose hook deletes the pod's HOME on any
+    systemd-initiated stop — including the stop half of a ``Restart=``, which no
+    ``down`` gate is in the path of. Unlinking on failure keeps the on-disk state
+    honest, so the next call re-renders and retries.
+
+    Returns ``None`` on success, or the failing ``daemon-reload`` result.
+    """
+    unit_mod.install_unit(cfg)
+    cp = systemctl("daemon-reload")
+    if cp.returncode == 0:
+        return None
+    unit_mod.unit_path(cfg).unlink(missing_ok=True)
+    return cp
+
+
+def _refresh_stale_unit(cfg: PodConfig) -> subprocess.CompletedProcess | None:
+    """Re-render and load the template unit; report why the caller must not proceed.
+
+    Returns ``None`` once systemd is running the current definition, or a failure
+    carrying the remedy when it is not.
+    """
+    cp = _write_and_load_unit(cfg)
+    if cp is None:
+        return None
+    detail = f" {cp.stderr.strip()}" if (cp.stderr or "").strip() else ""
+    return subprocess.CompletedProcess(
+        args=[],
+        returncode=cp.returncode or 1,
+        stdout=cp.stdout or "",
+        stderr=(
+            f"refreshed the pod template unit but `systemctl --user daemon-reload` "
+            f"failed (rc={cp.returncode}), so systemd would still run the previous "
+            "definition — which deletes a pod's HOME from a stop hook. Refusing to "
+            "start or stop a pod until the unit is loaded: run `kirocrew pod install` "
+            f"and retry.{detail}"
+        ),
+    )
+
+
+def loaded_teardown_hook(cfg: PodConfig, name: str) -> bool | None:
+    """Whether systemd will run a teardown hook when THIS pod's unit stops.
+
+    Asks systemd what it has LOADED instead of reading the unit file. Disk
+    freshness is not proof of a load — a hand-edited unit, or any writer whose
+    reload failed, leaves the two disagreeing — and the question that decides
+    whether a stop is safe is only ever "what will systemd execute now".
+
+    ``None`` means the question could not be answered; callers must treat that as
+    "assume the hook is there" rather than as absence.
+    """
+    cp = systemctl("show", pod_unit(cfg, name), "-p", "ExecStopPost", "--value")
+    if cp.returncode != 0:
+        return None
+    return bool((cp.stdout or "").strip())
 
 
 def start_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
     """Bring pod *name* up through whichever service manager this host uses."""
-    if IS_MACOS:
-        # Re-rendered every start, which is why launchd needs no equivalent of
-        # the systemd path's stale-ExecStart self-heal. The mutex serializes
-        # against a concurrent stop of the same name, whose plist unlink and
-        # HOME sweep would otherwise race this write (see launchd.pod_mutex).
-        with launchd.pod_mutex(cfg, name):
+    with pod_name_mutex(cfg, name):
+        if IS_MACOS:
+            # Re-rendered every start, which is why launchd needs no equivalent
+            # of the systemd path's stale-ExecStart self-heal. The mutex
+            # serializes against a concurrent stop of the same name, whose
+            # definition unlink and HOME sweep would otherwise race this write.
             launchd.write_plist(cfg, name)
             return launchd.start(cfg, name)
 
-    # Self-heal a dangling ExecStart binary: the template unit bakes an absolute
-    # kirocrew path at install time; if the worktree it resolved into was pruned
-    # since, every start fails EXEC (203).
-    if not unit_mod.unit_exec_ok(cfg):
-        unit_mod.install_unit(cfg)
-        rel = systemctl("daemon-reload")
-        if rel.returncode != 0:
-            return rel
-    return systemctl("start", pod_unit(cfg, name))
+        # Self-heal a stale installed unit before booting it: the template bakes
+        # an absolute kirocrew path at install time (a pruned worktree leaves it
+        # failing EXEC 203), and a unit installed by an older build can still
+        # carry the teardown hook this one removed.
+        if not unit_mod.unit_is_current(cfg):
+            refused = _refresh_stale_unit(cfg)
+            if refused is not None:
+                return refused
+        return systemctl("start", pod_unit(cfg, name))
+
+
+# Where a systemd cgroup's process list lives on a cgroup-v2 host.
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+
+# How long teardown waits for a stopped unit's process tree to go away. Named so
+# the wait and the message that reports it expiring cannot drift apart.
+DRAIN_TIMEOUT_SECS = 15.0
+
+
+def cgroup_procs_file(cfg: PodConfig, name: str) -> Path | None:
+    """``cgroup.procs`` for pod *name*'s unit, or ``None`` when unresolvable.
+
+    Must be read while the unit is still up: systemd reports an empty
+    ``ControlGroup`` once it goes inactive, so asking after the stop is too late.
+    Returns ``None`` off cgroup-v2 layouts (and on any host where the path does
+    not exist), which makes the drain wait an optimisation rather than a
+    dependency — the post-delete verification in :func:`stop_pod` is what actually
+    decides whether teardown succeeded.
+    """
+    cp = systemctl("show", pod_unit(cfg, name), "-p", "ControlGroup", "--value")
+    rel = (cp.stdout or "").strip()
+    if cp.returncode != 0 or not rel.startswith("/"):
+        return None
+    procs = _CGROUP_ROOT / rel.lstrip("/") / "cgroup.procs"
+    return procs if procs.parent.is_dir() else None
+
+
+def drain_cgroup(procs: Path, timeout: float = DRAIN_TIMEOUT_SECS) -> list[str]:
+    """Wait for a stopped unit's cgroup to empty; return the PIDs still in it.
+
+    An empty list means every pod-scoped process is gone, so the HOME can be
+    deleted without racing a writer that would recreate it. A vanished cgroup
+    directory counts as drained — systemd removes it once the last process exits.
+    An unreadable one is reported as drained too: nothing better can be observed
+    from here, and the caller verifies the deleted HOME afterwards regardless.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            pids = [ln.strip() for ln in procs.read_text().splitlines() if ln.strip()]
+        except OSError:
+            return []
+        if not pids:
+            return []
+        if time.monotonic() >= deadline:
+            return pids
+        time.sleep(0.2)
+
+
+def resolved_pod_home(cfg: PodConfig, name: str) -> Path:
+    """Pod *name*'s HOME as :func:`cleanup_home` reports it.
+
+    Teardown messages must agree on one spelling of the path. ``pod_home`` returns
+    it unresolved, while ``cleanup_home`` resolves before deleting (its safety
+    check needs the real parent), so quoting both in one failure read as two
+    different directories wherever ``$HOME`` is a symlink — which is the default
+    layout on a dev desktop.
+    """
+    try:
+        return (cfg.pod_root / name).resolve()
+    except OSError:
+        return pod_home(cfg, name)
 
 
 def stop_pod(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
-    """Stop pod *name* and guarantee its isolated HOME is gone.
+    """Stop pod *name* and reclaim its isolated HOME, or say why it could not.
 
-    On Linux the unit's ``ExecStopPost`` runs ``pod _cleanup``, so teardown
-    happens whatever stopped the service. launchd has **no post-stop hook**, so
-    the HOME removal is done here after a successful ``bootout`` — routed through
-    :func:`cleanup_home`, which re-validates the name, rather than a raw
-    recursive delete. Both paths therefore end with zero residue; only the macOS
-    one depends on this call being reached, which is why the crash case is
-    covered separately by ``launchd.orphan_homes()``.
+    Teardown lives HERE on both platforms rather than in a post-stop service hook.
+    systemd runs ``ExecStopPost`` before the final kill of the unit's cgroup, so a
+    hook-based delete raced the pod's own surviving subprocesses — they reopened
+    their audit log in append mode and recreated the directory behind it — and it
+    also ran on the stop half of a ``Restart=``, bringing the pod back up on a
+    home that no longer had its sessions or config. Reclaiming after the service
+    is confirmed down fixes both, at the cost of a pod that goes away without a
+    ``down`` leaving its HOME behind; :func:`orphan_homes` reports those.
+
+    Sequenced so nothing is deleted while a writer could still be alive: stop the
+    service, wait for its process tree to drain, delete, then VERIFY. A HOME that
+    survives is reported as a failure — never as zero residue.
     """
-    if IS_MACOS:
-        # One mutex across bootout + confirmation + the HOME sweep: a
-        # concurrent `up` of the same name blocks until teardown fully
-        # finishes instead of interleaving with it (the plist-presence
-        # reclaim check below stays as defense-in-depth — the flock is
-        # advisory and only guards paths that route through it).
-        with launchd.pod_mutex(cfg, name):
-            # launchd.stop() is authoritative: rc 0 means the label is confirmed
-            # unloaded (a bootout of an unloaded label is a no-op success). A non-zero
-            # rc means the unload could NOT be confirmed — in that case do NOT touch
-            # the HOME: it may belong to a live gateway, and deleting it while
-            # returning success was exactly the blocking review finding here.
-            cp = launchd.stop(cfg, name)
-            if cp.returncode != 0:
-                return cp
-            # Reap with a short grace window. launchd confirms the SERVICE process is
-            # unloaded, but a dying child can outlive it by a beat and flush state on
-            # exit — observed in a real teardown: cleanup ran, verification passed,
-            # then a child wrote settings back and resurrected the HOME milliseconds
-            # later. Retry the reap a few times so a final write cannot win the race;
-            # if the directory still reappears after the window, someone is genuinely
-            # alive in there and we must say so, not shrug.
-            leftover = pod_home(cfg, name)
-            # Observe the FULL window — no early exit on a clean sample (the dying
-            # child that motivated this flushed state after a beat). But DO exit the
-            # moment the name is claimed by a NEW pod: `down` and `up` are
-            # independent Dev Fleet endpoints with no per-name lock, so a quick
-            # down→up would otherwise put the fresh gateway's HOME under the
-            # remaining rmtree passes. Our unload was already confirmed, and a new
-            # `up` re-writes the plist BEFORE bootstrapping — so plist presence is
-            # the claim marker. Deliberately a pure filesystem check: probing
-            # launchctl here would shell out on every sweep and break on hosts
-            # without launchd (the unit suites run this path on Linux/Windows CI).
-            #
-            # A reclaimed name is reported via RECLAIMED_MARKER in stdout so the
-            # caller knows the teardown handed over: it must NOT delete the per-pod
-            # env file, which now pins the NEW pod's checkout.
-            for _ in range(6):
-                if launchd.plist_path(cfg, name).exists():
-                    return subprocess.CompletedProcess(
-                        args=[], returncode=0, stdout=RECLAIMED_MARKER, stderr=""
-                    )
-                cleanup_home(cfg, name)
-                time.sleep(0.5)
-            if launchd.plist_path(cfg, name).exists():
-                return subprocess.CompletedProcess(
-                    args=[], returncode=0, stdout=RECLAIMED_MARKER, stderr=""
-                )
-            cleanup_home(cfg, name)
-            if leftover.exists():
-                return subprocess.CompletedProcess(
-                    args=[],
-                    returncode=1,
-                    stdout=cp.stdout or "",
-                    stderr=(
-                        f"pod stopped but its isolated HOME keeps reappearing at "
-                        f"{leftover} — a process is still writing there, so teardown "
-                        "is incomplete. Remove it by hand and report this."
-                    ),
-                )
-            return subprocess.CompletedProcess(args=[], returncode=0, stdout=cp.stdout or "", stderr="")
-    return systemctl("stop", pod_unit(cfg, name))
+    with pod_name_mutex(cfg, name):
+        if IS_MACOS:
+            return _stop_pod_launchd(cfg, name)
+        # A unit installed by an OLDER build still carries the destructive
+        # ExecStopPost, and `systemctl stop` runs it before our drain — deleting
+        # the HOME under the pod's own live processes, which is the exact defect
+        # this path exists to remove. Refresh BEFORE stopping: daemon-reload
+        # re-parses the fragment for an already-running unit, and the stop job has
+        # not started yet, so the refreshed (hookless) definition is what runs.
+        #
+        # Gated on what systemd has LOADED, never on the unit file: disk freshness
+        # is not proof of a load, so a hookless file can sit in front of a cached
+        # definition that still deletes the HOME. An unanswerable query counts as
+        # "hook present" — the only safe reading.
+        #
+        # Refuse rather than proceed when the reload fails. Proceeding would mean
+        # knowingly triggering the hook-races-live-processes defect this change
+        # removes, on the argument that the HOME is being deleted anyway — the
+        # same reasoning the fix rejects. A pod left running after a loud,
+        # retryable failure is the safer end state.
+        if loaded_teardown_hook(cfg, name) is not False:
+            refused = _refresh_stale_unit(cfg)
+            if refused is not None:
+                return refused
+        # Read the cgroup path BEFORE stopping: systemd clears ControlGroup on
+        # an inactive unit.
+        procs_file = cgroup_procs_file(cfg, name)
+        cp = systemctl("stop", pod_unit(cfg, name))
+        if cp.returncode != 0:
+            # The unit may still be live; deleting its HOME here is exactly the
+            # race this ordering exists to avoid.
+            return cp
+        survivors = drain_cgroup(procs_file) if procs_file is not None else []
+        # Resolved, because cleanup_home reports the resolved path: on a host
+        # whose home is a symlink, naming it both ways reads as two directories.
+        leftover = resolved_pod_home(cfg, name)
+        if survivors:
+            # Deleting now would BE the original defect. A process that outlived
+            # the drain either holds the tree open or reopens its audit log in
+            # append mode right behind the delete, and the verification below
+            # cannot catch that because the recreation lands after it. So leave
+            # the HOME alone and name what is holding it.
+            shown = ", ".join(survivors[:5])
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout=cp.stdout or "",
+                stderr=(
+                    f"pod stopped but {len(survivors)} pod process(es) are still in "
+                    f"its cgroup (pid {shown}) after {DRAIN_TIMEOUT_SECS:.0f}s, so "
+                    f"its isolated HOME at {leftover} was NOT deleted — this pod is "
+                    f"NOT zero-residue. Reclaim it with `kirocrew pod down {name}` "
+                    "once nothing is writing there."
+                ),
+            )
+        rc = cleanup_home(cfg, name)
+        if rc != 0 or leftover.exists():
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout=cp.stdout or "",
+                stderr=(
+                    f"pod stopped but its isolated HOME is still at {leftover} — "
+                    f"teardown is incomplete, so this pod is NOT zero-residue. "
+                    f"Reclaim it with `kirocrew pod down {name}` once nothing is "
+                    "writing there."
+                ),
+            )
+        return cp
+
+
+def _stop_pod_launchd(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
+    """The macOS half of :func:`stop_pod` — called with the name mutex held.
+
+    launchd has no cgroup to drain, so the surviving-writer problem is handled by
+    sweeping the grace window instead: ``bootout`` confirms the SERVICE process is
+    unloaded, but a dying child can outlive it by a beat and flush state on exit
+    (observed in a real teardown — cleanup ran, verification passed, then a child
+    wrote settings back and resurrected the HOME milliseconds later).
+    """
+    # launchd.stop() is authoritative: rc 0 means the label is confirmed
+    # unloaded (a bootout of an unloaded label is a no-op success). A non-zero
+    # rc means the unload could NOT be confirmed — in that case do NOT touch
+    # the HOME: it may belong to a live gateway.
+    cp = launchd.stop(cfg, name)
+    if cp.returncode != 0:
+        return cp
+    leftover = resolved_pod_home(cfg, name)
+    # Observe the FULL window — no early exit on a clean sample (the dying
+    # child that motivated this flushed state after a beat). But DO exit the
+    # moment the name is claimed by a NEW pod: the mutex serializes callers that
+    # route through it, and a new `up` re-writes the plist BEFORE bootstrapping,
+    # so plist presence is the claim marker for any writer that bypasses it.
+    # Deliberately a pure filesystem check: probing launchctl here would shell
+    # out on every sweep and break on hosts without launchd (the unit suites run
+    # this path on Linux/Windows CI).
+    #
+    # A reclaimed name is reported via RECLAIMED_MARKER in stdout so the caller
+    # knows the teardown handed over: it must NOT delete the per-pod env file,
+    # which now pins the NEW pod's checkout.
+    for _ in range(6):
+        if launchd.plist_path(cfg, name).exists():
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=RECLAIMED_MARKER, stderr=""
+            )
+        cleanup_home(cfg, name)
+        time.sleep(0.5)
+    if launchd.plist_path(cfg, name).exists():
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=RECLAIMED_MARKER, stderr=""
+        )
+    cleanup_home(cfg, name)
+    if leftover.exists():
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=cp.stdout or "",
+            stderr=(
+                f"pod stopped but its isolated HOME keeps reappearing at "
+                f"{leftover} — a process is still writing there, so teardown "
+                "is incomplete. Remove it by hand and report this."
+            ),
+        )
+    return subprocess.CompletedProcess(args=[], returncode=0, stdout=cp.stdout or "", stderr="")
+
+
+def orphan_homes(cfg: PodConfig) -> list[str]:
+    """Pod HOMEs left on disk with no live pod and no installed definition.
+
+    Reachable on BOTH platforms, because neither reclaims from a post-stop service
+    hook any more (see :func:`stop_pod`): a pod that goes away without an explicit
+    ``down`` — a crash, a raw ``systemctl --user stop`` / ``launchctl bootout``, a
+    host reboot — leaves its isolated HOME behind. Reported rather than deleted so
+    the operator decides, and so the delete still routes through
+    :func:`cleanup_home`'s re-validation via ``kirocrew pod down <name>``.
+    """
+    try:
+        # never follow a symlink: a link under pod_root can point at a LIVE
+        # pod's HOME (or anywhere), and everything downstream of this
+        # enumeration treats the NAME as the directory it will judge and
+        # delete. A real pod HOME is always created as a plain directory.
+        entries = [p for p in cfg.pod_root.iterdir() if p.is_dir() and not p.is_symlink()]
+    except OSError:
+        return []
+    live = active_names(cfg)
+    out = []
+    for p in entries:
+        if p.name.startswith("."):
+            continue
+        if p.name in live:
+            continue
+        # macOS writes a per-pod plist at `up` and drops it at `down`, so its
+        # presence means the pod is installed rather than orphaned. systemd's
+        # template unit is machine-wide, so liveness is the only signal there.
+        if IS_MACOS and launchd.plist_path(cfg, p.name).exists():
+            continue
+        out.append(p.name)
+    return sorted(out)
 
 
 def install_backend(cfg: PodConfig) -> tuple[str, subprocess.CompletedProcess | None]:
@@ -543,6 +897,13 @@ def install_backend(cfg: PodConfig) -> tuple[str, subprocess.CompletedProcess | 
     as the second element rather than an exception, because the caller reports
     that as a hard exit while the gate refusal is converted by the CLI's
     dispatch layer — two different documented behaviours.
+
+    Routed through :func:`_write_and_load_unit` so this path upholds the same
+    invariant the lifecycle paths do: a unit file left on disk has been loaded.
+    A hookless file left behind by a failed reload would make
+    ``unit_is_current`` report "current" while systemd still runs the old
+    ``ExecStopPost`` — so :func:`start_pod` would skip its refresh and boot the
+    pod under a definition that deletes its HOME from a stop hook.
     """
     require_backend()
     if IS_MACOS:
@@ -551,11 +912,18 @@ def install_backend(cfg: PodConfig) -> tuple[str, subprocess.CompletedProcess | 
             "pod's agent plist is written at `kirocrew pod up <worktree>`.",
             None,
         )
-    dst = unit_mod.install_unit(cfg)
-    cp = systemctl("daemon-reload")
-    if cp.returncode != 0:
-        return f"installed pod template unit → {dst}", cp
-    return f"installed pod template unit → {dst}\nsystemctl --user daemon-reload OK", cp
+    dst = unit_mod.unit_path(cfg)
+    failed = _write_and_load_unit(cfg)
+    if failed is not None:
+        return (
+            f"rendered the pod template unit but `systemctl --user daemon-reload` "
+            f"failed, so it was removed again rather than left unloaded at {dst}",
+            failed,
+        )
+    return (
+        f"installed pod template unit → {dst}\nsystemctl --user daemon-reload OK",
+        subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+    )
 
 
 def health(port: int, timeout: int = 3) -> int:
@@ -568,7 +936,7 @@ def health(port: int, timeout: int = 3) -> int:
         # Loopback-only probe to the pod's own gateway on 127.0.0.1; the URL is
         # internally derived (never attacker-supplied), so the dynamic-URL SSRF
         # audit rule is a false positive here.
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # nosemgrep
+        with loopback_urlopen(url, timeout=timeout) as resp:  # nosemgrep
             return resp.status
     except urllib.error.HTTPError as e:
         return e.code
@@ -595,7 +963,7 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
     try:
         # Loopback-only call to the pod's own gateway on 127.0.0.1; the URL is
         # internally derived, so the dynamic-URL SSRF audit rule is a false positive.
-        with urllib.request.urlopen(req, timeout=5) as resp:  # nosemgrep
+        with loopback_urlopen(req, timeout=5) as resp:  # nosemgrep
             token = json.loads(resp.read()).get("token", "")
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise PodError(f"token mint failed on :{port} ({name}): {exc}") from exc
@@ -605,15 +973,50 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Seed sanitization — deny-by-default. A seeded pod must NEVER be able to grab the
-# real Slack identity, so we only ever return a config with tunnel DISABLED.
-# Anything that prevents us from positively guaranteeing that (missing file, bad
-# JSON) returns None → the caller skips the seed and the pod boots blank.
+# Seed sanitization — deny-by-default. A seeded pod must NEVER be able to grab a
+# live messaging identity, so we only ever return a config with the tunnel and
+# every self-activating channel DISABLED. Anything that prevents us from positively
+# guaranteeing that (missing file, bad JSON) returns None → the caller skips the
+# seed and the pod boots blank.
 # --------------------------------------------------------------------------- #
+
+# Config sections a sanitized seed boots with ``enabled=False``. Deny-by-default:
+# every channel carrying a config-level ``enabled`` is listed, because that flag is
+# the only thing between a seed cloned from the real config (the intended
+# ``--seed ~/.kiro/crew`` workflow) and a pod that answers real people as the
+# operator's bot. The channel's credential is not a second gate — Telegram,
+# Discord, Webex and Weixin read their token straight out of the seeded
+# config.json; iMessage needs no credential at all, since its transport is the
+# operator's own signed-in Messages.app; and Teams keeps its App ID in config.json
+# while ``MICROSOFT_APP_PASSWORD`` reaches the pod through the inherited env.
+# Slack is deliberately absent: it has no config-level enable, being gated purely
+# on credentials that ``build_pod_env`` scrubs.
+#
+# ``test_pod.py`` pins this tuple against ``channels.builtin_channel_descriptors()``
+# so a channel added to the roster cannot reach a pod ungated.
+SEED_DISABLED_SECTIONS: tuple[str, ...] = (
+    "tunnel",
+    "wecom",
+    "telegram",
+    "discord",
+    "webex",
+    "teams",
+    "weixin",
+    "imessage",
+    # WhatsApp is the sharpest case on this list: its transport is the operator's
+    # OWN account, paired as a linked device, so a seeded pod booting it live would
+    # send from the operator's real number using a credential that is not an env
+    # var this env can scrub (the session store lives under the data home).
+    "whatsapp",
+    "feishu",
+)
+
+
 def sanitized_seed_config(seed_dir: Path) -> dict | None:
-    """Read ``<seed_dir>/config.json`` and return it with ``tunnel.enabled``
-    forced to False, or None if it can't be safely sanitized (no file / bad JSON
-    / sensitive path). Never copies any other state (DB / sessions / crons)."""
+    """Read ``<seed_dir>/config.json`` and return it with ``enabled`` forced to
+    False on every ``SEED_DISABLED_SECTIONS`` section, or None if it can't be
+    safely sanitized (no file / bad JSON / sensitive path). Never copies any other
+    state (DB / sessions / crons)."""
     # ``--seed`` is a user-supplied path: refuse to read from a sensitive /
     # credential location before touching the file. Resolve first so a symlink or
     # ".." can't smuggle past the guard.
@@ -632,14 +1035,10 @@ def sanitized_seed_config(seed_dir: Path) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
-    # Deny-by-default: force OFF every messaging channel that can self-activate
-    # from config.json — not just the tunnel. A seed cloned from a real config
-    # (the intended ``--seed ~/.kiro/crew`` workflow) would otherwise boot live
-    # Telegram / WeCom bots answering real users. Overwrite any non-dict section
-    # value too, so the enabled=False guarantee can't be skipped by a falsy value.
-    # (Slack has no config-level enable — it is credential-gated, and those creds
-    # are scrubbed from the pod env by build_pod_env.)
-    for section in ("tunnel", "telegram", "wecom"):
+    # Force OFF every self-activating section (SEED_DISABLED_SECTIONS carries the
+    # roster and the reasoning). Overwrite a non-dict section value too, so the
+    # enabled=False guarantee can't be skipped by a falsy value.
+    for section in SEED_DISABLED_SECTIONS:
         if not isinstance(data.get(section), dict):
             data[section] = {}
         data[section]["enabled"] = False
@@ -650,13 +1049,19 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
     """Construct the isolated gateway environment for a pod.
 
     Scrubs messaging-identity creds so the pod can't inherit and re-use the live
-    plane's Slack / WeCom / Telegram identity via the systemd --user manager env:
-    ``SLACK_*``, ``WECOM_*`` (WECOM_BOT_ID / WECOM_SECRET), and non-AWS ``*_TOKEN``
-    (covers ``TELEGRAM_BOT_TOKEN``). ``AWS_*`` is kept on purpose (pods run agent
-    turns), and the ``_TOKEN`` scrub deliberately EXCLUDES ``AWS_`` so
-    ``AWS_SESSION_TOKEN`` (temp creds) survives intact — scrubbing it would leave
-    half a credential and break every AWS call. Config-level channel enables are
-    additionally forced off by ``sanitized_seed_config`` (defense-in-depth).
+    plane's Slack / WeCom / Telegram / Teams / Feishu identity via the systemd
+    --user manager env: ``SLACK_*``, ``WECOM_*`` (WECOM_BOT_ID / WECOM_SECRET),
+    ``MICROSOFT_APP_*``, ``FEISHU_*`` and non-AWS ``*_TOKEN`` (covers
+    ``TELEGRAM_BOT_TOKEN``). Teams and Feishu each need their own prefix because
+    none of ``MICROSOFT_APP_ID`` / ``MICROSOFT_APP_PASSWORD`` /
+    ``MICROSOFT_APP_TENANT_ID`` / ``FEISHU_APP_ID`` / ``FEISHU_APP_SECRET`` ends
+    in ``_TOKEN``, so the generic suffix rule that catches every other channel's
+    bot credential passes the Azure Bot secret and the Feishu app secret straight
+    through. ``AWS_*`` is kept on purpose (pods run agent turns), and the
+    ``_TOKEN`` scrub deliberately EXCLUDES ``AWS_`` so ``AWS_SESSION_TOKEN`` (temp
+    creds) survives intact — scrubbing it would leave half a credential and break
+    every AWS call. Config-level channel enables are additionally forced off by
+    ``sanitized_seed_config`` (defense-in-depth).
     """
     env = {
         **os.environ,
@@ -679,24 +1084,8 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
         # real lessons). Safe only because every KiroCrew reader of the transcripts
         # dir now resolves through ``kiro_sessions_dir()``; without that the pod
         # would write sessions somewhere KiroCrew never looks and lose resume.
-        # Inside the pod HOME so the zero-residue ``ExecStopPost`` teardown
-        # reclaims it.
+        # Inside the pod HOME so ``pod down``'s teardown reclaims it.
         "KIRO_HOME": str(home_dir / "kiro"),
-        # NOTE: deliberately NO ``KIRO_HOME`` here, though it is tempting — it
-        # would give the pod its own agent specs and stop pod boots rewriting the
-        # machine-wide ``~/.kiro/agents``. ``KIRO_HOME`` is a DIRECTORY-WIDE
-        # kiro-cli override (agents, prompts, skills, steering, settings AND
-        # sessions), while KiroCrew still resolves the host paths for roughly two
-        # dozen of those readers — ``session_map.py``, ``subagent_persistence.py``,
-        # ``acp/{client,session_handle,session_provider}.py``,
-        # ``providers/acp.py``, ``dashboard/handlers/usage.py`` and the
-        # ``settings/mcp.json`` sites. Exporting it here would move where kiro-cli
-        # WRITES session transcripts without moving where KiroCrew READS them, so a
-        # pod restart would lose session resume and ``SessionMap`` would prune
-        # mappings whose transcripts it can no longer see: a worse split brain than
-        # the one this change set fixes. The write guard in ``agent.py`` covers the
-        # shared-spec hazard for pods in the meantime. Setting it here is safe only
-        # once those readers resolve through ``kiro_home()`` too.
         # Give the pod its OWN workspace root. Without this, `workspace_root()`
         # finds no `KIROCREW_WORKSPACE` and no `config_dir()/workspace_dir` file in
         # a fresh pod home, so it falls through to the platform default under the
@@ -705,8 +1094,8 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
         # WRITE the live workspace. `KIROCREW_WORKSPACE` is the documented override
         # (config/loader.py:220, used as-is) and `eval/runner.py` already scopes a
         # run the same way, so this is the existing mechanism rather than new
-        # resolution behaviour. Placing it inside the pod HOME means the
-        # zero-residue `ExecStopPost` teardown removes it with everything else.
+        # resolution behaviour. Placing it inside the pod HOME means `pod down`'s
+        # teardown removes it with everything else.
         "KIROCREW_WORKSPACE": str(home_dir / "workspace"),
         # The pod's OWN venv leads PATH, ahead of cfg.gateway_path (which starts
         # with ~/.local/bin). Without this a bare `kirocrew` inside a pod — an
@@ -721,9 +1110,17 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
         for k in env
         if k.startswith("SLACK_")
         or k.startswith("WECOM_")
+        or k.startswith("MICROSOFT_APP_")
+        or k.startswith("FEISHU_")
         or (k.endswith("_TOKEN") and not k.startswith("AWS_"))
     ]:
         env.pop(key, None)
+    # Cross-plane guard: a gateway-descended caller inherits the LIVE
+    # gateway's KIROCREW_BOUND_PORT (dashboard.server._export_bound_port).
+    # Inside a pod env it would name the wrong plane — the pod's own
+    # KIROCREW_PORT above is the target — so drop it unconditionally rather
+    # than rely on resolution precedence alone.
+    env.pop("KIROCREW_BOUND_PORT", None)
     return env
 
 
@@ -746,19 +1143,34 @@ def write_pod_config(home_dir: Path, seed: str) -> None:
         return
     sanitized = sanitized_seed_config(Path(seed)) if seed else None
     cfg_data = sanitized if sanitized is not None else {"tunnel": {"enabled": False}}
-    dst_cfg.write_text(json.dumps(cfg_data, indent=2))
-    os.chmod(dst_cfg, stat.S_IRUSR | stat.S_IWUSR)  # 0o600 owner read/write only
+    # Create-only (the exists() guard above): lock the temp down before any
+    # token-bearing payload reaches the published name. write_text then chmod
+    # left the file at its inherited DACL until the chmod returned, and the
+    # chmod itself was a no-op on Windows. atomic_write encodes UTF-8; the
+    # previous write_text call did not pass encoding=.
+    atomic_write(
+        dst_cfg,
+        json.dumps(cfg_data, indent=2),
+        restrict_to_owner=True,
+    )
 
 
 def cleanup_home(cfg: PodConfig, name: str) -> int:
-    """Zero-residue teardown of pod *name*'s HOME — the ``ExecStopPost`` body.
+    """Delete pod *name*'s isolated HOME and report whether it is really gone.
 
-    Routed through Python (not a raw ``rm -rf {pod_root}/%i``) because the rm safety
-    must NOT rely on systemd ``%i`` semantics: ``%i`` cannot contain ``/`` but CAN
-    be ``..``, and the template unit is a standalone artifact that bypasses the
-    CLI's ``validate_name``. Re-validate the name and confirm the target is a direct
-    child of pod_root before deleting, so teardown can never escape to ``$HOME`` or
-    a parent.
+    Routed through Python (not a raw ``rm -rf {pod_root}/<name>``) because the rm
+    safety must NOT rely on a service manager's instance-name semantics: a systemd
+    ``%i`` cannot contain ``/`` but CAN be ``..``, and the template unit is a
+    standalone artifact that bypasses the CLI's ``validate_name``. Re-validate the
+    name and confirm the target is a direct child of pod_root before deleting, so
+    teardown can never escape to ``$HOME`` or a parent.
+
+    Returns 0 only when the directory is gone afterwards. ``rmtree`` runs with
+    ``ignore_errors`` — it has to, since a partially-removed tree is still progress
+    — so the removal itself is silent; a tree that SURVIVES (a live process holds
+    it, or recreated it in append mode right behind the delete) returns 1 and names
+    what is left. Without that check a caller cannot tell a reclaimed HOME from a
+    swallowed failure.
     """
     try:
         validate_name(name)
@@ -766,12 +1178,66 @@ def cleanup_home(cfg: PodConfig, name: str) -> int:
         print(f"refusing pod cleanup for invalid instance name {name!r}")
         return 2
     root = cfg.pod_root.resolve()
-    target = (cfg.pod_root / name).resolve()
+    unresolved = cfg.pod_root / name
+    # Refuse to delete THROUGH a symlink: resolving first lets a link planted
+    # under pod_root pass the containment check below while the tree it names
+    # lives elsewhere — including another, live pod's HOME. A real pod HOME is
+    # always created as a plain directory, so a link here is never ours to follow.
+    if unresolved.is_symlink():
+        print(f"refusing pod cleanup: {unresolved} is a symlink, not a pod HOME")
+        return 2
+    target = unresolved.resolve()
     if target == root or target.parent != root:
         print(f"refusing pod cleanup: {target} is not a pod dir under {root}")
         return 2
-    shutil.rmtree(target, ignore_errors=True)
-    return 0
+    # Delete by the UNRESOLVED name, never the resolved target: between the
+    # symlink pre-check above and this call the entry can be swapped for a
+    # symlink (check-to-use race), and rmtree on the RESOLVED path would then
+    # delete the live sibling the link points at. rmtree itself refuses a
+    # top-level symlink, so deleting by name makes the swap harmless — nothing
+    # is removed and the survivor check below reports the failure.
+    shutil.rmtree(unresolved, ignore_errors=True)
+    # Verify by the ENTRY itself, never the resolved target: an entry swapped
+    # to a DANGLING symlink during the delete makes rmtree refuse silently
+    # (suppressed by ignore_errors), and the resolved target of a dangling
+    # link does not exist — so a target-existence check would report a clean
+    # reclaim while the link remains as residue that orphan_homes (which
+    # skips symlinks) can never surface again.
+    if not os.path.lexists(unresolved):
+        return 0
+    if unresolved.is_symlink():
+        # Swapped to a symlink mid-delete: rmtree refused it (correctly), and
+        # the link itself is the residue — name it rather than the target.
+        print(
+            f"pod cleanup did not remove {unresolved}: the entry is now a "
+            "symlink, which teardown refuses to follow — remove it by hand"
+        )
+        return 1
+    survivors = _surviving_entries(target)
+    print(
+        f"pod cleanup did not fully remove {target}: still present "
+        f"({', '.join(survivors)}) — either something is still writing there or "
+        "the tree cannot be unlinked (permissions)"
+    )
+    return 1
+
+
+def _surviving_entries(target: Path, limit: int = 5) -> list[str]:
+    """Names of the first few entries left under a HOME that survived teardown.
+
+    Diagnostics only: the point is to name a culprit ("security_events.jsonl")
+    rather than report a bare failure, so an unlistable directory degrades to the
+    directory itself instead of raising inside teardown.
+    """
+    try:
+        names = sorted(p.name for p in target.iterdir())
+    except OSError:
+        return [target.name]
+    if not names:
+        return [f"{target.name} (empty)"]
+    if len(names) > limit:
+        return [*names[:limit], f"… +{len(names) - limit} more"]
+    return names
 
 
 def pod_context(cfg: PodConfig, name: str) -> tuple[Path, dict[str, str]]:
@@ -822,9 +1288,8 @@ def pod_context(cfg: PodConfig, name: str) -> tuple[Path, dict[str, str]]:
 #                    pod install/uninstall would still mutate host state.)
 #   stop, restart  — service-aware: `cli_server._stop` short-circuits to
 #                    systemctl when no explicit --port is passed, so they hit the
-#                    LIVE gateway; and `restart` additionally makes systemd run
-#                    the pod unit's ExecStopPost (erasing the pod HOME) while
-#                    leaving a DETACHED replacement `pod down` cannot stop
+#                    LIVE gateway; and `restart` additionally leaves a DETACHED
+#                    replacement that `pod down` cannot stop
 #   service        — installs/removes the machine-wide systemd unit
 #   gateway        — would race a second gateway against the pod's own unit
 #   pod            — pod management from inside a pod (a nested `pod down` would
@@ -856,7 +1321,7 @@ def pod_context(cfg: PodConfig, name: str) -> tuple[Path, dict[str, str]]:
 #                    `chat --tui` branches straight into `_tui` (cli.py:1818), so
 #                    excluding only `tui` left the same hole open. Every OTHER
 #                    client verb (`status`, `logout`, and the credential verb) goes
-#                    through `cli_server.resolve_client_port`, which DOES honour
+#                    through `port_resolution.resolve_client_port`, which DOES honour
 #                    `KIROCREW_PORT` — so this hazard is confined to `_tui`.
 #   logs           — `cli_server._logs_cmd` runs `journalctl -u <SERVICE_NAME>`,
 #                    the HOST service unit, so inside a pod it would show the LIVE
@@ -927,7 +1392,6 @@ def require_pod_safe_verb(argv: list[str], name: str) -> None:
     verb = argv[0] if argv else ""
     if verb in _POD_SAFE_VERBS:
         return
-    hint = ""
     if verb in _POD_EQUIVALENT:
         hint = f" Use `{_POD_EQUIVALENT[verb].format(name=name)}` instead."
     elif verb.startswith("-"):
@@ -1003,6 +1467,32 @@ def boot(cfg: PodConfig, name: str) -> int:
         return 70
 
     seed = env_data.get("SEED", "")
+    approval = env_data.get("APPROVAL", "")
+    if approval and approval not in APPROVAL_MODES:
+        # `pod up` constrains the flag, but this file is hand-editable, so an
+        # unknown value can still reach here. Do NOT merely drop it: omitting
+        # --approval does not mean "interactive". The gateway leaves
+        # ``approval_mode`` unset, and slack/events.py falls through to
+        # ``cfg.agent.approval_mode``, which config/loader.py defaults to
+        # "auto" -- auto-approve every tool. Dropping would therefore be the
+        # LEAST restrictive outcome. Pin interactive explicitly instead.
+        print(
+            f"kirocrew-pod: ignoring unknown APPROVAL={approval!r} "
+            f"(expected one of: {', '.join(APPROVAL_MODES)}); "
+            f"forcing --approval interactive"
+        )
+        approval = "interactive"
+
+    crons_raw = env_data.get("CRONS", "")
+    crons = crons_raw.strip().lower() in CRONS_TRUE
+    if crons_raw and not crons:
+        # Same reasoning as APPROVAL above: hand-editable file, so an
+        # unrecognised value falls back to the safer setting (scheduler off)
+        # instead of guessing, and the pod still boots.
+        print(
+            f"kirocrew-pod: ignoring unrecognised CRONS={crons_raw!r} "
+            f"(expected one of: {', '.join(sorted(CRONS_TRUE))}); scheduler stays off"
+        )
 
     # Write the pod's isolated, tunnel-disabled config with owner-only perms.
     # Creates the HOME (0o700) too. Never copies DB/sessions/crons.
@@ -1011,5 +1501,10 @@ def boot(cfg: PodConfig, name: str) -> int:
     print(f"kirocrew-pod: name={name} port={port} home={home_dir} checkout={checkout}")
 
     pod_env = build_pod_env(cfg, home_dir, port, checkout)
-    os.execve(str(bin_path), [str(bin_path), "gateway", "--no-crons"], pod_env)
+    argv = ["gateway"]
+    if not crons:
+        argv.append("--no-crons")
+    if approval:
+        argv += ["--approval", approval]
+    os.execve(str(bin_path), [str(bin_path), *argv], pod_env)
     return 0  # unreachable on success

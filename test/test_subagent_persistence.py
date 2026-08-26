@@ -20,20 +20,16 @@ from kiro_crew.subagent_persistence import (
     write_tombstone,
 )
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 
 @pytest.fixture()
 def agent_root(tmp_path, monkeypatch):
     """Point persistence at a temp directory."""
     monkeypatch.setattr("kiro_crew.subagent_persistence._SUBAGENTS_DIR", tmp_path)
     return tmp_path
-
-
-@pytest.fixture(autouse=True)
-def _mock_memory_ok(monkeypatch):
-    """Prevent memory guard from refusing spawns on low-RAM build machines."""
-    monkeypatch.setattr(
-        "kiro_crew.subagent.check_memory_available", lambda **_kw: (True, 8.0)
-    )
 
 
 # ── create_agent_folder ──────────────────────────────────────────────
@@ -1047,10 +1043,12 @@ class TestOrphanNotification:
         state = {"id": "notif_redact", "task": "secret task", "parent_session": "dashboard:default"}
 
         injected_msg = None
+        injected_meta = None
 
-        async def _capture_inject(_session, msg):
-            nonlocal injected_msg
+        async def _capture_inject(_session, msg, meta=None):
+            nonlocal injected_msg, injected_meta
             injected_msg = msg
+            injected_meta = meta
             return True
 
         with patch.object(manager, "_try_inject_orphan_notification", side_effect=_capture_inject), \
@@ -1061,6 +1059,12 @@ class TestOrphanNotification:
         mock_redact.assert_called()
         assert injected_msg is not None
         assert injected_msg.startswith("[REDACTED]")
+        # has_result=True → interrupted, with the header's only explanation as
+        # the structured note (#1792). The card reads this, not the prose.
+        assert injected_meta is not None
+        assert injected_meta["kind"] == "single"
+        assert injected_meta["outcome"] == "interrupted"
+        assert injected_meta["note"] == "orphaned by gateway restart"
 
     @pytest.mark.asyncio
     async def test_notification_failure_doesnt_crash(self, agent_root):

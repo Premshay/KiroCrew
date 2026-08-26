@@ -165,7 +165,9 @@ _CI_ENV_VARS = (
 # "source" is the git-clone path and the correct answer for an unstamped tree,
 # so it is the default rather than an "unknown" bucket.
 DIST_ENV = "KIROCREW_DISTRIBUTION"
-KNOWN_DISTRIBUTIONS = frozenset({"dmg", "appimage", "wheel", "source", "docker"})
+KNOWN_DISTRIBUTIONS = frozenset(
+    {"dmg", "appimage", "deb", "rpm", "wheel", "source", "docker"}
+)
 DEFAULT_DISTRIBUTION = "source"
 
 # Optional dependency: ``_build_info`` exists only in a packaged artifact, so
@@ -879,7 +881,20 @@ def format_status(info: dict[str, object]) -> str:
         "  credentials, hostname, username, IP address, operating system, CPU",
         "  architecture, release channel, or governance posture.",
         "",
-        f"  To opt out:  export {DISABLE_ENV}=1",
-        "               (or set telemetry.beacon_enabled false in config)",
+        "  To opt out, choose one:",
+        "",
+        "    1. Kiro Crew CLI (recommended)",
+        "       kirocrew telemetry disable",
+        "",
+        "    2. Environment variable (choose your shell)",
+        "       macOS / Linux",
+        f"         export {DISABLE_ENV}=1",
+        "       Windows PowerShell",
+        f"         $env:{DISABLE_ENV} = '1'",
+        "       Windows Command Prompt",
+        f"         set {DISABLE_ENV}=1",
+        "",
+        "    3. Configuration file",
+        "       Set telemetry.beacon_enabled to false",
     ]
     return "\n".join(lines)

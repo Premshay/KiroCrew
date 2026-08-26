@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -61,12 +62,15 @@ from kiro_crew.dashboard.theme_validate import (
 )
 from kiro_crew.executors import discovery_executor
 from kiro_crew.hooks import safe_read_file_bytes_nolink
-from kiro_crew.sandbox import resource_limit_preexec, sandboxed_spawn_argv
+from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
+
+logger = logging.getLogger(__name__)
 
 # Theme install/serve traverses the O_NOFOLLOW + fd-real-path chokepoint in
 # hooks (safe_read_file_bytes_nolink), which has no Windows implementation
@@ -239,18 +243,17 @@ def _clone_github(url: str, dest: Path) -> str | None:
     # The URL is agent/user-influenced and git clone runs arbitrary remote
     # content, so route through the sandbox chokepoint (OS filesystem isolation
     # + credential-scrubbed env) and apply the fork-bomb/resource ceiling via
-    # preexec_fn — same discipline as git_coord._git.
+    # run_limited — same discipline as git_coord._git.
     argv, env, cleanup = sandboxed_spawn_argv(
         ["git", "clone", "--depth", "1", "--quiet", "--", url, str(dest)]
     )
     try:
-        proc = subprocess.run(
+        proc = run_limited(
             argv,
             capture_output=True,
-            text=True,
             timeout=_THEME_CLONE_TIMEOUT_SEC,
             env=env,
-            preexec_fn=resource_limit_preexec(),
+            **UTF8_TEXT,
         )
     except FileNotFoundError:
         return "git is not available on the server"
@@ -426,7 +429,10 @@ def _do_install(stype: Any, source: dict[str, Any]) -> tuple[dict[str, Any] | No
         stage = _themes_dir() / f".install-staging-{token}"
         try:
             _copy_installed_theme(src, stage)
-            summary, err = _validate_theme_dir(stage)
+            # installing=True: only the install path refuses a pack for pinning
+            # the UI font, so a pack installed before that rule keeps loading on
+            # the read path (see _validate_overrides_css).
+            summary, err = _validate_theme_dir(stage, installing=True)
         except ValueError as ve:
             shutil.rmtree(stage, ignore_errors=True)
             return None, str(ve), 400
@@ -679,8 +685,12 @@ async def api_theme_detail(request: web.Request) -> web.Response:
             discovery_executor(), _validate_theme_dir, dir_target
         )
         if err or summary is None:
+            # ``err`` can name the on-disk theme directory; keep it server-side
+            # and send the client a generic message (rendered verbatim in the UI).
+            logger.warning("invalid installed theme: %s", err)
             return web.json_response(
-                {"error": f"invalid installed theme: {err}"}, status=500
+                {"error": "invalid installed theme", "code": "invalid_installed_theme"},
+                status=500,
             )
         manifest, _m_err = await loop.run_in_executor(
             discovery_executor(),

@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import AssistantMessage, { parseOptions, fmtTurnElapsed, fmtCredits } from '../pages/chat/AssistantMessage'
+import AssistantMessage, { fmtTurnElapsed, fmtCredits, fmtTurnModel } from '../pages/chat/AssistantMessage'
+import { parseOptions } from '../app-sdk/protocol'
+// Imported from the defining module, not the `protocol` barrel, which deliberately
+// does not re-export a g-flagged regex. Only `.source` is read below — a string
+// copy — so the shared `lastIndex` this const's own docs warn about is untouched.
+import { OPTION_MARKER_RE } from '../app-sdk/protocol/optionMarker'
 
 // Mock MarkdownRenderer to avoid complex markdown parsing in tests
 vi.mock('../components/MarkdownRenderer', () => ({
@@ -32,6 +37,22 @@ describe('AssistantMessage', () => {
     expect(screen.queryByText('Alpha')).not.toBeInTheDocument()
     expect(screen.queryByText('Beta')).not.toBeInTheDocument()
     expect(screen.queryByText(/Send/)).not.toBeInTheDocument()
+  })
+
+  // Regression: OPTION_MARKER_RE anchors on a closing bracket that ends the line,
+  // so a half-arrived marker can't match it and used to type itself out as prose
+  // for the width of the marker line before flipping to pills at turn end.
+  it('hides a half-streamed [OPTIONS: marker from the streamed text', () => {
+    render(<AssistantMessage content={'All done.\n\n[OPTIONS: Merge it now | Show me the d'} isStreaming={true} slotRunning={true} />)
+    expect(screen.getByTestId('md')).toHaveTextContent('All done.')
+    expect(screen.getByTestId('md').textContent).not.toMatch(/\[OPTION/i)
+  })
+
+  // …but on a FINISHED message an unterminated marker is real content (prose about
+  // the syntax, or a truncated turn), so it must render as written.
+  it('keeps an unterminated marker once the message is no longer streaming', () => {
+    render(<AssistantMessage content={'The tag looks like [OPTIONS: A | B'} isStreaming={false} slotRunning={false} />)
+    expect(screen.getByTestId('md')).toHaveTextContent('[OPTIONS: A | B')
   })
 
   it('shows "Use as Plan" button for valid plan JSON', () => {
@@ -225,6 +246,27 @@ describe('AssistantMessage', () => {
 
 })
 
+describe('action footer on touch devices', () => {
+  // The footer is opacity-0 until group-hover, and a touch pointer never
+  // hovers — without the hover:none override the actions (copy, speak,
+  // regenerate, fork) are permanently invisible on phones. happy-dom does not
+  // evaluate media queries, so pin the utility class itself.
+  const footer = () => screen.getByTitle('Copy').closest('div') as HTMLElement
+
+  it('reveals the footer where the pointer cannot hover', () => {
+    render(<AssistantMessage content="Hello world" isStreaming={false} slotRunning={false} />)
+    expect(footer().className).toContain('[@media(hover:none)]:opacity-100')
+  })
+
+  it('keeps the footer hover-revealed for hover-capable pointers', () => {
+    render(<AssistantMessage content="Hello world" isStreaming={false} slotRunning={false} />)
+    const cls = footer().className
+    expect(cls).toContain('opacity-0')
+    expect(cls).toContain('group-hover/msg:opacity-100')
+    expect(cls).toContain('group-focus-within/msg:opacity-100')
+  })
+})
+
 describe('parseOptions', () => {
   it('parses [OPTIONS: a|b|c] multi syntax', () => {
     const { options, multi, isPlan } = parseOptions('Pick one [OPTIONS: Alpha|Beta|Gamma]')
@@ -342,13 +384,40 @@ describe('parseOptions', () => {
 
   // ReDoS guard: untrusted model output with thousands of unterminated `[OPTIONS:`
   // prefixes must not drive quadratic backtracking in the synchronous render path.
-  // The tempered body (utils/optionsMarker.ts) fails in O(1) per prefix.
+  //
+  // Asserted STRUCTURALLY, on the pattern itself, because no timing assertion can
+  // work here. This file installs fake timers for every test in `beforeEach`, and
+  // vitest's default `toFake` covers the whole clock surface: MEASURED under it,
+  // `Date.now()`, `performance.now()` AND `process.hrtime.bigint()` all report a
+  // delta of exactly 0 across a 20M-iteration spin. So the original
+  // `expect(Date.now() - start).toBeLessThan(500)` could not fail — it passed
+  // even against a catastrophically backtracking pattern — and swapping in either
+  // other clock does not fix it.
+  //
+  // A duration budget would be the wrong shape anyway: a backtracking regex is
+  // synchronous, so vitest's per-test timeout cannot interrupt it and a regression
+  // surfaces as a WEDGED WORKER rather than a failure. MEASURED: substituting a
+  // nested-quantifier body `(?:[^\n]+)+` for the tempered one takes this file from
+  // 29s to 357s with `tests 0ms`, and 300s standalone without finishing.
+  //
+  // What makes the pattern linear is the TEMPERED body: each alternative excludes
+  // the delimiter that starts a fresh marker, so a failed match cannot re-partition
+  // the same run. Pinning that shape catches the regression the timing check was
+  // reaching for, deterministically and in microseconds. The behavioural half — an
+  // adversarial input still parses to no options — is asserted directly below.
   it('does not catastrophically backtrack on adversarial `[OPTIONS:` input', () => {
-    const evil = '[OPTIONS:'.repeat(20000)
-    const start = Date.now()
-    const { options } = parseOptions(evil)
-    expect(options).toEqual([])
-    expect(Date.now() - start).toBeLessThan(500)
+    const src = OPTION_MARKER_RE.source
+    // The label body: tempered alternation, NOT a nested quantifier.
+    expect(src).toContain('(?:[^[\\n]|\\[(?!OPTIONS?:))*')
+    // No `(x+)+` / `(x*)*` anywhere: that is the shape that backtracks
+    // exponentially, and it is what the tempered body above replaced.
+    expect(src).not.toMatch(/\([^)]*[+*]\)[+*]/)
+    // And the parse itself still terminates and yields nothing for 20k
+    // unterminated prefixes. Under the tempered body this returns in ~2ms; under
+    // a backtracking one it would never return, which is a wedge the reviewer
+    // reads in the log rather than an assertion failure — hence the shape checks
+    // above, which fail first and cheaply.
+    expect(parseOptions('[OPTIONS:'.repeat(20000)).options).toEqual([])
   })
 
   it('shows "Copy link to message" button when messageTs and slotKey are provided', () => {
@@ -415,6 +484,35 @@ describe('turn stats footer (elapsed time + credits)', () => {
     expect(stats).not.toHaveTextContent('$')
   })
 
+  it('leads with the served model when the backend resolved one', () => {
+    render(<AssistantMessage content="done" isStreaming={false} slotRunning={false} turnStats={{ elapsed_ms: 84_000, credits: 2.5, model: 'claude-sonnet-4.6' }} />)
+    const text = screen.getByTestId('turn-stats').textContent!.replace(/\s+/g, ' ').trim()
+    expect(text).toMatch(/^claude-sonnet-4\.6 ·\s*2\.50 credits ·\s*1m 24s$/)
+  })
+
+  it('trims routing prefixes from the inline model label but keeps the full id in the tooltip', () => {
+    render(<AssistantMessage content="done" isStreaming={false} slotRunning={false} turnStats={{ elapsed_ms: 8_400, credits: 1.2, model: 'global.anthropic.claude-opus-4-8[1m]' }} />)
+    expect(screen.getByTestId('turn-model')).toHaveTextContent('claude-opus-4-8[1m]')
+    expect(screen.getByTestId('turn-model')).not.toHaveTextContent('global.anthropic')
+    expect(screen.getByTestId('turn-stats').title).toContain('global.anthropic.claude-opus-4-8[1m]')
+  })
+
+  it('omits the model chip when the backend did not resolve one', () => {
+    render(<AssistantMessage content="done" isStreaming={false} slotRunning={false} turnStats={{ elapsed_ms: 42_000, credits: 1.0 }} />)
+    expect(screen.queryByTestId('turn-model')).not.toBeInTheDocument()
+  })
+
+  // An Auto turn arrives as the literal `auto`, not a model id, because Auto's
+  // per-turn choice is not disclosed on the wire. It still renders: a blank
+  // chip there is indistinguishable from a turn with no measurement at all,
+  // which is exactly the reading this chip exists to prevent.
+  it('shows the bare auto sentinel for a turn the backend routed itself', () => {
+    render(<AssistantMessage content="done" isStreaming={false} slotRunning={false} turnStats={{ elapsed_ms: 6_100, credits: 0.64, model: 'auto' }} />)
+    expect(screen.getByTestId('turn-model')).toHaveTextContent('auto')
+    const text = screen.getByTestId('turn-stats').textContent!.replace(/\s+/g, ' ').trim()
+    expect(text).toMatch(/^auto ·\s*0\.64 credits ·\s*6\.1s$/)
+  })
+
   // The tooltip is four whole-sentence catalog keys, one per combination of the
   // two optional clauses. Nothing else asserts the `title`, so without these a
   // wrong key or a dropped clause would render silently and every visible-text
@@ -461,6 +559,17 @@ describe('turn stats footer (elapsed time + credits)', () => {
   it('fmtCredits trims to 2 decimals under 10, 1 above', () => {
     expect(fmtCredits(0.25)).toBe('0.25')
     expect(fmtCredits(12.53)).toBe('12.5')
+  })
+
+  it('fmtTurnModel drops region/vendor routing prefixes and keeps unknown shapes intact', () => {
+    expect(fmtTurnModel('global.anthropic.claude-opus-4-8[1m]')).toBe('claude-opus-4-8[1m]')
+    expect(fmtTurnModel('us.anthropic.claude-sonnet-4-6')).toBe('claude-sonnet-4-6')
+    expect(fmtTurnModel('anthropic.claude-haiku-4-5')).toBe('claude-haiku-4-5')
+    expect(fmtTurnModel('claude-sonnet-4.6')).toBe('claude-sonnet-4.6')
+    expect(fmtTurnModel('gpt-5.6-luna')).toBe('gpt-5.6-luna')
+    // The Auto sentinel is passed through verbatim — the trimmer must not
+    // mistake it for a vendor-prefixed id and leave an empty label behind.
+    expect(fmtTurnModel('auto')).toBe('auto')
   })
 })
 

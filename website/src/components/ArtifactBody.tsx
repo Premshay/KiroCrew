@@ -1,7 +1,8 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import DOMPurify from 'dompurify'
-import hljs from '../utils/hljs'
+import { Download, Image as ImageIcon, ImageOff, RotateCw } from 'lucide-react'
 import { useTheme } from '../hooks/useTheme'
+import { useSandboxDoc } from '../hooks/useSandboxDoc'
+import { useScrollMemory } from '../hooks/useScrollMemory'
 import { useCommentBridge, type IframeSelection } from '../hooks/useCommentBridge'
 import { InlineCommentOverlay } from './InlineCommentOverlay'
 import { sanitizeCssValue } from '../lib/cssSanitize'
@@ -11,6 +12,7 @@ import type { FileType } from './FileRenderers'
 import type { Artifact, ArtifactComment } from '../types'
 
 import { i18nT } from '../i18n/t'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 // Shared renderer for the full-page route and the chat side-panel Artifacts
 // tab (markdown/text/json/svg natively via ContentRenderer; widget/html via
 // the sandboxed iframe).
@@ -34,6 +36,10 @@ export function fileTypeForKind(kind: Artifact['kind']): FileType {
     case 'json':     return 'json'
     case 'svg':      return 'svg'
     case 'text':     return 'code'
+    // image is served as raw bytes from its asset URL, not rendered from
+    // content — it never flows through ContentRenderer, but map it explicitly
+    // so a stray call can't misroute image bytes into the markdown path.
+    case 'image':    return 'image'
     // widget / html shouldn't reach here, but fall back to markdown rather
     // than throwing — keeps the page survivable for unexpected enum values.
     default:         return 'markdown'
@@ -61,13 +67,13 @@ export function isEditableKind(kind: Artifact['kind']): boolean {
 /** Renders a non-iframe artifact body — markdown / text / json / svg.
  * Theme vars are inherited naturally because we're not in a sandboxed
  * iframe; nothing to inject. When `editing` is true, swaps the preview
- * for a Monaco code editor. The `previewRef` is owned by the parent so
+ * for a Pierre code editor. The `previewRef` is owned by the parent so
  * the detail page / side panel can attach selection-to-comment handlers
  * above it. */
 export const ArtifactBodyNative = memo(function ArtifactBodyNative({
   kind, content, editing, onChange, previewRef,
   comments, activeCommentId, scrollNonce, onActivateComment, unreadRootIds,
-  heightStyle, flush,
+  heightStyle, flush, scrollMemoryKey,
 }: {
   kind: Artifact['kind']
   content: string
@@ -92,26 +98,34 @@ export const ArtifactBodyNative = memo(function ArtifactBodyNative({
    *  `ContentRenderer`, whose non-markdown paths draw a second border of their
    *  own unless told to run flush. */
   flush?: boolean
+  /** Cross-remount scroll identity (slot + tab id) — see `useScrollMemory`.
+   *  Passed only by the side panel's EMBEDDED body: a chat-slot switch
+   *  unmounts that instance, and this brings the document back where the
+   *  user left it. The full-page route and the fullscreen overlay omit it
+   *  (different lifecycles, and a second instance sharing the key would
+   *  fight the first over recording). */
+  scrollMemoryKey?: string
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const fileType = fileTypeForKind(kind)
   const ext = extForKind(kind)
   const isRichType = fileType === 'json' || fileType === 'svg' || fileType === 'html' || fileType === 'image' || fileType === 'csv' || fileType === 'pdf'
   const isMarkdown = fileType === 'markdown'
   const lang = langFor(ext)
   const scrollerRef = useRef<HTMLDivElement>(null)
+  // This div is the REAL scroll container for natively-rendered artifacts —
+  // the panel's outer wrapper never overflows (measured in the #5701 capture
+  // harness), so the memory must live here to observe anything.
+  const scrollMemory = useScrollMemory(scrollMemoryKey, scrollerRef, content !== '')
   const displayContent = isMarkdown ? content : wrapCode(content, ext)
-  const highlightedHtml = useMemo(() => {
-    if (isMarkdown || editing || isRichType) return ''
-    try { return DOMPurify.sanitize(hljs.highlight(content, { language: lang }).value) + '\n' }
-    catch { return DOMPurify.sanitize(hljs.highlightAuto(content).value) + '\n' }
-  }, [content, lang, isMarkdown, editing, isRichType])
   // Comment overlay for every natively-rendered body that has a previewRef —
-  // markdown (rendered DOM) AND the <pre> path (text/json/svg). Widgets/HTML use
+  // markdown (rendered DOM) AND the code path (text/json/svg). Widgets/HTML use
   // the iframe bridge instead.
   const showOverlay = !editing && !!onActivateComment && (comments?.length ?? 0) > 0
   return (
     <div
       ref={scrollerRef}
+      onScroll={scrollMemory.onScroll}
       className={`relative overflow-auto ${flush ? '' : 'rounded-xl border border-border bg-card'}`}
       style={heightStyle ?? { minHeight: 480, height: 'calc(100vh - 240px)' }}
     >
@@ -124,12 +138,10 @@ export const ArtifactBodyNative = memo(function ArtifactBodyNative({
           lang={lang}
           lineNums={true}
           wordWrap={true}
-          autocomplete={false}
           onChange={onChange}
           previewRef={previewRef}
           displayContent={displayContent}
           isMarkdown={isMarkdown}
-          highlightedHtml={highlightedHtml}
           flush={flush}
           markdownClassName="msg-content text-sm leading-relaxed"
         />
@@ -169,6 +181,7 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
   /** Override the iframe height (side-panel fit). */
   heightStyle?: React.CSSProperties
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const { theme, colorTheme, themeVersion } = useTheme()
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const themeVars = useMemo(() => readThemeVars(), [theme, colorTheme, themeVersion])
@@ -177,20 +190,17 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
     () => artifact.content ? buildSrcdoc({ html: artifact.content, themeVars, mode: theme, enableComments: true }) : null,
     [artifact.content, themeVars, theme],
   )
-  const [blobUrl, setBlobUrl] = useState<string | null>(null)
+  // One shared hook rather than this effect in four components: the previous
+  // document survives both an in-flight and a failed re-mint, and `failed`
+  // clears when a retry starts. See hooks/useSandboxDoc.ts for why each rule
+  // exists.
+  const { url: blobUrl, failed, retry } = useSandboxDoc(srcdoc)
+  // Reset on every new document: a re-mint (theme change, retry) navigates the
+  // frame again, so the previous load must not keep the new one visible early.
+  const [frameLoaded, setFrameLoaded] = useState(false)
   useEffect(() => {
-    // Clear the stale blob URL when srcdoc goes falsy (e.g. artifact.content
-    // empties while the panel is open); the cleanup below revokes the old URL,
-    // so leaving blobUrl set would point the iframe at a dead blob.
-    if (!srcdoc) {
-      setBlobUrl(null)
-      return
-    }
-    const blob = new Blob([srcdoc], { type: 'text/html;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    setBlobUrl(url)
-    return () => URL.revokeObjectURL(url)
-  }, [srcdoc])
+    setFrameLoaded(false)
+  }, [blobUrl])
   // Bridge: push anchored highlights into the iframe, surface in-iframe text
   // selections (-> popover) and highlight clicks (-> flash the sidebar row).
   const { scrollToAnchor, onIframeLoad } = useCommentBridge({
@@ -204,20 +214,145 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
     // ArtifactBodyNative); otherwise the hardcoded minHeight forces 480px and
     // overflows the panel's flex container. Falls back to the 480 default
     // merged with the full-page reading-width previewStyle (max-width).
-    <div className="rounded-xl border border-border bg-card overflow-hidden" style={heightStyle ?? { minHeight: 480, ...previewStyle }}>
-      {blobUrl ? (
-        <iframe
-          ref={iframeRef}
-          src={blobUrl}
-          onLoad={onIframeLoad}
-          sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
-          className="w-full border-none bg-card"
-          style={heightStyle ?? { height: 'calc(100vh - 240px)', minHeight: 480 }}
-          title={i18nT('components.artifactBody.artifact', { slug })}
-        />
-      ) : (
-        <div className="p-6 text-muted">{i18nT('components.artifactBody.rendering')}</div>
+    <div className="relative rounded-xl border border-border bg-card overflow-hidden" style={heightStyle ?? { minHeight: 480, ...previewStyle }}>
+      {/* Two shapes for the same notice, because the two situations read very
+          differently. With a document still showing, the notice OVERLAYS it: a
+          failed re-mint must not displace what the user is reading, and the
+          wrapper is a fixed height with overflow-hidden so a notice in the flow
+          would push the document down and clip its bottom edge. With no document
+          at all, the same overlay is a thin strip along the top of a 480px empty
+          box, which reads as a broken page rather than a failed load — so it
+          centres instead. */}
+      {failed && (
+        <div
+          className={
+            blobUrl
+              ? 'absolute top-0 left-0 right-0 z-10 px-6 py-3 flex items-center gap-3 text-text bg-bg-elevated/95 border-b border-border'
+              : 'absolute inset-0 z-10 flex items-center justify-center gap-3 text-text'
+          }
+        >
+          <span>{i18nT('components.artifactBody.could_not_render')}</span>
+          <button type="button" className="btn btn-sm" onClick={retry}>
+            <RotateCw className="lucide-inline" />
+            {i18nT('components.artifactBody.retry')}
+          </button>
+        </div>
       )}
+      {blobUrl ? (
+        <>
+          {/* The frame is TRANSPARENT until its document reports load, with a
+              themed panel underneath. Swapping the placeholder for the iframe the
+              moment the URL arrives shows the browser's own canvas for the length
+              of the document fetch — and some engines paint that canvas WHITE
+              regardless of this element's background, which reads as a flash on
+              every open. WidgetFrame already fades in on load for this reason;
+              this is the same guard on the artifact frame. */}
+          {!frameLoaded && (
+            <div aria-hidden className="absolute inset-0 bg-card" />
+          )}
+          <iframe
+            ref={iframeRef}
+            src={blobUrl}
+            onLoad={() => {
+              setFrameLoaded(true)
+              onIframeLoad?.()
+            }}
+            sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+            className="w-full border-none bg-card"
+            style={{
+              ...(heightStyle ?? { height: 'calc(100vh - 240px)', minHeight: 480 }),
+              // `color-scheme` is cheap insurance on top: it tells the engine
+              // which base canvas to paint for the embedded document before that
+              // document's own CSS is parsed.
+              colorScheme: theme,
+              opacity: frameLoaded ? 1 : 0,
+              transition: 'opacity .12s ease',
+            }}
+            title={i18nT('components.artifactBody.artifact', { slug })}
+          />
+        </>
+      ) : (
+        !failed && (
+          <div className="p-6 text-muted">{i18nT('components.artifactBody.rendering')}</div>
+        )
+      )}
+    </div>
+  )
+})
+
+/** The URL the image bytes stream from. The server sets Content-Type, so the
+ * browser renders it directly in an <img> / downloads it via an anchor — the
+ * artifact JSON never carries base64. Slugs are already URL-safe, but encode
+ * defensively so an unexpected character can't break the path. */
+export function artifactAssetUrl(slug: string): string {
+  return `/api/artifacts/${encodeURIComponent(slug)}/asset`
+}
+
+/** Renders an image artifact: the picture itself streamed from the asset URL,
+ * plus a Download control pointing at the same URL. No editor, no iframe —
+ * image is not an editable text kind, so it never reaches ArtifactBodyNative /
+ * ArtifactBodyIframe. Reads the optional `image` metadata defensively: `alt`
+ * drives the accessible description (falling back to the artifact name), and
+ * `width`/`height` set the intrinsic aspect ratio so the layout doesn't jump
+ * before the bytes arrive. Download names the file from `original_filename`,
+ * or a slug + extension when that is absent. */
+export const ArtifactBodyImage = memo(function ArtifactBodyImage({
+  artifact, slug, heightStyle,
+}: {
+  artifact: Artifact
+  slug: string
+  /** Override the body height/min-height (side-panel fit), mirroring the other
+   *  bodies. Falls back to the full-page reading height. */
+  heightStyle?: React.CSSProperties
+}) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const url = artifactAssetUrl(slug)
+  const alt = artifact.image?.alt || artifact.name
+  const downloadName =
+    artifact.image?.original_filename || `${slug}.${artifact.image?.ext || 'png'}`
+  // The asset endpoint can legitimately fail (missing sidecar, unreadable file,
+  // a mime the read path refuses). Without this the user gets the browser's
+  // broken-image glyph and no explanation on an otherwise healthy page.
+  const [failed, setFailed] = useState(false)
+  return (
+    <div
+      className="rounded-xl border border-border bg-card overflow-hidden flex flex-col"
+      style={heightStyle ?? { minHeight: 480, height: 'calc(100vh - 240px)' }}
+    >
+      <div className="flex-1 min-h-0 flex items-center justify-center overflow-auto p-4">
+        {failed ? (
+          <div className="flex flex-col items-center gap-2 text-center">
+            <ImageOff size={24} className="text-muted" aria-hidden="true" />
+            <span className="text-sm text-muted">
+              {i18nT('components.artifactBody.image_could_not_be_loaded')}
+            </span>
+          </div>
+        ) : (
+          <img
+            src={url}
+            alt={alt}
+            width={artifact.image?.width}
+            height={artifact.image?.height}
+            loading="lazy"
+            className="max-w-full max-h-full object-contain"
+            draggable={false}
+            onError={() => setFailed(true)}
+          />
+        )}
+      </div>
+      <div className="flex items-center justify-between gap-2 border-t border-border px-4 py-2 text-sm text-muted">
+        <span className="flex items-center gap-1.5 min-w-0">
+          <ImageIcon size={14} className="shrink-0" />
+          <span className="truncate">{downloadName}</span>
+        </span>
+        <a
+          href={url}
+          download={downloadName}
+          className="flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-text hover:border-border-strong transition-colors shrink-0"
+        >
+          <Download size={14} /> {i18nT('pages.artifactDetailPage.download')}
+        </a>
+      </div>
     </div>
   )
 })

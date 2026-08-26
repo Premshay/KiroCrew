@@ -3,12 +3,15 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Check, Bot, FolderOpen, Brain, Settings, Lock, Flame } from 'lucide-react'
 import { api } from '../../api/client'
 import { Card, CardTitle, Badge, EmptyState } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
 import InfoTip from '../../components/InfoTip'
+import SimpleSelect from '../../components/SimpleSelect'
 import { useProvider } from '../../providers'
 
 import type { KiroCrewAgent } from '../../components/AgentSelector'
 
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 type KiroCrewAgentCfg = Omit<KiroCrewAgent, 'name'>
 interface WorkspaceCfg { dir: string }
 interface MemoryStoreCfg { description: string; embedding_provider: string }
@@ -34,7 +37,7 @@ function UsedByTags({ names }: { names: string[] }) {
 }
 
 const rowCls = "flex justify-between items-center gap-3 py-1.5 border-b border-border text-sm"
-const inputCls = "h-7 min-w-[120px] bg-bg-elevated border border-border rounded px-2 py-0.5 text-[13px] font-mono text-text focus:border-accent focus:outline-none"
+const inputCls = "h-7 min-w-[120px] bg-bg-elevated border border-border rounded-md px-2 py-0.5 text-[13px] font-mono text-text focus-visible:border-accent focus:outline-none"
 const readonlyCls = "flex justify-between items-center gap-3 py-1.5 border-b border-border text-sm bg-bg-elevated/30 rounded px-1 -mx-1"
 
 function useDirtyTrack<T>(value: T) {
@@ -63,14 +66,26 @@ function CfgSelect({ label, path, value, options, hint, labels, onSave }: { labe
   useEffect(() => { setLocal(value) }, [value])
   return (
     <CfgRow label={label} hint={hint} ok={ok}>
-      <select className={inputCls} value={local} onChange={e => { markDirty(); setLocal(e.target.value); onSave(path, e.target.value) }}>
-        {options.map(o => <option key={o} value={o}>{labels?.[o] ?? o}</option>)}
-      </select>
+      {/* The trigger is a <button>, so the row's visible label is threaded in
+          as the accessible name (matches CfgNumber's aria-label={label}).
+          `className` restores this table's compact geometry: the shared trigger
+          defaults to `px-3 py-2 text-sm`, which is ~10px taller than the `h-7
+          text-[13px]` control it replaced and would grow every row. */}
+      <SimpleSelect
+        aria-label={label}
+        className="h-7 px-2 py-0.5 text-[13px] font-mono"
+        style={{ minWidth: 120 }}
+        options={options}
+        optionLabels={options.map(o => labels?.[o] ?? o)}
+        value={local}
+        onChange={v => { markDirty(); setLocal(v); onSave(path, v) }}
+      />
     </CfgRow>
   )
 }
 
 function CfgNumber({ label, path, value, suffix, min, max, hint, onSave }: { label: string; path: string; value: number; suffix?: string; min?: number; max?: number; hint?: string; onSave: (p: string, v: number) => void }) {
+  const ime = useImeGuard()
   const [local, setLocal] = useState(String(value))
   const { ok, markDirty } = useDirtyTrack(value)
   const [err, setErr] = useState('')
@@ -88,8 +103,7 @@ function CfgNumber({ label, path, value, suffix, min, max, hint, onSave }: { lab
         className={`${inputCls} text-right ${err ? 'border-danger' : ''}`}
         value={local}
         onChange={e => { setLocal(e.target.value); setErr('') }}
-        onBlur={commit}
-        onKeyDown={e => { if (e.key === 'Enter') commit() }}
+        {...ime.bindEnter({ onEnter: commit, onBlur: commit })}
       />
       {suffix && <span className="text-muted text-[12px]">{suffix}</span>}
       {err && <span className="text-danger text-[11px]">{err}</span>}
@@ -139,7 +153,7 @@ export default function KiroCrewCfgTab() {
     patchMut.mutate({ path, value })
   }
 
-  if (err) return <Card><p className="text-danger text-sm">{err}</p></Card>
+  if (err) return <Card><ErrorNotice message={err} askAgent /></Card>
   if (!cfg) return <Card><div className="skeleton h-40 rounded" /></Card>
 
   const agents = Object.entries(cfg.agents)

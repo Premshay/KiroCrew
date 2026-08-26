@@ -26,6 +26,7 @@ from kiro_crew.context import _neutralize_structural_markers
 from kiro_crew.dashboard.chat_runner import _run_chat
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key
+from kiro_crew.dashboard.turn_dispatch import chat_turn_timeout_secs
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.validation import _AGENT_NAME_RE
@@ -375,21 +376,42 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
         resources=f"slot={slot.key} agent={agent}",
     )
 
-    # Launch the chat
-    task = asyncio.create_task(asyncio.wait_for(_run_chat(state, slot, prompt), timeout=300))
-    slot.task = task
-    state._background_tasks.add(task)
-    task.add_done_callback(state._background_tasks.discard)
-
-    created = int(time.time())
-    ephemeral = not slot_id
-
-    if stream:
-        return await _stream_response(
-            request, state, slot, completion_id, model, created, ephemeral
+    # Both response shapes below consume `slot._pending` as their delivery
+    # queue, and neither sets `_has_reader` (that flag also suppresses the
+    # global message broadcast, which an app-owned slot still wants). Claim the
+    # queue BEFORE the turn is dispatched: the first `await` inside the response
+    # helpers lets the turn run, so a scope opened there would leave a window in
+    # which a turn-end release could discard tokens this reader owes its client.
+    with slot.pending_consumer():
+        # Launch the chat, bounded by the standard chat-turn ceiling. A fixed
+        # 300s cap here would race COMPACT_WAIT_TIMEOUT_SECS: a /compact prompt
+        # phase plus the full compaction wait always exceeds it, so the outer
+        # cancel would surface as an HTTP 500 instead of the graceful
+        # compaction-timeout result.
+        task = asyncio.create_task(
+            asyncio.wait_for(
+                _run_chat(
+                    state,
+                    slot,
+                    prompt,
+                    _directive_user_origin=is_dashboard_caller,
+                ),
+                timeout=chat_turn_timeout_secs(),
+            )
         )
-    else:
-        return await _blocking_response(state, slot, completion_id, model, created, ephemeral)
+        slot.task = task
+        state._background_tasks.add(task)
+        task.add_done_callback(state._background_tasks.discard)
+
+        created = int(time.time())
+        ephemeral = not slot_id
+
+        if stream:
+            return await _stream_response(
+                request, state, slot, completion_id, model, created, ephemeral
+            )
+        else:
+            return await _blocking_response(state, slot, completion_id, model, created, ephemeral)
 
 
 async def _stream_response(

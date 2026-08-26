@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from kiro_crew.platform.interfaces import McpScope
+    from kiro_crew.platform.interfaces import ImportSource, McpScope
 
 from kiro_crew import security, sso_status
 from kiro_crew.platform.interfaces import CapabilityResult, InterceptDecision
@@ -131,7 +131,13 @@ class DefaultCredentialPolicy:
 
 
 class DefaultSlackEnterpriseGate:
-    """Default-open gate delegating to ``slack/enterprise.py``."""
+    """Default-open gate delegating to ``slack/enterprise.py``.
+
+    ``extra_ids`` is accepted for protocol compatibility and IGNORED: the module
+    re-reads ``slack.allowed_enterprise_ids`` itself, which is the same key the
+    callers derive this value from, so a passed set is at best a duplicate and
+    at worst an older copy naming ids the operator removed.
+    """
 
     def validate_enterprise(self, bot_token: str, *, extra_ids: "set[str] | None" = None) -> bool:
         # deferred: defaults.py loads at platform-init (bootstrap imports it);
@@ -253,6 +259,13 @@ class DefaultPromptSourceProvider:
         return []
 
 
+class DefaultImportSourceProvider:
+    """No edition import sources — the onboarding importer offers the builtins only."""
+
+    def import_sources(self) -> List["ImportSource"]:
+        return []
+
+
 class DefaultCapabilityManager:
     """Unavailable capability manager — the public edition ships no external
     package manager, so ``/api/capability/*`` report 503. Every operation is a
@@ -303,6 +316,22 @@ class DefaultCapabilityManager:
         return CapabilityResult(ok=False, message="capability manager not available")
 
 
+class DefaultExternalAccessPolicy:
+    """Admits every external service — today's open-source behaviour.
+
+    The public build queries skills.sh and the official MCP registry and offers
+    cloud deployment, so the default must stay permissive or an ordinary install
+    would lose both browsers and the deploy page. A managed edition overrides this
+    to allowlist its own registry and to withhold cloud deployment.
+    """
+
+    def admits_registry(self, kind: str, name: str, api_base: str) -> bool:
+        return True
+
+    def admits_cloud_deployment(self, target: str) -> bool:
+        return True
+
+
 class DefaultAppRegistryPolicy:
     """Today's public trusted-host set + clone-sandbox-mode decision.
 
@@ -338,6 +367,12 @@ class DefaultAppsLoader:
     def registry_rows(self) -> List[Dict[str, Any]]:
         # The public edition bundles no extra App-Store rows beyond
         # apps/app-registry.json. A companion returns its internal catalog rows.
+        return []
+
+    def default_registries(self) -> List[Dict[str, Any]]:
+        # The public edition pins no external registry: the only registries are
+        # the ones the operator typed into config.registries. A companion returns
+        # its organisation's official registry.
         return []
 
 

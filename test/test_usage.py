@@ -26,6 +26,7 @@ from kiro_crew.dashboard.handlers.usage import (
     read_context_tokens,
     read_effective_agent,
     read_effective_model,
+    read_turn_model,
 )
 
 # ── _parse_sessions ─────────────────────────────────────────────────────
@@ -51,7 +52,11 @@ class TestParseSessions:
         ):
             result = _parse_sessions()
             assert "error" in result
-            assert "boom" in result["error"]
+            # The OSError carries a filesystem path; it stays server-side. The
+            # returned `error` is a generic message with a machine-readable code.
+            assert "boom" not in result["error"]
+            assert result["error"] == "cannot read sessions directory"
+            assert result["code"] == "sessions_dir_unreadable"
 
     def test_skips_non_jsonl(self, tmp_path):
         d = tmp_path / "cli"
@@ -902,6 +907,37 @@ class TestBuildTokenRecordContextFields:
         assert rec["context_window"] == 0
         json.dumps(rec)  # must not raise
 
+    def test_stop_reason_recorded_from_event(self):
+        """The row carries the turn's terminal stop reason so watchdog outcomes
+        (tool_stall / stale_recover) can be joined against the free-form
+        ``agent`` field retroactively — per-agent stall analysis happens HERE,
+        not on OTel attrs (cardinality rule)."""
+        from types import SimpleNamespace
+
+        ev = SimpleNamespace(usage=None, stop_reason="error: tool stall")
+        rec = usage_mod._build_token_record(
+            "chat-1", "m", ev, "acp", datetime.now(timezone.utc)
+        )
+        assert rec["stop_reason"] == "error: tool stall"
+        json.dumps(rec)  # must not raise
+
+    def test_stop_reason_defaults_empty_and_tolerates_non_string(self):
+        # A bare TurnUsage-shaped event (provider_last_turn_usage) has no
+        # stop_reason; a non-string on a test double must not break json.dumps.
+        rec = usage_mod._build_token_record(
+            "chat-1", "m", self._event(), "acp", datetime.now(timezone.utc)
+        )
+        assert rec["stop_reason"] == ""
+
+        from types import SimpleNamespace
+
+        weird = SimpleNamespace(usage=None, stop_reason=1234)
+        rec = usage_mod._build_token_record(
+            "chat-1", "m", weird, "acp", datetime.now(timezone.utc)
+        )
+        assert rec["stop_reason"] == ""
+        json.dumps(rec)
+
     def test_backcompat_defaults_when_no_kwargs(self):
         # Called positionally with no new kwargs (mirrors every legacy caller):
         # the original keys are unchanged and the new keys default to ""/0, so
@@ -1097,6 +1133,42 @@ class TestReadEffectiveModel:
         assert read_effective_model(node) == "claude-opus-4.8"
 
 
+class TestReadTurnModel:
+    """read_turn_model: display attribution — concrete id, `auto`, or blank."""
+
+    def test_concrete_id_outranks_the_sentinel(self):
+        # A resolved id anywhere in the chain wins even while an outer wrapper
+        # still reports the Auto request, so a pinned turn never reads "auto".
+        handle = type("Handle", (), {"_resolved_model_id": "claude-opus-4.8"})()
+        provider = type("P", (), {"_model": "auto", "_handle": handle})()
+        assert read_turn_model(provider) == "claude-opus-4.8"
+
+    def test_auto_request_with_no_resolved_id_reports_auto(self):
+        # The case read_effective_model collapses to "": the user chose Auto and
+        # the backend disclosed no id. Reporting the choice is not guessing.
+        assert read_turn_model(_Inner("auto")) == "auto"
+        assert read_effective_model(_Inner("auto")) == ""
+
+    def test_auto_sentinel_is_matched_case_and_space_insensitively(self):
+        assert read_turn_model(_Inner("  AUTO ")) == "auto"
+
+    def test_auto_found_deeper_in_the_chain(self):
+        inner = type("Handle", (), {"_model": "auto"})()
+        assert read_turn_model(type("P", (), {"_handle": inner})()) == "auto"
+
+    def test_no_model_information_stays_blank(self):
+        # Distinct from the Auto case: nothing is known, so nothing is claimed.
+        assert read_turn_model(object()) == ""
+
+    def test_never_raises_on_a_hostile_source(self):
+        class Boom:
+            @property
+            def _model(self):
+                raise RuntimeError("no")
+
+        assert read_turn_model(Boom()) == ""
+
+
 class TestReadEffectiveAgent:
     """The resolved agent, not the slot alias."""
 
@@ -1202,18 +1274,32 @@ class TestModelSourceFallback:
         )
         assert self._row(shard_dir)["model"] == "claude-opus-4.8"
 
-    def test_auto_without_resolvable_source_records_blank(self, tmp_path, monkeypatch):
-        # Matches test_late_backfill_skips_auto_sentinel's contract: the record
-        # stays blank until a real model is known -- never the sentinel itself.
+    def test_auto_without_resolvable_source_records_auto(self, tmp_path, monkeypatch):
+        # `auto` records the explicit backend-selection mode even when the
+        # backend does not disclose the concrete model for this completed turn.
         shard_dir = _patch_shard_layout(monkeypatch, tmp_path)
         persist_token_record(
             "slot", "auto", self._event(), provider="acp", surface="task_runner"
         )
-        assert self._row(shard_dir)["model"] == ""
+        assert self._row(shard_dir)["model"] == "auto"
 
     def test_auto_is_case_and_space_insensitive(self, tmp_path, monkeypatch):
         shard_dir = _patch_shard_layout(monkeypatch, tmp_path)
         persist_token_record(
             "slot", "  AUTO ", self._event(), provider="acp", surface="cron"
         )
-        assert self._row(shard_dir)["model"] == ""
+        assert self._row(shard_dir)["model"] == "auto"
+
+    def test_auto_source_fills_empty_model(self, tmp_path, monkeypatch):
+        # Dashboard slots use an empty override for Auto while the live client
+        # retains the request sentinel.
+        shard_dir = _patch_shard_layout(monkeypatch, tmp_path)
+        persist_token_record(
+            "dashboard:auto",
+            "",
+            self._event(),
+            provider="acp",
+            surface="dashboard",
+            model_source=_Inner("  AUTO "),
+        )
+        assert self._row(shard_dir)["model"] == "auto"

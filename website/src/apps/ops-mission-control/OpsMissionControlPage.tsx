@@ -346,7 +346,7 @@ function ClosedIncidents() {
                   onClick={() =>
                     setExpanded(expanded === inc.incident_id ? null : inc.incident_id)
                   }
-                  className="w-full flex items-center gap-2 py-2 text-left text-sm hover:bg-card-hover"
+                  className="w-full flex items-center gap-2 py-2 text-left text-sm hover:bg-bg-hover"
                 >
                   <StatusIcon status={inc.status} />
                   <span className="font-mono text-xs text-muted shrink-0">{inc.incident_id}</span>
@@ -560,7 +560,7 @@ export default function OpsMissionControlPage() {
         }
       />
 
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         <div className="mb-4">
           {/* Literal keys inline, not a `.map()` over a key table: `check-i18n-keys` cannot
               follow a key through a closure parameter, and an unresolvable site is one it
@@ -730,7 +730,7 @@ export default function OpsMissionControlPage() {
                       onClick={() =>
                         setSelected(selected === inc.incident_id ? null : inc.incident_id)
                       }
-                      className="w-full flex items-center gap-2 py-2 text-left text-sm hover:bg-card-hover"
+                      className="w-full flex items-center gap-2 py-2 text-left text-sm hover:bg-bg-hover"
                     >
                       <StatusIcon status={inc.status} />
                       <span className="font-mono text-xs text-muted shrink-0">

@@ -64,6 +64,25 @@ def test_pod_env_puts_the_checkout_venv_ahead_of_the_global_shim_dir(tmp_path):
     assert entries.index(venv_bin) < entries.index(shim_dir)
 
 
+def test_pod_env_scrubs_the_live_gateways_bound_port(tmp_path, monkeypatch):
+    """KIROCREW_BOUND_PORT must never cross the pod boundary.
+
+    A gateway-descended caller (an agent bash turn) inherits the LIVE
+    gateway's bound-port export. Inside a pod env it names the wrong plane —
+    the pod's own KIROCREW_PORT is the target — and resolve_client_port reads
+    it as a fallback, so leaving it in would let pod client commands aim at
+    the live gateway if precedence ever changed. Scrubbed unconditionally.
+    """
+    monkeypatch.setenv("KIROCREW_BOUND_PORT", "5476")
+    cfg = _pod_cfg(tmp_path)
+    checkout = _provisioned_checkout(tmp_path)
+
+    env = rt.build_pod_env(cfg, tmp_path / "home", 7900, checkout)
+
+    assert "KIROCREW_BOUND_PORT" not in env
+    assert env["KIROCREW_PORT"] == "7900"
+
+
 def test_pod_env_still_isolates_home_and_port(tmp_path):
     """The PATH change must not disturb the existing isolation keys."""
     cfg = _pod_cfg(tmp_path)
@@ -185,7 +204,7 @@ def test_host_scoped_verbs_are_refused(verb):
         rt.require_pod_safe_verb([verb], "wt-feature")
 
 
-def test_app_is_refused_because_it_rewrites_the_host_agent_registry():
+def test_app_is_refused_because_it_rewrites_the_host_agent_registry(unpinned_agent_spec_home):
     """`apps/bridges.py` symlinks app agents into `Path.home()/.kiro/agents` and
     edits `~/.kiro/settings/mcp.json` — the HOST registry. A pod install/uninstall
     would replace or delete symlinks the live gateway depends on."""
@@ -196,6 +215,10 @@ def test_app_is_refused_because_it_rewrites_the_host_agent_registry():
     # directly would assert the override rather than the path bridges actually
     # writes to. The claim under test is unchanged -- bridges targets the
     # machine-wide HOST registry, which is why a pod may not run `app`.
+    #
+    # ``unpinned_agent_spec_home`` because that override is exactly what the rootdir
+    # floor now sets for every test: leaving it pinned would assert that bridges
+    # targets a per-test tmp dir, which is the opposite of the claim.
     assert bridges._kiro_agents_dir() == Path.home() / ".kiro" / "agents"
     assert "app" not in rt._POD_SAFE_VERBS
 
@@ -329,7 +352,7 @@ def test_logs_is_refused_and_points_at_the_pod_journal():
 def test_snapshot_is_refused_because_its_destination_is_configurable():
     """`snapshot_dir` is a config field and `--keep N` DELETES older archives, so a
     pod seeded from the live config could prune the user's real backups —
-    `sanitized_seed_config` only forces tunnel/telegram/wecom off."""
+    `sanitized_seed_config` only forces the tunnel and the channel enables off."""
     from kiro_crew.config.loader import KiroCrewConfig
 
     assert hasattr(KiroCrewConfig, "__dataclass_fields__")

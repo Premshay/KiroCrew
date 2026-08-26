@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, waitFor, within } from '@testing-library/react'
+import { screen, waitFor, within, fireEvent } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { DisplayPanel } from '../pages/settings/DisplayPanel'
 import { renderWithProviders } from './helpers'
@@ -205,6 +205,39 @@ describe('DisplayPanel – theme install', () => {
     spy.mockRestore()
   })
 
+  it('picking "Local folder" retargets the install at a filesystem path', async () => {
+    // Regression guard for the native-<select> → SimpleSelect migration: the
+    // source picker is a Radix Select, so a `change` event on the trigger does
+    // nothing — open it, then click the option. The placeholder and the
+    // installTheme payload are the two observable consequences of the state move.
+    const spy = vi
+      .spyOn(api, 'installTheme')
+      .mockResolvedValue({ ok: true, slug: 'lcars' })
+    renderWithProviders(<DisplayPanel />)
+
+    const trigger = screen.getByRole('combobox', { name: 'Theme source' })
+    expect(trigger).toHaveTextContent('GitHub')
+    expect(screen.getByLabelText('Theme source location')).toHaveAttribute(
+      'placeholder',
+      'https://github.com/user/theme'
+    )
+
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole('option', { name: 'Local folder' }))
+
+    expect(trigger).toHaveTextContent('Local folder')
+    const location = screen.getByLabelText('Theme source location')
+    expect(location).toHaveAttribute('placeholder', '/path/to/theme')
+
+    fireEvent.change(location, { target: { value: '/srv/themes/lcars' } })
+    fireEvent.click(screen.getByText('Install'))
+
+    await waitFor(() => {
+      expect(spy).toHaveBeenCalledWith({ type: 'local', path: '/srv/themes/lcars' })
+    })
+    spy.mockRestore()
+  })
+
   it('shows the "Applying…" status indicator while a theme switch is in flight', () => {
     mockUseTheme.mockImplementation(() => ({ ...DEFAULT_THEME, themeSwitching: true }))
     renderWithProviders(<DisplayPanel />)
@@ -229,6 +262,29 @@ describe('DisplayPanel – theme install', () => {
     // installTheme never resolves → the button stays in the 'fetching' phase.
     expect(await screen.findByRole('button', { name: /Fetching/ })).toBeInTheDocument()
     spy.mockRestore()
+  })
+})
+
+describe('DisplayPanel – font family setting', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('tells the user the code font tracks the theme, not this preference', () => {
+    // A theme pack's `mono` face reaches code blocks, inline code and diffs
+    // under EVERY option here, System included (website/docs/theming-contract.md
+    // § Fonts). Without this sentence a user who picks System and still sees the
+    // code font change reads the option as broken.
+    // Since OpenDyslexic shipped, the description also carves out that option:
+    // it applies its own OpenDyslexicMono to code surfaces, so the "follows the
+    // active theme" rule doesn't hold for it. The assertion pins both halves so
+    // a future edit can't silently drop either.
+    renderWithProviders(<DisplayPanel />)
+
+    expect(screen.getByText('Font Family')).toBeInTheDocument()
+    expect(
+      screen.getByText('UI font family for the dashboard. Code font follows the active theme, except OpenDyslexic which supplies its own.'),
+    ).toBeInTheDocument()
   })
 })
 
@@ -272,5 +328,75 @@ describe('DisplayPanel – zoom setting', () => {
     // No zoom % value button renders in browser mode (other steppers keep theirs).
     expect(screen.queryByText(/^\d+%$/)).not.toBeInTheDocument()
     expect(screen.queryByText('Font Size')).not.toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – dropped overrides notice', () => {
+  // The runtime scoper silently removes overrides.css rules the theming
+  // contract disallows; the ONLY other signal is a console warning no dashboard
+  // user has open. These pin the Settings-side surface: shown for the active
+  // pack with the rule names an author needs, absent otherwise.
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const REPORT = { slug: 'manrope', rules: ['body { --font-body }', '.session-card'] }
+
+  it('names the dropped rules when the active theme had rules removed', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      overridesDropReport: REPORT,
+    }))
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.getByText("Some of this theme's styles were ignored")).toBeInTheDocument()
+    // The rule names are the actionable part — a bare count tells an author
+    // nothing to edit.
+    expect(screen.getByText(/body \{ --font-body \}/)).toBeInTheDocument()
+    expect(screen.getByText(/\.session-card/)).toBeInTheDocument()
+    const link = screen.getByRole('link', { name: 'Theming guide' })
+    expect(link).toHaveAttribute('target', '_blank')
+    expect(link).toHaveAttribute('rel', expect.stringContaining('noopener'))
+  })
+
+  it('renders nothing when no rules were dropped', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      overridesDropReport: null,
+    }))
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.queryByText("Some of this theme's styles were ignored")).not.toBeInTheDocument()
+  })
+
+  it('ignores a report that belongs to a theme other than the active one', () => {
+    // Belt-and-braces for the switch race: the provider clears the report on
+    // theme change, but a stale report must still never be attributed to the
+    // wrong pack in the UI.
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-other',
+      overridesDropReport: REPORT,
+    }))
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.queryByText("Some of this theme's styles were ignored")).not.toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – Font Family picker (OpenDyslexic option)', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  // The Font Family row is a SettingsButtonGroup that lists Sans / Mono /
+  // System, plus OpenDyslexic as a fourth built-in a11y option. The buttons
+  // render their label as accessible text; asserting on the button role is
+  // enough to prove the option is discoverable — actually clicking it would
+  // just re-verify the shared SettingsButtonGroup wiring, which has its own
+  // tests.
+  it('lists OpenDyslexic as a fourth font family option alongside Sans/Mono/System', () => {
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.getByRole('button', { name: 'Sans' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Mono' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'System' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'OpenDyslexic' })).toBeInTheDocument()
   })
 })

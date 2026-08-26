@@ -9,7 +9,6 @@ registration (agents, skills, crons) to bridge functions.
 
 from __future__ import annotations
 
-import asyncio
 import ipaddress
 import json
 import logging
@@ -18,20 +17,29 @@ import re
 import shutil
 import stat
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from kiro_crew.apps.admission import app_admission_denied
 from kiro_crew.apps.discovery import discover_builtin_apps
 from kiro_crew.apps.execution import (
     app_execution_denied,
+    repository_bound_grant_denied,
     shipped_builtin_app_root,
 )
-from kiro_crew.apps.manifest import AppManifest
+from kiro_crew.apps.manifest import AppManifest, app_name_error
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import config_dir
+from kiro_crew.config.loader import (
+    config_dir,
+    config_local_path,
+    config_path,
+    write_config_atomically,
+)
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform import current_context, safe_context_call
 from kiro_crew.sel import sel
 
@@ -110,6 +118,17 @@ class InstalledApp:
         ""  # noqa: N815  — target standalone app: "registry:{name}" or "standalone:{name}"
     )
     dev: bool = False  # dev mode: no-store UI serving + file-watch live reload
+    # Whether this record has already received a default-on PROMOTION (see
+    # ``_DEFAULT_ON_BACKFILL``).  Lives on the record rather than in a marker file
+    # so it is written by the SAME atomic write that flips ``enabled``: two
+    # separate writes have no correct ordering, since whichever goes first leaves
+    # a window the other owns (a lost flag re-applies the promotion forever and
+    # reverses the user's own disable; a flag that outlives a failed flip skips
+    # the app forever and never delivers it).  A record created under the promoted
+    # default is born ``True``: a first registration with ``defaultEnabled`` is
+    # the promotion being received, so nothing is owed.  Meaningless-but-inert
+    # (``False``) for every app that is not a promotion target.
+    defaultOnBackfilled: bool = False  # noqa: N815
     # Structured install provenance, recorded for registry installs (see
     # ``set_app_provenance``).  ``source`` alone is a bare ``registry:<name>``
     # marker that re-resolves by name, so a same-named entry from a different
@@ -153,6 +172,7 @@ class InstalledApp:
             schemaVersion=int(data.get("schemaVersion", 1)),
             migratedTo=str(data.get("migratedTo", "")),
             dev=bool(data.get("dev", False)),
+            defaultOnBackfilled=bool(data.get("defaultOnBackfilled", False)),
             sourceUrl=str(data.get("sourceUrl", "")),
             sourceRegistry=str(data.get("sourceRegistry", "")),
             sourceCommit=str(data.get("sourceCommit", "")),
@@ -213,11 +233,43 @@ def _read_installed(name: str) -> InstalledApp | None:
         return None
 
 
+def _credential_free_source_metadata(value: str) -> str:
+    """Sanitize an explicit remote URI while preserving path/id metadata."""
+    candidate = value.strip()
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*://", candidate) is None:
+        return value
+
+    # Deferred because ``apps.registry`` imports this module.
+    from kiro_crew.apps.registry import _strip_git_target_userinfo
+
+    return _strip_git_target_userinfo(candidate)
+
+
 def _write_installed(name: str, meta: InstalledApp) -> None:
-    """Write installed.json for an app."""
+    """Write credential-free installed.json metadata for an app.
+
+    A raw clone/source URL is a transport capability, not durable app identity.
+    Registry callers already pass credential-free provenance, but the external
+    registration API also accepts a free-form ``source`` and direct Python
+    callers can supply ``sourceUrl`` independently.  ``sourceUrl`` is always a
+    Git coordinate and is sanitized unconditionally.  ``source`` and
+    ``sourceRegistry`` are discriminated metadata (path/marker/id OR URL), so
+    only an explicit remote URI is sanitized; treating arbitrary ``:...@...:``
+    text as SCP would corrupt valid POSIX filenames.
+
+    The import is deferred because ``apps.registry`` imports this module.
+    """
+    from kiro_crew.apps.registry import _strip_git_target_userinfo
+
+    credential_free_meta = replace(
+        meta,
+        source=_credential_free_source_metadata(str(meta.source or "")),
+        sourceUrl=_strip_git_target_userinfo(str(meta.sourceUrl or "")),
+        sourceRegistry=_credential_free_source_metadata(str(meta.sourceRegistry or "")),
+    )
     meta_path = app_dir(name) / INSTALLED_META_FILENAME
     meta_path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(meta_path, json.dumps(meta.to_dict(), indent=2) + "\n")
+    atomic_write(meta_path, json.dumps(credential_free_meta.to_dict(), indent=2) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -268,10 +320,23 @@ def _validate_source_path(source: Path) -> list[str]:
         return errors
     try:
         manifest = AppManifest.from_json_file(manifest_path)
-    except (json.JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         errors.append(f"invalid {APP_MANIFEST_FILENAME}: {exc}")
         return errors
     errors.extend(manifest.validate(app_root=source))
+    # `ui.overlays` replaces a host surface by naming an overlay component compiled
+    # into the dashboard bundle. An installed app has no way to supply one -- there is
+    # no per-overlay `entryPoint` the way `ui.pages` has -- so accepting the manifest
+    # here would install an app whose declaration can only fail later as a browser
+    # console warning, the one channel an app author never reads. Refuse at install,
+    # which is the channel they do read. Builtins are validated by discovery.py and
+    # are unaffected.
+    if manifest.ui.overlays:
+        errors.append(
+            "ui.overlays is not available to installed apps: an overlay must name a "
+            "component compiled into the dashboard bundle, so a declaration here can "
+            "never render"
+        )
     if manifest.minKiroCrewVersion:
         ver_err = _check_min_version(manifest.minKiroCrewVersion)
         if ver_err:
@@ -390,17 +455,46 @@ def _copy_app_tree(source: Path, dest: Path) -> None:
 # otherwise race the installed-check against the copy — and update/uninstall
 # use shared move-aside names (``.{name}-data-tmp``), so an interleaving can
 # destroy preserved user data.  Different apps proceed in parallel.
-_LIFECYCLE_LOCKS: dict[str, "asyncio.Lock"] = {}
+_LIFECYCLE_LOCKS: dict[str, LoopBoundLock] = {}
+
+# Registry installs historically call ``install_app(source)`` / ``update_app(source)``
+# with one positional argument. Keep that internal callable contract (tests and
+# downstream integrations replace these functions), while carrying the server-
+# resolved repository through ``asyncio.to_thread`` without putting it in the
+# app-controlled manifest. Context variables are copied into to_thread workers
+# and remain task-local when two registry installs run concurrently.
+_REGISTRY_SOURCE_REPOSITORY: ContextVar[str | None] = ContextVar(
+    "kirocrew_registry_source_repository", default=None
+)
 
 
-def app_lifecycle_lock(name: str) -> "asyncio.Lock":
-    """Return the per-app asyncio lock guarding install/update/uninstall.
+@contextmanager
+def registry_source_repository(repository: str) -> Iterator[None]:
+    """Scope a sanitized registry coordinate to one manager operation."""
+    coordinate = repository.strip()
+    if not coordinate:
+        raise ValueError("registry source repository is required")
+    token = _REGISTRY_SOURCE_REPOSITORY.set(coordinate)
+    try:
+        yield
+    finally:
+        _REGISTRY_SOURCE_REPOSITORY.reset(token)
+
+
+def _effective_source_repository(explicit: str) -> str:
+    """Resolve an explicit/local source against the scoped registry source."""
+    contextual = _REGISTRY_SOURCE_REPOSITORY.get()
+    return contextual if contextual is not None else explicit.strip()
+
+
+def app_lifecycle_lock(name: str) -> LoopBoundLock:
+    """Return the per-app lock guarding install/update/uninstall (loop-bound, #4800).
 
     Must be called from (and the lock used on) the event loop thread; the
     guarded blocking work itself runs off-loop via executor/``to_thread``.
     """
     if name not in _LIFECYCLE_LOCKS:
-        _LIFECYCLE_LOCKS[name] = asyncio.Lock()
+        _LIFECYCLE_LOCKS[name] = LoopBoundLock()
     return _LIFECYCLE_LOCKS[name]
 
 
@@ -409,10 +503,15 @@ def app_lifecycle_lock(name: str) -> "asyncio.Lock":
 # ---------------------------------------------------------------------------
 
 
-def install_app(source: str | Path) -> AppResult:
+def install_app(
+    source: str | Path,
+    *,
+    expected_name: str | None = None,
+    source_repository: str = "",
+) -> AppResult:
     """Install an app from a local directory path.
 
-    1. Validate manifest
+    1. Validate manifest and any caller-pinned app identity
     2. Copy to ``~/.kiro/crew/apps/{name}/``
     3. Write ``installed.json``
 
@@ -443,6 +542,24 @@ def install_app(source: str | Path) -> AppResult:
 
     manifest = AppManifest.from_json_file(source / APP_MANIFEST_FILENAME)
     name = manifest.name
+    if expected_name is not None and name != expected_name:
+        detail = (
+            f"app identity changed during install: expected {expected_name!r}, "
+            f"found {name!r}"
+        )
+        sel().log_api_access(
+            caller="app_install",
+            operation="install",
+            outcome="failed",
+            resources=f"source={source!s}",
+            error=detail,
+        )
+        return AppResult(
+            ok=False,
+            name=name,
+            error=detail,
+            error_code="app_identity_changed",
+        )
     dest = app_dir(name)
 
     # Guard against path traversal in manifest name
@@ -484,6 +601,23 @@ def install_app(source: str | Path) -> AppResult:
             name=name,
             error=f"app {name!r} is already installed (v{existing.version}). "
             f"Uninstall first or use the update endpoint.",
+        )
+
+    source_repository = _effective_source_repository(source_repository)
+    trust_denied = repository_bound_grant_denied(name, repository=source_repository)
+    if trust_denied:
+        sel().log_api_access(
+            caller="app_install",
+            operation="trust_repository",
+            outcome="rejected",
+            resources=f"name={name!r}",
+            error=trust_denied,
+        )
+        return AppResult(
+            ok=False,
+            name=name,
+            error=trust_denied,
+            error_code="app_trust_repository_mismatch",
         )
 
     # Preserve existing data/ directory (left behind by a prior default uninstall)
@@ -574,6 +708,11 @@ def install_app(source: str | Path) -> AppResult:
         enabled=False,  # installed but not enabled until explicitly enabled
         installedAt=_now_iso(),
         source=str(source),
+        # Persist the server-resolved repository at the first durable metadata
+        # write.  The registry's richer set_app_provenance bookkeeping happens
+        # later and may fail after the copied app is already the live occupant;
+        # runtime admission must still remain bound to what was installed.
+        sourceUrl=source_repository.strip(),
     )
     _write_installed(name, meta)
 
@@ -603,7 +742,12 @@ def install_app(source: str | Path) -> AppResult:
 # ---------------------------------------------------------------------------
 
 
-def update_app(source: str | Path, *, expected_name: str | None = None) -> AppResult:
+def update_app(
+    source: str | Path,
+    *,
+    expected_name: str | None = None,
+    source_repository: str = "",
+) -> AppResult:
     """Update an already-installed app from a local directory path.
 
     1. Validate new manifest
@@ -654,6 +798,23 @@ def update_app(source: str | Path, *, expected_name: str | None = None) -> AppRe
     if not existing:
         return AppResult(ok=False, name=name, error=f"app {name!r} is not installed")
 
+    source_repository = _effective_source_repository(source_repository)
+    trust_denied = repository_bound_grant_denied(name, repository=source_repository)
+    if trust_denied:
+        sel().log_api_access(
+            caller="app_update",
+            operation="trust_repository",
+            outcome="rejected",
+            resources=f"name={name!r}",
+            error=trust_denied,
+        )
+        return AppResult(
+            ok=False,
+            name=name,
+            error=trust_denied,
+            error_code="app_trust_repository_mismatch",
+        )
+
     old_version = existing.version
 
     # Preserve data directory and app secret
@@ -703,7 +864,8 @@ def update_app(source: str | Path, *, expected_name: str | None = None) -> AppRe
 
     # Update metadata — carry every persisted field forward from ``existing``
     # via dataclasses.replace, overriding only what the update actually changes
-    # (version/displayName/updatedAt/source). Constructing a fresh InstalledApp
+    # (version/displayName/updatedAt/source and source provenance). Constructing
+    # a fresh InstalledApp
     # here silently dropped any field not re-listed (enabled, installedAt,
     # origin, resources, lifecycle, schemaVersion, migratedTo, and — the bug
     # that surfaced this — the ``dev`` flag, so updating an app being iterated
@@ -715,6 +877,15 @@ def update_app(source: str | Path, *, expected_name: str | None = None) -> AppRe
         displayName=manifest.displayName,
         updatedAt=_now_iso(),
         source=str(source),
+        # A local-source update is a provenance transition, not a refresh of the
+        # old registry checkout. Keeping the previous sourceUrl made runtime
+        # repository checks attest repo A while the files now came from local B.
+        # Registry callers pass the target they just cloned and then persist the
+        # remaining commit/signer fields through set_app_provenance.
+        sourceUrl=source_repository.strip(),
+        sourceRegistry="",
+        sourceCommit="",
+        sourceSigner="",
     )
     _write_installed(name, meta)
 
@@ -762,6 +933,43 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
     if not dest.is_dir():
         return AppResult(ok=False, name=name, error=f"app {name!r} is not installed")
 
+    # Withdraw the execution grant FIRST, and abort the whole uninstall if it
+    # cannot be withdrawn.
+    #
+    # Runtime admission is keyed on the app NAME, so one left behind can admit a
+    # DIFFERENT app later installed under this name — in-process code execution
+    # with no consent prompt, because the gate just sees a name it was told to
+    # trust. New registry grants additionally bind their install repository, but
+    # that does not make an orphaned runtime grant safe. Doing this AFTER the files
+    # were deleted (as this did) produced a state
+    # the user could not recover from: the app is gone, so there is nothing left to
+    # uninstall and no retry that would clear the grant, while the name stays
+    # armed. Ordering it first makes the failure retryable — nothing has been
+    # destroyed, the user fixes the cause (typically an overlay-owned setting) and
+    # runs uninstall again. Same reasoning as the revoke path, which runs teardown
+    # before its config write for exactly this reason.
+    try:
+        # Recorded BEFORE the withdrawal so a failed delete below can put back
+        # exactly what was there — and only when there WAS something. Restoring a
+        # grant the app never held would be granting, not restoring.
+        had_grant = _has_trust_grant(name)
+        granted_repository = _trust_grant_repository(name)
+        granted_local = _trust_grant_local(name)
+        _drop_trust_grant(name)
+    except Exception as exc:  # noqa: BLE001 - refuse rather than half-uninstall
+        logger.warning("trust-grant cleanup on uninstall of %r failed", name, exc_info=True)
+        return AppResult(
+            ok=False,
+            name=name,
+            error=(
+                f"not uninstalling {name!r}: its third-party execution grant could "
+                f"not be removed ({exc}). The grant is keyed on the name, so removing "
+                f"the app while it stands would let any future app installed under "
+                f"this name run code without asking. Clear the cause and retry."
+            ),
+            error_code="trust_grant_not_removed",
+        )
+
     try:
         if keep_data:
             data = dest / "data"
@@ -776,9 +984,92 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
         else:
             shutil.rmtree(dest)
     except OSError as exc:
-        return AppResult(ok=False, name=name, error=f"failed to remove app: {exc}")
+        # The delete failed, so the app is STILL INSTALLED — but its grant was
+        # withdrawn above, which would leave a trusted app silently stripped of the
+        # permission the operator gave it, from an operation that did not even
+        # succeed. Put it back.
+        #
+        # Restoring is not widening: this re-adds the grant the operator had already
+        # made, to an app that is still on disk, returning the exact state that
+        # existed before this call. The alternative shapes are both worse. Deferring
+        # the withdrawal until after a successful delete re-opens the hole the
+        # pre-delete ordering exists to close — a withdrawal that then fails leaves
+        # the app GONE with its name still armed, and no app left to uninstall means
+        # no retry can ever clear it. Leaving the grant withdrawn here is fail-safe
+        # but silently punitive. Restoring keeps the withdrawal-first ordering (so a
+        # withdrawal failure stays retryable with nothing destroyed) AND leaves a
+        # failed uninstall with no side effect on trust.
+        restore_note = ""
+        try:
+            _restore_trust_grant(
+                name,
+                had_grant,
+                granted_repository,
+                local=granted_local,
+                expected_app=meta,
+            )
+        except Exception as restore_exc:  # noqa: BLE001 - report, never mask the real error
+            logger.warning(
+                "could not restore %r's execution grant after a failed uninstall",
+                name,
+                exc_info=True,
+            )
+            restore_note = (
+                f" Its third-party execution grant could not be safely restored "
+                f"({restore_exc}). Review the current installed app, then re-grant "
+                f"it in Settings only if you still trust that occupant."
+            )
+        return AppResult(
+            ok=False, name=name, error=f"failed to remove app: {exc}{restore_note}"
+        )
 
     logger.info("Uninstalled app %s (keep_data=%s)", name, keep_data)
+
+    # Withdraw the grant a SECOND time, now that the files are actually gone.
+    #
+    # The first withdrawal above deliberately runs BEFORE the delete so that a
+    # failure is retryable with nothing destroyed. That ordering, though, leaves a
+    # cross-process window a dashboard grant can land in — no in-process lock helps,
+    # because this runs under `kirocrew app uninstall` in a DIFFERENT process:
+    #
+    #   this process: drop grant (no-op, none yet) ................ then ... rmtree
+    #   dashboard:      app exists? yes -> write grant -> app still exists? yes -> 200
+    #
+    # Every check on both sides passes, and the grant is left standing over a name
+    # no app occupies — the exact orphan both sides exist to prevent, and one that
+    # would let a DIFFERENT app later installed under this name execute with no
+    # consent prompt.
+    #
+    # Closing it needs no cross-process lock, only this ordering argument. The grant
+    # is orphaned only if the write happened, the delete happened, AND the handler's
+    # post-write existence check still saw the app. That check seeing the app means
+    # it ran before this `rmtree` finished — so this second withdrawal, which runs
+    # after the delete, necessarily runs after that write and therefore SEES the
+    # grant. The handler's post-write check covers the opposite interleaving (delete
+    # completes first, so the check finds nothing and rolls its own write back).
+    # Between them the two guards leave no window, without either side blocking on
+    # the other.
+    residual = ""
+    try:
+        _drop_trust_grant(name)
+    except Exception as exc:  # noqa: BLE001 - the app is already gone; report, never hide
+        # Refusing the uninstall is not available here and would be a lie: the
+        # files are deleted. So report it. A live grant over a name with no app is
+        # precisely the state that must not stay quiet — it is invisible in the app
+        # list (there is no app to show) and only surfaces when something new takes
+        # the name.
+        logger.warning(
+            "app %r was uninstalled but its execution grant could not be withdrawn "
+            "afterwards; the grant is still standing",
+            name,
+            exc_info=True,
+        )
+        residual = (
+            f" WARNING: a third-party execution grant for {name!r} is still in "
+            f"agent.apps_trusted and could not be removed ({exc}). Remove it in "
+            f"Settings -> Security before installing anything under this name."
+        )
+
     # Drop any dev-mode sentinel entry so an app later reinstalled under this
     # name does not inherit stale dev-mode serving/watching. Lazy import avoids
     # a module-level cycle (dev_mode imports from manager).
@@ -788,7 +1079,292 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
         remove_dev_app(name)
     except Exception:
         logger.debug("dev-mode cleanup on uninstall of %r failed", name, exc_info=True)
-    return AppResult(ok=True, name=name, message=f"uninstalled {name}")
+    return AppResult(ok=True, name=name, message=f"uninstalled {name}{residual}")
+
+
+def trust_grant_removal_blocked(name: str) -> str | None:
+    """Return why *name*'s execution grant could not be dropped, or ``None``.
+
+    A read-only PRECONDITION. Both uninstall entry points run destructive,
+    non-idempotent work (cron deregistration, the app's own ``onUninstall``
+    script, backend stop, dependency cleanup) before they reach
+    :func:`uninstall_app`, so a refusal discovered inside ``uninstall_app`` is
+    not the retryable "nothing has been destroyed" case it was written as: it
+    strands a half-removed app and re-runs ``onUninstall`` on every retry. Callers
+    therefore ask this FIRST and abort while it is still free to abort — the same
+    reason the cron cleanup is ordered ahead of the script.
+    """
+    # An overlay-owned grant cannot be dropped by writing config.json: the loader
+    # deep-merges config.local.json OVER it and save() strips overlay-owned values
+    # from the output, so the write is ineffective in both directions.
+    #
+    # Scoped to a grant this app actually holds. An overlay that pins
+    # `apps_trusted` for OTHER apps says nothing about THIS uninstall, and gating
+    # on the key's mere presence made every app un-uninstallable for any operator
+    # who set it at all — a blanket refusal, not a grant-specific one.
+    local = config_local_path()
+    if local.is_file():
+        try:
+            raw_local = json.loads(local.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raw_local = {}  # the loader ignores an unreadable overlay, so do we
+        agent_local = raw_local.get("agent") if isinstance(raw_local, dict) else None
+        if isinstance(agent_local, dict):
+            overlay_grants = agent_local.get("apps_trusted")
+            # A non-list overlay value cannot express a grant for this app, so
+            # there is nothing here that a write would have to survive.
+            if isinstance(overlay_grants, list) and name in overlay_grants:
+                return f"apps_trusted is set in {local}, which overrides config.json"
+
+    path = config_path()
+    if path.is_file():
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            # Report rather than stay silent: a quiet bail here is precisely the
+            # "uninstalled but still trusted" state the caller must not reach. The
+            # write is still refused (it would erase everything else the file
+            # holds) — it just is not refused quietly.
+            return f"{path} is unreadable: {exc}"
+    return None
+
+
+def _drop_trust_grant(name: str) -> None:
+    """Remove *name* from ``agent.apps_trusted``, if present.
+
+    A no-op when the app held no grant, which is the common case. Refuses to write
+    over an unparseable ``config.json`` for the same reason the trusted-apps
+    endpoints do: ``KiroCrewConfig.load()`` degrades a corrupt file to defaults, so
+    a blind load/save would erase everything else the file holds.
+    """
+    blocked = trust_grant_removal_blocked(name)
+    if blocked:
+        raise RuntimeError(blocked)
+
+    # Operate on the BASE file's own list, not the merged view.
+    #
+    # `KiroCrewConfig.load()` deep-merges `config.local.json` OVER `config.json`,
+    # and a list MERGE REPLACES rather than unions — so with base
+    # `apps_trusted: ["foo"]` and overlay `["bar"]`, the merged value is `["bar"]`
+    # and a merged-view check concludes `foo` holds no grant and removes nothing.
+    # The base entry then survives the uninstall: inert while the overlay stands,
+    # but live again the moment the operator edits or drops that overlay key, at
+    # which point a DIFFERENT app installed under the name `foo` inherits a grant
+    # nobody made for it. Reading merged state to decide a base-file write is the
+    # bug; the two layers have to be reasoned about separately.
+    #
+    # Writing through `cfg.save()` cannot fix it either: save() deliberately
+    # strips overlay-owned keys from its output, so the one key we need to rewrite
+    # is exactly the one it will not emit. Hence a targeted edit of the raw base
+    # document, which also keeps the blast radius to a single key instead of
+    # re-serialising the whole config from the model.
+    path = config_path()
+    if not path.is_file():
+        return
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        # RAISE rather than return: a silent bail here is precisely the
+        # "uninstalled but still trusted" state the caller must not reach. The
+        # write is still refused — it would erase everything else the file holds.
+        raise RuntimeError(f"{path} is unreadable: {exc}") from exc
+    if not isinstance(raw, dict):
+        return
+    agent_raw = raw.get("agent")
+    if not isinstance(agent_raw, dict):
+        return
+    base_grants = agent_raw.get("apps_trusted")
+    repositories = agent_raw.get("apps_trusted_repositories")
+    local_grants = agent_raw.get("apps_trusted_local")
+    has_name = isinstance(base_grants, list) and name in base_grants
+    has_repository = isinstance(repositories, dict) and name in repositories
+    has_local = isinstance(local_grants, list) and name in local_grants
+    # Orphaned kind metadata is inert without the name grant, but uninstall still
+    # clears it so a later hand edit cannot unexpectedly reactivate old consent.
+    # Preserve the no-grant fast path: ordinary uninstalls perform no config write.
+    if not (has_name or has_repository or has_local):
+        return
+    agent_raw["apps_trusted"] = [
+        a for a in (base_grants if isinstance(base_grants, list) else []) if a != name
+    ]
+    if isinstance(repositories, dict):
+        repositories = dict(repositories)
+        repositories.pop(name, None)
+        agent_raw["apps_trusted_repositories"] = repositories
+    if isinstance(local_grants, list):
+        agent_raw["apps_trusted_local"] = [a for a in local_grants if a != name]
+    # Concurrency: this is the repo's standard config read-modify-write, and it
+    # inherits that model exactly — no cross-process lock, atomic (tmp+rename) on
+    # the way out so no reader can see a torn file. `read_config_for_update`'s own
+    # docstring describes the same shape and the same residual exposure, and the
+    # base branch has two dozen writers in it, `kirocrew config set` among them, so
+    # a CLI write racing a dashboard write can drop the loser's settings today
+    # regardless of this function. Closing that properly means locking at the config
+    # layer for every writer at once, which is its own change; doing it for this one
+    # writer would serialize it against nothing.
+    #
+    # What is in scope here is not adding exposure: the early returns above mean the
+    # ordinary uninstall (no grant on the name) reaches no write at all, and a write
+    # happens only when there really is a grant to withdraw — locked by
+    # `test_uninstall_writes_no_config_at_all_when_there_is_no_grant`. The write is
+    # also a single-key edit of the raw document rather than a re-serialisation of
+    # the whole config, so what it can clobber is bounded to a concurrent edit that
+    # lands inside the same read-to-write window.
+    write_config_atomically(path, raw)
+    logger.info("Dropped third-party trust grant for uninstalled app %s", name)
+    # Audited, because this REVOKES an execution permission. The dashboard's revoke
+    # endpoint emits its own SEL event, but this path runs from `kirocrew app
+    # uninstall` — so a grant could be withdrawn with nothing in the security event
+    # log to show it, and the log is what an operator reconstructs a trust timeline
+    # from. A permission boundary that moves silently is exactly what SEL exists to
+    # make visible; the log records the transition, not merely the request that
+    # caused it. Emitted AFTER the write so it attests something that actually
+    # happened, and never allowed to fail the uninstall: losing the audit line is
+    # bad, refusing to complete a withdrawal because the audit sink is unavailable
+    # is worse.
+    try:
+        sel().log_api_access(
+            caller="cli",
+            operation="app_trust_revoke",
+            outcome="allowed",
+            resources=f"{name}=grant_removed_on_uninstall",
+        )
+    except Exception:  # noqa: BLE001 - the withdrawal already happened
+        logger.warning("could not audit the trust withdrawal for %r", name, exc_info=True)
+
+
+def _has_trust_grant(name: str) -> bool:
+    """Whether the BASE ``config.json`` currently grants *name* execution.
+
+    Reads the base document, not the merged view, for the same reason
+    :func:`_drop_trust_grant` writes to it: an overlay list REPLACES rather than
+    unions, so the merged value answers a different question than "is there a base
+    entry here to put back".
+    """
+    path = config_path()
+    if not path.is_file():
+        return False
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    agent_raw = raw.get("agent")
+    if not isinstance(agent_raw, dict):
+        return False
+    grants = agent_raw.get("apps_trusted")
+    return isinstance(grants, list) and name in grants
+
+
+def _trust_grant_repository(name: str) -> str:
+    """Repository binding for *name* in the BASE config, or ``""``."""
+    path = config_path()
+    if not path.is_file():
+        return ""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    agent_raw = raw.get("agent") if isinstance(raw, dict) else None
+    if not isinstance(agent_raw, dict):
+        return ""
+    repositories = agent_raw.get("apps_trusted_repositories")
+    repository = repositories.get(name) if isinstance(repositories, dict) else None
+    return repository if isinstance(repository, str) else ""
+
+
+def _trust_grant_local(name: str) -> bool:
+    """Whether *name* has an explicit local grant marker in the BASE config."""
+    path = config_path()
+    if not path.is_file():
+        return False
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    agent_raw = raw.get("agent") if isinstance(raw, dict) else None
+    if not isinstance(agent_raw, dict):
+        return False
+    local_grants = agent_raw.get("apps_trusted_local")
+    return isinstance(local_grants, list) and name in local_grants
+
+
+def _restore_trust_grant(
+    name: str,
+    had_grant: bool,
+    repository: str = "",
+    *,
+    local: bool = False,
+    expected_app: InstalledApp,
+) -> None:
+    """Put *name*'s grant back after an uninstall failed with the app still installed.
+
+    A no-op when the app held no grant to begin with — restoring one it never had
+    would be GRANTING execution permission as a side effect of a failed uninstall,
+    which is the one thing this must never do. The durable installed record must
+    match *expected_app* both before and after the config write, so a partial delete
+    or same-name replacement cannot inherit the old occupant's consent. Also a
+    no-op if a grant is already present, so a concurrent re-grant is not duplicated.
+    """
+    if not had_grant:
+        return
+    if _read_installed(name) != expected_app:
+        raise RuntimeError(
+            "the original installed app metadata is missing or changed; "
+            "leaving its execution grant withdrawn"
+        )
+    if _has_trust_grant(name):
+        return
+    path = config_path()
+    raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"{path} does not hold a JSON object")
+    agent_raw = raw.setdefault("agent", {})
+    if not isinstance(agent_raw, dict):
+        raise RuntimeError(f"{path} has a non-object agent section")
+    grants = agent_raw.get("apps_trusted")
+    agent_raw["apps_trusted"] = [*(grants if isinstance(grants, list) else []), name]
+    if repository:
+        repositories = agent_raw.get("apps_trusted_repositories")
+        bindings = dict(repositories) if isinstance(repositories, dict) else {}
+        bindings[name] = repository
+        agent_raw["apps_trusted_repositories"] = bindings
+    if local:
+        local_grants = agent_raw.get("apps_trusted_local")
+        local_names = list(local_grants) if isinstance(local_grants, list) else []
+        if name not in local_names:
+            local_names.append(name)
+        agent_raw["apps_trusted_local"] = local_names
+    write_config_atomically(path, raw)
+
+    # The CLI and dashboard run in different processes, so a same-name
+    # replacement can land after the pre-write check.  Recheck the exact durable
+    # occupant after the config write; if it changed, remove every kind of grant
+    # we just restored rather than arming replacement code with old consent.
+    if _read_installed(name) != expected_app:
+        try:
+            _drop_trust_grant(name)
+        except Exception as rollback_exc:  # noqa: BLE001 - report an armed name
+            raise RuntimeError(
+                "the installed app changed while its grant was restored and the "
+                f"unsafe grant could not be withdrawn ({rollback_exc}); remove it "
+                "in Settings before installing or running this name"
+            ) from rollback_exc
+        raise RuntimeError(
+            "the installed app changed while its grant was restored; the grant "
+            "was withdrawn"
+        )
+    logger.info("Restored %s's trust grant after a failed uninstall", name)
+    try:
+        sel().log_api_access(
+            caller="cli",
+            operation="app_trust_restore",
+            outcome="allowed",
+            resources=f"{name}=grant_restored_after_failed_uninstall",
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("could not audit the trust restore for %r", name, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -807,11 +1383,9 @@ def _app_activation_denied(name: str) -> str | None:
     session key (surface ``host``): app activation is an operator/host action, so
     it is governed by the policy ceiling AND any ``bind: {type: surface, id:
     host}`` profile — an honest, stable bind target.  (It must NOT use an empty
-    key, which would classify to surface ``unknown`` and silently match nothing;
-    an empty key previously mis-classified to ``slack`` and accidentally picked up
-    slack-bound profiles.)  Best-effort beyond the always-on
-    checks: a ``PlatformCompositionError`` propagates (fail-closed CPP); any other
-    error degrades to "no opinion" (None).
+    key, which classifies to surface ``unknown`` and silently matches nothing.)
+    Best-effort beyond the always-on checks: a ``PlatformCompositionError``
+    propagates (fail-closed CPP); any other error degrades to "no opinion" (None).
     """
     from kiro_crew.platform.context import PlatformCompositionError
 
@@ -961,23 +1535,22 @@ def list_apps() -> list[dict[str, Any]]:
                 manifest = AppManifest.from_json_file(manifest_path)
                 manifest_data = manifest.to_dict()
                 # For self-managed apps, the app may update its own
-                # app.json without going through update_app().  Sync
-                # the version from the manifest so the dashboard shows
-                # the real version instead of a stale installed.json.
+                # app.json without going through update_app().  Reflect
+                # the manifest version in the RETURNED metadata only, so
+                # the dashboard shows the real version. Deliberately no
+                # write-back here: list_apps() must stay read-only —
+                # callers run it concurrently from worker threads, and a
+                # persisted read-modify-write of installed.json from a
+                # listing would race real mutators (install/enable/
+                # register) and silently overwrite their fields. The
+                # durable repair happens on the single-app paths
+                # (get_app / update_app).
                 if (
                     meta.lifecycle == "app"
                     and manifest.version
                     and manifest.version != meta.version
                 ):
-                    logger.debug(
-                        "Syncing %s version: installed=%s manifest=%s",
-                        meta.name,
-                        meta.version,
-                        manifest.version,
-                    )
                     meta.version = manifest.version
-                    meta.updatedAt = _now_iso()
-                    _write_installed(entry.name, meta)
             except Exception:
                 pass
         app_info: dict[str, Any] = {
@@ -1108,6 +1681,7 @@ def register_external_app(
     origin: str = "external",
     resources: str = "app",
     lifecycle: str = "app",
+    source_repository: str = "",
 ) -> AppResult:
     """Register a self-managed app with KiroCrew's app system.
 
@@ -1125,6 +1699,9 @@ def register_external_app(
         origin: Classification — where the app came from.
         resources: Classification — who manages resource registration.
         lifecycle: Classification — who manages updates/uninstall.
+        source_repository: Server-resolved repository coordinate for a registry
+            install/update. An empty value on an existing repository-owned record
+            is a metadata refresh, not permission to erase its provenance.
 
     Returns:
         AppResult indicating success or failure.
@@ -1132,20 +1709,16 @@ def register_external_app(
     if not _check_path_safety(name):
         return AppResult(ok=False, error=f"unsafe app name: {name!r}")
 
-    # Enforce the canonical lowercase-ASCII kebab-case form on the
-    # self-registration path (CWE-178). Admission normalizes with
-    # NFKC+casefold+strip, but the backend below stores/resolves the app by the
-    # RAW name (app_dir(name), _write_installed(name), write_app_secret(name)),
-    # so without this an admitted "Safe-App"/"safe-app "/Unicode-equivalent
-    # would diverge from the approved identity. install_app/update_app already
-    # gate on KEBAB_RE via AppManifest; this closes the register_external gap.
-    from kiro_crew.apps.manifest import KEBAB_RE
-
-    if not KEBAB_RE.match(name):
-        return AppResult(
-            ok=False, name=name,
-            error=f"invalid app name (must be lowercase kebab-case): {name!r}",
-        )
+    # Enforce the canonical app-name contract on the self-registration path
+    # (CWE-178). Admission normalizes with NFKC+casefold+strip, but the backend
+    # below stores/resolves the app by the RAW name (app_dir(name),
+    # _write_installed(name), write_app_secret(name)), so without this an
+    # admitted "Safe-App"/"safe-app "/Unicode-equivalent would diverge from the
+    # approved identity. install_app/update_app reach the same contract via
+    # AppManifest.validate(); this closes the register_external gap.
+    name_error = app_name_error(name)
+    if name_error:
+        return AppResult(ok=False, name=name, error=f"invalid app name: {name_error}")
 
     # Builtin provenance is assigned only by register_builtin_apps(). Accepting
     # it from self-registration would make the execution exemption caller-controlled.
@@ -1184,8 +1757,38 @@ def register_external_app(
         )
         return AppResult(ok=False, name=name, error=f"blocked by admission policy: {denied}")
 
-    dest = app_dir(name)
     existing = _read_installed(name)
+    requested_repository = source_repository.strip()
+    preserve_server_provenance = bool(
+        existing and not requested_repository and existing.sourceUrl.strip()
+    )
+    # Self-managed registry apps use the public registration contract on every
+    # launch. That request cannot carry a server-resolved clone coordinate, so an
+    # omission refreshes app-owned metadata while the durable install coordinate
+    # remains the authority for an existing grant. Only an internal caller that
+    # supplies a non-empty repository can request a source transition.
+    trust_repository = (
+        existing.sourceUrl.strip()
+        if preserve_server_provenance and existing is not None
+        else requested_repository
+    )
+    trust_denied = repository_bound_grant_denied(name, repository=trust_repository)
+    if trust_denied:
+        sel().log_api_access(
+            caller="app_register_external",
+            operation="trust_repository",
+            outcome="rejected",
+            resources=f"name={name!r}",
+            error=trust_denied,
+        )
+        return AppResult(
+            ok=False,
+            name=name,
+            error=trust_denied,
+            error_code="app_trust_repository_mismatch",
+        )
+
+    dest = app_dir(name)
 
     # Builtin provenance is assigned ONLY by register_builtin_apps(). A
     # self-registration must never OVERWRITE an existing builtin-owned record
@@ -1217,9 +1820,14 @@ def register_external_app(
         existing.version = version
         existing.displayName = display_name
         existing.updatedAt = _now_iso()
-        if source:
-            existing.source = source
-        existing.origin = origin
+        if not preserve_server_provenance:
+            if source:
+                existing.source = source
+            existing.sourceUrl = requested_repository
+            existing.sourceRegistry = ""
+            existing.sourceCommit = ""
+            existing.sourceSigner = ""
+            existing.origin = origin
         existing.resources = resources
         existing.lifecycle = lifecycle
         _write_installed(name, existing)
@@ -1233,6 +1841,7 @@ def register_external_app(
             enabled=True,  # self-managed apps are always "enabled"
             installedAt=_now_iso(),
             source=source,
+            sourceUrl=requested_repository,
             origin=origin,
             resources=resources,
             lifecycle=lifecycle,
@@ -1309,7 +1918,144 @@ def register_external_app(
 # both the hardcoded list and the file-based manifests read it from here, so a
 # builtin cannot become default-on in one registration path while the other
 # path's test still forbids it.
-_DEFAULT_ON_BUILTINS: frozenset[str] = frozenset({"projects"})  # Task Runner
+_DEFAULT_ON_BUILTINS: frozenset[str] = frozenset(
+    {
+        "projects",  # Task Runner
+        # Command Bar replaces the quick-search (Cmd+K) surface rather than adding
+        # a sidebar entry, so shipping it off leaves the gesture on the legacy
+        # palette and the launcher unseen. Disabling the app is what restores the
+        # old surface, which is the opt-out this exemption trades for.
+        "command-bar",
+    }
+)
+
+# Promotions still owed to installs that PREDATE them — a different question from
+# the set above, and the distinction is load-bearing.
+#
+# ``_DEFAULT_ON_BUILTINS`` answers "what does a FRESH install enable". This set
+# answers "which promotion has not yet reached installs that registered the app
+# while it was still default-off". Reading the first set for the second question
+# reverses deliberate opt-outs: ``projects`` (Task Runner) has shipped
+# ``defaultEnabled: true`` since it was aligned with the other builtins, long
+# before this allowlist existed, so it has been enabled and visible in the
+# sidebar on every existing install. A record showing ``enabled: false`` for it
+# is therefore a user who FOUND it and turned it off — the opposite of the
+# population a backfill exists to serve.
+#
+# So a name belongs here only when both hold: a fresh install enables it (it is
+# in the set above), and existing installs were never in a position to choose.
+# ``command-bar`` qualifies because it was default-OFF at first registration for
+# those installs AND, replacing the quick-search surface rather than adding a
+# sidebar entry, it appears on no store or launcher surface they could have found
+# it on. An app already default-on when they installed it never qualifies.
+#
+# Entries are permanent, not cleaned up after a release: the marker is per
+# install, so a user restoring an old data home still gets the promotion once.
+_DEFAULT_ON_BACKFILL: frozenset[str] = frozenset({"command-bar"})
+
+
+def backfill_default_on_builtins() -> list[str]:
+    """Deliver a default-on PROMOTION to installs that predate it. One-shot per app.
+
+    ``register_builtin_apps()`` applies ``defaultEnabled`` only on FIRST
+    registration and preserves user state on every later start, so adding a name
+    to ``_DEFAULT_ON_BUILTINS`` reaches NEW installs only. An install that
+    registered the app while it was still default-off keeps ``enabled: false``
+    through every subsequent restart, update and version bump — the record lives
+    in the user's data home, which a code update does not touch.
+
+    That is survivable for a builtin that adds a sidebar entry, because the App
+    Store can still offer it. It is not survivable for one that replaces a host
+    surface: it has no page, so it is absent from the launcher's own app list,
+    and it is absent from Discover unless the published catalog carries a row for
+    it, which leaves a disabled row in Library as the only trace. Those users
+    cannot enable what they have no way to learn exists.
+
+    Reads ``_DEFAULT_ON_BACKFILL``, NOT ``_DEFAULT_ON_BUILTINS`` — see that set's
+    comment for why conflating the two silently reverses deliberate opt-outs.
+
+    ONE-SHOT, and the record of that is ``InstalledApp.defaultOnBackfilled``,
+    written in the SAME atomic record write that flips ``enabled``. One document
+    deliberately: a separate marker file has no correct ordering, because
+    whichever of the two writes goes first leaves a window the other one owns.
+    Marker-last loses the record of an enable that happened, so every later start
+    re-applies the promotion and reverses the user's own disable forever;
+    marker-first can outlive a flip that failed, so the app is skipped forever and
+    the promotion is never delivered. Both are real; neither is reachable when the
+    flag and the state it guards land or fail together.
+
+    Surviving a user's disable is the point: disabling the app is the ONLY thing
+    that gives a replaced host surface back. Per app rather than per install, so a
+    promotion added in a later release is still delivered.
+
+    Returns the names actually flipped, so the caller can log them.
+    """
+    flipped: list[str] = []
+    for name in sorted(_DEFAULT_ON_BACKFILL):
+        existing = _read_installed(name)
+        if existing is None:
+            # Not registered on this install (an older wheel does not ship the
+            # app). A record created LATER is born already flagged, because a
+            # first registration under the promoted default IS the promotion
+            # being received — see register_builtin_apps().
+            continue
+        if not _builtin_owns_install(existing):
+            # A USER installed an app under this name. Same boundary
+            # register_builtin_apps() keeps: never touch their entry.
+            continue
+        if existing.defaultOnBackfilled:
+            continue
+        turning_on = not existing.enabled
+        if turning_on:
+            denied = _app_activation_denied(name)
+            if denied:
+                # Mirror the gate register_builtin_apps() applies to a default-on
+                # builtin: a deny-by-default host policy is not bypassed by
+                # arriving through the backfill. Deliberately NOT flagged — if the
+                # policy later permits the app, the promotion is still owed.
+                logger.info("Default-on backfill skipped %s: %s", name, denied)
+                continue
+            existing.enabled = True
+        existing.defaultOnBackfilled = True
+        existing.updatedAt = _now_iso()
+        # atomic_write, so a failure here persists NEITHER the flag nor the enable
+        # and the promotion is simply retried on the next start. The failure
+        # propagates out of this function (the caller logs it and continues
+        # startup), so no partially-delivered state and no half-truthful return
+        # value is observable. `flipped` is appended after the write to keep that
+        # reading obvious, not because anything could observe the other order.
+        _write_installed(name, existing)
+        if turning_on:
+            flipped.append(name)
+            _audit_default_on_backfill(name)
+    return flipped
+
+
+def _audit_default_on_backfill(name: str) -> None:
+    """Record that *name* was activated with no user request behind it.
+
+    The dashboard and CLI enable paths are reachable only by someone asking; this
+    one runs at startup, and activation is the chokepoint where an app starts
+    contributing agents, skills, crons and routes. An operator reconstructing
+    "when did this app become active, and who asked for it" would otherwise find
+    nothing at all. Same shape as the trust-grant withdrawal above: emitted AFTER
+    the write so it attests something that actually happened, and never allowed to
+    fail the operation — losing the audit line is bad, refusing to deliver a
+    promotion because the audit sink is unavailable is worse.
+    """
+    try:
+        from kiro_crew.sel import sel
+
+        sel().log_api_access(
+            caller="gateway",
+            operation="app_default_on_backfill",
+            outcome="allowed",
+            source="startup",
+            resources=f"{name}=enabled_by_promotion_backfill",
+        )
+    except Exception:  # noqa: BLE001 - the activation already happened
+        logger.warning("could not audit the default-on backfill for %r", name, exc_info=True)
+
 
 # EMPTY, and that is a finished migration rather than an oversight. Every builtin now
 # ships as a file-based manifest under ``builtins/<dir>/app.json`` and is picked up by
@@ -1371,6 +2117,13 @@ def _validate_builtin_app(app_data: dict[str, Any]) -> list[str]:
     name = app_data.get("name", "")
     if name and not _check_path_safety(name):
         errors.append(f"unsafe app name: {name!r}")
+    elif name:
+        # Builtins are registered from a dict, never through AppManifest, so the
+        # shared contract has to be applied here too — otherwise an edition's
+        # AppsLoader could contribute a name the manifest path would refuse.
+        name_error = app_name_error(name)
+        if name_error:
+            errors.append(name_error)
     # migratedTo validation is lenient — invalid formats are handled by
     # _effective_migrated_to() which returns "" for bad values.  We log a
     # warning in register_builtin_apps() but do NOT block registration.
@@ -1861,6 +2614,20 @@ def register_builtin_apps() -> int:
                 resources="gateway",
                 lifecycle="locked",
                 migratedTo=_effective_migrated_to(app_data),
+                # A first registration under the promoted default IS the promotion
+                # being received, so nothing is owed and the backfill must never
+                # touch this record. Without this the sequence "install, disable
+                # the app in that same session, restart" would re-enable it: the
+                # backfill would find a disabled record it had never flagged and
+                # read the user's own choice as a promotion still owed.
+                #
+                # Gated on the POST-governance ``default_enabled``, matching the
+                # rule the backfill itself applies: a governance-denied app
+                # registers DISABLED, so it did NOT receive the promotion and is
+                # still owed one. Flagging it here would strand it -- relaxing the
+                # policy later could never deliver the launcher, because the
+                # record would claim it already had.
+                defaultOnBackfilled=default_enabled and name in _DEFAULT_ON_BACKFILL,
             )
             _write_installed(name, meta)
 

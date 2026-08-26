@@ -4,6 +4,7 @@ import { useMutation } from '@tanstack/react-query'
 import { useAppSelector, useAppDispatch } from '../store'
 import { createSlot } from '../store/chatSlice'
 import { X, Plus } from 'lucide-react'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import type { ChatSlot } from '../types'
 
 import { i18nT } from '../i18n/t'
@@ -199,6 +200,24 @@ export default function EmbedTabStrip() {
   const [dragOffset, setDragOffset] = useState(0)
   const tabRefs = useRef<(HTMLDivElement | null)[]>([])
   const stripRef = useRef<HTMLDivElement | null>(null)
+  const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
+
+  // The hook owns the node's edge measurement; this keeps a plain handle to
+  // the same node for the drag auto-scroll, pointer capture, and the wheel
+  // translation, which all read stripRef directly.
+  const setStrip = useCallback((node: HTMLDivElement | null) => {
+    stripRef.current = node
+    attachEdges(node)
+  }, [attachEdges])
+
+  // Tabs opening, closing, or renaming keep the strip's own box, so neither
+  // the ResizeObserver nor a scroll event reports the changed content width —
+  // only this remeasure can refresh the cue. `slots` is in the deps because
+  // the rendered label comes from redux, not from `tabs`: a session retitled
+  // after its first turn (auto-titling) widens the strip while `tabs` stays
+  // identity-stable. remeasure drops same-value writes, so the extra churn
+  // from unrelated slot updates costs no re-render.
+  useEffect(() => { remeasure() }, [tabs, slots, remeasure])
 
   const onPointerDown = (e: React.PointerEvent, index: number) => {
     if ((e.target as HTMLElement).closest('button')) return
@@ -317,11 +336,14 @@ export default function EmbedTabStrip() {
   // Status dot color per tab
   const unreadSlots = useAppSelector(s => s.dashboard.unreadSlots)
 
-  const getStatus = (slug: string): 'idle' | 'running' | 'unread' | 'permission' => {
+  const getStatus = (slug: string): 'idle' | 'running' | 'unread' | 'permission' | 'question' => {
     if (!slug) return 'idle'
     const slot = slots.find(s => s.key === slug)
     if (!slot) return 'idle'
     if (slot.pending_approval) return 'permission'
+    // Above running: a blocking question card leaves the turn parked, so the tab
+    // would otherwise pulse "working" while it waits on the user.
+    if (slot.needs_input) return 'question'
     if (slot.running) return 'running'
     if (unreadSlots.includes(slug)) return 'unread'
     return 'idle'
@@ -332,15 +354,20 @@ export default function EmbedTabStrip() {
       className="flex items-center shrink-0 border-b border-border px-1.5 py-1.5"
       style={{ background: 'var(--bg)' }}
     >
-      <div
-        ref={stripRef}
-        className="flex items-center gap-1 overflow-x-auto min-w-0 flex-1 relative"
-        style={{ scrollbarWidth: 'none' }}
-        onWheel={e => { if (stripRef.current) stripRef.current.scrollLeft += e.deltaY }}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerCancel}
-      >
+      {/* The wrapper exists for the edge cues: absolutely-positioned children
+          of the scroller itself would travel with the scrolled content, so the
+          fades anchor to this non-scrolling parent. It also owns the flex
+          sizing so the scroller keeps filling the row. */}
+      <div className="relative min-w-0 flex-1">
+        <div
+          ref={setStrip}
+          className="flex items-center gap-1 overflow-x-auto relative"
+          style={{ scrollbarWidth: 'none' }}
+          onWheel={e => { if (stripRef.current) stripRef.current.scrollLeft += e.deltaY }}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerCancel}
+        >
         {tabs.map((tab, i) => {
           const active = i === activeIndex
           const title = getTitle(tab.slug, i)
@@ -373,7 +400,7 @@ export default function EmbedTabStrip() {
             >
               {tab.slug && (() => {
                 const status = getStatus(tab.slug)
-                const colors = { idle: 'var(--muted)', running: 'var(--accent)', unread: 'var(--ok)', permission: 'var(--warn)' }
+                const colors = { idle: 'var(--muted)', running: 'var(--accent)', unread: 'var(--ok)', permission: 'var(--warn)', question: 'var(--info)' }
                 return (
                   <span
                     className={`shrink-0 w-1.5 h-1.5 rounded-full self-center mr-0.5 ${status === 'running' || status === 'permission' ? 'animate-pulse' : ''}`}
@@ -395,6 +422,19 @@ export default function EmbedTabStrip() {
             </div>
           )
         })}
+        </div>
+        {/* Edge cues, same treatment as the sibling strips: this scroller hides
+            its scrollbar entirely (scrollbarWidth: none), so a gradient is the
+            only signal that tabs continue past the clipped edge. from-bg
+            matches the bar's var(--bg) surface. The dragged tab's z-50 stays
+            above the cue on purpose — mid-drag the tab is the content being
+            placed, not the content being hinted at. */}
+        {edges.left && (
+          <div aria-hidden="true" data-testid="embed-tab-strip-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-r from-bg to-transparent" />
+        )}
+        {edges.right && (
+          <div aria-hidden="true" data-testid="embed-tab-strip-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-l from-bg to-transparent" />
+        )}
       </div>
       <button
         onClick={e => {

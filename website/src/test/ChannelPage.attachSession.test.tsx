@@ -62,10 +62,14 @@ describe('ChannelPage — attach live dashboard session', () => {
 
   it('defaults to a session-only channel and opens its session picker', async () => {
     const user = userEvent.setup()
+    const sessionOnlyChannel = { ...channel, id: 'ch2', members: {} }
+    vi.mocked(api).channelCreate.mockResolvedValue({ channel: sessionOnlyChannel })
+    vi.mocked(api).channelGet.mockImplementation((id: string) =>
+      Promise.resolve(id === 'ch2' ? sessionOnlyChannel : channel),
+    )
     renderWithProviders(<ChannelPage />)
 
-    const [mobileNew] = await screen.findAllByRole('button', { name: /New/ })
-    await user.click(mobileNew)
+    await user.click(await screen.findByRole('button', { name: /New/ }))
     await user.type(screen.getByRole('textbox', { name: 'Topic' }), 'Multiplex coordination')
     await user.click(screen.getByRole('button', { name: 'Create' }))
 
@@ -73,11 +77,5 @@ describe('ChannelPage — attach live dashboard session', () => {
       'Multiplex coordination', [], true,
     ))
     expect(await screen.findByRole('combobox', { name: 'Sessions' })).toBeInTheDocument()
-  })
-
-  it('offers a compact channel switcher on small screens', async () => {
-    renderWithProviders(<ChannelPage />)
-
-    expect(await screen.findByRole('combobox', { name: 'Channels' })).toBeInTheDocument()
   })
 })

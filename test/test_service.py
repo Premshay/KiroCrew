@@ -14,14 +14,19 @@ subprocess calls in :mod:`kiro_crew.service.linux` and
 
 from __future__ import annotations
 
+import inspect
 import os
 import plistlib
+import re
+import shlex
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kiro_crew.service import common, controller
 from kiro_crew.service.common import (
     LAUNCHD_LABEL,
     SERVICE_NAME,
@@ -30,6 +35,19 @@ from kiro_crew.service.common import (
     kirocrew_bin,
     service_environment,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_sudo_user(monkeypatch):
+    """Keep ``User=`` resolution deterministic across hosts.
+
+    ``_current_user()`` prefers ``SUDO_USER`` (so ``sudo … service install``
+    targets the human, not root). A CI runner that happened to set ``SUDO_USER``
+    would otherwise override the ``USER=tester`` these tests set. Clear it once
+    for every test in this module; tests that exercise the SUDO_USER path set it
+    explicitly themselves.
+    """
+    monkeypatch.delenv("SUDO_USER", raising=False)
 
 
 class TestPlatformDetection:
@@ -213,6 +231,9 @@ class TestLinuxUnitRendering:
         from kiro_crew.service import linux as svc_linux
 
         monkeypatch.setenv("USER", "tester")
+        # Pin a non-root euid so the privilege prefix is deterministically
+        # `sudo` regardless of the CI runner's uid (root CI would drop it).
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
 
         # Capture every subprocess.run call. All return success.
         ok = MagicMock(returncode=0, stdout="", stderr="")
@@ -255,6 +276,7 @@ class TestLinuxUnitRendering:
         from kiro_crew.service import linux as svc_linux
 
         monkeypatch.setenv("USER", "tester")
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
         install_failed = MagicMock(
             returncode=1, stdout="", stderr="sudo: a password is required"
         )
@@ -299,6 +321,279 @@ class TestLinuxUnitRendering:
         with patch("kiro_crew.service.linux.subprocess.run") as run:
             svc_linux.uninstall()
         run.assert_not_called()
+
+
+class TestLinuxPrivilegeResolution:
+    """Root fast-path and the missing-sudo error, so a minimal CentOS /
+    container image (root, no sudo) neither shells out to a nonexistent sudo
+    nor lets a raw FileNotFoundError escape controller.install_service."""
+
+    def test_privilege_prefix_is_empty_as_root(self, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 0, raising=False)
+        assert svc_linux._privilege_prefix() == []
+
+    def test_privilege_prefix_is_sudo_when_not_root(self, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+        assert svc_linux._privilege_prefix() == ["sudo"]
+
+    def test_require_privilege_ok_as_root_without_sudo(self, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 0, raising=False)
+        monkeypatch.setattr(svc_linux.shutil, "which", lambda _n: None)
+        # Root needs no sudo — must not raise.
+        svc_linux._require_privilege()
+
+    def test_require_privilege_raises_when_not_root_and_no_sudo(self, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        # The guard is Linux-scoped (systemd module); pin the platform so the
+        # test asserts the raising branch on any host it runs on.
+        monkeypatch.setattr(svc_linux.sys, "platform", "linux")
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+        monkeypatch.setattr(svc_linux.shutil, "which", lambda _n: None)
+        with pytest.raises(svc_linux.ServiceInstallError) as exc:
+            svc_linux._require_privilege()
+        assert "sudo" in str(exc.value).lower()
+
+    def test_require_privilege_is_noop_off_linux(self, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        # On a non-Linux host (macOS/Windows) the systemd path is never the real
+        # dispatch target, and cross-platform unit tests call these functions
+        # with a mocked subprocess layer, so the guard must not raise there.
+        monkeypatch.setattr(svc_linux.sys, "platform", "darwin")
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+        monkeypatch.setattr(svc_linux.shutil, "which", lambda _n: None)
+        svc_linux._require_privilege()  # must not raise
+
+    def test_install_refuses_to_run_agent_as_root(self, monkeypatch):
+        """A bare-root install (root login, or sudo with no SUDO_USER) must NOT
+        produce a User=root unit — the gateway runs untrusted tools and the
+        module invariant is that it runs as a normal user."""
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setenv("USER", "root")
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        monkeypatch.delenv("LOGNAME", raising=False)
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 0, raising=False)
+        with pytest.raises(svc_linux.ServiceInstallError) as exc:
+            svc_linux.install()
+        assert "root" in str(exc.value).lower()
+
+    def test_current_user_prefers_sudo_user_over_root(self, monkeypatch):
+        """`sudo kirocrew service install` must target the human behind sudo,
+        not the root sudo elevated to — so the unit gets User=<human>."""
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setenv("USER", "root")
+        monkeypatch.setenv("SUDO_USER", "alice")
+        assert svc_linux._current_user() == "alice"
+
+    def test_unit_home_matches_the_resolved_user_not_process_home(self, monkeypatch):
+        """Under `sudo -H` the process HOME is /root but User= is the sudo human.
+        HOME=/WorkingDirectory= in the unit must follow the resolved USER (from
+        that user's passwd home), never the process's /root — otherwise the
+        non-root service cannot enter its working dir and fails to start."""
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setenv("USER", "root")
+        monkeypatch.setenv("SUDO_USER", "alice")
+        # Simulate `sudo -H`: process home is /root.
+        monkeypatch.setattr(svc_linux.Path, "home", classmethod(lambda cls: Path("/root")))
+        # alice's passwd home.
+        monkeypatch.setattr(svc_linux, "_home_for_user", lambda u: "/home/alice" if u == "alice" else "/root")
+        gid = MagicMock(returncode=0, stdout="alice\n", stderr="")
+        with patch(
+            "kiro_crew.service.common.shutil.which", return_value="/usr/local/bin/kirocrew"
+        ), patch("kiro_crew.service.linux.subprocess.run", return_value=gid):
+            unit = svc_linux.render_unit()
+        assert "User=alice" in unit
+        assert "WorkingDirectory=/home/alice" in unit
+        assert 'Environment="HOME=/home/alice"' in unit
+        assert "/root" not in unit
+
+    def test_install_raises_clean_error_when_sudo_missing(self, monkeypatch):
+        """The reported bug: on a root-only/minimal host without sudo, install
+        used to crash with an uncaught FileNotFoundError. It must raise the
+        friendly ServiceInstallError instead."""
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux.sys, "platform", "linux")
+        monkeypatch.setenv("USER", "tester")
+        monkeypatch.delenv("SUDO_USER", raising=False)
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+        monkeypatch.setattr(svc_linux.shutil, "which", lambda _n: None)
+        with pytest.raises(svc_linux.ServiceInstallError):
+            svc_linux.install()
+
+    def test_sudo_run_survives_missing_sudo_binary(self, monkeypatch):
+        """restart()/stop() are best-effort and reachable from the update path;
+        a missing sudo must degrade to a failed result, never a raised
+        FileNotFoundError."""
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+
+        def _boom(*_a, **_k):
+            raise FileNotFoundError("sudo")
+
+        monkeypatch.setattr(svc_linux.subprocess, "run", _boom)
+        res = svc_linux._sudo_run("systemctl", "restart", "kirocrew.service")
+        assert res.returncode == 127
+        # restart() surfaces the failure as False rather than crashing.
+        assert svc_linux.restart() is False
+
+
+class TestLinuxEnvironmentFile:
+    """The operator-editable overrides file — the honest fix to 'I set
+    KIROCREW_PORT on the service and it did not change the port'."""
+
+    def test_unit_references_the_env_file(self, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setenv("USER", "tester")
+        with patch(
+            "kiro_crew.service.common.shutil.which",
+            return_value="/usr/local/bin/kirocrew",
+        ):
+            unit = svc_linux.render_unit()
+        assert f"EnvironmentFile=-{svc_linux.ENV_FILE_PATH}\n" in unit
+        # The overrides file is read after (and thus overrides) the baked
+        # Environment= snapshot; both must sit inside [Service].
+        service = unit.index("[Service]")
+        install = unit.index("[Install]")
+        assert service < unit.index("EnvironmentFile=") < install
+
+    def test_seed_env_file_creates_when_absent(self, tmp_path, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        env_file = tmp_path / "kirocrew" / "kirocrew.env"
+        monkeypatch.setattr(svc_linux, "ENV_DIR", env_file.parent)
+        monkeypatch.setattr(svc_linux, "ENV_FILE_PATH", env_file)
+
+        written: dict[str, str] = {}
+
+        def _fake_install(contents, dest, mode="0644"):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(contents)
+            written["contents"] = contents
+
+        # _seed_env_file probes existence via `_sudo_run("test", "-e", path)`;
+        # answer it from the real tmp file so the create-if-absent logic runs.
+        def _fake_sudo(*args, **_k):
+            if args and args[0] == "test":
+                rc = 0 if Path(args[-1]).exists() else 1
+                return MagicMock(returncode=rc, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(svc_linux, "_install_file_via_sudo", _fake_install)
+        monkeypatch.setattr(svc_linux, "_sudo_run", _fake_sudo)
+
+        svc_linux._seed_env_file()
+        assert env_file.exists()
+        # Seed is inert until an operator opts in: the port line is commented.
+        assert "#KIROCREW_PORT=" in written["contents"]
+
+    def test_seed_env_file_never_clobbers_operator_edits(self, tmp_path, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        env_file = tmp_path / "kirocrew" / "kirocrew.env"
+        env_file.parent.mkdir(parents=True)
+        env_file.write_text("KIROCREW_PORT=5477\n")
+        monkeypatch.setattr(svc_linux, "ENV_DIR", env_file.parent)
+        monkeypatch.setattr(svc_linux, "ENV_FILE_PATH", env_file)
+
+        def _fake_sudo(*args, **_k):
+            if args and args[0] == "test":
+                rc = 0 if Path(args[-1]).exists() else 1
+                return MagicMock(returncode=rc, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        called = MagicMock()
+        monkeypatch.setattr(svc_linux, "_install_file_via_sudo", called)
+        monkeypatch.setattr(svc_linux, "_sudo_run", _fake_sudo)
+        svc_linux._seed_env_file()
+        # An existing file is left exactly as the operator wrote it.
+        called.assert_not_called()
+        assert env_file.read_text() == "KIROCREW_PORT=5477\n"
+
+    def test_seed_env_file_is_non_fatal_when_probe_denied(self, tmp_path, monkeypatch):
+        """A pre-existing root-only /etc/kirocrew must not abort install: the
+        existence probe goes through privileged `test -e`, and any error still
+        degrades to a warning instead of propagating."""
+        from kiro_crew.service import linux as svc_linux
+
+        env_file = tmp_path / "kirocrew" / "kirocrew.env"
+        monkeypatch.setattr(svc_linux, "ENV_DIR", env_file.parent)
+        monkeypatch.setattr(svc_linux, "ENV_FILE_PATH", env_file)
+
+        # Even if the privileged probe itself raised, _seed_env_file swallows it.
+        def _boom(*_a, **_k):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(svc_linux, "_sudo_run", _boom)
+        monkeypatch.setattr(svc_linux, "_install_file_via_sudo", MagicMock())
+        svc_linux._seed_env_file()  # must not raise
+
+    def test_uninstall_preserves_an_operator_edited_env_file(self, tmp_path, monkeypatch):
+        """Uninstall must delete ONLY our untouched seed — an operator-authored
+        or -edited overrides file (including one pre-provisioned before install)
+        is their config, not ours to remove."""
+        from kiro_crew.service import linux as svc_linux
+
+        unit = tmp_path / "kirocrew.service"
+        unit.write_text("[Unit]\n")
+        env_file = tmp_path / "kirocrew" / "kirocrew.env"
+        env_file.parent.mkdir(parents=True)
+        env_file.write_text("KIROCREW_PORT=5477\n")  # operator content, not our seed
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", unit)
+        monkeypatch.setattr(svc_linux, "ENV_DIR", env_file.parent)
+        monkeypatch.setattr(svc_linux, "ENV_FILE_PATH", env_file)
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+
+        removed: list[str] = []
+
+        def _fake_sudo(*args, **_k):
+            if args and args[0] == "rm":
+                removed.append(args[-1])
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(svc_linux, "_sudo_run", _fake_sudo)
+        monkeypatch.setattr(svc_linux, "_systemctl", lambda *a, **k: MagicMock(returncode=0))
+        svc_linux.uninstall()
+        # The unit is removed; the operator's env file is NOT.
+        assert str(unit) in removed
+        assert str(env_file) not in removed
+
+    def test_uninstall_removes_our_untouched_seed(self, tmp_path, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        unit = tmp_path / "kirocrew.service"
+        unit.write_text("[Unit]\n")
+        env_file = tmp_path / "kirocrew" / "kirocrew.env"
+        env_file.parent.mkdir(parents=True)
+        env_file.write_text(svc_linux._ENV_FILE_TEMPLATE)  # our exact untouched seed
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", unit)
+        monkeypatch.setattr(svc_linux, "ENV_DIR", env_file.parent)
+        monkeypatch.setattr(svc_linux, "ENV_FILE_PATH", env_file)
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+
+        removed: list[str] = []
+
+        def _fake_sudo(*args, **_k):
+            if args and args[0] in ("rm", "rmdir"):
+                removed.append(args[-1])
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(svc_linux, "_sudo_run", _fake_sudo)
+        monkeypatch.setattr(svc_linux, "_systemctl", lambda *a, **k: MagicMock(returncode=0))
+        svc_linux.uninstall()
+        assert str(env_file) in removed
 
 
 class TestMacOSPlistRendering:
@@ -684,6 +979,23 @@ class TestControllerDispatch:
             rc = controller.uninstall_service()
         assert rc == 0
         mock_un.assert_called_once()
+
+    def test_uninstall_systemd_handles_service_install_error(self, capsys):
+        """uninstall() needs root to remove the root-owned unit, so it can raise
+        ServiceInstallError on a non-root host without sudo. The controller must
+        catch it and return non-zero, not let a traceback escape."""
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        with patch(
+            "kiro_crew.service.controller.current_platform",
+            return_value=Platform.SYSTEMD,
+        ), patch.object(
+            svc_linux, "uninstall", side_effect=svc_linux.ServiceInstallError("needs sudo")
+        ):
+            rc = controller.uninstall_service()
+        assert rc == 1
+        assert "needs sudo" in capsys.readouterr().err
 
     def test_uninstall_routes_to_macos(self):
         from kiro_crew.service import controller
@@ -1833,7 +2145,7 @@ class TestLauncherReconcileIsProductionOnly:
 
         assert cli_server._should_reconcile_launchd_launcher() is False
 
-    def test_a_frozen_build_never_reconciles(self, monkeypatch):
+    def test_the_desktop_bundle_never_reconciles(self, monkeypatch, tmp_path):
         """The packaged app must not own this artifact.
 
         launchd would run the bundled interpreter WITHOUT the environment the app
@@ -1841,11 +2153,21 @@ class TestLauncherReconcileIsProductionOnly:
         the signed bundle and invalidate its signature. The launchd agent belongs
         to a `service install`, not to an app that manages its own backend.
         """
-        from kiro_crew import cli_server
+        from kiro_crew import cli_server, platform_compat
 
         monkeypatch.delenv("KIROCREW_HOME", raising=False)
         monkeypatch.setattr(cli_server.sys, "platform", "darwin")
-        monkeypatch.setattr(cli_server.sys, "frozen", True, raising=False)
+        # Drive the real predicate with a bundle-shaped interpreter path rather
+        # than stubbing it, so this test and the packaging layout cannot agree on
+        # a shape the build never ships.
+        bundled_python = (
+            tmp_path
+            / platform_compat.BUNDLED_BACKEND_DIST_DIRNAME
+            / "kirocrew-backend"
+            / "bin"
+            / "python3.12"
+        )
+        monkeypatch.setattr(cli_server.sys, "executable", str(bundled_python))
 
         assert cli_server._should_reconcile_launchd_launcher() is False
 
@@ -2368,6 +2690,10 @@ class TestTrustedToolResolution:
         reason="asserts POSIX ownership/permission semantics on a real system binary; "
         "Windows has neither /bin/sh nor a root uid, and the AppArmor path is Linux-only",
     )
+    @pytest.mark.skipif(
+        os.path.exists("/bin/sh") and os.stat("/bin/sh").st_uid != 0,
+        reason="system binaries are not root-owned on this host",
+    )
     def test_resolves_a_real_root_owned_system_binary(self):
         """Against the real filesystem, not a fixture: /bin/sh must resolve."""
         from kiro_crew.service import apparmor as aa
@@ -2408,6 +2734,10 @@ class TestProfileLoadsBeforeTheServiceStarts:
             "_systemctl",
             lambda *args: (order.append(args[0]), MagicMock(returncode=0))[1],
         )
+        # _seed_env_file calls _sudo_run("test", "-e", ...) which blocks for a
+        # sudo password on non-Linux hosts (macOS). The function is best-effort
+        # and not under test here — patch it to a no-op.
+        monkeypatch.setattr(svc_linux, "_seed_env_file", lambda: None)
 
         outcome = svc_linux.install()
 
@@ -2681,8 +3011,13 @@ class TestATakeoverOfTheAttachedPathIsRefused:
         from kiro_crew.service import apparmor as aa
 
         target = Path("/usr/bin/env")  # root-owned on every POSIX host
-        if not target.exists() or target.stat().st_uid == os.getuid():
-            pytest.skip("need a root-owned binary not owned by the test user")
+        if not target.exists():
+            pytest.skip("need /usr/bin/env")
+        target_uid = target.stat().st_uid
+        if target_uid == os.getuid():
+            pytest.skip("need a binary not owned by the test user")
+        if target_uid != 0:
+            pytest.skip("need a root-owned binary; this host has uid %d" % target_uid)
 
         problem = aa._substitutable_by_others(target.resolve())
 
@@ -2738,6 +3073,10 @@ class TestATakeoverOfTheAttachedPathIsRefused:
         could give is refused.
         """
         from kiro_crew.service import apparmor as aa
+
+        tmp_uid = Path("/tmp").stat().st_uid
+        if tmp_uid not in (0, os.getuid()):
+            pytest.skip("/tmp owned by uid %d (not root or current user)" % tmp_uid)
 
         problem = aa._substitutable_by_others(Path("/tmp"))
 
@@ -3173,3 +3512,598 @@ class TestSandboxProfileControllerDispatch:
         with patch.object(controller, "current_platform", return_value=Platform.SYSTEMD), \
              patch.object(apparmor, "launcher_status", return_value=(True, "covered")):
             assert controller.sandbox_profile_status(None) == 0
+
+
+class TestHeadlessApiKeyDoctorReport:
+    """`doctor` must report the same dropped credential, and only when it is real.
+
+    Install-time alone misses every ordering where the service is already
+    installed. Doctor is where the operator stands and where the contradiction is
+    visible in one output, so the same helper is called there -- but only when a
+    service definition exists, because a foreground gateway inherits the shell
+    that runs doctor and the credential does reach it.
+    """
+
+    API_KEY = "KIRO_API_KEY"
+    SECRET = "sk-doctor-value-not-for-disclosure"
+
+    def _warn(self, monkeypatch, unit, warning="Note: dropped key"):
+        from kiro_crew import cli_doctor
+
+        monkeypatch.setattr(
+            cli_doctor.service_controller, "installed_unit_path", lambda: unit
+        )
+        monkeypatch.setattr(
+            cli_doctor.common_service, "headless_auth_warning", lambda: warning
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_headless_auth(issues)
+        return issues
+
+    def test_reports_when_a_service_is_installed(self, monkeypatch, capsys, tmp_path):
+        issues = self._warn(monkeypatch, tmp_path / "kirocrew.service")
+        out = capsys.readouterr().out
+        assert "cannot see it" in out
+        assert "Note: dropped key" in out
+        assert issues == [], "the report is advisory; see the exit-code test below"
+
+    def test_the_report_cannot_make_doctor_exit_nonzero(self, monkeypatch, tmp_path):
+        """`issues` is the exit-code channel, and this gate cannot prove failure.
+
+        `_doctor` ends in `if issues: print("❌ Fix these issues: ..."); sys.exit(1)`,
+        so an entry here turns a host where sign-in works into a failed verdict:
+        `service_environment()` bakes `HOME`, so a service that has a
+        `kiro-cli login` credential store is healthy while this fires, and a unit
+        path only proves a definition exists on disk. Both halves are pinned --
+        the append being absent, and the `sys.exit(1)` it would have reached.
+        """
+        from kiro_crew import cli_doctor
+
+        source = inspect.getsource(cli_doctor._doctor_headless_auth)
+        assert "issues.append" not in source
+        assert "del issues" in source
+        assert self._warn(monkeypatch, tmp_path / "kirocrew.service") == []
+        assert "sys.exit(1)" in inspect.getsource(cli_doctor._doctor)
+
+    def test_silent_when_no_service_is_installed(self, monkeypatch, capsys):
+        """A foreground gateway inherits this shell, so there is nothing wrong."""
+        issues = self._warn(monkeypatch, None)
+        assert capsys.readouterr().out == ""
+        assert issues == []
+
+    def test_silent_when_the_helper_has_nothing_to_say(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        issues = self._warn(monkeypatch, tmp_path / "kirocrew.service", warning="")
+        assert capsys.readouterr().out == ""
+        assert issues == []
+
+    def test_a_failing_probe_cannot_break_doctor(self, monkeypatch, capsys, tmp_path):
+        """Doctor reports; it must not raise because a diagnostic could not run."""
+        from kiro_crew import cli_doctor
+
+        monkeypatch.setattr(
+            cli_doctor.service_controller,
+            "installed_unit_path",
+            lambda: tmp_path / "kirocrew.service",
+        )
+
+        def boom():
+            raise OSError("environment resolution exploded")
+
+        monkeypatch.setattr(
+            cli_doctor.common_service, "headless_auth_warning", boom
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_headless_auth(issues)
+        assert capsys.readouterr().out == ""
+        assert issues == []
+
+    def test_doctor_never_echoes_the_credential_value(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        real = common.headless_auth_warning
+        monkeypatch.setenv(self.API_KEY, self.SECRET)
+        monkeypatch.setattr(common.loader, "env_path", lambda: tmp_path / ".env")
+        issues = self._warn(
+            monkeypatch, tmp_path / "kirocrew.service", warning=real()
+        )
+        captured = capsys.readouterr().out
+        assert captured, "expected a report for this fixture"
+        assert self.SECRET not in captured
+        assert self.SECRET not in "".join(issues)
+
+    def test_doctor_actually_calls_the_check(self):
+        """A diagnostic with no production caller reports nothing to anyone.
+
+        Asserted against `_doctor`'s source rather than by running it, because
+        `_doctor` performs dozens of live host probes; the property under test is
+        only that the call site exists.
+        """
+        from kiro_crew import cli_doctor
+
+        assert "_doctor_headless_auth(issues)" in inspect.getsource(
+            cli_doctor._doctor
+        )
+
+
+class TestInstalledUnitPath:
+    """Presence of the definition file is the installed signal, per platform."""
+
+    def test_systemd_reports_the_unit_when_present(self, monkeypatch, tmp_path):
+        unit = tmp_path / "kirocrew.service"
+        unit.write_text("[Unit]\n", encoding="utf-8")
+        monkeypatch.setattr(controller, "current_platform", lambda: Platform.SYSTEMD)
+        monkeypatch.setattr(controller.linux, "UNIT_PATH", unit)
+        assert controller.installed_unit_path() == unit
+
+    def test_launchd_reports_the_plist_when_present(self, monkeypatch, tmp_path):
+        plist = tmp_path / "dev.kirocrew.gateway.plist"
+        plist.write_text("<plist/>", encoding="utf-8")
+        monkeypatch.setattr(controller, "current_platform", lambda: Platform.LAUNCHD)
+        monkeypatch.setattr(controller.macos, "PLIST_PATH", plist)
+        assert controller.installed_unit_path() == plist
+
+    def test_absent_definition_is_not_installed(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(controller, "current_platform", lambda: Platform.SYSTEMD)
+        monkeypatch.setattr(controller.linux, "UNIT_PATH", tmp_path / "nope.service")
+        assert controller.installed_unit_path() is None
+
+    def test_unsupported_platform_is_not_installed(self, monkeypatch):
+        monkeypatch.setattr(controller, "current_platform", lambda: Platform.UNSUPPORTED)
+        assert controller.installed_unit_path() is None
+
+
+class TestHeadlessApiKeyWarning:
+    """`service install` must not silently drop kiro-cli's API-key credential.
+
+    launchd/systemd hand the gateway a minimal environment, so a key exported in
+    the installing shell is absent when the service starts and the readiness
+    probe reports a signed-out state on a host where kiro-cli itself is
+    authenticated (issue #3257). The install path warns instead of pretending
+    nothing was lost — and never bakes the credential into the unit.
+    """
+
+    API_KEY = "KIRO_API_KEY"
+    SECRET = "sk-headless-value-not-for-disclosure"
+
+    def _dotenv(self, monkeypatch, tmp_path, contents=None):
+        """Point env_path() at a temp file so the developer's own .env is never read."""
+        target = tmp_path / ".env"
+        if contents is not None:
+            target.write_text(contents, encoding="utf-8")
+        monkeypatch.setattr(common.loader, "env_path", lambda: target)
+        return target
+
+    def test_warns_when_key_set_but_absent_from_dotenv(self, monkeypatch, tmp_path):
+        dotenv = self._dotenv(monkeypatch, tmp_path, "SLACK_BOT_TOKEN=xoxb-unrelated\n")
+        warning = common.headless_auth_warning({self.API_KEY: self.SECRET})
+        assert warning, "a dropped credential must produce a warning"
+        assert self.API_KEY in warning
+        assert str(dotenv) in warning, "the warning must name the file to edit"
+        assert "kirocrew service restart" in warning
+
+    def test_the_signed_out_claim_is_qualified(self, monkeypatch, tmp_path):
+        """A login credential store under the baked `HOME` can still authenticate.
+
+        `service_environment()` bakes `HOME`, so a service on a host that ran
+        `kiro-cli login` before the key was exported is signed in even though the
+        key is dropped. The note must therefore not state the signed-out outcome
+        as certain: doctor treats this same predicate as advisory rather than a
+        failure precisely because it cannot rule that fall-back out.
+        """
+        self._dotenv(monkeypatch, tmp_path, "")
+        warning = common.headless_auth_warning({self.API_KEY: self.SECRET})
+        assert "signed-out state" in warning
+        assert "unless" in warning, "the outcome is conditional, not certain"
+
+    def test_silent_when_dotenv_already_defines_the_key(self, monkeypatch, tmp_path):
+        self._dotenv(monkeypatch, tmp_path, f"{self.API_KEY}=already-configured\n")
+        assert common.headless_auth_warning({self.API_KEY: self.SECRET}) == ""
+
+    def test_silent_when_no_key_in_installer_environment(self, monkeypatch, tmp_path):
+        self._dotenv(monkeypatch, tmp_path, "")
+        assert common.headless_auth_warning({}) == ""
+
+    def test_blank_key_is_not_a_credential(self, monkeypatch, tmp_path):
+        self._dotenv(monkeypatch, tmp_path, "")
+        assert common.headless_auth_warning({self.API_KEY: "   "}) == ""
+
+    def test_missing_dotenv_warns_rather_than_assuming_configured(
+        self, monkeypatch, tmp_path
+    ):
+        # No file written: an unreadable/absent .env must fail toward warning,
+        # because a missed warning is the defect being fixed.
+        self._dotenv(monkeypatch, tmp_path)
+        assert common.headless_auth_warning({self.API_KEY: self.SECRET})
+
+    def test_commented_out_assignment_does_not_count_as_configured(
+        self, monkeypatch, tmp_path
+    ):
+        self._dotenv(monkeypatch, tmp_path, f"#{self.API_KEY}=commented-out\n")
+        assert common.headless_auth_warning({self.API_KEY: self.SECRET})
+
+    def test_warning_never_echoes_the_credential_value(self, monkeypatch, tmp_path):
+        self._dotenv(monkeypatch, tmp_path, "")
+        warning = common.headless_auth_warning({self.API_KEY: self.SECRET})
+        assert self.SECRET not in warning
+        # The remedy must reference the variable, not interpolate its value.
+        assert f"${self.API_KEY}" in warning
+
+    def test_custom_home_caveat_only_when_home_is_overridden(
+        self, monkeypatch, tmp_path
+    ):
+        self._dotenv(monkeypatch, tmp_path, "")
+        plain = common.headless_auth_warning({self.API_KEY: self.SECRET})
+        assert "KIROCREW_HOME" not in plain
+        with_home = common.headless_auth_warning(
+            {self.API_KEY: self.SECRET, "KIROCREW_HOME": "/srv/crew"}
+        )
+        assert "KIROCREW_HOME" in with_home
+
+    def test_remedy_tightens_permissions_before_writing_the_secret(
+        self, monkeypatch, tmp_path
+    ):
+        """The append must not be the step that creates the file.
+
+        Under a standard 022 umask a .env born from the append alone is 0644, and
+        the gateway only forces 0600 the next time it reads it — so the key would
+        be world-readable in the interim. Order is the whole fix, so assert on
+        position, not mere presence.
+        """
+        self._dotenv(monkeypatch, tmp_path, "")
+        warning = common.headless_auth_warning({self.API_KEY: self.SECRET})
+        assert "chmod 600" in warning
+        assert warning.index("chmod 600") < warning.index("printf"), (
+            "chmod must precede the append, or the secret lands in a 0644 file"
+        )
+
+    def test_remedy_survives_a_crew_home_containing_spaces(self, monkeypatch, tmp_path):
+        """An operator copy-pastes this line, so the shell must read one path.
+
+        Unquoted, a spaced path word-splits: `touch` creates the wrong files,
+        `chmod` fails on a path that never existed, and the redirect appends the
+        credential to a different file under the ambient umask — which
+        load_credentials() never visits to tighten. That is the same
+        world-readable outcome the chmod ordering exists to prevent, so quoting
+        belongs to that same contract.
+        """
+        spaced = tmp_path / "crew home"
+        spaced.mkdir()
+        dotenv = self._dotenv(monkeypatch, spaced, "")
+        warning = common.headless_auth_warning({self.API_KEY: self.SECRET})
+        quoted = shlex.quote(str(dotenv))
+        assert quoted != str(dotenv), "fixture must exercise a path needing quotes"
+        for line in warning.splitlines():
+            if "touch" not in line and "printf" not in line:
+                continue
+            assert quoted in line, line
+            # shlex.split is the ground truth: the path must survive as ONE arg.
+            assert str(dotenv) in shlex.split(line.strip()), line
+
+    def test_blank_value_in_dotenv_is_not_configured(self, monkeypatch, tmp_path):
+        """A bare `NAME=` must still warn.
+
+        load_credentials() skips falsy values when it seeds os.environ, so a
+        valueless assignment never reaches the probe and the dashboard stays
+        signed-out. Counting it as configured is precisely the missed warning
+        this module fails toward avoiding, and the shell side already rejects the
+        same emptiness.
+        """
+        for blank in (f"{self.API_KEY}=\n", f"{self.API_KEY}=   \n"):
+            dotenv = self._dotenv(monkeypatch, tmp_path, blank)
+            assert common.headless_auth_warning({self.API_KEY: self.SECRET}), blank
+            assert self.API_KEY not in common._names_defined_in_env_file(dotenv)
+
+    def test_decision_returns_a_bool_so_no_value_can_ride_out_of_it(
+        self, monkeypatch, tmp_path
+    ):
+        """The only function reading the credential must not return text.
+
+        Keeping the read in a bool-returning function is what makes "the value
+        cannot reach a print" structural instead of a property of the current
+        formatting. `is True` is deliberate: a str return would satisfy a truthy
+        assertion while carrying the secret.
+        """
+        self._dotenv(monkeypatch, tmp_path, "")
+        assert common.api_key_will_be_dropped({self.API_KEY: self.SECRET}) is True
+        assert common.api_key_will_be_dropped({}) is False
+
+    def test_env_var_name_identifier_avoids_credential_words(self):
+        """The constant holding the variable NAME must not be named like a secret.
+
+        Taint analysis classifies sources by identifier name, so a constant
+        called `_API_KEY_ENV` marks every string it flows into as a cleartext
+        credential — which flagged the operator message even though the message
+        contains only a variable name and a path. The value is unchanged and
+        still printed verbatim; only the identifier is constrained.
+        """
+        assert common._AUTH_ENV_VAR == "KIRO_API_KEY"
+        banned = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)")
+        assert not banned.search("_AUTH_ENV_VAR"), (
+            "renaming this constant to a credential-sounding identifier "
+            "re-introduces the py/clear-text-logging-sensitive-data alert"
+        )
+        src = inspect.getsource(common)
+        assert "_API_KEY_ENV" not in src
+
+    def test_credential_is_never_baked_into_the_service_environment(self, monkeypatch):
+        """The unit and plist are world-readable; the credential stays out of both."""
+        monkeypatch.setenv(self.API_KEY, self.SECRET)
+        env = service_environment("/home/tester")
+        assert self.API_KEY not in env
+        assert self.SECRET not in "".join(env.values())
+
+    def test_a_failing_check_cannot_break_a_successful_install(self, capsys):
+        """The unit is already started when this runs, so it must never raise."""
+        boom = MagicMock(side_effect=OSError("home resolution exploded"))
+        with patch.object(controller, "headless_auth_warning", boom):
+            controller._print_headless_auth_warning()
+        assert boom.called
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize(
+        "plat,module",
+        [(Platform.SYSTEMD, "linux"), (Platform.LAUNCHD, "macos")],
+    )
+    def test_both_install_paths_surface_the_warning(self, plat, module, capsys):
+        """Neither platform may install and stay quiet about a dropped credential."""
+        installer = MagicMock(return_value=MagicMock(ok=True, message=""))
+        with (
+            patch.object(controller, "current_platform", return_value=plat),
+            patch.object(getattr(controller, module), "install", installer),
+            patch.object(
+                controller, "headless_auth_warning", return_value="Note: dropped key"
+            ),
+        ):
+            assert controller.install_service() == 0
+        assert "Note: dropped key" in capsys.readouterr().out
+
+
+class TestAppArmorProfileValidation:
+    """``validate`` parses a profile WITHOUT loading it.
+
+    Loading needs root and a wrong profile that loads is a confined gateway that
+    cannot start; parsing first is what turns that into a message. ``--skip-cache``
+    is load-bearing: writing ``/var/cache/apparmor`` needs root and this runs
+    before any privileged step.
+    """
+
+    @staticmethod
+    def _fake_run(monkeypatch, *, returncode=0, stdout="", stderr="", raises=None):
+        from kiro_crew.service import apparmor as aa
+
+        seen: dict = {}
+
+        def _run(argv, **kw):
+            seen["argv"] = list(argv)
+            seen["kw"] = kw
+            if raises is not None:
+                raise raises
+            return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+        monkeypatch.setattr(aa.subprocess, "run", _run)
+        return seen
+
+    def test_a_clean_parse_reports_ok(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        seen = self._fake_run(monkeypatch)
+        ok, detail = aa.validate("/usr/sbin/apparmor_parser", "profile x {}")
+
+        assert (ok, detail) == (True, "")
+        assert seen["argv"][:3] == ["/usr/sbin/apparmor_parser", "-Q", "--skip-cache"]
+
+    def test_the_profile_text_reaches_the_parser_and_the_temp_file_is_removed(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        seen = self._fake_run(monkeypatch)
+        written: dict = {}
+
+        def _capture(argv, **kw):
+            written["text"] = Path(argv[-1]).read_text(encoding="utf-8")
+            written["path"] = argv[-1]
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(aa.subprocess, "run", _capture)
+        aa.validate("/usr/sbin/apparmor_parser", "profile marker {}")
+
+        assert written["text"] == "profile marker {}"
+        # The temp file carries a profile, not a secret, but leaving one per
+        # install attempt is still a leak of /tmp entries.
+        assert not Path(written["path"]).exists()
+        assert seen == {}
+
+    def test_a_parse_failure_returns_the_parsers_own_words(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        self._fake_run(monkeypatch, returncode=1, stderr="  syntax error at line 3  ")
+        assert aa.validate("/usr/sbin/apparmor_parser", "bad") == (
+            False,
+            "syntax error at line 3",
+        )
+
+    def test_stdout_is_used_when_stderr_is_empty(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        self._fake_run(monkeypatch, returncode=1, stdout="told you so")
+        assert aa.validate("/usr/sbin/apparmor_parser", "bad") == (False, "told you so")
+
+    def test_a_missing_parser_is_a_failure_not_a_crash(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        self._fake_run(monkeypatch, raises=OSError("no such file"))
+        ok, detail = aa.validate("/usr/sbin/apparmor_parser", "profile x {}")
+
+        assert ok is False
+        assert "no such file" in detail
+
+    def test_a_parser_timeout_is_a_failure_not_a_crash(self, monkeypatch):
+        import subprocess
+
+        from kiro_crew.service import apparmor as aa
+
+        self._fake_run(monkeypatch, raises=subprocess.TimeoutExpired("p", 30))
+        assert aa.validate("/usr/sbin/apparmor_parser", "profile x {}")[0] is False
+
+
+#: The AppImage path the attachment scan matches on, POSIX-flavoured on purpose.
+#: ``conflicting_attachment`` interpolates the path into a literal needle, and on
+#: Windows a plain ``Path("/opt/x")`` renders with BACKSLASHES — so the needle
+#: would never match the forward-slash profile text and the test would assert a
+#: platform artefact instead of the matching logic. AppArmor is Linux-only, so
+#: PurePosixPath is also what production actually passes here.
+_APPIMAGE = PurePosixPath("/opt/KiroCrew.AppImage")
+
+
+class TestAppArmorConflictingAttachment:
+    """Two profiles claiming one attachment is an ambiguous load.
+
+    A hand-written profile attached to the same AppImage is the workaround people
+    find first, so it is common rather than exotic — and the caller can only warn
+    about it if this finds it. Best effort by design: a literal scan, no policy
+    parsing, and an unreadable file is skipped rather than failing the install.
+    """
+
+    @staticmethod
+    def _dir(monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", tmp_path / aa.LAUNCHER_PROFILE_NAME)
+        return aa
+
+    def test_no_other_profile_means_no_conflict(self, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path)
+        assert aa.conflicting_attachment(_APPIMAGE) is None
+
+    def test_our_own_profile_is_never_the_conflict(self, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path)
+        (tmp_path / aa.LAUNCHER_PROFILE_NAME).write_text('"/opt/KiroCrew.AppImage" {}')
+        assert aa.conflicting_attachment(_APPIMAGE) is None
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '"/opt/KiroCrew.AppImage" flags=(attach_disconnected) {}',
+            "profile local /opt/KiroCrew.AppImage {}",
+            "profile local\n/opt/KiroCrew.AppImage",
+        ],
+    )
+    def test_each_attachment_spelling_is_found(self, body: str, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path)
+        other = tmp_path / "local-kirocrew"
+        other.write_text(body)
+        assert aa.conflicting_attachment(_APPIMAGE) == str(other)
+
+    def test_a_profile_for_another_path_is_not_a_conflict(self, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path)
+        (tmp_path / "other").write_text('"/opt/SomethingElse.AppImage" {}')
+        assert aa.conflicting_attachment(_APPIMAGE) is None
+
+    def test_a_subdirectory_is_skipped(self, monkeypatch, tmp_path):
+        # /etc/apparmor.d has abstractions/ and tunables/ subdirectories; reading
+        # one as a file would raise, and this scan must not fail the install.
+        aa = self._dir(monkeypatch, tmp_path)
+        (tmp_path / "abstractions").mkdir()
+        assert aa.conflicting_attachment(_APPIMAGE) is None
+
+    def test_an_unreadable_file_is_skipped_not_fatal(self, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path)
+        (tmp_path / "unreadable").write_text("x")
+        good = tmp_path / "zz-real"
+        good.write_text('"/opt/KiroCrew.AppImage" {}')
+        real_read = Path.read_text
+
+        def _read(self, *a, **kw):
+            if self.name == "unreadable":
+                raise OSError("EACCES")
+            return real_read(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", _read)
+        assert aa.conflicting_attachment(_APPIMAGE) == str(good)
+
+    def test_a_missing_directory_is_not_an_error(self, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path / "absent")
+        assert aa.conflicting_attachment(_APPIMAGE) is None
+
+
+class TestAppArmorLauncherUninstall:
+    """Unloading is idempotent and never raises.
+
+    An uninstall that fails hard leaves the user with a half-removed profile and
+    no way to finish; the file is what matters, so a failed UNLOAD is logged and
+    the removal still runs.
+    """
+
+    def test_nothing_to_do_when_no_profile_is_installed(self, monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", tmp_path / "absent")
+        outcome = aa.uninstall_launcher(lambda *a: None)
+        assert (outcome.changed, outcome.ok) == (False, True)
+
+    def test_it_unloads_then_removes(self, monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        path = tmp_path / "kirocrew-launcher"
+        path.write_text("profile")
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", path)
+        monkeypatch.setattr(aa, "parser_path", lambda: "/usr/sbin/apparmor_parser")
+        calls: list[tuple] = []
+
+        outcome = aa.uninstall_launcher(lambda *a: calls.append(a))
+
+        assert calls == [
+            ("/usr/sbin/apparmor_parser", "-R", str(path)),
+            ("rm", "-f", str(path)),
+        ]
+        assert outcome.changed is True and outcome.ok is True
+
+    def test_a_failed_unload_still_removes_the_file(self, monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        path = tmp_path / "kirocrew-launcher"
+        path.write_text("profile")
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", path)
+        monkeypatch.setattr(aa, "parser_path", lambda: "/usr/sbin/apparmor_parser")
+        calls: list[tuple] = []
+
+        def _sudo(*a):
+            if a[1] == "-R":
+                raise RuntimeError("kernel said no")
+            calls.append(a)
+
+        outcome = aa.uninstall_launcher(_sudo)
+
+        assert calls == [("rm", "-f", str(path))]
+        assert outcome.ok is True
+
+    def test_a_failed_removal_is_reported(self, monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        path = tmp_path / "kirocrew-launcher"
+        path.write_text("profile")
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", path)
+        monkeypatch.setattr(aa, "parser_path", lambda: None)
+
+        def _sudo(*a):
+            raise RuntimeError("read-only /etc")
+
+        outcome = aa.uninstall_launcher(_sudo)
+
+        assert outcome.ok is False
+        assert "read-only /etc" in outcome.message
+
+    def test_no_parser_skips_the_unload_and_still_removes(self, monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        path = tmp_path / "kirocrew-launcher"
+        path.write_text("profile")
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", path)
+        monkeypatch.setattr(aa, "parser_path", lambda: None)
+        calls: list[tuple] = []
+
+        outcome = aa.uninstall_launcher(lambda *a: calls.append(a))
+
+        assert calls == [("rm", "-f", str(path))]
+        assert outcome.changed is True

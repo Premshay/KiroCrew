@@ -45,7 +45,7 @@ opens the file at that line instead of navigating the browser back to Chat.
 - **Tool purpose pills**: tool call labels show purpose text, persisted across reloads
 - **Batch tool rejection**: reject multiple pending tool approvals at once
 - **Cancel queued messages**: cancel button for messages waiting in the queue
-- **Edit queued messages**: edit a message waiting in the queue in place before it runs (order preserved)
+- **Edit queued messages**: edit a message waiting in the queue in place before it runs (order preserved); automatic recovery entries stay immutable so their delivery receipts remain bound to the original message
 - **iOS-style queue stack**: queued messages displayed as a visual stack
 - **Streaming transcription**: live speech-to-text partials via WebSocket
 - **Weighted content search**: session content search with weighted ranking
@@ -58,6 +58,7 @@ opens the file at that line instead of navigating the browser back to Chat.
   system Files picker directly. Both paths accept images and regular files such
   as `.zip`, `.csv`, and `.docx`.
 - **Folder management**: create, rename, and organize sessions into sidebar folders with indent borders
+- **Per-channel session folders**: optional, off by default — each channel's settings panel (Slack, Discord, Telegram, Teams, Webex, WeCom, WeChat) can file conversations that start there into a named sidebar folder, marked with the channel's brand mark. Config key: `<channel>.session_folder` ("" = off). The folder is created when the setting is saved, so the surfacing path only ever reads the folder store; a configured folder that no longer exists (config.json hand-edited, or the folder deleted) leaves conversations unfiled until the next save recreates it. Filing applies as each conversation is first surfaced; a session moved by hand afterwards stays where it was put.
 - **Session colors**: per-session color picker for visual organization
 
 ### Overview (`/overview`)
@@ -168,6 +169,20 @@ annotated with a `Terminal output (path):` header — using the live `cwd`
 value when the backend has reported one, else the terminal's spawn directory
 — and wrapped in a code fence so the agent reads it as literal output. Copy
 places the raw selection on the clipboard.
+
+**Credential redaction.** The terminal shows exactly what your shell wrote.
+The live stream is not scanned, so a token you printed on purpose
+(`gh auth token`), a device-code login or presigned URL you are mid-flow on,
+and high-entropy build output such as an npm `integrity sha512-…` line all
+render as themselves. Nothing is gained by hiding them here: this panel is
+your own interactive shell, and anything that could read it could read the
+terminal app next to it.
+
+The scan runs where the output actually leaves your machine's screen — the
+selection hand-off above, the one path by which terminal output reaches the
+agent. That re-scan is unconditional, has no setting to disable it, and reads
+the whole contiguous selection rather than one 4096-byte read at a time, so a
+credential split across a read boundary cannot slip past it.
 
 ## Dark/Light Theme
 

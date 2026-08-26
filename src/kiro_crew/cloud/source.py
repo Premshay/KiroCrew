@@ -22,6 +22,7 @@ from typing import Optional
 
 from kiro_crew.cloud import aws
 from kiro_crew.sel import sel
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,21 @@ _EXCLUDE_NAMES = frozenset(
 )
 
 
+def find_repo_root() -> Optional[Path]:
+    """The Kiro Crew source root, or ``None`` when this is not a checkout.
+
+    The non-raising half of :func:`repo_root`, for callers that must *decide*
+    whether source shipping is possible rather than fail when it is not — e.g. a
+    dashboard launch, which has to work from a wheel/app install where there is no
+    checkout to package.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "install.sh").exists() and (parent / "setup.cfg").exists():
+            return parent
+    return None
+
+
 def repo_root() -> Path:
     """The KiroCrew source root to package (the installed package's repo).
 
@@ -95,14 +111,13 @@ def repo_root() -> Path:
     The caller should pass an explicit ``SourceBucket``-less git-clone path or a
     real checkout in that case.
     """
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        if (parent / "install.sh").exists() and (parent / "setup.cfg").exists():
-            return parent
+    found = find_repo_root()
+    if found is not None:
+        return found
     raise aws.AWSError(
         "could not locate the KiroCrew source root (no install.sh + setup.cfg "
         "above this module) — source shipping needs an editable/git checkout. "
-        "Run `kirocrew cloud launch` from a clone, or launch without S3 source "
+        "Run the cloud launcher from a clone, or launch without S3 source "
         "shipping (public git-clone fallback).",
         action="source:PackageLocalCheckout",
     )
@@ -139,8 +154,8 @@ def _use_git_archive(root: Path) -> Optional[Path]:
         rc = subprocess.run(  # noqa: S603 — fixed argv, no shell
             ["git", "-C", str(root), "archive", "--format=tar.gz", "-o", out.name, "HEAD"],
             capture_output=True,
-            text=True,
             timeout=120,
+            **UTF8_TEXT,
         )
         if rc.returncode == 0 and Path(out.name).stat().st_size > 0:
             return _refilter_archive(Path(out.name))
@@ -240,8 +255,8 @@ def _tracked_tree_is_dirty(root: Path) -> bool:
         rc = subprocess.run(  # noqa: S603 — fixed argv, no shell
             ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
             capture_output=True,
-            text=True,
             timeout=60,
+            **UTF8_TEXT,
         )
     except (OSError, subprocess.SubprocessError):
         return False

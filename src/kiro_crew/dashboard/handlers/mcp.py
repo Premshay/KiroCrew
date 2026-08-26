@@ -7,16 +7,44 @@ import json
 import logging
 import re
 import time
+from collections.abc import Collection
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.agent import _atomic_json_write, kiro_agents_dir_path, rebuild_agent_config
+from kiro_crew.atomic_write import atomic_write
+from kiro_crew.config.loader import (
+    FORWARD_DECLARED_ENV_DEFAULT,
+    KiroCrewConfig,
+    _resolve_stub_servers,
+)
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.mcp_gateway import is_gateway_supported
-from kiro_crew.mcp_utils import mcp_server_alias
+from kiro_crew.env import emit_env
+from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.mcp_discovery import (
+    managed_server_is_session_bound,
+    probe_metadata,
+    redact_mcp_error,
+    redact_mcp_headers,
+)
+from kiro_crew.mcp_gateway import hazards, is_gateway_supported
+from kiro_crew.mcp_gateway.hashing import hash_command
+from kiro_crew.mcp_gateway.rewriter import records_dir
+from kiro_crew.mcp_gateway.shareability import ShareEvidence, ShareVerdict, assess
+from kiro_crew.mcp_gateway.verdict_cache import load_cache
+from kiro_crew.mcp_provenance import ABSENT, resolve_write, stamp
+from kiro_crew.mcp_utils import (
+    INTERNAL_CLIENT_ID_KEY,
+    INTERNAL_SCOPES_KEY,
+    apply_kiro_oauth_hints,
+    mcp_server_alias,
+)
 from kiro_crew.platform.governance import may_skip_gate_now
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -25,14 +53,17 @@ logger = logging.getLogger(__name__)
 
 # Allowlist pattern for MCP server names.  Matches the convention used
 # in AIM / kiro-cli (alphanumerics, dashes, underscores, slashes, dots,
-# and ``@`` for scoped names like ``@org/server``) and defends against
-# command-injection into subprocess calls that pass the name as an argv
-# element (e.g. a capability-manager `uninstall <name>` argv).
+# ``@`` for scoped names like ``@org/server``, and ``:`` for app-provided
+# keys like ``<app>:<server>`` as enumerated from ``~/.kiro/agents/*.json``)
+# and defends against command-injection into subprocess calls that pass the
+# name as an argv element (e.g. a capability-manager `uninstall <name>` argv).
+# A colon is not a shell metacharacter and names only ever travel as
+# list-form argv elements, so admitting it does not widen that surface.
 #
 # The leading char must be alphanumeric or ``@`` so a name can't begin
-# with ``.`` or ``/``.  Path-traversal sequences (``..``) are rejected
-# separately at validation time below.
-_VALID_MCP_NAME_RE = re.compile(r"^[@a-zA-Z0-9][@a-zA-Z0-9/_.-]*$")
+# with ``.``, ``/``, or ``:``.  Path-traversal sequences (``..``) are
+# rejected separately at validation time below.
+_VALID_MCP_NAME_RE = re.compile(r"^[@a-zA-Z0-9][@a-zA-Z0-9/_.:-]*$")
 _MAX_MCP_NAME_LEN = 128
 
 
@@ -46,6 +77,9 @@ def _is_valid_mcp_name(name: str) -> bool:
 
 
 _GLOBAL_MCP_JSON = Path.home() / ".kiro" / "settings" / "mcp.json"
+# Surface label carried into the provenance decision so a declined rewrite names
+# the file it declined to touch.
+_KIRO_GLOBAL_SURFACE = "~/.kiro/settings/mcp.json"
 
 # Max per-request changes accepted by /api/mcp/apply. The capability-manager
 # uninstalls run OFF the MCP file lock (deferred, bounded-concurrent, under one
@@ -53,6 +87,12 @@ _GLOBAL_MCP_JSON = Path.home() / ".kiro" / "settings" / "mcp.json"
 # size) for a single apply call rather than lock-hold time. The
 # dashboard applies at most one change per visible server, so this is generous.
 _MCP_APPLY_MAX_CHANGES = 200
+
+# Max server names accepted by one /api/mcp-gateway/servers/stub call. The
+# batch form exists for the UI's "toggle all", whose upper bound is the number of
+# configured servers, so this only fences a hand-rolled request from turning one
+# config write into an unbounded one.
+_MAX_STUB_BATCH = 200
 
 # Bounded concurrency for the deferred capability-manager uninstall phase, so a
 # large batch neither serializes (timeout×N) nor floods the companion with N
@@ -157,28 +197,18 @@ def _get_mcp_lock_sync() -> _McpFileLockSync:
 # config, B then re-adds the same server from a preserved spec — leaving config
 # pointing at a removed package. This coarse async mutex spans BOTH phases so
 # apply calls are fully serialized; the narrower file lock is retained inside for
-# cross-process coordination with bridges.py. Bound to the running loop
-# (Python 3.10 compat), mirroring agents.py::_get_config_lock.
-_apply_lock: asyncio.Lock | None = None
-_apply_lock_loop: asyncio.AbstractEventLoop | None = None
+# cross-process coordination with bridges.py. Loop-bound via the shared
+# LoopBoundLock (#4800).
+_apply_lock = LoopBoundLock()
 
 
-def _get_apply_lock() -> asyncio.Lock:
-    """Return the /api/mcp/apply mutex bound to the current event loop."""
-    global _apply_lock, _apply_lock_loop
-    loop = asyncio.get_running_loop()
-    if _apply_lock is None or _apply_lock_loop is not loop:
-        _apply_lock = asyncio.Lock()
-        _apply_lock_loop = loop
+def _get_apply_lock() -> LoopBoundLock:
+    """Return the /api/mcp/apply mutex (loop-bound; rebinds per running loop)."""
     return _apply_lock
 
 
 def _write_mcp_json(data: dict) -> None:
     """Atomically write global mcp.json to prevent partial reads."""
-    from kiro_crew.agent import (  # noqa: F811  # circular import: agent imports handlers
-        _atomic_json_write,
-    )
-
     _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
     _atomic_json_write(_GLOBAL_MCP_JSON, data)
 
@@ -190,6 +220,11 @@ _mcp_probe_cache: list[dict] = []
 _mcp_probe_ts: float = 0.0
 _MCP_PROBE_CACHE_SECS = 600  # 10 min
 _mcp_probe_in_progress = False
+# Handle on the one probe allowed to be in flight. `_mcp_probe_in_progress` is
+# the flag the request handlers below consult to avoid STACKING a re-probe; this
+# is the joinable object that makes `_bg_mcp_probe` single-flight, which the flag
+# alone cannot do (a caller cannot await a bool).
+_mcp_probe_task: asyncio.Task[None] | None = None
 
 
 def _sync_mcp_to_agent(name: str, enabled: bool, *, remove: bool = False) -> None:
@@ -317,10 +352,6 @@ def _sync_mcp_to_agent_unlocked(name: str, enabled: bool, *, remove: bool = Fals
         cfg.get("mcpServers", {}).pop(alias, None)
         cfg.get("mcpServers", {}).pop(name, None)
     try:
-        from kiro_crew.agent import (  # noqa: F811 circular: agent imports handlers
-            _atomic_json_write,
-        )
-
         _atomic_json_write(path, cfg)
     except OSError as exc:
         logger.warning("Cannot write agent config %s: %s", path, exc)
@@ -439,18 +470,49 @@ def _sync_mcp_to_agent_batch_unlocked(names: list[str], enabled: bool) -> None:
     if not changed:
         return
     try:
-        from kiro_crew.agent import (  # noqa: F811 circular: agent imports handlers
-            _atomic_json_write,
-        )
-
         _atomic_json_write(path, cfg)
     except OSError as exc:
         logger.warning("Cannot write agent config %s: %s", path, exc)
 
 
 async def _bg_mcp_probe() -> None:
-    """Background MCP probe — populates cache at startup."""
+    """Populate the MCP probe cache — SINGLE-FLIGHT.
+
+    Two independent boot paths reach this: ``dashboard/server.py`` fires it as a
+    background task once the port is bound, and ``slack/gateway.py`` awaits it
+    before warming sessions (kiro-cli reads mcp.json at spawn time). Without a
+    join, boot spawns and handshakes EVERY enabled MCP server twice — doubling
+    the subprocess churn, doubling occupancy of probe_all()'s concurrency
+    semaphore (so the first URL waits longer), and giving each server two
+    chances to trip a rate limit or an auth prompt.
+
+    ``_mcp_probe_in_progress`` could not close this on its own: it was written
+    but never read here, and a bool cannot be awaited, so the second caller had
+    nothing to wait on. The task handle can be, so both callers get one fan-out
+    and both still return only once the cache is populated.
+
+    The join is SHIELDED so a caller giving up (gateway wraps this in
+    ``wait_for`` with a timeout) abandons its own wait without cancelling the
+    probe mid-handshake — the fan-out completes and the cache is populated for
+    whoever asks next, which is what the boot path's
+    "continuing without full probe" message already implies.
+    """
+    global _mcp_probe_task
+
+    inflight = _mcp_probe_task
+    if inflight is not None and not inflight.done():
+        await asyncio.shield(inflight)
+        return
+
+    task = asyncio.ensure_future(_run_mcp_probe())
+    _mcp_probe_task = task
+    await asyncio.shield(task)
+
+
+async def _run_mcp_probe() -> None:
+    """The probe fan-out itself. Reached only through `_bg_mcp_probe`."""
     global _mcp_probe_ts, _mcp_probe_in_progress
+    _mcp_probe_in_progress = True
     try:
         # circular import: mcp_discovery defers imports of kiro_crew.agent
         # which shares state with this module, so importing it at module top
@@ -466,7 +528,7 @@ async def _bg_mcp_probe() -> None:
             pass
 
         # Route through probe_all() so the fan-out is bounded by its
-        # _PROBE_MAX_CONCURRENCY semaphore. An
+        # PROBE_MAX_CONCURRENCY semaphore. An
         # unbounded gather here floods the loop's default executor during a
         # network blip and can starve the heartbeat into a watchdog _exit.
         probed = await probe_all()
@@ -490,9 +552,13 @@ async def _bg_mcp_probe() -> None:
 async def api_mcp_servers(request: web.Request) -> web.Response:
     """GET /api/mcp — list configured MCP servers with enabled state.
 
-    Reads from ``~/.kiro/settings/mcp.json`` — the global MCP config that
-    kiro-cli ACP actually loads at runtime.  Agent-level ``mcpServers``
-    and ``includeMcpJson`` are ignored by kiro-cli in ACP mode.
+    Inventory comes from ``list_servers()``, which merges the agent config's
+    ``mcpServers``, the scope-tagged ``mcp.json`` files (Kiro Crew data home
+    and ``~/.kiro/settings/mcp.json``), and provider-global entries. This
+    handler describes what the DASHBOARD shows; it makes no claim about which
+    of these sources kiro-cli itself loads at session time — that is backend
+    behaviour this repo cannot verify (see issue #2946, where agent-level and
+    disabled entries still initialized).
     """
     global _mcp_probe_in_progress
     from kiro_crew.mcp_discovery import list_servers  # circular import
@@ -585,8 +651,6 @@ async def api_mcp_active(request: web.Request) -> web.Response:
     when ``--agent <name>`` is passed.  For kirocrew (or no agent),
     reads from global ``~/.kiro/settings/mcp.json`` as before.
     """
-    from kiro_crew.agent import kiro_agents_dir_path  # noqa: F811
-
     agent = request.query.get("agent", "")
 
     # Resolve KiroCrew agent name → kiro agent name so "default" → "kirocrew"
@@ -651,6 +715,14 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
     from kiro_crew.mcp_discovery import probe_all  # noqa: F811
 
     servers = await probe_all()
+    # The operator just asked us to spawn every configured server, which is the
+    # only moment the shareability pre-flight is affordable. Evaluate the ones
+    # whose execution identity has no cached measurement; failures here must not
+    # cost the probe its response, since status and tools are what was asked for.
+    try:
+        await _evaluate_shareability(servers)
+    except Exception:
+        logger.debug("shareability evaluation failed; probe result unaffected", exc_info=True)
     # Read global mcp.json for enabled/disabledTools state
     global_mcps: dict[str, Any] = {}
     try:
@@ -671,6 +743,105 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def _evaluate_shareability(servers: list[Any]) -> None:
+    """Pre-flight any server whose execution identity has no cached measurement.
+
+    Separated from the endpoint so the probe's own contract — status and tools —
+    cannot be changed by a shareability failure.
+    """
+    # Imported HERE, not at module scope, and not because of a cycle: this module
+    # is on the gateway's boot path, and ``evaluate`` pulls in ``preflight`` ->
+    # ``mcp_discovery`` and ``stub`` (the stub PROCESS entry point). Measured on
+    # this tree, hoisting it put 8 extra modules on that path — enough to push a
+    # startup loop-responsiveness ceiling over on Windows. Nothing needs it until
+    # an operator explicitly probes.
+    from kiro_crew.mcp_gateway.evaluate import evaluate_new_servers
+
+    # Deliberately NOT gated on a configured broker: a machine that has never
+    # enabled stubbing is exactly the one that needs to learn whether it could.
+    await evaluate_new_servers(
+        list(servers), records_dir(KiroCrewConfig.load().mcp_gateway.socket_path)
+    )
+
+
+#: Progress of the operator-requested measurement pass. One pass at a time per
+#: gateway: the work is bounded by the configured server count, and a second
+#: concurrent pass would double the spawn load for no new measurements, since
+#: both would pick the same unmeasured set.
+_measure_progress: dict[str, Any] = {
+    "running": False,
+    # ``done`` is servers ATTEMPTED, which is what a progress bar advances on.
+    # ``measured`` is how many of those produced a verdict. They disagree whenever
+    # a pre-flight could not run, and only ``measured`` can carry a claim about
+    # the outcome: a pass that reached nothing must not report that it measured
+    # everything it tried.
+    "done": 0,
+    "measured": 0,
+    "total": 0,
+    "error": "",
+}
+
+
+async def _bg_measure_all() -> None:
+    """Measure every server that has no current verdict, reporting progress.
+
+    Runs uncapped, which is safe here and is not on the request path: an operator
+    asked for it and is watching a progress readout, so the cost is expected
+    rather than paid by somebody loading a page. The per-pass fan-out ceiling
+    still applies inside the evaluator, so this is a longer pass and not a
+    heavier one.
+    """
+    from kiro_crew.mcp_discovery import probe_all  # noqa: F811
+    from kiro_crew.mcp_gateway.evaluate import evaluate_new_servers
+
+    def report(measured: int, attempted: int, total: int) -> None:
+        _measure_progress["measured"] = measured
+        _measure_progress["done"] = attempted
+        _measure_progress["total"] = total
+
+    try:
+        servers = await probe_all()
+        await evaluate_new_servers(
+            list(servers),
+            records_dir(KiroCrewConfig.load().mcp_gateway.socket_path),
+            budget=None,
+            on_progress=report,
+        )
+    except Exception as exc:
+        # Surfaced in the progress payload rather than only logged: the operator
+        # is watching this readout, and a pass that silently stops looks
+        # identical to one that finished with nothing to do.
+        logger.warning("shareability: measurement pass failed: %s", exc)
+        _measure_progress["error"] = type(exc).__name__
+    finally:
+        _measure_progress["running"] = False
+
+
+async def api_mcp_measure_start(request: web.Request) -> web.Response:
+    """POST /api/mcp/measure — measure every server with no current verdict.
+
+    Returns immediately. The pass spawns two processes per unmeasured server and
+    can take minutes on a large configuration, so it must not be awaited by a
+    request: poll ``GET /api/mcp/measure`` for progress.
+
+    A second call while a pass is running is reported rather than queued, because
+    both passes would select the same unmeasured set and simply double the spawns.
+    """
+    if _measure_progress["running"]:
+        return web.json_response({"ok": False, "running": True, **_measure_progress})
+    _measure_progress.update(running=True, done=0, measured=0, total=0, error="")
+    state: DashboardState = request.app["state"]
+    task = asyncio.create_task(_bg_measure_all())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+    return web.json_response({"ok": True, "running": True, **_measure_progress})
+
+
+async def api_mcp_measure_progress(request: web.Request) -> web.Response:
+    """GET /api/mcp/measure — where the current or last measurement pass got to."""
+    return web.json_response({"ok": True, **_measure_progress})
+
+
 async def api_mcp_probe_cached(request: web.Request) -> web.Response:
     """GET /api/mcp/probe — return cached probe results (non-blocking)."""
     global _mcp_probe_in_progress
@@ -681,7 +852,20 @@ async def api_mcp_probe_cached(request: web.Request) -> web.Response:
         task = asyncio.create_task(_bg_mcp_probe())
         state._background_tasks.add(task)
         task.add_done_callback(state._background_tasks.discard)
-    return web.json_response(_mcp_probe_cache)
+
+    result: list[dict] = []
+    for cached in _mcp_probe_cache:
+        item = dict(cached)
+        # The cache is populated from to_dict(), which already redacts headers
+        # and errors — this pass is defense-in-depth for any future cache
+        # population path that stores raw output, not the primary boundary.
+        cached_headers = item.get("headers")
+        if "error" in item:
+            item["error"] = redact_mcp_error(item["error"], cached_headers)
+        if "headers" in item:
+            item["headers"] = redact_mcp_headers(cached_headers)
+        result.append(item)
+    return web.json_response(result)
 
 
 async def api_mcp_sync(request: web.Request) -> web.Response:
@@ -693,18 +877,17 @@ async def api_mcp_sync(request: web.Request) -> web.Response:
     3. Resets all sessions so changes take effect.
     """
     from kiro_crew.mcp_discovery import (  # noqa: F811
-        discover_servers_to_sync,
-        register_servers_for_cc,
-        sync_to_agent_config,
+        kirocrew_managed_names,
+        sync_discovered_servers,
     )
 
-    to_sync = discover_servers_to_sync()
-    synced = 0
+    # One serialized discover→write pass (agent config + CC sidecar), off the
+    # event loop — the sync is blocking file I/O, and sync_discovered_servers'
+    # mutex is what keeps this handler and the sessions-restart pre-sync from
+    # interleaving their read-modify-writes of the same files.
+    to_sync = await asyncio.to_thread(sync_discovered_servers)
+    synced = len(to_sync)
     if to_sync:
-        ok = sync_to_agent_config(to_sync)
-        if ok:
-            synced = len(to_sync)
-        register_servers_for_cc(to_sync)
         # Also add to global mcp.json (what ACP actually reads)
         async with _get_mcp_lock():
             try:
@@ -712,14 +895,118 @@ async def api_mcp_sync(request: web.Request) -> web.Response:
             except (FileNotFoundError, json.JSONDecodeError):
                 gdata = {"mcpServers": {}}
             gservers = gdata.setdefault("mcpServers", {})
+            # The kiro-global mcp.json is NOT ours, and a name cannot say who
+            # wrote an entry in it: the minimal ``{"url": ...}`` this emitter
+            # produces for a hint-less managed server is also the smallest thing a
+            # user can hand-type. Ownership is therefore the marker on the entry --
+            # ``resolve_write`` rewrites what we provably wrote, and declines
+            # everything else so a hand-authored collision survives untouched. A
+            # present unmarked entry is never written, not even when its bytes
+            # already match this emit: that state is also what reclaiming an entry
+            # leaves behind, so stamping it would take the entry back.
+            _managed = kirocrew_managed_names()
             for s in to_sync:
-                if s.name not in gservers:
-                    entry: dict[str, Any] = {"command": s.command}
+                if s.is_remote:
+                    current = gservers.get(s.name)
+                    entry: dict[str, Any] = dict(current) if isinstance(current, dict) else {}
+                    for key in ("command", "args", "env", "type"):
+                        entry.pop(key, None)
+                    entry["url"] = s.url
+                    # A headers map is scoped to the HOST it was typed for. The
+                    # overlay below deliberately carries a credential the user put
+                    # in their own global file across a sync -- but that copy was
+                    # issued by, and for, the url already on disk. When the store
+                    # moves a managed server to a different url, keeping the map
+                    # stops being preservation and becomes forwarding: the user's
+                    # Authorization value gets written beside an origin that never
+                    # saw it, and the next session sends it there. So the map only
+                    # survives when the url is unchanged, and the test sits ahead
+                    # of BOTH write branches -- a header-less discovery never runs
+                    # the overlay, so a guard inside it would miss the entry that
+                    # simply rode along in ``dict(current)``. Dropping costs a
+                    # re-auth, which the user can redo; a leaked bearer cannot be
+                    # called back. An entry with no url on disk is treated the same
+                    # way: nothing proves that map belongs to where we are pointing.
+                    if not (isinstance(current, dict) and current.get("url") == s.url):
+                        entry.pop("headers", None)
+                    # Discovery coerces only a FALSY headers value, so a truthy
+                    # non-dict from a hand-edited entry arrives here as-is. It
+                    # carries no usable credential, so it reads as "discovery
+                    # said nothing" and leaves the on-disk map alone rather than
+                    # aborting a sync that covers every other server too.
+                    _discovered = s.headers if isinstance(s.headers, dict) else {}
+                    if _discovered:
+                        # Overlay, never replace. Discovery reads the MERGED view,
+                        # which takes the store's copy of the entry, so a header
+                        # the user hand-added to their own global file is absent
+                        # from the discovered map while still present in
+                        # ``current``. Assigning wholesale would delete exactly the
+                        # global-only credential the empty-map guard below exists
+                        # to protect -- and this write path only became reachable
+                        # for existing entries here, so it has to be as
+                        # conservative as the base ref's create-only behaviour.
+                        _prior = entry.get("headers")
+                        entry["headers"] = {
+                            **(_prior if isinstance(_prior, dict) else {}),
+                            **_discovered,
+                        }
+                    # An empty discovered header map is NOT an instruction to
+                    # delete. Discovery reads the dashboard's own mcp.json, so a
+                    # server of the same name carrying an Authorization header in
+                    # the user's global ~/.kiro/settings/mcp.json legitimately
+                    # arrives here header-less. Popping on that would erase the
+                    # only copy of a credential the user typed, silently and with
+                    # nothing to restore it from.
+                    #
+                    # scopes/clientId below are handled the opposite way ON
+                    # PURPOSE: those are written only by flows that own the whole
+                    # OAuth request, so absent means the request was narrowed and
+                    # the old grant must stop being asked for. Getting a stale
+                    # scope wrong over-requests access; getting a header wrong
+                    # destroys it.
+                    #
+                    # Both hints therefore always SPEAK here -- an empty list or
+                    # id is a real "no longer requested", not silence -- while
+                    # ``apply_kiro_oauth_hints`` edits ``oauth`` surgically, so a
+                    # sub-key we do not own (``issuer``, ...) is not collateral.
+                    entry.pop(INTERNAL_SCOPES_KEY, None)
+                    entry.pop(INTERNAL_CLIENT_ID_KEY, None)
+                    entry = apply_kiro_oauth_hints(
+                        entry,
+                        scopes=list(s.scopes),
+                        client_id=s.client_id,
+                        server=s.name,
+                    )
+                    resolved = resolve_write(
+                        name=s.name,
+                        # ``ABSENT``, not ``current``: a hand-edited file can hold
+                        # ``null`` or a string under a name, and that value
+                        # occupies the name -- it cannot carry a marker, so it is
+                        # the user's, not a free slot to create into.
+                        on_disk=gservers.get(s.name, ABSENT),
+                        candidate=entry,
+                        store_managed=s.name in _managed,
+                        surface=_KIRO_GLOBAL_SURFACE,
+                    )
+                    if resolved is not None and current != resolved:
+                        gservers[s.name] = resolved
+                elif s.name not in gservers:
+                    entry = {"command": s.command}
                     if s.args:
                         entry["args"] = s.args
                     if s.env:
-                        entry["env"] = s.env
-                    gservers[s.name] = entry
+                        # This file is consumed directly by the ACP runtime,
+                        # which applies a declared env per key — emit through
+                        # the shared normalization point (env.emit_env) so a
+                        # declared PATH is complete. Create-only: an entry the
+                        # user authored here is never rewritten, so their text
+                        # stays theirs. Off the event loop: the PATH expansion
+                        # scans Node-manager directories on a cold cache.
+                        entry["env"] = await asyncio.to_thread(emit_env, s.env)
+                    # Create-only here, as on the base ref, so there is no rewrite
+                    # to gate -- but the entry is still ours, and marking it now is
+                    # what lets a later slice re-sync it without guessing.
+                    gservers[s.name] = stamp(entry) if s.name in _managed else entry
             _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
             _write_mcp_json(gdata)
 
@@ -750,6 +1037,28 @@ async def api_mcp_sync(request: web.Request) -> web.Response:
     )
 
 
+def _string_identifier(body: dict, field: str) -> tuple[str, web.Response | None]:
+    """Read one mutation identifier the dashboard's forms post.
+
+    The field must be a STRING before normalization: a truthy non-string
+    (array/object/number from a malformed client) used to reach ``.strip()``
+    and surface as HTTP 500 before any validation ran — past the point where
+    such a handler would already hold the config lock or have touched
+    persistence. Missing or blank keeps the handlers' existing required-field
+    responses untouched; only the TYPE contract is new, and its 400 carries a
+    stable machine-readable ``code``.
+    """
+    raw = body.get(field)
+    if raw is None:
+        raw = ""
+    if isinstance(raw, str):
+        return raw.strip(), None
+    return "", web.json_response(
+        {"error": f"{field} must be a string", "code": f"mcp.{field}_not_string"},
+        status=400,
+    )
+
+
 async def api_mcp_toggle(request: web.Request) -> web.Response:
     """POST /api/mcp/toggle — enable or disable an MCP server globally.
 
@@ -760,7 +1069,9 @@ async def api_mcp_toggle(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    name = body.get("name", "").strip()
+    name, err = _string_identifier(body, "name")
+    if err is not None:
+        return err
     enabled = body.get("enabled", True)
     if not name:
         return web.json_response({"error": "name is required"}, status=400)
@@ -824,8 +1135,12 @@ async def api_mcp_toggle_tool(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    server = body.get("server", "").strip()
-    tool = body.get("tool", "").strip()
+    server, err = _string_identifier(body, "server")
+    if err is not None:
+        return err
+    tool, err = _string_identifier(body, "tool")
+    if err is not None:
+        return err
     enabled = body.get("enabled", True)
     if not server or not tool:
         return web.json_response({"error": "server and tool are required"}, status=400)
@@ -932,7 +1247,9 @@ async def api_mcp_remove(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    name = body.get("name", "").strip()
+    name, err = _string_identifier(body, "name")
+    if err is not None:
+        return err
     if not name:
         return web.json_response({"error": "name is required"}, status=400)
 
@@ -1038,7 +1355,16 @@ async def api_mcp_server_detail(request: web.Request) -> web.Response:
     if body.get("args"):
         entry["args"] = body["args"]
     if body.get("env"):
-        entry["env"] = body["env"]
+        # This file is consumed directly by the ACP runtime (declared env is
+        # applied per key), and this caller is programmatic (App Kit), not a
+        # user hand-authoring their own file — emit through the shared
+        # normalization point so a declared PATH is complete. Off the event
+        # loop: emit_env's PATH expansion scans Node-manager directories on a
+        # cold cache. See env.emit_env.
+        if isinstance(body["env"], dict):
+            entry["env"] = await asyncio.to_thread(emit_env, body["env"])
+        else:
+            entry["env"] = body["env"]
 
     # Write to global mcp.json
     async with _get_mcp_lock():
@@ -1129,14 +1455,51 @@ def _load_json_or_empty(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _atomic_write(path: Path, data: dict) -> None:
-    """Atomic JSON write; reuses the agent helper."""
-    from kiro_crew.agent import (  # noqa: F811  # circular: agent imports dashboard handlers
-        _atomic_json_write,
-    )
+async def _offload_config_write(fn, /, *args, **kwargs):
+    """Run a store-writing helper in a worker thread, surviving cancellation.
 
+    A worker thread cannot be cancelled: shielding the await and re-awaiting
+    the future on ``CancelledError`` guarantees the write runs to completion
+    before the cancellation propagates.  Without this, a cancelled request
+    task would release the MCP lock (or begin teardown) while the thread is
+    still mutating the store, letting a concurrent purge interleave with the
+    stale write.  Same pattern as the dangling-uninstall sweep below.
+    """
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(None, partial(fn, *args, **kwargs))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        await future
+        raise
+
+
+def _atomic_write(path: Path, data: dict) -> None:
+    """Atomic JSON write; secret-aware for the store owned by Kiro Crew.
+
+    That store is secret-bearing by construction (``env`` values and remote
+    ``headers`` carry credentials), so it is published through
+    :func:`kiro_crew.atomic_write.atomic_write` with ``restrict_to_owner=True``
+    — the owner-only lockdown lands on the temp file BEFORE any payload byte,
+    so the credential never exists in a file readable under the parent
+    directory's inherited permissions.  The writer's default fail-closed
+    policy is kept deliberately: a store this surface cannot protect is not
+    written, and the caller's request fails visibly rather than publishing a
+    credential another OS user could read.  On Windows the lockdown shells
+    out to ``icacls``, so async callers must hand the whole write to a worker
+    thread rather than call this on the event loop.  Other paths (the shared
+    global file, agent files) keep the mode-preserving helper — their
+    lifecycles are owned by other tools.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_json_write(path, data)
+    if path == _kirocrew_mcp_json():
+        atomic_write(
+            path,
+            (json.dumps(data, indent=2) + "\n").encode("utf-8"),
+            restrict_to_owner=True,
+        )
+    else:
+        _atomic_json_write(path, data)
 
 
 def _find_server_spec_anywhere(name: str) -> dict | None:
@@ -1617,7 +1980,7 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
                     # Config removal is the LAST mutation (package-then-config
                     # ordering); _purge_server_config strips every scope + agent
                     # file idempotently.
-                    outcome["actions"].update(_purge_server_config(name))
+                    outcome["actions"].update(await _offload_config_write(_purge_server_config, name))
                     purged_names.add(name)
                     # Companion package removal already ran in Phase 1 (before the
                     # lock); merge its recorded result here.
@@ -1658,7 +2021,8 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
                 # Apply MC first — flipping MC green needs the entry to exist or
                 # the disabled override removed.  Flipping MC gray writes
                 # disabled:true, preserving config for later re-enable.
-                outcome["actions"]["kirocrew"] = _set_kirocrew_entry(
+                outcome["actions"]["kirocrew"] = await _offload_config_write(
+                    _set_kirocrew_entry,
                     name,
                     enabled=desired_mc,
                     spec=preserved_spec,
@@ -1670,14 +2034,16 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
                 # spec, and the CC add would get "missing_spec" even though
                 # the user clearly intended it to move over.
                 resolved_spec = _find_server_spec_anywhere(name)
-                outcome["actions"]["kiroGlobal"] = _set_scope_entry(
+                outcome["actions"]["kiroGlobal"] = await _offload_config_write(
+                    _set_scope_entry,
                     _GLOBAL_MCP_JSON,
                     name,
                     enabled=desired_kiro,
                     spec=resolved_spec,
                 )
                 for scope in extra_scopes:
-                    outcome["actions"][f"{scope.id}Global"] = _set_scope_entry(
+                    outcome["actions"][f"{scope.id}Global"] = await _offload_config_write(
+                        _set_scope_entry,
                         scope.global_json,
                         name,
                         enabled=desired_extra[scope.id],
@@ -1710,7 +2076,7 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
                             resources=f"{name}:{','.join(rejected)[:128]}",
                         )
                     if sanitized:
-                        changed_tools = _set_tool_overrides(name, sanitized)
+                        changed_tools = await _offload_config_write(_set_tool_overrides, name, sanitized)
                         if changed_tools:
                             outcome["actions"]["tools"] = changed_tools
 
@@ -1777,10 +2143,6 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
     rebuild_ok = False
     rebuild_error: str | None = None
     try:
-        # circular import: kiro_crew.agent imports dashboard handlers, so
-        # this is delayed to runtime to break the cycle at module load.
-        from kiro_crew.agent import rebuild_agent_config  # noqa: F811
-
         await asyncio.to_thread(rebuild_agent_config)
         rebuild_ok = True
     except Exception as exc:
@@ -1806,12 +2168,13 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
 
 
 async def api_mcp_gateway_status(request: web.Request) -> web.Response:
-    """GET /api/mcp-gateway/status — shared MCP gateway state.
+    """GET /api/mcp-gateway/status — MCP gateway state.
 
-    ``enabled`` reflects the persisted config flag; ``running``/``ping_ok``
-    reflect the live broker held by the gateway orchestrator.  The broker is
-    only spawned at startup when the flag is on, so a freshly-flipped flag
-    reads ``enabled=true`` with ``running=false`` until the restart lands.
+    ``enabled`` is the persisted backend-sharing flag; ``running``/``ping_ok``
+    reflect the live broker held by the gateway orchestrator. The broker runs iff
+    something is stubbed, so ``stub_count == 0`` with ``running=false`` is the
+    default install, not a fault. A freshly-flipped flag reads its new value with
+    ``running`` still stale until the restart lands.
     """
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
 
@@ -1819,9 +2182,16 @@ async def api_mcp_gateway_status(request: web.Request) -> web.Response:
     manager = getattr(state, "_mcp_gateway_manager", None)
     running = manager is not None and manager.is_running
     ping_ok = manager is not None and running and await manager.ping()
+    cfg = KiroCrewConfig.load().mcp_gateway
     return web.json_response(
         {
-            "enabled": KiroCrewConfig.load().mcp_gateway.enabled,
+            "enabled": cfg.enabled,
+            # The stub set is what the sharing switch acts on, so the UI needs
+            # it to say what turning sharing on will affect. Sent as a count and
+            # a list: the count drives the header line, the list drives each
+            # row's own control without a second request.
+            "stub": sorted(cfg.stub_servers),
+            "stub_count": len(cfg.stub_servers),
             "running": bool(running),
             "ping_ok": bool(ping_ok),
             # Whether the broker can run on this OS at all. The UI reads this to
@@ -1848,11 +2218,150 @@ async def api_mcp_gateway_metrics(request: web.Request) -> web.Response:
     return web.json_response({"running": True, **snap})
 
 
-# Serializes in-process gateway apply operations (enable/disable + set-poolable)
+# Serializes in-process gateway apply operations (enable/disable + set-stub)
 # so two concurrent dashboard requests cannot interleave broker start/stop and
 # orphan a gatewayd process. The config write is guarded by _get_config_lock();
 # this lock guards the apply() side effect that runs AFTER that lock is released.
-_MCP_GATEWAY_APPLY_LOCK = asyncio.Lock()
+_MCP_GATEWAY_APPLY_LOCK = LoopBoundLock()
+
+
+def _local_overlay_section() -> dict:
+    """Return ``mcp_gateway`` from ``config.local.json``, or ``{}``.
+
+    That file is USER-OWNED and deep-merged OVER ``config.json`` (see
+    ``KiroCrewConfig.load``), so ``config.json`` alone is not the effective
+    config. Any read-modify-write on the base file has to account for it or it
+    reasons about a view the runtime never sees.
+    """
+    from kiro_crew.config.loader import config_local_path
+
+    path = config_local_path()
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # Unreadable overlay: treat as absent. The loader logs and ignores it
+        # too, so behaving otherwise here would diverge from the runtime.
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    section = raw.get("mcp_gateway")
+    return section if isinstance(section, dict) else {}
+
+
+def _overlay_shadowed_keys(overlay: dict, keys: Collection[str]) -> list[str]:
+    """Which of *keys* the local overlay defines — i.e. writes that cannot land.
+
+    The overlay wins the deep merge for every key it defines, so writing such a
+    key into ``config.json`` changes nothing the runtime will read. Reporting
+    that write as applied is the same class of lie as a 200 with
+    ``applied: false``: the switch looks live and governs nothing.
+    """
+    return sorted(k for k in keys if k in overlay)
+
+
+def _freeze_stub_servers(section: dict, overlay: dict | None = None) -> None:
+    """Materialize the resolved stub set into ``stub_servers``. Call BEFORE any
+    other mutation of *section*.
+
+    Resolves from the MERGED effective view (base + ``config.local.json``), not
+    from *section* alone: a legacy allowlist commonly lives in the user-owned
+    overlay, and freezing from the base would write an EMPTY ``stub_servers``.
+    Because key PRESENCE wins in ``_resolve_stub_servers``, that empty base value
+    then beats the overlay's allowlist and silently unstubs servers the operator
+    never touched. The frozen value is still written to the BASE section — the
+    caller owns ``config.json`` — but it is computed from what the runtime reads.
+
+    ``_resolve_stub_servers`` is deliberately conditional on ``enabled``: a legacy
+    config carrying ``poolable_servers`` with ``enabled: false`` must resolve to an
+    EMPTY stub set, so an upgrade never invents a daemon for an install whose
+    gateway was off. The cost of that correctness is that the resolved value is
+    UNSTABLE across a change to ``enabled`` — so a writer that leaves the file
+    still riding the deprecated alias hands the NEXT read a different stub set
+    than the operator was looking at when they clicked.
+
+    Both directions were reachable through the sharing toggle alone:
+
+    * ON, from ``enabled:false, poolable_servers:[X]`` — the page truthfully says
+      "0 stubbed", and one click on *sharing* would stub every alias entry and
+      share it, the unrequested-topology change this design exists to make opt-in.
+    * OFF, from ``enabled:true, poolable_servers:[X]`` — the alias stops firing and
+      the stub set empties, so "stubbed but private" becomes unreachable for
+      exactly the migrated operator, and turning sharing off does more than narrow.
+
+    Freezing on every write closes both: afterwards the file always carries an
+    explicit ``stub_servers``, key presence wins in the resolver, and ``enabled``
+    goes back to meaning only "share these backends". Ordering is load-bearing —
+    freezing after ``enabled`` had been reassigned would resolve against the NEW
+    value and bake in the very set this prevents.
+
+    Absent-key test, not truthiness: an operator who wrote ``stub_servers: []``
+    chose to stub nothing, and overwriting that from a stale ``poolable_servers``
+    would re-stub servers they had just cleared.
+
+    Deduplicates: the resolver preserves whatever the file held, and a
+    ``poolable_servers`` carrying the same name twice would otherwise be frozen
+    with the duplicate and make the dashboard's ``stub_count`` overcount.
+    """
+    if "stub_servers" not in section:
+        effective = dict(section)
+        effective.update(overlay or {})
+        section["stub_servers"] = sorted(set(_resolve_stub_servers(effective)))
+
+
+#: Serializes explicit pre-resolve refreshes. Installs are registry-bound and
+#: slow, so two overlapping presses would double the network work and race each
+#: other's atomic commits. Deliberately NOT the gateway apply lock: a refresh
+#: must not block an operator toggling sharing while it runs.
+_MCP_RESOLVE_REFRESH_LOCK = LoopBoundLock()
+
+
+async def api_mcp_resolve_refresh(request: web.Request) -> web.Response:
+    """POST /api/mcp-gateway/resolve-refresh -- re-resolve npm MCP targets now.
+
+    Pre-resolving lets a launch exec an already-installed tree, so session start
+    performs no dependency resolution. An unpinned spec is refreshed on a timer;
+    this is the operator asking for that check immediately, so it forces past the
+    freshness window.
+
+    Returns ``{ok, resolved, ready}`` where ``resolved`` maps each npm package to
+    ``ready`` / ``unresolved`` / ``error``. A server that fails to resolve is not
+    an error for the request: it simply keeps launching the way it does today.
+    """
+    state: DashboardState = request.app["state"]
+    refresh = getattr(state, "_mcp_resolve_refresh", None)
+    if refresh is None:
+        return web.json_response(
+            {
+                "error": "Pre-resolve is not available in this process.",
+                "code": "resolve_refresh_unavailable",
+            },
+            status=503,
+        )
+    if _MCP_RESOLVE_REFRESH_LOCK.locked():
+        # Report the in-flight pass instead of queueing behind it: the caller is
+        # a person who pressed a button, and a silent multi-minute wait reads as
+        # a hang.
+        return web.json_response(
+            {"error": "A pre-resolve pass is already running.", "code": "resolve_in_progress"},
+            status=409,
+        )
+    async with _MCP_RESOLVE_REFRESH_LOCK:
+        try:
+            result = await refresh()
+        except Exception:
+            logger.exception("mcp-gateway: explicit pre-resolve refresh failed")
+            return web.json_response(
+                {"error": "Could not pre-resolve.", "code": "resolve_refresh_failed"},
+                status=500,
+            )
+    if not isinstance(result, dict):
+        return web.json_response(
+            {"error": "Could not pre-resolve.", "code": "resolve_refresh_failed"},
+            status=500,
+        )
+    return web.json_response(result)
 
 
 async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
@@ -1860,11 +2369,10 @@ async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
 
     Writes ``mcp_gateway.enabled`` to config.json then applies the change
     live: the broker is started/stopped and all agent sessions are dropped +
-    relinked to the new MCP routing — without restarting the gateway process,
+    relinked to the new stub set — without restarting the gateway process,
     so the dashboard session stays authenticated.  Returns the verified state
     ``{ok, enabled, running, ping_ok}``.
     """
-    from kiro_crew.agent import _atomic_json_write  # circular import
     from kiro_crew.config.loader import config_path  # circular import
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # circular import
 
@@ -1908,6 +2416,25 @@ async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
             section = data.setdefault("mcp_gateway", {})
             if not isinstance(section, dict):
                 return web.json_response({"error": "mcp_gateway is not an object"}, status=500)
+            # Freeze the alias BEFORE reassigning `enabled` — the resolver reads
+            # `enabled`, so doing this afterwards would resolve against the new
+            # value and bake in the stub set this call must not change.
+            overlay = _local_overlay_section()
+            shadowed = _overlay_shadowed_keys(overlay, ("enabled",))
+            if shadowed:
+                return web.json_response(
+                    {
+                        "error": (
+                            "config.local.json defines "
+                            f"mcp_gateway.{', mcp_gateway.'.join(shadowed)}, which "
+                            "overrides config.json. Edit that file instead — writing "
+                            "here would not change anything the gateway reads."
+                        ),
+                        "code": "overlay_owns_enabled",
+                    },
+                    status=409,
+                )
+            _freeze_stub_servers(section, overlay)
             section["enabled"] = enabled
             path.parent.mkdir(parents=True, exist_ok=True)
             _atomic_json_write(path, data)
@@ -1921,7 +2448,11 @@ async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
                 source="dashboard",
                 resources=f"enabled={enabled} error={exc}",
             )
-            return web.json_response({"error": f"apply failed: {exc}"}, status=500)
+            # The exception detail is in the SEL log above; the client body
+            # (rendered verbatim into a localized UI) gets a generic message.
+            return web.json_response(
+                {"error": "apply failed", "code": "mcp_apply_failed"}, status=500
+            )
 
     sel().log_api_access(
         caller=request.get("user", "dashboard"),
@@ -1936,142 +2467,700 @@ async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
 # ─── Per-server poolability management ──────────────────────────────────
 
 
+def _collect_server_rows() -> dict[str, dict[str, Any]]:
+    """Scan the agent specs into one row per distinct server. BLOCKING.
+
+    Reads ``~/.kiro/agents/*.json`` — the clean source specs, which the rewriter
+    never mutates. Shared by the rows endpoint and the batch stub write so both
+    describe the same fleet from the same scan; a second copy of this loop would
+    let the two disagree about which servers exist and what they declare.
+
+    Values are never collected, only env NAMES: the verdict engine needs to know
+    whether a per-session rotating credential is declared, never what it is.
+    """
+    rows: dict[str, dict[str, Any]] = {}
+    agents_dir = kiro_agents_dir_path()
+    if not agents_dir.is_dir():
+        return rows
+    for path in sorted(agents_dir.glob("*.json")):
+        try:
+            spec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(spec, dict):
+            continue
+        agent_name = spec.get("name") or path.stem
+        mcp_servers = spec.get("mcpServers")
+        if not isinstance(mcp_servers, dict):
+            continue
+        for name, entry in mcp_servers.items():
+            if not isinstance(entry, dict):
+                continue
+            row = rows.get(name)
+            if row is None:
+                row = {
+                    "agents": set(),
+                    "transport": "stdio" if "command" in entry else "http",
+                    "entry_poolable": False,
+                    "env_names": set(),
+                    # One hash per DISTINCT launch seen under this name. A
+                    # measurement belongs to one execution identity, and the probe
+                    # only ever runs the definition that won the merge, so a second
+                    # distinct launch here means the row covers something nobody
+                    # measured. Hashing is pure -- no file is opened.
+                    "launch_ids": set(),
+                }
+                rows[name] = row
+            row["agents"].add(str(agent_name))
+            command = entry.get("command")
+            if isinstance(command, str) and command:
+                args = entry.get("args")
+                row["launch_ids"].add(
+                    hash_command(command, [str(a) for a in args] if isinstance(args, list) else [])
+                )
+            if entry.get("poolable") is True:
+                row["entry_poolable"] = True
+            declared_env = entry.get("env")
+            if isinstance(declared_env, dict):
+                row["env_names"].update(str(k) for k in declared_env)
+    return rows
+
+
+def _launch_specs_for(names: set[str]) -> dict[str, list[SimpleNamespace]]:
+    """EVERY definition of each named server, for identity computation only.
+
+    Every one, not the first: a name can be declared by several agents, and two
+    declarations that differ only in env are different programs as far as pooling
+    is concerned. Returning one of them would let the identity of whichever file
+    sorts first stand in for the rest.
+
+    Separate from :func:`_collect_server_rows` on purpose. That builder feeds the
+    rows payload and collects env NAMES only, because a display path must never
+    hold a credential value. Identity needs the VALUES -- ``hash_effective_env``
+    hashes them, with the pool's own rotating-secret exclusions, so a credential
+    rotation does not read as a different server -- and they are consumed by the
+    hash and never returned, logged or rendered.
+
+    Only the requested names are collected, so a batch of three does not
+    fingerprint a fleet of thirty.
+    """
+    specs: dict[str, list[SimpleNamespace]] = {}
+    agents_dir = kiro_agents_dir_path()
+    if not agents_dir.is_dir():
+        return specs
+    for path in sorted(agents_dir.glob("*.json")):
+        try:
+            spec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(spec, dict):
+            continue
+        mcp_servers = spec.get("mcpServers")
+        if not isinstance(mcp_servers, dict):
+            continue
+        for name, entry in mcp_servers.items():
+            if name not in names or not isinstance(entry, dict):
+                continue
+            command = entry.get("command")
+            if not isinstance(command, str) or not command:
+                continue
+            args = entry.get("args")
+            env = entry.get("env")
+            specs.setdefault(name, []).append(
+                SimpleNamespace(
+                    command=command,
+                    args=[str(a) for a in args] if isinstance(args, list) else [],
+                    env={str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {},
+                )
+            )
+    return specs
+
+
+def _stub_eligibility(
+    names: list[str],
+    *,
+    sharing_on: bool,
+    forward_declared_env: bool,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Decide which of *names* the evidence allows stubbing. BLOCKING.
+
+    THE eligibility rule, and the only copy of it. The caller passes the sharing
+    state it read under the config lock, so the answer describes the fleet as the
+    write about to happen will find it -- not as a client saw it when a person
+    started composing the batch. A client that resolved this itself could only
+    ever answer for an earlier moment: sharing is a separate switch another
+    dashboard or the CLI can flip, and every guard against that window closes the
+    window rather than the gap it comes from.
+
+    Returns ``(eligible, skipped)`` where each skip carries the reason code the
+    operator needs to understand a count they did not expect. Reasons:
+
+    - ``unknown`` -- not in any agent spec, so there is nothing to stub
+    - ``cannot_stub`` -- HTTP/SSE (no stdio pipe to interpose on) or denylisted
+    - ``pooling_blocked_by_env`` -- sharing is on and the rewriter would leave this
+      entry unwrapped to avoid withholding a declared key, so stubbing it would
+      report work the broker never does
+    - ``evidence_insufficient`` -- the verdict does not recommend the operation
+      being asked for, INCLUDING when the stored measurement describes a program
+      this name no longer launches
+
+    With sharing ON the question is ``recommend_share``, because a stub joins a
+    pooled backend and co-tenancy is what needs supporting. With sharing OFF a
+    stub pools nothing, so ``recommend_stub`` is the honest bar; asking for the
+    stricter one there would make the gesture stub nothing at all in the
+    configuration most operators are in.
+
+    The two kinds of evidence are read differently, because they push opposite
+    ways. A PREFLIGHT can promote a server and enable co-tenancy, so it is read
+    through ``VerdictCache.get`` with the server's CURRENT identity, and only when
+    every definition under that name resolves to the SAME identity: a row is keyed
+    by name, so a replaced command keeps the previous measurement until the next
+    probe overwrites it, and two agents declaring one name differently mean no
+    single row describes what this write would stub. Either way a mismatch reads
+    as no measurement, which is the same fail-closed answer as never having
+    probed. HAZARDS only ever demote, so they are read name-wide rather than
+    identity-filtered -- restricting them to the current identity would DISCARD a
+    recorded objection and read as promotion.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
+    from kiro_crew.mcp_gateway.evaluate import identity_for
+    from kiro_crew.mcp_gateway.rewriter import (
+        UNPOOLABLE_SERVERS,
+        _withheld_env_count,
+        pool_identity_env_keys,
+    )
+    from kiro_crew.mcp_gateway.verdict_cache import load_cache
+
+    rows = _collect_server_rows()
+    specs = _launch_specs_for(set(names))
+    try:
+        runtime = records_dir(KiroCrewConfig.load().mcp_gateway.socket_path)
+        observed = hazards.load_ledger(runtime).as_dict()
+        cache = load_cache(runtime)
+    except OSError:
+        # Unreadable records are not a claim of safety: no hazards and no
+        # measurements is exactly how the verdict engine treats a fresh install.
+        observed, cache = {}, None
+
+    eligible: list[str] = []
+    skipped: list[dict[str, str]] = []
+    for name in names:
+        row = rows.get(name)
+        if row is None:
+            skipped.append({"name": name, "reason": "unknown"})
+            continue
+        is_stdio = row["transport"] == "stdio"
+        if not is_stdio or name in UNPOOLABLE_SERVERS:
+            skipped.append({"name": name, "reason": "cannot_stub"})
+            continue
+        if sharing_on and _withheld_env_count(
+            {k: "" for k in row["env_names"]},
+            forward_declared_env,
+            pool_identity_env_keys(),
+        ):
+            skipped.append({"name": name, "reason": "pooling_blocked_by_env"})
+            continue
+        preflight: tuple[bool, bool] | None = None
+        # Identity is computed for EVERY definition under this name, and they must
+        # all agree before any measurement counts. The row builder's ``launch_ids``
+        # is not consulted here: it hashes command+args only, so two agents
+        # declaring one name with different env read as a single launch, and the
+        # measurement of one would authorise pooling the other. Comparing full
+        # identities makes the agreement test the same notion the cache is keyed
+        # against, rather than a display-side approximation of it.
+        candidates = specs.get(name) or []
+        identities = {identity_for(s).as_str() for s in candidates} if candidates else set()
+        if cache is not None and len(identities) == 1:
+            hit = cache.get(name, identity_for(candidates[0]))
+            if hit is not None:
+                preflight = (hit.ran, hit.caller_sensitive)
+        verdict = _assess_server(
+            name,
+            is_stdio=is_stdio,
+            env_names=tuple(sorted(row["env_names"])),
+            observed_hazards=observed.get(name, ()),
+            preflight=preflight,
+            identity_keys=pool_identity_env_keys(),
+        )
+        allowed = verdict.recommend_share if sharing_on else verdict.recommend_stub
+        if not allowed:
+            skipped.append({"name": name, "reason": "evidence_insufficient"})
+            continue
+        eligible.append(name)
+    return eligible, skipped
+
+
 async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
     """GET /api/mcp-gateway/servers — enumerate distinct MCP servers.
 
-    Reads ``~/.kiro/agents/*.json`` (the clean source specs — the rewriter
-    never mutates them) and returns one row per distinct server with its
-    effective poolable state.  Pooling is opt-in: a stdio server is pooled
-    only when its name is in the config allowlist
-    (``mcp_gateway.poolable_servers``) OR its agent-JSON entry sets
-    ``poolable:true``.  HTTP/SSE servers are shared by nature (not poolable);
-    denylisted servers (``UNPOOLABLE_SERVERS``) can never be pooled.
+    Reads ``~/.kiro/agents/*.json`` (the clean source specs — the rewriter never
+    mutates them) and returns one row per distinct server with its effective
+    STUB state. The stub is opt-in: a stdio server is stubbed only when its name
+    is in ``mcp_gateway.stub_servers`` — that list is the ONLY trigger. A per-spec
+    ``poolable:true`` is retired and does NOT stub a server; it is still reported
+    as ``entry_poolable`` for information, because a row that claimed ``stub`` on
+    the strength of that key was describing a stub that did not exist.
+    HTTP/SSE servers cannot be stubbed — there is no stdio pipe to interpose
+    on — and denylisted servers (``UNPOOLABLE_SERVERS``) never are.
+
+    Whether a stubbed server SHARES its backend is not per-row: that is the one
+    global switch (``mcp_gateway.enabled``), reported by the status endpoint.
     """
-    from kiro_crew.agent import kiro_agents_dir_path
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
-    from kiro_crew.mcp_gateway.rewriter import UNPOOLABLE_SERVERS
+    from kiro_crew.mcp_gateway.rewriter import (
+        UNPOOLABLE_SERVERS,
+        _withheld_env_count,
+        pool_identity_env_keys,
+    )
 
-    allowlist = set(KiroCrewConfig.load().mcp_gateway.poolable_servers)
+    gw_cfg = KiroCrewConfig.load().mcp_gateway
+    stub_set = set(gw_cfg.stub_servers)
+    forward_declared_env = bool(gw_cfg.forward_declared_env)
+    # Resolved ONCE for the whole payload, same reason the shareability files are:
+    # two rows in one response must not disagree about the operator's list.
+    identity_keys = pool_identity_env_keys()
 
-    rows: dict[str, dict[str, Any]] = {}
-    agents_dir = kiro_agents_dir_path()
-    if agents_dir.is_dir():
-        for path in sorted(agents_dir.glob("*.json")):
-            try:
-                spec = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(spec, dict):
-                continue
-            agent_name = spec.get("name") or path.stem
-            mcp_servers = spec.get("mcpServers")
-            if not isinstance(mcp_servers, dict):
-                continue
-            for name, entry in mcp_servers.items():
-                if not isinstance(entry, dict):
-                    continue
-                row = rows.get(name)
-                if row is None:
-                    row = {
-                        "agents": set(),
-                        "transport": "stdio" if "command" in entry else "http",
-                        "entry_poolable": False,
-                    }
-                    rows[name] = row
-                row["agents"].add(str(agent_name))
-                if entry.get("poolable") is True:
-                    row["entry_poolable"] = True
+    rows = await asyncio.to_thread(_collect_server_rows)
+
+    # Both shareability files are read ONCE, off the event loop, before the row
+    # loop — and the row builder does no IO at all. Reading per row would put N
+    # synchronous parses on the loop for an N-server config, stalling the
+    # dashboard and every chat sharing it, and would also let two rows in one
+    # payload disagree about the same file.
+    observed, preflights = await asyncio.to_thread(_load_shareability_state)
 
     result: list[dict[str, Any]] = []
     for name in sorted(rows):
         row = rows[name]
         is_stdio = row["transport"] == "stdio"
         denylisted = name in UNPOOLABLE_SERVERS
-        effective = is_stdio and not denylisted and (name in allowlist or row["entry_poolable"])
+        # Separated on purpose: ``can_stub`` is a property of the server (is
+        # there a stdio pipe, is it denylisted) while ``stub`` is the
+        # operator's choice. The UI needs both — one disables the control, the
+        # other sets it — and collapsing them would make an unstubbable server
+        # look like one the operator declined.
+        can_stub = is_stdio and not denylisted
+        # ``stub_servers`` is the only thing that produces a stub, so it is the
+        # only thing this row may report. ``entry_poolable`` is still returned
+        # below as information — a spec-level ``poolable: true`` no longer opts a
+        # server in, and reading it as "stubbed" here made the row claim a stub
+        # the broker had not created.
+        stubbed = can_stub and name in stub_set
+        # Whether stubbing this server could actually produce a SHARED backend.
+        # The rewriter leaves an env-declaring entry unwrapped when the pooled
+        # spawn would withhold a declared key (every key with
+        # ``forward_declared_env`` off; the rotating-secret and credential
+        # classes with it on), because a backend that dies without that key
+        # would crash-loop through fallback on every session. Reported here so a
+        # batch action cannot enable something the rewriter will silently skip —
+        # that is the same "intent reported as reality" the Running-as column
+        # already risks, and a bulk gesture multiplies it.
+        #
+        # Key NAMES only, never values: the classifier is name-based, so the
+        # row builder's value-free discipline holds.
+        pooling_blocked = bool(
+            gw_cfg.enabled
+            and _withheld_env_count(
+                {k: "" for k in row["env_names"]}, forward_declared_env, identity_keys
+            )
+        )
         result.append(
             {
                 "name": name,
-                "poolable": effective,
-                "in_allowlist": name in allowlist,
+                "stub": stubbed,
+                "can_stub": can_stub,
+                "in_allowlist": name in stub_set,
                 "entry_poolable": row["entry_poolable"],
+                "pooling_blocked_by_env": pooling_blocked,
                 "agents": sorted(row["agents"]),
                 "transport": row["transport"],
                 "denylisted": denylisted,
+                # Advisory only. Never auto-applied: the evidence is weaker
+                # than proof (the probe handshakes as a different client than
+                # the gateway does), so the operator decides.
+                "recommendation": _assess_server(
+                    name,
+                    is_stdio=is_stdio,
+                    env_names=tuple(sorted(row["env_names"])),
+                    observed_hazards=observed.get(name, ()),
+                    # A measurement describes ONE execution identity. When this
+                    # name merged more than one distinct launch, the probe
+                    # measured whichever definition won the merge, so serving that
+                    # result here would tell the operator it is safe to share a
+                    # backend nobody ran. Same invariant the cache-side check
+                    # applies, enforced at the other place the information exists.
+                    preflight=(
+                        preflights.get(name) if len(row["launch_ids"]) <= 1 else None
+                    ),
+                    identity_keys=identity_keys,
+                ).to_dict(),
             }
         )
     return web.json_response({"servers": result})
 
 
-async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
-    """POST /api/mcp-gateway/servers/poolable — toggle a server's poolable flag.
+def _load_shareability_state() -> tuple[
+    dict[str, tuple[str, ...]], dict[str, tuple[bool, bool]]
+]:
+    """Read both shareability records for one response. BLOCKING — call off-loop.
 
-    Body ``{"name": "slack-mcp", "poolable": true}``.  Adds/removes ``name``
-    from ``mcp_gateway.poolable_servers`` in config.json (same config lock +
-    atomic write as the enable toggle), then re-applies the change in-process
-    so new sessions pick up the new MCP routing without a restart.  When the
-    gateway is disabled, the allowlist is persisted only (it takes effect when
-    the gateway is enabled).  Returns ``{ok, name, poolable, ...}``.
+    Returns ``(hazards_by_name, preflight_by_name)`` where the preflight value is
+    ``(ran, caller_sensitive)``.
+
+    Absence is not an error and not a claim of safety: an empty map means nothing
+    has been observed or measured yet, which is exactly how
+    ``shareability.assess`` treats it.
+
+    Preflight rows are keyed by server NAME — one server, one row — so this is a
+    direct lookup. Identity is a field inside the row and is not checked here: this
+    builder is deliberately IO-free and cannot resolve a binary fingerprint, so a
+    server whose command just changed shows its previous measurement until the next
+    probe overwrites the row. Ambiguity that DOES matter — one name covering two
+    different launches in the merged agent config — is decided in the row loop,
+    where those definitions are visible.
     """
-    from kiro_crew.agent import _atomic_json_write
-    from kiro_crew.config.loader import config_path  # noqa: F811
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # circular: agents imports mcp
+    try:
+        rt = records_dir(KiroCrewConfig.load().mcp_gateway.socket_path)
+        observed = hazards.load_ledger(rt).as_dict()
+        cache = load_cache(rt)
+    except OSError:
+        return {}, {}
+    preflights: dict[str, tuple[bool, bool]] = {}
+    for name in cache.server_names():
+        row = cache.get_by_name(name)
+        if row is not None:
+            preflights[name] = (row.ran, row.caller_sensitive)
+    return observed, preflights
+
+
+def _assess_server(
+    name: str,
+    *,
+    is_stdio: bool,
+    env_names: tuple[str, ...],
+    observed_hazards: tuple[str, ...],
+    preflight: tuple[bool, bool] | None,
+    identity_keys: Collection[str] = (),
+) -> ShareVerdict:
+    """Build evidence for one row and hand it to the verdict engine.
+
+    Pure: no IO, no config read, no clock. All the judgement lives in
+    ``shareability``; this function only gathers what the caller already loaded.
+    Probe metadata comes from the in-memory discovery cache rather than a fresh
+    probe — starting a server to render a table would spawn every configured MCP
+    on every page load, and probing is deliberately an explicit user action.
+    """
+    meta = probe_metadata(name)
+    return assess(
+        ShareEvidence(
+            name=name,
+            is_stdio=is_stdio,
+            # Not "is this one of ours". A managed server is session-bound only
+            # when it declines the caller-identity extension: kirocrew-core
+            # consumes the injected caller block and shares a backend safely,
+            # while kirocrew-cron reads process identity. Asking the server's own
+            # module answers this without a handshake, which the probe cannot
+            # always provide (no spawn on Windows / macOS >= 26, and none at all
+            # before the first probe cycle).
+            session_bound_by_construction=managed_server_is_session_bound(name),
+            probe_ok=bool(meta and meta.status == "ok"),
+            capabilities=meta.capabilities if meta else None,
+            protocol_version=meta.protocol_version if meta else "",
+            tool_annotations=list(meta.tool_annotations) if meta else [],
+            has_tools=bool(meta and meta.tools),
+            declared_env_names=env_names,
+            observed_hazards=observed_hazards,
+            preflight_ran=preflight[0] if preflight else None,
+            preflight_caller_sensitive=preflight[1] if preflight else False,
+        ),
+        identity_keys,
+    )
+
+
+async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
+    """POST /api/mcp-gateway/servers/stub — toggle servers' stub flag.
+
+    Body ``{"name": "slack-mcp", "stub": true}`` for one server, or
+    ``{"names": ["a-mcp", "b-mcp"], "stub": true}`` for several.  Adds or
+    removes those names from ``mcp_gateway.stub_servers`` in config.json
+    (same config lock + atomic write as the enable toggle).  The change is
+    RECORDED, not applied: the running broker is left alone and the response
+    carries ``restart_required``, because the daemon's routing is built with the
+    agent-spec rewrite at startup and a session's MCP toolset is fixed at
+    ``session/new``.  When the gateway is disabled, the allowlist is persisted
+    only (it takes effect when the gateway is enabled).
+
+    The batch form exists because the UI's "toggle all" would otherwise issue
+    one request per server: N config rewrites for a single user gesture, each
+    one racing the others for the config lock.  One request
+    means one write and one apply, so the allowlist can never land half-flipped.
+
+    ``resolve_eligibility: true`` (with ``stub: true``) hands the POLICY to this
+    handler: the caller sends candidate names and the server decides which ones
+    the evidence allows, inside the same lock hold that writes them. The response
+    then reports ``stubbed`` and ``skipped`` (with a reason per name) instead of
+    echoing the request, because the two deliberately differ.
+
+    Returns ``{ok, name, stub, ...}`` for the single form and
+    ``{ok, names, stub, ...}`` for the batch form.
+    """
+    from kiro_crew.config.loader import (  # noqa: F811
+        ConfigReadError,
+        config_path,
+        update_config_locked,
+    )
 
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be an object", "code": "body_not_object"}, status=400
+        )
     name = str(body.get("name", "")).strip()
-    poolable = body.get("poolable")
-    if not name:
-        return web.json_response({"error": "name is required"}, status=400)
-    if not _is_valid_mcp_name(name):
-        return web.json_response({"error": "invalid server name"}, status=400)
-    if not isinstance(poolable, bool):
-        return web.json_response({"error": "poolable must be a boolean"}, status=400)
+    raw_names = body.get("names")
+    stub = body.get("stub")
+    batch = raw_names is not None
+    if batch:
+        if not isinstance(raw_names, list) or not all(
+            isinstance(n, str) for n in raw_names
+        ):
+            return web.json_response(
+                {
+                    "error": "names must be a list of strings",
+                    "code": "names_not_string_list",
+                },
+                status=400,
+            )
+        names = [n.strip() for n in raw_names if n.strip()]
+        if not names:
+            return web.json_response(
+                {"error": "names is required", "code": "names_required"}, status=400
+            )
+        if len(names) > _MAX_STUB_BATCH:
+            return web.json_response(
+                {
+                    "error": f"names must hold at most {_MAX_STUB_BATCH} servers",
+                    "code": "names_too_many",
+                },
+                status=400,
+            )
+        if any(not _is_valid_mcp_name(n) for n in names):
+            return web.json_response(
+                {"error": "invalid server name", "code": "invalid_server_name"},
+                status=400,
+            )
+    else:
+        if not name:
+            return web.json_response({"error": "name is required"}, status=400)
+        if not _is_valid_mcp_name(name):
+            return web.json_response({"error": "invalid server name"}, status=400)
+        names = [name]
+    if not isinstance(stub, bool):
+        return web.json_response({"error": "stub must be a boolean"}, status=400)
+    # Opt-in: "stub only the ones the evidence allows, and decide that yourself".
+    #
+    # The alternative -- a client filtering the rows it already has -- can only
+    # answer for the moment it read them. Sharing is a separate switch another
+    # dashboard or the CLI can flip, and the verdicts themselves move as
+    # measurements land, so any client-side answer is a snapshot that the write
+    # may no longer match. Resolving it HERE, inside the same lock hold that
+    # performs the write, means the decision and the write see one state.
+    #
+    # Only meaningful for ``stub: true``: unstubbing needs no evidence, and
+    # refusing to unstub a server whose verdict has since weakened would strand
+    # the operator with a stub they explicitly asked to remove.
+    resolve_eligibility = body.get("resolve_eligibility", False)
+    if not isinstance(resolve_eligibility, bool):
+        return web.json_response(
+            {
+                "error": "resolve_eligibility must be a boolean",
+                "code": "resolve_eligibility_not_bool",
+            },
+            status=400,
+        )
 
     path = config_path()
-    async with _get_config_lock():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except (OSError, json.JSONDecodeError):
-            return web.json_response({"error": "config.json is corrupt"}, status=500)
-        section = data.setdefault("mcp_gateway", {})
-        if not isinstance(section, dict):
-            return web.json_response({"error": "mcp_gateway is not an object"}, status=500)
-        current = section.get("poolable_servers")
-        servers_list = (
-            [s for s in current if isinstance(s, str)] if isinstance(current, list) else []
-        )
-        if poolable and name not in servers_list:
-            servers_list.append(name)
-        elif not poolable and name in servers_list:
-            servers_list = [s for s in servers_list if s != name]
-        section["poolable_servers"] = sorted(set(servers_list))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_json_write(path, data)
+    # ``_MCP_GATEWAY_APPLY_LOCK`` outermost, in the SAME order the sharing toggle
+    # takes it, so the two handlers serialize against each other in THIS process
+    # and cannot deadlock. Inside it, BOTH locks are needed and neither implies
+    # the other: ``update_config_locked``'s advisory FILE lock is what excludes
+    # other processes, while ``_get_config_lock`` is what excludes this process's
+    # agent-CRUD writers -- those call ``cfg.save()`` -> ``write_config_atomically``,
+    # which takes no file lock, so the file lock alone would let an agent write
+    # and a stub write clobber each other.
+    #
+    # Imported here rather than at module scope because agents imports mcp.
+    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
-    state: DashboardState = request.app["state"]
-    apply = getattr(state, "_mcp_gateway_apply_poolable", None)
-    applied: dict[str, Any] = {"applied": False}
-    if apply is not None:
-        try:
-            async with _MCP_GATEWAY_APPLY_LOCK:
-                applied = await apply()
-        except Exception as exc:
-            sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="mcp_gateway_set_poolable",
-                outcome="error",
-                source="dashboard",
-                resources=f"name={name} poolable={poolable} error={exc}",
+    async with _MCP_GATEWAY_APPLY_LOCK:
+        overlay = _local_overlay_section()
+        shadowed = _overlay_shadowed_keys(overlay, ("stub_servers",))
+        if shadowed:
+            return web.json_response(
+                {
+                    "error": (
+                        "config.local.json defines mcp_gateway.stub_servers, which "
+                        "overrides config.json. Edit that file instead — writing here "
+                        "would not change anything the gateway reads."
+                    ),
+                    "code": "overlay_owns_stub_servers",
+                },
+                status=409,
             )
-            return web.json_response({"error": f"apply failed: {exc}"}, status=500)
+
+        # Carries the compare-and-set outcome out of the mutate callback. Raising
+        # through ``update_config_locked`` would abort the write, which is the
+        # behaviour wanted, but it would also lose the value the caller must be
+        # told; returning ``None`` from mutate skips the write just as cleanly and
+        # keeps the reason addressable here.
+        refused: dict[str, Any] = {}
+        # Same shape for the eligibility decision: it is made inside the lock, and
+        # the response has to report what was actually written rather than what was
+        # asked for.
+        resolved: dict[str, Any] = {}
+
+        def _mutate(data: dict) -> dict | None:
+            section = data.setdefault("mcp_gateway", {})
+            if not isinstance(section, dict):
+                refused["code"] = "mcp_gateway_not_object"
+                return None
+            written = list(names)
+            if resolve_eligibility and stub:
+                # Effective value, so the overlay's `enabled` wins the same way the
+                # deep merge gives it to the runtime. The overlay is a hand-edited
+                # file with no programmatic writer, so it is read outside the lock;
+                # the lock's job is the config.json read-modify-write this handler
+                # races with (the sharing toggle, the CLI's `config set`).
+                sharing_on = bool(
+                    overlay["enabled"] if "enabled" in overlay else section.get("enabled", False)
+                )
+                written, skipped = _stub_eligibility(
+                    names,
+                    sharing_on=sharing_on,
+                    # Effective value, read the same way as ``enabled`` just above:
+                    # the overlay wins, because that is what the rewriter will see.
+                    # Taking the base value alone would let a base ``true`` plus an
+                    # overlay ``false`` report a stub whose backend the rewriter
+                    # then leaves direct. The absent-key fallback comes from the
+                    # config field's own default (FORWARD_DECLARED_ENV_DEFAULT),
+                    # not a literal: this reader and the rewriter must agree, or
+                    # the batch skips servers the rewrite pools perfectly well.
+                    forward_declared_env=bool(
+                        overlay["forward_declared_env"]
+                        if "forward_declared_env" in overlay
+                        else section.get(
+                            "forward_declared_env",
+                            FORWARD_DECLARED_ENV_DEFAULT,
+                        )
+                    ),
+                )
+                resolved["skipped"] = skipped
+                resolved["sharing_on"] = sharing_on
+                if not written:
+                    # Nothing qualified. Returning None skips the write entirely
+                    # rather than rewriting the file with an unchanged set.
+                    resolved["eligible"] = []
+                    return None
+            resolved["eligible"] = written
+            # Freeze the alias through the SAME helper the sharing toggle uses, so
+            # both writers leave the file in one shape. On a legacy install the
+            # effective set comes from the deprecated `poolable_servers`, and reading
+            # the raw `stub_servers` here would see nothing: the first toggle would
+            # then persist only the server just clicked and silently unstub
+            # everything the migration was preserving.
+            _freeze_stub_servers(section, overlay)
+            servers_set = set(_resolve_stub_servers(section))
+            if stub:
+                servers_set |= set(written)
+            else:
+                servers_set -= set(written)
+            section["stub_servers"] = sorted(servers_set)
+            return data
+
+        try:
+            # Blocking: an advisory file lock plus config IO, and the lock can be
+            # held by another process, so this must not run on the event loop.
+            # ``_get_config_lock`` is held ACROSS the offload because the await
+            # yields the event loop -- without it an agent-CRUD save could land
+            # between this read and its write.
+            #
+            # Offloaded through the shielded helper rather than a bare
+            # ``asyncio.to_thread``: a worker thread cannot be cancelled, so a
+            # cancelled request would unwind both locks while the thread was still
+            # mid-write, which is the same interleaving the locks exist to prevent.
+            async with _get_config_lock():
+                await _offload_config_write(update_config_locked, path, mutate=_mutate)
+        except ConfigReadError:
+            return web.json_response({"error": "config.json is corrupt"}, status=500)
+        except OSError as exc:
+            # OSError can carry a filesystem path; keep it server-side and send
+            # the client a generic message (rendered verbatim into a localized UI).
+            logger.warning("mcp config lock failed: %s", exc)
+            return web.json_response(
+                {"error": "could not lock config.json", "code": "config_lock_failed"},
+                status=503,
+            )
+
+        if refused.get("code") == "mcp_gateway_not_object":
+            return web.json_response({"error": "mcp_gateway is not an object"}, status=500)
+
+        state: DashboardState = request.app["state"]
+        apply = getattr(state, "_mcp_gateway_apply_stub", None)
+        applied: dict[str, Any] = {"applied": False}
+        # One apply for the whole batch: the allowlist is already fully written, so a
+        # single call records every name at once.
+        audited = f"names={','.join(names)}" if batch else f"name={name}"
+        if resolve_eligibility and stub:
+            # Audit what was WRITTEN, not what was asked for -- the two differ by
+            # design here, and the asked-for list is already in the request log.
+            audited += f" written={','.join(resolved.get('eligible') or [])}"
+        # Nothing qualified means nothing was written, so there is no new link for
+        # an apply to pick up.
+        nothing_written = bool(resolve_eligibility and stub and not resolved.get("eligible"))
+        if apply is not None and not nothing_written:
+            try:
+                applied = await apply()
+            except Exception as exc:
+                sel().log_api_access(
+                    caller=request.get("user", "dashboard"),
+                    operation="mcp_gateway_set_stub",
+                    outcome="error",
+                    source="dashboard",
+                    resources=f"{audited} stub={stub} error={exc}",
+                )
+                # Detail is in the SEL log above; the verbatim-rendered client
+                # body gets a generic message.
+                return web.json_response(
+                    {"error": "apply failed", "code": "mcp_apply_failed"}, status=500
+                )
+        elif not nothing_written:
+            # No callback means no gateway wired this process -- but the allowlist
+            # was already persisted above, so the change WAS recorded and takes
+            # effect at the next start, which is exactly what the callback would
+            # have reported. Answering it here keeps the client off its
+            # ``applied: false`` fault branch, which would otherwise tell the
+            # operator the gateway could not start a change that is safely saved.
+            applied = {"applied": False, "restart_required": True}
 
     sel().log_api_access(
         caller=request.get("user", "dashboard"),
-        operation="mcp_gateway_set_poolable",
+        operation="mcp_gateway_set_stub",
         outcome="ok",
         source="dashboard",
-        resources=f"name={name} poolable={poolable}",
+        resources=f"{audited} stub={stub}",
     )
-    return web.json_response({"ok": True, "name": name, "poolable": poolable, **applied})
+    subject: dict[str, Any] = {"names": names} if batch else {"name": name}
+    outcome: dict[str, Any] = {}
+    if resolve_eligibility and stub:
+        # The caller asked the server to decide, so the answer has to say what it
+        # decided -- a bare ``ok`` would let the UI report a stub the write never
+        # made. ``skipped`` carries a reason per name so the operator can act on a
+        # count that surprised them.
+        outcome = {
+            "stubbed": resolved.get("eligible") or [],
+            "skipped": resolved.get("skipped") or [],
+            "sharing_on": resolved.get("sharing_on"),
+        }
+    return web.json_response({"ok": True, **subject, "stub": stub, **outcome, **applied})

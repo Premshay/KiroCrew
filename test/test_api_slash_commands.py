@@ -16,6 +16,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.dashboard.chat_utils import (
+    _BLOCKED_SLASH_COMMANDS,
     _SLASH_COMMANDS,
     SLASH_COMMAND_DESCRIPTIONS,
 )
@@ -88,8 +89,10 @@ class TestApiSlashCommands:
         payload = await _get("kiro")
         by_name = {item["name"]: item["description"] for item in payload}
 
-        # Default path returns exactly the _SLASH_COMMANDS set.
-        assert set(by_name) == set(_SLASH_COMMANDS)
+        # Default path returns the _SLASH_COMMANDS set minus the blocked
+        # commands: a blocked command only ever produces a rejection message,
+        # so advertising it in the autocomplete would be an inert suggestion.
+        assert set(by_name) == set(_SLASH_COMMANDS - _BLOCKED_SLASH_COMMANDS)
         # Every command has a non-empty description matching the shared map.
         for name, desc in by_name.items():
             assert desc, f"blank description for {name}"
@@ -97,6 +100,34 @@ class TestApiSlashCommands:
         # KiroCrew-local commands read meaningfully.
         assert "side" in by_name["/side"].lower()
 
+    @pytest.mark.asyncio
+    async def test_blocked_commands_absent_from_suggestions(self):
+        """Regression guard: no blocked command may appear in the suggestion
+        payload. /tangent regressed this way once — present in _SLASH_COMMANDS
+        (so the menu offered it) but rejected at execution time."""
+        payload = await _get("kiro")
+        names = {item["name"] for item in payload}
+        leaked = names & _BLOCKED_SLASH_COMMANDS
+        assert not leaked, f"blocked commands advertised in menu: {sorted(leaked)}"
+        assert "/tangent" not in names
+
+    @pytest.mark.asyncio
+    async def test_claude_code_provider_filters_blocked_commands(self):
+        """The provider-reported path applies the same gate: a harness that
+        reports a blocked command must not have it forwarded to the menu."""
+        provider = _fake_provider(
+            [
+                {"name": "compact", "description": "Compact"},
+                {"name": "tangent", "description": "Unavailable"},
+                {"name": "quit", "description": "Unavailable"},
+                {"name": "help", "description": "Help"},
+            ]
+        )
+        payload = await _get("acp", state=_fake_state([provider]), claude_providers=(provider,))
+        names = {item["name"] for item in payload}
+        assert "/compact" in names and "/help" in names and "/side" in names
+        assert "/tangent" not in names
+        assert "/quit" not in names
 
 class TestAdvertisedCommands:
     """The Claude backend forwards the CLI's own registry; the menu shows it.
@@ -131,7 +162,7 @@ class TestAdvertisedCommands:
         """kiro-cli advertises too, but its list would restore blocked commands."""
         provider = _fake_provider([{"name": "design", "description": "d"}])
         payload = await _get("acp", state=_fake_state([provider]), claude_providers=())
-        assert {item["name"] for item in payload} == set(_SLASH_COMMANDS)
+        assert {item["name"] for item in payload} == set(_SLASH_COMMANDS - _BLOCKED_SLASH_COMMANDS)
 
     @pytest.mark.asyncio
     async def test_slot_query_picks_that_slots_backend(self):
@@ -175,7 +206,7 @@ class TestAdvertisedCommands:
     @pytest.mark.asyncio
     async def test_no_live_session_falls_back_to_the_static_set(self):
         payload = await _get("acp", state=_fake_state([]), claude_providers=())
-        assert {item["name"] for item in payload} == set(_SLASH_COMMANDS)
+        assert {item["name"] for item in payload} == set(_SLASH_COMMANDS - _BLOCKED_SLASH_COMMANDS)
 
     @pytest.mark.asyncio
     async def test_claude_code_provider_still_answers_before_any_handshake(self):

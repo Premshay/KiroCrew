@@ -35,6 +35,9 @@ from typing import TYPE_CHECKING, Callable, Optional
 from kiro_crew.acp.runtime import _get_rss_tree_mb, _iter_descendant_pids
 from kiro_crew.dashboard.handlers_system import _get_static_system_info
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE
+from kiro_crew.executors import subprocess_executor
+from kiro_crew.mcp_gateway import STUB_MODULE
+from kiro_crew.messaging.link import telemetry_channel_of
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session import BACKGROUND_KEY
 from kiro_crew.subagent import _CLK_TCK, _subtree_cpu_jiffies
@@ -53,8 +56,9 @@ _HISTORY_LEN = 60
 
 # Marker identifying an MCP stub process inside a session's tree. Stubs are the
 # per-server shims a session spawns, so their count is the useful "how many MCP
-# servers is this session carrying" signal.
-_STUB_MARKER = "mcp_gateway.stub"
+# servers is this session carrying" signal. Imported rather than spelled out so
+# it cannot drift from the launch line the rewriter emits.
+_STUB_MARKER = STUB_MODULE
 
 
 def _read_cmdline(pid: int) -> str:
@@ -64,6 +68,49 @@ def _read_cmdline(pid: int) -> str:
             return fh.read().replace("\0", " ")
     except OSError:
         return ""
+
+
+def _spend_for_session(
+    spend: dict,
+    key: object,
+    spend_slot_by_session: Optional[dict[str, str]],
+) -> Optional[dict]:
+    """The spend row for a session key, or None when nothing was recorded.
+
+    Two lookups, in order:
+
+    1. **Direct.** ``slot_spend`` already files an ordinary dashboard slot under
+       its session-key form, so most rows hit here.
+    2. **Via the slot alias.** A slot bound to a channel or cron conversation runs
+       its turns under ``linked_session_key`` while its usage rows still carry the
+       dashboard slot key, so the two keys are unrelated strings and the direct
+       lookup cannot match. ``spend_slot_by_session`` supplies that slot key, and
+       ``spend_key_for_slot`` — the one owner of the shard-key rule — converts it.
+
+    Returning None is meaningful: the payload contract says ``credits``/``turns``
+    of null mean "no measured turn in the window", which is not zero.
+
+    Every value crossing in from the caller is type-checked, not merely truth-
+    checked. ``spend_slot_by_session`` is supplied by the handler and is a
+    ``MagicMock`` in much of the existing suite; a mock's ``.get()`` returns
+    another truthy mock, so a bare ``if not slot_key`` admits it and the regex in
+    ``spend_key_for_slot`` raises ``TypeError``. The rest of this module already
+    guards with ``isinstance`` for the same reason.
+    """
+    if not isinstance(key, str):
+        return None
+    row = spend.get(key) if isinstance(spend, dict) else None
+    if isinstance(row, dict):
+        return row
+    if not isinstance(spend_slot_by_session, dict):
+        return None
+    slot_key = spend_slot_by_session.get(key)
+    if not isinstance(slot_key, str) or not slot_key:
+        return None
+    from kiro_crew.dashboard.handlers.usage import spend_key_for_slot
+
+    aliased = spend.get(spend_key_for_slot(slot_key))
+    return aliased if isinstance(aliased, dict) else None
 
 
 def session_title(key: str, get_slot: Callable[[str], object]) -> dict[str, object]:
@@ -158,21 +205,38 @@ class SessionMemorySampler:
             "cpu_cores": self._cpu_cores(pid, now),
         }
 
-    def _blocking_sample(self, rows: list[dict[str, object]]) -> dict[int, dict[str, object]]:
-        """Sample every distinct pid once. Co-tenants of a multiplexed runtime
-        share a pid, so sampling per row would read the same tree N times."""
+    def _blocking_sample(self, rows: list[dict[str, object]]) -> dict[str, object]:
+        """Sample every distinct pid once, then the machine-wide extras.
+
+        Co-tenants of a multiplexed runtime share a pid, so sampling per row would
+        read the same tree N times. The orphan scan and the credits window join
+        this offloaded call rather than the async one: both touch the filesystem
+        (a full ``/proc`` walk, and the shard window) and would stall the event
+        loop from the coroutine.
+        """
         now = time.monotonic()
         out: dict[int, dict[str, object]] = {}
+        owned: set[int] = set()
         for row in rows:
             pid = row.get("pid")
-            if not isinstance(pid, int) or pid in out:
+            if not isinstance(pid, int):
+                continue
+            owned.update(_iter_descendant_pids(pid))
+            if pid in out:
                 continue
             try:
                 out[pid] = self._sample_pid(pid, now)
             except Exception:  # pragma: no cover — a dying pid must not fail the page
                 logger.debug("session memory sample failed for pid %s", pid, exc_info=True)
         self._prune_cpu_baselines({r.get("pid") for r in rows})
-        return out
+        # circular import: handlers/__init__ imports handlers.sessions,
+        # which imports this module
+        from kiro_crew.dashboard.handlers.usage import slot_spend
+
+        return {
+            "per_pid": out,
+            "spend": slot_spend(),
+        }
 
     def _prune_cpu_baselines(self, live_pids: set[object]) -> None:
         """Drop baselines for pids that are gone, so the dict cannot grow without
@@ -185,16 +249,36 @@ class SessionMemorySampler:
         sessions: "SessionManager",
         subagents: "Optional[SubagentManager]" = None,
         get_slot: Optional[Callable[[str], object]] = None,
+        spend_slot_by_session: Optional[dict[str, str]] = None,
     ) -> dict[str, object]:
         """Build the full payload: session rows, task rows, totals, history.
 
-        Session sampling is offloaded with ``asyncio.to_thread``; task rows are
-        read from samples the reaper already took, so they need no offload.
+        Session sampling runs on the dedicated ``subprocess_executor`` (``mc-subproc``)
+        rather than ``asyncio.to_thread``, which would use the DEFAULT executor —
+        the pool the event loop also hands ``getaddrinfo`` and every other
+        ``run_in_executor(None, ...)`` call. This sampling is browser-triggered on
+        a 5s poll and spawns ``ps`` on platforms without ``/proc``, so parking it
+        in the shared pool is what let a slow sample stall unrelated requests;
+        task rows are read from samples the reaper already took, so they need no
+        offload.
         ``get_slot`` resolves display titles (see :func:`session_title`); without
         it rows fall back to their raw keys.
+
+        ``spend_slot_by_session`` maps a session key to the slot key its usage rows
+        are filed under (``DashboardState.spend_slot_by_session``). It is only
+        load-bearing for a slot bound to a channel or cron conversation, whose
+        turns run under ``linked_session_key`` while its spend still carries the
+        dashboard slot key — without it those rows report credits as unknown even
+        though the spend exists. Omitting it degrades to the direct join.
         """
         rows = sessions.runtime_pids()
-        samples = await asyncio.to_thread(self._blocking_sample, rows)
+        samples = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), self._blocking_sample, rows
+        )
+        per_pid = samples["per_pid"]
+        assert isinstance(per_pid, dict)
+        spend = samples["spend"]
+        assert isinstance(spend, dict)
         now_wall = time.time()
 
         sessions_out: list[dict[str, object]] = []
@@ -213,7 +297,7 @@ class SessionMemorySampler:
                 sharers[row_pid] = sharers.get(row_pid, 0) + 1
         for row in rows:
             pid = row.get("pid")
-            sample = samples.get(pid) if isinstance(pid, int) else None
+            sample = per_pid.get(pid) if isinstance(pid, int) else None
             rss = (sample or {}).get("rss_mb")
             cpu = (sample or {}).get("cpu_cores")
             # An even split is an attribution, not a measurement: per-session
@@ -225,6 +309,7 @@ class SessionMemorySampler:
             cpu_row = cpu / share if isinstance(cpu, float) and share > 1 else cpu
             created = row.get("created_at")
             key = row.get("key")
+            spend_row = _spend_for_session(spend, key, spend_slot_by_session)
             named = (
                 session_title(key, get_slot)
                 if get_slot is not None and isinstance(key, str)
@@ -237,6 +322,11 @@ class SessionMemorySampler:
                     "slot_key": named["slot_key"],
                     "untitled": named["untitled"],
                     "agent": row.get("agent"),
+                    # The grouping dimension for the Sessions table, resolved by
+                    # the same function the telemetry metrics use. Deriving it
+                    # from the key shape in the frontend instead would create a
+                    # second taxonomy that drifts from this one.
+                    "channel": telemetry_channel_of(key if isinstance(key, str) else None),
                     "pid": pid,
                     "owns_runtime": row.get("owns_runtime"),
                     "prompts": row.get("prompts"),
@@ -244,6 +334,13 @@ class SessionMemorySampler:
                     "procs": (sample or {}).get("procs"),
                     "mcp": (sample or {}).get("mcp"),
                     "cpu_cores": cpu_row,
+                    # Cumulative over the credits window, not a rate: credits are
+                    # only known per completed turn. null means this slot has no
+                    # measured turn in the window, which is not the same as zero.
+                    "credits": (
+                        round(float(spend_row["credits"]), 3) if spend_row else None
+                    ),
+                    "turns": (int(spend_row["turns"]) if spend_row else None),
                     "uptime_s": (
                         round(now_wall - created, 1) if isinstance(created, float) else None
                     ),

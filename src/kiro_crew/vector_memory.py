@@ -11,6 +11,8 @@ time-decay retrieval via FAISS (falls back to FTS5 without embeddings).
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import heapq
 import json
 import logging
@@ -18,6 +20,9 @@ import math
 import re
 import struct
 import threading
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from fnmatch import fnmatch
@@ -26,6 +31,13 @@ from typing import Callable
 from uuid import uuid4
 
 from snowballstemmer import stemmer as _snowball_stemmer
+
+# Scheduling classes for the shared embedding queue. This module stays decoupled
+# from the embedding BACKEND (it takes an injected ``embed_fn``); these are three
+# int constants, imported rather than duplicated so the two cannot drift. Safe
+# direction: ``embeddings`` reaches the store only through a Protocol, so it does
+# not import this module and there is no cycle.
+from kiro_crew.embeddings import PRIORITY_BULK, PRIORITY_INTERACTIVE, PRIORITY_NORMAL
 
 try:
     import pysqlite3 as sqlite3
@@ -44,7 +56,13 @@ import time
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import config_dir
 from kiro_crew.metrics.db_metrics import timed
+from kiro_crew.project_scope import (
+    canonical_scope,
+    project_scope_satisfied,
+    scope_is_admissible,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.validation import ALLOWED_LESSON_CATEGORIES, normalize_lesson_category
 
 # Consolidation caps live in vector_memory_constants (a light module with no
 # heavy transitive deps) so prompt-building callers can import them at top
@@ -85,6 +103,8 @@ _FAISS_FILE = "memory.faiss"
 _KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_.]*[a-z0-9]$")
 _MAX_KEY_LEN = 100
 _MAX_VALUE_BYTES = 4096
+# Serialized forms, not truthiness: 0/false/[]/{} are legitimate values.
+_EMPTY_VALUE_JSON = frozenset({"null", '""'})
 
 
 class SemanticRejectCode(str, Enum):
@@ -93,8 +113,99 @@ class SemanticRejectCode(str, Enum):
     RESERVED_PREFIX = "reserved_prefix"
     CONFIDENCE = "low_confidence"
     VALUE_SIZE = "value_size"
+    VALUE_EMPTY = "value_empty"
     INJECTION = "injection_blocked"
     CONFLICT = "conflict_skip"
+
+
+class LessonWriteOutcome(str, Enum):
+    """What a lesson write actually DID, for callers that must tell the cases apart.
+
+    ``write_lesson`` used to return a bare ``bool`` whose ``False`` meant several
+    unrelated things: validation refused the value, a dedup rule claimed the write,
+    the submit was a genuine no-op, or a bare re-submit deliberately kept the stored
+    NOT-clause. The first two mean "your lesson did not land"; the last two mean
+    "your lesson is fine, there was nothing to do". A caller that cannot tell them
+    apart has to guess, and the CLI guessed wrong -- it read every ``False`` as "the
+    vector store did not take it" and wrote a second record into ``lessons.jsonl``.
+
+    The vocabulary matches :meth:`kiro_crew.learn.LessonStore.save_or_enrich`, which
+    already returns ``inserted``/``enriched``/``unchanged``, so the two stores now
+    describe the same events with the same words.
+    """
+
+    INSERTED = "inserted"
+    ENRICHED = "enriched"
+    UNCHANGED = "unchanged"
+    DEDUPED = "deduped"
+    REFUSED = "refused"
+
+
+# The two outcomes that changed the store. UNCHANGED is deliberately NOT here: the
+# lesson IS stored as submitted, but nothing was written, so a caller asking "did I
+# need to do something" gets no, while a caller asking "is my lesson stored" reads
+# ``stored`` below.
+_LESSON_WROTE_OUTCOMES = frozenset({LessonWriteOutcome.INSERTED, LessonWriteOutcome.ENRICHED})
+
+
+@dataclass(frozen=True)
+class LessonWriteResult:
+    """A lesson write's outcome plus the short reason code behind it.
+
+    ``reason`` names WHICH rule produced the outcome -- a
+    :class:`SemanticRejectCode` value for ``REFUSED``, the dedup rule's name for
+    ``DEDUPED``, and ``kept_stored_clause`` for the one ``UNCHANGED`` case that is
+    not a byte-identical re-submit. It is ``None`` when the outcome says everything
+    there is to say. Surfaces that report back to a human or a model (the CLI, the
+    ``/api/lessons`` response, the ``learn_add`` tool result) need the reason; the
+    ones that only branch on success do not.
+
+    **Truthiness is deliberate, and it is the reason this replaced the old ``bool``
+    outright instead of shipping beside it.** ``write_lesson`` used to answer
+    ``True``/``False``, and three callers plus ~55 assertions read that answer with a
+    bare ``if``/``assert``. Returning any ordinary object would have made every one of
+    them unconditionally true -- silently, since a bare ``if`` on a truthy value is not
+    a type error and mypy cannot flag it. :meth:`__bool__` closes exactly that hole by
+    giving this type the OLD answer: ``bool(result)`` is ``wrote``, byte-for-byte the
+    predicate those callers were already written against. So there is one method, one
+    name, and nothing to migrate to -- a caller that needs the detail reads
+    :attr:`outcome`, and a caller that only needs "did this write something" keeps
+    using the truth value it always used.
+    """
+
+    outcome: LessonWriteOutcome
+    reason: str | None = None
+
+    def __bool__(self) -> bool:
+        """``wrote`` -- the exact predicate the old ``bool`` return answered.
+
+        Preserving it is the whole point: see the class docstring. Do NOT redefine
+        this as ``stored``, which would quietly turn a no-op re-submit into a write
+        for every caller that branches on the truth value.
+
+        Removing it does NOT redden the wide assertion surface, which is exactly why
+        it is easy to lose: without it a result object is truthy by default, so every
+        positive ``assert store.write_lesson(...)`` keeps passing while asserting
+        nothing at all. Only the negative assertions and the dedicated tests in
+        ``TestWriteLessonTruthValueIsTheOldBool`` catch its absence -- verified by
+        deleting this method, which left 160 tests green and reddened 5.
+        """
+        return self.wrote
+
+    @property
+    def wrote(self) -> bool:
+        """The store changed -- a row was inserted, or an existing row enriched."""
+        return self.outcome in _LESSON_WROTE_OUTCOMES
+
+    @property
+    def stored(self) -> bool:
+        """The lesson is in the store as submitted -- written now, or already there.
+
+        Distinct from :attr:`wrote` (and from the truth value): a no-op re-submit did
+        not write anything, yet the caller's lesson is stored, so telling them it
+        failed would be false.
+        """
+        return self.outcome is LessonWriteOutcome.UNCHANGED or self.wrote
 
 
 _AUDITABLE_REJECT_CODES = {
@@ -102,13 +213,24 @@ _AUDITABLE_REJECT_CODES = {
     SemanticRejectCode.CONFIDENCE,
     SemanticRejectCode.INJECTION,
     SemanticRejectCode.RESERVED_PREFIX,
+    SemanticRejectCode.VALUE_EMPTY,
 }
 
 _SECURITY_REJECT_CODES = {
     SemanticRejectCode.INJECTION,
     SemanticRejectCode.RESERVED_PREFIX,
 }
+# Named explicitly rather than derived as "not a security code": ALLOWLIST and CONFIDENCE
+# predate the dedupe and get_rejection_stats counts them per attempt.
+_AUDIT_ONCE_REJECT_CODES = {
+    SemanticRejectCode.VALUE_EMPTY,
+}
 _MAX_EVENTS = 10_000
+# Bound on the warn-once promotion-refusal set. The project.<proj>.tool key form is
+# derived from arbitrary episodic text, so the key space is unbounded in principle.
+_MAX_PROMOTION_REFUSED = 1_000
+# Same bound, same reason, for the audit-once set in log_reject_event.
+_MAX_AUDITED_REJECTS = 1_000
 _DEFAULT_CONFIDENCE_THRESHOLD = 0.8
 _DEFAULT_DEDUP_THRESHOLD = 0.88
 _DEFAULT_EPISODIC_MAX = 10_000
@@ -118,6 +240,16 @@ _EPISODIC_LONG_TEXT_CHARS = 300  # texts longer than this get a relaxed threshol
 _EPISODIC_LONG_TEXT_THRESHOLD = 0.42  # relaxed threshold for long entries
 _EPISODIC_TEXT_MIN = 10
 _EPISODIC_TEXT_MAX = 2000
+# Episodic recency decay: score factor exp(-rate * days_old), per day. The
+# built-in rate applies when memory.decay_rates configures nothing else; the
+# reserved "default" key in that mapping replaces it for untagged/unmatched
+# rows. Rates outside [_DECAY_RATE_MIN, _DECAY_RATE_MAX] are clamped: 0 means
+# a memory never ages out, and by 10/day a single day already scales a score
+# by e^-10, so larger values are indistinguishable in ranking.
+_DEFAULT_DECAY_RATE = 0.03
+_DECAY_RATE_MIN = 0.0
+_DECAY_RATE_MAX = 10.0
+_DECAY_DEFAULT_KEY = "default"
 _FAISS_SAVE_INTERVAL = 100  # save index every N writes
 _MMR_LAMBDA = 0.6  # relevance vs diversity tradeoff (higher = more relevance)
 # Recall-safe upper bound on the MMR candidate pool. This is NOT a perf cap that
@@ -130,12 +262,72 @@ _MMR_MAX_POOL = 1000
 _SEMANTIC_VECTOR_WEIGHT = 0.6  # weight for vector score in hybrid semantic retrieval
 _SEMANTIC_KEYWORD_WEIGHT = 0.4  # weight for keyword score in hybrid semantic retrieval
 
-_snowball = _snowball_stemmer("english")
+
+def _keyword_score(raw_overlap: int) -> float:
+    """Normalize a raw keyword-overlap count to [0, 1]."""
+    return min(raw_overlap / 10.0, 1.0) if raw_overlap > 0 else 0.0
+
+
+def _hybrid_score(keyword: float, vector: float, *, query_has_vector: bool = False) -> float:
+    """Merge keyword and vector scores, degrading to keyword-only without a vector.
+
+    Shared by every hybrid retrieval path so the weighting cannot drift between
+    them; each caller still chooses which text it matches and where its vector
+    comes from, because those differ legitimately.
+
+    ``query_has_vector`` distinguishes the two ways ``vector`` can be 0: when
+    the QUERY has no embedding the whole request degrades to keyword-only and
+    every row keeps the unweighted keyword score (uniform, comparable). When
+    the query IS embedded but this ROW has no stored vector, the caller passes
+    ``query_has_vector=True`` so the row scores on the same 0.6/0.4 scale as
+    its embedded siblings — otherwise a vectorless row with keyword overlap k
+    scores k while an embedded row with the same overlap scores at most
+    0.6·cos + 0.4·k, and rows the backfill has not reached yet systematically
+    outrank freshly embedded ones.
+    """
+    if vector > 0 or query_has_vector:
+        return _SEMANTIC_VECTOR_WEIGHT * vector + _SEMANTIC_KEYWORD_WEIGHT * keyword
+    return keyword
+
+
+# snowballstemmer's pure-Python stemmers keep the word being stemmed as
+# mutable instance state (set_current() -> _stem() -> get_current()), so a
+# single shared instance is NOT thread-safe: concurrent context builds
+# (parallel subagent spawns via run_in_embed_pool) interleave their cursor
+# state and crash with IndexError("string index out of range") — or silently
+# return the wrong stem. One instance per thread; construction is trivial
+# (~0.1 µs once the language module is imported).
+_snowball_local = threading.local()
+
+
+def _get_snowball():
+    stemmer = getattr(_snowball_local, "stemmer", None)
+    if stemmer is None:
+        stemmer = _snowball_stemmer("english")
+        _snowball_local.stemmer = stemmer
+    return stemmer
+
+
+# The same words recur across many entries, so stemming per occurrence repeats
+# work that depends only on the word. Memoize on the word: one stem per distinct
+# word for the life of the process rather than one per occurrence per retrieval.
+# The win grows with the store, which only ever appends.
+#
+# The cache holds the resulting STRING, never the stemmer. The stemmer itself
+# must stay thread-local (see above) because it carries mutable cursor state;
+# caching its output is safe because stemming is deterministic per word.
+_STEM_CACHE_SIZE = 100_000
+
+
+@functools.lru_cache(maxsize=_STEM_CACHE_SIZE)
+def _stem_one(word: str) -> str:
+    """Return the Snowball stem of *word*, memoized per distinct word."""
+    return str(_get_snowball().stemWords([word])[0])
 
 
 def _stem_words(words: set[str]) -> set[str]:
     """Stem a set of words, returning both original and stemmed forms."""
-    return words | set(_snowball.stemWords(list(words)))
+    return words | {_stem_one(word) for word in words}
 
 
 _BUILTIN_PREFIXES = [
@@ -223,6 +415,203 @@ _MIGRATIONS: list[tuple[int, str, "Callable[[sqlite3.Connection], None] | None"]
 ]
 
 _MAX_BACKFILLS_PER_CALL = 5  # cap lazy embedding backfills to bound latency
+
+# Joins a lesson's rule to its NOT-clause in a legacy single-value row, and renders
+# a mapping-shaped one for display. Reads need it as well as writes: it is what
+# tells "<rule>" apart from "<rule><sep><negative>" when deciding whether a bare
+# re-submit would strip a clause that is already stored.
+_LESSON_NEGATIVE_SEP = " — NOT: "
+
+
+def _lesson_slug(rule: str) -> str:
+    """The key slug write_lesson derives for *rule*. Single source of truth."""
+    return hashlib.md5(rule.encode(), usedforsecurity=False).hexdigest()[:12]
+
+
+def _lesson_key(rule: str, repo_scope: str | None = None) -> str:
+    """The semantic key a lesson is stored under.
+
+    An unscoped lesson keys on the rule alone, byte-identical to what it has always
+    been, so no stored row moves and the legacy-string reader in ``_split_stored``
+    (which confirms a candidate prefix by re-deriving ``_lesson_slug``) keeps
+    working -- legacy rows are always unscoped.
+
+    A scoped lesson folds its scope into the digest, because the same rule scoped to
+    two repositories is two lessons. Sharing one key would let the second write
+    overwrite the first through ``set_semantic`` and silently re-scope it, which is
+    worse than the cross-scope superseding this separation prevents.
+    """
+    if not repo_scope:
+        return f"lesson.{_lesson_slug(rule)}"
+    # NUL separator so a rule ending in the scope text cannot collide with a
+    # differently-split pair. Reuses the one digest helper rather than hashing here.
+    basis = f"{rule}\x00{repo_scope}"
+    return f"lesson.{_lesson_slug(basis)}"
+
+
+def _lesson_fields(decoded: object) -> tuple[str, str | None] | None:
+    """Extract ``(rule, negative)`` from a mapping-shaped lesson value.
+
+    The mapping shape — ``{"rule": ..., "category": ..., "negative": ...}`` — is
+    the one place a lesson's two halves exist as separate fields, so reading them
+    back needs no parsing and cannot be confused by a rule whose own text contains
+    ``_LESSON_NEGATIVE_SEP``. Returns ``None`` when *decoded* is not that shape
+    (strings are the legacy in-band form and are read by ``_split_stored``;
+    anything else is not lesson data). A blank or non-string ``negative`` is
+    normalized to ``None`` — mirroring ``write_lesson``'s own input normalization,
+    so a round-trip compares equal to what was submitted.
+    """
+    if not isinstance(decoded, dict):
+        return None
+    rule = decoded.get("rule")
+    if not isinstance(rule, str) or not rule.strip():
+        return None
+    negative = decoded.get("negative")
+    if not isinstance(negative, str) or not negative.strip():
+        negative = None
+    else:
+        negative = negative.strip()
+    return rule.strip(), negative
+
+
+def _lesson_scope(decoded: object) -> str | None:
+    """Extract ``repo_scope`` from a lesson value, or None when unscoped.
+
+    Only the mapping shape can carry a scope. A legacy string row has nowhere to
+    put one, so it reads as unscoped and keeps applying everywhere -- which is
+    what an existing store expects. A blank or non-string value normalizes to
+    None, mirroring the write path, so a round-trip compares equal.
+    """
+    if not isinstance(decoded, dict):
+        return None
+    scope = decoded.get("repo_scope")
+    if not isinstance(scope, str) or not scope.strip():
+        return None
+    return scope.strip()
+
+
+def _lesson_scope_unusable(decoded: object) -> bool:
+    """Whether a lesson carries a ``repo_scope`` that is PRESENT but unusable.
+
+    Absent and present-but-broken are different answers and must not collapse.
+    Absent means "applies everywhere", which is the correct default. A present
+    value that is not a usable string -- a list or a number from an imported or
+    hand-edited row -- means "this was meant to be scoped and we cannot tell
+    where", so the row is withheld at injection rather than admitted globally.
+    Treating it as absent is fail-OPEN: the one direction this gate must never
+    take.
+    """
+    if not isinstance(decoded, dict):
+        return False
+    if "repo_scope" not in decoded:
+        return False
+    scope = decoded["repo_scope"]
+    if scope is None:
+        return False
+    # Asks the GATE's own admissibility test rather than carrying a second notion
+    # of "usable". A non-blank string is not enough: "." is a string and the gate
+    # refuses it, so judging by shape marked it usable, it rendered nothing, and it
+    # still counted as stored knowledge -- which silenced the JSONL store and lost
+    # the lessons the user saved. Deferring here is what keeps the two in step.
+    return not scope_is_admissible(scope)
+
+
+def _lesson_display_text(decoded: object) -> str:
+    """Render a decoded lesson value as the prose that goes into the prompt.
+
+    Lessons are stored in two shapes, and only one of them is a string. The
+    legacy ``learn_add`` form is ``"<rule>"`` or ``"<rule><sep><negative>"``
+    (see ``_LESSON_NEGATIVE_SEP``), while ``write_lesson`` and the onboarding
+    import store a mapping ``{"rule": ..., "category": ..., "negative": ...}``,
+    which keeps the two halves apart without in-band escaping. Interpolating the
+    decoded value directly therefore pasted a Python ``dict`` repr into the system
+    prompt for every imported lesson: the model was handed ``{'rule': 'Prefer dark
+    mode', 'category': 'preference', 'negative': None}`` instead of the rule,
+    spending tokens on punctuation and field names while burying the instruction it
+    is supposed to follow.
+
+    Stored bytes are read as-is: legacy string rows are returned unchanged (no
+    migration runs, and ``_split_stored`` still parses them where enrichment
+    needs the halves), while mapping rows are recomposed with the separator only
+    for DISPLAY -- the fields, not this rendering, remain the source of truth.
+
+    An unrecognized shape yields ``""`` and is skipped by the caller rather than
+    being stringified as a guess. This runs while a session's prompt is being
+    built, where a raise costs the whole turn, so every branch has to produce a
+    string without trusting the value's type.
+    """
+    if isinstance(decoded, str):
+        return decoded.strip()
+    if isinstance(decoded, dict):
+        rule = decoded.get("rule")
+        if not isinstance(rule, str) or not rule.strip():
+            return ""
+        negative = decoded.get("negative")
+        if isinstance(negative, str) and negative.strip():
+            return f"{rule.strip()}{_LESSON_NEGATIVE_SEP}{negative.strip()}"
+        return rule.strip()
+    return ""
+
+
+def _lesson_embed_text(decoded: object) -> str:
+    """The text a lesson's embedding is computed FROM, matching write_lesson.
+
+    The write path embeds the bare ``rule`` (never the NOT-clause), so every
+    vector that participates in semantic similarity must come from the same
+    input space: a mapping row embeds its ``rule`` field. A legacy string row
+    cannot be split reliably (that ambiguity is what the mapping shape fixes),
+    so it embeds the stored text as-is -- the best available approximation and
+    what those rows have always embedded.
+    """
+    if isinstance(decoded, dict):
+        fields = _lesson_fields(decoded)
+        if fields is not None:
+            return fields[0]
+    return _lesson_display_text(decoded)
+
+
+def _split_stored(existing_val: str, rule_norm: str, existing_key: str) -> tuple[str | None, bool]:
+    """Split a stored lesson value against a normalized rule.
+
+    Returns ``(base, stored_clause)``: the stored spelling of the rule, and whether
+    a NOT-clause follows it. ``(None, False)`` means this row is not that rule.
+
+    The separator is stored IN-BAND and unescaped, so the value alone is ambiguous:
+    ``A — NOT: B`` is either rule ``A`` with clause ``B``, or a bare rule whose text
+    happens to contain the separator. No amount of text parsing settles that -- both
+    readings are valid, and picking either one by itself loses data in the other case
+    (silently dropping a clause update one way, OVERWRITING an unrelated rule the
+    other). Two review rounds demanded exactly opposite behaviour on the same text
+    for that reason.
+
+    The row itself carries the answer: the key is ``md5(rule)`` taken at write time,
+    in the rule's stored casing. So a candidate prefix is the rule only when it
+    hashes to this row's key. That is exact rather than heuristic, and it is why
+    every separator boundary can be tried safely.
+
+    Rows keyed some other way -- the onboarding import uses sha256, and legacy
+    migrations set their own keys -- match only on the whole value. For those a
+    case-variant re-submit onto an EXISTING clause will not enrich. That is a missed
+    enrichment, never an overwrite: the ambiguous branch always declines.
+
+    Case-insensitivity here is ``lower()``, not ``casefold()`` -- see write_lesson for
+    why. ``casefold()``'s ß-to-ss expansion conflates "Maße" with "Masse", which would
+    make this function confidently return the WRONG row's spelling as ``base``.
+    """
+    stripped = existing_val.strip()
+    if stripped.lower() == rule_norm:
+        return stripped, False  # the whole value is the rule; no clause
+    slug = existing_key.split(".", 1)[-1]
+    idx = stripped.find(_LESSON_NEGATIVE_SEP)
+    while idx != -1:
+        prefix = stripped[:idx].strip()
+        # Compare whole prefixes, never a slice at len(rule_norm): lower() can still
+        # CHANGE length ("İ" -> "i" + combining dot), so a length-based slice cuts in
+        # the wrong place for exactly the case-variant inputs this serves.
+        if prefix.lower() == rule_norm and _lesson_slug(prefix) == slug:
+            return prefix, True  # the key confirms prefix IS the rule
+        idx = stripped.find(_LESSON_NEGATIVE_SEP, idx + 1)
+    return None, False
 
 
 # ── Helpers ──
@@ -329,6 +718,47 @@ def _mmr_rerank(
     return [candidates[i] for i in selected]
 
 
+def _sanitize_decay_rates(raw: Mapping[str, object] | None) -> dict[str, float]:
+    """Validate and clamp user-configured per-tag episodic decay rates.
+
+    The mapping comes from hand-edited config JSON (``memory.decay_rates``), so
+    entries are screened rather than trusted: a non-string key or a non-numeric
+    or non-finite rate is dropped with a warning (logged once, at store
+    construction — retrieval never re-validates per row), and numeric rates are
+    clamped to [``_DECAY_RATE_MIN``, ``_DECAY_RATE_MAX``]. Keys are lowercased
+    to match the case-insensitive tag matching used by episodic retrieval
+    (:meth:`VectorMemoryStore._matches_tags`).
+    """
+    out: dict[str, float] = {}
+    if not raw:
+        return out
+    if not isinstance(raw, Mapping):
+        logger.warning(
+            "memory.decay_rates ignored: expected a mapping, got %r", type(raw).__name__
+        )
+        return out
+    for key, val in raw.items():
+        if not isinstance(key, str) or not key.strip():
+            logger.warning("memory.decay_rates: ignoring non-string key %r", key)
+            continue
+        # bool is an int subclass, but true/false is not a rate; NaN/Infinity
+        # are parsed by json.loads yet are not usable rates either.
+        if (
+            isinstance(val, bool)
+            or not isinstance(val, (int, float))
+            or (isinstance(val, float) and not math.isfinite(val))
+        ):
+            logger.warning("memory.decay_rates[%r]: ignoring non-numeric rate %r", key, val)
+            continue
+        # Clamp BEFORE converting to float: JSON admits arbitrary-precision
+        # integers, and float() (like math.isfinite()) raises OverflowError past
+        # ~1e308 -- crashing store construction on a garbage config value
+        # instead of clamping it. int/float comparison is exact in Python, so
+        # the clamp itself never overflows.
+        out[key.strip().lower()] = float(min(max(val, _DECAY_RATE_MIN), _DECAY_RATE_MAX))
+    return out
+
+
 # ── Store ──
 
 
@@ -344,6 +774,7 @@ class VectorMemoryStore:
         episodic_max: int = _DEFAULT_EPISODIC_MAX,
         embedding_dim: int = 1024,
         episodic_limit: int = _DEFAULT_EPISODIC_LIMIT,
+        decay_rates: dict[str, float] | None = None,
     ):
         self._db_path = db_path or (config_dir() / _DB_FILE)
         self._faiss_path = self._db_path.parent / _FAISS_FILE
@@ -352,6 +783,15 @@ class VectorMemoryStore:
         self._episodic_max = episodic_max
         self._episodic_limit = episodic_limit
         self._embedding_dim = embedding_dim
+        # Per-tag episodic recency decay (memory.decay_rates). Sanitized once
+        # here — clamped, non-numeric entries warned about and dropped — so the
+        # per-row resolver (_decay_rate_for) only ever sees clean floats. The
+        # reserved "default" key is split out: it replaces the built-in rate
+        # for rows matching no configured tag and never participates in
+        # per-tag matching.
+        _rates = _sanitize_decay_rates(decay_rates)
+        self._decay_default = _rates.pop(_DECAY_DEFAULT_KEY, _DEFAULT_DECAY_RATE)
+        self._decay_by_tag = _rates
         self._prefixes = list(_BUILTIN_PREFIXES)
         if extra_prefixes:
             self._prefixes.extend(extra_prefixes)
@@ -369,6 +809,11 @@ class VectorMemoryStore:
         self._faiss_index: object | None = None  # faiss.IndexFlatIP (untyped)
         self._faiss_id_map: list[str] = []
         self._faiss_writes_since_save = 0
+        # Promotion keys already refused: the refusal is deterministic, so warn once per store
+        # per distinct reject cause. Bounded and oldest-first, so an evicted cause may warn
+        # once more rather than the set growing for the process lifetime.
+        self._promotion_refused: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._audited_rejects: OrderedDict[tuple[str, str], None] = OrderedDict()
         # Optional sync embedding function for migration (set by caller)
         self.embed_fn: Callable[[str], list[float] | None] | None = None
         # Optional factory that builds an embed_fn on demand. When set, _try_embed()
@@ -397,9 +842,90 @@ class VectorMemoryStore:
         # grows past _LAST_ACCESSED_CACHE_MAX.
         self._last_accessed_touch: dict[str, float] = {}
 
+    def _secret_bearing_files(self) -> tuple[Path, ...]:
+        """Every file beside the DB that carries the user's memories.
+
+        All of them, not just the DB, because on Windows the owner-only DIRECTORY is
+        not sufficient for a file that already exists: **Bypass Traverse Checking** is
+        granted to Everyone by default, so a permissive DACL on the file itself stays
+        reachable even inside a tightened directory. The directory governs what SQLite
+        and FAISS create from now on; this list is what repairs an existing install.
+
+        - ``-wal`` / ``-shm``: a COMMITTED row lives in the ``-wal`` until a
+          checkpoint moves it. Same suffix set ``memory.py`` uses to drop a corrupt
+          index.
+        - ``memory.faiss`` / ``memory.ids.json``: the embedding index and its
+          id map, written with no lockdown of their own.
+
+        Not exhaustive for the data home as a whole -- ``memory.py``'s FTS index
+        (``memory_index.db``) and its sidecars carry the same secrets and are not
+        this class's to open. Tracked separately rather than reached across a module
+        boundary from here.
+        """
+        return (
+            Path(f"{self._db_path}-wal"),
+            Path(f"{self._db_path}-shm"),
+            self._faiss_path,
+            self._faiss_path.with_suffix(".ids.json"),
+        )
+
+    def _restrict_memory_files(self) -> None:
+        """Make every memory-bearing file that exists owner-only.
+
+        Called TWICE by :meth:`init` -- once before the connect and once after -- and
+        the ordering is the point of the first call. The owner-only directory does not
+        cover a file that already EXISTS on Windows, because Bypass Traverse Checking
+        is granted to Everyone by default, so a permissive DACL on the file itself
+        stays reachable inside a tightened directory. Restricting before
+        ``sqlite3.connect`` means the migrations do not run against a file another
+        local user can still write; restricting again after covers whatever SQLite
+        just created.
+
+        Missing files are skipped BY AN EXISTENCE CHECK, not by catching the failure:
+        on Windows ``restrict_to_owner`` shells out, so a missing path raises plain
+        ``OSError`` (icacls exits non-zero) rather than ``FileNotFoundError``, which
+        only ever comes from the POSIX ``os.chmod``. Catching alone would spawn up to
+        five futile ``icacls`` processes on a clean init and log a false "may be
+        readable by other users" warning for each, twice per init. The race between
+        the check and the call is benign: a file that appears in between is created by
+        SQLite or FAISS inside the already-tightened directory, so it inherits
+        owner-only access on both platforms and the next init covers it regardless.
+
+        Any other failure warns rather than raising -- memory being unavailable is a
+        supported degraded state, and ``restrict_to_owner`` documents this
+        warn-and-continue handler as its caller contract.
+        """
+        for path in (self._db_path, *self._secret_bearing_files()):
+            if not path.exists():
+                continue  # SQLite and FAISS create theirs on demand
+            try:
+                platform_compat.restrict_to_owner(path)
+            except OSError:
+                logger.warning(
+                    "Cannot restrict %s to owner; it may be readable by other users",
+                    path,
+                    exc_info=True,
+                )
+
     def init(self) -> None:
         """Create DB, apply migrations, set permissions."""
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Owner-only lockdown, in two halves. This directory call covers everything
+        # SQLite and FAISS create from here on -- inheritable on Windows, because
+        # `make_owner_only_dir` routes through `restrict_dir_to_owner`. The per-file
+        # pass below repairs what already EXISTS, which a tightened parent cannot do:
+        # Windows grants *Bypass Traverse Checking* to Everyone by default, so a
+        # pre-lockdown file stays reachable through it. Full reasoning -- the sidecar
+        # file set, the every-init rationale, the Windows icacls cost, the fail-soft
+        # contract -- lives in docs/guides/windows-install.md, "The memory store".
+        #
+        # SCOPE: with the default `db_path` this directory IS the data home
+        # (`config_dir()`), so a memory init tightens the whole home. That is wider
+        # than this class and the only place in the tree that does it -- named here
+        # rather than left to be discovered.
+        platform_compat.make_owner_only_dir(self._db_path.parent)
+        # BEFORE the connect so the migrations do not run against a file another
+        # local user can still write; repeated after it to cover what SQLite created.
+        self._restrict_memory_files()
         self._db = sqlite3.connect(
             str(self._db_path), check_same_thread=False, isolation_level=None
         )
@@ -437,9 +963,22 @@ class VectorMemoryStore:
                 self._db.commit()
                 logger.info("Applied memory schema migration v%s", ver)
 
-        # Set file permissions (owner-only). chmod_safe already logs+swallows
-        # OSError internally and is a no-op on Windows, so no wrapper needed.
-        platform_compat.chmod_safe(self._db_path, 0o600)
+        # Second pass, after the connect: covers what SQLite has just created. Runs
+        # on EVERY init, not only when init created the files -- an existing DB is
+        # exactly the one that may have lost its protection since (restored backup,
+        # home migration, manual edit, or an install predating this lockdown).
+        # ``restrict_to_owner`` rather than ``chmod_safe``, which is a documented
+        # no-op on Windows. Cost, file set and fail-soft contract:
+        # docs/guides/windows-install.md, "The memory store".
+        #
+        # CALLER CONTRACT: an async caller must offload this. The Windows path shells
+        # out to icacls, so calling ``init()`` directly on an event loop freezes it
+        # for seconds. All async callers now offload: ``eval.runner``,
+        # ``slack.gateway`` and ``cli_server._run_task`` via ``asyncio.to_thread``
+        # (#5389); ``dashboard/handlers/memory.py``'s standalone fallback routes
+        # through ``_get_vector_store_async``, which offloads the init-bearing
+        # path (#5221).
+        self._restrict_memory_files()
 
         # Load persisted FAISS index (or rebuild from SQLite embeddings)
         try:
@@ -459,6 +998,33 @@ class VectorMemoryStore:
         if self._db is None:
             raise RuntimeError("VectorMemoryStore not initialized — call init() first")
         return self._db
+
+    # ── Locked fetch helpers ──
+    #
+    # The single ``check_same_thread=False`` connection is shared across the
+    # event loop, executor threads (context assembly via run_in_embed_pool) and
+    # worker threads (consolidation, dashboard handlers). sqlite3 caches
+    # prepared statements per connection, so an unsynchronized statement racing
+    # another thread's implicit transaction corrupts the statement cache —
+    # observed in production as sqlite3.InterfaceError ("bad parameter or other
+    # API misuse") and DatabaseError ("another row available") — or silently
+    # corrupts row iteration. EVERY statement on ``self.db`` must therefore be
+    # serialized on ``_db_lock`` (enforced by an AST guard in
+    # test_vector_memory.py). Route plain SELECTs through these helpers; only
+    # read-modify-write sections that must be atomic should take the lock
+    # explicitly. Both helpers materialize results before releasing the lock,
+    # so callers never iterate a live cursor unlocked — and per the lock's
+    # contract, never call a blocking embed while holding it.
+
+    def _fetch_all_locked(self, sql: str, params: Sequence[object] = ()) -> list[sqlite3.Row]:
+        """Run a SELECT serialized on ``_db_lock``; return materialized rows."""
+        with self._db_lock:
+            return self.db.execute(sql, params).fetchall()
+
+    def _fetch_one_locked(self, sql: str, params: Sequence[object] = ()) -> sqlite3.Row | None:
+        """Run a SELECT serialized on ``_db_lock``; return the first row or None."""
+        with self._db_lock:
+            return self.db.execute(sql, params).fetchone()
 
     # ── Key Validation ──
 
@@ -503,7 +1069,48 @@ class VectorMemoryStore:
                 f"Confidence {confidence:.2f} below threshold {self._confidence_threshold}",
             )
         vj = value_json if value_json is not None else json.dumps(value)
-        vj_bytes = len(vj.encode("utf-8"))
+        if not vj.strip() or vj.strip() in _EMPTY_VALUE_JSON:
+            return SemanticRejectCode.VALUE_EMPTY, "Value must not be null or empty"
+        # A lesson mapping is size-gated on its CONTENT (the legacy-equivalent
+        # "<rule><sep><negative>" rendering), not the JSON envelope: the
+        # envelope's ~50-70 bytes of keys would otherwise shrink the accepted
+        # rule capacity below what the bare string form always allowed, and a
+        # caller with a JSONL fallback would report the lesson saved while the
+        # vector store had refused it. The exemption applies ONLY when every
+        # unbounded field is measured at its RAW stored size: exact
+        # {rule, category, negative} shape, enum-bounded (or absent) category,
+        # and a None-or-string negative. The basis concatenates the UNSTRIPPED
+        # rule and negative — the same bytes that persist — so whitespace
+        # padding cannot ride past the cap; anything else (oversized category,
+        # extra key, non-string negative) is measured as its full envelope.
+        # Every stored byte is therefore either raw-measured or bounded by a
+        # constant (the enum member and the key envelope).
+        size_basis = vj
+        if key.startswith("lesson.") and isinstance(value, dict) and _lesson_fields(value) is not None:
+            cat = value.get("category")
+            raw_negative = value.get("negative")
+            raw_scope = value.get("repo_scope")
+            if (
+                set(value.keys()) <= {"rule", "category", "negative", "repo_scope"}
+                and (cat is None or (isinstance(cat, str) and cat in ALLOWED_LESSON_CATEGORIES))
+                and (raw_negative is None or isinstance(raw_negative, str))
+                and (raw_scope is None or isinstance(raw_scope, str))
+            ):
+                raw_rule = value["rule"]  # _lesson_fields guarantees a str
+                if isinstance(raw_negative, str):
+                    size_basis = f"{raw_rule}{_LESSON_NEGATIVE_SEP}{raw_negative}"
+                else:
+                    size_basis = raw_rule
+                # A scope is measured at its RAW size too, rather than trusted to be
+                # bounded by the write surface's cap: set_semantic is reachable
+                # directly, so assuming a constant here would be the one unmeasured
+                # byte the invariant above forbids. Excluding repo_scope from the
+                # key set instead would drop a scoped lesson out of the exemption
+                # entirely, so a near-limit multibyte rule would be refused while a
+                # caller with a JSONL fallback reported it saved.
+                if isinstance(raw_scope, str):
+                    size_basis = f"{size_basis}{_LESSON_NEGATIVE_SEP}{raw_scope}"
+        vj_bytes = len(size_basis.encode("utf-8"))
         if vj_bytes > _MAX_VALUE_BYTES:
             return (
                 SemanticRejectCode.VALUE_SIZE,
@@ -523,17 +1130,27 @@ class VectorMemoryStore:
         value_json: str | None = None,
     ) -> None:
         """Emit an audit event for a validation rejection."""
-        if code in _AUDITABLE_REJECT_CODES:
-            snippet = (value_json if value_json is not None else str(value))[:200]
-            self._log_event(code.value, "semantic", key, None, snippet, source)
+        if code not in _AUDITABLE_REJECT_CODES:
+            return
+        # Only a refusal that repeats every promotion pass audits once per (key, cause); every
+        # other code records each attempt, which is what get_rejection_stats already counts.
+        if code in _AUDIT_ONCE_REJECT_CODES:
+            audited = (key, code.value)
+            if audited in self._audited_rejects:
+                return
+            self._audited_rejects[audited] = None
+            while len(self._audited_rejects) > _MAX_AUDITED_REJECTS:
+                self._audited_rejects.popitem(last=False)
+        snippet = (value_json if value_json is not None else str(value))[:200]
+        self._log_event(code.value, "semantic", key, None, snippet, source)
 
     # ── Semantic CRUD ──
 
     def get_semantic(self, key: str) -> dict | None:
         """Get a single semantic memory entry by key."""
-        row = self.db.execute(
+        row = self._fetch_one_locked(
             "SELECT * FROM semantic_memory WHERE key = ? AND is_deleted = 0", (key,)
-        ).fetchone()
+        )
         return dict(row) if row else None
 
     def get_all_semantic(self, limit: int | None = None, offset: int = 0) -> list[dict]:
@@ -550,7 +1167,7 @@ class VectorMemoryStore:
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
             params = (int(limit), int(offset))
-        rows = self.db.execute(sql, params).fetchall()
+        rows = self._fetch_all_locked(sql, params)
         return [dict(r) for r in rows]
 
     @timed("vector", "write")
@@ -677,12 +1294,19 @@ class VectorMemoryStore:
             else:
                 self._log_event("create", "semantic", key, None, value_json, source)
 
-            # 8. Upsert
+            # 8. Upsert. The conflict clause keeps the stored vector ONLY when
+            # the value is unchanged (a re-affirmation with a new confidence or
+            # source — consolidation rewrites the same keys every cycle) and
+            # clears it when the value changed, so a row never keeps ranking by
+            # a vector computed from text it no longer holds. Step 8.5 below
+            # (or the backfill sweep) refills a cleared vector.
             now = _now_iso()
             self.db.execute(
                 "INSERT INTO semantic_memory (key, value_json, confidence, source, created_at, updated_at, is_deleted) "
                 "VALUES (?, ?, ?, ?, ?, ?, 0) "
-                "ON CONFLICT(key) DO UPDATE SET value_json=?, confidence=?, source=?, updated_at=?, is_deleted=0",
+                "ON CONFLICT(key) DO UPDATE SET value_json=?, confidence=?, source=?, updated_at=?, is_deleted=0, "
+                "embedding=CASE WHEN semantic_memory.value_json = excluded.value_json "
+                "THEN semantic_memory.embedding ELSE NULL END",
                 (
                     key,
                     value_json,
@@ -697,6 +1321,74 @@ class VectorMemoryStore:
                 ),
             )
             self.db.commit()
+
+        # 8.5. Persist the value's embedding so retrieval can rank this row from
+        # the stored vector instead of re-embedding the whole table per request
+        # (mirrors write_lesson's tail). ``lesson.*`` keys are skipped: lessons
+        # route through here via write_lesson, which owns their vector contract
+        # (raw rule text, written in its own tail) — embedding the JSON envelope
+        # here would double-embed every lesson write with a different text.
+        # An unchanged-value rewrite whose vector survived the upsert's CASE is
+        # skipped too: the stored vector already describes this exact text, and
+        # re-embedding it would spend an inference on every consolidation
+        # re-affirmation. (A tombstone resurrection with the same value keeps
+        # its vector for the same reason — reconcile clears tombstoned rows'
+        # vectors on a model swap, so a kept vector is never from an old space.)
+        #
+        # The embed runs OUTSIDE _db_lock (blocking model inference must never
+        # hold the lock) at PRIORITY_BULK: nothing is blocked on the write-time
+        # vector — retrieval degrades to keyword scoring until it lands — and
+        # this tail is reached from corpus loops (history consolidation, memory
+        # import), which must not queue ahead of interactive work. Same
+        # space-generation contract as write_lesson: sample BEFORE the embed,
+        # re-check under the lock, and leave the row NULL for the backfill when
+        # a model swap lands in the gap. The ``value_json`` guard makes a
+        # concurrent re-write of the same key a no-op here — the later writer
+        # persists its own vector.
+        already_embedded = bool(
+            existing
+            and existing["value_json"] == value_json
+            and existing["embedding"] is not None
+        )
+        if self.embed_fn is not None and not key.startswith("lesson.") and not already_embedded:
+            embed_generation = self._space_generation
+            vec = self._try_embed(f"{key} {value_json}", PRIORITY_BULK)
+            if vec:
+                blob = struct.pack(f"{len(vec)}f", *vec)
+                with self._db_lock:
+                    if self._space_generation == embed_generation:
+                        # Best-effort: the semantic row is already committed, so
+                        # a failure persisting this derived vector (disk full,
+                        # I/O error) must not escape as a failed write — callers
+                        # batch many keys per call, and an exception raised after
+                        # a successful commit would discard every remaining item
+                        # in the batch. The row stays NULL and the backfill sweep
+                        # repairs it.
+                        try:
+                            self.db.execute(
+                                "UPDATE semantic_memory SET embedding = ? "
+                                "WHERE key = ? AND value_json = ? AND is_deleted = 0",
+                                (blob, key, value_json),
+                            )
+                            self.db.commit()
+                        except Exception:
+                            logger.warning(
+                                "Embedding persist failed for %r (semantic write kept; "
+                                "vector left NULL for backfill)",
+                                key,
+                                exc_info=True,
+                            )
+                            try:
+                                self.db.rollback()
+                            except Exception:
+                                logger.debug(
+                                    "Rollback after failed embedding persist failed",
+                                    exc_info=True,
+                                )
+                    else:
+                        logger.debug(
+                            "Dropping a semantic embedding produced in a previous space"
+                        )
 
         # 9. Retire conflicting episodic entries that reference the old value
         # (called outside the lock — _retire_stale_episodic does a blocking embed
@@ -806,10 +1498,10 @@ class VectorMemoryStore:
     @timed("vector", "search")
     def search_semantic(self, prefix: str) -> list[dict]:
         """Search semantic memory by key prefix."""
-        rows = self.db.execute(
+        rows = self._fetch_all_locked(
             "SELECT * FROM semantic_memory WHERE key LIKE ? AND is_deleted = 0 ORDER BY key",
             (prefix.rstrip("*").rstrip(".") + "%",),
-        ).fetchall()
+        )
         return [dict(r) for r in rows]
 
     # ── Context Injection ──
@@ -826,15 +1518,30 @@ class VectorMemoryStore:
         # Query-aware filtering: hybrid vector + keyword scoring
         if query_text:
             query_words = _stem_words(set(re.findall(r"\w+", query_text.lower())))
-            query_embedding = self._try_embed(query_text) if self.embed_fn else None
+            query_embedding = (
+                self._try_embed(query_text, PRIORITY_INTERACTIVE) if self.embed_fn else None
+            )
 
-            all_rows = self.db.execute(
-                "SELECT key, value_json, updated_at FROM semantic_memory "
+            # Context assembly runs on executor threads (subagent context builds,
+            # run_in_embed_pool) concurrent with writers on worker threads, and
+            # context.py does not guard this call — an unserialized fetch here
+            # kills the whole subagent run (see the locked-fetch helper
+            # contract). The helper materializes the rows.
+            all_rows = self._fetch_all_locked(
+                "SELECT key, value_json, updated_at, embedding FROM semantic_memory "
                 "WHERE is_deleted = 0 AND key NOT LIKE 'lesson.%'"
-            ).fetchall()
+            )
+
+            # Stored write-time vectors only — one embed per request (the query),
+            # same as the lessons path. Re-embedding every row here was an
+            # unbounded O(table) loop of blocking embeds per context build. Rows
+            # the write path or backfill has not embedded yet contribute 0.0 on
+            # the vector term of the same weighted scale (see _hybrid_score).
+            similarity = self._stored_similarity_scorer(query_embedding)
 
             scored_rows: list[tuple[float, dict]] = []
-            for r in all_rows:
+            for raw in all_rows:
+                r = dict(raw)
                 # Keyword score (always available)
                 key_words = _stem_words(
                     set(re.findall(r"\w+", r["key"].replace("_", " ").replace(".", " ")))
@@ -843,37 +1550,35 @@ class VectorMemoryStore:
                 key_overlap = len(query_words & key_words)
                 val_overlap = len(query_words & val_words)
                 kw_raw = key_overlap * 3 + val_overlap
-                # Normalize keyword score to [0, 1]
-                kw_score = min(kw_raw / 10.0, 1.0) if kw_raw > 0 else 0.0
+                kw_score = _keyword_score(kw_raw)
 
-                # Vector score (when embeddings available)
-                vec_score = 0.0
-                if query_embedding is not None:
-                    entry_text = f"{r['key']} {r['value_json']}"
-                    entry_emb = self._try_embed(entry_text)
-                    if entry_emb:
-                        vec_score = max(0.0, self._cosine_sim(query_embedding, entry_emb))
+                # Vector score (when a stored vector is present). The mixed
+                # population is real — legacy rows stay NULL until the backfill
+                # sweep or a re-write reaches them — so score them on the same
+                # weighted scale as embedded rows (see _hybrid_score).
+                # Clamped here (not inside the scorer): this caller passes
+                # query_has_vector=True below, so a negative raw cosine would
+                # otherwise reach _hybrid_score's weighted sum instead of the
+                # keyword-only floor a merely-dissimilar row should get.
+                vec_score = max(0.0, similarity(r))
 
-                # Hybrid merge
-                if query_embedding is not None and vec_score > 0:
-                    score = (
-                        _SEMANTIC_VECTOR_WEIGHT * vec_score + _SEMANTIC_KEYWORD_WEIGHT * kw_score
-                    )
-                else:
-                    score = kw_score
+                score = _hybrid_score(
+                    kw_score, vec_score, query_has_vector=query_embedding is not None
+                )
 
                 if score > 0:
-                    scored_rows.append((score, dict(r)))
+                    scored_rows.append((score, r))
 
             scored_rows.sort(key=lambda x: (-x[0], x[1]["updated_at"]))
             rows = [r[1] for r in scored_rows[:max_rows]]
         else:
-            # No query: recent entries
-            rows = self.db.execute(
+            # No query: recent entries. Same serialization requirement as the
+            # query path above.
+            rows = self._fetch_all_locked(
                 "SELECT key, value_json FROM semantic_memory WHERE is_deleted = 0 "
                 "AND key NOT LIKE 'lesson.%' ORDER BY updated_at DESC LIMIT ?",
                 (max_rows,),
-            ).fetchall()
+            )
 
         if not rows:
             return ""
@@ -928,10 +1633,10 @@ class VectorMemoryStore:
 
     def get_events(self, limit: int = 50, offset: int = 0) -> list[dict]:
         """Return recent memory events with pagination."""
-        rows = self.db.execute(
+        rows = self._fetch_all_locked(
             "SELECT * FROM memory_events ORDER BY id DESC LIMIT ? OFFSET ?",
             (limit, offset),
-        ).fetchall()
+        )
         return [dict(r) for r in rows]
 
     def rotate_events(self, max_rows: int = _MAX_EVENTS) -> int:
@@ -957,10 +1662,10 @@ class VectorMemoryStore:
             return 0
         self._faiss_index = faiss.IndexFlatIP(self._embedding_dim)
         self._faiss_id_map = []
-        rows = self.db.execute(
+        rows = self._fetch_all_locked(
             "SELECT id, embedding FROM episodic_memories "
             "WHERE is_deleted = 0 AND embedding IS NOT NULL"
-        ).fetchall()
+        )
         skipped = 0
         for row in rows:
             vec = np.frombuffer(row["embedding"], dtype=np.float32).reshape(1, -1)
@@ -1119,8 +1824,6 @@ class VectorMemoryStore:
 
         embedding_blob: bytes | None = None
         if embedding is not None:
-            import struct
-
             if _HAS_NUMPY:
                 vec = np.array(embedding, dtype=np.float32)
                 norm = np.linalg.norm(vec)
@@ -1307,14 +2010,13 @@ class VectorMemoryStore:
 
     def has_episodic_text(self, text: str) -> bool:
         """Return whether an active episodic memory exactly matches *text*."""
-        with self._db_lock:
-            return (
-                self.db.execute(
-                    "SELECT 1 FROM episodic_memories WHERE is_deleted = 0 AND text = ? LIMIT 1",
-                    (text,),
-                ).fetchone()
-                is not None
+        return (
+            self._fetch_one_locked(
+                "SELECT 1 FROM episodic_memories WHERE is_deleted = 0 AND text = ? LIMIT 1",
+                (text,),
             )
+            is not None
+        )
 
     @timed("vector", "search")
     def _episodic_relevance_threshold(self, text: str) -> float:
@@ -1357,6 +2059,9 @@ class VectorMemoryStore:
     ) -> list[dict]:
         """Search episodic memories by vector similarity with decay scoring.
 
+        The recency decay rate defaults to ``_DEFAULT_DECAY_RATE`` per day and
+        is configurable per tag via ``memory.decay_rates`` (see
+        :meth:`_decay_rate_for`).
         When ``mmr=True`` (default), applies Maximal Marginal Relevance
         reranking to balance relevance with diversity.
         When ``tag_filter`` is provided, only entries matching ANY of the
@@ -1414,8 +2119,11 @@ class VectorMemoryStore:
                         continue
                     created = datetime.fromisoformat(mem["created_at"])
                     days_old = max(0, (now - created).days)
+                    decay_rate = self._decay_rate_for(mem.get("tags"))
                     score = (
-                        cosine_sim * (0.7 + 0.3 * mem["importance"]) * math.exp(-0.03 * days_old)
+                        cosine_sim
+                        * (0.7 + 0.3 * mem["importance"])
+                        * math.exp(-decay_rate * days_old)
                     )
                     candidates.append(
                         {**mem, "score": round(score, 4), "cosine_sim": round(cosine_sim, 4)}
@@ -1466,26 +2174,21 @@ class VectorMemoryStore:
         relevance_filter: bool = False,
     ) -> list[dict]:
         """Cosine similarity search using embeddings stored in SQLite (stdlib only)."""
-        import struct
-
         # Normalize query
         norm = math.sqrt(sum(x * x for x in query_embedding))
         q = [x / norm for x in query_embedding] if norm > 0 else query_embedding
         q_len = len(q)
 
-        # The fetch is serialized with every other statement on this shared
-        # connection. sqlite3 caches prepared statements per connection, so two
-        # threads running a statement at the same time can corrupt each other's
-        # row iteration — observed as DatabaseError("another row available") and,
-        # on Windows CI, a NULL value for a column the WHERE clause excludes
-        # (`embedding IS NOT NULL` returning None, TypeError on len()). Only the
-        # fetch is locked: the scoring loop below works on materialized rows.
-        with self._db_lock:
-            rows = self.db.execute(
-                "SELECT id, conversation_id, text, tags, importance, created_at, "
-                "last_accessed_at, embedding FROM episodic_memories "
-                "WHERE is_deleted = 0 AND embedding IS NOT NULL"
-            ).fetchall()
+        # Serialized via the locked helper — two threads running a statement at
+        # the same time corrupt each other's row iteration (surfacing as
+        # DatabaseError("another row available") and, on Windows CI, a NULL
+        # value for a column the WHERE clause excludes). Only the fetch is
+        # locked: the scoring loop below works on materialized rows.
+        rows = self._fetch_all_locked(
+            "SELECT id, conversation_id, text, tags, importance, created_at, "
+            "last_accessed_at, embedding FROM episodic_memories "
+            "WHERE is_deleted = 0 AND embedding IS NOT NULL"
+        )
 
         logger.debug(
             "Episodic SQLite vector search: query=%s… rows_with_emb=%d",
@@ -1507,7 +2210,8 @@ class VectorMemoryStore:
             cosine_sim = sum(a * b for a, b in zip(q, vec))
             created = datetime.fromisoformat(r["created_at"])
             days_old = max(0, (now - created).days)
-            score = cosine_sim * (0.7 + 0.3 * r["importance"]) * math.exp(-0.03 * days_old)
+            decay_rate = self._decay_rate_for(r["tags"])
+            score = cosine_sim * (0.7 + 0.3 * r["importance"]) * math.exp(-decay_rate * days_old)
             candidates.append(
                 {
                     "id": r["id"],
@@ -1548,12 +2252,12 @@ class VectorMemoryStore:
         else:
             tag_conds = ""
             tag_params = ()
-        rows = self.db.execute(
+        rows = self._fetch_all_locked(
             "SELECT id, conversation_id, text, tags, importance, created_at, last_accessed_at "
             f"FROM episodic_memories WHERE is_deleted = 0{tag_conds} "
             "ORDER BY created_at DESC LIMIT ? OFFSET ?",
             (*tag_params, limit, offset),
-        ).fetchall()
+        )
         return [dict(r) for r in rows]
 
     def delete_episodic(self, mem_id: str, source: str = "user_explicit") -> bool:
@@ -1580,7 +2284,7 @@ class VectorMemoryStore:
         relevant-but-old memory is admitted rather than ordered out by recency.
         """
         if query_embedding is None and query_text and self.embed_fn is not None:
-            query_embedding = self._try_embed(query_text)
+            query_embedding = self._try_embed(query_text, PRIORITY_INTERACTIVE)
         results = self.search_episodic(
             query_embedding=query_embedding,
             query_text=query_text,
@@ -1608,7 +2312,7 @@ class VectorMemoryStore:
 
     def memory_stats(self) -> dict:
         """Return counts and sizes for dashboard display."""
-        row = self.db.execute(
+        row = self._fetch_one_locked(
             "SELECT "
             "(SELECT COUNT(*) FROM semantic_memory WHERE is_deleted=0) AS sem_active, "
             "(SELECT COUNT(*) FROM semantic_memory WHERE is_deleted=1) AS sem_deleted, "
@@ -1616,7 +2320,8 @@ class VectorMemoryStore:
             "(SELECT COUNT(*) FROM episodic_memories WHERE is_deleted=1) AS ep_deleted, "
             "(SELECT COUNT(*) FROM memory_events) AS events_count, "
             "(SELECT COUNT(*) FROM episodic_memories WHERE is_deleted=0 AND embedding IS NOT NULL) AS ep_with_vec"
-        ).fetchone()
+        )
+        assert row is not None  # a scalar-subquery SELECT always returns one row
         faiss_size = len(self._faiss_id_map) if self._faiss_id_map else 0
         return {
             "semantic_active": row[0],
@@ -1626,6 +2331,10 @@ class VectorMemoryStore:
             "events_count": row[4],
             "faiss_index_size": faiss_size,
             "embedded_count": row[5],
+            # The FAISS index is an optional in-RAM accelerator (needs both
+            # faiss and numpy); without it, retrieval falls back to an exact
+            # stdlib cosine scan over the same stored embeddings.
+            "faiss_available": _HAS_FAISS and _HAS_NUMPY,
         }
 
     # ── Episodic Helpers ──
@@ -1637,10 +2346,31 @@ class VectorMemoryStore:
         entry_tags = json.loads(raw) if isinstance(raw, str) else (raw or [])
         return bool(set(t.lower() for t in entry_tags) & set(t.lower() for t in tag_filter))
 
+    def _decay_rate_for(self, raw_tags: str | list[str] | None) -> float:
+        """Resolve the per-day recency decay rate for an episodic row.
+
+        Rates come from the ``memory.decay_rates`` config mapping, keyed by tag
+        (case-insensitive, same as :meth:`_matches_tags`); the reserved
+        ``default`` key replaces the built-in ``_DEFAULT_DECAY_RATE`` for rows
+        matching no configured tag. A row carrying several configured tags uses
+        the SLOWEST decay — the smallest rate, i.e. maximum retention — so a
+        memory tagged both a long-retention tag (rate 0.0) and a general tag
+        (rate 0.03) never ages out because of the broader tag.
+        """
+        if not self._decay_by_tag:
+            return self._decay_default
+        entry_tags = json.loads(raw_tags) if isinstance(raw_tags, str) else (raw_tags or [])
+        matched = [
+            self._decay_by_tag[t.lower()]
+            for t in entry_tags
+            if isinstance(t, str) and t.lower() in self._decay_by_tag
+        ]
+        return min(matched) if matched else self._decay_default
+
     def _get_episodic(self, mem_id: str) -> dict | None:
-        row = self.db.execute(
+        row = self._fetch_one_locked(
             "SELECT * FROM episodic_memories WHERE id = ? AND is_deleted = 0", (mem_id,)
-        ).fetchone()
+        )
         return dict(row) if row else None
 
     #: Columns returned for episodic search hits. Deliberately omits the
@@ -1662,11 +2392,14 @@ class VectorMemoryStore:
         if not mem_ids:
             return {}
         placeholders = ",".join("?" * len(mem_ids))
-        rows = self.db.execute(
+        # The FAISS search path calls this while already holding _db_lock;
+        # the helper's re-acquire is safe (RLock) and keeps the site covered
+        # when reached from any future unlocked caller.
+        rows = self._fetch_all_locked(
             f"SELECT {self._EPISODIC_SEARCH_COLUMNS} FROM episodic_memories "
             f"WHERE id IN ({placeholders}) AND is_deleted = 0",
             tuple(mem_ids),
-        ).fetchall()
+        )
         return {row["id"]: dict(row) for row in rows}
 
     #: Minimum interval between last_accessed_at writes for the same episodic row.
@@ -1744,8 +2477,17 @@ class VectorMemoryStore:
         source: str = "user_explicit",
         rule_emb: list[float] | None = None,
         rule_emb_generation: int | None = None,
-    ) -> bool:
+        repo_scope: str | None = None,
+    ) -> LessonWriteResult:
         """Write a lesson as a semantic entry with key lesson.<hash>.
+
+        Returns which outcome occurred (see :class:`LessonWriteOutcome`) rather than a
+        bare ``bool``, whose ``False`` conflated "validation refused this", "a dedup
+        rule claimed it", "it is already stored exactly as submitted" and "your bare
+        re-submit kept the stored clause" -- four facts a caller cannot act on without
+        telling them apart. The result's TRUTH VALUE is still the old predicate (see
+        :class:`LessonWriteResult`), so a caller that only needs "did this write
+        something" keeps using ``if store.write_lesson(...)`` unchanged.
 
         Deduplicates against existing lessons:
         - Substring match: if existing contains new (or vice versa), longer wins
@@ -1759,9 +2501,58 @@ class VectorMemoryStore:
         this write is detected and the vector is left NULL for the backfill
         instead of being committed into the wrong space.
         """
-        import hashlib
-
         rule_lower = rule.lower()
+        # lower(), deliberately NOT casefold(). casefold() maps ß to ss, which matches
+        # "Straße" against "STRASSE" -- but the same mapping makes "Maße" and "Masse"
+        # compare EQUAL, and those are different words, so a clause submitted for one
+        # attached itself to the other and the intended lesson was never created. The
+        # two behaviours are inseparable, so this is a trade: lower() never conflates
+        # distinct rules, and its cost is a missed enrichment rather than a corrupted
+        # one. Keep both stores on the same function.
+        rule_norm = rule.strip().lower()
+        # A whitespace-only clause is no clause. `--negative "   "` is truthy, so
+        # without this it composed "<rule> — NOT:    " and REPLACED a real stored
+        # clause with blanks -- silent loss of the guidance the user had saved.
+        #
+        # isinstance FIRST, because this normalisation is what makes a non-string
+        # reachable as a crash: consolidation passes the LLM's own
+        # item.get("negative") straight through (history.py), so a model emitting
+        # `"negative": 123` would hit .strip() and abort the whole run with
+        # AttributeError. Before this normalisation existed an int only ever reached
+        # an f-string, which interpolated it harmlessly -- so the guard is paying for
+        # the strip, not for a pre-existing hole. A non-string is not usable
+        # guidance, and str()-ifying it would store a repr as if the user wrote it,
+        # so treat it as absent.
+        negative = negative.strip() or None if isinstance(negative, str) else None
+        # Same normalisation and the same non-string guard as the clause above:
+        # consolidation forwards the model's own value unchecked, so a blank scope
+        # stores as absent (applies everywhere) and a non-string is treated as
+        # absent rather than reaching .strip() and aborting the run.
+        # Canonicalise to the form the GATE compares, so storage and the gate agree
+        # on what one scope is. See canonical_scope for why the raw string is wrong.
+        #
+        # A scope the gate can NEVER satisfy is refused here rather than normalised
+        # or dropped. Both alternatives are wrong in opposite directions:
+        # canonicalising "/src/pkg" strips the slash and ACTIVATES the lesson in
+        # every repository holding src/pkg, which it was never validly scoped to;
+        # returning None instead would store it GLOBALLY, which is the fail-open a
+        # scoped lesson must never take. Refusing is the only answer that neither
+        # invents a scope nor widens one, and it keeps this surface consistent with
+        # the schema, which already rejects the same shapes.
+        if repo_scope is not None and isinstance(repo_scope, str) and repo_scope.strip():
+            if not scope_is_admissible(repo_scope):
+                return LessonWriteResult(LessonWriteOutcome.REFUSED, "scope_inadmissible")
+        repo_scope = canonical_scope(repo_scope)
+        # The category is now part of the stored value, so an unusable one would be
+        # scanned by validate_semantic and could REJECT the whole lesson -- turning a
+        # bad label into lost guidance. Consolidation passes the LLM's own
+        # item.get("category") straight through (history.py) with no validation,
+        # unlike the REST and MCP paths, which are enum-restricted by
+        # LEARN_ADD_SCHEMA. The shared helper clamps to that same enum
+        # (write policy, strict=True), safely handling unhashable labels
+        # (a dict or list from the LLM) that would make a raw set membership
+        # test raise and abort consolidation instead of clamping.
+        category = normalize_lesson_category(category, strict=True)
         rule_words = self._lesson_keywords(rule_lower)
         # Same reasoning as write_episodic: carry the space generation to the write
         # so a swap landing between the embed and the lock cannot commit a vector
@@ -1783,6 +2574,38 @@ class VectorMemoryStore:
         # inside the dedup scan below, so a swap can land between entries.
         pending_backfills: list[tuple[bytes, str, int]] = []
 
+        # PREFLIGHT the final value BEFORE the dedup scan below, which DELETES
+        # superseded rows. The value was only validated by set_semantic at the very
+        # end, so a value this store refuses (e.g. an injection-pattern ``negative``)
+        # cost the caller its existing lesson: the dedup scan deleted the old row,
+        # then set_semantic refused the replacement, and the route still returned
+        # HTTP 200 with no lesson stored. Validating here makes the whole call a
+        # no-op when the replacement cannot land.
+        key = _lesson_key(rule, repo_scope)
+        # The mapping shape keeps the two halves as separate fields, so they
+        # survive a round-trip regardless of what characters the rule contains.
+        # The legacy in-band form ("<rule><sep><negative>") is still READ below
+        # and by every renderer — no migration; old rows upgrade only when a
+        # re-submit rewrites them anyway. validate_semantic size-gates lesson
+        # mappings on their content (legacy-equivalent bytes), so the JSON
+        # envelope does not shrink the accepted rule capacity.
+        lesson_value: dict[str, object] = {
+            "rule": rule,
+            "category": category,
+            "negative": negative,
+        }
+        # The key is added only when a scope was given, so an unscoped lesson keeps
+        # the exact stored shape it has always had and no existing row is churned.
+        if repo_scope:
+            lesson_value["repo_scope"] = repo_scope
+        value: object = lesson_value
+        confidence = 1.0 if source == "user_explicit" else 0.9
+        preflight = self.validate_semantic(key, value, confidence, source)
+        if preflight is not None:
+            code, message = preflight
+            logger.info("Lesson rejected before dedup (%s): %s", code, message)
+            return LessonWriteResult(LessonWriteOutcome.REFUSED, code.value)
+
         def _flush_backfills() -> None:
             if pending_backfills:
                 with self._db_lock:
@@ -1800,15 +2623,176 @@ class VectorMemoryStore:
                         )
                     self.db.commit()
 
-        for existing in self.get_lessons():
-            existing_val = str(json.loads(existing["value_json"]))
-            existing_lower = existing_val.lower()
+        # TWO PASSES, and the order is load-bearing.
+        #
+        # Pass 1 resolves THIS lesson. Pass 2 runs the generic dedup rules, and those
+        # can claim the write on an UNRELATED row -- a superset whose text contains our
+        # rule. get_lessons() orders by md5 key, so whether such a row is scanned
+        # before ours is effectively random, and doing both in one loop made the
+        # outcome depend on that order: an unrelated superset seen first discarded an
+        # enrichment we had already selected, and the clause was dropped on HTTP 200.
+        # Resolving the exact match first makes the result order-independent, and
+        # pass 2 is skipped entirely once pass 1 claims the write.
+        # Deduplication is SCOPE-LOCAL, and both passes below share this list.
+        #
+        # A lesson scoped to one repository and a global one are different lessons
+        # even when their wording is close, so a scoped write must never supersede,
+        # enrich, or be discarded against a row from another scope. Without this the
+        # generic dedup rules (substring containment, >50% keyword overlap, high
+        # cosine similarity) reach across scopes and DELETE guidance the submitter
+        # never addressed -- writing a repo-scoped rule could retire a global one
+        # that merely shared most of its significant words.
+        #
+        # A row whose value will not parse is dropped here rather than compared,
+        # matching what ``_as_text`` does with a value that has no lesson shape.
+        lesson_rows = []
+        for _row in self.get_lessons():
+            try:
+                _decoded = json.loads(_row["value_json"])
+            except (ValueError, TypeError):
+                continue
+            # A row whose scope is present but unusable belongs to NO partition. It
+            # is withheld at injection, so letting it read as unscoped here would let
+            # it dedup away a genuine global write: the caller would be told the
+            # lesson was saved while the only row carrying that rule never reaches a
+            # prompt. All three readers of this field agree on that now.
+            if _lesson_scope_unusable(_decoded):
+                continue
+            if _lesson_scope(_decoded) == repo_scope:
+                lesson_rows.append(_row)
+
+        def _as_text(row: dict) -> str | None:
+            """The row's value as lesson TEXT, or None when it has no lesson shape.
+
+            set_semantic accepts any object, so an import or a legacy migration can
+            leave a list or a rule-less dict under a lesson.* key. str() would render
+            a Python repr, and every text comparison here -- the substring dedup and
+            the keyword overlap -- would then match against that repr. Skipping is
+            the honest reading: it is not lesson text.
+
+            Mapping-shaped rows (write_lesson's own format, and the onboarding
+            import's) render through _lesson_embed_text (the rule only, without
+            the NOT-clause), so deduplication compares rules on the same basis
+            that embedding similarity does — the negative qualifies the rule but
+            does not change its identity.
+            """
+            text = _lesson_embed_text(json.loads(row["value_json"]))
+            return text or None
+
+        matched = False
+        for existing in lesson_rows:
+            decoded = json.loads(existing["value_json"])
+            fields = _lesson_fields(decoded)
+            if fields is not None:
+                # Mapping shape: the halves are separate fields, so the stored
+                # ``rule`` IS the rule and identifying it needs no key confirmation,
+                # whatever key the writer derived (write_lesson uses md5, the
+                # onboarding import sha256). This is what lets a re-submit enrich an
+                # imported lesson, which the string form could never do safely.
+                #
+                # Identity is the stored rule TEXT, never the key alone: a row whose
+                # key and stored rule disagree would otherwise be claimed by this
+                # rule and rewritten, attaching the submitted clause to a different
+                # lesson and dropping the submitted rule entirely.
+                stored_rule, stored_negative = fields
+                if stored_rule.lower() != rule_norm:
+                    continue
+                base = stored_rule
+                stored_clause = stored_negative is not None
+            elif isinstance(decoded, str):
+                existing_val = decoded
+                # Key equality FIRST: md5(rule) identifies THIS lesson exactly,
+                # whatever the stored value contains. Otherwise defer to
+                # _split_stored, which confirms a candidate prefix against the row's
+                # own key rather than guessing a reading of the in-band separator.
+                if existing["key"] == key:
+                    legacy_base: str | None = rule.strip()
+                    stored_clause = existing_val != legacy_base
+                else:
+                    legacy_base, stored_clause = _split_stored(
+                        existing_val, rule_norm, existing["key"]
+                    )
+                if legacy_base is None:
+                    continue
+                base = legacy_base
+                stored_negative = None  # in-band; only its presence is known
+            else:
+                continue  # not lesson data (list, rule-less dict, ...)
+
+            if not negative and stored_clause:
+                # A BARE re-submit of a rule that already carries a clause. Writing
+                # the bare value would delete the stored negative, so keep what is
+                # there. This is also what the call did before the fix, so no caller
+                # sees a change here.
+                logger.info(
+                    "Keeping the stored NOT-clause on %r; re-submit carried none",
+                    existing["key"],
+                )
+                _flush_backfills()
+                return LessonWriteResult(LessonWriteOutcome.UNCHANGED, "kept_stored_clause")
+            if fields is not None:
+                # Mapping row: a re-submit that changes nothing the fields express
+                # is a no-op. Category is effectively WRITE-ONCE here: it is not
+                # compared or rewritten on enrichment, because the intent of a
+                # re-submit-with-clause is "attach the clause", not "recategorize"
+                # (correcting a category means delete + re-add). The string form
+                # never stored a category for anything to have depended on.
+                if negative == stored_negative:
+                    _flush_backfills()
+                    return LessonWriteResult(LessonWriteOutcome.UNCHANGED)
+                stored_category = decoded.get("category")
+                enriched: dict[str, object] = {
+                    "rule": stored_rule,
+                    "category": stored_category if isinstance(stored_category, str) else category,
+                    "negative": negative,
+                }
+                # The scope is WRITE-ONCE for the same reason the category is: the
+                # intent of a re-submit-with-clause is "attach the clause", not
+                # "re-scope". Carrying the STORED value forward means enrichment can
+                # never strip a scope, and re-scoping is a delete + re-add.
+                stored_scope = _lesson_scope(decoded)
+                if stored_scope:
+                    enriched["repo_scope"] = stored_scope
+                target: object = enriched
+            else:
+                # Legacy string row. Recompose from the STORED base so a
+                # case-variant re-submit attaches its clause without silently
+                # re-casing the rule. A byte-identical re-submit stays a no-op (the
+                # row is not churned into the new shape); an actual enrichment
+                # rewrites it as a mapping, upgrading the row in place.
+                target_text = base if not negative else f"{base}{_LESSON_NEGATIVE_SEP}{negative}"
+                if target_text == existing_val:
+                    _flush_backfills()
+                    return LessonWriteResult(LessonWriteOutcome.UNCHANGED)
+                target = {"rule": base, "category": category, "negative": negative}
+            # The preflight above validated the value built from the SUBMITTED rule;
+            # this one differs, so validate what is actually written.
+            enrich_reject = self.validate_semantic(existing["key"], target, confidence, source)
+            if enrich_reject is not None:
+                _flush_backfills()
+                return LessonWriteResult(LessonWriteOutcome.REFUSED, enrich_reject[0].value)
+            # Write back under the EXISTING key -- a case-variant would otherwise
+            # insert a second row for the same lesson under a different md5. The
+            # shared tail below does the write.
+            key, value = existing["key"], target
+            matched = True
+            break
+
+        # Built once for the whole scan (query-side vector + norm are the same
+        # for every row) rather than per candidate — see _stored_similarity_scorer.
+        similarity = self._stored_similarity_scorer(rule_emb) if rule_emb else None
+
+        for existing in [] if matched else lesson_rows:
+            existing_text = _as_text(existing)
+            if existing_text is None:
+                continue
+            existing_lower = existing_text.lower()
 
             # Substring dedup
             if rule_lower in existing_lower:
                 logger.info("Lesson dedup: %r already covered by %r", rule[:60], existing["key"])
                 _flush_backfills()
-                return False
+                return LessonWriteResult(LessonWriteOutcome.DEDUPED, "substring_covered")
             if existing_lower in rule_lower:
                 self.delete_semantic(existing["key"], source)
                 continue
@@ -1823,26 +2807,22 @@ class VectorMemoryStore:
                         logger.info(
                             "Lesson conflict: %r replaces %r (%.0f%% overlap)",
                             rule[:60],
-                            existing_val[:60],
+                            existing_text[:60],
                             ratio * 100,
                         )
                         self.delete_semantic(existing["key"], source)
                         continue
 
             # Semantic dedup via embeddings (use stored embedding when available)
-            if rule_emb:
+            if similarity is not None:
                 existing_emb_blob = existing.get("embedding")
+                row_blob: bytes | None = None
                 if (
                     existing_emb_blob
                     and isinstance(existing_emb_blob, bytes)
                     and len(existing_emb_blob) >= 4
                 ):
-                    try:
-                        existing_emb = list(
-                            struct.unpack(f"{len(existing_emb_blob) // 4}f", existing_emb_blob)
-                        )
-                    except struct.error:
-                        existing_emb = None
+                    row_blob = existing_emb_blob
                 elif self.embed_fn and backfills_done < _MAX_BACKFILLS_PER_CALL:
                     # Lazy backfill: compute embedding for legacy lessons (count even on failure)
                     # Sampled BEFORE the embed: _try_embed returns None when a swap
@@ -1850,20 +2830,24 @@ class VectorMemoryStore:
                     # Sampling after it returns would tag an old blob with the new
                     # generation and the flush check would wave it through.
                     backfill_generation = self._space_generation
-                    existing_emb = self._try_embed(existing_val)
+                    # Embed the canonical rule text (matching write_lesson), not
+                    # the display rendering -- the vector must live in the same
+                    # space as the query vectors it is compared against.
+                    existing_emb = self._try_embed(
+                        _lesson_embed_text(json.loads(existing["value_json"])),
+                        PRIORITY_BULK,
+                    )
                     if existing_emb:
-                        blob = struct.pack(f"{len(existing_emb)}f", *existing_emb)
+                        row_blob = struct.pack(f"{len(existing_emb)}f", *existing_emb)
                         pending_backfills.append(
-                            (blob, existing["key"], backfill_generation)
+                            (row_blob, existing["key"], backfill_generation)
                         )
                     backfills_done += 1
-                else:
-                    existing_emb = None
-                if existing_emb:
-                    sim = self._cosine_sim(rule_emb, existing_emb)
+                if row_blob is not None:
+                    sim = similarity({"embedding": row_blob})
                     if sim > 0.85:
                         logger.info("Lesson semantic dedup: %.2f sim with %r", sim, existing["key"])
-                        if len(rule) > len(existing_val):
+                        if len(rule) > len(existing_text):
                             pending_backfills[:] = [
                                 (b, k, g)
                                 for b, k, g in pending_backfills
@@ -1872,16 +2856,16 @@ class VectorMemoryStore:
                             self.delete_semantic(existing["key"], source)
                         else:
                             _flush_backfills()
-                            return False
+                            return LessonWriteResult(
+                                LessonWriteOutcome.DEDUPED, "semantic_similarity"
+                            )
 
         _flush_backfills()
 
-        slug = hashlib.md5(rule.encode(), usedforsecurity=False).hexdigest()[:12]
-        key = f"lesson.{slug}"
-        value = rule if not negative else f"{rule} — NOT: {negative}"
-        confidence = 1.0 if source == "user_explicit" else 0.9
         err = self.set_semantic(key, value, confidence, source)
-        if err is None and rule_emb:
+        if err is not None:
+            return LessonWriteResult(LessonWriteOutcome.REFUSED, err[0].value)
+        if rule_emb:
             emb_blob = struct.pack(f"{len(rule_emb)}f", *rule_emb)
             with self._db_lock:
                 if self._space_generation != lesson_embed_generation:
@@ -1895,7 +2879,14 @@ class VectorMemoryStore:
                         (emb_blob, key),
                     )
                     self.db.commit()
-        return err is None
+        # ``matched`` is pass 1's verdict: it rewrote an EXISTING row under that row's
+        # own key to attach a clause, which is an enrichment. Every other route here
+        # wrote a new row under the submitted rule's key -- including the ones that
+        # superseded an older row first, since the caller's lesson did not exist under
+        # this key before. Same two words the JSONL store uses for the same events.
+        return LessonWriteResult(
+            LessonWriteOutcome.ENRICHED if matched else LessonWriteOutcome.INSERTED
+        )
 
     @staticmethod
     def _lesson_keywords(text: str) -> set[str]:
@@ -1948,6 +2939,7 @@ class VectorMemoryStore:
         threshold_low: float = 0.4,
         threshold_high: float = 0.85,
         rule_emb: list[float] | None = None,
+        repo_scope: str | None = None,
     ) -> list[dict]:
         """Find lessons related to rule but not caught by standard dedup.
 
@@ -1955,32 +2947,77 @@ class VectorMemoryStore:
         — candidates that may contradict the new rule. Pass ``rule_emb`` to reuse
         an embedding already computed by the caller and avoid a second blocking
         embed of the identical text.
+
+        Candidates are SCOPE-LOCAL: only rows whose stored ``repo_scope`` equals
+        *repo_scope* are considered. Superseding resolves a contradiction by
+        DELETING the losing row, and a repository-scoped rule that contradicts a
+        global one inside its own tree does not contradict it anywhere else --
+        sweeping across scopes would retire the global rule for every other
+        repository on the strength of one repo's exception.
         """
         if rule_emb is None:
             rule_emb = self._try_embed(rule) if self.embed_fn else None
         if not rule_emb:
             return []
+        # Builds the query-side work (vector + its norm) once for the whole scan,
+        # same reasoning as _rank_lessons / get_semantic_context. A row with no
+        # stored embedding, or one at a different dimensionality, scores 0.0 —
+        # which threshold_low's default of 0.4 already excludes without an
+        # explicit skip.
+        similarity = self._stored_similarity_scorer(rule_emb)
         candidates = []
         for existing in self.get_lessons():
-            existing_emb_blob = existing.get("embedding")
-            if (
-                not existing_emb_blob
-                or not isinstance(existing_emb_blob, bytes)
-                or len(existing_emb_blob) < 4
-            ):
-                continue
-            try:
-                existing_emb = list(
-                    struct.unpack(f"{len(existing_emb_blob) // 4}f", existing_emb_blob)
-                )
-            except struct.error:
-                continue
-            sim = self._cosine_sim(rule_emb, existing_emb)
+            sim = similarity(existing)
             if threshold_low <= sim < threshold_high:
-                existing_val = str(json.loads(existing["value_json"]))
+                try:
+                    decoded = json.loads(existing["value_json"])
+                except (ValueError, TypeError):
+                    continue
+                if _lesson_scope_unusable(decoded):
+                    continue
+                if _lesson_scope(decoded) != repo_scope:
+                    continue
+                # Rendered text, not str(): a mapping-shaped row would otherwise
+                # hand its Python repr to the contradiction prompt as the "rule".
+                existing_val = _lesson_display_text(decoded)
+                if not existing_val:
+                    continue
                 candidates.append({"key": existing["key"], "rule": existing_val, "similarity": sim})
         candidates.sort(key=lambda x: x["similarity"], reverse=True)
         return candidates[:5]
+
+    def has_any_lesson(self) -> bool:
+        """Whether any active row decodes to RENDERABLE lesson data, ignoring scope.
+
+        Distinguishes "this store is not populated yet" from "this store is
+        populated but nothing is in scope for this project". Those look identical
+        in a rendered context block and need opposite handling: the first means the
+        JSONL store is still the authority, the second means this store already
+        answered and the JSONL store must stay silent.
+
+        A ``lesson.*`` key is not sufficient evidence. ``set_semantic`` accepts any
+        object, so an import or a legacy migration can leave a list or a rule-less
+        dict under one -- which every renderer already skips. Counting such a row as
+        population would silence the JSONL store while nothing renders, so saved
+        corrections would vanish. The decode is the same one the renderer uses.
+
+        Selects ``value_json`` only, never ``SELECT *``: reading every embedding
+        blob is the duplicate-SELECT cost the rendering path was written to avoid.
+        """
+        rows = self._fetch_all_locked(
+            "SELECT value_json FROM semantic_memory "
+            "WHERE is_deleted = 0 AND key LIKE 'lesson.%'"
+        )
+        for row in rows:
+            try:
+                decoded = json.loads(row["value_json"])
+            except (ValueError, TypeError):
+                continue
+            if _lesson_scope_unusable(decoded):
+                continue
+            if _lesson_display_text(decoded):
+                return True
+        return False
 
     def get_lessons(self, limit: int | None = None) -> list[dict]:
         """Return lesson.* entries ordered by most recently updated."""
@@ -1989,11 +3026,16 @@ class VectorMemoryStore:
             "WHERE is_deleted = 0 AND key LIKE 'lesson.%' "
             "ORDER BY updated_at DESC"
         )
+        # On the same concurrent context-injection path as get_semantic_context
+        # (get_lessons_context runs on executor threads while lesson writes are
+        # offloaded to workers), so the fetch must be serialized on the shared
+        # connection. _db_lock is reentrant, so callers that already hold it
+        # remain safe.
         if limit is not None and limit > 0:
             sql += " LIMIT ?"
-            rows = self.db.execute(sql, (limit,)).fetchall()
+            rows = self._fetch_all_locked(sql, (limit,))
         else:
-            rows = self.db.execute(sql).fetchall()
+            rows = self._fetch_all_locked(sql)
         return [dict(r) for r in rows]
 
     def delete_lesson(self, rule_substring: str) -> bool:
@@ -2001,30 +3043,200 @@ class VectorMemoryStore:
         deleted = False
         for e in self.get_lessons():
             val = json.loads(e["value_json"])
-            if rule_substring.lower() in str(val).lower():
+            # Match against the rendered lesson text so a mapping-shaped row is
+            # matched on its rule/clause, not on its repr (which would let a
+            # substring like "category" delete every imported lesson). Rows with
+            # no lesson shape fall back to str() so junk rows stay deletable.
+            text = _lesson_display_text(val) or str(val)
+            if rule_substring.lower() in text.lower():
                 self.delete_semantic(e["key"], "user_explicit")
                 deleted = True
         return deleted
 
-    def get_lessons_context(self) -> str:
-        """Format lessons for prompt injection."""
-        lessons = self.get_lessons(limit=50)
-        if not lessons:
+    def get_lessons_context(
+        self, query_text: str = "", cap: int = 0, project_dir: str | Path | None = None
+    ) -> str:
+        """Format lessons for prompt injection, most relevant first.
+
+        Lessons are ranked against *query_text* using the same hybrid
+        vector + keyword score as :meth:`get_semantic_context`, then emitted
+        until *cap* characters are used. Ranking is relevance-only — neither
+        ``source`` nor ``confidence`` contributes — so an unrelated user-taught
+        rule cannot displace a relevant inferred one.
+
+        Args:
+            query_text: Request to rank against. Empty keeps recency order.
+            cap: Character budget for the rendered block. 0 means unbounded.
+            project_dir: The session's active project, used only by the
+                ``repo_scope`` gate. Omitting it withholds every scoped lesson.
+        """
+        # Scope is applied BEFORE the counts are taken, so a lesson withheld as
+        # out-of-scope is not reported as "omitted" -- omitted means "did not fit
+        # the budget", and conflating the two would tell the model that rules it
+        # should never see are being kept from it for space.
+        entries: list[tuple[dict, str]] = []
+        for row in self.get_lessons():
+            decoded = json.loads(row["value_json"])
+            text = _lesson_display_text(decoded)
+            if not text:
+                continue
+            scope = _lesson_scope(decoded)
+            if _lesson_scope_unusable(decoded):
+                continue
+            if scope and not project_scope_satisfied(scope, project_dir):
+                continue
+            entries.append((row, text))
+        if not entries:
             return ""
-        lines = [
-            "[Learned corrections — user-taught rules from past mistakes.\n"
-            "ALWAYS follow these. They override default behavior.]"
-        ]
-        for e in lessons:
-            lines.append(f"- {json.loads(e['value_json'])}")
-        lines.append("[End of learned corrections]\n")
-        return "\n".join(lines)
+        total = len(entries)
+        ranked = self._rank_lessons(entries, query_text) if query_text else entries
+        order = "most relevant" if query_text else "most recent"
+
+        def render(rows: list[tuple[dict, str]]) -> str:
+            header = (
+                "[Learned corrections — user-taught rules from past mistakes.\n"
+                "ALWAYS follow these. They override default behavior."
+            )
+            if len(rows) < total:
+                header += (
+                    f"\nShowing {len(rows)} of {total} lessons, {order} first; "
+                    f"{total - len(rows)} omitted."
+                )
+            body = "\n".join(f"- {text}" for _, text in rows)
+            return f"{header}]\n{body}\n[End of learned corrections]\n"
+
+        if not cap:
+            return render(ranked)
+
+        selected: list[tuple[dict, str]] = []
+        used = 0
+        for entry in ranked:
+            size = len(entry[1]) + 3  # "- " prefix and newline
+            if selected and used + size > cap:
+                # Skip rather than stop: one long lesson high in the ranking
+                # must not discard every shorter one behind it that still fits.
+                continue
+            selected.append(entry)
+            used += size
+        # The header grows with the counts it reports, so trim to fit rather
+        # than reserving a guessed margin. At least one lesson is always kept.
+        while len(selected) > 1 and len(render(selected)) > cap:
+            selected.pop()
+        return render(selected)
+
+    def _rank_lessons(
+        self, entries: list[tuple[dict, str]], query_text: str
+    ) -> list[tuple[dict, str]]:
+        """Order *entries* by hybrid relevance to *query_text*, most relevant first.
+
+        Stored ``embedding`` blobs are reused, so this costs one embed for the
+        query rather than one per lesson. The sort is stable and *entries*
+        arrives newest-first, so equal scores keep recency order and a query
+        that matches nothing degrades to plain recency.
+        """
+        query_words = _stem_words(set(re.findall(r"\w+", query_text.lower())))
+        query_emb = self._try_embed(query_text, PRIORITY_INTERACTIVE) if self.embed_fn else None
+        similarity = self._stored_similarity_scorer(query_emb)
+        scored: list[tuple[float, tuple[dict, str]]] = []
+        for entry in entries:
+            row, text = entry
+            # Only the rendered text is matched. A lesson key is
+            # ``lesson.<md5hash>``, which carries no words, so there is no key
+            # term to weight here the way get_semantic_context() weights its own.
+            overlap = len(query_words & _stem_words(set(re.findall(r"\w+", text.lower()))))
+            score = _hybrid_score(_keyword_score(overlap), similarity(row))
+            scored.append((score, entry))
+        scored.sort(key=lambda pair: -pair[0])
+        return [entry for _, entry in scored]
+
+    @staticmethod
+    def _stored_similarity_scorer(
+        query_emb: list[float] | None,
+    ) -> Callable[[dict], float]:
+        """Build a cosine scorer for one query, with query-side work done once.
+
+        The query vector and its norm are the same for every row, so deriving
+        them per row repeats a full pass over the query once per lesson. Hoisting
+        them out of the loop is where nearly all of the saving is — vectorizing
+        the dot product while still converting the query inside the loop keeps
+        most of the original cost. ``_sqlite_vector_search`` already normalizes
+        its query once for the same reason; this is the lesson-path equivalent.
+
+        Stored lesson vectors are un-normalized by contract (see
+        ``backfill_lesson_embeddings``), so the row norm stays inside the loop
+        and both norms are divided out. A bare inner product would be correct
+        only while the embedding model happens to emit unit vectors, which
+        nothing enforces.
+
+        A row whose vector has a different dimensionality is incomparable and
+        scores 0.0 rather than being truncated against the query, matching
+        ``_sqlite_vector_search`` and ``HybridRetriever._cosine_similarity``.
+
+        The raw (possibly negative) cosine value is returned uncapped — a
+        ranking caller that never distinguishes "no vector" (0.0) from
+        "opposite direction" (negative) should clamp at its own call site
+        (``max(0.0, ...)``); a threshold caller comparing the value against a
+        band that may include non-positive bounds needs the true value. The
+        numpy path promotes both operands to float64 before the norm and the
+        dot product: the stored blob is float32 on disk, and accumulating a
+        many-dimensional norm/dot in float32 lands ~1e-7 away from the plain
+        ``_cosine_sim`` this scorer replaces — irrelevant when only sorting,
+        not irrelevant when the value is compared against a fixed threshold
+        like the semantic-dedup line.
+        """
+        if not query_emb:
+            return lambda row: 0.0
+        q_len = len(query_emb)
+        q_bytes = q_len * 4
+
+        if _HAS_NUMPY:
+            q_vec = np.asarray(query_emb, dtype=np.float64)
+            q_norm = float(np.linalg.norm(q_vec))
+            if not q_norm:
+                return lambda row: 0.0
+
+            def numpy_scorer(row: dict) -> float:
+                blob = row.get("embedding")
+                if not isinstance(blob, bytes) or len(blob) != q_bytes:
+                    return 0.0
+                vec = np.frombuffer(blob, dtype=np.float32).astype(np.float64)
+                denom = float(np.linalg.norm(vec)) * q_norm
+                return float(vec @ q_vec) / denom if denom else 0.0
+
+            return numpy_scorer
+
+        q_norm_py = math.sqrt(sum(x * x for x in query_emb))
+        if not q_norm_py:
+            return lambda row: 0.0
+
+        def stdlib_scorer(row: dict) -> float:
+            blob = row.get("embedding")
+            if not isinstance(blob, bytes) or len(blob) != q_bytes:
+                return 0.0
+            vec = struct.unpack(f"{q_len}f", blob)
+            denom = math.sqrt(sum(y * y for y in vec)) * q_norm_py
+            if not denom:
+                return 0.0
+            return sum(x * y for x, y in zip(query_emb, vec)) / denom
+
+        return stdlib_scorer
 
     # ── Migration & Import ──
 
     @staticmethod
     def _cosine_sim(a: list[float], b: list[float]) -> float:
-        """Cosine similarity between two vectors."""
+        """Cosine similarity between two vectors.
+
+        Vectors of different length are incomparable and score 0.0 rather
+        than being silently truncated to the shorter one by ``zip`` — a row
+        embedded at a different dimensionality (e.g. an old embedding-model
+        generation) would otherwise return a plausible-looking partial-overlap
+        score instead of being rejected. Matches the dimension guard already
+        enforced by ``_stored_similarity_scorer`` (byte-length check) and
+        ``HybridRetriever._cosine_similarity``.
+        """
+        if len(a) != len(b):
+            return 0.0
         dot = sum(x * y for x, y in zip(a, b))
         norm_a = math.sqrt(sum(x * x for x in a))
         norm_b = math.sqrt(sum(y * y for y in b))
@@ -2047,7 +3259,7 @@ class VectorMemoryStore:
             return ("pref.general", match.group(1).strip())
         return None
 
-    def _try_embed(self, text: str) -> list[float] | None:
+    def _try_embed(self, text: str, priority: int = PRIORITY_NORMAL) -> list[float] | None:
         """Embed text using embed_fn if available.
 
         If embed_fn is None but embed_fn_factory is set, attempt to lazily
@@ -2104,7 +3316,12 @@ class VectorMemoryStore:
         if self.embed_fn is not None:
             try:
                 generation_before = self._space_generation
-                result = self.embed_fn(text)
+                # Only forward to an embed_fn that advertises the kwarg. A custom
+                # or legacy embed_fn keeps its single-argument contract.
+                if getattr(self.embed_fn, "accepts_priority", False):
+                    result = self.embed_fn(text, priority=priority)  # type: ignore[call-arg]
+                else:
+                    result = self.embed_fn(text)
                 if self._space_generation != generation_before:
                     # A model swap landed while this text was in flight. The
                     # vector belongs to the previous space; committing it would
@@ -2125,8 +3342,7 @@ class VectorMemoryStore:
 
     def _read_meta(self, key: str) -> str | None:
         """Read a ``memory_meta`` value, or None when absent."""
-        with self._db_lock:
-            row = self.db.execute("SELECT value FROM memory_meta WHERE key = ?", (key,)).fetchone()
+        row = self._fetch_one_locked("SELECT value FROM memory_meta WHERE key = ?", (key,))
         return str(row["value"]) if row is not None else None
 
     def _write_meta(self, key: str, value: str) -> None:
@@ -2317,6 +3533,36 @@ class VectorMemoryStore:
             logger.info("Recorded embedding vector space %s (no stored vectors)", signature)
         return invalidated
 
+    def has_pending_embeddings(self) -> bool:
+        """True when any row is waiting for a vector. Never loads the model.
+
+        The existence probe for :meth:`backfill_missing_embeddings`: it answers
+        "would that sweep have anything to do?" without touching the embedder, so
+        a caller can skip a ~700MB model load on a boot with nothing to embed.
+        Three ``SELECT 1 ... LIMIT 1`` reads over the SAME predicates the sweep's
+        three sub-sweeps use — episodic, ``lesson.*`` semantic, and non-lesson
+        semantic — so a row this returns False for is a row that sweep would not
+        have embedded either.
+
+        Deliberately independent of ``embed_fn``: the question is whether WORK
+        exists, not whether this store is currently able to do it. The sweep
+        keeps its own ``embed_fn is None`` guard, and a caller that is about to
+        bind ``embed_fn`` needs the answer before it does so.
+
+        The numpy gate on the episodic loop is likewise not mirrored here. numpy
+        is a declared runtime dependency, so its absence is a broken install
+        rather than a state to optimise for, and erring toward True there only
+        costs what every boot pays today.
+        """
+        probes = (
+            "SELECT 1 FROM episodic_memories WHERE is_deleted = 0 AND embedding IS NULL LIMIT 1",
+            "SELECT 1 FROM semantic_memory WHERE is_deleted = 0 AND embedding IS NULL "
+            "AND key LIKE 'lesson.%' LIMIT 1",
+            "SELECT 1 FROM semantic_memory WHERE is_deleted = 0 AND embedding IS NULL "
+            "AND key NOT LIKE 'lesson.%' LIMIT 1",
+        )
+        return any(self._fetch_one_locked(sql) is not None for sql in probes)
+
     def backfill_missing_embeddings(
         self, progress: "Callable[[int, int], None] | None" = None
     ) -> int:
@@ -2333,8 +3579,12 @@ class VectorMemoryStore:
         Rows cleared by :meth:`reconcile_embedding_space` after an embedding-model
         change arrive here the same way, so a model swap re-embeds through this
         one path rather than a parallel one. Lesson vectors cleared by the same
-        call are repaired here too via :meth:`_backfill_lesson_embeddings`; the
-        returned count stays EPISODIC-only, which is what callers report.
+        call are repaired here too via :meth:`_backfill_lesson_embeddings`, and
+        non-lesson semantic rows via :meth:`_backfill_semantic_kv_embeddings`
+        (covers rows written before write-time embedding existed, rows written
+        while the model was absent, and ``set_semantic_if_absent`` imports,
+        which defer embedding to this sweep by design); the returned count stays
+        EPISODIC-only, which is what callers report.
 
         Idempotent and cheap in steady state: a no-op (returns 0) when there is
         no ``embed_fn``, numpy is missing, or no NULL-embedding rows remain.
@@ -2355,13 +3605,18 @@ class VectorMemoryStore:
         # there is not a single NULL episodic row — which is exactly the state
         # after reconcile_embedding_space() on a memory that holds only lessons.
         self._backfill_lesson_embeddings(progress)
+        # Same for non-lesson semantic KV rows: struct-packed, no numpy, no
+        # FAISS — get_semantic_context ranks them straight from the stored blob.
+        # No progress callback: the (done,total) stream belongs to the episodic
+        # loop below, and a second denominator would make the dashboard bar
+        # jump backward when both row types need re-embedding.
+        self._backfill_semantic_kv_embeddings()
         if not _HAS_NUMPY:
             return 0
-        with self._db_lock:
-            rows = self.db.execute(
-                "SELECT id, text FROM episodic_memories "
-                "WHERE is_deleted = 0 AND embedding IS NULL"
-            ).fetchall()
+        rows = self._fetch_all_locked(
+            "SELECT id, text FROM episodic_memories "
+            "WHERE is_deleted = 0 AND embedding IS NULL"
+        )
         if not rows:
             return 0
         embedded = 0
@@ -2371,7 +3626,7 @@ class VectorMemoryStore:
             # spin, and this loop can run for minutes on a large corpus.
             progress(0, total)
         for row in rows:
-            vec = self._try_embed(row["text"])
+            vec = self._try_embed(row["text"], PRIORITY_BULK)
             if not vec:
                 if progress is not None:
                     progress(embedded, total)
@@ -2428,19 +3683,19 @@ class VectorMemoryStore:
         arbitrarily long, and until then dedup silently degrades and can accept a
         duplicate or contradictory lesson.
 
-        Scoped to ``lesson.*`` keys because those are the only semantic rows that
-        ever carry a vector — embedding every semantic KV would be new work, not a
-        repair. Failures leave the row NULL so a later sweep retries it, matching
-        the episodic sweep's contract. No FAISS involvement: lesson vectors are
+        Scoped to ``lesson.*`` keys because lessons embed different TEXT than
+        the other semantic rows (the raw rule text, matching write_lesson);
+        non-lesson rows are swept by :meth:`_backfill_semantic_kv_embeddings`.
+        Failures leave the row NULL so a later sweep retries it, matching the
+        episodic sweep's contract. No FAISS involvement: lesson vectors are
         compared directly, never indexed.
         """
         if self.embed_fn is None:
             return 0
-        with self._db_lock:
-            rows = self.db.execute(
-                "SELECT key, value_json FROM semantic_memory "
-                "WHERE is_deleted = 0 AND embedding IS NULL AND key LIKE 'lesson.%'"
-            ).fetchall()
+        rows = self._fetch_all_locked(
+            "SELECT key, value_json FROM semantic_memory "
+            "WHERE is_deleted = 0 AND embedding IS NULL AND key LIKE 'lesson.%'"
+        )
         if not rows:
             return 0
         embedded = 0
@@ -2449,11 +3704,18 @@ class VectorMemoryStore:
             progress(0, total)
         for row in rows:
             try:
-                text = str(json.loads(row["value_json"]))
+                # Canonical embedding input: the mapping's rule field (matching
+                # write_lesson, which embeds the bare rule), the stored text for
+                # a legacy string row. Embedding a mapping row's str() would
+                # vectorize its Python repr.
+                text = _lesson_embed_text(json.loads(row["value_json"]))
             except (ValueError, TypeError):
                 logger.debug("Skipping lesson %s with unparseable value", row["key"])
                 continue
-            vec = self._try_embed(text)
+            if not text:
+                logger.debug("Skipping lesson %s with no renderable text", row["key"])
+                continue
+            vec = self._try_embed(text, PRIORITY_BULK)
             if not vec:
                 continue
             # Stored un-normalized to match write_lesson(): _cosine_sim()
@@ -2470,6 +3732,68 @@ class VectorMemoryStore:
                 progress(embedded, total)
         if embedded:
             logger.info("Backfilled embeddings for %d lessons", embedded)
+        return embedded
+
+    def _backfill_semantic_kv_embeddings(
+        self, progress: "Callable[[int, int], None] | None" = None
+    ) -> int:
+        """Embed non-lesson semantic rows whose vector is NULL. Returns the count.
+
+        Steady-state rows are embedded at write time (``_write_semantic``); this
+        sweep repairs the rest: rows written while the embedding model was
+        absent, rows cleared by :meth:`reconcile_embedding_space` after a model
+        swap, and bulk-imported rows from :meth:`set_semantic_if_absent`, which
+        defers embedding here the way ``write_episodic(defer_embedding=True)``
+        does for episodic bulk writers.
+
+        The embedded text is ``"<key> <value_json>"`` — the same text the write
+        path embeds and :meth:`get_semantic_context` ranks against, so a
+        backfilled vector is indistinguishable from a write-time one. Blobs are
+        struct-packed and un-normalized, matching the lesson contract
+        (:meth:`_stored_similarity_scorer` divides both norms out). Failures
+        leave the row NULL so a later sweep retries it. No FAISS involvement.
+        """
+        if self.embed_fn is None:
+            return 0
+        rows = self._fetch_all_locked(
+            "SELECT key, value_json FROM semantic_memory "
+            "WHERE is_deleted = 0 AND embedding IS NULL AND key NOT LIKE 'lesson.%'"
+        )
+        if not rows:
+            return 0
+        embedded = 0
+        total = len(rows)
+        if progress is not None:
+            progress(0, total)
+        for row in rows:
+            # Sampled BEFORE the embed, re-checked under the lock: a model swap
+            # landing across the embed must not commit a vector from the old
+            # space (reconcile has already swept past this row).
+            backfill_generation = self._space_generation
+            vec = self._try_embed(f"{row['key']} {row['value_json']}", PRIORITY_BULK)
+            if not vec:
+                if progress is not None:
+                    progress(embedded, total)
+                continue
+            blob = struct.pack(f"{len(vec)}f", *vec)
+            with self._db_lock:
+                if backfill_generation != self._space_generation:
+                    logger.debug("Dropping a semantic backfill from a previous space")
+                    continue
+                # value_json guard: a concurrent re-write of this key already
+                # cleared-and-refilled its own vector; stamping the OLD value's
+                # vector over it would rank the row by text it no longer holds.
+                self.db.execute(
+                    "UPDATE semantic_memory SET embedding = ? "
+                    "WHERE key = ? AND value_json = ? AND embedding IS NULL",
+                    (blob, row["key"], row["value_json"]),
+                )
+                self.db.commit()
+            embedded += 1
+            if progress is not None:
+                progress(embedded, total)
+        if embedded:
+            logger.info("Backfilled embeddings for %d semantic entries", embedded)
         return embedded
 
     def migrate_from_markdown(self) -> dict[str, int]:
@@ -2493,8 +3817,26 @@ class VectorMemoryStore:
                     data = json.loads(line)
                     rule = data.get("rule", "")
                     negative = data.get("negative")
+                    # This loop reads lessons.jsonl DIRECTLY rather than through
+                    # LessonStore.load_all, so it needs the same three-state rule:
+                    # an absent scope means global, but a PRESENT unusable one means
+                    # the row wanted a scope and cannot say which. Passing that to
+                    # write_lesson would normalise it to None and inject the
+                    # correction everywhere -- fail-open. Counted as skipped, like
+                    # any other row this loop cannot use.
+                    raw_scope = data.get("repo_scope")
+                    if raw_scope is not None and not scope_is_admissible(raw_scope):
+                        counts["skipped"] += 1
+                        continue
+                    # Carry the scope across. Dropping it would silently widen a
+                    # repository-scoped correction into a global one, which is the
+                    # one direction the scope gate must never move.
                     if rule and self.write_lesson(
-                        rule, data.get("category", "knowledge"), negative, source="migration"
+                        rule,
+                        data.get("category", "knowledge"),
+                        negative,
+                        source="migration",
+                        repo_scope=raw_scope,
                     ):
                         counts["semantic"] += 1
                     else:
@@ -2584,9 +3926,10 @@ class VectorMemoryStore:
                     else:
                         counts["skipped"] += 1
 
-        embedded_n = self.db.execute(
+        embedded_row = self._fetch_one_locked(
             "SELECT COUNT(*) FROM episodic_memories WHERE is_deleted=0 AND embedding IS NOT NULL"
-        ).fetchone()[0]
+        )
+        embedded_n = embedded_row[0] if embedded_row is not None else 0
         logger.info(
             "Migration complete: semantic=%d episodic=%d skipped=%d embedded=%d",
             counts["semantic"],
@@ -2649,13 +3992,12 @@ class VectorMemoryStore:
             params.extend(f'%"{t.lower()}"%' for t in tag_filter)
         # Serialized for the same reason as the vector fallback above: this runs
         # on the context-assembly path, concurrently with memory writes.
-        with self._db_lock:
-            rows = self.db.execute(
-                f"SELECT id, conversation_id, text, tags, importance, created_at, last_accessed_at "
-                f"FROM episodic_memories WHERE is_deleted = 0 AND ({conditions}) "
-                f"ORDER BY created_at DESC LIMIT ?",
-                (*params, limit),
-            ).fetchall()
+        rows = self._fetch_all_locked(
+            f"SELECT id, conversation_id, text, tags, importance, created_at, last_accessed_at "
+            f"FROM episodic_memories WHERE is_deleted = 0 AND ({conditions}) "
+            f"ORDER BY created_at DESC LIMIT ?",
+            (*params, limit),
+        )
         return [dict(r) for r in rows]
 
     # ── Episodic Promotion ──
@@ -2670,11 +4012,12 @@ class VectorMemoryStore:
             return 0
 
         promoted = 0
-        rows = self.db.execute(
+        skipped = 0
+        rows = self._fetch_all_locked(
             "SELECT id, text, embedding FROM episodic_memories "
             "WHERE is_deleted = 0 AND embedding IS NOT NULL "
             "ORDER BY importance DESC, created_at DESC LIMIT 500"
-        ).fetchall()
+        )
 
         # Cluster similar episodic memories
         clusters: dict[int, list[dict]] = {}
@@ -2703,12 +4046,33 @@ class VectorMemoryStore:
                 continue
 
             value = self._extract_value_from_text(text)
-            if self.set_semantic(key, value, 0.9, "promotion") is None:
+            reject = self.set_semantic(key, value, 0.9, "promotion")
+            if reject is None:
                 promoted += 1
                 for m in members:
                     self._delete_episodic_row(m["id"])
                 logger.info("Promoted %d episodic → %s: %s", len(members), key, value[:60])
+            else:
+                # A refused cluster keeps its rows and re-clusters identically next pass, so the
+                # refusal repeats forever: count every pass, but warn only the first time per key.
+                skipped += 1
+                reject_code, reject_reason = reject
+                # Keyed on the cause too: _infer_semantic_key returns a constant for every
+                # "user prefers" cluster, so keying on key alone hides refusals of other causes.
+                if (key, reject_code.value) not in self._promotion_refused:
+                    self._promotion_refused[(key, reject_code.value)] = None
+                    while len(self._promotion_refused) > _MAX_PROMOTION_REFUSED:
+                        self._promotion_refused.popitem(last=False)
+                    logger.warning(
+                        "Promotion skipped %s (%s: %s): %d rows retained, retried each pass",
+                        key,
+                        reject_code.value,
+                        reject_reason,
+                        len(members),
+                    )
 
+        if skipped:
+            logger.info("Promotion pass: %d promoted, %d skipped", promoted, skipped)
         return promoted
 
     @staticmethod
@@ -2739,20 +4103,26 @@ class VectorMemoryStore:
         FAISS dedup, so counting episodic there would conflate benign
         deduplication with policy rejections.
         """
-        rows = self.db.execute(
+        rows = self._fetch_all_locked(
             "SELECT event_type, COUNT(*) as count FROM memory_events "
             "WHERE event_type = 'injection_blocked' "
             "OR (memory_type = 'semantic' AND event_type IN "
-            "('allowlist_reject', 'low_confidence', 'conflict_skip')) "
+            "('allowlist_reject', 'low_confidence', 'conflict_skip', 'value_empty')) "
             "GROUP BY event_type"
-        ).fetchall()
+        )
         return {r["event_type"]: r["count"] for r in rows}
 
     def get_context_preview(self, query_text: str = "") -> dict:
-        """Preview what would be injected into context (for debugging)."""
+        """Preview what would be injected into context (for debugging).
+
+        Reports the UNSCOPED view. A ``project_dir`` parameter was offered here
+        briefly and removed: the only caller never passed one, so it could not
+        change any observed output, and a knob nobody turns still has to be read
+        and trusted by whoever comes next.
+        """
         semantic = self.get_semantic_context(query_text=query_text)
         episodic = self.get_episodic_context(query_text=query_text)
-        lessons = self.get_lessons_context()
+        lessons = self.get_lessons_context(query_text=query_text)
         return {
             "semantic_chars": len(semantic),
             "episodic_chars": len(episodic),

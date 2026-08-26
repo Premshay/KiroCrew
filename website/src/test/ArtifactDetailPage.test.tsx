@@ -1,10 +1,18 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, fireEvent } from '@testing-library/react'
 import { Routes, Route, useNavigate } from 'react-router-dom'
 import ArtifactDetailPage from '../pages/ArtifactDetailPage'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 import type { Artifact } from '../types'
+
+// The sandboxed frames mint their document URL through the api client. The
+// automock resolves every method to `undefined`, which the component cannot
+// await — without this stub the frame throws instead of rendering.
+beforeEach(() => {
+  vi.mocked(api.sandboxDocUrl).mockResolvedValue({ url: '/sandbox-doc/test/tok' })
+})
+
 
 vi.mock('../api/client')
 // Stub the embedded chat page (companion chat) — its rendering is covered by its
@@ -39,16 +47,38 @@ function renderRoute() {
   )
 }
 
+/**
+ * The version picker's trigger. `SimpleSelect` wraps a Radix Select, so this is
+ * a <button role="combobox"> — its current value is read with toHaveTextContent,
+ * not `.value`, and it carries `disabled` like any button.
+ */
+const versionTrigger = () => screen.getByRole('combobox', { name: /Version/i })
+
+/**
+ * Pick a row from the version picker. A `change` event on the trigger does
+ * nothing — Radix needs open-then-click (see `SimpleSelect.test.tsx`).
+ */
+async function pickVersion(label: string) {
+  fireEvent.click(versionTrigger())
+  fireEvent.click(await screen.findByRole('option', { name: label }))
+}
+
+/** The version rows' labels. They exist in the DOM only while the popup is open. */
+async function versionRowLabels() {
+  fireEvent.click(versionTrigger())
+  return (await screen.findAllByRole('option')).map((o) => o.textContent?.trim())
+}
+
 describe('ArtifactDetailPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    // jsdom needs URL.createObjectURL for blob iframes
-    if (!URL.createObjectURL) {
-      // @ts-expect-error stub
-      URL.createObjectURL = vi.fn().mockReturnValue('blob:test')
-      // @ts-expect-error stub
-      URL.revokeObjectURL = vi.fn()
-    }
+    // Spy rather than assign: only a spy lands in the registry that
+    // vi.restoreAllMocks() can undo. The env provides both natively.
+    // Well-formed blob: URI, not a bare 'blob:test' literal — see the note in
+    // WidgetFrame.test.tsx's beforeEach for why a malformed mock value here
+    // risks a deferred ECONNREFUSED crashing an unrelated shard.
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:http://localhost:6776/test')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
     // Default events response so the events query never throws "undefined".
     // Individual tests can override this with .mockResolvedValueOnce when
     // they need a specific event log.
@@ -70,6 +100,10 @@ describe('ArtifactDetailPage', () => {
     vi.mocked(api).chatSlots = vi.fn().mockResolvedValue([])
   })
 
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('renders artifact metadata and iframe', async () => {
     vi.mocked(api).artifact = vi.fn().mockResolvedValue(mkArtifact())
     vi.mocked(api).artifactVersions = vi
@@ -84,6 +118,76 @@ describe('ArtifactDetailPage', () => {
     // the blob URL (async); findByTitle waits for it. A synchronous getByTitle
     // races the effect under coverage instrumentation (CI-only flake).
     expect(await screen.findByTitle(/Artifact: cr-queue/)).toBeInTheDocument()
+  })
+
+  it('renders an image artifact as an <img> from the asset URL with a download control and no editor/iframe', async () => {
+    vi.mocked(api).artifact = vi.fn().mockResolvedValue(
+      mkArtifact({
+        kind: 'image',
+        content: undefined,
+        image: { mime: 'image/png', ext: 'png', original_filename: 'chart.png', alt: 'A bar chart' },
+      }),
+    )
+    vi.mocked(api).artifactVersions = vi
+      .fn()
+      .mockResolvedValue({ slug: 'cr-queue', versions: [1, 2] })
+    renderRoute()
+    await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
+    // The image renders straight from the asset endpoint (no base64 in JSON).
+    const img = screen.getByAltText('A bar chart') as HTMLImageElement
+    expect(img.getAttribute('src')).toBe('/api/artifacts/cr-queue/asset')
+    // Download control points at the same URL and names the file.
+    const anchor = document.querySelector('a[download]') as HTMLAnchorElement | null
+    expect(anchor?.getAttribute('href')).toBe('/api/artifacts/cr-queue/asset')
+    expect(anchor?.getAttribute('download')).toBe('chart.png')
+    // Image is not editable: no Monaco textarea, no widget iframe body.
+    expect(document.querySelector('.monaco-editor')).toBeNull()
+    expect(document.querySelector('iframe')).toBeNull()
+    // The kind badge reads "image".
+    expect(screen.getByText('image')).toBeInTheDocument()
+  })
+
+  it('header Download for an image artifact targets the asset URL, not an empty .html blob', async () => {
+    // The header Download is the habituated spot; for images it must deliver the
+    // real bytes. `artifact.content` is empty by design for kind: 'image', so
+    // blobbing it would silently hand the user a junk `Name-v1.html`.
+    vi.mocked(api).artifact = vi.fn().mockResolvedValue(
+      mkArtifact({
+        kind: 'image',
+        content: undefined,
+        image: { mime: 'image/png', ext: 'png', original_filename: 'chart.png' },
+      }),
+    )
+    vi.mocked(api).artifactVersions = vi
+      .fn()
+      .mockResolvedValue({ slug: 'cr-queue', versions: [1] })
+    renderRoute()
+    await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
+
+    const clicked: { href?: string; download?: string } = {}
+    const realCreate = document.createElement.bind(document)
+    const createSpy = vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      const el = realCreate(tag) as HTMLElement
+      if (tag === 'a') {
+        // Capture what the synthetic anchor was pointed at instead of navigating.
+        Object.defineProperty(el, 'click', {
+          value: () => {
+            clicked.href = (el as HTMLAnchorElement).getAttribute('href') ?? undefined
+            clicked.download = (el as HTMLAnchorElement).getAttribute('download') ?? undefined
+          },
+        })
+      }
+      return el
+    })
+    try {
+      fireEvent.click(screen.getByLabelText('Download'))
+    } finally {
+      createSpy.mockRestore()
+    }
+
+    expect(clicked.href).toBe('/api/artifacts/cr-queue/asset')
+    expect(clicked.download).toBe('chart.png')
+    expect(clicked.href).not.toMatch(/^blob:/)
   })
 
   it('keeps the comment sidebar collapsed when the artifact has no comments', async () => {
@@ -181,14 +285,15 @@ describe('ArtifactDetailPage', () => {
 
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    const select = screen.getByRole('combobox', { name: /Version/i }) as HTMLSelectElement
+    const trigger = versionTrigger()
     // Dropdown defaults to "Live" — historical snapshots are numbered and
     // ordered newest-first below it.
-    expect(select.value).toBe('live')
+    expect(trigger).toHaveTextContent('Live')
     expect(screen.getByText(/Showing Live \(v2\)/i)).toBeInTheDocument()
-    // Numbered options exist for each historical version.
-    const options = Array.from(select.options).map((o) => o.value)
-    expect(options).toEqual(['live', '2', '1'])
+    // Numbered rows exist for each historical version. Assert the labels rather
+    // than the values: the Radix rows carry no value attribute, and the label is
+    // what a person actually picks from.
+    expect(await versionRowLabels()).toEqual(['Live', 'v2', 'v1'])
   })
 
   it('displays loading state', () => {
@@ -340,8 +445,7 @@ describe('ArtifactDetailPage', () => {
     // Current view: no Revert button.
     expect(screen.queryByTitle(/Revert to v/)).toBeNull()
     // Switch to v1.
-    const select = screen.getByRole('combobox', { name: /Version/i }) as HTMLSelectElement
-    fireEvent.change(select, { target: { value: '1' } })
+    await pickVersion('v1')
     await waitFor(() => expect(screen.getByTitle(/Revert to v1/)).toBeInTheDocument())
   })
 
@@ -534,8 +638,7 @@ describe('ArtifactDetailPage', () => {
       .mockResolvedValue({ slug: 'cr-queue', versions: [1, 2, 3] })
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    const select = screen.getByRole('combobox', { name: /Version/i }) as HTMLSelectElement
-    const labels = Array.from(select.options).map((o) => o.textContent?.trim())
+    const labels = await versionRowLabels()
     expect(labels).toEqual(['Live', 'v3', 'v2', 'v1'])
   })
 
@@ -558,9 +661,8 @@ describe('ArtifactDetailPage', () => {
 
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    const select = screen.getByRole('combobox', { name: /Version/i }) as HTMLSelectElement
     // Select v3 (the latest numbered snapshot).
-    fireEvent.change(select, { target: { value: '3' } })
+    await pickVersion('v3')
     // versionQuery must fire for v3 — the buggy code skipped it.
     await waitFor(() => expect(versionFetch).toHaveBeenCalledWith('cr-queue', 3))
     // Page renders v3 content (frozen), not Live.
@@ -646,11 +748,11 @@ describe('ArtifactDetailPage', () => {
     )
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    const select = screen.getByRole('combobox', { name: /Version/i }) as HTMLSelectElement
-    expect(select.disabled).toBe(false)
+    const trigger = versionTrigger()
+    expect(trigger).not.toBeDisabled()
     fireEvent.click(screen.getByText('Snapshot'))
     // Wait for the saving state to render (in-flight update).
-    await waitFor(() => expect(select.disabled).toBe(true))
+    await waitFor(() => expect(trigger).toBeDisabled())
     // Resolve to clean up.
     resolveUpdate?.(mkArtifact({ kind: 'markdown' }))
   })
@@ -737,7 +839,7 @@ describe('ArtifactDetailPage', () => {
     vi.mocked(api).artifactVersion = versionFetch
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    fireEvent.change(screen.getByRole('combobox', { name: /Version/i }), { target: { value: '2' } })
+    await pickVersion('v2')
     await waitFor(() => expect(versionFetch).toHaveBeenCalledWith('cr-queue', 2))
     await waitFor(() => expect(screen.getByText(/historical v2/)).toBeInTheDocument())
     // Edit/Snapshot buttons hidden on historical view.
@@ -761,7 +863,7 @@ describe('ArtifactDetailPage', () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
     renderRoute()
     await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
-    fireEvent.change(screen.getByRole('combobox', { name: /Version/i }), { target: { value: '2' } })
+    await pickVersion('v2')
     await waitFor(() => expect(screen.getByTitle(/Revert to v2/)).toBeInTheDocument())
     fireEvent.click(screen.getByTitle(/Revert to v2/))
     await waitFor(() =>
@@ -859,7 +961,7 @@ describe('ArtifactDetailPage', () => {
     // Enter edit mode but stay clean — no dirty, no confirm needed.
     fireEvent.click(screen.getByTitle('Edit content'))
     const confirmSpy = vi.spyOn(window, 'confirm')
-    fireEvent.change(screen.getByRole('combobox', { name: /Version/i }), { target: { value: '1' } })
+    await pickVersion('v1')
     expect(confirmSpy).not.toHaveBeenCalled()
     confirmSpy.mockRestore()
   })
@@ -1036,7 +1138,7 @@ describe('ArtifactDetailPage', () => {
       await waitFor(() => expect(screen.getByText('CR Queue')).toBeInTheDocument())
       expect(screen.getByLabelText('Remove star from artifact')).toBeInTheDocument()
 
-      fireEvent.change(screen.getByRole('combobox'), { target: { value: '1' } })
+      await pickVersion('v1')
 
       await waitFor(() =>
         expect(screen.queryByLabelText('Remove star from artifact')).not.toBeInTheDocument(),

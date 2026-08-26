@@ -32,16 +32,24 @@ import { removeWarm } from '../../store/instancesSlice'
 import { i18nT } from '../../i18n/t'
 import { fmtDuration, fmtUnit } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
+import { Trans } from 'react-i18next'
+
+import { SettingRef } from '../../components/settingRef/SettingRef'
+import {
+  InstanceFormFields,
+  useInstanceFormState,
+  EMPTY_INSTANCE_FORM,
+} from './InstanceFormFields'
 const STATE_DOT: Record<InstanceTunnelStatus['state'], string> = {
-  connected: 'bg-success',
-  connecting: 'bg-warning',
+  connected: 'bg-ok',
+  connecting: 'bg-warn',
   error: 'bg-danger',
   stopped: 'bg-muted',
   disconnected: 'bg-muted',
 }
 
 /** Human-friendly duration ("3h 12m", "45m", "30s"). */
-function humanizeSecs(secs: number): string {
+export function humanizeSecs(secs: number): string {
   if (secs <= 0) return fmtUnit(0, 'second', { maximumFractionDigits: 0 })
   const h = Math.floor(secs / 3600)
   const m = Math.floor((secs % 3600) / 60)
@@ -50,7 +58,7 @@ function humanizeSecs(secs: number): string {
   return fmtUnit(secs, 'second', { maximumFractionDigits: 0 })
 }
 
-function StatusBadge({ status }: { status: InstanceTunnelStatus }) {
+export function StatusBadge({ status }: { status: InstanceTunnelStatus }) {
   const dot = STATE_DOT[status.state] ?? 'bg-muted'
   return (
     <span className="inline-flex items-center gap-1.5 text-[13px] text-muted">
@@ -61,50 +69,13 @@ function StatusBadge({ status }: { status: InstanceTunnelStatus }) {
   )
 }
 
-function AddInstanceForm({ onAdded, usedPorts }: { onAdded: () => void; usedPorts: number[] }) {
-  const [name, setName] = useState('')
-  const [method, setMethod] = useState<'ssh' | 'ssm'>('ssh')
-  const [sshHost, setSshHost] = useState('')
-  const [ssmTarget, setSsmTarget] = useState('')
-  const [awsProfile, setAwsProfile] = useState('')
-  const [awsRegion, setAwsRegion] = useState('')
-  const [ssmRunAs, setSsmRunAs] = useState('')
-  const [remotePort, setRemotePort] = useState('7777')
-  const [ttl, setTtl] = useState('20h')
-  const [remoteBin, setRemoteBin] = useState('')
-
-  const portNum = Number(remotePort) || 0
-  const dupPort = portNum > 0 && usedPorts.includes(portNum)
-  const isSsm = method === 'ssm'
-  // The transport-specific required field: ssh_host for SSH, ssm_target for SSM.
-  const targetFilled = isSsm ? !!ssmTarget.trim() : !!sshHost.trim()
+export function AddInstanceForm({ onAdded }: { onAdded: () => void }) {
+  const form = useInstanceFormState(EMPTY_INSTANCE_FORM)
 
   const addMutation = useMutation({
-    mutationFn: () =>
-      api.addInstance({
-        name: name.trim(),
-        connection_method: method,
-        ...(isSsm
-          ? {
-              ssm_target: ssmTarget.trim(),
-              aws_profile: awsProfile.trim() || undefined,
-              aws_region: awsRegion.trim() || undefined,
-              ssm_run_as: ssmRunAs.trim() || undefined,
-            }
-          : { ssh_host: sshHost.trim() }),
-        remote_port: Number(remotePort) || 7777,
-        ttl: ttl.trim() || '20h',
-        remote_bin: remoteBin.trim() || undefined,
-      }),
+    mutationFn: () => api.addInstance(form.body()),
     onSuccess: () => {
-      setName('')
-      setSshHost('')
-      setSsmTarget('')
-      setAwsProfile('')
-      setAwsRegion('')
-      setRemotePort('7777')
-      setTtl('20h')
-      setRemoteBin('')
+      form.reset(EMPTY_INSTANCE_FORM)
       onAdded()
     },
   })
@@ -114,107 +85,15 @@ function AddInstanceForm({ onAdded, usedPorts }: { onAdded: () => void; usedPort
       : i18nT('pages.settings.instancesPanel.failed_to_add_remote_crew')
     : ''
 
-  const inputCls =
-    'bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm outline-none focus-ring'
-
   return (
     <Card>
       <div className="flex items-center gap-2 mb-3 text-text font-medium">
         <Plus className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.add_instance')}
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <label htmlFor="add-instance-name" className="flex flex-col gap-1 text-[13px] text-muted">
-          {i18nT('pages.settings.instancesPanel.name')}
-          <input id="add-instance-name" aria-label={i18nT('pages.settings.instancesPanel.name')} className={inputCls} value={name} onChange={e => setName(e.target.value)} placeholder={i18nT('pages.settings.instancesPanel.remote_host_1')} />
-        </label>
-        <label htmlFor="add-instance-method" className="flex flex-col gap-1 text-[13px] text-muted">
-          {i18nT('pages.settings.instancesPanel.connection_method')}
-          <select
-            id="add-instance-method"
-            aria-label={i18nT('pages.settings.instancesPanel.connection_method')}
-            className={inputCls}
-            value={method}
-            onChange={e => setMethod(e.target.value as 'ssh' | 'ssm')}
-          >
-            <option value="ssh">{i18nT('pages.settings.instancesPanel.ssh_tunnel')}</option>
-            <option value="ssm">{i18nT('pages.settings.instancesPanel.aws_ssm_session_manager')}</option>
-          </select>
-          <span className="text-[12px] text-muted leading-snug">
-            {isSsm
-              ? i18nT('pages.settings.instancesPanel.tunnels_via_aws_ssm_start_session_no_inbound_ssh')
-              : i18nT('pages.settings.instancesPanel.opens_ssh_n_l_to_the_host_requires_non_interacti')}
-          </span>
-        </label>
-        {isSsm ? (
-          <>
-            <label htmlFor="add-instance-ssm-target" className="flex flex-col gap-1 text-[13px] text-muted">
-              {i18nT('pages.settings.instancesPanel.ssm_target_instance_id')}
-              <input id="add-instance-ssm-target" aria-label={i18nT('pages.settings.instancesPanel.ssm_target_instance_id')} className={inputCls} value={ssmTarget} onChange={e => setSsmTarget(e.target.value)} placeholder="i-0123456789abcdef0" />
-              <span className="text-[12px] text-muted leading-snug">
-                {i18nT('pages.settings.instancesPanel.ec2_instance_id_i_or_ssm_managed_instance_id_mi')}
-              </span>
-            </label>
-            <label htmlFor="add-instance-aws-profile" className="flex flex-col gap-1 text-[13px] text-muted">
-              {i18nT('pages.settings.instancesPanel.aws_profile')} <span className="text-muted-strong">{i18nT('pages.settings.instancesPanel.optional')}</span>
-              <input id="add-instance-aws-profile" aria-label={i18nT('pages.settings.instancesPanel.aws_profile')} className={inputCls} value={awsProfile} onChange={e => setAwsProfile(e.target.value)} placeholder={i18nT('pages.settings.instancesPanel.default_credential_chain')} />
-            </label>
-            <label htmlFor="add-instance-aws-region" className="flex flex-col gap-1 text-[13px] text-muted">
-              {i18nT('pages.settings.instancesPanel.aws_region')} <span className="text-muted-strong">{i18nT('pages.settings.instancesPanel.optional')}</span>
-              <input id="add-instance-aws-region" aria-label={i18nT('pages.settings.instancesPanel.aws_region')} className={inputCls} value={awsRegion} onChange={e => setAwsRegion(e.target.value)} placeholder="us-east-1" />
-            </label>
-            <label htmlFor="add-instance-ssm-run-as" className="flex flex-col gap-1 text-[13px] text-muted">
-              {i18nT('pages.settings.instancesPanel.remote_user')} <span className="text-muted-strong">{i18nT('pages.settings.instancesPanel.optional')}</span>
-              <input id="add-instance-ssm-run-as" aria-label={i18nT('pages.settings.instancesPanel.remote_user')} className={inputCls} value={ssmRunAs} onChange={e => setSsmRunAs(e.target.value)} placeholder="ec2-user" />
-              <span className="text-[12px] text-muted leading-snug">
-                {i18nT('pages.settings.instancesPanel.the_user_the_remote_gateway_runs_as_sudo_u_for_s')}
-              </span>
-            </label>
-          </>
-        ) : (
-          <label htmlFor="add-instance-ssh-host" className="flex flex-col gap-1 text-[13px] text-muted">
-            {i18nT('pages.settings.instancesPanel.ssh_host_alias')}
-            <input id="add-instance-ssh-host" aria-label={i18nT('pages.settings.instancesPanel.ssh_host_alias')} className={inputCls} value={sshHost} onChange={e => setSshHost(e.target.value)} placeholder={i18nT('pages.settings.instancesPanel.host_1_alias')} />
-          </label>
-        )}
-        <label htmlFor="add-instance-remote-port" className="flex flex-col gap-1 text-[13px] text-muted">
-          {i18nT('pages.settings.instancesPanel.remote_port')}
-          <input id="add-instance-remote-port" aria-label={i18nT('pages.settings.instancesPanel.remote_port')} className={inputCls} value={remotePort} onChange={e => setRemotePort(e.target.value)} placeholder="7777" inputMode="numeric" />
-          <span className="text-[12px] text-muted leading-snug">
-            {i18nT('pages.settings.instancesPanel.must_match_the_port_the_remote_gateway_serves_on')}
-          </span>
-          {dupPort ? (
-            <span className="text-[12px] text-danger leading-snug">
-              {i18nT('pages.settings.instancesPanel.port')} {portNum} {i18nT('pages.settings.instancesPanel.is_already_used_by_another_instance_choose_a_dif')}
-            </span>
-          ) : null}
-        </label>
-        <label htmlFor="add-instance-ttl" className="flex flex-col gap-1 text-[13px] text-muted">
-          {i18nT('pages.settings.instancesPanel.token_ttl')}
-          <input id="add-instance-ttl" aria-label={i18nT('pages.settings.instancesPanel.token_ttl')} className={inputCls} value={ttl} onChange={e => setTtl(e.target.value)} placeholder={i18nT('pages.settings.instancesPanel.20h')} />
-        </label>
-        <label htmlFor="add-instance-remote-bin" className="flex flex-col gap-1 text-[13px] text-muted sm:col-span-2">
-          {i18nT('pages.settings.instancesPanel.remote_kirocrew_path')} <span className="text-muted-strong">{i18nT('pages.settings.instancesPanel.optional')}</span>
-          <input
-            id="add-instance-remote-bin"
-            aria-label={i18nT('pages.settings.instancesPanel.remote_kirocrew_path')}
-            className={inputCls}
-            value={remoteBin}
-            onChange={e => setRemoteBin(e.target.value)}
-            placeholder={i18nT('pages.settings.instancesPanel.home_you_local_bin_kirocrew_leave_blank_for_stan')}
-          />
-          <span className="text-[12px] text-muted leading-snug">
-            {i18nT('pages.settings.instancesPanel.only_needed_if')} <code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew')}</code> {i18nT('pages.settings.instancesPanel.is_installed_somewhere_non_standard_on_the_remot')} <code className="text-text">{i18nT('pages.settings.instancesPanel.command_v_kirocrew')}</code>{' '}
-            {i18nT('pages.settings.instancesPanel.commonly')} <code className="text-text">{i18nT('pages.settings.instancesPanel.local_bin_kirocrew')}</code>{i18nT('pages.settings.instancesPanel.use_an_absolute_path_no')} <code className="text-text">~</code>).
-          </span>
-        </label>
-      </div>
+      <InstanceFormFields idPrefix="add-instance" form={form} />
       <ErrorNotice message={err} className="mt-3" />
       <div className="mt-3">
-        <Btn
-          primary
-          onClick={() => addMutation.mutate()}
-          disabled={addMutation.isPending || !name.trim() || !targetFilled || dupPort}
-        >
+        <Btn primary onClick={() => addMutation.mutate()} disabled={addMutation.isPending || !form.valid}>
           {addMutation.isPending ? i18nT('pages.settings.instancesPanel.adding') : i18nT('pages.settings.instancesPanel.add_remote_crew')}
         </Btn>
       </div>
@@ -258,7 +137,7 @@ function InstanceRow({
         </div>
         <div className="mt-1"><StatusBadge status={inst.status} /></div>
         {diag && !diag.ok ? (
-          <div className="mt-1 text-[12px] text-warning"><AlertTriangle size={12} className="lucide-inline" /> {diag.reason}</div>
+          <div className="mt-1 text-[12px] text-warn"><AlertTriangle size={12} className="lucide-inline" /> {diag.reason}</div>
         ) : null}
       </div>
       <div className="flex items-center gap-2 shrink-0">
@@ -409,7 +288,7 @@ export function InstancesPanel() {
           {i18nT('pages.settings.instancesPanel.enable_it_to_let_this_gateway_open_ssh_tunnels_t')}
         </p>
         {restartPending && (
-          <div role="status" className="flex items-start gap-2 px-3 py-2 mb-3 text-[13px] rounded-md bg-warning/10 text-warning border border-warning/30">
+          <div role="status" className="flex items-start gap-2 px-3 py-2 mb-3 text-[13px] rounded-md bg-warn/10 text-warn border border-warn/30">
             <AlertTriangle size={14} className="lucide-inline mt-0.5 shrink-0" />
             <span>
               {i18nT('pages.settings.instancesPanel.disabled_in_config_restart_the_gateway')}<code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_restart')}</code>){' '}
@@ -420,10 +299,15 @@ export function InstancesPanel() {
         <Btn primary onClick={() => setEnabledMutation.mutate(true)} disabled={setEnabledMutation.isPending}>
           <Power className="lucide-inline" /> {setEnabledMutation.isPending ? i18nT('pages.settings.instancesPanel.enabling') : i18nT('pages.settings.instancesPanel.enable_remote_crew_management')}
         </Btn>
-        <ErrorNotice message={actionErr} className="mt-2" />
+        <ErrorNotice message={actionErr} askAgent className="mt-2" />
         <p className="mt-2 text-[12px] text-muted">
-          {i18nT('pages.settings.instancesPanel.equivalent_cli')} <code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_config_set_instances_enabled_true')}</code> {i18nT('pages.settings.instancesPanel.then')}{' '}
-          <code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_restart')}</code>.
+          <Trans
+            i18nKey="pages.settings.instancesPanel.enable_via_setting"
+            components={{
+              settingRef: <SettingRef configKey="instances.enabled" />,
+              restartCmd: <code className="text-text">kirocrew restart</code>,
+            }}
+          />
         </p>
       </Card>
     )
@@ -435,7 +319,7 @@ export function InstancesPanel() {
           config; `active` reflects whether the SSH manager is actually running. */}
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2 text-[13px]">
-          <span className={`inline-block w-2 h-2 rounded-full ${active ? 'bg-success' : 'bg-warning'}`} aria-hidden />
+          <span className={`inline-block w-2 h-2 rounded-full ${active ? 'bg-ok' : 'bg-warn'}`} aria-hidden />
           <span className="text-muted">
             {i18nT('pages.settings.instancesPanel.multi_instance_management_is')} <span className="text-text font-medium">{i18nT('pages.settings.instancesPanel.enabled')}</span>
             {active ? '' : ' — not active until restart'}
@@ -446,7 +330,7 @@ export function InstancesPanel() {
         </Btn>
       </div>
       {!active && (
-        <div role="status" className="flex items-start gap-2 px-3 py-2 text-[13px] rounded-md bg-warning/10 text-warning border border-warning/30">
+        <div role="status" className="flex items-start gap-2 px-3 py-2 text-[13px] rounded-md bg-warn/10 text-warn border border-warn/30">
           <AlertTriangle size={14} className="lucide-inline mt-0.5 shrink-0" />
           <span>
             {i18nT('pages.settings.instancesPanel.enabled_but_not_active_yet_restart_the_gateway')}<code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_restart')}</code>){' '}
@@ -455,7 +339,7 @@ export function InstancesPanel() {
         </div>
       )}
       {connectedNote && (
-        <div role="status" className="flex items-start gap-2 px-3 py-2 text-[13px] rounded-md bg-success/10 text-success border border-success/30">
+        <div role="status" className="flex items-start gap-2 px-3 py-2 text-[13px] rounded-md bg-ok/10 text-ok border border-ok/30">
           <Plug size={14} className="lucide-inline mt-0.5 shrink-0" />
           <span className="flex-1 break-words">{connectedNote}</span>
           <button type="button" aria-label={i18nT('pages.settings.instancesPanel.dismiss')} className="shrink-0 opacity-70 hover:opacity-100" onClick={() => setConnectedNote(null)}><X size={12} /></button>
@@ -474,10 +358,10 @@ export function InstancesPanel() {
           className={
             'flex items-start gap-2 px-3 py-2 text-[13px] rounded-md border ' +
             (diagNote.kind === 'ok'
-              ? 'bg-success/10 text-success border-success/30'
+              ? 'bg-ok/10 text-ok border-ok/30'
               : diagNote.kind === 'info'
                 ? 'bg-accent/10 text-accent border-accent/30'
-                : 'bg-warning/10 text-warning border-warning/30')
+                : 'bg-warn/10 text-warn border-warn/30')
           }
         >
           <Stethoscope size={14} className="lucide-inline mt-0.5 shrink-0" />
@@ -528,7 +412,7 @@ export function InstancesPanel() {
               </div>
               <p className="mt-2 text-[12px] text-muted">
                 {i18nT('pages.settings.instancesPanel.up_to')} {warmCap} {i18nT('pages.settings.instancesPanel.instances_stay_warm_live_tunnel_at_once_the_rest')}{' '}
-                <code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_config_set_instances_warm_set_cap_n')}</code>.
+                <SettingRef configKey="instances.warm_set_cap" />.
               </p>
             </Card>
           ) : (
@@ -538,7 +422,7 @@ export function InstancesPanel() {
               </div>
             </Card>
           )}
-          <AddInstanceForm onAdded={reload} usedPorts={instances.map(i => i.remote_port)} />
+          <AddInstanceForm onAdded={reload} />
         </>
       )}
     </div>

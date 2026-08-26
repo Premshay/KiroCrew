@@ -3,7 +3,7 @@
 Kiro Crew is a personal, autonomous AI agent that runs locally on your own
 machine. It is powered by kiro-cli (KiroACP) and reaches tools over the Model
 Context Protocol (MCP). Everything below is the reference for the features you
-can reach from the dashboard, Slack, or the CLI.
+can reach from the dashboard, the CLI, or a connected messaging channel.
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ kirocrew gateway     # → http://localhost:5476
 
 `kiro-cli` must be installed, on your `PATH`, and logged in. See
 [Getting Started](getting-started.md) for the source install, the pip channel
-index, first-time setup, and Slack credentials.
+index, first-time setup, and connecting messaging channels.
 
 ## Core Capabilities
 
@@ -35,7 +35,7 @@ index, first-time setup, and Slack credentials.
 | [Research Lab](research-lab.md) | Autonomous multi-cycle research campaigns with scoping, adaptive agent execution, and exportable reports |
 | [Dashboard](dashboard.md) | React web UI with multi-session chat, memory management, and live system metrics |
 | [Agent Questions](agent-questions.md) | Let an agent pause mid-turn and ask you a clickable multiple-choice question |
-| [Slack](slack-integration.md) | DM-based interaction with tool approval, streaming, and channel monitoring |
+| Chat Channels | DM-based chat with tool approval — [Slack](slack-integration.md), [Discord](discord-integration.md), [Telegram](telegram-integration.md), [Teams](teams-integration.md), [Webex](webex-integration.md), [WeCom](wecom-integration.md), [WeChat](weixin-integration.md), [iMessage](imessage-integration.md), [WhatsApp](whatsapp-integration.md), [Feishu](feishu-integration.md); per-channel capabilities in each guide |
 | [Agents](agents.md) | Switch between specialized agents per conversation, thread, or cron job |
 | [Skills](skills.md) | Drop-in markdown knowledge packs for domain-specific workflows |
 
@@ -46,6 +46,7 @@ index, first-time setup, and Slack credentials.
 | [Backup & Restore](snapshot-and-restore.md) | Portable snapshot and restore of Kiro Crew state, for upgrades and machine migration |
 | [Knowledge Library](knowledge-library-how-it-works.md) | Semantic search over your own documents, folders, and generated artifacts |
 | [Web Deploy](deploy-web.md) | Publish artifacts to a public HTTPS URL on your own AWS (private S3 + CloudFront + OAC) |
+| [Inbound Webhooks](inbound-webhooks.md) | Let an external system trigger an agent turn over HTTP — named tokens, HMAC request signing, a reversible off switch, ephemeral sessions, `register_hook` resume context |
 | [Feature Tips](feature-tips.md) | Occasional personalized tips above the composer pointing at features you have not used yet |
 | [Follow-up Suggestions](followup-suggestions.md) | Agent-proposed next steps above the composer: start in a new git worktree, add to this session, or skip |
 | [Queued-Message Editing](dashboard.md) | Edit, reorder, or cancel a chat message waiting in the queue before it runs |
@@ -55,12 +56,15 @@ index, first-time setup, and Slack credentials.
 
 ## Chat Channels
 
-Besides the dashboard and Slack, Kiro Crew ships channel integrations for
-[Discord](discord-integration.md), [Telegram](telegram-integration.md),
-[Teams](teams-integration.md), [Webex](webex-integration.md),
-[WeCom](wecom-integration.md), and [Weixin](weixin-integration.md). They share
-one channel-neutral core, described in
-[Messaging Transport](messaging-transport.md).
+Besides the dashboard and CLI, Kiro Crew ships channel integrations for
+[Slack](slack-integration.md), [Discord](discord-integration.md),
+[Telegram](telegram-integration.md), [Teams](teams-integration.md),
+[Webex](webex-integration.md), [WeCom](wecom-integration.md),
+[Weixin](weixin-integration.md), [iMessage](imessage-integration.md),
+[WhatsApp](whatsapp-integration.md), and
+[Feishu](feishu-integration.md). They
+share one channel-neutral core, described
+in [Messaging Transport](messaging-transport.md).
 
 ## Guides
 

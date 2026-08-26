@@ -14,8 +14,14 @@ agent loads only the one it needs.
 |---|---|
 | [acp-client.md](acp-client.md) | The ACP JSON-RPC client that drives `kiro-cli`: transport, framing, timeouts, and the backend seam. |
 | [providers.md](providers.md) | The `LLMProvider` interface and the KiroACP-only provider surface. |
+| [harness-parity.md](harness-parity.md) | The invariants keeping the Kiro harness first-class while other harnesses are adapted, and the test pinning each. |
+| [kas-backend.md](kas-backend.md) | The second, adapted ACP backend: how Crew selects and adapts it (the `kas_wire` seam, harness-parity, ABC defaults) and the deferred hooks / transport / `/clear` items. Crew-side only. |
 | [session.md](session.md) | Sessions, slots, session keys, the warm pool, and PID tracking. |
 | [history.md](history.md) | Conversation persistence, JSONL rotation, and transcript search. |
+| [session-summary.md](session-summary.md) | Intent-level session summaries: the sidecar cache, extraction, and the turn-end pass. |
+| [file-search.md](file-search.md) | The `@`-mention file/folder search: index, ranking, `kinds` filter, and the sensitive-path symmetry. |
+| [session-storage.md](session-storage.md) | What sessions cost on disk, and the user-initiated trash that reclaims it. |
+| [session-control.md](session-control.md) | One chat session opening, stopping, and reading another. |
 | [config.md](config.md) | The config schema, defaults, loading, and live reload. |
 | [cli.md](cli.md) | Every CLI command, the gateway flags, and the test harness. |
 | [heartbeat.md](heartbeat.md) | The liveness heartbeat and its restricted tool allowlist. |
@@ -66,22 +72,26 @@ agent loads only the one it needs.
 |---|---|
 | [app-kit-platform.md](app-kit-platform.md) | App contracts: MCP scoping, agent JSON composition, permissions, and dependencies. |
 | [mcp-apps.md](mcp-apps.md) | Apps that surface as MCP servers. |
+| [mcp-shareability.md](mcp-shareability.md) | Predicting which MCP servers can share one backend, from local evidence. |
 | [artifacts.md](artifacts.md) | Artifact identity, versioning, and the companion chat panel. |
 | [themes.md](themes.md) | The theme tier model and the CSS variable contract. |
 | [md-notebook.md](md-notebook.md) | The inline markdown viewer and editor. |
 | [side.md](side.md) | The chat side panel. |
-| [browser.md](browser.md) | Website browsing through Playwright MCP. |
+| [browser.md](browser.md) | Website browsing through the `playwright-cli` shell commands. |
 
 ## Built-in apps
 
 | Spec | Subsystem |
 |---|---|
 | [papyrus.md](papyrus.md) | The Papyrus writing app. |
+| [command-bar.md](command-bar.md) | The opt-in launcher that replaces quick-search: the overlay seam, the request-free root, ranking and scopes. |
 | [pptx-maker.md](pptx-maker.md) | Deck generation. |
 | [meetings.md](meetings.md) | Meeting capture and summarization. |
 | [issue-radar.md](issue-radar.md) | Issue triage and grouping. |
 | [ops-mission-control.md](ops-mission-control.md) | Autonomous ops first responder: alarms, pages and monitors. |
 | [mochi.md](mochi.md) | The Mochi app. |
+| [auto-improvement.md](auto-improvement.md) | Measurement-first self-improvement loop: ruler calibration, keep-or-revert cycles, draft PRs. |
+| [auto-improvement-test-plan.md](auto-improvement-test-plan.md) | Integration test plan for auto-improvement (all endpoints + UI + full loop), against a real GitHub repo. |
 
 ## Operations
 

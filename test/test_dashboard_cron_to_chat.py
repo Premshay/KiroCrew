@@ -4,24 +4,60 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from kiro_crew.dashboard.cron_inject import inject_cron_result_to_dashboard
+from kiro_crew.session_surface import set_dashboard_surfaced
+
+
+@pytest.fixture(autouse=True)
+def _reset_surface_registry():
+    """inject_cron_result_to_dashboard publishes to the process-global
+    dashboard-surface registry; reset it so keys from these mock states
+    never leak into other tests."""
+    set_dashboard_surfaced(())
+    yield
+    set_dashboard_surfaced(())
 
 
 def _make_state(history_messages=None):
     """Create a mock DashboardState with conversation_log."""
     state = MagicMock()
     slots = {}
+    # Real dict: inject_cron_result_to_dashboard publishes the surface registry
+    # via _sync_dashboard_slots, which iterates state._slots.values().
+    state._slots = slots
 
-    def get_or_create_slot(name=None, agent=""):
+    def get_or_create_slot(name=None, agent="", origin=""):
+        # ``origin`` is recorded, not just tolerated: the cron paths must
+        # declare SlotOrigin.CRON, and a fake that swallowed the kwarg
+        # would let that regress silently (a cron slot relabelled USER is
+        # readable by any app holding `slots:user`).
         if name not in slots:
             slot = MagicMock()
             slot.key = name
+            slot._origin = origin
             slot.linked_session_key = ""
             slot.messages = []
             slot.title = ""
 
-            def append(role, content, cls, broadcast=True):
-                slot.messages.append({"role": role, "content": content, "cls": cls})
+            def append(role, content, cls, broadcast=True, meta=None):
+                # Mirror the real ``_ChatSlot.append`` contract: preserve a
+                # supplied ``meta.mid``, mint one otherwise, and hand the
+                # appended row back — the injector reads the id off the return
+                # to stamp the durable transcript copy.
+                supplied = meta.get("mid") if isinstance(meta, dict) else None
+                msg = {
+                    "role": role,
+                    "content": content,
+                    "cls": cls,
+                    "meta": {
+                        **(meta if isinstance(meta, dict) else {}),
+                        "mid": supplied or f"m-test-{len(slot.messages)}",
+                    },
+                }
+                slot.messages.append(msg)
+                return msg
 
             slot.append = append
             slots[name] = slot
@@ -44,6 +80,22 @@ def _make_job(job_id="abc123", name="test-cron", last_result="Hello world"):
 
 
 class TestInjectCronResultToDashboard:
+    def test_slot_is_tagged_cron_not_user(self):
+        """A cron result is the job's output, not something the person typed.
+
+        The slot used to be created untagged and then labelled USER by
+        get_or_create_slot's default, which put private cron content inside the
+        ``slots:user`` WS scope -- so any app holding that scope received it.
+        """
+        from kiro_crew.dashboard.state import SlotOrigin
+
+        state = _make_state()
+        job = _make_job()
+        inject_cron_result_to_dashboard(state, job, "result")
+        slot = state.get_or_create_slot(name=f"cron-{job.id}")
+        assert slot._origin == SlotOrigin.CRON
+        assert slot._origin != SlotOrigin.USER
+
     def test_sets_linked_session_key(self):
         state = _make_state()
         job = _make_job()
@@ -114,6 +166,31 @@ class TestInjectCronResultToDashboard:
         inject_cron_result_to_dashboard(state, job, "result")
         state.push_slots_update.assert_called_once()
 
+    def test_publishes_the_tab_to_the_surface_registry(self):
+        """Regression: the cron tab must be surfaced the moment it is created.
+
+        Every gate that asks "does this session have a tab?" — sub-agent event
+        routing, completion injection, widget/question delivery — reads the
+        surface registry via has_dashboard_surface. A created-but-unpublished
+        slot fails those gates until some unrelated slot change republishes,
+        so the first cron run's sub-agents stayed invisible and their results
+        were never injected."""
+        from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+        from kiro_crew.session_surface import (
+            has_dashboard_surface,
+            set_dashboard_surfaced,
+        )
+
+        set_dashboard_surfaced(())
+        try:
+            state = _make_state()
+            job = _make_job(job_id="188f71e5")
+            inject_cron_result_to_dashboard(state, job, "result")
+            assert has_dashboard_surface("cron:188f71e5") is True
+            assert dashboard_slot_key("cron:188f71e5") == "cron-188f71e5"
+        finally:
+            set_dashboard_surfaced(())
+
 
 class TestPersistsResultToConversationLog:
     """the result must be written to the canonical ConversationLog
@@ -149,6 +226,18 @@ class TestPersistsResultToConversationLog:
         inject_cron_result_to_dashboard(state, job, "the result")
         state.conversation_log.append_if_absent.assert_called_once()
         state.conversation_log.append.assert_not_called()
+
+    def test_durable_copy_carries_the_window_rows_id(self):
+        # The durable transcript copy must ride with the SAME ``meta.mid`` the
+        # window copy was minted; a re-minted or absent id leaves a bounded
+        # slot-detail read unable to reconcile the two copies as one message.
+        state = _make_state()
+        job = _make_job(job_id="job5", name="my-cron")
+        inject_cron_result_to_dashboard(state, job, "the result")
+        slot = state.get_or_create_slot(name=f"cron-{job.id}")
+        window_mid = slot.messages[-1]["meta"]["mid"]
+        kwargs = state.conversation_log.append_if_absent.call_args.kwargs
+        assert kwargs["mid"] == window_mid, "the durable copy did not carry the window row's id"
 
     def test_empty_result_does_not_persist(self):
         state = _make_state()
@@ -217,6 +306,27 @@ class TestHydrateSlotFromHistory:
         hydrate_slot_from_history(slot, history)
         assert slot.messages[0]["cls"] == "msg msg-u"
         assert slot.messages[1]["cls"] == "msg msg-a"
+
+    def test_preserves_persisted_row_ids(self):
+        # A hydrated row must keep the ``meta.mid`` its disk copy carries.
+        # Minting fresh ids here leaves the window and the disk holding
+        # disjoint id sets for the same rows while the durable injection
+        # copies make the region read all-id — the identity walk then marks
+        # every hydrated row owed and a bounded read serves the history twice.
+        from kiro_crew.dashboard.cron_inject import hydrate_slot_from_history
+
+        history = [
+            {"role": "user", "content": "hello", "meta": {"mid": "m-disk-1"}},
+            {"role": "assistant", "content": "world", "meta": {"mid": "m-disk-2"}},
+            {"role": "assistant", "content": "pre-id row"},
+        ]
+        state = _make_state(history_messages=history)
+        slot = state.get_or_create_slot(name="cron-abc")
+        hydrate_slot_from_history(slot, history)
+        assert [m["meta"]["mid"] for m in slot.messages[:2]] == [
+            "m-disk-1",
+            "m-disk-2",
+        ], "hydration re-minted ids the disk rows already carry"
 
 
 class TestHasSlot:

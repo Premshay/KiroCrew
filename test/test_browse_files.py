@@ -9,13 +9,16 @@ paths (added).
 from __future__ import annotations
 
 import os
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from conftest import requires_symlinks
 from kiro_crew.dashboard.handlers import api_browse_files
+from kiro_crew.dashboard.handlers.files import _browse_files_sync
 
 
 def _make_app() -> web.Application:
@@ -122,6 +125,7 @@ class TestBrowseFiles:
                 assert resp.status == 403
 
     @pytest.mark.asyncio
+    @requires_symlinks
     async def test_symlink_to_sensitive_path_filtered(self, tmp_path, mock_sel):
         """Symlink in a benign dir pointing at ~/.aws must not leak through.
 
@@ -213,3 +217,25 @@ class TestBrowseFiles:
                 data = await resp.json()
                 entry = next(e for e in data["files"] if e["name"] == "racey.md")
                 assert entry["mtime"] == 0
+
+    @pytest.mark.asyncio
+    async def test_scan_does_not_run_on_the_event_loop(self, tmp_path, mock_sel):
+        """The walk must execute off the loop thread — see the sibling dirs test."""
+        (tmp_path / "alpha").mkdir()
+        (tmp_path / "readme.md").write_text("hello")
+        loop_thread = threading.get_ident()
+        ran_on: list[int] = []
+
+        def spy(base: str, skip: set[str]) -> tuple[list[dict], list[dict]]:
+            ran_on.append(threading.get_ident())
+            return _browse_files_sync(base, skip)
+
+        with patch("kiro_crew.dashboard.handlers.files._browse_files_sync", spy):
+            async with TestClient(TestServer(_make_app())) as client:
+                resp = await client.get(f"/api/browse-files?path={tmp_path}")
+                assert resp.status == 200
+                data = await resp.json()
+                assert {d["name"] for d in data["dirs"]} == {"alpha"}
+                assert {f["name"] for f in data["files"]} == {"readme.md"}
+        assert ran_on, "the scan helper was never called"
+        assert ran_on[0] != loop_thread

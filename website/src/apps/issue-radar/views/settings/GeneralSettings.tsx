@@ -6,17 +6,23 @@ import { useIssueRadar } from '../../context'
 import ReadOnlyTag, { isReadOnly } from '../../components/ReadOnlyTag'
 import type { GeneralAnchor } from '../../lib/types'
 import { Toggle } from '../../../../components/ui'
+import SimpleSelect from '../../../../components/SimpleSelect'
 import {
+  AI_LANGUAGE_CHOICES, AI_LANGUAGE_FOLLOW,
   DETAIL_POLL_CHOICES_MS, LIST_POLL_CHOICES_MS, STALE_TIME_CHOICES_MS,
 } from '../../lib/format'
-import { fmtUnit } from '../../../../i18n/format'
+import { activeLocale, fmtUnit } from '../../../../i18n/format'
+import { languageLabel } from '../../../../i18n/languages'
 
 import { i18nT } from '../../../../i18n/t'
 /** General (app-wide) settings — full width. The GitHub identity and the list
  * of connected repos. Each repo card jumps to that repo's own settings page.
  * `anchor` scrolls to the requested sub-section when the rail asks for it. */
 export default function GeneralSettings({ anchor }: { anchor: GeneralAnchor }) {
-  const { me, repos, onAddRepo, openSettings, active, refreshPrefs, setRefreshPrefs } = useIssueRadar()
+  const {
+    me, repos, onAddRepo, openSettings, active, refreshPrefs, setRefreshPrefs,
+    aiLanguage, setAiLanguage,
+  } = useIssueRadar()
   // The account shown is the one on the ACTIVE repo's provider — `me` is fetched
   // per provider, so naming the wrong CLI here would contradict the login above it.
   const terms = providerTerms(active)
@@ -28,8 +34,13 @@ export default function GeneralSettings({ anchor }: { anchor: GeneralAnchor }) {
     ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }, [anchor])
 
+  // Narrow-first gutter. This page ran the widest inset in the app — 32px at
+  // every width, on top of the 20px each card below adds, so a form label
+  // started 52px in on a 390px screen. `md:px-8` keeps the desktop value it
+  // already had rather than folding it into the 24px the other pages use;
+  // that difference predates this change and is not what is being fixed.
   return (
-    <div className="w-full max-w-6xl px-8 py-8">
+    <div className="w-full max-w-6xl px-4 py-8 md:px-8">
       <h1 className="text-[22px] font-semibold mb-1">{i18nT('apps.issueRadar.views.settings.generalSettings.settings')}</h1>
       <p className="text-[13px] text-muted mb-8">
         {i18nT('apps.issueRadar.views.settings.generalSettings.your')} {terms.providerName} {i18nT('apps.issueRadar.views.settings.generalSettings.identity_and_the_repositories_issue_radar_watche')}
@@ -105,6 +116,45 @@ export default function GeneralSettings({ anchor }: { anchor: GeneralAnchor }) {
         </div>
       </section>
 
+      <section className="mb-10 scroll-mt-8">
+        <SectionHeader title={i18nT('apps.issueRadar.views.settings.generalSettings.agent_section')} />
+        <div className="rounded-xl border border-border bg-bg-elevated shadow-sm p-5">
+          <p className="text-[13px] text-muted mb-4">
+            {i18nT('apps.issueRadar.views.settings.generalSettings.agent_intro')}
+          </p>
+          {/* Stacked until `sm`, unlike the interval and toggle rows above: their
+              controls are a fixed-width switch or a short duration, while this
+              trigger renders a language ENDONYM, which can be long enough at 320px
+              to squeeze the hint into a sliver beside it. */}
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+            <div className="min-w-0">
+              <div className="text-[13px] font-medium">
+                {i18nT('apps.issueRadar.views.settings.generalSettings.agent_language')}
+              </div>
+              <div className="text-[12px] text-muted mt-0.5">
+                {i18nT('apps.issueRadar.views.settings.generalSettings.agent_language_hint')}
+              </div>
+            </div>
+            {/* Endonyms, not translated names: a picker that renders every option in
+                the CURRENT language is unusable to someone switching away from a
+                language they cannot read. The follow entry is the only translated one. */}
+            <SimpleSelect
+              options={[AI_LANGUAGE_FOLLOW, ...AI_LANGUAGE_CHOICES.map(l => l.code)]}
+              optionLabels={[
+                i18nT('apps.issueRadar.views.settings.generalSettings.agent_language_follow', {
+                  language: languageLabel(activeLocale()),
+                }),
+                ...AI_LANGUAGE_CHOICES.map(l => l.label),
+              ]}
+              value={aiLanguage}
+              onChange={setAiLanguage}
+              aria-label={i18nT('apps.issueRadar.views.settings.generalSettings.agent_language')}
+              style={{ flexShrink: 0 }}
+            />
+          </div>
+        </div>
+      </section>
+
       <section ref={reposRef} className="scroll-mt-8">
         <SectionHeader title={i18nT('apps.issueRadar.views.settings.generalSettings.repositories')} hint={`${repos.length} connected`} />
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
@@ -118,7 +168,7 @@ export default function GeneralSettings({ anchor }: { anchor: GeneralAnchor }) {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="text-[14px] font-medium truncate">{r.owner}/{r.repo}</span>
-                  {isReadOnly(r.permissions) && <ReadOnlyTag />}
+                  {isReadOnly(r.permissions) && <ReadOnlyTag repoRef={r} />}
                 </div>
                 <div className="text-[12px] text-muted mt-0.5 inline-flex items-center gap-1">
                   <SettingsIcon size={11} /> {i18nT('apps.issueRadar.views.settings.generalSettings.configure_triage')}
@@ -162,16 +212,17 @@ function IntervalRow({ label, hint, value, choices, onChange }: {
         <div className="text-[13px] font-medium">{label}</div>
         <div className="text-[12px] text-muted mt-0.5">{hint}</div>
       </div>
-      <select
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
+      {/* `choices` are milliseconds and SimpleSelect is string-only, so they round-trip
+          through String/Number. `flex-shrink-0` was the only non-chrome class on the old
+          select — it survives as a wrapper style, since that div is now the flex item. */}
+      <SimpleSelect
+        options={choices.map(ms => String(ms))}
+        optionLabels={choices.map(ms => intervalLabel(ms))}
+        value={String(value)}
+        onChange={v => onChange(Number(v))}
         aria-label={label}
-        className="bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-none cursor-pointer transition-colors focus-ring flex-shrink-0"
-      >
-        {choices.map((ms) => (
-          <option key={ms} value={ms}>{intervalLabel(ms)}</option>
-        ))}
-      </select>
+        style={{ flexShrink: 0 }}
+      />
     </div>
   )
 }

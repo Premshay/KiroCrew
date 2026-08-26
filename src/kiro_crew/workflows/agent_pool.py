@@ -40,8 +40,8 @@ from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 # Per-step tool-call ceiling — shared with the per-call path (agent_exec) so a
-# single edit retunes both; a hand-duplicated copy here would silently diverge
-# the pooled vs fallback ceilings (no test pins them equal).
+# single edit retunes both; a hand-duplicated copy here would silently diverge the
+# pooled vs fallback ceilings. ``test_workflows_agent_pool.py`` pins them equal.
 from kiro_crew.workflows.agent_exec import _MAX_TURNS_PER_STEP
 
 logger = logging.getLogger(__name__)
@@ -86,12 +86,14 @@ class _WorkflowSessionWorker:
         agent: Optional[str],
         model: Optional[str],
         cwd: Optional[str],
+        extra_env: Optional[dict[str, str]] = None,
     ) -> None:
         self._sessions = sessions
         self._key = key
         self._agent = agent
         self._model = model
         self._cwd = cwd
+        self._extra_env = extra_env
         self._provider: Any = None
 
     async def start(self) -> None:
@@ -101,6 +103,7 @@ class _WorkflowSessionWorker:
             agent=self._agent,
             model=self._model,
             cwd=self._cwd,
+            extra_env=self._extra_env,
         )
         self._provider = provider
 
@@ -180,6 +183,7 @@ def build_pooled_agent_fn(
     default_agent: Optional[str] = None,
     default_model: Optional[str] = None,
     cwd: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
     max_workers: int = 4,
     max_starting: int = 2,
     max_identities: int = 8,
@@ -214,6 +218,7 @@ def build_pooled_agent_fn(
                 agent=agent,
                 model=model,
                 cwd=work_dir,
+                extra_env=extra_env,
             )
 
         return WorkerPool(
@@ -235,12 +240,9 @@ def build_pooled_agent_fn(
         # ``agent=None`` on the call means "use the run default" — identical to
         # build_agent_fn's ``opts.get("agent") or default_agent``. Resolve first
         # so a call that explicitly asks for the default reuses the default pool.
-        eff_agent = agent or default_agent
-        eff_model = model or default_model
-        eff_cwd = work_dir or cwd
-        if (eff_agent, eff_model, eff_cwd) == (default_agent, default_model, cwd):
+        key = (agent or default_agent, model or default_model, work_dir or cwd)
+        if key == (default_agent, default_model, cwd):
             return default_pool
-        key = (eff_agent, eff_model, eff_cwd)
         sp = subpools.get(key)
         if sp is not None:
             return sp
@@ -254,7 +256,7 @@ def build_pooled_agent_fn(
         # ``(max_identities + 1) * max_workers``.
         if len(subpools) >= max(1, max_identities):
             return None
-        sp = _make_pool(eff_agent, eff_model, eff_cwd)
+        sp = _make_pool(*key)
         subpools[key] = sp
         return sp
 
@@ -270,6 +272,7 @@ def build_pooled_agent_fn(
             agent=opts.get("agent") or default_agent,
             model=opts.get("model") or default_model,
             cwd=opts.get("cwd") or cwd,
+            extra_env=extra_env,
         )
         try:
             return await _run_step(provider, prompt)
@@ -289,6 +292,7 @@ def build_pooled_agent_fn(
                 agent=opts.get("agent") or default_agent,
                 model=opts.get("model") or default_model,
                 cwd=opts.get("cwd") or cwd,
+                extra_env=extra_env,
             )
             return await _run_step(provider, prompt)
         # Ephemeral default path: run on a warm worker from the sub-pool matching

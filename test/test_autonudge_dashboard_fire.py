@@ -38,10 +38,15 @@ def _loop(slot_key: str = "chat-1-1785") -> NudgeLoop:
     )
 
 
-def _slot(key: str = "chat-1-1785", *, running: bool = False) -> MagicMock:
+def _slot(
+    key: str = "chat-1-1785", *, running: bool = False, in_stage: bool = False
+) -> MagicMock:
     slot = MagicMock()
     slot.key = key
     slot.running = running
+    # Real _ChatSlot defaults this False; a bare MagicMock would return a truthy
+    # Mock and trip the busy guard, so model the default explicitly.
+    slot._in_stage_execution = in_stage
     return slot
 
 
@@ -53,6 +58,10 @@ def _orchestrator() -> gw.GatewayOrchestrator:
         get_slot=MagicMock(return_value=None),
         push_slots_update=MagicMock(),
         _background_tasks=set(),
+        # FIX 2 seam: the real method awaits the turn under the unattended-turn
+        # semaphore. Here it is a plain passthrough returning the inner
+        # coroutine, so ``_fake_spawn`` can still close exactly one coroutine.
+        run_background_turn=MagicMock(side_effect=lambda _slot, coro: coro),
     )
     orch.autonudge_svc = MagicMock()
     orch.autonudge_svc.remove = AsyncMock()
@@ -94,7 +103,9 @@ class TestDashboardNudgeSlotResolution:
             patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
         ):
             assert await orch._fire_dashboard_nudge(loop) is True
-        rehydrate.assert_awaited_once_with(orch.dashboard_state, loop.slot_key)
+        rehydrate.assert_awaited_once_with(
+            orch.dashboard_state, loop.slot_key, adopt_closed=True
+        )
         orch.autonudge_svc.remove.assert_not_awaited()
         assert spawn.calls == [restored], "the nudge turn did not run in the restored slot"
         assert orch._session_tasks[restored.key] is restored.task
@@ -123,7 +134,9 @@ class TestDashboardNudgeSlotResolution:
             patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
         ):
             assert await orch._fire_dashboard_nudge(loop) is True
-        rehydrate.assert_awaited_once_with(orch.dashboard_state, loop.slot_key)
+        rehydrate.assert_awaited_once_with(
+            orch.dashboard_state, loop.slot_key, adopt_closed=True
+        )
         assert spawn.calls == [restored]
 
     @pytest.mark.asyncio
@@ -171,7 +184,12 @@ class TestDashboardNudgeSlotResolution:
     async def test_unreachable_session_retires_the_loop_once_with_a_reason(
         self, caplog
     ) -> None:
-        """A genuinely gone session (deleted, or closed with ✕) still retires."""
+        """A genuinely gone session (no history, or deleted) still retires.
+
+        A tab the user dismissed with ✕ is retired by the close handler itself
+        now (api_chat_slot_delete removes the loop), not by this miss — the fire
+        path adopts a ``closed`` session so idle archival cannot destroy a loop.
+        """
         orch = _orchestrator()
         loop = _loop()
         spawn = _fake_spawn()
@@ -195,6 +213,31 @@ class TestDashboardNudgeSlotResolution:
         loop = _loop()
         before = loop.cycle_count
         orch.dashboard_state.get_slot = MagicMock(return_value=_slot(running=True))
+        spawn = _fake_spawn()
+        with (
+            patch.object(gw, "spawn_guarded_turn", spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
+        ):
+            assert await orch._fire_dashboard_nudge(loop) is False
+        orch.autonudge_svc.remove.assert_not_awaited()
+        assert spawn.calls == []
+        assert loop.cycle_count == before
+
+    @pytest.mark.asyncio
+    async def test_stage_execution_slot_skips_without_retiring_the_loop(self) -> None:
+        """A multi-stage plan mid-flight defers the cycle; it must not clobber it.
+
+        Between stages the plan sets ``slot.task = None`` (chat_orchestrator), so
+        ``slot.running`` reads False even though the plan is still executing. The
+        nudge must still defer on ``_in_stage_execution`` — firing here would start
+        a concurrent turn that scatters the plan's output.
+        """
+        orch = _orchestrator()
+        loop = _loop()
+        before = loop.cycle_count
+        orch.dashboard_state.get_slot = MagicMock(
+            return_value=_slot(running=False, in_stage=True)
+        )
         spawn = _fake_spawn()
         with (
             patch.object(gw, "spawn_guarded_turn", spawn),

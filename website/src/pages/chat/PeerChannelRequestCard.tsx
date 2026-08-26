@@ -63,7 +63,9 @@ export default memo(function PeerChannelRequestCard({
   disclosureKey?: string
 }) {
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
-  const requestLabel = parsed.delivery === 'interrupt' ? 'Urgent' : 'Message'
+  // Delivery remains in the durable envelope for diagnostics, but transport
+  // field names and values are not dashboard copy.
+  const label = parsed.delivery === 'interrupt' ? 'Urgent' : 'Message'
 
   return (
     <div
@@ -83,10 +85,8 @@ export default memo(function PeerChannelRequestCard({
           aria-hidden="true"
         />
         <MessageCircle className="lucide-inline w-[13px] h-[13px] shrink-0 text-accent" aria-hidden="true" />
-        <span className="font-medium text-fg truncate">{parsed.fromRole}</span>
-        <span className="truncate text-[12px] opacity-75 min-w-0">
-          {requestLabel}
-        </span>
+        <span className="font-medium text-fg shrink-0">{label}</span>
+        <span className="truncate text-[12px] opacity-75 min-w-0">{parsed.fromRole}</span>
       </button>
       {expanded && (
         <div className="px-2.5 pb-2.5 pt-2 border-t border-border" data-testid="peer-channel-request-body">

@@ -10,7 +10,6 @@ No spawn recursion: subagents cannot spawn other subagents.
 from __future__ import annotations
 
 import asyncio
-import ctypes
 import logging
 import math
 import os
@@ -19,9 +18,20 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Protocol
 
+from kiro_crew.acp.liveness import (
+    VERDICT_DEAD,
+    VERDICT_STUCK_INPUT,
+    VERDICT_UNKNOWN,
+    VERDICT_WORKING,
+    LivenessOracle,
+    ToolCallState,
+    boottime_now,
+    consult_offloaded,
+)
 from kiro_crew.acp.session_provider import AcpSessionProvider
+from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE, PROVIDER_LABEL_DEFAULT
 from kiro_crew.executors import run_in_embed_pool
 
 if TYPE_CHECKING:
@@ -29,8 +39,16 @@ if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
 
 from kiro_crew import platform_compat
-from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.context import ContextBuilder, window_for_provider_client
+from kiro_crew.agent_discovery import cached_project_agent_names, list_agents
+from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig
+from kiro_crew.constants import SUBAGENT_COMPLETION_PREFIX
+from kiro_crew.context import (
+    CONTEXT_GROUP_LESSONS,
+    CONTEXT_GROUP_MEMORY,
+    CONTEXT_GROUP_PROJECT,
+    ContextBuilder,
+    window_for_provider_client,
+)
 from kiro_crew.context_management import (
     COMPLETION_KEEP_DEFAULT_CHARS,
     apply_completion_keep,
@@ -46,10 +64,18 @@ from kiro_crew.hooks import (
     safe_read_file,
 )
 from kiro_crew.llm_helpers import (
+    FALLBACK_CANDIDATE_ATTEMPTS,
     TRANSIENT_RETRIES,
+    TURN_FALLBACK_ATTR,
+    FallbackState,
     acp_error_is_transient,
+    advance_fallback_candidate,
+    configured_fallback_chain,
+    provider_fallback_active,
     transient_retry_delay,
 )
+from kiro_crew.mcp_gateway import STUB_MODULE
+from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -58,13 +84,23 @@ from kiro_crew.providers.base import (
     EVENT_TOOL_RESULT,
     LLMEvent,
 )
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.resource_status import cached_admission_check
+from kiro_crew.security import (
+    redact_and_truncate,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionManager
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.session_workspace import result_path as _ws_result_path
 from kiro_crew.slack.format import extract_options
 from kiro_crew.stats import Stats
+from kiro_crew.subagent_completion_meta import (
+    OUTCOME_FAILED,
+    OUTCOME_INTERRUPTED,
+    single_completion_meta,
+)
 from kiro_crew.subagent_cost import (
     append_cost_sample,
     compact_cost_log,
@@ -74,6 +110,7 @@ from kiro_crew.subagent_persistence import (
     _agent_dir,
     _cleanup_session_files_sync,
     _subagents_dir,
+    agent_dir_for_display,
     clear_tombstone,
     create_agent_folder,
     list_orphans,
@@ -114,21 +151,81 @@ def _safe_fire(coro: Awaitable[None]) -> None:
 
 _MAX_CONCURRENT = 3
 
+#: Agent names a roster never suggests: the host default and the conductor are
+#: reached by OMITTING ``agent``, not by naming one. Shared with the spawn tools'
+#: parameter-description roster (``mcp_tools.spawn``) so the pair cannot drift
+#: when a third reserved name appears.
+UNADVERTISED_AGENTS = frozenset({"kirocrew", "kirocrew-conductor"})
 
-def _validate_agent(requested: str) -> tuple[str, str]:
-    """Validate agent name exists in ~/.kiro/agents/.
+# How many valid names an unknown-agent refusal carries. The string reaches a WS
+# frame, a tombstone and the caller's transcript, so it is bounded like every
+# other rendered detail in this module; the remainder is reported as a count with
+# a pointer to spawn_list, which lists them all.
+_MAX_AVAILABLE_IN_ERROR = 12
+
+
+def _available_agents_hint(available: list[str]) -> str:
+    """Render the valid-name roster for an unknown-agent refusal.
+
+    The names are computed anyway, to log the refusal. Withholding them from the
+    RETURNED error is what left the caller unable to self-correct: it retried
+    other invented names while every log line already held the answer, and the
+    log is not a surface the caller can read (#4842).
+
+    Every name is matched against ``_AGENT_NAME_RE`` before it is rendered, then
+    redacted, then the list is bounded. The grammar is the load-bearing filter, not
+    a tidiness check: an agent spec's ``name`` field is taken verbatim by
+    ``agent_discovery._global_agent_info`` with no validation, so a spec can
+    declare a name containing a newline and instruction-shaped text -- which is
+    pure ASCII, and would ride this string into the caller's model context.
+    ``SPAWN_RUN_SCHEMA`` already gates the ``agent`` parameter on the same grammar,
+    so a name that fails it could never have been dispatched anyway: offering it
+    here would advertise an unusable name.
+    """
+    names = [_redact(n) for n in available if _AGENT_NAME_RE.fullmatch(n)]
+    if not names:
+        # An empty roster is a different instruction than a truncated one: there
+        # is no name to correct to, so the only valid move is to stop naming an
+        # agent at all.
+        return "; no other agents are installed - omit 'agent' to use the default"
+    shown = names[:_MAX_AVAILABLE_IN_ERROR]
+    hint = "; available: " + ", ".join(shown)
+    if len(names) > len(shown):
+        hint += f" (+{len(names) - len(shown)} more, call spawn_list)"
+    return hint
+
+
+def _validate_agent(requested: str, project_dir: str = "") -> tuple[str, str]:
+    """Validate that an agent name is one kiro-cli can actually load.
+
+    Runs ON the event loop (``spawn`` is synchronous), so it must not add
+    filesystem work. The user-level ``list_agents()`` scan here is pre-existing —
+    callers that can validate off-loop skip it via ``_agent_prevalidated`` — and
+    this deliberately does NOT widen it: the project scope is read from
+    ``cached_project_agent_names()``, which performs no syscalls at all.
+
+    Consequence, stated plainly: a project agent is accepted only once that
+    project's cache is warm (any session that has already resolved bindings for it
+    has warmed it). A cold cache means the name is reported unknown, which is
+    fail-closed and matches this function's existing rule — refusing an unknown
+    name rather than silently running the default agent, which would be a
+    privilege escalation. Widening the on-loop scan to a second directory instead
+    would stall the gateway on a slow or network checkout.
+
+    *project_dir* must be the cwd the subagent will actually run in, because that
+    is what kiro-cli resolves ``--agent`` against.
 
     Returns (agent_name, error). If agent found, error is empty.
     If not found, agent_name is empty and error explains what happened.
     """
     if not requested:
         return "", ""
-    from kiro_crew.agent_discovery import list_agents
-
     known = {a.name for a in list_agents()}
+    if project_dir:
+        known |= set(cached_project_agent_names(project_dir) or frozenset())
     if requested in known:
         return requested, ""
-    available = sorted(known - {"kirocrew", "kirocrew-conductor"})
+    available = sorted(known - UNADVERTISED_AGENTS)
     # REFUSE a named-but-unknown agent rather than silently falling back to the
     # host default: that fallback runs the full default agent (frequently at
     # approval_mode="auto"), so a typo'd — or malicious — agent name was a silent
@@ -136,7 +233,9 @@ def _validate_agent(requested: str) -> tuple[str, str]:
     # "use the default" (handled above); only a named agent that does not exist
     # is rejected, so a future caller cannot reintroduce the escalation.
     logger.warning("Agent %r not found; refusing spawn. Available: %s", requested, available)
-    return "", f"agent {requested!r} not found"
+    # The roster travels WITH the refusal, not only to the log: the caller acts on
+    # the returned string, and a bare "not found" gives it nothing to correct to.
+    return "", f"agent {requested!r} not found{_available_agents_hint(available)}"
 
 
 def _vet_spawn_governance(parent_session_key: str, agent: str, app: str = "") -> str | None:
@@ -202,6 +301,58 @@ def _redact(text: str) -> str:
     text, _ = redact_exfiltration_urls(text)
     text, _ = redact_credentials(text)
     return text
+
+
+def _redact_and_truncate(text: str, max_chars: int) -> str:
+    """Redact over the FULL text, then truncate (never ``_redact(x[:n])``).
+
+    Truncating first can cut a credential in half at the boundary, leaving a
+    fragment the redaction regexes no longer match — the raw remainder would
+    then leak into the surface this feeds. Delegates to the canonical helper.
+    """
+    return redact_and_truncate(text, max_chars)
+
+
+# Bounds for a rendered exception chain. The rendering reaches a WS frame, a
+# tombstone and the Subagents panel, so it is capped rather than trusted.
+_MAX_ERROR_DETAIL_LEN = 2_000
+_MAX_ERROR_CHAIN = 4
+
+
+def _describe_exception(exc: BaseException) -> str:
+    """Render *exc* as ``Type: message``, following its cause chain.
+
+    A bare ``str(exc)`` drops the class, and for a whole family of failures the
+    message alone cannot be attributed to a subsystem: ``bad parameter or other
+    API misuse`` is unreadable prose until ``sqlite3.InterfaceError`` names
+    what raised it. The module is included for anything outside ``builtins``,
+    because the bare class name is frequently just as ambiguous as the message.
+
+    The chain is followed because the outermost exception is often a generic
+    wrapper whose ``__cause__`` holds the real fault. ``__context__`` is
+    followed only when it was not suppressed, matching how a traceback decides
+    the same question, so an unrelated exception that merely happened to be in
+    flight is not reported as this one's cause.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and len(parts) < _MAX_ERROR_CHAIN:
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        cls = type(current)
+        name = cls.__qualname__
+        module = getattr(cls, "__module__", "")
+        if module and module != "builtins":
+            name = f"{module}.{name}"
+        message = str(current).strip()
+        parts.append(f"{name}: {message}" if message else name)
+        nxt = current.__cause__
+        if nxt is None and not current.__suppress_context__:
+            nxt = current.__context__
+        current = nxt
+    return " <- caused by ".join(parts)[:_MAX_ERROR_DETAIL_LEN]
 
 
 _MAX_DONE_RESULT_LEN = 50_000  # cap subagent_done payload to avoid bloating WS frames
@@ -310,14 +461,39 @@ def _resolve_injection_timeout() -> float:
 INJECTION_TIMEOUT = _resolve_injection_timeout()
 
 
+def _resolved_model_of(client: object) -> str:
+    """The model id *client*'s live session actually resolved to serve, or ``""``.
+
+    Reads the provider's PUBLIC ``served_model`` accessor (never private
+    ``_client`` internals, which are free to move) — the same contract the
+    poisoned-conversation canary and ``AcpProvider.served_model`` use. Both
+    provider shapes are covered: ``AcpSessionProvider.served_model`` prefers the
+    explicit ``set_model`` and falls back to the ``session/new|load`` response's
+    ``currentModelId`` (so a session on the backend-selected DEFAULT is still
+    readable at spawn), while the raw ``AcpClient`` reports ``_resolved_model_id``
+    once the backend has answered (known after the first turn on the CC path).
+
+    The ``DEFAULT_MODEL`` (``"auto"``) sentinel — "let the backend pick", not yet
+    resolved — is filtered to ``""`` (unknown/inconclusive) so a caller never
+    renders it as if it were a real model, and callers must treat ``""`` as
+    "don't show", never as a wildcard. Never raises — an unreadable or
+    duck-typed client (test doubles) yields ``""``.
+    """
+    try:
+        model = str(getattr(client, "served_model", "") or "").strip()
+    except Exception:
+        return ""
+    return "" if model == DEFAULT_MODEL else model
+
+
 def _subagent_default_model() -> str:
     """Explicit sub-agent model pin (``agent.role_models['subagent']``), or ``""``.
 
     Returns ``""`` when the sub-agent role is unpinned so the caller OMITS the
-    model kwarg and keeps deferring to the provider's configured default exactly
-    as before this knob existed — rather than forcing the chat default on as an
-    explicit override (which also breaks callers/mocks that don't expect the
-    kwarg). Only a deliberate pin overrides. Never raises.
+    model kwarg and keeps deferring to the provider's configured default —
+    rather than forcing the chat default on as an explicit override (which also
+    breaks callers/mocks that don't expect the kwarg). Only a deliberate pin
+    overrides. Never raises.
     """
     try:
         from kiro_crew.config.loader import KiroCrewConfig, normalize_agent_model
@@ -331,8 +507,8 @@ def _subagent_default_effort() -> str:
     """Explicit sub-agent effort pin (``agent.role_efforts['subagent']``), or ``""``.
 
     Returns ``""`` when unpinned so the caller omits ``reasoning_effort_override``
-    and the factory's default effort applies — the prior behavior. Only a
-    deliberate pin overrides. Never raises.
+    and the factory's default effort applies. Only a deliberate pin overrides.
+    Never raises.
     """
     try:
         from kiro_crew.config.loader import KiroCrewConfig
@@ -347,10 +523,76 @@ _STALL_IDLE_SECS = (
     120  # seconds with no stream activity before a running subagent is surfaced as "stalled"
 )
 
+# SUPPRESSION CEILING: the multiple of the idle threshold past which a WORKING
+# liveness verdict may no longer hold the "stalled" badge back.
+#
+# Attribution is not infallible. Under ``agent.session_sharing`` (default true)
+# siblings share a runtime pid, so two subagents running similar commands can
+# cmdline-match the SAME child process; a genuinely wedged agent can then read
+# WORKING for as long as its sibling's child lives. Unbounded, that converts a
+# case the old idle-time-only path DID badge into a permanent false negative --
+# suppressing the only user-facing signal is worse than badging a healthy agent,
+# because the badge is self-clearing and a missing badge is not. With the ceiling
+# a misattribution costs extra latency instead of the signal itself.
+_SUPPRESS_CEILING = 4
 
-def _timeout_context(info: "SubagentInfo", *, include_elapsed: bool = True) -> str:
-    """Build a human-readable context string for timeout errors."""
-    parts = [f"turn {info.turns}/{info.max_turns}"]
+# Wave-digest HOLD DEADLINE: the maximum time a COMPLETED wave member's result
+# may sit undelivered while the gateway waits for the digest chunk to fill.
+#
+# The chunk-size trigger alone (``SUBAGENT_DIGEST_CHUNK_SIZE``, default 10) is
+# a COUNT trigger, and the concurrency cap makes typical waves 2-5 members —
+# so the count can never be reached and the only flush that ever fires is the
+# wave-close one. Every sibling's result is then withheld for the SLOWEST
+# member's entire remaining runtime; a member that HANGS rather than fails
+# withholds them for the full ``_TIMEOUT_SECS`` reap (30 min), which is
+# indistinguishable from a dead session (issue #2215).
+#
+# This deadline is the latency half of that one-knob-two-jobs split: the count
+# trigger keeps bounding digest SIZE for large waves, while the deadline caps
+# worst-case delivery LATENCY for every wave size. A wave whose members all
+# finish within the deadline of each other still delivers ONE consolidated
+# digest — the deliberate small-wave behavior is unchanged.
+#
+# Tunable via ``KIROCREW_SUBAGENT_DIGEST_HOLD_SECS``; 0/negative disables the
+# deadline (count-trigger-only, i.e. pre-fix behavior). Guarded parse: a
+# malformed value must never crash import.
+_DEFAULT_DIGEST_HOLD_SECS = 120.0
+
+
+def _digest_hold_secs() -> float:
+    try:
+        val = float(os.environ.get("KIROCREW_SUBAGENT_DIGEST_HOLD_SECS", ""))
+    except (TypeError, ValueError):
+        return _DEFAULT_DIGEST_HOLD_SECS
+    if math.isnan(val):
+        # NaN parses fine but loses every comparison, so it would be neither
+        # disabled (``nan <= 0`` is False) nor bounded (``min(nan, x)`` is nan)
+        # — the sweep's ``age < DIGEST_HOLD_SECS`` would also be False, forcing
+        # a flush on the FIRST hold, and ``int(nan)`` then raises inside digest
+        # composition AFTER the hold clocks were cleared and ``flushed`` was
+        # advanced. That permanently withholds the very results this deadline
+        # exists to release, so NaN is malformed input, not a deadline.
+        return _DEFAULT_DIGEST_HOLD_SECS
+    if val <= 0:
+        return 0.0  # explicit opt-out
+    return min(val, float(_TIMEOUT_SECS))
+
+
+DIGEST_HOLD_SECS = _digest_hold_secs()
+
+
+def _timeout_context(
+    info: "SubagentInfo", *, include_elapsed: bool = True, turn_limit: int = 0
+) -> str:
+    """Build a human-readable context string for timeout errors.
+
+    ``turn_limit`` is the resolved effective turn cap (per-spawn override →
+    manager default → hardcoded). ``info.max_turns`` alone is only the raw
+    per-spawn override, which is 0 when unset and would render a misleading
+    ``turn N/0``. When no positive cap is known, the cap is omitted entirely.
+    """
+    limit = turn_limit or info.max_turns
+    parts = [f"turn {info.turns}/{limit}" if limit > 0 else f"turn {info.turns}"]
     if info.last_tool:
         parts.append(f"last tool: {_redact(info.last_tool)}")
     if include_elapsed:
@@ -385,10 +627,13 @@ def check_memory_available(min_gb: float = 4.0, path: str = "/proc/meminfo") -> 
     return (True, -1.0)
 
 
-# Process-subtree RSS readers (relocated from the upstream mcp_gateway pool,
+# Process-subtree readers (relocated from the upstream mcp_gateway pool,
 # which is absent in this fork). Pure-stdlib /proc walkers: on non-Linux hosts
 # every /proc access raises OSError and these degrade to -1 / [] gracefully.
-_RSS_SUBTREE_MAX_PROCS = 256
+# ONE ceiling for every reading. RSS, CPU and the two counts used to be three
+# walks carrying two copies of the same 256, which is how they could have
+# drifted apart.
+_SUBTREE_MAX_PROCS = 256
 
 
 def _single_proc_rss_kb(pid: int) -> int:
@@ -424,38 +669,156 @@ def _proc_children(pid: int) -> list[int]:
     return kids
 
 
-def _proc_rss_kb(pid: Optional[int]) -> int:
-    """Resident set size (KiB) for ``pid`` **and all its descendants**.
+def _parse_cpu_jiffies(stat: bytes) -> int:
+    """Sum utime+stime (clock ticks) from raw ``/proc/<pid>/stat`` bytes.
+
+    Splits after the final ``)`` so a ``comm`` containing spaces/parens is
+    handled. utime/stime are fields 14/15 (1-indexed) → indices 11/12 of the
+    post-comm tokens. Returns 0 on any parse error.
+    """
+    try:
+        rparen = stat.rindex(b")")
+        fields = stat[rparen + 2 :].split()
+        return int(fields[11]) + int(fields[12])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _proc_cpu_jiffies(pid: int) -> int:
+    """utime+stime (clock ticks) for a single pid, 0 on error."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            return _parse_cpu_jiffies(fh.read())
+    except OSError:
+        return 0
+
+
+class _SubtreeSample(NamedTuple):
+    """Every subtree reading the cost sweep needs, from ONE walk.
+
+    Each field keeps the sentinel its own reader had, because the four readings
+    are unmeasurable in different ways and collapsing any of them into zero is
+    the bug class the count columns were added to fix:
+
+    * ``rss_kb`` — summed KiB, or ``-1`` when the root pid's own status is
+      unreadable (it is gone, or the host has no ``/proc``).
+    * ``jiffies`` — summed utime+stime clock ticks; an unreadable pid
+      contributes 0, since a *delta* of jiffies is what the caller consumes.
+    * ``procs`` / ``stubs`` — how many processes a runtime carries, and how many
+      of them are MCP stubs, matched on ``STUB_MODULE``, the module path the
+      rewriter itself puts on the stub launch line. ``None`` means UNMEASURABLE,
+      never zero. Rendering "0 processes" for a live runtime would be a lie; the
+      surface renders ``None`` as an em dash instead.
+    """
+
+    rss_kb: int
+    jiffies: int
+    procs: Optional[int]
+    stubs: Optional[int]
+
+
+def _proc_subtree_sample(
+    pid: Optional[int],
+    *,
+    rss: bool = True,
+    counts: bool = True,
+) -> _SubtreeSample:
+    """Walk ``pid``'s process subtree ONCE and return every reading from it.
 
     A subagent's kiro-cli process is frequently a thin launcher whose real
-    memory lives in a child process. Counting only ``pid``'s own ``VmRSS``
-    under-reports the true footprint, so we sum the whole subtree.
+    memory lives in a child process, so all four readings describe the whole
+    subtree rather than the root pid alone.
 
-    Returns -1 if ``pid`` is falsy or its own status cannot be read; otherwise
-    the summed KiB (descendants that vanish mid-walk are simply skipped, so the
-    result degrades gracefully to parent-only when ``children`` is unreadable).
+    The point of one pass is not only the ~3x fewer ``/proc`` reads: the three
+    readers this replaced ran at three different instants, so a process that
+    exited between them was counted by one and missed by another. Reading every
+    metric off a single frontier is what makes "the same set of processes" true
+    of the *result* and not merely of the walk rules.
+
+    ``rss`` / ``counts`` let a caller that only needs the CPU total skip those
+    per-process reads, so it costs what it cost before this walk was shared.
+    Skipped metrics come back as their own unmeasurable sentinel.
+
+    Blocking: reads a handful of ``/proc`` entries per process in the subtree,
+    so it belongs on an executor thread, never on the event loop (see
+    ``_reaper_loop`` -> ``_sample_live_costs``).
     """
     if not pid:
-        return -1
-    own = _single_proc_rss_kb(pid)
-    if own < 0:
-        return -1
-    total = own
+        return _SubtreeSample(-1, 0, None, None)
+    # The counts share RSS's liveness probe: a root pid whose own status cannot
+    # be read has nothing to attribute, so there is nothing to count either.
+    own_rss = _single_proc_rss_kb(pid) if (rss or counts) else -1
+    countable = counts and platform_compat.IS_LINUX and own_rss >= 0
+    rss_total = own_rss if (rss and own_rss >= 0) else -1
+    needles = (STUB_MODULE,)
+    jiffies = _proc_cpu_jiffies(pid)
+    procs = 1
+    stubs = 1 if countable and platform_compat.process_matches(pid, needles) else 0
     seen = {pid}
     frontier = [pid]
-    while frontier and len(seen) < _RSS_SUBTREE_MAX_PROCS:
+    while frontier and len(seen) < _SUBTREE_MAX_PROCS:
         nxt: list[int] = []
         for parent in frontier:
             for child in _proc_children(parent):
                 if child in seen:
                     continue
                 seen.add(child)
-                kb = _single_proc_rss_kb(child)
-                if kb > 0:
-                    total += kb
+                if rss_total >= 0:
+                    kb = _single_proc_rss_kb(child)
+                    if kb > 0:
+                        rss_total += kb
+                jiffies += _proc_cpu_jiffies(child)
+                if countable:
+                    procs += 1
+                    if platform_compat.process_matches(child, needles):
+                        stubs += 1
                 nxt.append(child)
         frontier = nxt
-    return total
+    if not countable:
+        return _SubtreeSample(rss_total, jiffies, None, None)
+    return _SubtreeSample(rss_total, jiffies, procs, stubs)
+
+
+def _subtree_cpu_jiffies(pid: int) -> int:
+    """Sum utime+stime across ``pid`` and its descendants (clock ticks).
+
+    Thin wrapper over :func:`_proc_subtree_sample`, so the CPU subtree the
+    Sessions session rows read is the same subtree the task rows describe.
+    """
+    return _proc_subtree_sample(pid, rss=False, counts=False).jiffies
+
+
+def _attributed_count(total: Optional[int], sharers: int, previous: Optional[int]) -> Optional[int]:
+    """One co-tenant's share of a subtree *total*, or *previous* if unmeasured.
+
+    Counts follow the same per-sharer split as the RSS/CPU attribution (see
+    ``SubagentManager._live_shared_count``) so every attributed column on a row
+    describes the same fraction of the runtime. Two differences follow from a
+    count being a whole number:
+
+    * The quotient is rounded to the nearest whole process.
+    * A nonzero total never rounds down to zero. "This runtime carries stubs,
+      your share is 0" is the reading that would reproduce the original bug in a
+      new form, so the floor is 1 whenever anything was counted.
+
+    Passing *previous* through on an unmeasured sweep (``total is None`` — the
+    pid died, or the platform has no ``/proc``) keeps the last good reading
+    rather than blanking a column mid-run, matching how RSS only writes when its
+    own read succeeded.
+
+    NOTE on the divisor: ``_live_shared_count`` counts SUBAGENT tenants. A
+    subagent shares its parent session's runtime whenever one is available
+    (``_create_shared_session``), and the parent session is not a subagent, so
+    with a parent co-tenant the divisor is a lower bound and a task's share is an
+    upper bound. That is the divisor RSS and CPU have always used; unifying it is
+    a separate change to numbers users already read, not a side effect of adding
+    two columns.
+    """
+    if total is None:
+        return previous
+    if sharers <= 1 or total <= 0:
+        return total
+    return max(1, round(total / sharers))
 
 
 # Legacy hard-coded concurrent cap; also the lower clamp bound for auto-sizing
@@ -498,97 +861,30 @@ def _available_memory_gb() -> float:
     return -1.0
 
 
-def _macos_vm_reclaimable_pages() -> Optional[int]:  # pragma: no cover
+def _macos_vm_reclaimable_pages() -> Optional[int]:
     """Reclaimable memory in **pages** via Mach ``host_statistics64``, or ``None``.
 
-    macOS-only. Excluded from coverage because the Linux CI fleet cannot execute
-    the Mach path; validated live against ``vm_stat`` on Apple silicon (matches
-    within live-fluctuation noise). Reads in-process through ``ctypes`` /
-    ``libSystem`` — **no subprocess** — so it is safe on the gateway event loop
-    and passes the spawn-audit guard.
+    macOS-only; validated live against ``vm_stat`` on Apple silicon (matches
+    within live-fluctuation noise). The Mach call itself lives in
+    ``platform_compat.macos_vm_statistics``, so the kernel struct is declared in
+    one place; what stays here is this caller's own composition of it.
 
     Reclaimable ≈ ``free + inactive + speculative + purgeable`` page classes:
     memory that can back a new allocation without swapping (the closest analogue
     to Linux ``MemAvailable``). Wired/active/compressed pages are excluded.
-    Returns ``None`` on any failure (non-macOS ``libSystem`` absent, non-zero
+    Returns ``None`` on any failure (non-macOS, ``libSystem`` absent, non-zero
     ``kern_return_t``) so the caller falls back to the legacy default.
+
+    This sum is knowingly looser than ``platform_compat.host_available_mib``,
+    which bounds ``inactive`` by ``external_page_count`` and does not re-add
+    ``speculative`` (``free_count`` already contains it). The two are not
+    interchangeable: tightening this one moves ``compute_max_subagents``, a
+    number that is documented and that operators tune against.
     """
-    try:
-        libc = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
-    except OSError:
-        return None  # not macOS / libSystem unavailable
-
-    natural_t = ctypes.c_uint  # natural_t is 32-bit on macOS
-    u64 = ctypes.c_uint64
-
-    # Leading fields of vm_statistics64_data_t (<mach/vm_statistics.h>) in
-    # declaration order, so the byte layout matches what the kernel fills. Only
-    # free/inactive/speculative/purgeable are read, but the full struct is
-    # declared so the element count handed to host_statistics64 is exact.
-    class _VMStatistics64(ctypes.Structure):
-        _fields_ = [
-            ("free_count", natural_t),
-            ("active_count", natural_t),
-            ("inactive_count", natural_t),
-            ("wire_count", natural_t),
-            ("zero_fill_count", u64),
-            ("reactivations", u64),
-            ("pageins", u64),
-            ("pageouts", u64),
-            ("faults", u64),
-            ("cow_faults", u64),
-            ("lookups", u64),
-            ("hits", u64),
-            ("purges", u64),
-            ("purgeable_count", natural_t),
-            ("speculative_count", natural_t),
-            ("decompressions", u64),
-            ("compressions", u64),
-            ("swapins", u64),
-            ("swapouts", u64),
-            ("compressor_page_count", natural_t),
-            ("throttled_count", natural_t),
-            ("external_page_count", natural_t),
-            ("internal_page_count", natural_t),
-            ("total_uncompressed_pages_in_compressor", u64),
-        ]
-
-    HOST_VM_INFO64 = 4  # flavor selector for host_statistics64
-
-    try:
-        libc.mach_host_self.restype = ctypes.c_uint
-        libc.mach_task_self.restype = ctypes.c_uint
-        libc.mach_port_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint]
-        libc.host_statistics64.restype = ctypes.c_int
-        libc.host_statistics64.argtypes = [
-            ctypes.c_uint,
-            ctypes.c_int,
-            ctypes.POINTER(_VMStatistics64),
-            ctypes.POINTER(ctypes.c_uint),
-        ]
-        host_port = libc.mach_host_self()
-        try:
-            stats = _VMStatistics64()
-            count = ctypes.c_uint(ctypes.sizeof(_VMStatistics64) // ctypes.sizeof(ctypes.c_int))
-            kern_return = libc.host_statistics64(
-                host_port,
-                HOST_VM_INFO64,
-                ctypes.byref(stats),
-                ctypes.byref(count),
-            )
-        finally:
-            # Release the send right returned by mach_host_self so the port
-            # reference isn't leaked on every probe. Guard the deallocate so a
-            # missing symbol here still returns None cleanly below.
-            try:
-                libc.mach_port_deallocate(libc.mach_task_self(), host_port)
-            except (AttributeError, OSError, ValueError):
-                pass
-    except (AttributeError, OSError, ValueError):
+    probe = platform_compat.macos_vm_statistics()
+    if probe is None:
         return None
-    if kern_return != 0:  # non-zero kern_return_t → failure
-        return None
-
+    stats, _filled = probe
     return stats.free_count + stats.inactive_count + stats.speculative_count + stats.purgeable_count
 
 
@@ -748,53 +1044,6 @@ def resolve_max_subagents(cfg: KiroCrewConfig) -> int:
 
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-_CPU_SUBTREE_MAX_PROCS = 256
-
-
-def _parse_cpu_jiffies(stat: bytes) -> int:
-    """Sum utime+stime (clock ticks) from raw ``/proc/<pid>/stat`` bytes.
-
-    Splits after the final ``)`` so a ``comm`` containing spaces/parens is
-    handled. utime/stime are fields 14/15 (1-indexed) → indices 11/12 of the
-    post-comm tokens. Returns 0 on any parse error.
-    """
-    try:
-        rparen = stat.rindex(b")")
-        fields = stat[rparen + 2 :].split()
-        return int(fields[11]) + int(fields[12])
-    except (ValueError, IndexError):
-        return 0
-
-
-def _proc_cpu_jiffies(pid: int) -> int:
-    """utime+stime (clock ticks) for a single pid, 0 on error."""
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as fh:
-            return _parse_cpu_jiffies(fh.read())
-    except OSError:
-        return 0
-
-
-def _subtree_cpu_jiffies(pid: int) -> int:
-    """Sum utime+stime across ``pid`` and its descendants (clock ticks).
-
-    Walks the same kernel children list as ``pool._proc_rss_kb`` so the CPU
-    subtree matches the RSS subtree.
-    """
-    total = _proc_cpu_jiffies(pid)
-    seen = {pid}
-    frontier = [pid]
-    while frontier and len(seen) < _CPU_SUBTREE_MAX_PROCS:
-        nxt: list[int] = []
-        for parent in frontier:
-            for child in _proc_children(parent):
-                if child in seen:
-                    continue
-                seen.add(child)
-                total += _proc_cpu_jiffies(child)
-                nxt.append(child)
-        frontier = nxt
-    return total
 
 
 def validate_cwd(cwd: str, allowed_roots: list[str]) -> tuple[str, str]:
@@ -882,12 +1131,47 @@ class SubagentInfo:
     stalled: bool = (
         False  # True while the reaper has flagged this subagent as idle/stalled (UI signal)
     )
+    # follow_up delivery mode (spawn_steer mode="follow_up"): messages queued
+    # here are NOT injected into the running turn — they are dispatched as ONE
+    # continuation on this run's conversation after the run completes, so a
+    # correction can wait for the current turn instead of interrupting it
+    # mid-execution. Drained by the per-run watcher (_deliver_followups).
+    pending_followups: list = field(default_factory=list)
+    # True once a followup watcher task is armed for this run (one per run).
+    _followup_watcher: bool = False
     _stall_suspect_at: float = (
         0.0  # first reaper sweep that saw the idle threshold exceeded; 2-sweep confirmation (scale dampening)
     )
     _awaiting_approval: bool = (
         False  # True while blocked on a human tool-approval prompt; exempt from idle-stall
     )
+    # Attribution snapshot of the tool currently in flight, mirroring what
+    # ``AcpSessionHandle`` keeps for the main agent. This is what lets the
+    # liveness oracle key evidence to THIS subagent's own child process (by
+    # cmdline match) instead of to the whole runtime subtree — which, on a
+    # session-shared runtime, is dominated by kiro-cli's own background I/O.
+    _inflight_tool: Any = None
+    # Per-agent liveness oracle. One instance PER AGENT is required, not one per
+    # manager: the oracle keys its counter samples by kind ("io"/"cpu"), not by
+    # pid, so a shared instance would let one agent's sample become another's
+    # baseline and read as movement. Retired (not cleared) on every new tool
+    # dispatch so a walk still running against the previous tool cannot write
+    # into the next tool's baseline.
+    _stall_oracle: Any = None
+    # The in-flight offloaded consult for this agent, if any. Tracked so at most
+    # ONE /proc walk per agent is outstanding: a permanently wedged read would
+    # otherwise leave a blocked worker behind on every reaper sweep and starve
+    # the shared subprocess pool that teardown also draws from. Deliberately NOT
+    # cleared when the oracle is retired on a new tool dispatch — dropping the
+    # handle would un-bound exactly that growth.
+    _consult_future: Any = None
+    # Monotonic generation of the attribution snapshot above. Bumped on EVERY
+    # retirement (new dispatch, final tool result, fresh stream activity) so an
+    # offloaded consult that outlived the tool it was submitted for can be
+    # recognised as stale and discarded instead of applied to whatever is in
+    # flight now. Without it the ``/proc`` walk's own latency is enough to flag a
+    # subagent that resumed work while the walk was still running.
+    _stall_gen: int = 0
     # Batch/wave identity: set when this spawn is part of a multi-task wave
     # (spawn_run tasks=[...]) so scale plumbing can digest completions and
     # emit batch lifecycle events. Empty for standalone spawns.
@@ -900,6 +1184,19 @@ class SubagentInfo:
     # restart mid-wave would silently lose every held completion. The gateway
     # marks held members delivered when the digest fires.
     _digest_held: bool = False
+    # ``time.time()`` when the gateway HELD this member's delivery for the wave
+    # digest; 0.0 once that hold has been flushed (or never held). Separate from
+    # ``_digest_held`` on purpose: that flag is the restart-safety contract read
+    # by the run loop, and must not be mutated by the hold-deadline sweep. This
+    # timestamp is the sweep's only input — see ``_sweep_digest_holds``.
+    _digest_held_at: float = 0.0
+    # True ONLY for the synthetic record that :meth:`force_digest_flush`
+    # announces to release held results whose hold deadline expired. It is NOT a
+    # wave member: it carries the wave's ``batch_id`` so the gateway can find
+    # the wave's digest buffer, but the gateway must skip every per-member side
+    # effect for it (WS terminal event, orchestration tracker accounting,
+    # done/ok/err counters, digest lines) and only force the flush.
+    _digest_flush_only: bool = False
     # A reap/stop has STARTED but may still be in its (awaiting) teardown. Split
     # out of `reaped` because that flag carries two incompatible meanings: the
     # cancel-recovery scheduler needs it set BEFORE the teardown awaits (or it
@@ -916,6 +1213,16 @@ class SubagentInfo:
     # digest COMPOSITION would re-open the restart-loss window between
     # composing and routing.
     _digest_settle_ids: list[str] = field(default_factory=list)
+    # True when the gateway QUEUED this completion's injection because the
+    # parent's slot was busy. Delivery is not consumption: the announce sits in
+    # the slot queue until a turn drains it, and that wait is bounded only by the
+    # turn ceiling — far longer than agent.subagent_result_ttl_secs. The run loop
+    # must therefore SKIP mark_delivered() (a "delivered" tombstone starts the
+    # retention clock, so the reaper would prune result.txt while the promise of
+    # it is still queued, and the parent would be handed a dead path). The drain
+    # settles the tombstone instead — see
+    # ``_ChatSlot.take_pending_subagent_deliveries`` (issue #4839).
+    _delivery_queued: bool = False
     max_turns: int = 0
     reaped: bool = False
     streaming_text: str = ""
@@ -923,6 +1230,28 @@ class SubagentInfo:
     _raw_task: str = ""  # unredacted task for kiro-cli execution prompt
     # CC-specific overrides (ignored for ACP)
     model: str = ""
+    # The model id the live session ACTUALLY resolved to serve, read back from
+    # the provider's public ``served_model`` accessor. Distinct from ``model``,
+    # which is only the REQUESTED pin (often "" ⇒ provider default): the ACP
+    # backend reports the served id even on the default, and a routing/config/
+    # availability downgrade makes the two differ. "" means unknown/inconclusive
+    # (never a wildcard) — the ACP session/new response fills it at spawn, while
+    # the CC/raw path only knows it after the first turn, so it is refreshed at
+    # completion too. Surfaced on the subagent WS frames and completion meta so a
+    # model-pinned review's actual model is auditable (issue #3582).
+    resolved_model: str = ""
+    # The EFFECTIVE requested model — the per-spawn pin (``model``) OR, when that
+    # is empty, the ``agent.role_models['subagent']`` config pin (AGENTS.md names
+    # the config pin as *the* way to pin a subagent model). This is the side the
+    # downgrade comparison must use: a config-pinned run served a different model
+    # is exactly the "unverifiable pin" this feature exists to catch, and keying
+    # off the bare per-spawn ``model`` would miss it (Design review on #3582).
+    # "" ⇒ no pin (the provider default). Resolved once at spawn.
+    requested_model: str = ""
+    # Per-call reasoning-effort override (spawn_run ``reasoning_effort``).
+    # Wins over the ``role_efforts['subagent']`` pin; ``""`` defers to it.
+    # Like ``model``, a non-empty value forces the dedicated-process path.
+    reasoning_effort: str = ""
     allowed_tools: list[str] = field(default_factory=list)
     bare: bool = False
     # Continuable conversations (spawn_run keep=True / spawn_continue):
@@ -930,6 +1259,16 @@ class SubagentInfo:
     # SessionManager.mark_continuable, and skips session-file deletion at
     # teardown so the conversation can be resumed by a later run.
     keep: bool = False
+    # Which switchable context groups this sub-agent inherits from the injected
+    # session context. All True ⇒ byte-identical to a non-sub-agent session. A
+    # parent opts one out when it can name why this task cannot need it; the
+    # sub-agent is told by name what was withheld so it reports the gap instead
+    # of guessing. Resolved once at spawn and carried through the queue and
+    # retry paths, so a drained or retried run sees the same scope as the run
+    # its caller asked for.
+    include_memory: bool = True
+    include_lessons: bool = True
+    include_project: bool = True
     # Session key override for continuation runs: a spawn_continue run reuses
     # the ORIGINAL run's session key (``subagent:<conv-id>``) so get_or_create
     # finds the persisted sid and arms session/load. Empty ⇒ the default
@@ -959,6 +1298,13 @@ class SubagentInfo:
     # sample costs no extra syscalls.
     last_rss_gb: float = 0.0
     last_cpu_cores: float = 0.0
+    # Live process/MCP-stub counts of this run's subtree, from the same sweep.
+    # ``None`` = not measured yet (or unmeasurable on this platform), which the
+    # surface must render as an em dash: a live runtime with "0 processes" is a
+    # lie, and it is exactly the reading that made subagent rows look like they
+    # carried no MCP stubs at all.
+    last_procs: int | None = None
+    last_stubs: int | None = None
     _cpu_jiffies_prev: int = 0  # last subtree utime+stime sample (clock ticks)
     _cpu_sample_ts: float = 0.0  # monotonic time of the last CPU sample
     # Session sharing — when True, this subagent runs as a session on the
@@ -1018,8 +1364,61 @@ class SubagentInfo:
 # Callback: (subagent_info) -> None
 AnnounceCallback = Callable[[SubagentInfo], Awaitable[None]]
 
+
+def _injection_notice_outcome(info: "SubagentInfo") -> str:
+    """One-sentence outcome line for the injection-failure fallback notice.
+
+    ``notify_injection_failed`` fires whenever a terminal report could not be
+    injected into the parent — for EVERY terminal state, not just successful
+    completion. Asserting "finished" for a run that was stopped or rejected
+    before it executed misdescribes the outcome, so the line branches on the
+    record's canonical :attr:`SubagentInfo.outcome` with one before-start
+    refinement per branch: ``_exec_started`` — the marker ``_run_inner`` sets
+    when execution actually begins — is ``None`` exactly when the run never
+    executed, which covers every spawn-rejection site (all of them construct
+    their record without it) with no wording contract between ``error``
+    strings and this notice. The "no result to deliver" phrasings are guarded
+    on the absence of any output so they can never contradict the result-path
+    recovery hint. Pure function of the record, unit-tested per branch.
+    """
+    never_ran = info._exec_started is None and not info.result and not info.result_path
+    outcome = info.outcome
+    if outcome == "stopped":
+        if never_ran:
+            return "The run was stopped before it started, so there is no result to deliver."
+        return "The run was stopped before it completed."
+    if outcome == "failed":
+        if never_ran:
+            return "The run failed before it started, so there is no result to deliver."
+        return "The agent failed before a result could be delivered."
+    return "The agent finished but result delivery timed out."
+
+
 # Event callback: (event_type, info, extra_data) -> None
 SubagentEventCallback = Callable[[str, "SubagentInfo", dict], Awaitable[None]]
+
+
+def _context_groups_of(info: "SubagentInfo") -> frozenset[str]:
+    """The switchable context groups this run KEEPS.
+
+    One source of truth for the run's scope, shared by the ``build_message``
+    call that applies it and the ``state.json`` record a continuation reads it
+    back from, so the two cannot drift.
+    """
+    return frozenset(
+        group
+        for group, on in (
+            (CONTEXT_GROUP_MEMORY, info.include_memory),
+            (CONTEXT_GROUP_LESSONS, info.include_lessons),
+            (CONTEXT_GROUP_PROJECT, info.include_project),
+        )
+        if on
+    )
+
+
+def _context_groups_field(info: "SubagentInfo") -> str:
+    """``state.json`` encoding of the run's scope: comma-joined, sorted."""
+    return ",".join(sorted(_context_groups_of(info)))
 
 
 class ToolApprovalCallback(Protocol):
@@ -1054,7 +1453,7 @@ class SubagentManager:
         on_spawn_approval: SpawnApprovalCallback | None = None,
         is_yolo: Callable[[], bool] | None = None,
         on_event: SubagentEventCallback | None = None,
-        on_orphan_notify: Callable[[str, str], Awaitable[bool]] | None = None,
+        on_orphan_notify: Callable[..., Awaitable[bool]] | None = None,
         on_orphan_dm: Callable[[str], Awaitable[bool]] | None = None,
         completion_keep: str = "head",
         completion_keep_chars: int = COMPLETION_KEEP_DEFAULT_CHARS,
@@ -1086,6 +1485,13 @@ class SubagentManager:
         # Strong refs to in-flight shielded terminal reports (see
         # `_spawn_terminal_report`); drained in `cancel_all`.
         self._report_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # follow_up watchers (spawn_steer mode="follow_up"), keyed by run id.
+        # Manager-OWNED on purpose: these tasks can spawn a brand-new run
+        # (continue_conversation), so per this module's containment contract
+        # (see _schedule_cancel_recovery) they must be reachable by
+        # cancel_all() — a watcher parked in the global _safe_fire set would
+        # survive shutdown and dispatch against a closing SessionManager.
+        self._followup_watchers: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         # task -> the agent whose terminal report it is delivering
         self._report_owners: dict[asyncio.Task, SubagentInfo] = {}  # type: ignore[type-arg]
         self._last_spawn_ts: float = 0.0  # monotonic time of the last actual start (stagger gate)
@@ -1107,6 +1513,17 @@ class SubagentManager:
         except AttributeError:
             pass  # test doubles without the setter
         self._tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
+        # Teardown gates for runs whose terminal report has started, keyed by id and
+        # OUTLIVING both dicts above. A "delivered" tombstone excludes a folder from
+        # restart orphan reconciliation, so it must never be written while the run's
+        # child is still being killed -- and the settlement that writes it can happen
+        # outside the run (the parent's queue drain; issue #4839), long after a
+        # dashboard "clear completed" / "cancel" has popped BOTH ``_agents`` and
+        # ``_tasks`` for a done-but-still-tearing-down run. Reading the gate from
+        # here, rather than inferring "record gone means teardown finished", is what
+        # makes that inference unnecessary. Removed by the same ``finally`` that sets
+        # the event, so a missing entry always means "nothing left to wait for".
+        self._teardown_gates: dict[str, asyncio.Event] = {}
         # Queued spawns store the FULL spawn() kwarg set (not just a 5-tuple), so a
         # drained spawn preserves approval_mode / silent / model / allowed_tools / bare —
         # dropping them made a queued headless/auto spawn hit the deny-by-default gate and
@@ -1152,6 +1569,14 @@ class SubagentManager:
         except Exception:
             self._spawn_stagger_secs = 2.0
 
+    def _effective_turn_limit(self, info: SubagentInfo) -> int:
+        """Resolved turn cap for a run: per-spawn ``max_turns`` → config
+        default (``agent.subagent_max_turns``) → hardcoded ``_TURN_LIMIT``.
+
+        ``0`` at any level means "not set" and falls through to the next.
+        """
+        return info.max_turns or self._default_turn_limit or _TURN_LIMIT
+
     def update_completion_keep(self, mode: str, max_chars: int) -> None:
         """Update the live completion-keep mode and char budget.
 
@@ -1178,8 +1603,17 @@ class SubagentManager:
         event: LLMEvent,
         *,
         metadata: dict | None = None,
+        info: "SubagentInfo | None" = None,
     ) -> None:
         await client.approve_tool(request_id)
+        # An APPROVED child-origin escalation is side-effect activity: count
+        # it in tool_count so the transient-retry / cancel-respawn replay
+        # gates see it (an approved child mutation must never be replayed by
+        # a bare original prompt). Counted here — on the approval outcome —
+        # not at receipt: a purely rejected escalation executed nothing and
+        # must not permanently disable the run's replay budget.
+        if info is not None and event.sub_session_id:
+            info.tool_count += 1
         sel().log_tool_invocation(
             session_key=session_key,
             source="subagent",
@@ -1201,6 +1635,16 @@ class SubagentManager:
         metadata: dict | None = None,
     ) -> None:
         await client.reject_tool(request_id)
+        # getattr: production LLMEvents always carry sub_session_id, but this
+        # static helper is also driven with lightweight test doubles.
+        if getattr(event, "sub_session_id", ""):
+            # Hang-resilience series: backend-child denials on the headless
+            # subagent surface (low-fidelity fail-close, escalation/turn-limit
+            # bails, interactive rejections). ``reason`` is a closed enum.
+            emit_counter(
+                CHILD_PERMISSION_DENIED,
+                {"surface": "subagent", "reason": error or "rejected"},
+            )
         sel().log_tool_invocation(
             session_key=session_key,
             source="subagent",
@@ -1379,23 +1823,40 @@ class SubagentManager:
         """
         task_preview = (state.get("task", "") or "")[:100]
         parent_session = state.get("parent_session", "")
-
-        result_path = str(_agent_dir(agent_id) / "result.txt")
+        result_path = str(agent_dir_for_display(agent_id) / "result.txt")
 
         if has_result:
             msg = (
-                f"[Subagent completion event]\n"
+                f"{SUBAGENT_COMPLETION_PREFIX}\n"
                 f"Agent `{agent_id}` ⚠️ orphaned by gateway restart\n"
                 f"Task: {task_preview}\n"
                 f"Result saved at: `{result_path}`\n"
                 f"Use the read tool to retrieve it."
             )
+            # A restart orphan whose result survived on disk: interrupted, not a
+            # plain failure. The note is the only explanation the header carries.
+            row_meta = single_completion_meta(
+                agent_id=agent_id,
+                outcome=OUTCOME_INTERRUPTED,
+                task=task_preview,
+                note="orphaned by gateway restart",
+                requested_model=str(state.get("requested_model") or ""),
+                resolved_model=str(state.get("resolved_model") or ""),
+            )
         else:
             msg = (
-                f"[Subagent completion event]\n"
+                f"{SUBAGENT_COMPLETION_PREFIX}\n"
                 f"Agent `{agent_id}` ❌ lost to gateway restart\n"
                 f"Task: {task_preview}\n"
                 f"No result was captured before the restart."
+            )
+            row_meta = single_completion_meta(
+                agent_id=agent_id,
+                outcome=OUTCOME_FAILED,
+                task=task_preview,
+                note="lost to gateway restart",
+                requested_model=str(state.get("requested_model") or ""),
+                resolved_model=str(state.get("resolved_model") or ""),
             )
 
         # Redact before any delivery path (injection or Slack DM)
@@ -1407,7 +1868,7 @@ class SubagentManager:
         # tab the digest DM below is the only surface.
         if has_dashboard_surface(parent_session):
             try:
-                injected = await self._try_inject_orphan_notification(parent_session, msg)
+                injected = await self._try_inject_orphan_notification(parent_session, msg, row_meta)
                 if injected:
                     # Update tombstone recovery_action
                     try:
@@ -1428,18 +1889,23 @@ class SubagentManager:
         # Undelivered: hand back for the caller's single digest DM.
         return msg
 
-    async def _try_inject_orphan_notification(self, parent_session: str, msg: str) -> bool:
+    async def _try_inject_orphan_notification(
+        self, parent_session: str, msg: str, meta: dict | None = None
+    ) -> bool:
         """Try to inject a message into the parent dashboard session.
 
         Delegates to the gateway-wired ``on_orphan_notify`` callback, which
         appends the (already-redacted) message to the parent slot's transcript
         and queues it into ``slot._pending_subagent_failures`` so the LLM
         learns about the orphan on its next turn. Returns True if delivered.
+
+        ``meta`` carries the structured completion facts for the dashboard card
+        (#1792) so the orphan row renders without re-parsing its prose header.
         """
         if self._on_orphan_notify is None:
             return False
         try:
-            delivered = bool(await self._on_orphan_notify(parent_session, msg))
+            delivered = bool(await self._on_orphan_notify(parent_session, msg, meta))
         except Exception:
             logger.debug("on_orphan_notify raised for %s", parent_session, exc_info=True)
             return False
@@ -1471,18 +1937,22 @@ class SubagentManager:
                 logger.debug("on_orphan_dm raised", exc_info=True)
         logger.warning("Orphan notification (no delivery channel wired): %s", msg[:200])
 
-    def _live_shared_count(self, pid: int | None) -> int:
+    def _live_shared_count(self, pid: int | None, agents: "list[SubagentInfo]") -> int:
         """Count live session-shared subagents sharing runtime *pid* (>= 1).
 
         Used to average the shared AcpRuntime's measured RSS/CPU across the
         sessions currently running inside it, so each shared subagent is charged
         an empirical per-session share rather than the whole process.
+
+        *agents* is the registry snapshot the caller already took, and is
+        required: the sole caller runs on a worker thread (see
+        ``_sample_live_costs``), where iterating the live registry would raise
+        ``RuntimeError`` the moment the event loop registered or evicted an
+        agent. An on-loop caller passes ``list(self._agents.values())``.
         """
         if not pid:
             return 1
-        n = sum(
-            1 for a in self._agents.values() if not a.done and a._session_sharing and a._pid == pid
-        )
+        n = sum(1 for a in agents if not a.done and a._session_sharing and a._pid == pid)
         return n if n > 0 else 1
 
     def _sample_live_costs(self) -> None:
@@ -1493,9 +1963,21 @@ class SubagentManager:
         sample = Δ(utime+stime jiffies) / (CLK_TCK × Δt). The first sample only
         seeds the CPU baseline (no delta yet). Best-effort: a dead/unreadable
         pid is simply skipped.
+
+        BLOCKING, and therefore off-loop: every live agent costs ONE ``/proc``
+        subtree walk (:func:`_proc_subtree_sample`, which returns RSS, CPU
+        jiffies and the process/stub counts from a single frontier), so the
+        caller hands this to :func:`maintenance_executor` and the body must stay
+        thread-safe. Concretely that means it takes ONE snapshot of the agent
+        registry up front and derives everything, sharer counts included, from
+        that list: iterating the live dict from a worker thread would raise
+        ``RuntimeError`` the moment the event loop registered or evicted an
+        agent mid-sweep. Writes are plain float/int field assignments on
+        ``SubagentInfo``, which the surface only ever reads.
         """
         now = time.monotonic()
-        for info in list(self._agents.values()):
+        agents = list(self._agents.values())
+        for info in agents:
             if info.done or not info._pid:
                 continue
             # Session-shared subagents run inside the parent's AcpRuntime process;
@@ -1505,37 +1987,23 @@ class SubagentManager:
             # by the number of concurrently-live shared sessions on that PID — an
             # empirical per-session average, not a guessed constant
             # (dynamic-subagent-sizing.md §session-sharing cost model).
-            if info._session_sharing:
-                shared_n = self._live_shared_count(pid_owner := info._pid)
-                rss_kb = _proc_rss_kb(pid_owner)
-                if rss_kb > 0 and shared_n > 0:
-                    gb = (rss_kb / (1024 * 1024)) / shared_n
-                    info.last_rss_gb = gb
-                    if gb > info.peak_rss_gb:
-                        info.peak_rss_gb = gb
-                jiffies = _subtree_cpu_jiffies(pid_owner)
-                if info._cpu_sample_ts > 0.0 and jiffies >= info._cpu_jiffies_prev and shared_n > 0:
-                    dt = now - info._cpu_sample_ts
-                    if dt > 0:
-                        cores = ((jiffies - info._cpu_jiffies_prev) / (_CLK_TCK * dt)) / shared_n
-                        info.last_cpu_cores = cores
-                        if cores > info.peak_cpu_cores:
-                            info.peak_cpu_cores = cores
-                info._cpu_jiffies_prev = jiffies
-                info._cpu_sample_ts = now
-                continue
-            pid = info._pid
-            rss_kb = _proc_rss_kb(pid)
-            if rss_kb > 0:
-                gb = rss_kb / (1024 * 1024)
+            #
+            # Sole tenant of its own process: the subtree reading IS this run's,
+            # which is a share of one.
+            shared_n = self._live_shared_count(info._pid, agents) if info._session_sharing else 1
+            sample = _proc_subtree_sample(info._pid)
+            if sample.rss_kb > 0 and shared_n > 0:
+                gb = (sample.rss_kb / (1024 * 1024)) / shared_n
                 info.last_rss_gb = gb
                 if gb > info.peak_rss_gb:
                     info.peak_rss_gb = gb
-            jiffies = _subtree_cpu_jiffies(pid)
-            if info._cpu_sample_ts > 0.0 and jiffies >= info._cpu_jiffies_prev:
+            info.last_procs = _attributed_count(sample.procs, shared_n, info.last_procs)
+            info.last_stubs = _attributed_count(sample.stubs, shared_n, info.last_stubs)
+            jiffies = sample.jiffies
+            if info._cpu_sample_ts > 0.0 and jiffies >= info._cpu_jiffies_prev and shared_n > 0:
                 dt = now - info._cpu_sample_ts
                 if dt > 0:
-                    cores = (jiffies - info._cpu_jiffies_prev) / (_CLK_TCK * dt)
+                    cores = ((jiffies - info._cpu_jiffies_prev) / (_CLK_TCK * dt)) / shared_n
                     info.last_cpu_cores = cores
                     if cores > info.peak_cpu_cores:
                         info.peak_cpu_cores = cores
@@ -1580,13 +2048,26 @@ class SubagentManager:
                         "Reaper: conversation registry rebuild failed — retrying next sweep",
                         exc_info=True,
                     )
-            self._sample_live_costs()
+            # Off the event loop: the sweep is several /proc walks per live agent,
+            # and the reaper shares the loop with every chat turn and heartbeat.
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    maintenance_executor(), self._sample_live_costs
+                )
+            except Exception:
+                logger.debug("Reaper: live-cost sample failed", exc_info=True)
             # Wave liveness backstop: reconcile waves wedged by submissions
             # lost before the process boundary (see _sweep_stuck_waves).
             try:
                 self._sweep_stuck_waves(now)
             except Exception:
                 logger.debug("Reaper: stuck-wave sweep failed", exc_info=True)
+            # Digest hold deadline: release completed wave results that a
+            # straggler (or a hung member) has been withholding.
+            try:
+                self._sweep_digest_holds(now)
+            except Exception:
+                logger.debug("Reaper: digest-hold sweep failed", exc_info=True)
             try:
                 self._sweep_conversations(now)
             except Exception:
@@ -1672,22 +2153,158 @@ class SubagentManager:
             info.turns == 0 and info._pid is None and (now - exec_started) > self._startup_deadline
         )
 
+    @staticmethod
+    def _note_tool_dispatch(info: SubagentInfo, event: Any) -> None:
+        """Record the in-flight tool for liveness attribution.
+
+        Mirrors ``AcpSessionHandle``'s ``_inflight_tool`` snapshot: title, the
+        already-redacted input, the dispatch instant, and the TRUSTED
+        ``is_shell`` / ``tool_name`` fields from ``_meta.kiro`` (never the
+        LLM-authored title). The subagent event loop already receives the same
+        ``AcpEvent``; it previously kept only ``title`` and dropped the rest,
+        which is why stall detection had nothing to attribute evidence with.
+
+        Retiring the oracle here (rather than clearing it) is load-bearing: a
+        movement walk still running against the PREVIOUS tool's command holds a
+        reference to the old instance, and clearing in place would let its late
+        write land on the new tool's baseline and read as movement.
+        """
+        info._inflight_tool = ToolCallState(
+            title=event.title or "",
+            command=event.tool_input or "",
+            dispatch_ts=time.monotonic(),
+            dispatch_boot_ts=boottime_now(),
+            # No consumer parking on this path: a subagent's events are consumed
+            # by the run loop itself, with no approval / IM send / hook holding a
+            # frame, so this stamp cannot lag the runtime's spawn the way the
+            # dashboard dispatch loop's can.
+            dispatch_parked_secs=0.0,
+            is_shell=bool(getattr(event, "is_shell", False)),
+            tool_name=getattr(event, "tool_name", "") or "",
+        )
+        oracle = info._stall_oracle
+        info._stall_oracle = oracle.fresh() if oracle is not None else None
+        info._stall_gen += 1
+
+    @staticmethod
+    def _note_tool_result(info: SubagentInfo, event: Any) -> None:
+        """Retire the attribution snapshot when a tool's FINAL result arrives.
+
+        The gate lives here rather than at the call site so the invariant is
+        directly testable. ``EVENT_TOOL_RESULT`` is also emitted for
+        non-completed progress updates (``_dispatch`` sets
+        ``tool_final = status == "completed"``), and treating one of those as the
+        end of the tool would drop attribution while the command is still
+        running — degrading liveness to idle-time-only for exactly the long
+        silent command this detection exists to judge, and so raising the badge
+        on a healthy agent. ``acp.client`` gates on the same field.
+        """
+        if event.tool_final:
+            SubagentManager._clear_tool_dispatch(info)
+
+    @staticmethod
+    def _clear_tool_dispatch(info: SubagentInfo) -> None:
+        """Drop the in-flight tool snapshot and retire the oracle with it."""
+        info._inflight_tool = None
+        oracle = info._stall_oracle
+        info._stall_oracle = oracle.fresh() if oracle is not None else None
+        info._stall_gen += 1
+
+    async def _stall_verdict(self, info: SubagentInfo) -> tuple[str, str]:
+        """Liveness verdict for an idle subagent: working, wedged, or unknown.
+
+        Idle time alone cannot separate a hung tool call from a slow silent one,
+        so this consults the same ``LivenessOracle`` the main agent's watchdog
+        uses (:mod:`kiro_crew.acp.liveness`) for ``/proc`` evidence.
+
+        The attribution is what makes it sound. With the in-flight tool's real
+        ``is_shell`` + command, the consult takes the oracle's shell-child
+        branch, which matches a live descendant by CMDLINE and then tracks that
+        pid — so the evidence belongs to THIS subagent's own child even when the
+        runtime is shared with sibling subagents. That is the distinction an
+        earlier whole-subtree attempt could not make: a subtree aggregate is
+        dominated by kiro-cli's own background socket/keepalive traffic, so a
+        ``sleep``-only subagent read as "working" and was never flagged.
+
+        Returns ``(verdict, evidence)``; any failure degrades to
+        ``(VERDICT_UNKNOWN, ...)`` so the caller falls back to idle time.
+        """
+        if not info._pid:
+            return VERDICT_UNKNOWN, "no runtime pid"
+        tool = info._inflight_tool
+        if tool is None:
+            # Idle with no tool in flight is a model-wait, not a hung command.
+            # The model-wait branch reads the whole runtime subtree, which is not
+            # attributable on a shared runtime — so decline rather than guess.
+            return VERDICT_UNKNOWN, "no tool in flight"
+        if not tool.is_shell:
+            # A non-shell MCP tool has no child process to match, so the oracle
+            # can only offer the same unattributable subtree aggregate. Decline.
+            return VERDICT_UNKNOWN, "non-shell tool — not attributable"
+        if info._stall_oracle is None:
+            info._stall_oracle = LivenessOracle()
+        # The consult is a SYNCHRONOUS /proc filesystem walk (``iter_descendants``
+        # over the runtime's descendant subtree, plus ``os.readlink`` on
+        # ``/proc/<pid>/fd/*``, which can block on the very wedged fd being
+        # investigated) — and this runs on the reaper's event loop, the same loop
+        # that serves every chat turn and the liveness heartbeat, sweeping agents
+        # serially. Inline, one wedged read freezes the gateway until the
+        # loop-stall watchdog kills it. Offload it exactly as the main-agent path
+        # does (``AcpSessionHandle._consult_oracle_offloaded``): bounded await,
+        # and at most ONE outstanding walk per agent so a permanently wedged read
+        # cannot leave a new blocked worker behind on every sweep.
+        # ``consult_offloaded`` owns that whole sequence -- one outstanding walk per
+        # holder, submission inside the guard, exception retrieval attached at
+        # submission, every failure degrading to UNKNOWN -- for the two watchdog
+        # paths that already depend on it, so a fix there lands here too.
+        # ``SubagentInfo`` satisfies its ``ConsultFutureHolder`` protocol via
+        # ``_consult_future``. That handle deliberately OUTLIVES snapshot
+        # retirement: ``_clear_tool_dispatch`` bumps ``_stall_gen`` (which
+        # invalidates a stale verdict, below) but leaves the future in place, so a
+        # walk still wedged on a stuck fd keeps suppressing resubmission instead
+        # of letting each later sweep strand another blocked worker.
+        submitted_gen = info._stall_gen
+        verdict = await consult_offloaded(
+            info,
+            info._stall_oracle.check_tool,
+            (info._pid, tool),
+            executor_factory=subprocess_executor,
+            log_label=f"stall consult for {info.id}",
+        )
+        # The consult awaits, so fresh activity, a final tool result, or the next
+        # dispatch can retire this snapshot while the walk is still running. A
+        # verdict about a tool that is no longer in flight must not be applied to
+        # whatever replaced it: DEAD/STUCK_INPUT skips the two-sweep confirmation,
+        # so a stale one would flag an agent that has demonstrably resumed working.
+        if info._stall_gen != submitted_gen:
+            return VERDICT_UNKNOWN, "superseded mid-consult"
+        return verdict
+
     async def _maybe_flag_stall(self, agent_id: str, info: SubagentInfo, now: float) -> None:
         """Idle-stall detection for a running subagent (surface-only).
 
-        A subagent that has actually started (>=1 turn or a live runtime PID)
-        but has emitted no stream activity for ``_stall_idle_secs`` is likely
-        wedged in a single hung tool call — or simply running one slow, silent
-        command. Unlike the main agent, subagents get no liveness oracle /
-        tool-stall watchdog, and (because session-sharing subagents share the
-        parent's runtime PID) a per-PID oracle could not tell the two apart.
+        A subagent that has started (>=1 turn or a live runtime PID) but has
+        emitted no stream activity for ``_stall_idle_secs`` may be wedged in a
+        hung tool call — or simply running one slow, silent command. Idle time
+        cannot tell those apart, so the flag is gated on a ``LivenessOracle``
+        consult (:meth:`_stall_verdict`) that attributes evidence to the
+        subagent's OWN child process by cmdline match:
 
-        So this is deliberately *surface-only*: it emits a ``subagent_stalled``
-        UI signal (so the user understands why a "simple" task is taking so
-        long) and records the slow command for later analysis, but it NEVER
-        terminates the agent — the user closes a genuinely-hung subagent from
-        the UX (per-row stop / Stop-all). This means a slow-but-healthy command
-        can only ever produce a self-clearing badge, never a kill.
+        * ``WORKING`` — a live matched child, so it is progressing: not flagged.
+        * ``DEAD`` / ``STUCK_INPUT`` — the child exited with no result frame, or
+          its subtree is flat and blocked on a tty/stdin read. That is positive
+          evidence of a wedge, so it flags IMMEDIATELY, skipping the two-sweep
+          confirmation the idle-time path needs.
+        * ``UNKNOWN`` — no attributable evidence (no shell child to match, no
+          tool in flight, unreadable ``/proc``). Falls back to idle time with the
+          two-sweep confirmation, i.e. exactly the previous behaviour.
+
+        Still deliberately *surface-only*: it emits a ``subagent_stalled`` UI
+        signal and records the slow command, but NEVER terminates the agent, so
+        a slow-but-healthy command can only ever produce a self-clearing badge.
+        Escalating a ``DEAD`` verdict to an early reap would be a change to kill
+        semantics and is intentionally NOT part of this; the wall-clock reaper at
+        ``_TIMEOUT_SECS`` remains the only automatic terminator.
         """
         if not (info.turns > 0 or info._pid is not None):
             return
@@ -1698,6 +2315,57 @@ class SubagentManager:
             return
         idle = now - info.last_activity
         if not info.stalled and idle > self._stall_idle_secs:
+            verdict, evidence = await self._stall_verdict(info)
+            if verdict == VERDICT_WORKING and idle < self._stall_idle_secs * _SUPPRESS_CEILING:
+                # Attributable progress in this subagent's own child: silent, not
+                # stalled. Leave the suspicion open (do not reset
+                # _stall_suspect_at) so the badge appears as soon as that child
+                # stops moving or exits.
+                #
+                # The ceiling above bounds how long a WORKING reading may hold the
+                # badge back, because attribution is not infallible: under
+                # ``session_sharing`` two siblings running similar commands can
+                # cmdline-match the SAME child, so a wedged agent can read WORKING
+                # for as long as its sibling's child lives. Without a bound that
+                # turns an old true positive into a permanent false negative —
+                # strictly worse than the idle-time-only path it replaces. With
+                # it, misattribution costs latency, not the signal.
+                logger.debug(
+                    "Reaper: subagent %s idle %.0fs but working (%s) — not flagging",
+                    agent_id,
+                    idle,
+                    evidence,
+                )
+                return
+            # A wedged verdict normally skips it: DEAD/STUCK_INPUT is positive
+            # evidence about this agent's child rather than a guess from elapsed
+            # silence, so dampening it would only delay a signal already earned.
+            #
+            # BUT that trust is only warranted when the cmdline match cannot have
+            # landed on someone else's child. ``_SUPPRESS_CEILING`` exists
+            # precisely because the match is fallible under a shared runtime, and
+            # a DEAD derived from a fallible match is exactly as wrong as the
+            # WORKING the ceiling bounds — a sibling's matched child exiting would
+            # otherwise raise an immediate badge on a healthy agent, skipping the
+            # very dampening added to keep the badge trustworthy at scale. So the
+            # skip is withdrawn whenever another session could be the one being
+            # measured, and the wedged verdict then earns its badge the same way
+            # an idle-time guess does: by holding across two sweeps.
+            #
+            # The gate keys on ``session_sharing`` itself, not on a count of live
+            # siblings, because the confusable co-tenant is not only a sibling:
+            # ``_create_shared_session`` puts the subagent on the PARENT's
+            # AcpRuntime ("one process hosts everything"), so ``info._pid`` is the
+            # parent's process and the parent's own tool children are descendants
+            # of it too. ``_live_shared_count`` iterates the subagent registry and
+            # therefore cannot see the parent, so a LONE subagent counted 1 and
+            # kept the fast path while still able to cmdline-match the parent's
+            # child — and flag instantly when that child exited. Since a shared
+            # runtime always has the parent in it, "could this match belong to
+            # someone else?" is true for every session-sharing agent.
+            wedged = verdict in (VERDICT_DEAD, VERDICT_STUCK_INPUT)
+            if wedged and info._session_sharing:
+                wedged = False
             # Two-sweep confirmation (scale dampening): at 60-100 concurrent
             # agents a single-window trip ambers several healthy-slow agents at
             # any moment, training users to ignore the badge. Require the idle
@@ -1705,14 +2373,16 @@ class SubagentManager:
             # flagging — a stream event between sweeps resets the suspicion
             # (_touch_activity clears both flags). Adds at most one sweep
             # interval (~60s) of latency to a genuine stall.
-            if info._stall_suspect_at <= 0.0:
+            if not wedged and info._stall_suspect_at <= 0.0:
                 info._stall_suspect_at = now
                 return
             info.stalled = True
             logger.warning(
-                "Reaper: subagent %s idle %.0fs (no stream activity) — marking stalled",
+                "Reaper: subagent %s idle %.0fs (verdict=%s; %s) — marking stalled",
                 agent_id,
                 idle,
+                verdict,
+                evidence,
             )
             # Persist the slow command for future analysis. Best-effort; must
             # not disturb the still-running agent (NOT a tombstone — the agent
@@ -1720,7 +2390,16 @@ class SubagentManager:
             self._record_slow_command(info, idle)
             try:
                 await self._fire_event(
-                    "subagent_stalled", info, {"stalled": True, "idle_secs": int(idle)}
+                    "subagent_stalled",
+                    info,
+                    # The verdict and its evidence are deliberately NOT on the
+                    # wire: no consumer reads them (the frontend narrows this
+                    # payload to {slot, id, stalled, idle_secs} on arrival, and
+                    # the coalesced batch update forwards only `stalled`), and the
+                    # event is app-sdk-forwarded, so shipping unread keys would
+                    # create semi-permanent surface. The log line above records
+                    # both for diagnosis; add them here when something renders it.
+                    {"stalled": True, "idle_secs": int(idle)},
                 )
             except Exception:
                 logger.debug(
@@ -1841,6 +2520,11 @@ class SubagentManager:
                 "outcome": info.outcome,
                 "task": _redact(info.task),
                 "agent": _redact(info.agent),
+                # The model actually served (issue #3582). By the terminal
+                # report this is the authoritative value on every provider — the
+                # CC/raw path has completed at least one turn, so its
+                # ``_resolved_model_id`` is populated (refreshed in ``_run``).
+                "model": info.resolved_model,
                 "result": _done_result(info.result),
             },
         )
@@ -1862,7 +2546,18 @@ class SubagentManager:
             # result has not reached the parent yet (the gateway marks them when
             # the digest fires), so a restart mid-wave leaves them visible to
             # orphan reconciliation.
-            if mark_delivered_on_success and not info.error and not info._digest_held:
+            #
+            # A QUEUED injection is the same statement about a different wait:
+            # the announce is parked in the parent's slot queue, so the result is
+            # not in its context yet and the retention clock must not start (the
+            # drain settles it). Both flags are set by the gateway inside
+            # _on_done, above.
+            if (
+                mark_delivered_on_success
+                and not info.error
+                and not info._digest_held
+                and not info._delivery_queued
+            ):
                 # Wait for the caller's session teardown before writing the
                 # "delivered" tombstone. This report is deliberately SPAWNED
                 # ahead of teardown (so a cancellation cannot strand it), which
@@ -2131,9 +2826,9 @@ class SubagentManager:
             if not info.error and not info.user_stopped:
                 # A user stop is neutral — never synthesize a reap error for it.
                 if reason == "startup_timeout":
-                    info.error = f"Failed to start within {self._startup_deadline}s (no runtime launched, no turn produced) [{_timeout_context(info, include_elapsed=False)}]"
+                    info.error = f"Failed to start within {self._startup_deadline}s (no runtime launched, no turn produced) [{_timeout_context(info, include_elapsed=False, turn_limit=self._effective_turn_limit(info))}]"
                 else:
-                    info.error = f"Reaped after {int(elapsed)}s (exceeded {self._default_timeout}s deadline) [{_timeout_context(info, include_elapsed=False)}]"
+                    info.error = f"Reaped after {int(elapsed)}s (exceeded {self._default_timeout}s deadline) [{_timeout_context(info, include_elapsed=False, turn_limit=self._effective_turn_limit(info))}]"
             if not info.user_stopped:
                 # A user-initiated stop is a neutral outcome, not a failure.
                 Stats().inc_subagent_failed()
@@ -2296,7 +2991,11 @@ class SubagentManager:
         Appends a synthetic error to the dashboard slot (UI) and queues a
         failure message into ``slot._pending_subagent_failures`` so the LLM
         learns about the failure on the next ``_run_chat`` turn and can read
-        the result from disk if needed.
+        the result from disk if needed. The notice's outcome line is derived
+        from the record (:func:`_injection_notice_outcome`) rather than
+        asserting completion: this path fires for every terminal state whose
+        report could not be injected, including runs cancelled or rejected
+        before they ever executed.
         """
         try:
             # Lazy: the dashboard layer must not be imported by a core module at
@@ -2326,10 +3025,10 @@ class SubagentManager:
                     + "\nUse the read tool to retrieve it if needed."
                 )
             failure_msg = (
-                f"[Subagent completion event]\n"
+                f"{SUBAGENT_COMPLETION_PREFIX}\n"
                 f"Agent `{info.id}` ❌ {reason}\n"
                 f"Task: {task_preview}\n"
-                f"The agent finished but result delivery timed out.{result_hint}"
+                f"{_injection_notice_outcome(info)}{result_hint}"
             )
 
             # Queue for LLM context drain on next _run_chat
@@ -2393,23 +3092,23 @@ class SubagentManager:
 
         ``shared`` mirrors ``_session_sharing``: the value is that runtime's
         measurement divided by the number of concurrently-live sharing sessions
-        on the same pid, i.e. an average share, not an exclusive figure.
+        on the same pid, i.e. an average share, not an exclusive figure. The same
+        split applies to ``procs``/``mcp`` (see ``_attributed_count``), which are
+        null until a sweep has counted them — a task row that reported no MCP
+        stubs because the field was simply absent read as "subagents do not use
+        the MCP pool", which is the opposite of what they do.
         """
-
-        def _r(s: str) -> str:
-            s, _ = redact_exfiltration_urls(s)
-            s, _ = redact_credentials(s)
-            return s
-
         return [
             {
                 "id": a.id,
-                "task": _r(a.task[:80]),
-                "agent": _r(a.agent),
+                "task": _redact_and_truncate(a.task, 80),
+                "agent": _redact(a.agent),
                 "parent": a.parent_session_key,
                 "rss_mb": round(a.last_rss_gb * 1024, 1),
                 "peak_rss_mb": round(a.peak_rss_gb * 1024, 1),
                 "cpu_cores": round(a.last_cpu_cores, 2),
+                "procs": a.last_procs,
+                "mcp": a.last_stubs,
                 "started_at": a.started,
                 "shared": a._session_sharing,
                 "pid": a._pid,
@@ -2426,6 +3125,7 @@ class SubagentManager:
         agent: str = "",
         max_turns: int = 0,
         model: str | None = None,
+        reasoning_effort: str = "",
         allowed_tools: list[str] | None = None,
         bare: bool = False,
         cwd: str = "",
@@ -2436,6 +3136,9 @@ class SubagentManager:
         keep: bool = False,
         conversation_key: str = "",
         app: str = "",
+        include_memory: bool = True,
+        include_lessons: bool = True,
+        include_project: bool = True,
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
@@ -2466,6 +3169,8 @@ class SubagentManager:
             parent_session_key (str): Session key of the caller.
             agent (str): Agent name override (default: "kirocrew").
             model (str): Model override for CC provider (ignored for ACP).
+            reasoning_effort (str): Per-call reasoning-effort override; wins
+                over the ``role_efforts['subagent']`` pin. ``""`` defers to it.
             allowed_tools (list): Tool allowlist for CC provider (ignored for ACP).
             bare (bool): Launch CC in bare mode (ignored for ACP).
             cwd (str): Optional absolute path where the subagent subprocess
@@ -2570,6 +3275,41 @@ class SubagentManager:
                 parent_session_key=parent_session_key,
                 done=True,
                 error=f"spawn refused: only {avail_gb:.1f} GB memory available (need {min_mem:.0f} GB)",
+                batch_id=batch_id,
+                batch_total=max(0, int(batch_total)),
+            )
+            return self._announce_rejection(info)
+
+        # --- Admission gate: refuse NEW spawns while host memory posture is
+        # critical. Complements the absolute spawn_min_memory_gb floor above
+        # with the posture tier (resource_critical_gb) and shares its
+        # off-switch (agent.admission_gate) with the cron scheduler's deferral
+        # gate. This method is sync and runs on the gateway event loop, so it
+        # reads the CACHED off-thread verdict — never inline config/procfs
+        # I/O; bounded staleness is acceptable for pressure-shedding.
+        # In-flight subagents are untouched; direct user chat turns are
+        # not gated; fails open on an unknown posture. ---
+        admission = cached_admission_check()
+        if not admission.admitted:
+            logger.warning("Subagent spawn refused: %s", admission.reason)
+            sel().log_tool_invocation(
+                session_key=parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="refused_memory_critical",
+                metadata={
+                    "available_gb": admission.available_gb,
+                    "posture": admission.posture,
+                    "task": _redacted_task[:120],
+                },
+            )
+            info = SubagentInfo(
+                id=agent_id,
+                task=_redacted_task,
+                agent=agent,
+                parent_session_key=parent_session_key,
+                done=True,
+                error=f"spawn refused: {admission.reason}",
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
             )
@@ -2690,6 +3430,7 @@ class SubagentManager:
                     "agent": agent,
                     "max_turns": max_turns,
                     "model": model,
+                    "reasoning_effort": reasoning_effort,
                     "allowed_tools": allowed_tools,
                     "bare": bare,
                     "cwd": resolved_cwd,
@@ -2700,6 +3441,9 @@ class SubagentManager:
                     "keep": keep,
                     "conversation_key": conversation_key,
                     "app": app,
+                    "include_memory": include_memory,
+                    "include_lessons": include_lessons,
+                    "include_project": include_project,
                     "_agent_prevalidated": _agent_prevalidated,
                     "_preassigned_id": agent_id,
                 }
@@ -2731,6 +3475,9 @@ class SubagentManager:
                 queued=True,
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
+                include_memory=include_memory,
+                include_lessons=include_lessons,
+                include_project=include_project,
             )
             return info
 
@@ -2741,7 +3488,13 @@ class SubagentManager:
         # stalling chat and the heartbeat on a populated agents directory. Only
         # the app path sets it; every other caller still validates inline.
         if agent and not _agent_prevalidated:
-            agent, err = _validate_agent(agent)
+            # Validate against the cwd the subagent will ACTUALLY run in. When no
+            # explicit cwd was given the runtime falls back to the session pool's
+            # cwd, so validating only the explicit value refused a project agent
+            # kiro-cli would have loaded — the same interface asymmetry the project
+            # scope exists to remove, just one layer down.
+            effective_cwd = resolved_cwd or str(getattr(self._sessions, "_pool_cwd", "") or "")
+            agent, err = _validate_agent(agent, effective_cwd)
             if err:
                 info = SubagentInfo(
                     id=agent_id,
@@ -2765,6 +3518,7 @@ class SubagentManager:
             silent=silent,
             max_turns=max_turns,
             model=model or "",
+            reasoning_effort=reasoning_effort or "",
             allowed_tools=list(allowed_tools) if allowed_tools else [],
             bare=bare,
             cwd=resolved_cwd,
@@ -2772,6 +3526,9 @@ class SubagentManager:
             batch_total=max(0, int(batch_total)),
             keep=keep,
             conversation_key=conversation_key,
+            include_memory=include_memory,
+            include_lessons=include_lessons,
+            include_project=include_project,
         )
         info._raw_task = task  # unredacted prompt for kiro-cli execution
         self._agents[agent_id] = info
@@ -2900,7 +3657,10 @@ class SubagentManager:
 
         Non-batch rejections skip the announce: the caller already receives
         the error synchronously in the returned info, and injecting a
-        completion turn for them would double-report.
+        completion turn for them would double-report. That holds for
+        queue-drained non-batch rejections too — ``_drain_queue`` announces
+        those itself off the returned info, so announcing here as well would
+        inject the completion twice.
         """
         if info.batch_id and self._on_done:
             try:
@@ -2956,14 +3716,16 @@ class SubagentManager:
         """
         if not key.startswith("subagent:"):
             return False
-        conv_id = key[len("subagent:"):]
+        conv_id = key[len("subagent:") :]
         try:
             state = read_state(conv_id) or {}
         except Exception:
             return False
         return bool(state.get("keep"))
 
-    def _promote_conversation(self, conv_id: str, conv_key: str, last_used: float | None = None) -> None:
+    def _promote_conversation(
+        self, conv_id: str, conv_key: str, last_used: float | None = None
+    ) -> None:
         """Single choke point for promoting a conversation's retention (#1115).
 
         Writes all three retention surfaces together so they cannot drift:
@@ -2999,15 +3761,19 @@ class SubagentManager:
                 if not state.get("keep"):
                     continue
                 conv_key = str(state.get("conversation_key") or "") or f"subagent:{d.name}"
-                conv_id = conv_key[len("subagent:"):]
+                conv_id = conv_key[len("subagent:") :]
                 sid = str(state.get("session_id") or "")
                 last_used = float(state.get("updated_at") or state.get("started") or 0.0)
-                out.append((
-                    conv_id, conv_key, sid,
-                    str(state.get("provider") or "acp"),
-                    str(state.get("cwd") or ""),
-                    last_used,
-                ))
+                out.append(
+                    (
+                        conv_id,
+                        conv_key,
+                        sid,
+                        str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
+                        str(state.get("cwd") or ""),
+                        last_used,
+                    )
+                )
             except Exception:
                 logger.debug("registry rebuild: skipping %s", d, exc_info=True)
         return out
@@ -3076,8 +3842,15 @@ class SubagentManager:
         agent: str = "",
         model: str | None = None,
         max_turns: int = 0,
+        cwd: str = "",
+        _preassigned_id: str = "",
     ) -> SubagentInfo | None:
         """Dispatch a follow-up *task* into conversation *conv_id*.
+
+        ``_preassigned_id`` mirrors ``spawn``: a caller that must persist the
+        dispatch identity BEFORE the side effect (so a crash in between is
+        recoverable rather than ambiguous) supplies the id it already wrote
+        down, instead of discovering the minted one only on return.
 
         Retain-by-default: works on ANY completed run whose session files are
         still on disk — no keep flag needed at spawn time. Every run's sid /
@@ -3120,7 +3893,7 @@ class SubagentManager:
                 self._sessions.seed_conversation(
                     conv_key,
                     sid,
-                    provider=str(state.get("provider") or "acp"),
+                    provider=str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
                     cwd=str(state.get("cwd") or ""),
                 )
         # Re-check: SessionMap.get self-prunes entries whose session files
@@ -3130,7 +3903,7 @@ class SubagentManager:
             # (result.txt outlives the session under the tombstone TTL).
             result_hint = ""
             try:
-                _rp = _agent_dir(conv_id) / "result.txt"
+                _rp = agent_dir_for_display(conv_id) / "result.txt"
                 if _rp.exists():
                     result_hint = f" Prior result still readable at: {_rp}"
             except Exception:
@@ -3153,14 +3926,80 @@ class SubagentManager:
         # the SessionManager continuable cache, and the TTL registry entry.
         # The conversation TTL sweep / spawn_release owns deletion from here.
         self._promote_conversation(conv_id, conv_key)
+        inc_memory, inc_lessons, inc_project = self._inherited_context_groups(conv_id)
+        # A continuation has to run WHERE THE RUN RAN. `spawn` resolves an empty
+        # cwd to the pool project before it validates the agent name, so a run
+        # spawned against a project-local agent (defined under that project's
+        # .kiro/agents/) came back "unknown agent" here — and the caller reads any
+        # non-busy error as unresumable and respawns from the digest alone,
+        # silently dropping the conversation this call exists to preserve.
+        #
+        # The cwd must come from the CALLER, not be discovered here. This method is
+        # synchronous and runs on the gateway's event loop, so probing the recorded
+        # path (`is_dir()`) would freeze the gateway for as long as a stalled
+        # network mount takes to answer. Async callers resolve it off-loop instead:
+        # crew passes its slot project, and `recorded_cwd()` gives the others the
+        # run's own recorded path to hand back in.
         return self.spawn(
             task,
+            _preassigned_id=_preassigned_id,
             parent_session_key=parent_session_key,
             agent=agent,
             model=model,
             max_turns=max_turns,
             keep=True,
+            cwd=cwd,
             conversation_key=conv_key,
+            include_memory=inc_memory,
+            include_lessons=inc_lessons,
+            include_project=inc_project,
+        )
+
+    def recorded_cwd(self, conv_id: str) -> str:
+        """The cwd run *conv_id* executed in, or "" if it never had one.
+
+        `continue_conversation` deliberately does NOT discover this itself: it is
+        synchronous and runs on the gateway's event loop, where the state read would
+        block for as long as a stalled network mount takes to answer. This helper
+        does the blocking work in one place so an async caller can hand it to
+        `asyncio.to_thread` and pass the result in.
+
+        A path that no longer exists is returned ANYWAY, so `spawn` refuses it.
+        Round 35 filtered it to "" to keep such a continuation working, which was
+        the wrong trade: an empty cwd resolves to the POOL project, so a follow-up
+        whose task names relative files would have edited an unrelated project's
+        working tree. A loud refusal is recoverable; a silent write to the wrong
+        repository is not. Only a run that never recorded a cwd returns "" — for it
+        the pool default is correct, because there is no project to miss.
+        """
+        return str((read_state(conv_id) or {}).get("cwd") or "")
+
+    def _inherited_context_groups(self, conv_id: str) -> tuple[bool, bool, bool]:
+        """Recover the context scope of the run being continued.
+
+        A continuation DOES rebuild session context: ``get_or_create`` reports
+        ``is_new=True`` even when it restores the session via ``session/load``
+        (``resumed`` is the separate flag, and it gates only thread history), so
+        ``build_message`` runs the full session-context path for the follow-up
+        turn. Without inheriting the scope here, a run the parent deliberately
+        spawned without memory would silently regain it on continuation.
+
+        Prefers the live record; falls back to the scope persisted in the run's
+        ``state.json``. A run that predates the field records no scope at all,
+        which is distinguishable from "every group withheld" (an empty string)
+        and defaults to all-on.
+        """
+        live = self._agents.get(conv_id)
+        if live is not None:
+            return live.include_memory, live.include_lessons, live.include_project
+        raw = (read_state(conv_id) or {}).get("context_groups")
+        if raw is None:
+            return True, True, True
+        groups = {g for g in str(raw).split(",") if g}
+        return (
+            CONTEXT_GROUP_MEMORY in groups,
+            CONTEXT_GROUP_LESSONS in groups,
+            CONTEXT_GROUP_PROJECT in groups,
         )
 
     async def steer_run(self, agent_id: str, message: str) -> tuple[bool, str]:
@@ -3227,6 +4066,253 @@ class SubagentManager:
                 logger.debug("steer_run: SEL audit failed", exc_info=True)
         return ok, "ok" if ok else "steer rejected by provider"
 
+    # Bounds for the follow_up watcher: poll cadence, post-done busy retries
+    # (finalization may briefly hold the conversation), and a hard deadline so
+    # a wedged run can never leave an immortal watcher behind.
+    _FOLLOWUP_POLL_SECS = 2.0
+    _FOLLOWUP_BUSY_RETRIES = 10
+    _FOLLOWUP_BUSY_RETRY_SECS = 3.0
+
+    async def follow_up_run(self, agent_id: str, message: str) -> tuple[bool, str]:
+        """Queue *message* for delivery AFTER run *agent_id*'s turn completes.
+
+        The non-interrupting sibling of :meth:`steer_run` (spawn_steer
+        ``mode="follow_up"``): instead of injecting into the running turn —
+        which can derail critical work mid-execution — the message waits for
+        the run to finish and is then dispatched as a CONTINUATION on the
+        run's own conversation (``continue_conversation``), executing with its
+        accumulated context. The continuation is a new run whose result
+        arrives as a normal completion event on the same parent session.
+
+        Multiple queued follow-ups drain as ONE continuation (joined in
+        arrival order), so three corrections cost one run, not three.
+
+        Returns ``(ok, detail)``. Typed refusals mirror ``steer_run``:
+        ``not_found`` (unknown id) and ``not_running`` (already finished —
+        ``spawn_continue`` is the direct tool for that case). Queued
+        follow-ups are best-effort by design: if the conversation is gone by
+        the time the run ends, the failure is logged and audited, not raised.
+        """
+        info = self._agents.get(agent_id)
+        if info is None:
+            return False, "not_found"
+        if info.done:
+            return False, "not_running: run finished — use spawn_continue"
+        if self._shutting_down:
+            # Refuse rather than accept-and-drop: an accepted follow-up
+            # promises a completion event, and a shutting-down gateway can
+            # keep neither the watcher nor the continuation alive.
+            return False, "shutting_down: the gateway is stopping — re-send after restart"
+        info.pending_followups.append(message)
+        if not info._followup_watcher:
+            self._arm_followup_watcher(info)
+        try:
+            sel().log_tool_invocation(
+                session_key=info.parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_steer",
+                outcome="followup_queued",
+                metadata={"subagent_id": agent_id, "queued": len(info.pending_followups)},
+            )
+        except Exception:
+            logger.debug("follow_up_run: SEL audit failed", exc_info=True)
+        return True, "queued"
+
+    def _arm_followup_watcher(self, info: SubagentInfo) -> None:
+        """Arm the (single) follow-up watcher for *info*'s run.
+
+        The done-callback resets the one-watcher latch AND re-arms when
+        messages are still pending: a follow-up can be accepted while the
+        previous watcher is inside its final awaits (announcing an expiry) —
+        it sees the latch still true and arms nothing, so without the re-arm
+        that accepted message would be stranded with no dispatch and no event
+        (GPT review). Not re-armed during shutdown or once the run record is
+        gone (removal drops any leftovers deliberately).
+        """
+        info._followup_watcher = True
+        run_id = info.id
+        run_info = info  # narrowed local: mypy loses the None-narrow in closure defaults
+        task = asyncio.create_task(self._deliver_followups(info))
+        self._followup_watchers[run_id] = task
+
+        def _done(t: "asyncio.Task", _id: str = run_id, _info: SubagentInfo = run_info) -> None:
+            self._followup_watchers.pop(_id, None)
+            _info._followup_watcher = False
+            if not t.cancelled() and t.exception() is not None:
+                logger.warning("follow_up watcher for %s failed", _id, exc_info=t.exception())
+                return
+            if (
+                not t.cancelled()
+                and _info.pending_followups
+                and not self._shutting_down
+                and _id in self._agents
+            ):
+                self._arm_followup_watcher(_info)
+
+        task.add_done_callback(_done)
+
+    async def _deliver_followups(self, info: SubagentInfo) -> None:
+        """Watch run *info* until its turn completes, then dispatch the queue.
+
+        DELIBERATELY a per-run poller rather than a hook in ``_run``'s
+        finalization: completion is reached from many terminal paths (normal,
+        error, timeout, cancel-recovery, reaper), all guarded by a carefully
+        ordered 3-guard finally — a watcher observes the outcome without
+        adding a new obligation to any of them. Waits for the run's task to be
+        popped from ``self._tasks`` too, so teardown (session release) has
+        finished before the continuation tries to reuse the conversation; any
+        residual ``conversation_busy`` gets a bounded retry.
+
+        OUTCOME-AWARE: a run the user explicitly STOPPED does not get its
+        follow-ups dispatched — resurrecting work the user killed is the
+        opposite of "the correction can wait" (``followup_suppressed`` audit).
+        Other non-success terminals (error, timeout) still dispatch: the
+        continuation runs with the conversation's context, so "fix what just
+        broke" is a legitimate follow-up.
+
+        NEVER SILENT: the spawn_steer reply promised the parent a completion
+        event, so every path that cannot deliver one from a real continuation
+        (suppressed, expired, dispatch failure) announces a SYNTHETIC failure
+        completion event through the normal ``_on_done`` path — the parent
+        must not wait forever on an event that is not coming.
+
+        Hard-bounded and manager-owned: gives up at the manager's run timeout
+        plus a margin, and the task is registered in ``_followup_watchers`` so
+        ``cancel_all()`` cancels it — a watcher must never dispatch a fresh
+        run into a shutting-down gateway.
+        """
+        deadline = time.monotonic() + self._default_timeout + 300
+        while time.monotonic() < deadline:
+            if info.done and info.id not in self._tasks:
+                break
+            await asyncio.sleep(self._FOLLOWUP_POLL_SECS)
+        else:
+            dropped = list(info.pending_followups)
+            logger.warning(
+                "follow_up watcher for %s timed out before the run completed — "
+                "%d queued message(s) dropped",
+                info.id,
+                len(dropped),
+            )
+            self._audit_followup(info, "followup_expired")
+            await self._announce_followup_failure(
+                info,
+                "follow_up expired: the run never completed within its timeout "
+                "window; the queued follow-up message(s) were dropped",
+                messages=dropped,
+            )
+            # Drop ONLY what was just reported dropped, and only AFTER the
+            # announce settled — clearing first meant a shutdown cancelling
+            # this task mid-announce left the queue empty for cancel_all()'s
+            # sweep, so the messages vanished with no event. The slice keeps
+            # anything queued while we were announcing (the done-callback
+            # re-arms for it).
+            info.pending_followups = info.pending_followups[len(dropped) :]
+            return
+        # SNAPSHOT, do not drain: messages stay in ``pending_followups`` until
+        # their outcome is SETTLED (dispatched, or their failure announced).
+        # An eager drain lost messages when shutdown landed mid-await — e.g.
+        # during a conversation_busy retry sleep — because cancel_all() saw an
+        # empty queue, cancelled this task, and nothing was ever announced.
+        # Appends only ever happen at the tail, so removing the first
+        # ``len(messages)`` entries at settlement drops exactly this snapshot
+        # and preserves anything queued while we were dispatching.
+        messages = list(info.pending_followups)
+        if not messages:
+            return
+
+        def _settle() -> None:
+            info.pending_followups = info.pending_followups[len(messages) :]
+
+        if info.user_stopped:
+            logger.info("follow_up for %s suppressed — the user stopped the run", info.id)
+            self._audit_followup(info, "followup_suppressed")
+            _settle()
+            await self._announce_followup_failure(
+                info,
+                "follow_up suppressed: the user stopped this run, so its queued "
+                "follow-up message(s) were NOT dispatched",
+                messages=messages,
+            )
+            return
+        if self._shutting_down:
+            # Leave the queue intact: cancel_all()'s shutdown sweep owns the
+            # announce-and-drop for pending messages.
+            return
+        task = "\n\n---\n\n".join(messages)
+        # Finalization may hold the conversation for a beat after the task is
+        # popped (shielded report); retry a bounded number of times.
+        for _attempt in range(self._FOLLOWUP_BUSY_RETRIES):
+            child = self.continue_conversation(
+                info.id,
+                task,
+                parent_session_key=info.parent_session_key,
+                agent=info.agent,
+            )
+            err = "spawn_failed" if child is None else str(getattr(child, "error", "") or "")
+            if not err.startswith("conversation_busy"):
+                break
+            await asyncio.sleep(self._FOLLOWUP_BUSY_RETRY_SECS)
+        if err:
+            logger.warning("follow_up delivery for %s failed: %s", info.id, err.split(":", 1)[0])
+            self._audit_followup(info, "followup_failed")
+            _settle()
+            # continue_conversation's typed failures are already done
+            # SubagentInfo records — announce the real one when we have it.
+            if child is not None:
+                await self._announce_followup_failure(info, "", failure_info=child)
+            else:
+                await self._announce_followup_failure(info, f"follow_up dispatch failed: {err}")
+        else:
+            self._audit_followup(info, "followup_dispatched")
+            _settle()
+
+    async def _announce_followup_failure(
+        self,
+        info: SubagentInfo,
+        reason: str,
+        failure_info: SubagentInfo | None = None,
+        messages: list | None = None,
+    ) -> None:
+        """Deliver a SYNTHETIC failure completion event for an undeliverable
+        follow-up, through the same ``_on_done`` path as real completions.
+
+        Best-effort by design (a notification about a failure must not itself
+        take anything down), but never silent-by-default: without this the
+        parent — told by spawn_steer that a completion event would arrive —
+        blocks its plan on an event that only ever existed in SEL logs.
+        ``messages`` labels the synthetic event when the queue was already
+        drained by the caller (the expiry path clears before announcing so a
+        later watcher cannot resurrect messages reported dead).
+        """
+        if self._on_done is None:
+            return
+        label_msgs = messages if messages is not None else info.pending_followups
+        synthetic = failure_info or SubagentInfo(
+            id=uuid.uuid4().hex[:8],
+            task=f"[follow_up of run {info.id}] "
+            + _redact("; ".join(m[:120] for m in label_msgs) or "queued follow-up"),
+            done=True,
+            parent_session_key=info.parent_session_key,
+            error=reason,
+        )
+        try:
+            await self._on_done(synthetic)
+        except Exception:
+            logger.warning("follow_up failure announce for %s failed", info.id, exc_info=True)
+
+    def _audit_followup(self, info: SubagentInfo, outcome: str) -> None:
+        try:
+            sel().log_tool_invocation(
+                session_key=info.parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_steer",
+                outcome=outcome,
+                metadata={"subagent_id": info.id},
+            )
+        except Exception:
+            logger.debug("follow_up audit failed", exc_info=True)
+
     def release_conversation(self, conv_id: str) -> tuple[bool, str]:
         """Release conversation *conv_id*: forget the sid and delete files.
 
@@ -3237,7 +4323,7 @@ class SubagentManager:
         busy = self._conversation_busy(conv_key)
         if busy is not None:
             return False, f"conversation_busy: run {busy.id} is in flight"
-        provider_label = self._sessions.conversation_provider(conv_key) or "acp"
+        provider_label = self._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT
         sid = self._sessions.forget_conversation(conv_key)
         self._conversations.pop(conv_key, None)
         # Demote the persisted source of truth too (#1115): with the disk
@@ -3295,6 +4381,21 @@ class SubagentManager:
                 pass  # no running loop (sync/test context)
             return
         params = self._queue.pop(0)
+        # A run can be cancelled WHILE it waits here — a user stop, or a session
+        # deleted out from under it. Starting it anyway would execute tools for
+        # work already reported as stopped, so skip it and drain the next one
+        # instead: `cancel()` marks the info terminal but cannot unqueue this.
+        queued_id = str(params.get("_preassigned_id") or "")
+        if queued_id:
+            waiting = self._agents.get(queued_id)
+            if waiting is not None and (waiting.done or waiting.user_stopped or waiting.reaped):
+                logger.info("Skipping queued spawn %s: cancelled while waiting", queued_id)
+                self._emit_queue_depth(
+                    str(params.get("parent_session_key", "")), str(params.get("batch_id", ""))
+                )
+                if self._queue:
+                    self._drain_queue()
+                return
         logger.info(
             "Draining queue: spawning '%s' (%d left)",
             str(params.get("task", ""))[:40],
@@ -3313,7 +4414,31 @@ class SubagentManager:
         # the queue round-trip — including `_preassigned_id`, which makes the agent
         # start under the id its caller was already told (and, if the gate re-queues
         # it, keeps that id across the second round-trip too).
-        self.spawn(**params, _from_queue=True)
+        drained = self.spawn(**params, _from_queue=True)
+        # A drained spawn has NO synchronous reader: this call site is a timer
+        # callback, and the original caller was handed a queued info long ago. So a
+        # terminal rejection here — the cwd was deleted while the run waited, the
+        # agent stopped resolving — was dropped on the floor: no completion event,
+        # and the caller's own bookkeeping showed the run as still going. Crew left
+        # such a topic `running` forever.
+        #
+        # Only for NON-batch runs, which is exactly the set `_announce_rejection`
+        # skips (it announces batch members itself, from inside `spawn`). Announcing
+        # regardless double-counted a queued batch rejection: the wave's own
+        # accounting closed early and emitted a duplicate or incomplete digest.
+        if (
+            drained is not None
+            and drained.done
+            and drained.error
+            and not drained.batch_id
+            and self._on_done
+        ):
+            try:
+                self._tasks[f"reject-{drained.id}"] = asyncio.ensure_future(
+                    self._safe_announce(drained)
+                )
+            except RuntimeError:
+                pass  # no running loop (sync/test context)
         if self._queue and self._running_count < self._max_concurrent:
             try:
                 asyncio.get_event_loop().call_later(self._spawn_stagger_secs, self._drain_queue)
@@ -3354,8 +4479,8 @@ class SubagentManager:
             # A user Stop funnels into `_force_reap` and can land while this
             # approval is still pending (a human prompt has no deadline), and
             # `_force_reap` releases the slot and reports. A bare decrement here
-            # then double-released — driving `_running_count` negative — and the
-            # announce below double-reported the completion.
+            # would double-release — driving `_running_count` negative — and the
+            # announce below would double-report the completion.
             if self._release_slot(info):
                 self._running_count -= 1
                 self._drain_queue()
@@ -3392,6 +4517,7 @@ class SubagentManager:
                 agent=info.agent,
                 parent_session=info.parent_session_key,
                 max_turns=info.max_turns,
+                context_groups=_context_groups_field(info),
             )
         except Exception:
             logger.warning("Failed to create agent folder for %s", info.id, exc_info=True)
@@ -3545,19 +4671,195 @@ class SubagentManager:
                 parent_session_key=parent,
             )
 
+    def _sweep_digest_holds(self, now: float) -> None:
+        """Reaper backstop: release wave results whose HOLD DEADLINE expired.
+
+        The gateway holds a completed member's per-agent injection until the
+        wave's digest chunk fires. Both of the chunk's triggers are event-driven
+        — a COUNT trigger (``SUBAGENT_DIGEST_CHUNK_SIZE`` completions pending)
+        and wave close — so neither can fire while a straggler is simply *not
+        finishing*. With the default count (10) above any realistic wave size,
+        the only flush that ever fires is the wave-close one, and a member that
+        HANGS rather than fails withholds every sibling's finished result for
+        the full ``_TIMEOUT_SECS`` reap window (issue #2215).
+
+        This sweep is the timer the event-driven triggers lack: when the OLDEST
+        outstanding hold in a wave has aged past :data:`DIGEST_HOLD_SECS` and
+        the wave is still live, it announces a synthetic *flush-only* record
+        through the single completion consumer (the same re-entry mechanism
+        :meth:`record_lost_submission` uses), which forces the partial digest
+        out. Ordinary fast waves never reach the deadline, so the deliberate
+        "small wave = one consolidated digest" behavior is untouched.
+        """
+        if DIGEST_HOLD_SECS <= 0 or self._on_done is None:
+            return  # deadline disabled — count-trigger-only
+        oldest: dict[str, float] = {}
+        parents: dict[str, str] = {}
+        totals: dict[str, int] = {}
+        for info in list(self._agents.values()):
+            _bid = info.batch_id
+            if not _bid or info._digest_held_at <= 0.0:
+                continue
+            _prev = oldest.get(_bid)
+            if _prev is None or info._digest_held_at < _prev:
+                oldest[_bid] = info._digest_held_at
+            parents.setdefault(_bid, info.parent_session_key)
+            totals.setdefault(_bid, info.batch_total)
+        for batch_id, held_at in oldest.items():
+            age = now - held_at
+            if age < DIGEST_HOLD_SECS:
+                continue  # still inside the grace window
+            if not self.batch_members_pending(batch_id):
+                # The wave is closing on its own — the real wave-close flush is
+                # already in flight (or the held flags are stale bookkeeping).
+                # Forcing a partial digest here would race it and could emit a
+                # duplicate chunk for the same members.
+                continue
+            logger.warning(
+                "Reaper: wave %s held results for %.0fs (deadline %.0fs) —"
+                " forcing partial digest flush",
+                batch_id,
+                age,
+                DIGEST_HOLD_SECS,
+            )
+            self.force_digest_flush(
+                batch_id,
+                parents.get(batch_id, ""),
+                totals.get(batch_id, 0),
+                age,
+            )
+
+    def force_digest_flush(
+        self,
+        batch_id: str,
+        parent_session_key: str,
+        batch_total: int,
+        held_secs: float,
+    ) -> None:
+        """Announce a synthetic *flush-only* record to release a wave's held
+        results without waiting for another member to complete.
+
+        The record is deliberately NOT a wave member: ``_digest_flush_only``
+        tells the gateway to skip every per-member side effect (terminal WS
+        event, orchestration accounting, done/ok/err counters, digest lines) and
+        only force the pending chunk out. Announcing it through ``_on_done`` —
+        rather than reaching into the gateway's digest buffers — reuses the one
+        completion consumer that owns digest composition, routing, and the
+        held-tombstone settle contract.
+        """
+        if not batch_id or self._on_done is None:
+            return
+        info = SubagentInfo(
+            id=uuid.uuid4().hex[:8],
+            task=f"(wave digest flush — results held {int(held_secs)}s)",
+            parent_session_key=parent_session_key,
+            done=True,
+            batch_id=batch_id,
+            batch_total=max(0, int(batch_total)),
+        )
+        info._digest_flush_only = True
+        try:
+            sel().log_tool_invocation(
+                session_key=parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="digest_hold_expired",
+                metadata={"batch_id": batch_id, "held_secs": int(held_secs)},
+            )
+        except Exception:
+            logger.debug("SEL audit failed for digest hold expiry", exc_info=True)
+        try:
+            self._tasks[f"flush-{info.id}"] = asyncio.ensure_future(
+                self._announce_digest_flush(info)
+            )
+        except RuntimeError:
+            pass  # no running loop (sync/test context)
+
+    async def _announce_digest_flush(self, info: SubagentInfo) -> None:
+        """Run the flush-only announce with the SAME settle contract as ``_run``.
+
+        ``_settle_digest_holds`` must run only after ``_on_done`` returns
+        cleanly: a routing failure has to leave the held members undelivered so
+        orphan reconciliation can still recover them after a restart. This path
+        has no run loop to enforce that ordering, so it enforces it here.
+        """
+        assert self._on_done is not None
+        try:
+            await self._on_done(info)
+        except Exception:
+            logger.warning(
+                "Digest hold flush announce failed for wave %s", info.batch_id, exc_info=True
+            )
+            return
+        self._settle_digest_holds(info)
+
+    async def settle_queued_delivery(self, agent_ids: list[str]) -> None:
+        """Write the ``delivered`` tombstones for completions consumed from a queue.
+
+        The queued-injection path (issue #4839) deliberately leaves a completion
+        un-tombstoned until the parent's turn has consumed the announce, so the
+        write lands here — in the parent's drain — rather than in
+        :meth:`_report_terminal`. That is also why it must repeat the gate that
+        report holds: a ``delivered`` tombstone EXCLUDES the folder from restart
+        orphan reconciliation, and the drain can come due while the run's teardown
+        is still killing its child, so writing early would let a crash in that
+        window strand a live child that nothing would ever reap.
+
+        The wait is bounded exactly as the report's is (teardown is itself bounded
+        by ``_RESET_TIMEOUT`` then SIGKILL, and runs in a ``finally``), and a
+        timeout writes anyway rather than abandoning the retention bound — the same
+        trade the report makes. The gate is read from ``_teardown_gates``, which
+        outlives the run's ``_agents``/``_tasks`` records: a dashboard "clear
+        completed" or "cancel" pops both of those for a run that is done but still
+        tearing down, so inferring "record gone means child gone" would tombstone a
+        live child. No gate entry means teardown has finished (or never started).
+
+        The tombstone write itself is offloaded: it fsyncs, and this runs on the
+        gateway event loop.
+        """
+        for agent_id in agent_ids:
+            gate = self._teardown_gates.get(agent_id)
+            if gate is not None and not gate.is_set():
+                try:
+                    await asyncio.wait_for(gate.wait(), timeout=_RESET_TIMEOUT + 30)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Subagent %s: teardown did not complete before the queued "
+                        "delivered tombstone; writing it anyway",
+                        agent_id,
+                    )
+            try:
+                await asyncio.to_thread(mark_delivered, agent_id)
+            except Exception:
+                logger.debug(
+                    "Failed to mark drained subagent %s delivered", agent_id, exc_info=True
+                )
+
     def _settle_digest_holds(self, info: SubagentInfo) -> None:
         """Settle delivery tombstones for wave members whose injection was
         held for this member's digest. Called ONLY after ``_on_done`` returned
-        without raising — the digest has been handed off, so marking the held
-        members delivered no longer risks the restart-loss window
-        (settling at digest composition, before routing, would).
+        without raising — and it is a real settle only for the routes where
+        that return IS the confirmation. Both dashboard routes hand off
+        asynchronously, so they detach the ids before ``_on_done`` returns and
+        owe them to the parent's consumption instead (the queue branch via
+        ``_defer_queued_delivery``, the direct-injection branch via the same
+        slot ledger), leaving this a no-op there. Marking the held members
+        delivered no longer risks the restart-loss window here (settling at
+        digest composition, before routing, would).
+
+        The ids are taken off ``info`` BEFORE settling, so a re-entry cannot
+        write a second tombstone and a route that detached them first leaves
+        this a no-op.
+
+        A failing tombstone write is logged and skipped, never raised: one
+        unwritable run folder must not strand the rest of the chunk.
         """
-        for _hid in info._digest_settle_ids:
+        ids, info._digest_settle_ids = info._digest_settle_ids, []
+        for _hid in ids:
             try:
                 mark_delivered(_hid)
             except Exception:
                 logger.debug("Failed to settle held subagent %s", _hid, exc_info=True)
-        info._digest_settle_ids = []
 
     def get(self, agent_id: str) -> SubagentInfo | None:
         """Get agent info by ID."""
@@ -3630,7 +4932,7 @@ class SubagentManager:
             )
         except asyncio.TimeoutError:
             if not info.reaped:
-                info.error = f"Timed out after {self._default_timeout // 60} minutes [{_timeout_context(info)}]"
+                info.error = f"Timed out after {self._default_timeout // 60} minutes [{_timeout_context(info, turn_limit=self._effective_turn_limit(info))}]"
                 info.done = True
                 Stats().inc_subagent_failed()
                 self._write_tombstone(info, "timeout")
@@ -3696,7 +4998,7 @@ class SubagentManager:
             logger.info("Subagent %s cancelled", info.id)
         except Exception as exc:
             if not info.reaped:
-                info.error = str(exc)
+                info.error = _describe_exception(exc)
                 info.done = True
                 Stats().inc_subagent_failed()
                 self._write_tombstone(info, "error")
@@ -3714,6 +5016,12 @@ class SubagentManager:
             # already-spawned report holds its "delivered" tombstone until the
             # child is provably gone (see `_report_terminal`).
             teardown_done = asyncio.Event()
+            # Published where it survives this record being evicted: a settlement
+            # that happens OUTSIDE this report (the parent's queue drain, issue
+            # #4839) can come due after a dashboard clear/cancel has removed the run
+            # from _agents AND _tasks, and it still must not tombstone a child that
+            # is being killed.
+            self._teardown_gates[info.id] = teardown_done
             if self._claim_finalize(info):
                 info.elapsed = time.time() - info.started
                 self._record_cost(info)
@@ -3745,6 +5053,10 @@ class SubagentManager:
                 # release the report's delivered-tombstone gate. Unconditional,
                 # so the report can never wedge on a cancelled teardown.
                 teardown_done.set()
+                # Set BEFORE the entry is dropped: a waiter that already holds the
+                # event is released by the line above, and one arriving after finds
+                # no entry, which now means exactly "nothing left to wait for".
+                self._teardown_gates.pop(info.id, None)
 
         # The report itself already ran (or is running) on the shielded task
         # spawned in the finally above; block until it completes so sequencing is
@@ -3939,6 +5251,13 @@ class SubagentManager:
         """
         info.last_activity = time.time()
         info._stall_suspect_at = 0.0  # activity resets the 2-sweep confirmation
+        # Retire the oracle so the next suspicion samples a fresh baseline rather
+        # than differencing against counters from before this activity, and bump
+        # the generation so a consult submitted before this moment cannot land a
+        # stalled verdict on an agent that has just proven it is working.
+        if info._stall_oracle is not None:
+            info._stall_oracle = info._stall_oracle.fresh()
+        info._stall_gen += 1
         if info.stalled:
             info.stalled = False
             await self._fire_event("subagent_stalled", info, {"stalled": False})
@@ -3954,6 +5273,28 @@ class SubagentManager:
         """Number of spawns currently queued for *parent_session_key* (waiting
         behind the concurrency cap / stagger gate, not yet started)."""
         return sum(1 for q in self._queue if q.get("parent_session_key", "") == parent_session_key)
+
+    def queued_count_for(self, parent_session_key: str) -> int:
+        """Public queued-spawn count for *parent_session_key*.
+
+        Spawns accepted behind the concurrency cap / stagger gate sit in
+        ``_queue`` with no ``SubagentInfo`` yet, so ``running``-based checks
+        read "no pending work" during exactly the window a wave is ramping.
+        Reset-deferral guards must consult this alongside ``running``.
+        """
+        return self._queued_depth(parent_session_key)
+
+    def has_pending_work_for(self, parent_session_key: str) -> bool:
+        """True while *parent_session_key* has sub-agents RUNNING or QUEUED.
+
+        The reset-deferral guards must consult this, not ``running`` alone —
+        see :meth:`queued_count_for` for why. A parent session reset while a
+        spawn is still queued strands that agent's completion on a
+        cold-started, context-free replacement session.
+        """
+        if self._queued_depth(parent_session_key) > 0:
+            return True
+        return any(a.parent_session_key == parent_session_key for a in self.running)
 
     def _emit_queue_depth(self, parent_session_key: str, batch_id: str = "") -> None:
         """Emit the current queued depth for *parent_session_key* as a
@@ -3994,6 +5335,11 @@ class SubagentManager:
                 turns=info.turns,
                 last_tool=info.last_tool,
                 outcome=info.outcome,
+                # ``cause`` is a coarse bucket ("error", "timeout"), which is
+                # not enough to act on. ``info.error`` is in-memory only and
+                # dies with the gateway, so without this the specific reason is
+                # recoverable from nothing but the log.
+                detail=(_redact(info.error)[:_MAX_ERROR_DETAIL_LEN] if info.error else ""),
             )
         except Exception:
             logger.debug("Failed to write tombstone for %s", info.id, exc_info=True)
@@ -4087,12 +5433,17 @@ class SubagentManager:
         # that role is unpinned the helper returns "" so we omit the kwarg and
         # keep deferring to the provider's configured default, exactly as before.
         eff_model = info.model or _subagent_default_model()
+        # Record the EFFECTIVE pin (per-spawn OR the role_models['subagent']
+        # config pin) as the requested side of the downgrade comparison — keying
+        # off the bare per-spawn ``model`` would miss a config-pinned run served a
+        # different model (Design review on #3582).
+        info.requested_model = eff_model
         if eff_model:
             extra_kwargs["model"] = eff_model
-        # Sub-agent reasoning effort (role_efforts['subagent'] -> chat default).
-        # Passed as an override so it wins over the factory's agent-derived
-        # default; "" leaves it to that default.
-        eff_effort = _subagent_default_effort()
+        # Sub-agent reasoning effort (per-call override -> role_efforts['subagent']
+        # -> chat default). Passed as an override so it wins over the factory's
+        # agent-derived default; "" leaves it to that default.
+        eff_effort = info.reasoning_effort or _subagent_default_effort()
         if eff_effort:
             extra_kwargs["reasoning_effort_override"] = eff_effort
         if info.bare:
@@ -4196,23 +5547,91 @@ class SubagentManager:
         # subagent can be pinned to a smaller model). Resolved from the live
         # client; None ⇒ 1M reference.
         _sub_window = window_for_provider_client(client)
+        # Context scope this run was spawned with. Passed even when every group
+        # is on, so build_message applies one code path for sub-agents.
+        _groups = _context_groups_of(info)
         # Off-loop: build_message embeds the episodic query (blocking urllib).
+        # A run's explicitly-given cwd IS its project for skill scoping: a
+        # dashboard spawn inherits the parent slot's project as its cwd, so the
+        # hands-off surface keeps the repo-scoped skills that surface exists for.
+        # The pool default is deliberately NOT substituted -- it is the
+        # workspace directory, not a checkout, so it can only ever mean "this
+        # run named no project", which is exactly the fail-closed case. Keeping
+        # one meaning for that makes the rule the same on every surface.
         full_message, _ = await run_in_embed_pool(
             self._ctx_builder.build_message,
             message,
             is_new,
             session_key,
-            provider_type="claude_code" if is_cc else "acp",
+            project=info.cwd or None,
+            provider_type=self._provider_label_of(client),
             model_window=_sub_window,
+            context_groups=_groups,
+        )
+        # The one place the resolved scope and its cost are both known — without
+        # this, "the sub-agent didn't know X" is undebuggable after the fact.
+        logger.info(
+            "Subagent %s context: groups=%s, %d chars",
+            info.id,
+            ",".join(sorted(_groups)) or "conduct-only",
+            len(full_message),
         )
 
         result_text = ""
         turns = 0
-        turn_limit = info.max_turns or self._default_turn_limit or _TURN_LIMIT
+        turn_limit = self._effective_turn_limit(info)
+        # Separate volume bound for child-origin permission escalations —
+        # they are exempt from the parent's turn budget (see the
+        # EVENT_PERMISSION_REQUEST branch) but must not be unbounded.
+        child_escalations = 0
+        child_escalation_limit = max(turn_limit * 3, 60)
         # Reports inherited agent (not just info.agent) so telemetry shows
         # the actual agent used for this subagent session.
+        #
+        # Read back the model the live session actually resolved to serve, so
+        # the panel shows what ran rather than only what was requested (issue
+        # #3582). Best-effort at spawn: the ACP session/new response already
+        # carries the served id (readable now, even on the backend default),
+        # while the raw CC path only knows it after the first turn — so this is
+        # refreshed authoritatively at completion below. Only overwrite a prior
+        # non-empty value with another non-empty one, so a spawn-time read that
+        # succeeded is never clobbered back to "" by a transient later miss.
+        _spawn_model = _resolved_model_of(client)
+        if _spawn_model:
+            info.resolved_model = _spawn_model
+        # Persist provenance to disk BEFORE the spawn event so a gateway restart
+        # in the window between the event and the later session_id state write
+        # cannot lose it — orphan recovery reads these from disk (GPT review on
+        # #3582). Off-loop (to_thread): update_state does a synchronous fsync, so
+        # a slow FS must not freeze the gateway/heartbeat. Best-effort with ONE
+        # bounded retry: this write is the SINGLE owner of these two fields on
+        # the spawn path (#5394) — the later session_id write no longer doubles
+        # as a fallback, so a transient failure gets its second chance HERE
+        # rather than from a second writer downstream. update_state reports a
+        # silently-skipped merge (unreadable state) as False, which counts as a
+        # failure for the retry — only a REPORTED write ends the loop. A
+        # persistence hiccup must still never block the spawn.
+        for _provenance_attempt in range(2):
+            try:
+                _wrote = await asyncio.to_thread(
+                    update_state,
+                    info.id,
+                    requested_model=info.requested_model,
+                    resolved_model=info.resolved_model,
+                )
+                if _wrote:
+                    break
+                logger.debug("Provenance write skipped (unreadable state) for %s", info.id)
+            except Exception:
+                logger.debug("Failed to persist model provenance for %s", info.id, exc_info=True)
         await self._fire_event(
-            "subagent_spawn", info, {"task": _redact(info.task), "agent": agent or ""}
+            "subagent_spawn",
+            info,
+            {
+                "task": _redact(info.task),
+                "agent": agent or "",
+                "model": info.resolved_model,
+            },
         )
         # Stream results to disk for orchestrated chat.
 
@@ -4229,10 +5648,19 @@ class SubagentManager:
         # Record session_id and provider type for session file cleanup
         try:
             session_id = client.session_id if hasattr(client, "session_id") else ""
-            provider_type = "claude_code" if is_cc else "acp"
+            provider_type = self._provider_label_of(client)
             state_update: dict[str, object] = {
                 "session_id": session_id,
                 "provider": provider_type,
+                # Model provenance (requested_model/resolved_model) is NOT
+                # re-written here: the crash-safe write BEFORE the
+                # subagent_spawn event above is the single owner of those two
+                # fields on the spawn path, and a transient failure there is
+                # handled by that write's own bounded retry (#5394). This write
+                # still performs the same read-merge-rewrite either way, so the
+                # point is one authoritative writer, not saved I/O. The CC-path
+                # refinement below still updates resolved_model when it first
+                # becomes known.
                 # keep marks this run's session files as resume material: the
                 # orphan reconciler and tombstone pruner skip file deletion
                 # for keep runs (restart-safe — read from disk, not memory).
@@ -4259,7 +5687,7 @@ class SubagentManager:
         except Exception:
             logger.debug("Failed to record session_id for %s", info.id, exc_info=True)
 
-        _rp = _agent_dir(info.id) / "result.txt"
+        _rp = agent_dir_for_display(info.id) / "result.txt"
         info.result_path = str(_rp)
         # Cache tool names by tool_call_id so PostToolUse can recover the tool name
         # when EVENT_TOOL_RESULT arrives (which only carries tool_call_id and output).
@@ -4289,6 +5717,13 @@ class SubagentManager:
             # intentionally identical semantics — a fix to either's activity
             # predicate or budget rules must be mirrored in the other.
             post_activity_attempts = 0
+            # Throttle-exhaustion fallback chain (agent.fallback_model):
+            # engaged only once the zero-activity budget above is spent, same
+            # trigger as stream_and_collect's Case 2.75 and the dashboard's
+            # fallback branch. State is per-run (this closure), matching
+            # "a slot/session-scoped equivalent" — the sticky marker for the
+            # session lives on the provider via TURN_FALLBACK_ATTR.
+            _fb_state = FallbackState(configured_fallback_chain())
             msg = full_message
             while True:
                 try:
@@ -4312,7 +5747,74 @@ class SubagentManager:
                             raise
                         post_activity_attempts += 1
                     elif attempts >= TRANSIENT_RETRIES:
-                        raise
+                        # ── Throttle-exhaustion fallback chain ──
+                        # Zero-activity budget spent: walk agent.fallback_model
+                        # before surfacing (empty chain ⇒ raise exactly as
+                        # before this feature). Two attempts per candidate
+                        # (FALLBACK_CANDIDATE_ATTEMPTS), ~2s backoff each —
+                        # NOT the exponential same-model curve; see
+                        # llm_helpers Case 2.75 for the rationale.
+                        if not _fb_state.chain:
+                            raise
+                        if (
+                            _fb_state.active is not None
+                            and _fb_state.attempts < FALLBACK_CANDIDATE_ATTEMPTS
+                        ):
+                            _fb_state.attempts += 1
+                        else:
+                            _cand = await advance_fallback_candidate(
+                                client,
+                                _fb_state,
+                                surface="subagent",
+                                log_suffix=f", id={info.id}",
+                            )
+                            if _cand is None:
+                                if _fb_state.walked:
+                                    _story = (
+                                        f"{_fb_state.primary or 'the selected model'} "
+                                        f"throttled; fallbacks "
+                                        f"{', '.join(_fb_state.walked)} also unavailable"
+                                    )
+                                    logger.warning(
+                                        "model fallback: chain exhausted (%s) for "
+                                        "subagent %s; surfacing original error",
+                                        _story,
+                                        info.id,
+                                    )
+                                    try:
+                                        exc._kc_fallback_story = _story  # type: ignore[attr-defined]
+                                    except Exception:
+                                        pass
+                                raise
+                        _fb_delay = transient_retry_delay(1)
+                        await self._fire_event(
+                            "subagent_retrying",
+                            info,
+                            {
+                                "attempt": _fb_state.attempts,
+                                "max": FALLBACK_CANDIDATE_ATTEMPTS,
+                                "fallback_model": _fb_state.active or "",
+                            },
+                        )
+                        try:
+                            sel().log_api_access(
+                                caller=info.parent_session_key or f"subagent:{info.id}",
+                                operation="subagent.model_fallback_retry",
+                                outcome="retrying",
+                                source="subagent",
+                                resources=(
+                                    f"subagent_id={info.id},"
+                                    f"model={_fb_state.active or ''},"
+                                    f"attempt={_fb_state.attempts}"
+                                ),
+                            )
+                        except Exception:
+                            logger.debug("SEL audit for fallback retry failed", exc_info=True)
+                        await asyncio.sleep(_fb_delay)
+                        # Zero activity by construction on this arm — replay
+                        # the original prompt, never a continuation.
+                        msg = full_message
+                        continue
                     attempts += 1
                     delay = transient_retry_delay(attempts)
                     logger.warning(
@@ -4352,13 +5854,63 @@ class SubagentManager:
         # waited for this turn.
         _turn_t0 = time.monotonic()
         async for event in _stream_with_transient_retry():
-            # Refresh the activity clock for EVERY event kind (thinking chunks,
-            # tool-call updates, etc.) before dispatch, so idle-stall detection
-            # only trips on a genuine no-event hang — not on an event kind this
-            # switch does not special-case. Approval waits stay exempt via
+            # Refresh the activity clock for every event kind that BELONGS to
+            # this session (thinking chunks, tool-call updates, etc.) before
+            # dispatch, so idle-stall detection only trips on a genuine no-event
+            # hang -- not on an event kind this switch does not special-case.
+            #
+            # ``runtime_global`` events are the one exclusion: the frame behind
+            # them carried no ``sessionId`` and the runtime fanned it out to
+            # several sessions sharing one kiro-cli process, so it is another
+            # tenant's traffic. Under ``agent.session_sharing`` (default true)
+            # co-tenant subagents are separate sessions on the parent's runtime,
+            # and counting the roster broadcast as activity reset
+            # ``last_activity`` for a whole batch of wedged subagents at the same
+            # instant, cleared their "stalled" badge and restarted the idle count
+            # on agents that had made no progress -- so the badge flapped and the
+            # reported ``idle_secs`` measured time since an unrelated agent's
+            # roster churn. Field data: three co-tenants flagged in one reaper
+            # sweep at idle 214s/214s/215s (one shared refresh instant) while
+            # their elapsed was 1445s/1447s/1538s.
+            #
+            # Deliberately a PROVENANCE test, not an event-kind test: the same
+            # kind reached through a routed frame (the KAS sub-agent lifecycle
+            # path) is this session's own progress and must still count, or a
+            # working agent gets falsely badged. Approval waits stay exempt via
             # _awaiting_approval.
-            await self._touch_activity(info)
+            #
+            # Plain attribute access: every provider yields ``LLMEvent`` (an
+            # alias of ``AcpEvent``), which declares the field, so there is no
+            # shape here that could raise. A hop that forgets to carry the flag
+            # degrades to the default False, i.e. "counts as activity" -- the
+            # fail-open direction, which can only delay a badge, never invent
+            # one.
+            if not event.runtime_global:
+                await self._touch_activity(info)
             if event.kind == EVENT_TEXT_CHUNK:
+                # The CC/raw provider only learns its served model once the
+                # backend answers the first turn — by the first text chunk that
+                # has happened, so refresh here. Runs once (guarded on a still-
+                # empty value) and stays cheap: covers every downstream exit
+                # path (normal, turn_limit, child-escalation, cancel) without
+                # threading the live client through each. Never overwrites a good
+                # spawn-time read with "".
+                if not info.resolved_model:
+                    _live_model = _resolved_model_of(client)
+                    if _live_model:
+                        info.resolved_model = _live_model
+                        # Persist the CC-path refinement so a restart after the
+                        # first turn still recovers the served model. Off-loop
+                        # (to_thread): synchronous fsync must not block the loop
+                        # (GPT review on #3582).
+                        try:
+                            await asyncio.to_thread(
+                                update_state, info.id, resolved_model=_live_model
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist refined model for %s", info.id, exc_info=True
+                            )
                 result_text += event.text
                 write_result_chunk(info.id, event.text)
                 redacted = _redact(event.text)
@@ -4371,9 +5923,63 @@ class SubagentManager:
                 # session/request_permission. Run them through the same hook
                 # → parent_policy → interactive callback pipeline so the
                 # approve / reads / trust / yolo protocol applies uniformly.
-                turns += 1
-                info.turns = turns
+                #
+                # Child-origin escalations (runtime-routed backend subagents)
+                # do NOT consume the parent's turn budget: a child asking for
+                # enough permissions would otherwise trip the parent's
+                # turn_limit and kill the whole subagent run on activity that
+                # is not the parent's own turns. They get their OWN bound
+                # instead — without one, a chatty or adversarial backend
+                # child could generate unbounded approval prompts until the
+                # wall-clock reaper fires (the turn budget used to bound
+                # exactly this traffic). Generous multiple of the parent's
+                # limit: legitimate crews fan many small child tool calls.
+                if not event.sub_session_id:
+                    turns += 1
+                    info.turns = turns
+                else:
+                    # Child escalation: counted toward its own volume bound
+                    # here; side-effect activity (tool_count) is counted at
+                    # APPROVAL in _approve_and_log — a purely rejected
+                    # escalation executed nothing and must not consume the
+                    # run's replay budget (tool_count gates prompt replay
+                    # and cancel-respawn).
+                    child_escalations += 1
+                    if child_escalations > child_escalation_limit:
+                        # Answer the triggering request BEFORE bailing: this
+                        # event is already dequeued, so returning without a
+                        # response would strand the child's oneshot — under
+                        # session sharing the runtime outlives this subagent
+                        # and nothing else tears the connection down. The
+                        # "requests are answered on every queue path"
+                        # contract this PR establishes applies to limit
+                        # bails too.
+                        try:
+                            await self._reject_and_log(
+                                client,
+                                event.request_id,
+                                session_key,
+                                event,
+                                error="child_escalation_limit",
+                            )
+                        except Exception:
+                            logger.exception("failed to reject escalation-limit trigger request")
+                        info.result = result_text or "_Partial output._"
+                        info.error = f"child_escalation_limit:{child_escalation_limit}"
+                        info.done = True
+                        Stats().inc_subagent_failed()
+                        logger.warning(
+                            "Subagent %s hit child escalation limit (%d)",
+                            info.id,
+                            child_escalation_limit,
+                        )
+                        self._write_tombstone(info, "child_escalation_limit")
+                        return
+                # Diagnostic pointer is written for BOTH origins — orphan
+                # recovery must see child activity too; only the turn
+                # increment is parent-scoped.
                 info.last_tool = event.title or ""
+                self._note_tool_dispatch(info, event)
                 # Persist turn state for orphan recovery diagnostics
                 try:
                     update_state(info.id, turns=turns, last_tool=event.title or "")
@@ -4390,6 +5996,15 @@ class SubagentManager:
                     },
                 )
                 if turns > turn_limit:
+                    # Same contract as the child_escalation_limit bail: the
+                    # triggering request is already dequeued and must be
+                    # answered before this loop exits, or its oneshot strands.
+                    try:
+                        await self._reject_and_log(
+                            client, event.request_id, session_key, event, error="turn_limit"
+                        )
+                    except Exception:
+                        logger.exception("failed to reject turn-limit trigger request")
                     info.result = result_text or "_Partial output._"
                     info.error = f"turn_limit:{turn_limit}"
                     info.done = True
@@ -4414,6 +6029,79 @@ class SubagentManager:
                         client, event.request_id, session_key, event, error="hook_deny"
                     )
                     continue
+                if event.child_low_fidelity:
+                    # Backend-internal child origin whose SECURITY context is
+                    # absent (structured params missing, unresolved shell
+                    # classification, or shell without a recoverable command —
+                    # AcpEvent.child_low_fidelity): any AUTO-approve would
+                    # rest on the LLM-authored title alone, so skip the hook
+                    # auto-approve and parent_policy=auto branches. When an
+                    # interactive approver IS configured — the per-subagent
+                    # factory, or the gateway-level _on_tool_approval
+                    # fallback the non-child path below also uses — hand the
+                    # decision to it: that is a human/host judgment, the same
+                    # downgrade the dashboard's card provides. Only a truly
+                    # headless consumer fails closed.
+                    _child_fallback = self._on_tool_approval
+                    if self._on_tool_approval_factory or _child_fallback is not None:
+                        # The human must know the title is ALL there is: the
+                        # structured params the policy gates would verify are
+                        # absent, so the displayed text is agent-authored and
+                        # unverifiable. Annotate the prompt so the approval
+                        # is an informed judgment, not a title-only rubber
+                        # stamp.
+                        event.title = (
+                            "⚠️ UNVERIFIED child request (security context "
+                            f"missing — title is agent-authored): {event.title or '<unknown tool>'}"
+                        )
+                        approved = False
+                        # Same human-wait lifecycle as the ordinary callback
+                        # branches below: without _awaiting_approval the
+                        # reaper reads a healthy approval wait as a stalled
+                        # subagent after the idle threshold.
+                        info._awaiting_approval = True
+                        try:
+                            if self._on_tool_approval_factory:
+                                approve_cb = self._on_tool_approval_factory(info)
+                                approved = bool(await approve_cb(event))
+                            elif _child_fallback is not None:
+                                approved = bool(
+                                    await _child_fallback(event, info.parent_session_key)
+                                )
+                        except Exception:
+                            logger.exception("child approval callback failed")
+                        finally:
+                            info._awaiting_approval = False
+                            info.last_activity = time.time()
+                        if approved:
+                            await self._approve_and_log(
+                                client,
+                                event.request_id,
+                                session_key,
+                                event,
+                                metadata={
+                                    "subagent_id": info.id,
+                                    "reason": "child_interactive_approved",
+                                },
+                                info=info,
+                            )
+                        else:
+                            await self._reject_and_log(
+                                client,
+                                event.request_id,
+                                session_key,
+                                event,
+                                error="child_interactive_rejected",
+                            )
+                        continue
+                    await self._reject_and_log(
+                        client,
+                        event.request_id,
+                        session_key,
+                        event,
+                        error="child_origin_no_command_context",
+                    )
+                    continue
                 if tool_result.action == TOOL_AUTO_APPROVE:
                     await self._approve_and_log(
                         client,
@@ -4421,6 +6109,7 @@ class SubagentManager:
                         session_key,
                         event,
                         metadata={"subagent_id": info.id, "reason": "hook_auto_approve"},
+                        info=info,
                     )
                     continue
                 if parent_policy == "auto":
@@ -4430,6 +6119,7 @@ class SubagentManager:
                         session_key,
                         event,
                         metadata={"subagent_id": info.id, "reason": "parent_policy_auto"},
+                        info=info,
                     )
                     continue
                 if self._on_tool_approval_factory:
@@ -4455,6 +6145,7 @@ class SubagentManager:
                         session_key,
                         event,
                         metadata={"subagent_id": info.id},
+                        info=info,
                     )
                 elif self._on_tool_approval:
                     info._awaiting_approval = True
@@ -4472,6 +6163,7 @@ class SubagentManager:
                         session_key,
                         event,
                         metadata={"subagent_id": info.id},
+                        info=info,
                     )
                 else:
                     # No callback, no auto policy — deny by default
@@ -4491,6 +6183,7 @@ class SubagentManager:
                 # the permission path uses so the running-card shows live activity.
                 info.tool_count += 1
                 info.last_tool = event.title or info.last_tool
+                self._note_tool_dispatch(info, event)
                 await self._fire_event(
                     "subagent_tool",
                     info,
@@ -4526,6 +6219,11 @@ class SubagentManager:
                     agent_role=info.agent or None,
                 )
             elif event.kind == EVENT_TOOL_RESULT:
+                # A FINAL result means the tool is done: drop the attribution
+                # snapshot so a later idle stretch is not judged against a
+                # command that has already returned. A non-final progress frame
+                # is not the end of the tool — the gate is in _note_tool_result.
+                self._note_tool_result(info, event)
                 # Fire PostToolUse hooks (parity with chat_runner). Until this
                 # branch existed, hooks registered for subagent-spawned tools
                 # received PreToolUse but never PostToolUse — losing the
@@ -4561,6 +6259,24 @@ class SubagentManager:
 
             cleaned, _ = redact_exfiltration_urls(cleaned)
             cleaned, _ = redact_credentials(cleaned)
+        # Model-fallback visibility (agent.fallback_model): a run served by a
+        # fallback model must say so in the delivered result — same contract as
+        # the cron/heartbeat annotation and the dashboard notice card. Model
+        # ids come from config (LLM-reachable via MCP), so they pass the same
+        # redaction as the result body.
+        _fb_marker = getattr(client, TURN_FALLBACK_ATTR, None)
+        if _fb_marker:
+            try:
+                _fb_primary, _fb_candidate = _fb_marker
+                _fb_line = (
+                    f"⚠️ Model '{_fb_primary}' throttled; this run was served by "
+                    f"fallback '{_fb_candidate}'."
+                )
+                _fb_line, _ = redact_exfiltration_urls(_fb_line)
+                _fb_line, _ = redact_credentials(_fb_line)
+                cleaned = f"{_fb_line}\n\n{cleaned}" if cleaned else _fb_line
+            except Exception:
+                logger.debug("fallback annotation failed", exc_info=True)
         info.result = cleaned or "_No response._"
         # Cap disk file and trim memory — gateway decides how much to show based on mode.
         if info.result_path:
@@ -4601,10 +6317,17 @@ class SubagentManager:
             _used, _window = read_context_tokens(client)
             await persist_token_record_async(
                 session_key,
-                info.model or "",
+                # Blank while a fallback serves this run: the explicit pin
+                # would bill the fallback's spend to a model that never
+                # executed; model_source reports what actually ran.
+                ("" if provider_fallback_active(client) else (info.model or "")),
                 _complete_event,
                 provider="claude_code" if is_cc else "acp",
                 surface="subagent",
+                # Ownership stamp (see _build_token_record): an app-dispatched
+                # subagent's spend must be readable by that app's audit — the
+                # illustrator lane of an app is exactly this path.
+                app=info.app or "",
                 # Explicit/inherited `agent` FIRST here — unlike every other
                 # surface. Under session sharing this subagent reuses the
                 # PARENT's runtime, so read_effective_agent() would report the
@@ -4667,6 +6390,10 @@ class SubagentManager:
             agent=agent or None,
         )
         provider = AcpSessionProvider(handle, runtime)
+        # This consumer implements the low-fidelity child downgrade (interactive
+        # approver when configured, reject when headless) — opt in so the
+        # handle-level fail-close gate yields those events instead of rejecting.
+        provider.child_fidelity_aware = True
         info._session_sharing = True
         info._shared_provider = provider
         if runtime.pid:
@@ -4713,6 +6440,21 @@ class SubagentManager:
 
         return is_claude_backend(provider)
 
+    @staticmethod
+    def _provider_label_of(provider: object) -> str:
+        """Backend identity key for *provider*, persisted with the run's state.
+
+        Mirrors ``_is_cc_provider`` in also matching the (dead) standalone
+        ``ClaudeCodeProvider``, which the shared ``provider_label`` helper does
+        not know about.
+        """
+        if ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider):
+            return PROVIDER_LABEL_CLAUDE
+        # circular import: see _is_cc_provider.
+        from kiro_crew.providers.acp import provider_label
+
+        return provider_label(provider)
+
     def _cancel_task_intentionally(
         self,
         task: "asyncio.Task",  # type: ignore[type-arg]
@@ -4751,6 +6493,29 @@ class SubagentManager:
                 info._cancel_retry_used = True
         task.cancel()
 
+    def _unqueue(self, agent_id: str) -> bool:
+        """Drop a not-yet-started spawn from the stagger queue. True if removed.
+
+        The queue is the only record of a waiting run — `spawn` returns its queued
+        SubagentInfo without registering it in ``_agents`` — so removing the entry
+        is what makes a cancel take effect before the work exists. Also re-emits the
+        parent's queued depth, or the chip keeps counting an agent that will never
+        run.
+        """
+        keep = [p for p in self._queue if str(p.get("_preassigned_id") or "") != agent_id]
+        if len(keep) == len(self._queue):
+            return False
+        dropped = [p for p in self._queue if str(p.get("_preassigned_id") or "") == agent_id]
+        self._queue = keep
+        for p in dropped:
+            try:
+                self._emit_queue_depth(
+                    str(p.get("parent_session_key", "")), str(p.get("batch_id", ""))
+                )
+            except Exception:
+                logger.debug("queue-depth re-emit failed after unqueue", exc_info=True)
+        return True
+
     async def cancel(self, agent_id: str) -> bool:
         """Cancel a single running subagent. Returns True if found and cancelled.
 
@@ -4761,6 +6526,15 @@ class SubagentManager:
         """
         info = self._agents.get(agent_id)
         if not info or info.done:
+            # A run still WAITING behind the stagger has no `_agents` record at
+            # all: `spawn` builds its queued SubagentInfo and returns it without
+            # registering. So this used to answer False and leave the entry in the
+            # queue, which the drain later started — the stop was reported as
+            # ineffective while the work ran anyway, and a purge on a deleted
+            # session could not reach it. Unqueueing IS the cancel for that state.
+            if self._unqueue(agent_id):
+                logger.info("Cancelled queued subagent %s before it started", agent_id)
+                return True
             return False
         info.user_stopped = True
         # Neutral semantics live in the RECORD, not just the live event: a user
@@ -4785,6 +6559,45 @@ class SubagentManager:
         if self._reaper_task and not self._reaper_task.done():
             self._reaper_task.cancel()
             self._reaper_task = None
+        # follow_up watchers: CANCEL AND GATHER FIRST, announce after (GPT
+        # review). The announce awaits — _on_done injection can be slow — and
+        # a busy-retry watcher waking during that await could dispatch a
+        # continuation into the shutting-down gateway, so every watcher task
+        # must be DEAD before anything here yields. Announcing afterwards is
+        # safe: the settle-after-outcome protocol leaves undelivered messages
+        # in their queues, so each is still present to be reported. An
+        # ACCEPTED follow-up must not die silently: the spawn_steer reply
+        # promised the parent a completion event, so each non-empty queue is
+        # announced as a synthetic failure — the parent learns the message was
+        # dropped instead of waiting forever.
+        # Snapshot ids BEFORE cancelling: each watcher's done-callback pops it
+        # from the dict as the gather completes it, so a post-gather snapshot
+        # is already empty.
+        watcher_ids = list(self._followup_watchers)
+        followup_watchers = [t for t in self._followup_watchers.values() if not t.done()]
+        for followup_watcher in followup_watchers:
+            followup_watcher.cancel()
+        if followup_watchers:
+            await asyncio.gather(*followup_watchers, return_exceptions=True)
+        self._followup_watchers.clear()
+        for agent_id in watcher_ids:
+            watcher_info = self._agents.get(agent_id)
+            if watcher_info is not None and watcher_info.pending_followups:
+                dropped = list(watcher_info.pending_followups)
+                watcher_info.pending_followups = []
+                self._audit_followup(watcher_info, "followup_expired")
+                try:
+                    await self._announce_followup_failure(
+                        watcher_info,
+                        "follow_up dropped: the gateway is shutting down before "
+                        "the run completed; the queued message(s) were not "
+                        "dispatched",
+                        messages=dropped,
+                    )
+                except Exception:  # noqa: BLE001 - shutdown must not wedge here
+                    logger.debug(
+                        "shutdown follow_up announce failed for %s", agent_id, exc_info=True
+                    )
         tasks_to_await: list[asyncio.Task] = []  # type: ignore[type-arg]
         for agent_id, task in list(self._tasks.items()):
             if not task.done():

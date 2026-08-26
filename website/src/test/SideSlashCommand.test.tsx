@@ -51,6 +51,19 @@ describe('/side slash command interception', () => {
     expect(mockSideOpen).not.toHaveBeenCalled()
   })
 
+  // A quick prompt (/plain) is a BACKEND macro: build_message swaps the token for
+  // the instruction it stands for. Intercepting it here would stop the message
+  // ever being sent, so the feature would silently do nothing. Pinned because the
+  // command appears in the same menu as /side and looks interceptable.
+  it('does not intercept "/plain" — it must reach the backend expansion', async () => {
+    for (const text of ['/plain', '/plain why is CI red']) {
+      const result = await interceptSlashCommand(text, SLOT, store.dispatch)
+      expect(result).toEqual({ intercepted: false })
+    }
+    expect(mockSideOpen).not.toHaveBeenCalled()
+    expect(mockSideTurn).not.toHaveBeenCalled()
+  })
+
   it('starts the import gate before replaying onboarding', async () => {
     const listener = vi.fn()
     window.addEventListener('mc-start-import', listener)
@@ -63,5 +76,24 @@ describe('/side slash command interception', () => {
       continueOnboarding: true,
     })
     window.removeEventListener('mc-start-import', listener)
+  })
+
+  it('reports failed when there is no active slot', async () => {
+    const result = await interceptSlashCommand('/side', null, store.dispatch)
+    expect(result).toEqual({ intercepted: true, failed: true })
+  })
+
+  it('reports failed when sideOpen rejects', async () => {
+    mockSideOpen.mockRejectedValueOnce(new Error('boom'))
+    const result = await interceptSlashCommand('/side', SLOT, store.dispatch)
+    expect(result).toEqual({ intercepted: true, failed: true })
+  })
+
+  it('reports failed when sideTurn rejects (e.g. 409 turn in flight)', async () => {
+    mockSideTurn.mockRejectedValueOnce(new Error('409: side turn already in flight'))
+    const result = await interceptSlashCommand('/side my question', SLOT, store.dispatch)
+    expect(result).toEqual({ intercepted: true, failed: true })
+    // The panel still opened — only the turn was rejected.
+    expect(store.getState().chat.activityTab).toBe('side')
   })
 })

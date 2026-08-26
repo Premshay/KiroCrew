@@ -3,7 +3,7 @@
  * All changes are staged locally. Only applied on Save.
  * Closing without saving prompts the user and reverts if discarded.
  */
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import type { AppConfig } from '../shared/config'
 import { ELECTRON_MAP, MODIFIER_GLYPHS, MODIFIER_ORDER } from '../shared/config'
 import type { CompanionStats, McpServerInfo } from '../shared/types'
@@ -104,6 +104,11 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
   // scrolling past every unrelated one.
   const [active, setActive] = useState<SettingsSectionId>('general')
   const [shortcutRefused, setShortcutRefused] = useState<string[]>([])
+  // A switch the shell refused, or one attempted with no shell at all. Kept out
+  // of `shortcutRefused` so the two failures can say different things -- clearing
+  // dirty state on a refused switch is what made the panel read "saved" while the
+  // pet never moved.
+  const [instanceSwitchFailed, setInstanceSwitchFailed] = useState(false)
   const [trustMode, setTrustMode] = useState<'normal' | 'trust_reads' | 'trust' | 'yolo'>('normal')
   const [origTrust, setOrigTrust] = useState<'normal' | 'trust_reads' | 'trust' | 'yolo'>('normal')
   const [showUnsaved, setShowUnsaved] = useState(false)
@@ -114,11 +119,25 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
     return JSON.stringify(config) !== JSON.stringify(original)
   })()
 
-  // Listen for native window close (red × button)
+  // Declared before the native-close subscription: an early fire during subscribe
+  // would otherwise read handleClose while it is still in the temporal dead zone.
+  // The effect deps include handleClose so a dirty-state change replaces the
+  // listener; an empty list would keep the first (always-clean) closure forever.
+  const handleClose = useCallback(() => {
+    if (isDirty) { setShowUnsaved(true) } else { onClose() }
+  }, [isDirty, onClose])
+
   useEffect(() => {
-    const off = api?.onSettingsCloseRequested?.(() => handleClose())
+    const off = api?.onSettingsCloseRequested?.(() => {
+      // Before the config loads nothing is staged, so a native close may
+      // proceed immediately — and must not touch handleClose, whose const
+      // binding sits below the loading early-return and is still in TDZ on
+      // this render's closure.
+      if (!config || !original) { onClose(); return }
+      handleClose()
+    })
     return () => { off?.() }
-  })
+  }, [handleClose])
 
   useEffect(() => {
     api?.getConfig?.().then((c: AppConfig) => {
@@ -183,18 +202,16 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
     // seam does a fetch FROM THIS WINDOW, so closing it cancelled the in-flight
     // request and the save was silently lost.
     await api?.updateConfig?.(finalConfig)
-    // Same reasoning as applyShortcuts below: the shell only notices petInstance
-    // on its next reconcile pass, so without this the pet keeps showing the old
-    // instance for a few seconds after the user picked a new one — long enough to
-    // read as "the switch didn't work" and invite a second click. Awaited so the
-    // panel does not close before the windows have actually moved. AFTER the
-    // config write, because the shell re-reads the setting from the gateway.
-    if (config.mochi.petInstance !== original?.mochi?.petInstance) {
-      await api?.applyInstanceNow?.()
-    }
-    // Bind NOW and report a refusal. globalShortcut.register is the only place
-    // "is this key free?" can be answered, and without this call the rebind was
-    // picked up only by the shell's next drift tick -- with a taken key
+    // SHORTCUTS BEFORE THE INSTANCE SWITCH, and that order is load-bearing.
+    // `setPetInstance` reconciles inline, and a reconcile that sees a changed
+    // target calls closeSettingsWindow() — destroying THIS window while
+    // handleSave is still awaiting, so anything after it never runs. Since the
+    // shell's store is now the only place the accelerators are persisted (they
+    // are stripped from the settings POST above), running this second would lose
+    // the whole shortcut change, not merely its immediate binding.
+    //
+    // Bind NOW and report a refusal: globalShortcut.register is the only place
+    // "is this key free?" can be answered, and without this call a taken key is
     // silently shown as bound, which reads as "the shortcut just doesn't work".
     const bindResult = (await api?.applyShortcuts?.(config.shortcuts)) ?? {}
     const refused = Object.entries(bindResult)
@@ -202,9 +219,54 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
       .map(([action]) => action)
     if (refused.length > 0) {
       setShortcutRefused(refused)
+      // Reveal the section that RENDERS the message. Save is global but this
+      // refusal only renders under 'shortcuts', so saving from any other
+      // section would hold the panel open with no visible reason for it.
+      setActive('shortcuts')
       return // keep the panel open so the message is seen
     }
     setShortcutRefused([])
+
+    // The shell only notices petInstance on its next reconcile pass, so without
+    // an explicit apply the pet keeps showing the old instance for a few seconds
+    // after the user picked a new one — long enough to read as "the switch didn't
+    // work" and invite a second click.
+    if (config.mochi.petInstance !== original?.mochi?.petInstance) {
+      // Through the SHELL, not the same-origin settings POST. The pointer is a
+      // per-MACHINE choice and the shell's store owns it; posting it here would
+      // write it onto whichever gateway served this window, where nothing reads
+      // it — the one-way door that stranded a pet on a remote with no way back.
+      // One call stores AND moves, so the two cannot half-happen.
+      //
+      // The result is CHECKED: a refused or shell-less switch must not clear the
+      // dirty state and read as "saved" while the pet never moved.
+      const moved = api?.setPetInstance
+        ? await api.setPetInstance(config.mochi.petInstance as string)
+        : false
+      if (!moved) {
+        setInstanceSwitchFailed(true)
+        // Same reason as the shortcut refusal above: this message lives under
+        // 'instances', and a save started from elsewhere must not strand the
+        // user in a panel that refuses to close and does not say why.
+        setActive('instances')
+        // COMMIT THE BASELINE even though the switch did not land. The shell
+        // stores the pointer BEFORE the reconcile that failed, so the choice is
+        // already persisted and its retry loop will apply it — there is nothing
+        // here to revert. Leaving the old baseline in place would offer a Discard
+        // that resets these fields on screen while the pet still moves minutes
+        // later, which is the one thing worse than reporting the failure.
+        //
+        // Everything else on this path has landed too: trust, `updateConfig` and
+        // the accelerators all ran before this point. The refused-shortcut branch
+        // above deliberately does NOT do this — a refused key really was not
+        // stored, so it must stay dirty for the user to fix, and no watcher will
+        // apply it behind their back.
+        setOriginal(JSON.parse(JSON.stringify(config)))
+        setOrigTrust(trustMode)
+        return // keep the panel open, same as a refused shortcut
+      }
+      setInstanceSwitchFailed(false)
+    }
     setOriginal(JSON.parse(JSON.stringify(config)))
     setOrigTrust(trustMode)
     onClose()
@@ -217,10 +279,6 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
       applyTheme(original.mochi.theme as ThemeId)
     }
     onClose()
-  }
-
-  const handleClose = () => {
-    if (isDirty) { setShowUnsaved(true) } else { onClose() }
   }
 
   return (
@@ -313,7 +371,10 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
             { value: 'normal' as const, Icon: Cat, label: i18nT('apps.mochi.settingsPanel.mode_normal'), desc: i18nT('apps.mochi.settingsPanel.mode_normal_desc') },
             { value: 'quiet' as const, Icon: Moon, label: i18nT('apps.mochi.settingsPanel.mode_quiet'), desc: i18nT('apps.mochi.settingsPanel.mode_quiet_desc') },
           ]).map((opt) => (
-            <label key={opt.value} onClick={() => editMochi({ activityMode: opt.value })} style={{
+            <div key={opt.value} role="radio" aria-checked={config.mochi.activityMode === opt.value} tabIndex={0} onClick={() => editMochi({ activityMode: opt.value })}
+              onKeyDown={(e) => {
+                if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); editMochi({ activityMode: opt.value }) }
+              }} style={{
               display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer',
               padding: '6px 8px', borderRadius: 6,
               background: config.mochi.activityMode === opt.value ? 'var(--accent-glow)' : 'transparent',
@@ -328,7 +389,7 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text)', fontWeight: config.mochi.activityMode === opt.value ? 600 : 400 }}><opt.Icon size={13} /> {opt.label}</div>
                 <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{opt.desc}</div>
               </div>
-            </label>
+            </div>
           ))}
         </div>
       </Section>
@@ -371,7 +432,10 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
             { value: 'trust_reads', label: i18nT('apps.mochi.settingsPanel.trust_reads'), desc: i18nT('apps.mochi.settingsPanel.trust_reads_desc') },
             { value: 'trust', label: i18nT('apps.mochi.settingsPanel.trust_trust'), desc: i18nT('apps.mochi.settingsPanel.trust_trust_desc') },
           ] as const).map((opt) => (
-            <label key={opt.value} onClick={() => setTrustMode(opt.value)} style={{
+            <div key={opt.value} role="radio" aria-checked={trustMode === opt.value} tabIndex={0} onClick={() => setTrustMode(opt.value)}
+              onKeyDown={(e) => {
+                if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setTrustMode(opt.value) }
+              }} style={{
               display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer',
               padding: '6px 8px', borderRadius: 6,
               background: trustMode === opt.value ? 'var(--accent-glow)' : 'transparent',
@@ -386,7 +450,7 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
                 <div style={{ fontSize: 12, color: 'var(--text)', fontWeight: trustMode === opt.value ? 600 : 400 }}>{opt.label}</div>
                 <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{opt.desc}</div>
               </div>
-            </label>
+            </div>
           ))}
           {/* The level is app-wide and `yolo` is not settable here, so a slot
               already in it would otherwise render as three unselected radios —
@@ -405,11 +469,26 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
       </>)}
       {active === 'instances' && (<>
       <Section title={i18nT('apps.mochi.settingsPanel.instances')}>
-        <MochiInstancesList
-
-          value={(config.mochi as { petInstance?: string }).petInstance || 'self'}
-          onChange={(petInstance) => editMochi({ petInstance })}
-        />
+        {/* No shell means no IPC, and the pointer lives in the shell's store --
+            so picking a row here could store nothing and move nothing. Say that
+            instead of rendering a control that silently does nothing. */}
+        {!api.hasShell ? (
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+            {i18nT('apps.mochi.instances.desktop_only')}
+          </div>
+        ) : (<>
+          {instanceSwitchFailed && (
+            <div role="alert" style={{
+              fontSize: 10, color: 'var(--danger)', marginBottom: 6, lineHeight: 1.4,
+            }}>
+              {i18nT('apps.mochi.instances.switch_failed')}
+            </div>
+          )}
+          <MochiInstancesList
+            value={(config.mochi as { petInstance?: string }).petInstance || 'self'}
+            onChange={(petInstance) => editMochi({ petInstance })}
+          />
+        </>)}
       </Section>
       </>)}
 
@@ -435,8 +514,19 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
 
       {active === 'shortcuts' && (<>
       <Section title={i18nT('apps.mochi.settingsPanel.shortcuts')}>
+        {/* No shell means no way to register an OS global accelerator AND no
+            store to persist one in: the shell's store is the only copy, and
+            `flattenConfig` deliberately does not post these to the gateway. So
+            without it, editing here would report success and change nothing.
+            Same call as the instances pane above — say so rather than render a
+            control that cannot deliver. */}
+        {!api.hasShell ? (
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+            {i18nT('apps.mochi.settingsPanel.shortcuts_desktop_only')}
+          </div>
+        ) : (<>
         {shortcutRefused.length > 0 && (
-          <div style={{
+          <div role="alert" style={{
             fontSize: 10, color: 'var(--danger)', marginBottom: 6, lineHeight: 1.4,
           }}>
             {i18nT('apps.mochi.settingsPanel.shortcut_taken', { actions: shortcutRefused.join(', ') })}
@@ -451,6 +541,7 @@ export const SettingsPanel: React.FC<{ onClose: () => void }> = ({ onClose }) =>
         <ShortcutField label={i18nT('apps.mochi.settingsPanel.hide_all')} desc={i18nT('apps.mochi.settingsPanel.hide_all_desc')}
           value={config.shortcuts.hideAll}
           onChange={(v) => edit({ shortcuts: { ...config.shortcuts, hideAll: v } })} />
+        </>)}
       </Section>
       </>)}
 
@@ -526,11 +617,11 @@ const Field: React.FC<{ label: string; desc?: string; value: string; onChange: (
 )
 
 
-const SelectField: React.FC<{ label: string; desc?: string; value: string; options: (string | { value: string; label: string })[]; onChange: (v: string) => void }> = ({ label, desc, value, options, onChange }) => (
+const SelectField: React.FC<{ label: string; desc?: string; value: string; options: (string | { value: string; label: string })[]; onChange: (v: string) => void; disabled?: boolean }> = ({ label, desc, value, options, onChange, disabled }) => (
   <div style={{ marginBottom: 8 }}>
     <div style={{ fontSize: 12, color: 'var(--text)', marginBottom: 1 }}>{label}</div>
     {desc && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 3 }}>{desc}</div>}
-    <select value={value} onChange={(e) => onChange(e.target.value)}
+    <select value={value} onChange={(e) => onChange(e.target.value)} disabled={disabled}
       style={{ width: '100%', background: 'var(--bg-input)', border: '1px solid var(--border)', borderRadius: 6, padding: '5px 8px', color: 'var(--text)', fontSize: 12, outline: 'none' }}>
       {options.map((o) => { const v = typeof o === 'string' ? o : o.value; const l = typeof o === 'string' ? o : o.label; return <option key={v} value={v}>{l}</option> })}
     </select>
@@ -1250,7 +1341,10 @@ const BackgroundActivitySection: React.FC<{
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 8 }}>
         {tiers.map((opt) => (
-          <label key={opt.value} onClick={() => editMochi({ activityTier: opt.value })} style={{
+          <div key={opt.value} role="radio" aria-checked={tier === opt.value} tabIndex={0} onClick={() => editMochi({ activityTier: opt.value })}
+            onKeyDown={(e) => {
+              if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); editMochi({ activityTier: opt.value }) }
+            }} style={{
             display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer',
             padding: '6px 8px', borderRadius: 6,
             background: tier === opt.value ? 'var(--accent-glow)' : 'transparent',
@@ -1265,7 +1359,7 @@ const BackgroundActivitySection: React.FC<{
               <div style={{ fontSize: 12, color: 'var(--text)', fontWeight: tier === opt.value ? 600 : 400 }}>{opt.label}</div>
               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{opt.desc}</div>
             </div>
-          </label>
+          </div>
         ))}
       </div>
       {usage && (
@@ -1288,6 +1382,9 @@ const ModelSelector: React.FC<{
   const [current, setCurrent] = React.useState('')
   const [loading, setLoading] = React.useState(true)
   const [switching, setSwitching] = React.useState(false)
+  const [switchNotice, setSwitchNotice] = React.useState('')
+  // A pick made before the initial hydration resolves must win over it.
+  const touchedRef = React.useRef(false)
 
   React.useEffect(() => {
     api?.getModels?.().then((list: any) => {
@@ -1300,12 +1397,48 @@ const ModelSelector: React.FC<{
       }
       setLoading(false)
     }).catch(() => setLoading(false))
+    // Hydrate the selector from the slot's ACTUAL model. Without this it
+    // opens on "Auto" whatever the gateway runs, and the refusal rollback
+    // below would "restore" that lie instead of the real prior model.
+    api?.getSlotModel?.()?.then((m: string) => {
+      if (!touchedRef.current && typeof m === 'string') setCurrent(m)
+    })?.catch(() => {})
   }, [])
 
+  // Same expiry the dashboard's own switch notice uses (App.tsx): the advice
+  // is only useful while fresh — a turn that has since finished makes a
+  // sticky "try again later" wrong.
+  React.useEffect(() => {
+    if (!switchNotice) return
+    const timer = window.setTimeout(() => setSwitchNotice(''), 6000)
+    return () => window.clearTimeout(timer)
+  }, [switchNotice])
+
   const handleChange = async (model: string) => {
+    touchedRef.current = true
+    const prior = current
     setCurrent(model)
     setSwitching(true)
-    try { await api?.setModel?.(model) } catch {}
+    setSwitchNotice('')
+    try {
+      const res = await api?.setModel?.(model)
+      // A REPORTED refusal means the gateway definitively kept the old model —
+      // put the selector back so it does not misreport, and always say why:
+      // the specific mid-turn copy when the bridge carried the 409
+      // turn_in_flight code, the shared generic copy otherwise (a silent
+      // snap-back is the same "failed for no stated reason" defect this
+      // change exists to remove). A thrown failure stays optimistic as
+      // before: the bridge itself never throws (it maps every failure into
+      // the result), so a throw means the outcome is genuinely unknown.
+      if (res && !res.ok) {
+        setCurrent(prior)
+        setSwitchNotice(res.code === 'turn_in_flight'
+          ? i18nT('utils.agentSwitchFeedback.turn_in_flight')
+          : i18nT('components.errorBoundary.something_went_wrong'))
+      }
+    } catch {
+      // keep the optimistic value — see above
+    }
     setSwitching(false)
   }
 
@@ -1334,10 +1467,16 @@ const ModelSelector: React.FC<{
       <SelectField label={i18nT('apps.mochi.settingsPanel.chat_model')} desc={i18nT('apps.mochi.settingsPanel.model_desc')}
         value={current}
         options={chatOptions}
+        disabled={switching}
         onChange={(v) => void handleChange(v)} />
       {switching && (
         <div style={{ fontSize: 10, color: 'var(--accent)', marginTop: -4, marginBottom: 6 }}>
           {i18nT('apps.mochi.settingsPanel.model_switching')}
+        </div>
+      )}
+      {!switching && switchNotice && (
+        <div role="status" style={{ fontSize: 10, color: 'var(--warn)', marginTop: -4, marginBottom: 6 }}>
+          {switchNotice}
         </div>
       )}
       <SelectField label={i18nT('apps.mochi.settingsPanel.bg_model')} desc={i18nT('apps.mochi.settingsPanel.bg_model_desc')}

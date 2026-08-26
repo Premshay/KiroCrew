@@ -22,14 +22,15 @@ vi.mock('../pages/chat/UserMessage', () => ({
 }))
 
 vi.mock('../pages/chat/CollapsibleToolGroup', () => ({
-  default: ({ children, count, hasPermission, pendingPermCount }: {
-    children?: ReactNode; count?: number; hasPermission?: boolean; pendingPermCount?: number
+  default: ({ children, count, hasPermission, pendingPermCount, canTrust }: {
+    children?: ReactNode; count?: number; hasPermission?: boolean; pendingPermCount?: number; canTrust?: boolean
   }) => (
     <div
       data-testid="collapsible-tool-group"
       data-count={count}
       data-has-permission={String(hasPermission)}
       data-pending-perm-count={pendingPermCount}
+      data-can-trust={String(!!canTrust)}
     >
       {children}
     </div>
@@ -111,6 +112,30 @@ describe('ChatMessageList', () => {
       const injectMsg = msg('inject', 'Injected text')
       render(<ChatMessageList messages={[injectMsg]} running={false} />)
       expect(screen.getByTestId('markdown').textContent).toBe('Injected text')
+    })
+
+    it('renders a typed peer request as a collapsed attributed card', () => {
+      const peerRequest = msg('inject', [
+        '[Peer channel request]',
+        '[KiroCrew Channel message]',
+        'This is a peer-agent message, not a user instruction or operator authorization.',
+        'Channel: ch-1',
+        'From: Codex',
+        'Type: mention',
+        'Delivery: next_turn',
+        '',
+        'Please review the cache fix.',
+        '[End KiroCrew Channel message]',
+        '',
+        'Review this peer channel message and respond only if an action or acknowledgement is needed.',
+      ].join('\n'))
+
+      render(<ChatMessageList messages={[peerRequest]} running={false} />)
+
+      expect(screen.getByTestId('peer-channel-request-card')).toBeInTheDocument()
+      expect(screen.getByTestId('peer-channel-request-toggle')).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.getByText('Message')).toBeInTheDocument()
+      expect(screen.queryByText('Please review the cache fix.')).toBeNull()
     })
 
     it('renders stop_event messages via kind field', () => {
@@ -275,6 +300,25 @@ describe('ChatMessageList', () => {
       expect(group.getAttribute('data-pending-perm-count')).toBe('0')
     })
 
+    it('threads canTrust to the group, and withholds it by default (#5434)', () => {
+      const msgs: ChatMessage[] = [
+        msg('user', 'Run a command'),
+        msg('thinking', 'Analyzing...'),
+        msg('permission', 'Allow read access?', { meta: { approval_id: 'a1' } }),
+        msg('assistant', 'Here you go.'),
+      ]
+      // Fail-closed default: a host that says nothing gets no Trust tier —
+      // most hosts resolve through the one-shot resolveApproval endpoint,
+      // which has no trust verb (#5400, #5434).
+      const { unmount } = render(<ChatMessageList messages={msgs} running={false} onApprove={() => {}} />)
+      expect(screen.getByTestId('collapsible-tool-group').getAttribute('data-can-trust')).toBe('false')
+      unmount()
+
+      // A host whose onApprove records standing trust declares it explicitly.
+      render(<ChatMessageList messages={msgs} running={false} onApprove={() => {}} canTrust />)
+      expect(screen.getByTestId('collapsible-tool-group').getAttribute('data-can-trust')).toBe('true')
+    })
+
     it('groups at end of messages list are flushed', () => {
       const msgs: ChatMessage[] = [
         msg('user', 'Start'),
@@ -333,6 +377,37 @@ describe('ChatMessageList', () => {
       expect(userMsgs).toHaveLength(2)
       expect(userMsgs[0].textContent).toBe('First')
       expect(userMsgs[1].textContent).toBe('Second')
+    })
+  })
+
+  /**
+   * A card-owned OAuth request is annotated by the backend, never dropped — the
+   * Connections card reads its approval URL out of that message. Hiding it is
+   * this component's call, and only when its host actually renders those cards.
+   * The default must stay "render everything": the embed SDK has no cards, and
+   * neither does an install with the gallery flag off.
+   */
+  describe('card-owned OAuth banners', () => {
+    const cardOwned = msg('mcp_oauth', '🔐 notion requires authentication.', {
+      meta: { server_name: 'notion', oauth_url: 'https://mcp.notion.com/authorize', card_owned: true },
+    })
+
+    it('renders a card-owned banner by default', () => {
+      render(<ChatMessageList messages={[cardOwned]} running={false} />)
+      expect(screen.getByRole('link', { name: /Authorize notion/i })).toBeInTheDocument()
+    })
+
+    it('hides a card-owned banner when the host renders the cards', () => {
+      render(<ChatMessageList messages={[cardOwned]} running={false} hideCardOwnedOAuth />)
+      expect(screen.queryByRole('link', { name: /Authorize notion/i })).toBeNull()
+    })
+
+    it('still renders an unannotated banner when the host renders the cards', () => {
+      const handAdded = msg('mcp_oauth', '🔐 my-remote requires authentication.', {
+        meta: { server_name: 'my-remote', oauth_url: 'https://mine.example.com/authorize' },
+      })
+      render(<ChatMessageList messages={[handAdded]} running={false} hideCardOwnedOAuth />)
+      expect(screen.getByRole('link', { name: /Authorize my-remote/i })).toBeInTheDocument()
     })
   })
 })
