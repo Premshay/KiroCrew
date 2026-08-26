@@ -13,7 +13,7 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from kiro_crew import mcp_apps_render, model_registry, session_directive
 from kiro_crew.acp.client import (
@@ -88,7 +88,6 @@ from kiro_crew.dashboard.chat_utils import (
     _broadcast_compaction_result,
     _dequeue_next_message,
     _dequeue_next_system_message,
-    _extract_bash_command,
     _maybe_consolidate,
     _maybe_inject_persona,
     _normalize_model,
@@ -182,9 +181,16 @@ from kiro_crew.hooks import (
 from kiro_crew.image_artifacts import register_images_off_loop
 from kiro_crew.llm_helpers import (
     TRANSIENT_RETRIES,
+    TURN_FALLBACK_ATTR,
+    FallbackState,
     PromptBusyExhaustedError,
     acp_error_is_transient,
+    advance_fallback_candidate,
+    configured_fallback_chain,
+    provider_active_model,
+    provider_raw_model,
     record_interaction_event,
+    resolve_substitute_set_model,
     run_bg_oneliner,
     transient_retry_delay,
 )
@@ -222,6 +228,7 @@ from kiro_crew.sel import sel
 from kiro_crew.session import SessionClosingError, SpeculativeResumeRefused
 from kiro_crew.slack.handler import post_linked_approval, resolve_linked_approval
 from kiro_crew.slack.outbound import PostedOptions
+from kiro_crew.trust_patterns import extract_bash_command as _extract_bash_command
 from kiro_crew.validation import ValidationError, infer_use_case, validate_ask_user_question
 from kiro_crew.widget_artifacts import register_widgets_off_loop
 
@@ -236,6 +243,7 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402
     _POSTTOKEN_RECOVER_MSG,
     _PROMISE_ONLY_CONTINUE_MSG,
     _SYNTHETIC_RECOVERY_MSGS,
+    CRON_NOTIFICATION_KIND,
     SUBAGENT_COMPLETION_KIND,
     SYNTHETIC_RECOVERY_KIND,
     RecoveryPayload,
@@ -947,6 +955,94 @@ def _pinned_model_withheld(client: Any, model: str, provider: str) -> bool:
     except Exception:
         return False
     return model_is_unusable(model, advertised)
+
+
+def _agent_fallback_chain() -> tuple[str, ...]:
+    """Expose the configured fallback chain as a dashboard test seam."""
+    return configured_fallback_chain()
+
+
+async def _fallback_swap_for_turn(slot: Any, client: Any) -> str | None:
+    """Advance one configured model fallback without racing an explicit pick."""
+    chain = _agent_fallback_chain()
+    if not chain:
+        return None
+    pick_lock = getattr(slot, "_model_pick_lock", None) or asyncio.Lock()
+    async with pick_lock:
+        fallback = FallbackState(
+            chain,
+            pos=max(0, int(slot._fallback_candidate_idx or 0)),
+            primary=slot._fallback_primary_model or "",
+        )
+        candidate = await advance_fallback_candidate(
+            client, fallback, surface="dashboard", log_suffix=f", slot={slot.key}"
+        )
+        slot._fallback_candidate_idx = fallback.pos
+        if candidate is None:
+            return None
+        if not slot._fallback_primary_model:
+            slot._fallback_primary_model = fallback.primary
+            slot._fallback_slot_model = slot.model or ""
+            slot._fallback_pick_gen = slot._model_pick_gen
+        slot._active_fallback_model = candidate
+        slot._fallback_walked.append(candidate)
+        return candidate
+
+
+async def _probe_fallback_restore_for_slot(slot: Any, client: Any) -> None:
+    """Restore a recovered primary before a genuine user turn starts."""
+    pick_lock = getattr(slot, "_model_pick_lock", None) or asyncio.Lock()
+    async with pick_lock:
+        candidate = slot._active_fallback_model
+        if not candidate:
+            return
+        primary = slot._fallback_primary_model
+        current = provider_active_model(client)
+        user_repicked = slot._model_pick_gen != slot._fallback_pick_gen
+        moved_off = current and current.strip().lower() != candidate.strip().lower()
+        if moved_off or user_repicked or not primary:
+            _clear_fallback_sticky_state(slot, client)
+            return
+        set_model = resolve_substitute_set_model(client)
+        if set_model is None:
+            return
+        try:
+            await set_model(primary)
+        except Exception as exc:
+            logger.info(
+                "model fallback: primary %s still unavailable on slot %s (%s)",
+                primary,
+                slot.key,
+                exc,
+            )
+            return
+        raw_model = provider_raw_model(client)
+        if raw_model and raw_model.strip().lower() == candidate.strip().lower():
+            logger.info(
+                "model fallback: restore to %s was a no-op on slot %s", primary, slot.key
+            )
+            return
+        if (slot.model or "") != slot._fallback_slot_model:
+            slot.model = slot._fallback_slot_model
+        _clear_fallback_sticky_state(slot, client)
+        logger.warning(
+            "model fallback: restored %s -> %s (surface=dashboard, slot=%s)",
+            candidate,
+            primary,
+            slot.key,
+        )
+
+
+def _clear_fallback_sticky_state(slot: Any, client: Any) -> None:
+    """Clear fallback state together with its provider-side marker."""
+    slot._active_fallback_model = ""
+    slot._fallback_primary_model = ""
+    slot._fallback_slot_model = ""
+    try:
+        if getattr(client, TURN_FALLBACK_ATTR, None) is not None:
+            setattr(client, TURN_FALLBACK_ATTR, None)
+    except Exception:
+        logger.debug("clearing fallback marker failed", exc_info=True)
 
 
 def _context_usage_payload(slot_key: str, client: Any) -> dict[str, Any]:
@@ -3989,6 +4085,9 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
     """
     if not slot._pending_steers:
         return
+    # Circular import: session_control imports this module at module level.
+    from kiro_crew.dashboard.session_control import containment_meta
+
     requeued = slot._pending_steers[:]
     slot._pending_steers.clear()
     for steer_msg in reversed(requeued):
@@ -4005,11 +4104,16 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         # when several queued items are merged into one — which is the only way the
         # steer's caller can tell "already persisted by the drain" from "consumed by
         # the turn" after both bookkeeping lists have emptied.
-        _meta: dict | None = None
+        _meta: dict = containment_meta(state, slot)
         _did = getattr(slot, "_steer_delivery_ids", {}).pop(steer_msg, "")
         if _did:
-            _meta = {"steer_delivery_id": _did}
-        qid = slot.queue_insert(0, steer_msg, meta=_meta)
+            _meta["steer_delivery_id"] = _did
+        qid = slot.queue_insert(
+            0,
+            steer_msg,
+            meta=_meta,
+            directive_user_origin=not bool(getattr(slot, "_app", "")),
+        )
         try:
             content, _ = redact_exfiltration_urls(steer_msg)
             content, _ = redact_credentials(content)
@@ -4178,8 +4282,54 @@ def _has_user_queued_followup(slot: "_ChatSlot") -> bool:
     return any(not _queue_entry_is_orchestration(q) for q in getattr(slot, "_queue", []))
 
 
+def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
+    """Drop queued prompts whose target containment changed after admission."""
+    if not slot._queue:
+        return
+    # Circular import: session_control imports this module at module level.
+    from kiro_crew.dashboard import session_control as session_control
+
+    now = session_control.containment_snapshot(state, slot, on_probe_failure=True)
+    mirror_unverified = bool(now.get("mirror_unverified"))
+    doomed: list[tuple[dict, list[str]]] = []
+    for queued in slot._queue:
+        if queued.get("kind") in (CRON_NOTIFICATION_KIND, SUBAGENT_COMPLETION_KIND):
+            continue
+        changed = session_control.newly_held_constraints(
+            now,
+            queued.get("meta"),
+            directive_user_origin=queued.get("_directive_user_origin") is True,
+        )
+        if changed:
+            doomed.append((queued, changed))
+
+    for queued, changed in doomed:
+        slot.queue_remove_by_id(queued["id"])
+        _remove_queued_by_id(slot.messages, queued["id"])
+        state.broadcast_ws("queue_pop", {"slot": slot.key, "content": "", "queue_id": queued["id"]})
+        slot.append(
+            "notice",
+            "⚠️ Queued message dropped: "
+            + session_control.describe_containment_change(
+                changed, mirror_unverified=mirror_unverified
+            )
+            + " after it was queued, so the authorization that admitted it no longer holds.",
+            "msg msg-info",
+        )
+        session_control.audit_queued_drop(slot, queued["id"], changed)
+        log = logger.warning if mirror_unverified and "mirrored" in changed else logger.info
+        log(
+            "Dropped queued entry %s for slot %s at drain re-validation (newly held: %s)",
+            queued["id"],
+            slot.key,
+            ",".join(changed),
+        )
+
+
 async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> bool:
     """Dequeue and start one ready Kiro turn, preserving queue semantics."""
+
+    _drop_stale_admissions(state, slot)
 
     # Above the dequeue, so a held note's visible line lands before this turn's
     # user row: its context half drains inside _run_chat via drain_pending_context.
@@ -4297,6 +4447,22 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     if next_msg is None:
         return False
 
+    # Audit successful drain-time re-validation at the only point that makes a
+    # queue entry into a turn. Cron and subagent records are trusted internal
+    # lifecycle events, not externally admitted prompts.
+    from kiro_crew.dashboard.session_control import (
+        QUEUED_CONTAINMENT_META_KEY,
+        audit_queued_allow,
+    )
+
+    revalidated_ids = [
+        item["id"]
+        for item in consumed
+        if item.get("kind") not in (CRON_NOTIFICATION_KIND, SUBAGENT_COMPLETION_KIND)
+    ]
+    if revalidated_ids:
+        audit_queued_allow(slot, revalidated_ids)
+
     is_recovery = any(is_synthetic_recovery_item(item) for item in consumed)
     is_peer_channel_request = any(is_peer_channel_request_item(item) for item in consumed)
     peer_channel_request_refs = tuple(
@@ -4317,6 +4483,9 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     synthetic_payload = any(is_synthetic_payload_item(item) for item in consumed)
     synthetic_payload = synthetic_payload or is_peer_channel_request or is_post_restart_continuation
     is_system_injection = any(is_system_injection_item(item) for item in consumed)
+    directive_user_origin = bool(consumed) and all(
+        item.get("_directive_user_origin") is True for item in consumed
+    )
     if slot._stopping and not is_system_injection:
         slot.append(
             "error",
@@ -4391,7 +4560,11 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
             _many = _item_meta.get("steer_delivery_ids")
             if isinstance(_many, list):
                 _drained_ids.extend(x for x in _many if isinstance(x, str) and x)
-            _drained_meta.update(_item_meta)
+            _drained_meta.update(
+                (key, value)
+                for key, value in _item_meta.items()
+                if key != QUEUED_CONTAINMENT_META_KEY
+            )
     if _drained_ids:
         _drained_meta.pop("steer_delivery_id", None)
         _drained_meta["steer_delivery_ids"] = _drained_ids
@@ -4465,19 +4638,39 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         # debt was already settled): dispatch this row exactly as before.
         _settleable = []
 
+    delivery_callbacks = [
+        callback for item in consumed if callable(callback := item.get("_on_consumed"))
+    ]
+    irreversible_delivery_callbacks = [
+        callback
+        for item in consumed
+        if callable(callback := item.get("_on_irreversibly_consumed"))
+    ]
+
     def _note_consumed(consumed: bool = True) -> None:
         # False is a RETRACTION: the runner re-queued this exact announce verbatim
         # (first empty response), so the delivery that counts has not happened yet.
         _consumed[0] = consumed
+        for callback in delivery_callbacks:
+            callback(consumed)
+
+    async def _note_irreversibly_consumed() -> None:
+        for callback in irreversible_delivery_callbacks:
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
 
     _run_kwargs: dict[str, Any] = {
         "_synthetic_payload": synthetic_payload,
+        "_directive_user_origin": directive_user_origin,
         "_post_restart_continuation": is_post_restart_continuation,
     }
     if peer_channel_request_refs:
         _run_kwargs["_peer_channel_request_refs"] = peer_channel_request_refs
-    if _settleable:
+    if _settleable or delivery_callbacks:
         _run_kwargs["_on_consumed"] = _note_consumed
+    if irreversible_delivery_callbacks:
+        _run_kwargs["_on_irreversibly_consumed"] = _note_irreversibly_consumed
     task = spawn_guarded_turn(
         state,
         slot,
@@ -4695,10 +4888,12 @@ async def _run_chat(
     *,
     _prompt_depth: int = 0,
     _synthetic_payload: bool = False,
+    _directive_user_origin: bool = False,
     _post_restart_continuation: bool = False,
     _peer_channel_request_refs: tuple[tuple[str, str], ...] = (),
     regenerate_hint: str = "",
     _on_consumed: "Callable[[bool], None] | None" = None,
+    _on_irreversibly_consumed: "Callable[[], Awaitable[None] | None] | None" = None,
 ) -> None:
     """Stream LLM response into *slot*.  Survives browser disconnect."""
 
@@ -4936,9 +5131,23 @@ async def _run_chat(
     # than a later report. The second empty re-queues a continuation instead, and
     # stays consumed.
     _consumed_reported = False
+    _irreversible_consumption_reported = False
 
-    def _report_consumed(consumed: bool = True) -> None:
-        nonlocal _consumed_reported
+    async def _report_consumed(consumed: bool = True, *, irreversible: bool = False) -> None:
+        nonlocal _consumed_reported, _irreversible_consumption_reported
+        if irreversible and not _irreversible_consumption_reported:
+            _irreversible_consumption_reported = True
+            if _on_irreversibly_consumed is not None:
+                try:
+                    result = _on_irreversibly_consumed()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.debug(
+                        "irreversible consumption report failed for slot %s",
+                        slot.key,
+                        exc_info=True,
+                    )
         if _on_consumed is None or _consumed_reported == consumed:
             return
         _consumed_reported = consumed
@@ -4946,6 +5155,29 @@ async def _run_chat(
             _on_consumed(consumed)
         except Exception:
             logger.debug("consumption report failed for slot %s", slot.key, exc_info=True)
+
+    def _queue_recovery(
+        index: int,
+        content: str,
+        *,
+        kind: str,
+        payload: str = "",
+    ) -> str:
+        """Requeue a recovered turn with fresh containment admission state."""
+        from kiro_crew.dashboard.session_control import containment_meta
+
+        return slot.queue_insert(
+            index,
+            content,
+            kind=kind,
+            payload=payload,
+            meta=containment_meta(state, slot),
+            on_consumed=_on_consumed if not _consumed_reported else None,
+            on_irreversibly_consumed=(
+                _on_irreversibly_consumed if not _irreversible_consumption_reported else None
+            ),
+            directive_user_origin=_directive_user_origin,
+        )
 
     # Model-activity marker for the poisoned-conversation streak ONLY:
     # flipped True on thinking chunks. Deliberately separate from
@@ -6005,6 +6237,13 @@ async def _run_chat(
                 },
             )
 
+        if (
+            slot._active_fallback_model
+            and slot._fallback_candidate_idx == 0
+            and message not in _SYNTHETIC_RECOVERY_MSGS
+        ):
+            await _probe_fallback_restore_for_slot(slot, client)
+
         event_stream = client.stream_command(message) if is_slash else client.stream(full_message)
         state.broadcast_ws("chat_status", {"slot": slot.key, "status": "Thinking…"})
         state.broadcast_ws(
@@ -6155,7 +6394,7 @@ async def _run_chat(
                 if _orch_planning:
                     _orch_plan_buf += safe_chunk
                 _turn_emitted = True  # tokens delivered — transient retry now unsafe
-                _report_consumed()
+                await _report_consumed(irreversible=True)
                 # Stream to the wire through the rolling buffer so a credential
                 # split across token boundaries can't cross a broadcast boundary
                 # unredacted. Only the confirmed-safe prefix is emitted;
@@ -6209,7 +6448,7 @@ async def _run_chat(
                     assistant_text = ""
                 in_tool_group = True
                 _turn_emitted = True  # tool side effect — transient retry now unsafe
-                _report_consumed()
+                await _report_consumed(irreversible=True)
                 # Broadcast for real-time visibility and persist
                 _tool_payload = _tool_call_ws_payload(event)
                 _tool_payload["slot"] = slot.key
@@ -7758,7 +7997,7 @@ async def _run_chat(
                 # through the token/tool triggers, and the cost of being wrong here
                 # is asymmetric (a duplicate re-announce versus a pruned result).
                 if event.stop_reason == STOP_REASON_END_TURN:
-                    _report_consumed()
+                    await _report_consumed()
                 # Hang-attribution snapshot BEFORE the close-all safety net
                 # below force-marks every card done: only children still
                 # unfinished at the cut may count toward timeout attribution
@@ -7926,7 +8165,7 @@ async def _run_chat(
 
             if _prompt_depth == 0 and slot._stale_recovery_retries < 3:
                 slot._stale_recovery_retries += 1
-                slot.queue_insert(
+                _queue_recovery(
                     0,
                     f"{STALE_RECOVERY_PREFIX}\n{build_stale_recovery_prompt()}",
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -7984,7 +8223,7 @@ async def _run_chat(
                     command=_stall_command,
                     stuck_input=_stuck,
                 )
-                slot.queue_insert(
+                _queue_recovery(
                     0,
                     f"{TOOL_STALL_RECOVERY_PREFIX}\n{_body}",
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -8027,7 +8266,7 @@ async def _run_chat(
                     cause=ResetCause.CONNECTION_LOST,
                     message_is_synthetic=_is_synthetic,
                 )
-                slot.queue_insert(
+                _queue_recovery(
                     0,
                     _requeue_text,
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -8232,7 +8471,10 @@ async def _run_chat(
                 # streaming turn ends (so it never surfaces). Only the second
                 # consecutive empty surfaces a persisted notice card below.
                 slot._empty_response_retries += 1
-                slot.queue_insert(
+                # This message is going out again unchanged, so the recovery
+                # entry must inherit an unsettled producer callback.
+                await _report_consumed(False)
+                _queue_recovery(
                     0,
                     message,
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -8241,12 +8483,6 @@ async def _run_chat(
                     payload=payload_for_replay(_is_synthetic),
                 )
                 _retrying_empty = True
-                # This message is going out again unchanged, so whoever armed the
-                # turn must not treat it as delivered: a queued sub-agent
-                # completion's retention clock has to wait for the replay that
-                # actually lands (issue #4839). Retracts the turn-complete report
-                # made while streaming, when the empty text was not yet known.
-                _report_consumed(False)
             elif (
                 _prompt_depth == 0
                 and slot._empty_response_retries < 2
@@ -8268,7 +8504,7 @@ async def _run_chat(
                     "ℹ️ The model returned nothing twice — auto-continuing once.",
                     "msg msg-info",
                 )
-                slot.queue_insert(
+                _queue_recovery(
                     0,
                     _EMPTY_AUTO_CONTINUE_MSG,
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -8413,7 +8649,7 @@ async def _run_chat(
                     "auto-continuing once.",
                     "msg msg-info",
                 )
-                slot.queue_insert(
+                _queue_recovery(
                     0,
                     _PROMISE_ONLY_CONTINUE_MSG,
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -8517,6 +8753,8 @@ async def _run_chat(
             slot._stale_recovery_exhausted_emitted = False
             slot._tool_stall_exhausted_emitted = False
             slot._transient_5xx_retries = 0
+            slot._fallback_candidate_idx = 0
+            slot._fallback_walked = []
             # Reset the promise-only one-shot on a LANDED turn so the guard re-arms
             # per user turn (matching state.py's contract and the sibling budgets).
             # Without this a single false positive would disarm it for the slot's
@@ -8666,7 +8904,7 @@ async def _run_chat(
             # queue_insert(0, …) prepends, so insert in reverse to keep several
             # hooks' instructions in firing order.
             for _reason in reversed(_hook_reasons[:_room]):
-                slot.queue_insert(
+                _queue_recovery(
                     0,
                     f"{HOOK_CONTINUATION_RECOVERY_PREFIX}\n{_reason}",
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -8713,7 +8951,7 @@ async def _run_chat(
         ):
             _recovery_body = build_refusal_recovery_prompt(_refusal_reasons)
             if _recovery_body:
-                slot.queue_insert(
+                _queue_recovery(
                     0,
                     f"{REFUSAL_RECOVERY_PREFIX}\n{_recovery_body}",
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -8862,7 +9100,7 @@ async def _run_chat(
                 cause=ResetCause.CONNECTION_LOST,
                 message_is_synthetic=_is_synthetic,
             )
-            slot.queue_insert(
+            _queue_recovery(
                 0,
                 _requeue_text,
                 kind=SYNTHETIC_RECOVERY_KIND,
@@ -8899,7 +9137,7 @@ async def _run_chat(
                 cause=ResetCause.SESSION_BUSY,
                 message_is_synthetic=_is_synthetic,
             )
-            slot.queue_insert(
+            _queue_recovery(
                 0,
                 _requeue_text,
                 kind=SYNTHETIC_RECOVERY_KIND,
@@ -8951,7 +9189,7 @@ async def _run_chat(
                 "Rebuilding the local-model context and retrying…",
                 "msg msg-err",
             )
-            slot.queue_insert(
+            _queue_recovery(
                 0,
                 f"{_CONTEXT_WINDOW_RECOVERY_PREFIX}\n"
                 "The previous native session was discarded because it exceeded "
@@ -9046,7 +9284,7 @@ async def _run_chat(
                     ),
                     message_is_synthetic=_is_synthetic,
                 )
-                slot.queue_insert(
+                _queue_recovery(
                     0,
                     _requeue_text,
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -9106,7 +9344,7 @@ async def _run_chat(
                 # session (no reset), preserving conversation state.
                 slot.append("error", "⟳ Backend hiccup — retrying…", "msg msg-err")
                 await asyncio.sleep(_delay)
-                slot.queue_insert(
+                _queue_recovery(
                     0,
                     message,
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -9118,6 +9356,42 @@ async def _run_chat(
                 # depth>0 (nested turn): don't re-queue — surface a clean
                 # transient status; the live session stays resumable.
                 slot.append("error", "⟳ Backend hiccup — please retry.", "msg msg-err")
+        elif (
+            not _turn_emitted
+            and acp_error_is_transient(exc)
+            and slot._transient_5xx_retries >= TRANSIENT_RETRIES
+            and _prompt_depth == 0
+            and not _should_suppress_requeue(slot)
+            and (_fallback_model := await _fallback_swap_for_turn(slot, client)) is not None
+        ):
+            slot.purge_chunks()
+            primary, _ = redact_exfiltration_urls(
+                slot._fallback_primary_model or "the selected model"
+            )
+            primary, _ = redact_credentials(primary)
+            candidate, _ = redact_exfiltration_urls(_fallback_model)
+            candidate, _ = redact_credentials(candidate)
+            slot.append(
+                "notice",
+                f"⚠️ {primary} is throttled — running on {candidate} until {primary} recovers.",
+                "msg msg-info",
+            )
+            slot._transient_5xx_retries = TRANSIENT_RETRIES - 1
+            await asyncio.sleep(transient_retry_delay(1))
+            if (
+                _should_suppress_requeue(slot)
+                or getattr(slot, "_stop_generation", 0) != _stop_gen_turn_start
+            ):
+                slot._transient_5xx_retries = 0
+                slot._fallback_candidate_idx = 0
+                slot._fallback_walked = []
+            else:
+                _queue_recovery(
+                    0,
+                    message,
+                    kind=SYNTHETIC_RECOVERY_KIND,
+                    payload=payload_for_replay(_is_synthetic),
+                )
         elif _turn_emitted and acp_error_is_transient(exc) and not slot._posttoken_retry_used:
             # Post-token transient 5xx: assistant tokens and/or tool calls
             # already streamed this turn (_turn_emitted). Rather than fail-fast,
@@ -9196,7 +9470,7 @@ async def _run_chat(
                 # allowance HERE — only a real enqueue burns it.
                 await asyncio.sleep(_delay)
                 slot._posttoken_retry_used = True
-                slot.queue_insert(
+                _queue_recovery(
                     0,
                     _POSTTOKEN_RECOVER_MSG,
                     kind=SYNTHETIC_RECOVERY_KIND,
@@ -9372,12 +9646,20 @@ async def _run_chat(
                     "context from them)…",
                     "msg msg-err",
                 )
-                slot.queue_insert(0, message, kind=SYNTHETIC_RECOVERY_KIND)
+                _queue_recovery(0, message, kind=SYNTHETIC_RECOVERY_KIND)
                 # Fresh conversation ⇒ fresh ladder for the recovery cycle.
                 slot._transient_5xx_retries = 0
             else:
                 _err_text, _ = redact_exfiltration_urls(str(exc))
                 _err_text, _ = redact_credentials(_err_text)
+                if slot._fallback_walked:
+                    fallback_story = (
+                        f"{slot._fallback_primary_model or 'The selected model'} throttled; "
+                        f"fallbacks {', '.join(slot._fallback_walked)} also unavailable. "
+                    )
+                    fallback_story, _ = redact_exfiltration_urls(fallback_story)
+                    fallback_story, _ = redact_credentials(fallback_story)
+                    _err_text = fallback_story + _err_text
                 slot.append(
                     "error",
                     f"⏱️ {_err_text}" if "timed out" in _msg else f"❌ {_err_text}",
@@ -9398,6 +9680,8 @@ async def _run_chat(
                 # TRANSIENT_RETRIES. (_posttoken_retry_used needs no counterpart
                 # here: it is already refreshed at genuine-turn start.)
                 slot._transient_5xx_retries = 0
+                slot._fallback_candidate_idx = 0
+                slot._fallback_walked = []
     except _AppAgentNotLoaded as exc:
         # An app-owned slot whose agent never materialized, even after the
         # self-heal warm. Deliberately terminal: running the default agent here is

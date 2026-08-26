@@ -2357,7 +2357,7 @@ async def stop_slot_turn(
     """
     name = slot.key
     cancel_key = cancel_key or _cancel_target(slot)
-    task_at_stop = slot.task
+    task_at_stop = getattr(slot, "task", None)
 
     # Escalation path: a second stop press while a cooperative cancel is
     # already pending hard-kills. We escalate on ANY second press — not only

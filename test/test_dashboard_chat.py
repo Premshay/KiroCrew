@@ -5164,7 +5164,7 @@ class TestRunChatNativeSubagentAttribution:
         timeline = slot.session_timeline_payload()
         assert [entry["text"] for entry in timeline] == [
             "Session resumed.",
-            "TODO progress: 1 of 2 complete.",
+            "Completed: first.",
         ]
         assert all("ordinary assistant response" not in entry["text"] for entry in timeline)
         assert all("user request" not in entry["text"] for entry in timeline)

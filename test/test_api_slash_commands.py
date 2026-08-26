@@ -162,7 +162,7 @@ class TestAdvertisedCommands:
         """kiro-cli advertises too, but its list would restore blocked commands."""
         provider = _fake_provider([{"name": "design", "description": "d"}])
         payload = await _get("acp", state=_fake_state([provider]), claude_providers=())
-        assert {item["name"] for item in payload} == set(_SLASH_COMMANDS)
+        assert {item["name"] for item in payload} == set(_SLASH_COMMANDS - _BLOCKED_SLASH_COMMANDS)
 
     @pytest.mark.asyncio
     async def test_slot_query_picks_that_slots_backend(self):
@@ -206,7 +206,7 @@ class TestAdvertisedCommands:
     @pytest.mark.asyncio
     async def test_no_live_session_falls_back_to_the_static_set(self):
         payload = await _get("acp", state=_fake_state([]), claude_providers=())
-        assert {item["name"] for item in payload} == set(_SLASH_COMMANDS)
+        assert {item["name"] for item in payload} == set(_SLASH_COMMANDS - _BLOCKED_SLASH_COMMANDS)
 
     @pytest.mark.asyncio
     async def test_claude_code_provider_still_answers_before_any_handshake(self):

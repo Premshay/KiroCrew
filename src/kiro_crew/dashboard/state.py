@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Coroutine, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, TypeVar
 
 from aiohttp import web
 
@@ -96,6 +96,13 @@ if TYPE_CHECKING:
     from kiro_crew.slack.outbound import PostedOptions  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+#: The single ceiling on live slots, owned by the module that owns the slot
+#: table (see :meth:`DashboardState.live_slot_count`). Every path that allocates
+#: a slot -- session create, chat fork, session import -- tests ``live_slot_count()``
+#: against this one number, so raising the ceiling is a single edit and no entry
+#: point can silently drift to a different limit.
+MAX_LIVE_SLOTS = 500
 
 #: Return type of a mutate_folders callback.
 _T = TypeVar("_T")
@@ -1536,7 +1543,8 @@ class _ChatSlot:
         "created_at",
         "messages",
         "total_messages",
-        "task",
+        "_task",
+        "_turn_generation",
         "event",
         "_pending",
         "_pending_consumers",
@@ -1610,6 +1618,13 @@ class _ChatSlot:
         "_tool_stall_retries",
         "_tool_stall_exhausted_emitted",
         "_transient_5xx_retries",
+        "_fallback_candidate_idx",
+        "_fallback_walked",
+        "_active_fallback_model",
+        "_fallback_primary_model",
+        "_fallback_slot_model",
+        "_model_pick_gen",
+        "_fallback_pick_gen",
         "_posttoken_retry_used",
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
@@ -1637,6 +1652,7 @@ class _ChatSlot:
         "_lock",
         "forked_from",
         "_fork_lock",
+        "_model_pick_lock",
         "_tab_id",
         "_channel_window_mtime",
         "_disk_older_count",
@@ -1693,7 +1709,8 @@ class _ChatSlot:
         self._source_links_revision = 0
         self._source_links_cache: tuple[tuple[int, int], list[dict]] | None = None
         self.total_messages: int = 0  # lifetime count (survives trimming)
-        self.task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._task: asyncio.Task[Any] | None = None
+        self._turn_generation: int = 0
         self.event = asyncio.Event()
         self._pending: list[dict[str, str]] = []
         # Number of readers currently treating ``_pending`` as their delivery
@@ -1934,6 +1951,17 @@ class _ChatSlot:
         # ConnectionReset) retries on the interactive stream path. Distinct
         # budget from prompt-busy / pipe-death; reset on a completed turn.
         self._transient_5xx_retries: int = 0
+        # The fallback walk resets with the retry budgets. The selected fallback
+        # itself is sticky until a later start-of-turn probe can restore primary.
+        self._fallback_candidate_idx: int = 0
+        self._fallback_walked: list[str] = []
+        self._active_fallback_model: str = ""
+        self._fallback_primary_model: str = ""
+        self._fallback_slot_model: str = ""
+        # Only explicit model selections advance this generation. Automatic
+        # provider backfill must not be mistaken for a user model selection.
+        self._model_pick_gen: int = 0
+        self._fallback_pick_gen: int = 0
         # One-shot guard for the post-token (text-only) transient retry: a turn
         # that has already streamed answer tokens may be re-prompted at most
         # ONCE on a transient 5xx (and only when no tool call fired). Reset on a
@@ -2028,6 +2056,7 @@ class _ChatSlot:
         self._lock = asyncio.Lock()
         self.forked_from: str | None = None  # parent slot key if this is a fork
         self._fork_lock: asyncio.Lock = asyncio.Lock()  # serialises concurrent forks on this slot
+        self._model_pick_lock: asyncio.Lock = asyncio.Lock()
         self._tab_id: str = ""  # permanent tab identity for cross-restart session chaining
         # Transcript mtime the in-memory window was last brought up to date
         # against. Only meaningful for a slot bound to a channel session, whose
@@ -3152,6 +3181,7 @@ class _ChatSlot:
         kind: str = "",
         meta: dict | None = None,
         *,
+        directive_user_origin: bool = False,
         peer_channel_id: str = "",
         peer_message_id: str = "",
     ) -> str:
@@ -3174,6 +3204,8 @@ class _ChatSlot:
         item: dict[str, Any] = {"id": qid, "content": content, "kind": kind}
         if meta:
             item["meta"] = meta
+        if directive_user_origin:
+            item["_directive_user_origin"] = True
         if peer_channel_id and peer_message_id:
             item["peer_channel_id"] = peer_channel_id
             item["peer_message_id"] = peer_message_id
@@ -3204,6 +3236,9 @@ class _ChatSlot:
         payload: str = "",
         meta: dict | None = None,
         *,
+        on_consumed: Callable[[bool], None] | None = None,
+        on_irreversibly_consumed: Callable[[], Awaitable[None] | None] | None = None,
+        directive_user_origin: bool = False,
         peer_channel_id: str = "",
         peer_message_id: str = "",
     ) -> str:
@@ -3218,6 +3253,12 @@ class _ChatSlot:
         entry: dict[str, Any] = {"id": qid, "content": content, "kind": kind, "payload": payload}
         if meta:
             entry["meta"] = dict(meta)
+        if on_consumed is not None:
+            entry["_on_consumed"] = on_consumed
+        if on_irreversibly_consumed is not None:
+            entry["_on_irreversibly_consumed"] = on_irreversibly_consumed
+        if directive_user_origin:
+            entry["_directive_user_origin"] = True
         if peer_channel_id and peer_message_id:
             entry["peer_channel_id"] = peer_channel_id
             entry["peer_message_id"] = peer_message_id
@@ -3323,6 +3364,16 @@ class _ChatSlot:
         return False
 
     @property
+    def task(self) -> asyncio.Task[Any] | None:
+        return self._task
+
+    @task.setter
+    def task(self, value: asyncio.Task[Any] | None) -> None:
+        if value is not None and value is not self._task:
+            self._turn_generation += 1
+        self._task = value
+
+    @property
     def running(self) -> bool:
         return self.task is not None and not self.task.done()
 
@@ -3393,7 +3444,10 @@ class _ChatSlot:
         ``running == False`` within a single loop iteration.
         """
         if self.running:
-            self.queue_append(prompt)
+            # Circular import: session_control imports this module at module level.
+            from kiro_crew.dashboard.session_control import containment_meta
+
+            self.queue_append(prompt, meta=containment_meta(state, self))
             return False
         self.append("user", prompt, "msg msg-u")
         task = asyncio.create_task(run_chat_coro(state, self, prompt))
