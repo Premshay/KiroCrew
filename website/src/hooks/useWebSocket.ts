@@ -1783,10 +1783,14 @@ export function useWebSocket() {
       sendFocus(active)
     })
     const onVisibility = () => {
-      // Hidden → blur (cancels a pending prefetch server-side); visible →
-      // re-announce the active slot even if unchanged, since the server may
-      // have expired the previous prefetch while the tab was away.
-      sendFocus(document.hidden ? null : store.getState().chat.activeSlot)
+      if (document.hidden) {
+        // Blur cancels a pending prefetch server-side while the tab is away.
+        sendFocus(null)
+        return
+      }
+      // Backgrounded browsers can retain an OPEN socket after its transport no
+      // longer delivers frames; reconnecting is what reconciles missed turns.
+      forceReconnect()
     }
     document.addEventListener('visibilitychange', onVisibility)
     return () => {
@@ -1806,7 +1810,7 @@ export function useWebSocket() {
       unsubFocus()
       sendSlotFocusedImpl = () => {}
     }
-  }, [connect, playVoiceUrl, stopVoice, flushSlotActivity])
+  }, [connect, forceReconnect, playVoiceUrl, stopVoice, flushSlotActivity])
 
   /** Subscribe to log events — call with callback on mount, null on unmount. */
   const subscribeLogs = useCallback((cb: LogCallback) => {
