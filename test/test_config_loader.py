@@ -2675,6 +2675,7 @@ class TestDynamicSubagentSizingFields:
         assert a.subagent_cost_gb == 0.5
         assert a.subagent_cpu_cost_cores == 1.0
         assert a.subagent_auto_max == 32
+        assert a.subagent_max_per_parent == 0
         assert a.subagent_spawn_stagger_secs == 2.0
 
     def test_explicit_values_load(self) -> None:
@@ -2686,6 +2687,7 @@ class TestDynamicSubagentSizingFields:
                     "subagent_cost_gb": 0.4,
                     "subagent_cpu_cost_cores": 0.8,
                     "subagent_auto_max": 24,
+                    "subagent_max_per_parent": 1,
                     "subagent_spawn_stagger_secs": 1.5,
                 }
             }
@@ -2696,6 +2698,7 @@ class TestDynamicSubagentSizingFields:
         assert a.subagent_cost_gb == 0.4
         assert a.subagent_cpu_cost_cores == 0.8
         assert a.subagent_auto_max == 24
+        assert a.subagent_max_per_parent == 1
         assert a.subagent_spawn_stagger_secs == 1.5
 
     def test_to_dict_round_trip(self) -> None:
@@ -2707,6 +2710,7 @@ class TestDynamicSubagentSizingFields:
                     "subagent_cost_gb": 0.6,
                     "subagent_cpu_cost_cores": 0.9,
                     "subagent_auto_max": 12,
+                    "subagent_max_per_parent": 1,
                     "subagent_spawn_stagger_secs": 3.0,
                 }
             }
@@ -2717,6 +2721,7 @@ class TestDynamicSubagentSizingFields:
             "subagent_cost_gb",
             "subagent_cpu_cost_cores",
             "subagent_auto_max",
+            "subagent_max_per_parent",
             "subagent_spawn_stagger_secs",
         ):
             assert key in agent_dict, f"{key} missing from to_dict()"
@@ -2729,6 +2734,7 @@ class TestDynamicSubagentSizingFields:
         assert a.subagent_cost_gb == 0.6
         assert a.subagent_cpu_cost_cores == 0.9
         assert a.subagent_auto_max == 12
+        assert a.subagent_max_per_parent == 1
         assert a.subagent_spawn_stagger_secs == 3.0
 
 

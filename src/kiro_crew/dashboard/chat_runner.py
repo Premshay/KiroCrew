@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable
 from kiro_crew import mcp_apps_render, model_registry, session_directive
 from kiro_crew.acp.client import (
     AcpAuthRequired,
+    AcpConversationPayloadExceeded,
     AcpContextWindowExceeded,
     AcpError,
     AcpProcessDied,
@@ -9165,7 +9166,13 @@ async def _run_chat(
         # oversized conversation, so clear it and let the next acquire use the
         # bounded KiroCrew replay path instead. One marked retry preserves the
         # original request without allowing an unbounded recovery loop.
-        logger.warning("Context window exceeded in slot %s: %s", slot.key, exc)
+        payload_limit = isinstance(exc, AcpConversationPayloadExceeded)
+        logger.warning(
+            "%s exceeded in slot %s: %s",
+            "Native attachment payload limit" if payload_limit else "Context window",
+            slot.key,
+            exc,
+        )
         needs_session_reset = True
         needs_conversation_discard = True
         if assistant_text:
@@ -9173,37 +9180,57 @@ async def _run_chat(
             _safe, _ = redact_credentials(_safe)
             slot.messages = [m for m in slot.messages if m.get("role") != "chunk"]
             slot.append("assistant", _safe, "msg msg-a")
+        recovery_label = (
+            "The provider attachment limit was reached. The session was rebuilt; please retry."
+            if payload_limit
+            else "The local model context is full. The session was rebuilt; please retry."
+        )
         if _should_suppress_requeue(slot):
             slot.append(
                 "error",
-                "The local model context is full. The session was rebuilt; please retry.",
+                recovery_label,
                 "msg msg-err",
             )
         elif _prompt_depth != 0:
             slot.append(
                 "error",
-                "The local model context is full. The session was rebuilt; please retry.",
+                recovery_label,
                 "msg msg-err",
             )
         elif _context_window_recovery:
             slot.append(
                 "error",
-                "The rebuilt local-model context still does not fit this request. "
-                "Shorten the request or reduce the tool output, then retry.",
+                (
+                    "The rebuilt provider conversation still exceeds its attachment limit. "
+                    "Remove older attachments, then retry."
+                    if payload_limit
+                    else "The rebuilt local-model context still does not fit this request. "
+                    "Shorten the request or reduce the tool output, then retry."
+                ),
                 "msg msg-err",
             )
         else:
             slot.append(
                 "error",
-                "Rebuilding the local-model context and retrying…",
+                (
+                    "Rebuilding the provider conversation without retained attachments and retrying…"
+                    if payload_limit
+                    else "Rebuilding the local-model context and retrying…"
+                ),
                 "msg msg-err",
+            )
+            native_rebuild_reason = (
+                "The previous native session was discarded because its retained attachments "
+                "exceeded the provider request limit."
+                if payload_limit
+                else "The previous native session was discarded because it exceeded "
+                "the model context window."
             )
             _queue_recovery(
                 0,
                 f"{_CONTEXT_WINDOW_RECOVERY_PREFIX}\n"
-                "The previous native session was discarded because it exceeded "
-                "the model context window. Treat the following as the user's "
-                f"original request and answer it normally:\n\n{message}",
+                f"{native_rebuild_reason} Treat the following as the user's original request "
+                f"and answer it normally:\n\n{message}",
                 kind=SYNTHETIC_RECOVERY_KIND,
             )
     except AcpError as exc:

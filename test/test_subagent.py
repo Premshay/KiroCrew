@@ -234,6 +234,25 @@ class TestSpawnWithoutApprovalCallback:
         assert manager.has_pending_work_for("cron:j1") is True
         assert manager.queued_count_for("cron:other") == 0
 
+    @pytest.mark.asyncio
+    async def test_per_parent_limit_queues_only_the_second_child(self) -> None:
+        approval_callback = AsyncMock(return_value=True)
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=3,
+            on_spawn_approval=approval_callback,
+        )
+        manager._max_per_parent = 1
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            first = manager.spawn("task one", parent_session_key="dashboard:parent")
+            second = manager.spawn("task two", parent_session_key="dashboard:parent")
+
+        assert first is not None and first.queued is False
+        assert second is not None and second.queued is True
+        assert manager.queued_count_for("dashboard:parent") == 1
+
 
 class TestSpawnWithApprovalCallback:
     """When on_spawn_approval is set, spawns are gated behind approval."""

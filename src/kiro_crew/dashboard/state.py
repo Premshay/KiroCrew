@@ -3941,6 +3941,11 @@ class DashboardState:
         # entry path is protected, including task/workflow continuations.
         self.kiro_prerequisite_service: Any = None
         self.subagents = subagents
+        if self.subagents is not None:
+            try:
+                self.sessions.set_idle_expiry_guard(self.subagents.has_pending_work_for)
+            except AttributeError:
+                pass
         # Crew Mode control plane; attached by the gateway after
         # SubagentManager construction (None = crew mode unavailable).
         self.crew: Any = None
