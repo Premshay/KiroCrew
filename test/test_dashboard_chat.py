@@ -13260,6 +13260,45 @@ class TestStopTurnSlotState:
         assert slot.task.cancelled()
 
     @pytest.mark.asyncio
+    async def test_stop_turn_idle_cancels_orphaned_task(self, tmp_path, monkeypatch):
+        """An idle provider result cannot leave the dashboard turn running."""
+        state = self._make_state(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        slot.task = asyncio.ensure_future(asyncio.sleep(999))
+        state.sessions.stop_turn = AsyncMock(return_value="idle")
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/api/chat/slots/s1/stop")
+            assert response.status == 200
+
+        assert slot._stop_state == "idle"
+        assert slot.task.cancelled()
+        assert not slot.running
+
+    @pytest.mark.asyncio
+    async def test_interrupt_idle_cancels_orphaned_task(self, tmp_path, monkeypatch):
+        """Interrupt also settles a task after the provider reports no turn."""
+        from kiro_crew.dashboard.chat_handlers import api_chat_slot_interrupt
+
+        state = self._make_state(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        slot.task = asyncio.ensure_future(asyncio.sleep(999))
+        slot.queue_append("next prompt")
+        state.sessions.stop_turn = AsyncMock(return_value="idle")
+
+        app = web.Application()
+        app["state"] = state
+        app.router.add_post("/api/chat/slots/{slot}/interrupt", api_chat_slot_interrupt)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/api/chat/slots/s1/interrupt")
+            assert response.status == 200
+
+        assert slot._stop_state == "idle"
+        assert slot.task.cancelled()
+        assert not slot.running
+
+    @pytest.mark.asyncio
     async def test_stop_turn_force_query_param(self, tmp_path, monkeypatch):
         """POST stop?force=true when soft_pending → skips cancel, hard kill."""
         state = self._make_state(tmp_path, monkeypatch)

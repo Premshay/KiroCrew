@@ -2238,6 +2238,19 @@ def _make_stop_resolver(
     return _resolve
 
 
+async def _cancel_terminal_stop_task(task_at_stop: asyncio.Task[Any] | None) -> None:
+    """Settle the runner after its provider can no longer end the turn itself."""
+    if task_at_stop is None or task_at_stop is asyncio.current_task() or task_at_stop.done():
+        return
+    task_at_stop.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task_at_stop), timeout=2.0)
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
+        logger.warning("Stopped turn task did not settle within 2 seconds; inspect the slot")
+
+
 def _slot_not_found() -> web.Response:
     """The one 404 every cancel-route refusal returns.
 
@@ -2500,20 +2513,15 @@ async def stop_slot_turn(
         on_soft=_on_soft,
         on_hard=_on_hard,
     )
-    # A hard provider reset cannot make the runner's awaited stream return by
-    # itself. Cancel the task that owned the stopped turn so its finally block
-    # clears ``slot.running``; do not cancel a later task that may have claimed
-    # the slot while this request awaited the provider stop.
-    if outcome == "hard" and task_at_stop is not None and task_at_stop is not asyncio.current_task():
-        if not task_at_stop.done():
-            task_at_stop.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(task_at_stop), timeout=2.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
+    # A hard reset or missing provider cannot make the runner's awaited stream
+    # return. Settle the captured task, not a newer task that may have claimed
+    # this slot while the provider stop was in flight.
+    if outcome in {"hard", "idle"}:
+        await _cancel_terminal_stop_task(task_at_stop)
     # Resolve orphaned card when provider reports no active turn
-    if outcome == "idle" and slot._stop_event_id:
-        _resolve_stop_event(slot, "soft")
+    if outcome == "idle":
+        if slot._stop_event_id:
+            _resolve_stop_event(slot, "soft")
         slot._stop_state = "idle"
         state.push_slots_update()
     sel().log_tool_invocation(
@@ -2865,6 +2873,7 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "info": "stop already in progress"})
     if not slot._queue:
         return web.json_response({"error": "queue empty, use /stop instead"}, status=400)
+    task_at_stop = slot.task
 
     # Claim the stop slot synchronously BEFORE the await below: the
     # idempotency guard above is check-then-act, and a concurrent /interrupt
@@ -2928,9 +2937,12 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
         on_soft=_on_soft,
         on_hard=_on_hard,
     )
+    if outcome in {"hard", "idle"}:
+        await _cancel_terminal_stop_task(task_at_stop)
     # Resolve orphaned card when provider reports no active turn
-    if outcome == "idle" and slot._stop_event_id:
-        _resolve_stop_event(slot, "soft")
+    if outcome == "idle":
+        if slot._stop_event_id:
+            _resolve_stop_event(slot, "soft")
         slot._stop_state = "idle"
         state.push_slots_update()
     sel().log_tool_invocation(
