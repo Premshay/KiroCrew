@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { renderHook, act } from '@testing-library/react'
+import { renderHook, act, waitFor } from '@testing-library/react'
 import { createElement } from 'react'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { api } from '../api/client'
-import chatReducer, { PANE_HYDRATE_LIMIT, sseSubagentSpawn, sseSubagentPending, sseSubagentDone } from '../store/chatSlice'
-import type { RootState } from '../store'
+import chatReducer, { PANE_HYDRATE_LIMIT, setActiveSlot, sseChatMessage, sseSubagentSpawn, sseSubagentPending, sseSubagentDone } from '../store/chatSlice'
+import { store, type RootState } from '../store'
 
 // Track markSlotUnread dispatches
 const markSlotUnreadCalls: string[] = []
@@ -261,6 +261,64 @@ describe('useWebSocket reconnect unread suppression', () => {
     expect(markSlotUnreadCalls).toContain('chat-other')
 
     unmount()
+  })
+
+  it('reconnects and refreshes a partial active turn when the tab becomes visible', async () => {
+    vi.useFakeTimers()
+    let hidden = false
+    const hiddenSpy = vi.spyOn(document, 'hidden', 'get').mockImplementation(() => hidden)
+    try {
+      testStore = createTestStore({
+        chat: { ...chatReducer(undefined, { type: '@@INIT' }), activeSlot: 'chat-active' },
+      })
+      testStore.dispatch(sseChatMessage({
+        slot: 'chat-active', role: 'chunk', content: 'partial response', batched: true,
+      }))
+      // The hook reads the active key from the production singleton before it
+      // dispatches to the Provider store, so align both stores for this seam.
+      store.dispatch(setActiveSlot('chat-active'))
+      ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockResolvedValue({
+        messages: [{ role: 'assistant', content: 'complete response', ts: '1' }],
+        running: false,
+        has_more: false,
+        total: 1,
+        queue: [],
+      })
+
+      const { unmount } = renderHook(() => useWebSocket(), { wrapper })
+      const ws1 = WS_INSTANCES[0]
+      act(() => { ws1.simulateOpen() })
+
+      hidden = true
+      act(() => { document.dispatchEvent(new Event('visibilitychange')) })
+      expect(ws1.close).not.toHaveBeenCalled()
+
+      hidden = false
+      act(() => { document.dispatchEvent(new Event('visibilitychange')) })
+      expect(ws1.close).toHaveBeenCalledTimes(1)
+
+      act(() => { vi.advanceTimersByTime(0) })
+      const ws2 = WS_INSTANCES[1]
+      expect(ws2).toBeDefined()
+      await act(async () => {
+        ws2.simulateOpen()
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+
+      vi.useRealTimers()
+      await waitFor(() => {
+        expect(api.chatSlotDetail).toHaveBeenCalledWith('chat-active')
+        expect(testStore.getState().chat.messages).toEqual([
+          expect.objectContaining({ role: 'assistant', content: 'complete response' }),
+        ])
+      })
+      unmount()
+    } finally {
+      store.dispatch(setActiveSlot(null))
+      hiddenSpy.mockRestore()
+      vi.useRealTimers()
+    }
   })
 })
 
