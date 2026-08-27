@@ -1071,6 +1071,7 @@ class SessionManager:
         self._active_dashboard_slots: set[str] | None = (
             None  # None = uninitialized; empty set = all tabs closed
         )
+        self._idle_expiry_guard: Callable[[str], bool] | None = None
 
         # ── Warm Pool ──
         self._pool_size: int = min(_MAX_POOL, max(0, cfg.session.pool_size))
@@ -5975,6 +5976,10 @@ class SessionManager:
         """
         self._active_dashboard_slots = set(slot_keys)
 
+    def set_idle_expiry_guard(self, guard: Callable[[str], bool] | None) -> None:
+        """Install the dashboard's non-turn liveness guard for idle expiry."""
+        self._idle_expiry_guard = guard
+
     async def _expire_idle(self, timeout_secs: int) -> None:
         now = time.monotonic()
         expired: list[tuple[str, bool]] = []  # (key, is_orphan)
@@ -5997,6 +6002,17 @@ class SessionManager:
                 if sess.semaphore.locked():
                     continue
                 idle = now - sess.last_used > timeout_secs
+                if idle and self._idle_expiry_guard is not None:
+                    try:
+                        if self._idle_expiry_guard(key):
+                            continue
+                    except Exception:
+                        logger.warning(
+                            "Idle expiry guard failed for %s; preserving session",
+                            key,
+                            exc_info=True,
+                        )
+                        continue
                 orphaned = (
                     key.startswith("dashboard:")
                     and self._active_dashboard_slots is not None

@@ -1129,6 +1129,21 @@ class TestAgentSettingsPut:
             assert "subagent_auto_max must be an integer" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
+    async def test_per_parent_subagent_limit_persists_and_requires_restart(
+        self, seeded_config, fake_sel
+    ) -> None:
+        async with TestClient(TestServer(_agent_cfg_app())) as client:
+            resp = await _put_agent(client, {"subagent_max_per_parent": 1})
+            assert resp.status == 200
+            assert (await resp.json())["restart_required"] is True
+        assert (
+            json.loads(seeded_config.read_text(encoding="utf-8"))["agent"][
+                "subagent_max_per_parent"
+            ]
+            == 1
+        )
+
+    @pytest.mark.asyncio
     async def test_same_request_ceiling_raise_cannot_widen_the_pin(
         self, seeded_config, fake_sel
     ) -> None:

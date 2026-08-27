@@ -34,7 +34,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kiro_crew.acp.client import AcpContextWindowExceeded, AcpError, AcpPromptBusy
+from kiro_crew.acp.client import (
+    AcpContextWindowExceeded,
+    AcpConversationPayloadExceeded,
+    AcpError,
+    AcpPromptBusy,
+)
 from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.types import JsonRpcMessage
 
@@ -62,6 +67,16 @@ _CONTEXT_WINDOW_EXCEEDED = {
     "data": (
         'API Error: 413 {"code":"context_window_exceeded",'
         '"input_tokens":131717,"context_size":131072}'
+    ),
+}
+
+_CONVERSATION_PAYLOAD_EXCEEDED = {
+    "code": -32603,
+    "message": "Internal error",
+    "data": (
+        "Internal error: Request too large (max 32MB). Accumulated images and attachments "
+        "in the conversation pushed the request over the limit. "
+        "{'errorKind': 'invalid_request'}"
     ),
 }
 
@@ -156,6 +171,14 @@ class TestNoRawDictInUserFacingError:
         assert isinstance(exc, AcpContextWindowExceeded)
         assert exc.transient is False
         assert "context window is full" in str(exc)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_native_attachment_limit_raises_rebuildable_subclass(self, driver):
+        exc = await driver(_CONVERSATION_PAYLOAD_EXCEEDED)
+        assert isinstance(exc, AcpConversationPayloadExceeded)
+        assert exc.transient is False
+        assert "attachment data" in str(exc)
 
     @pytest.mark.asyncio
     async def test_unknown_shape_still_preserved(self):

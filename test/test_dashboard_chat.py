@@ -13260,6 +13260,45 @@ class TestStopTurnSlotState:
         assert slot.task.cancelled()
 
     @pytest.mark.asyncio
+    async def test_stop_turn_idle_cancels_orphaned_task(self, tmp_path, monkeypatch):
+        """An idle provider result cannot leave the dashboard turn running."""
+        state = self._make_state(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        slot.task = asyncio.ensure_future(asyncio.sleep(999))
+        state.sessions.stop_turn = AsyncMock(return_value="idle")
+
+        app = _make_app(state)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/api/chat/slots/s1/stop")
+            assert response.status == 200
+
+        assert slot._stop_state == "idle"
+        assert slot.task.cancelled()
+        assert not slot.running
+
+    @pytest.mark.asyncio
+    async def test_interrupt_idle_cancels_orphaned_task(self, tmp_path, monkeypatch):
+        """Interrupt also settles a task after the provider reports no turn."""
+        from kiro_crew.dashboard.chat_handlers import api_chat_slot_interrupt
+
+        state = self._make_state(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        slot.task = asyncio.ensure_future(asyncio.sleep(999))
+        slot.queue_append("next prompt")
+        state.sessions.stop_turn = AsyncMock(return_value="idle")
+
+        app = web.Application()
+        app["state"] = state
+        app.router.add_post("/api/chat/slots/{slot}/interrupt", api_chat_slot_interrupt)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/api/chat/slots/s1/interrupt")
+            assert response.status == 200
+
+        assert slot._stop_state == "idle"
+        assert slot.task.cancelled()
+        assert not slot.running
+
+    @pytest.mark.asyncio
     async def test_stop_turn_force_query_param(self, tmp_path, monkeypatch):
         """POST stop?force=true when soft_pending → skips cancel, hard kill."""
         state = self._make_state(tmp_path, monkeypatch)
@@ -14718,6 +14757,38 @@ class TestRunChatTransientRetry:
         assert call_count == 2
         state.sessions.discard_conversation.assert_awaited_once_with("dashboard:s1")
         state.sessions.reset.assert_not_awaited()
+        assert any("rebuilt-result" in text for text in self._assistant_texts(slot))
+
+    @pytest.mark.asyncio
+    async def test_attachment_payload_discards_native_session_then_retries_once(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.acp.client import AcpConversationPayloadExceeded
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        call_count = 0
+
+        async def _stream(_msg):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise AcpConversationPayloadExceeded(
+                    "native attachments too large", transient=False
+                )
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="rebuilt-result")
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        state = self._make_state(tmp_path, monkeypatch)
+        self._wire_sessions(state, self._client(_stream))
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+
+        await _run_chat(state, slot, "hello")
+        await self._drain_bg(state)
+
+        assert call_count == 2
+        state.sessions.discard_conversation.assert_awaited_once_with("dashboard:s1")
         assert any("rebuilt-result" in text for text in self._assistant_texts(slot))
 
     @pytest.mark.asyncio

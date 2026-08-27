@@ -1433,6 +1433,7 @@ async def api_security_posture(_request: web.Request) -> web.Response:
 _STARTUP_READ_AGENT_KEYS = frozenset(
     {
         "max_subagents",
+        "subagent_max_per_parent",
         "subagent_max_turns",
         "subagent_auto_max",
     }
@@ -1554,6 +1555,24 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
                     return None
                 agent["max_subagents"] = val
                 applied.append("max_subagents")
+
+            if "subagent_max_per_parent" in agent_settings:
+                val = agent_settings["subagent_max_per_parent"]
+                if (
+                    isinstance(val, bool)
+                    or not isinstance(val, int)
+                    or not 0 <= val <= persisted_hard_cap
+                ):
+                    _validation_error.append(
+                        (
+                            "subagent_max_per_parent must be 0 (unbounded) or an integer "
+                            f"between 1 and {persisted_hard_cap}",
+                            400,
+                        )
+                    )
+                    return None
+                agent["subagent_max_per_parent"] = val
+                applied.append("subagent_max_per_parent")
 
             for key in ("conductor_skill",):
                 if key in agent_settings:

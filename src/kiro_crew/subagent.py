@@ -1482,6 +1482,10 @@ class SubagentManager:
         self._completion_keep = completion_keep
         self._completion_keep_chars = completion_keep_chars
         self._running_count = 0
+        try:
+            self._max_per_parent = max(0, int(KiroCrewConfig.load().agent.subagent_max_per_parent))
+        except Exception:
+            self._max_per_parent = 0
         # Strong refs to in-flight shielded terminal reports (see
         # `_spawn_terminal_report`); drained in `cancel_all`.
         self._report_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
@@ -3379,6 +3383,9 @@ class SubagentManager:
 
         now = time.monotonic()
         should_queue, slot_free = self._should_stagger_queue(now)
+        parent_at_capacity = self._parent_at_capacity(parent_session_key)
+        should_queue = should_queue or parent_at_capacity
+        slot_free = slot_free and not parent_at_capacity
         if should_queue:
             # A prevalidated app spawn must NOT sit in the queue. _agent_prevalidated
             # skips the agent-directory ownership scan on drain (it was validated
@@ -3680,6 +3687,20 @@ class SubagentManager:
         slot_free = self._running_count < self._max_concurrent
         too_soon = (now - self._last_spawn_ts) < self._spawn_stagger_secs
         return (not slot_free or too_soon, slot_free)
+
+    def _parent_at_capacity(self, parent_session_key: str) -> bool:
+        if not parent_session_key or self._max_per_parent <= 0:
+            return False
+        return (
+            sum(
+                1
+                for info in self._agents.values()
+                if not info.done
+                and not info.queued
+                and info.parent_session_key == parent_session_key
+            )
+            >= self._max_per_parent
+        )
 
     # ── Continuable conversations (keep=True) ─────────────────────────────
 
@@ -4380,7 +4401,17 @@ class SubagentManager:
             except RuntimeError:
                 pass  # no running loop (sync/test context)
             return
-        params = self._queue.pop(0)
+        queue_index = next(
+            (
+                index
+                for index, queued in enumerate(self._queue)
+                if not self._parent_at_capacity(str(queued.get("parent_session_key", "")))
+            ),
+            None,
+        )
+        if queue_index is None:
+            return
+        params = self._queue.pop(queue_index)
         # A run can be cancelled WHILE it waits here — a user stop, or a session
         # deleted out from under it. Starting it anyway would execute tools for
         # work already reported as stopped, so skip it and drain the next one

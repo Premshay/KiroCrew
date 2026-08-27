@@ -1066,6 +1066,16 @@ class AcpContextWindowExceeded(AcpError):  # noqa: N818
     """
 
 
+class AcpConversationPayloadExceeded(AcpContextWindowExceeded):  # noqa: N818
+    """The provider retained attachments beyond its native request-size limit.
+
+    KiroCrew cannot inspect provider-owned retained attachments.  Interactive
+    callers must therefore discard that native conversation and rebuild it
+    from bounded dashboard history before retrying, just as for a token-window
+    overflow.
+    """
+
+
 # kiro-cli emits a "not logged in" banner on stderr when the user's session
 # has expired. Detected during spawn/prompt so we can raise AcpAuthRequired
 # (non-retryable) instead of churning through the retry ladder.
@@ -1461,7 +1471,13 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
         # The fleet router admits requests before forwarding.  Its machine code
         # tells interactive callers to rebuild from bounded KiroCrew history;
         # do not leak the router's JSON error envelope to the user.
-        if _CONTEXT_WINDOW_EXCEEDED_RE.search(haystack):
+        if _CONVERSATION_PAYLOAD_EXCEEDED_RE.search(haystack):
+            formatted = (
+                "The provider conversation retained too much attachment data. "
+                "The session must be rebuilt from bounded history before this request can run."
+                f"{req_id_suffix}"
+            )
+        elif _CONTEXT_WINDOW_EXCEEDED_RE.search(haystack):
             formatted = (
                 "The local model context window is full. The conversation must "
                 "be rebuilt from a shorter history before this request can run."
@@ -1664,6 +1680,12 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
 
 # ---------------------------------------------------------------------------
 _CONTEXT_WINDOW_EXCEEDED_RE = re.compile(r"\bcontext_window_exceeded\b", re.IGNORECASE)
+_CONVERSATION_PAYLOAD_EXCEEDED_RE = re.compile(
+    r"request too large\s*\(max\s*\d+\s*mb\).*accumulated images and attachments",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 def _rejected_model_from_error(error: object) -> str | None:
     """Return the model id a prompt-time error reports as invalid/unavailable.
 
@@ -1697,6 +1719,8 @@ def _raise_acp_error(error: object, available_models: Sequence[str] | None = Non
     raw_data = ""
     if isinstance(error, dict):
         raw_data = f"{error.get('data', '')} {error.get('message', '')}"
+    if _CONVERSATION_PAYLOAD_EXCEEDED_RE.search(raw_data):
+        raise AcpConversationPayloadExceeded(formatted, transient=False)
     if _CONTEXT_WINDOW_EXCEEDED_RE.search(raw_data):
         raise AcpContextWindowExceeded(formatted, transient=False)
     if _PROMPT_BUSY_RE.search(raw_data):

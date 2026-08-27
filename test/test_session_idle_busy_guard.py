@@ -51,6 +51,20 @@ def _mock_provider_factory():
 
 class TestIdleSweepBusyGuard:
     @pytest.mark.asyncio
+    async def test_pending_subagent_work_pins_an_idle_parent(self, cfg) -> None:
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("dashboard:tab1")
+        mgr.release("dashboard:tab1")
+        mgr.set_idle_expiry_guard(lambda key: key == "dashboard:tab1")
+        async with mgr._lock:
+            mgr._sessions["dashboard:tab1"].last_used = time.monotonic() - 10_000
+
+        await mgr._expire_idle(timeout_secs=1)
+
+        assert "dashboard:tab1" in mgr._sessions
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
     async def test_busy_session_is_not_reaped_when_it_looks_idle(self, cfg) -> None:
         """The regression: a long turn must survive the sweep.
 

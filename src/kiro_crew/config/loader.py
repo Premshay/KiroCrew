@@ -1758,6 +1758,15 @@ class AgentConfig:
             "below 3 would disable auto-sizing and run under the default).",
         ),
     )
+    subagent_max_per_parent: int = field(
+        default=0,
+        metadata=_meta(
+            "Max SubAgents Per Parent",
+            "Maximum active child runs for one parent session. 0 leaves the global "
+            "subagent cap as the only limit; set 1 when a routed model lane must "
+            "serve one worker at a time.",
+        ),
+    )
     max_stop_hook_nudges: int = field(
         default=100,
         metadata=_meta(
@@ -4110,6 +4119,7 @@ AUTOCOMPACT_PCT_MAX = 90.0
 _SECURITY_BOUNDED_FIELDS: tuple[tuple[str, str, int, int], ...] = (
     ("agent", "subagent_auto_max", 3, SUBAGENT_AUTO_MAX_CEILING),
     ("agent", "max_subagents", 0, SUBAGENT_AUTO_MAX_CEILING),
+    ("agent", "subagent_max_per_parent", 0, SUBAGENT_AUTO_MAX_CEILING),
     ("agent", "subagent_max_turns", 1, SUBAGENT_MAX_TURNS_CEILING),
     ("agent", "chat_turn_timeout_secs", CHAT_TURN_TIMEOUT_MIN, CHAT_TURN_TIMEOUT_MAX),
     (
@@ -7251,6 +7261,12 @@ class KiroCrewConfig:
                 session_sharing=bool(agent_data.get("session_sharing", True)),
                 max_subagents=_safe_int(
                     agent_data.get("max_subagents", 0), 0, 0, SUBAGENT_AUTO_MAX_CEILING
+                ),
+                subagent_max_per_parent=_safe_int(
+                    agent_data.get("subagent_max_per_parent", 0),
+                    0,
+                    0,
+                    SUBAGENT_AUTO_MAX_CEILING,
                 ),
                 max_stop_hook_nudges=_safe_int(agent_data.get("max_stop_hook_nudges", 100), 100, 0),
                 subagent_mem_buffer_pct=_safe_int(
