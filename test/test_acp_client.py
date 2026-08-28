@@ -949,6 +949,133 @@ class TestAcpClientBackendSelection:
             )
 
 
+class TestClaudeAutonomousReader:
+    """Direct Claude matches the native SDK's autonomous turn boundaries."""
+
+    def test_session_meta_requests_the_raw_cycle_boundaries(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+
+        filters = client._claude_session_meta()["claudeCode"]["emitRawSDKMessages"]
+
+        assert {entry["origin"] for entry in filters if entry["type"] == "user"} == {
+            "task-notification",
+            "peer",
+            "coordinator",
+            "observer",
+            "observer-activity",
+        }
+        assert {entry["origin"] for entry in filters if entry["type"] == "result"} == {
+            "task-notification",
+            "peer",
+            "coordinator",
+            "observer",
+            "observer-activity",
+        }
+        assert {entry["type"] for entry in filters} == {"user", "assistant", "result"}
+
+    @staticmethod
+    def _sdk_message(message: dict) -> "JsonRpcMessage":
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        return JsonRpcMessage(
+            method=acp_client._CLAUDE_SDK_MESSAGE_METHOD, params={"message": message}
+        )
+
+    @staticmethod
+    def _text_update(text: str) -> "JsonRpcMessage":
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        return JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text},
+                }
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_autonomous_output_is_delivered_before_the_next_prompt(self, tmp_path):
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._claude_inbox = asyncio.Queue()
+        delivered = []
+
+        async def deliver(turn):
+            delivered.append(turn)
+
+        await client.set_claude_autonomous_turn_handler(deliver)
+        await client._route_claude_frame(
+            self._sdk_message(
+                {
+                    "type": "user",
+                    "origin": {"kind": "task-notification"},
+                    "timestamp": "2026-08-28T00:00:00Z",
+                }
+            )
+        )
+        await client._route_claude_frame(self._text_update("Routine: still working. "))
+        await client._route_claude_frame(
+            self._sdk_message(
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-08-28T00:00:01Z",
+                    "message": {"id": "msg-native-routine"},
+                }
+            )
+        )
+        await client._route_claude_frame(
+            self._sdk_message({"type": "result", "origin": {"kind": "task-notification"}})
+        )
+
+        foreground = JsonRpcMessage(id=44, result={"stopReason": "end_turn"})
+        await client._route_claude_frame(foreground)
+
+        assert [(turn.text, turn.origin, turn.message_id) for turn in delivered] == [
+            ("Routine: still working. ", "task-notification", "msg-native-routine")
+        ]
+        assert await client._read_message(timeout=0.01) is foreground
+
+    @pytest.mark.asyncio
+    async def test_autonomous_permission_is_rejected_without_a_foreground_prompt(self, tmp_path):
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        client._claude_inbox = asyncio.Queue()
+        client._build_permission_event = MagicMock(
+            return_value=MagicMock(request_id="permission-1", title="Shell command")
+        )
+        client.reject_tool = AsyncMock()
+        await client._route_claude_frame(
+            self._sdk_message({"type": "user", "origin": {"kind": "task-notification"}})
+        )
+
+        await client._route_claude_frame(
+            JsonRpcMessage(method="session/request_permission", id="permission-1", params={})
+        )
+
+        client.reject_tool.assert_awaited_once_with("permission-1")
+        assert client._claude_inbox.empty()
+
+    @pytest.mark.asyncio
+    async def test_failed_autonomous_delivery_is_queued_for_retry(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        failed = AsyncMock(side_effect=OSError("history offline"))
+        turn = acp_client.ClaudeAutonomousTurn(
+            text="Routine complete.",
+            origin="task-notification",
+            timestamp="2026-08-28T00:00:00Z",
+            message_id="msg-retry",
+        )
+
+        await client.set_claude_autonomous_turn_handler(failed)
+        await client._deliver_claude_autonomous_turn(turn)
+
+        assert list(client._pending_claude_autonomous_turns) == [turn]
+
+
 class TestResolveClaudeAcpBin:
     def test_env_override_wins(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod

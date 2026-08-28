@@ -30,8 +30,9 @@ import sys
 import time
 from collections import deque
 from contextlib import aclosing
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, Callable, Sequence, TypeVar
+from typing import Any, AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence, TypeVar
 
 from kiro_crew import agent_scratch, model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
@@ -938,6 +939,20 @@ _STALE_TURN_TIMEOUT = 90.0
 # results, so this only trips on a genuine stall.
 _TOOL_STALL_TIMEOUT = 600.0
 _CANCEL_GRACE_SECS = 10.0  # grace window for cooperative cancel ack
+# Claude Code can start these SDK-originated cycles while the ACP host is idle.
+# They are not responses to a dashboard prompt and must never be consumed by the
+# next prompt's dispatch loop.
+_CLAUDE_AUTONOMOUS_ORIGINS = frozenset(
+    {
+        "task-notification",
+        "peer",
+        "coordinator",
+        "observer",
+        "observer-activity",
+    }
+)
+_MAX_PENDING_CLAUDE_AUTONOMOUS_TURNS = 16
+_CLAUDE_SDK_MESSAGE_METHOD = "_claude/sdkMessage"
 # Absolute safety cap for _wait_for_response's activity-based deadline. The
 # per-call deadline resets on every received frame (so a long session/load
 # replay that streams the whole transcript as notifications is not killed),
@@ -952,6 +967,16 @@ _SEL_AUDIT_TIMEOUT_SECONDS = 5.0
 # ONE place the ACP shell literal lives — _is_shell_kind() maps it to the
 # provider-agnostic AcpEvent.is_shell flag the dashboard validates against.
 _ACP_SHELL_KIND = "execute"
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeAutonomousTurn:
+    """A completed non-human Claude SDK cycle awaiting dashboard delivery."""
+
+    text: str
+    origin: str
+    timestamp: str
+    message_id: str
 
 
 def _is_shell_kind(kind: str | None) -> bool:
@@ -2240,6 +2265,20 @@ class AcpClient:
         self._next_id = 1
         self._buffer: deque[JsonRpcMessage] = deque(maxlen=100)
         self._mcp_notifications: list[JsonRpcMessage] = []
+        # The direct Claude transport is intentionally kept separate from the
+        # shared Kiro runtime, but it still needs one permanent stdout owner.
+        # Otherwise SDK work that arrives between prompts remains in the pipe
+        # until a later dashboard send reads it as that new turn's output.
+        self._claude_reader_task: asyncio.Task[None] | None = None
+        self._claude_inbox: asyncio.Queue[JsonRpcMessage | BaseException] | None = None
+        self._claude_autonomous_origin: str | None = None
+        self._claude_autonomous_text: list[str] = []
+        self._claude_autonomous_timestamp = ""
+        self._claude_autonomous_message_id = ""
+        self._claude_autonomous_handler: (
+            Callable[[ClaudeAutonomousTurn], Awaitable[None]] | None
+        ) = None
+        self._pending_claude_autonomous_turns: deque[ClaudeAutonomousTurn] = deque()
         # MCP OAuth requests collected during session init from
         # `_kiro.dev/mcp/oauth_request` notifications. Drained by callers via
         # `pop_pending_oauth_requests()` after `ensure_ready()` so the UI can
@@ -2448,6 +2487,33 @@ class AcpClient:
         session would have zero MCP tools.
         """
         return []
+
+    def _claude_session_meta(self) -> dict[str, Any]:
+        """Return the adapter extension requested on every Claude session bind."""
+        return {
+            "claudeCode": {
+                "options": {},
+                "emitRawSDKMessages": [
+                    *(
+                        {"type": "user", "origin": origin}
+                        for origin in sorted(_CLAUDE_AUTONOMOUS_ORIGINS)
+                    ),
+                    {"type": "assistant"},
+                    *(
+                        {"type": "result", "origin": origin}
+                        for origin in sorted(_CLAUDE_AUTONOMOUS_ORIGINS)
+                    ),
+                ],
+            }
+        }
+
+    async def set_claude_autonomous_turn_handler(
+        self, handler: Callable[[ClaudeAutonomousTurn], Awaitable[None]] | None
+    ) -> None:
+        """Set the dashboard sink and replay any completed undelivered turns."""
+        self._claude_autonomous_handler = handler
+        if handler is not None:
+            await self._flush_pending_claude_autonomous_turns()
 
     @property
     def is_ready(self) -> bool:
@@ -3430,6 +3496,28 @@ class AcpClient:
 
     def _reset_state(self) -> None:
         """Reset all session state (call after process is dead)."""
+        reader_task = getattr(self, "_claude_reader_task", None)
+        if reader_task is not None and not reader_task.done():
+            reader_task.cancel()
+        # A foreground dispatch might currently be waiting on the old inbox.
+        # Wake it before dropping our reference, or it can spend its remaining
+        # prompt timeout waiting on a reader we just cancelled.
+        claude_inbox = getattr(self, "_claude_inbox", None)
+        if claude_inbox is not None:
+            claude_inbox.put_nowait(AcpProcessDied("Claude ACP process reset"))
+        self._claude_reader_task = None
+        self._claude_inbox = None
+        self._claude_autonomous_origin = None
+        autonomous_text = getattr(self, "_claude_autonomous_text", None)
+        if autonomous_text:
+            logger.warning("Discarding partial Claude autonomous output during process reset")
+            autonomous_text.clear()
+        self._claude_autonomous_timestamp = ""
+        self._claude_autonomous_message_id = ""
+        # Completed autonomous turns remain queued. The same client can be
+        # reinitialized after this reset, and its registered dashboard sink can
+        # then deliver them; clearing them here would silently lose a terminal
+        # reply solely because the next process startup raced it.
         if self._process:
             for pipe in (self._process.stdin, self._process.stdout, self._process.stderr):
                 if pipe:
@@ -3557,7 +3645,7 @@ class AcpClient:
             ],
         }
         if self._is_claude:
-            new_params["_meta"] = {"claudeCode": {"options": {}}}
+            new_params["_meta"] = self._claude_session_meta()
 
         self._last_substitution_model = None
         session_id = await self._send_request(METHOD_SESSION_NEW, new_params)
@@ -3669,7 +3757,7 @@ class AcpClient:
                         ],
                     }
                     if self._is_claude:
-                        load_params["_meta"] = {"claudeCode": {"options": {}}}
+                        load_params["_meta"] = self._claude_session_meta()
                     else:
                         load_params["_meta"] = {"_kiro.dev/session_file": session_file}
                     load_id = await self._send_request(METHOD_SESSION_LOAD, load_params)
@@ -3818,6 +3906,8 @@ class AcpClient:
                     except Exception:
                         logger.warning("Failed to snapshot process tree", exc_info=True)
 
+                    await self._start_claude_reader()
+
                     _startup_outcome = "ready"
                     return
                 except (AcpTimeoutError, AcpError, OSError) as exc:
@@ -3934,6 +4024,164 @@ class AcpClient:
             raise AcpProcessDied(f"ACP process pipe broken: {exc}") from exc
         self._last_activity = time.monotonic()
 
+    async def _start_claude_reader(self) -> None:
+        """Give a direct Claude session one permanent owner for its stdout stream."""
+        if not self._is_claude:
+            return
+        task = self._claude_reader_task
+        if task is not None and not task.done():
+            return
+        self._claude_inbox = asyncio.Queue()
+        self._claude_reader_task = asyncio.create_task(
+            self._claude_reader_loop(), name=f"claude-acp-reader:{self._session_id or 'unknown'}"
+        )
+
+    async def _claude_reader_loop(self) -> None:
+        """Continuously route Claude ACP frames after the initialization handshake."""
+        try:
+            while True:
+                msg = await self._read_message_from_stdout()
+                if msg is None:
+                    continue
+                await self._route_claude_frame(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Claude ACP reader stopped for session %s", self._session_id)
+            inbox = self._claude_inbox
+            if inbox is not None:
+                await inbox.put(exc)
+
+    async def _route_claude_frame(self, msg: JsonRpcMessage) -> None:
+        """Keep autonomous Claude cycles out of the next dashboard dispatch."""
+        if msg.is_method(_CLAUDE_SDK_MESSAGE_METHOD):
+            await self._handle_claude_sdk_message(msg)
+            return
+        if self._claude_autonomous_origin is not None:
+            await self._collect_claude_autonomous_frame(msg)
+            return
+        inbox = self._claude_inbox
+        if inbox is not None:
+            await inbox.put(msg)
+
+    async def _handle_claude_sdk_message(self, msg: JsonRpcMessage) -> None:
+        params = msg.params if isinstance(msg.params, dict) else {}
+        sdk_message = params.get("message") if isinstance(params, dict) else None
+        if not isinstance(sdk_message, dict):
+            logger.warning("Ignoring malformed Claude SDK extension frame")
+            return
+        kind = sdk_message.get("type")
+        origin_data = sdk_message.get("origin")
+        origin = origin_data.get("kind") if isinstance(origin_data, dict) else None
+        if kind == "user" and origin in _CLAUDE_AUTONOMOUS_ORIGINS:
+            if self._claude_autonomous_origin is not None:
+                logger.error(
+                    "Claude emitted autonomous %s before terminal %s; discarding partial output",
+                    origin,
+                    self._claude_autonomous_origin,
+                )
+            self._claude_autonomous_origin = origin
+            self._claude_autonomous_text.clear()
+            self._claude_autonomous_timestamp = str(sdk_message.get("timestamp") or "")
+            self._claude_autonomous_message_id = ""
+            return
+        if kind == "assistant" and self._claude_autonomous_origin is not None:
+            timestamp = sdk_message.get("timestamp")
+            if isinstance(timestamp, str) and timestamp:
+                self._claude_autonomous_timestamp = timestamp
+            assistant_message = sdk_message.get("message")
+            message_id = (
+                assistant_message.get("id") if isinstance(assistant_message, dict) else None
+            )
+            if isinstance(message_id, str) and message_id:
+                self._claude_autonomous_message_id = message_id
+            return
+        if kind == "result" and origin == self._claude_autonomous_origin:
+            turn = ClaudeAutonomousTurn(
+                text="".join(self._claude_autonomous_text),
+                origin=self._claude_autonomous_origin,
+                timestamp=self._claude_autonomous_timestamp,
+                message_id=self._claude_autonomous_message_id,
+            )
+            self._claude_autonomous_origin = None
+            self._claude_autonomous_text.clear()
+            self._claude_autonomous_timestamp = ""
+            self._claude_autonomous_message_id = ""
+            if turn.text:
+                await self._deliver_claude_autonomous_turn(turn)
+
+    async def _collect_claude_autonomous_frame(self, msg: JsonRpcMessage) -> None:
+        """Collect one autonomous cycle while declining unsafe server requests.
+
+        There is no foreground dashboard turn to render a permission card for
+        this cycle. Letting the request sit in the foreground inbox would merely
+        hide it until the next user prompt and wedge Claude in the meantime, so
+        fail closed with the adapter's advertised reject option.
+        """
+        if msg.is_method(METHOD_REQUEST_PERMISSION):
+            permission = self._build_permission_event(msg)
+            logger.warning(
+                "Denying autonomous Claude permission request %s (tool=%s)",
+                permission.request_id,
+                permission.title,
+            )
+            await self.reject_tool(permission.request_id)
+            return
+        if msg.id is not None and msg.method:
+            logger.warning(
+                "Rejecting unsupported autonomous Claude server request %s",
+                msg.method,
+            )
+            await self._reject_unknown_server_request(msg)
+            return
+        if msg.is_method(METHOD_SESSION_UPDATE):
+            text, is_thinking = self._extract_text_chunk(msg)
+            if isinstance(text, str) and text and not is_thinking:
+                self._claude_autonomous_text.append(text)
+
+    async def _deliver_claude_autonomous_turn(self, turn: ClaudeAutonomousTurn) -> None:
+        handler = self._claude_autonomous_handler
+        if handler is None:
+            self._queue_pending_claude_autonomous_turn(turn)
+            return
+        try:
+            await handler(turn)
+        except Exception:
+            logger.exception(
+                "Could not deliver completed Claude autonomous turn (origin=%s, chars=%d)",
+                turn.origin,
+                len(turn.text),
+            )
+            self._queue_pending_claude_autonomous_turn(turn)
+
+    async def _flush_pending_claude_autonomous_turns(self) -> None:
+        handler = self._claude_autonomous_handler
+        if handler is None:
+            return
+        while self._pending_claude_autonomous_turns:
+            turn = self._pending_claude_autonomous_turns.popleft()
+            try:
+                await handler(turn)
+            except Exception:
+                logger.exception(
+                    "Could not deliver queued Claude autonomous turn (origin=%s, chars=%d)",
+                    turn.origin,
+                    len(turn.text),
+                )
+                self._pending_claude_autonomous_turns.appendleft(turn)
+                return
+
+    def _queue_pending_claude_autonomous_turn(self, turn: ClaudeAutonomousTurn) -> None:
+        if len(self._pending_claude_autonomous_turns) >= _MAX_PENDING_CLAUDE_AUTONOMOUS_TURNS:
+            dropped = self._pending_claude_autonomous_turns.popleft()
+            logger.error(
+                "Dropping undelivered Claude autonomous turn after pending queue overflow "
+                "(origin=%s, chars=%d)",
+                dropped.origin,
+                len(dropped.text),
+            )
+        self._pending_claude_autonomous_turns.append(turn)
+
     async def _read_message(self, timeout: float = _READ_TIMEOUT) -> JsonRpcMessage | None:
         if self._cancelled:
             if time.monotonic() - self._cancel_ts > self._cancel_grace_secs:
@@ -3941,6 +4189,22 @@ class AcpClient:
 
         if self._buffer:
             return self._buffer.popleft()
+
+        inbox = self._claude_inbox
+        if inbox is not None:
+            try:
+                item = await asyncio.wait_for(inbox.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return None
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        return await self._read_message_from_stdout(timeout)
+
+    async def _read_message_from_stdout(
+        self, timeout: float = _READ_TIMEOUT
+    ) -> JsonRpcMessage | None:
 
         if not self._process or not self._process.stdout:
             raise AcpError("ACP process not running")

@@ -40,6 +40,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
 )
+from kiro_crew.acp.client import ClaudeAutonomousTurn
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.history import ConversationLog
@@ -1002,6 +1003,63 @@ class TestFlushSegment:
         chat_runner._flush_segment(state, slot, "final text")
 
         assert [m.get("role") for m in slot.messages] == ["assistant"]
+
+
+class TestPersistClaudeAutonomousTurn:
+    @pytest.mark.asyncio
+    async def test_persists_a_separate_idempotent_assistant_row(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        turn = ClaudeAutonomousTurn(
+            text="Routine complete.",
+            origin="task-notification",
+            timestamp="2026-08-28T00:00:00Z",
+            message_id="msg-routine",
+        )
+
+        with patch.object(chat_runner, "save_slot_off_loop", new_callable=AsyncMock) as save:
+            await chat_runner._persist_claude_autonomous_turn(state, slot, turn)
+            await chat_runner._persist_claude_autonomous_turn(state, slot, turn)
+
+        assert [message["content"] for message in slot.messages] == ["Routine complete."]
+        assert slot.messages[0]["meta"]["mid"] == "m-claude-msg-routine"
+        assert save.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_redacts_autonomous_text_before_persisting(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        turn = ClaudeAutonomousTurn(
+            text="secret AKIAIOSFODNN7EXAMPLE",
+            origin="task-notification",
+            timestamp="2026-08-28T00:00:00Z",
+            message_id="msg-secret",
+        )
+
+        with patch.object(chat_runner, "save_slot_off_loop", new_callable=AsyncMock):
+            await chat_runner._persist_claude_autonomous_turn(state, slot, turn)
+
+        assert "AKIAIOSFODNN7EXAMPLE" not in slot.messages[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_save_retry_reuses_the_existing_autonomous_row(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        turn = ClaudeAutonomousTurn(
+            text="Routine complete.",
+            origin="task-notification",
+            timestamp="2026-08-28T00:00:00Z",
+            message_id="msg-retry",
+        )
+
+        with patch.object(
+            chat_runner,
+            "save_slot_off_loop",
+            new_callable=AsyncMock,
+            side_effect=[OSError("disk full"), None],
+        ):
+            with pytest.raises(OSError, match="disk full"):
+                await chat_runner._persist_claude_autonomous_turn(state, slot, turn)
+            await chat_runner._persist_claude_autonomous_turn(state, slot, turn)
+
+        assert [message["content"] for message in slot.messages] == ["Routine complete."]
 
 
 class TestScheduleWidgetRegistration:

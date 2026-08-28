@@ -266,6 +266,25 @@ Step 5 drains MCP server init notifications (both after `session/load` and
 `_mcp_notifications` instead of discarding them. `_drain_notifications()`
 processes buffered notifications first, then reads any remaining from stdout.
 
+### Claude autonomous turns
+
+The direct Claude adapter owns stdout continuously after its handshake, matching
+Claude Code's native session consumer. It requests raw SDK `user`, `assistant`,
+and terminal `result` frames for the supported non-human origins
+(`task-notification`, `peer`, `coordinator`, `observer`, and
+`observer-activity`). A completed cycle is delivered to the dashboard as one
+separate assistant row before any later user prompt is dispatched; it is never
+left in stdout to be appended to that next prompt's response.
+
+The native assistant message id is the row's durable delivery id. A failed save
+retries the same row rather than creating another visible reply. A malformed
+extension frame with no id uses a deterministic opaque fallback and is logged.
+Autonomous cycles have no foreground permission card, so a permission request
+is rejected with the adapter's advertised reject option; unsupported inbound
+requests receive the normal JSON-RPC method-not-found response. This prevents a
+background cycle from becoming an invisible blocked turn or widening its tool
+authority.
+
 The multiplexed `AcpRuntime` has the same guarantee for session-scoped init
 frames even though it cannot register the session queue until `session/new`
 or `session/load` returns the session id. While either request is in flight, the

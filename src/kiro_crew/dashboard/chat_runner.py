@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
@@ -23,6 +24,7 @@ from kiro_crew.acp.client import (
     AcpError,
     AcpProcessDied,
     AcpPromptBusy,
+    ClaudeAutonomousTurn,
     _is_safe_oauth_url,
     advertised_model_ids,
     model_is_unusable,
@@ -3300,6 +3302,60 @@ def _flush_segment(
     _schedule_widget_registration(state, slot, redacted, str(last_msg.get("ts", "")))
 
 
+async def _persist_claude_autonomous_turn(
+    state: DashboardState,
+    slot: _ChatSlot,
+    turn: ClaudeAutonomousTurn,
+) -> None:
+    """Persist one native Claude background reply as its own assistant row.
+
+    Direct Claude sessions can receive SDK-originated work while no dashboard
+    prompt is running. That work has an authoritative assistant message id, so
+    use it as the durable delivery id and retry the same row after a failed
+    save instead of folding its text into whichever prompt happens next.
+    """
+    if not turn.text.strip():
+        return
+    if turn.message_id:
+        source_mid = f"m-claude-{turn.message_id}"
+    else:
+        # The adapter normally supplies the native Claude message id. A
+        # malformed extension frame must not turn a persistence retry into a
+        # duplicate visible reply, so retain a deterministic, opaque fallback.
+        fallback = f"{turn.origin}\x00{turn.timestamp}\x00{turn.text}".encode()
+        source_mid = f"m-claude-fallback-{hashlib.sha256(fallback).hexdigest()[:24]}"
+        logger.error("Claude autonomous turn arrived without a native message id")
+    if source_mid:
+        existing = any(
+            message.get("role") == "assistant"
+            and isinstance(message.get("meta"), dict)
+            and message["meta"].get("mid") == source_mid
+            for message in slot.messages
+        )
+        if existing:
+            # The earlier append survived but its synchronous durable save did
+            # not. Retry that same row; appending a second copy would make a
+            # transport retry look like a second Claude response.
+            await save_slot_off_loop(state, slot, best_effort=False)
+            return
+
+    redacted, exfil_warnings = redact_exfiltration_urls(turn.text)
+    for warning in exfil_warnings:
+        logger.warning("Exfiltration URL redacted in autonomous Claude turn: %s", warning)
+    redacted, credential_warnings = redact_credentials(redacted)
+    for warning in credential_warnings:
+        logger.warning("Credential redacted in autonomous Claude turn: %s", warning)
+
+    message = slot.append(
+        "assistant",
+        redacted,
+        "msg msg-a",
+        meta={"mid": source_mid} if source_mid else None,
+    )
+    await save_slot_off_loop(state, slot, best_effort=False)
+    _schedule_widget_registration(state, slot, redacted, str(message.get("ts", "")))
+
+
 def _schedule_widget_registration(
     state: DashboardState,
     slot: _ChatSlot,
@@ -5658,6 +5714,13 @@ async def _run_chat(
         # (the dashboard steer handler) can reach the running session's client
         # to inject a mid-turn steer. Cleared in the finally below.
         slot._acp_client = getattr(client, "client", None)
+        register_autonomous_turn = getattr(
+            slot._acp_client, "set_claude_autonomous_turn_handler", None
+        )
+        if callable(register_autonomous_turn):
+            await register_autonomous_turn(
+                lambda turn: _persist_claude_autonomous_turn(state, slot, turn)
+            )
         # This consumer implements the low-fidelity child downgrade (the
         # interactive card) — opt in so the handle-level fail-close gate
         # yields those events here instead of rejecting them itself.
