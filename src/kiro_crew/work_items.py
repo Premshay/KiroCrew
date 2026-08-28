@@ -32,6 +32,7 @@ SCHEMA_VERSION = 1
 
 STATE_PROPOSED = "proposed"
 STATE_WAITING = "waiting"
+STATE_DISPATCHED = "dispatched"
 STATE_ACCEPTED = "accepted"
 STATE_REJECTED = "rejected"
 STATE_CANCELLED = "cancelled"
@@ -40,6 +41,28 @@ TERMINAL_STATES = frozenset({STATE_ACCEPTED, STATE_REJECTED, STATE_CANCELLED})
 COORDINATOR_TRANSITIONS = frozenset(
     {STATE_PROPOSED, STATE_WAITING, STATE_REJECTED, STATE_CANCELLED}
 )
+
+ASSIGNMENT_PENDING_DELIVERY = "pending_delivery"
+ASSIGNMENT_LAUNCH_QUEUED = "launch_queued"
+ASSIGNMENT_DELIVERED = "delivered"
+ASSIGNMENT_FAILED = "failed"
+ASSIGNMENT_REVOKED = "revoked"
+ASSIGNMENT_STATUSES = frozenset(
+    {
+        ASSIGNMENT_PENDING_DELIVERY,
+        ASSIGNMENT_LAUNCH_QUEUED,
+        ASSIGNMENT_DELIVERED,
+        ASSIGNMENT_FAILED,
+        ASSIGNMENT_REVOKED,
+    }
+)
+# The statuses a worker may act on: intent exists and nothing was revoked or
+# terminally failed. ``delivered`` is the launched child's live window.
+ASSIGNMENT_ACTIVE = frozenset(
+    {ASSIGNMENT_PENDING_DELIVERY, ASSIGNMENT_LAUNCH_QUEUED, ASSIGNMENT_DELIVERED}
+)
+ASSIGNMENT_SOURCE_LAUNCHED = "launched_subagent"
+ASSIGNMENT_SOURCE_EXISTING = "existing_session"
 
 _STATE_FILE = "state.json"
 _KEY_FILE = "coordinator_key"
@@ -59,14 +82,34 @@ _MAX_EVIDENCE = 2_000
 _MAX_STATE_BYTES = 1_000_000
 _MAX_ARCHIVES = 64
 _MAX_ARCHIVE_BYTES = 4_000_000
+_MAX_CONTRACT_BYTES = 32_768
+_MAX_ATTEMPTS = 32
+_MAX_FAILURE_CODE = 64
+_MAX_VERIFICATION = 8
+_MAX_VERIFICATION_ENTRY = 512
 _LOCK_TIMEOUT_SECS = 5.0
 _LOCK_POLL_SECS = 0.05
 
-_EVENT_KINDS = frozenset({"created", "progress", "blocker", "state", "evaluation"})
+_EVENT_KINDS = frozenset(
+    {
+        "created",
+        "progress",
+        "blocker",
+        "state",
+        "evaluation",
+        "assignment",
+        "worker_handoff",
+        "runtime",
+    }
+)
 _LEGACY_ITEM_KEY_RE = re.compile(r"item-[0-9]+\Z")
 _LEGACY_STATUSES = frozenset({"running", "waiting", "pass", "fail"})
 _ITEM_ID_RE = re.compile(r"wi_[0-9a-f]{32}\Z")
 _CYCLE_ID_RE = re.compile(r"wc_[0-9a-f]{32}\Z")
+_ASSIGNMENT_ID_RE = re.compile(r"wa_[0-9a-f]{32}\Z")
+_RUN_ID_RE = re.compile(r"[0-9a-f]{8}\Z")
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+_FINGERPRINT_RE = re.compile(r"[0-9a-f]{16}\Z")
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +128,14 @@ class WorkItemStoreCorrupt(WorkItemError):
 
 class WorkItemArchiveFull(WorkItemError):
     """Closing would exceed the store's deliberate archive retention bound."""
+
+
+class WorkItemAssignmentDenied(WorkItemError):
+    """The calling worker does not own the requested assignment."""
+
+
+class WorkItemAssignmentStale(WorkItemError):
+    """The assignment is no longer live for the calling worker."""
 
 
 def _now_iso() -> str:
@@ -184,7 +235,126 @@ def _coerce_event(raw: Any) -> dict[str, str]:
     text = raw.get("text")
     if not all(isinstance(value, str) for value in (ts, kind, text)):
         raise WorkItemStoreCorrupt("work-item event has invalid fields")
-    return {"ts": ts, "kind": kind, "text": text}
+    # ``actor`` is the server-stamped worker fingerprint for worker-authored
+    # events; coordinator events carry "". Slice 2 events predate it, so a
+    # missing value decodes as the empty actor rather than corruption.
+    actor = raw.get("actor", "")
+    if not isinstance(actor, str) or len(actor) > 64:
+        raise WorkItemStoreCorrupt("work-item event actor is invalid")
+    return {"ts": ts, "kind": kind, "text": text, "actor": actor}
+
+
+def _normalize_assignment(raw: Any) -> dict[str, Any] | None:
+    """Strictly decode one assignment record; Slice 2 items decode as ``None``."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise WorkItemStoreCorrupt("work-item assignment is not an object")
+    for field in (
+        "id",
+        "source",
+        "worker_session_key",
+        "worker_fingerprint",
+        "worker_slot",
+        "worker_run_id",
+        "candidate_fingerprint",
+        "status",
+        "contract_digest",
+        "created_at",
+        "delivered_at",
+        "failed_at",
+        "failure_code",
+    ):
+        if not isinstance(raw.get(field), str):
+            raise WorkItemStoreCorrupt("work-item assignment has invalid fields")
+    if not _ASSIGNMENT_ID_RE.fullmatch(raw["id"]):
+        raise WorkItemStoreCorrupt("work-item assignment has an invalid ID")
+    if raw["source"] not in {ASSIGNMENT_SOURCE_LAUNCHED, ASSIGNMENT_SOURCE_EXISTING}:
+        raise WorkItemStoreCorrupt("work-item assignment has an unknown source")
+    if raw["status"] not in ASSIGNMENT_STATUSES:
+        raise WorkItemStoreCorrupt("work-item assignment has an unknown status")
+    if not raw["worker_session_key"]:
+        raise WorkItemStoreCorrupt("work-item assignment names no worker identity")
+    if bool(raw["worker_slot"]) == bool(raw["worker_run_id"]):
+        raise WorkItemStoreCorrupt("work-item assignment names no worker or two")
+    if not _FINGERPRINT_RE.fullmatch(raw["worker_fingerprint"]):
+        raise WorkItemStoreCorrupt("work-item assignment fingerprint is invalid")
+    if raw["worker_run_id"] and not _RUN_ID_RE.fullmatch(raw["worker_run_id"]):
+        raise WorkItemStoreCorrupt("work-item assignment run ID is invalid")
+    if raw["candidate_fingerprint"] and not _FINGERPRINT_RE.fullmatch(
+        raw["candidate_fingerprint"]
+    ):
+        raise WorkItemStoreCorrupt("work-item assignment candidate is invalid")
+    attempt = raw.get("attempt")
+    if (
+        not isinstance(attempt, int)
+        or isinstance(attempt, bool)
+        or not 1 <= attempt <= _MAX_ATTEMPTS
+    ):
+        raise WorkItemStoreCorrupt("work-item assignment attempt is invalid")
+    if raw["contract_digest"] and not _DIGEST_RE.fullmatch(raw["contract_digest"]):
+        raise WorkItemStoreCorrupt("work-item assignment digest is invalid")
+    if raw["failure_code"] and len(raw["failure_code"]) > _MAX_FAILURE_CODE:
+        raise WorkItemStoreCorrupt("work-item assignment failure code is too long")
+    return {
+        "id": raw["id"],
+        "source": raw["source"],
+        "worker_session_key": raw["worker_session_key"],
+        "worker_fingerprint": raw["worker_fingerprint"],
+        "worker_slot": raw["worker_slot"],
+        "worker_run_id": raw["worker_run_id"],
+        "candidate_fingerprint": raw["candidate_fingerprint"],
+        "status": raw["status"],
+        "attempt": attempt,
+        "contract_digest": raw["contract_digest"],
+        "created_at": raw["created_at"],
+        "delivered_at": raw["delivered_at"],
+        "failed_at": raw["failed_at"],
+        "failure_code": raw["failure_code"],
+    }
+
+
+def _normalize_handoff(raw: Any) -> dict[str, Any] | None:
+    """Strictly decode the latest worker handoff; Slice 2 items decode as ``None``."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise WorkItemStoreCorrupt("worker handoff is not an object")
+    for field in (
+        "outcome",
+        "canonical_ref",
+        "next_action",
+        "blocker",
+        "release_condition",
+        "at",
+        "actor",
+    ):
+        if not isinstance(raw.get(field), str):
+            raise WorkItemStoreCorrupt("worker handoff has invalid fields")
+    verification = raw.get("verification")
+    if (
+        not isinstance(verification, list)
+        or not verification
+        or len(verification) > _MAX_VERIFICATION
+        or not all(isinstance(entry, str) and entry for entry in verification)
+    ):
+        raise WorkItemStoreCorrupt("worker handoff verification is invalid")
+    if not raw["outcome"].strip() or not raw["next_action"].strip():
+        raise WorkItemStoreCorrupt("worker handoff is missing required text")
+    if bool(raw["blocker"].strip()) != bool(raw["release_condition"].strip()):
+        raise WorkItemStoreCorrupt(
+            "worker handoff blocker and release condition are unpaired"
+        )
+    return {
+        "outcome": raw["outcome"],
+        "canonical_ref": raw["canonical_ref"],
+        "next_action": raw["next_action"],
+        "verification": list(verification),
+        "blocker": raw["blocker"],
+        "release_condition": raw["release_condition"],
+        "at": raw["at"],
+        "actor": raw["actor"],
+    }
 
 
 def _coerce_item(raw: Any) -> dict[str, Any]:
@@ -204,7 +374,11 @@ def _coerce_item(raw: Any) -> dict[str, Any]:
         raise WorkItemStoreCorrupt("work item has invalid fields")
     if not _ITEM_ID_RE.fullmatch(raw["id"]):
         raise WorkItemStoreCorrupt("work item has an invalid ID")
-    if raw["state"] not in TERMINAL_STATES | {STATE_PROPOSED, STATE_WAITING}:
+    if raw["state"] not in TERMINAL_STATES | {
+        STATE_PROPOSED,
+        STATE_WAITING,
+        STATE_DISPATCHED,
+    }:
         raise WorkItemStoreCorrupt("work item has an unknown state")
     try:
         acceptance = _normalize_acceptance(raw.get("acceptance"))
@@ -220,6 +394,8 @@ def _coerce_item(raw: Any) -> dict[str, Any]:
     provenance = raw.get("migration_provenance")
     if provenance is not None and not isinstance(provenance, dict):
         raise WorkItemStoreCorrupt("work item migration provenance is invalid")
+    assignment = _normalize_assignment(raw.get("assignment"))
+    handoff = _normalize_handoff(raw.get("worker_handoff"))
     item = {
         "id": raw["id"],
         "title": raw["title"],
@@ -231,6 +407,8 @@ def _coerce_item(raw: Any) -> dict[str, Any]:
         "events": [_coerce_event(event) for event in events[-_MAX_ITEM_EVENTS:]],
         "last_evaluation": copy.deepcopy(last_evaluation),
         "migration_provenance": copy.deepcopy(provenance),
+        "assignment": assignment,
+        "worker_handoff": handoff,
         "created_at": raw["created_at"],
         "updated_at": raw["updated_at"],
         "finished_at": raw["finished_at"],
@@ -365,6 +543,8 @@ def _legacy_item(key: str, raw_value: Any, now: str) -> tuple[dict[str, Any] | N
             }
         ],
         "last_evaluation": None,
+        "assignment": None,
+        "worker_handoff": None,
         "migration_provenance": provenance,
         "created_at": now,
         "updated_at": now,
@@ -531,12 +711,15 @@ def _find_item(cycle: dict[str, Any], item_id: str) -> dict[str, Any]:
     raise WorkItemNotFound(f"work item {item_id!r} was not found")
 
 
-def _append_event(item: dict[str, Any], *, kind: str, text: str, now: str) -> None:
+def _append_event(
+    item: dict[str, Any], *, kind: str, text: str, now: str, actor: str = ""
+) -> None:
     if kind not in _EVENT_KINDS:
         raise WorkItemError("work-item event kind is not supported")
-    item["events"] = (list(item["events"]) + [{"ts": now, "kind": kind, "text": text}])[
-        -_MAX_ITEM_EVENTS:
-    ]
+    item["events"] = (
+        list(item["events"])
+        + [{"ts": now, "kind": kind, "text": text, "actor": actor}][-_MAX_ITEM_EVENTS:]
+    )
 
 
 def _new_id(prefix: str) -> str:
@@ -617,6 +800,8 @@ def create_item(
             "next_action": _text(next_action, _MAX_TEXT, "next_action", required=True),
             "events": [],
             "last_evaluation": None,
+            "assignment": None,
+            "worker_handoff": None,
             "created_at": now,
             "updated_at": now,
             "finished_at": "",
@@ -792,6 +977,573 @@ def evaluate_items(
         current["updated_at"] = now
         _write_state(dir_path, key, state)
     return results
+
+
+
+# ---------------------------------------------------------------------------
+# Slice 3: launched-subagent assignment, launch receipts, worker surface.
+#
+# The coordinator arms one assignment per live work item. The subagent
+# manager's event stream is the only delivery authority: a launch is
+# ``pending_delivery`` until the spawned run reports, ``launch_queued`` once
+# the manager accepted it, and ``delivered`` (item ``dispatched``) when the
+# first turn starts. Receipts are keyed by the preassigned run ID so the
+# hook needs nothing but the parent key and the run identity; a receipt for
+# a run that is already past the receipt point is a no-op, which makes
+# duplicate manager events safe.
+# ---------------------------------------------------------------------------
+
+
+def _render_acceptance(acceptance: dict[str, Any]) -> list[str]:
+    lines = [f"  kind: {acceptance['kind']}"]
+    if acceptance["kind"] == "pr_checks":
+        lines.append(f"  repo: {acceptance['repo']}")
+        lines.append(f"  pr: {acceptance['pr']}")
+    elif acceptance["kind"] == "file":
+        lines.append(f"  path: {acceptance['path']}")
+        lines.append(f"  exists: {str(acceptance['exists']).lower()}")
+    return lines
+
+
+def render_contract(item: dict[str, Any], assignment: dict[str, Any]) -> str:
+    """Render the deterministic plain-text contract handed to a launched worker.
+
+    The contract is product text, not protocol: it names the immutable
+    acceptance, the current next action, and the worker's reporting duties.
+    Its SHA-256 digest is stored on the assignment, so the text itself never
+    carries the digest. The attempt count stays out of the contract: a
+    dispatch retry re-renders the same assignment under the same digest.
+    """
+    lines = [
+        "KiroCrew work item contract",
+        f"Assignment: {assignment['id']}",
+        f"Work item: {item['id']}",
+        f"Worker run: {assignment['worker_run_id']}",
+        "",
+        f"Title: {item['title']}",
+        "",
+        "Acceptance (evaluator-owned; the worker cannot change it):",
+        *_render_acceptance(item["acceptance"]),
+    ]
+    if item["canonical_ref"]:
+        lines += ["", f"Canonical ref: {item['canonical_ref']}"]
+    if item["declared_resources"]:
+        lines += ["", "Declared resources:"]
+        lines += [f"  - {resource}" for resource in item["declared_resources"]]
+    lines += [
+        "",
+        "Current next action:",
+        item["next_action"],
+        "",
+        "Worker instructions:",
+        "- Report progress with work_item_report_progress (kind progress or blocker).",
+        "- Finish with exactly one work_item_submit_handoff carrying the outcome,",
+        "  the next action for the coordinator, and the verification evidence.",
+        "- If blocked, include both the blocker and its release condition.",
+        "- You cannot change the item state, acceptance, or this assignment;",
+        "  only the coordinator's typed evaluator accepts the item.",
+    ]
+    contract = "\n".join(lines) + "\n"
+    if len(contract.encode("utf-8")) > _MAX_CONTRACT_BYTES:
+        raise WorkItemError("the rendered contract exceeds the byte limit")
+    return contract
+
+
+def launch_item(
+    session_key: str,
+    item_id: str,
+    candidate_fingerprint: str = ""
+) -> tuple[dict[str, Any], str]:
+    """Arm a new launched-subagent assignment on one non-terminal item.
+
+    ``candidate_fingerprint`` is the server-issued launch-candidate handle
+    the coordinator selected; it is the retry target, never a worker key.
+    Returns the updated item copy plus the exact contract string the
+    dispatcher must hand to the subagent manager.
+    """
+    if candidate_fingerprint and not _FINGERPRINT_RE.fullmatch(candidate_fingerprint):
+        raise WorkItemError("the launch candidate fingerprint is invalid")
+    key = ledger_key(session_key)
+    dir_path = coordinator_dir(key)
+    with _locked(dir_path):
+        state = _read_state_unlocked(dir_path)
+        _migrate_legacy_unlocked(dir_path, key, state)
+        state = _read_state_unlocked(dir_path)
+        cycle = state["active_cycle"]
+        if cycle is None:
+            raise WorkItemNotFound(f"work item {item_id!r} was not found")
+        item = _find_item(cycle, item_id)
+        if item["state"] in TERMINAL_STATES:
+            raise WorkItemError("a terminal work item cannot be launched")
+        assignment = item["assignment"]
+        if assignment is not None and assignment["status"] != ASSIGNMENT_REVOKED:
+            raise WorkItemError("an active assignment already exists for this work item")
+        now = _now_iso()
+        run_id = uuid.uuid4().hex[:8]
+        worker_key = f"subagent:{run_id}"
+        prospective = {
+            "id": _new_id("wa"),
+            "source": ASSIGNMENT_SOURCE_LAUNCHED,
+            "worker_session_key": worker_key,
+            "worker_fingerprint": hashlib.sha256(worker_key.encode("utf-8")).hexdigest()[:16],
+            "worker_slot": "",
+            "worker_run_id": run_id,
+            "candidate_fingerprint": candidate_fingerprint,
+            "status": ASSIGNMENT_PENDING_DELIVERY,
+            "attempt": 1,
+            "contract_digest": "",
+            "created_at": now,
+            "delivered_at": "",
+            "failed_at": "",
+            "failure_code": "",
+        }
+        contract = render_contract(item, prospective)
+        prospective["contract_digest"] = hashlib.sha256(contract.encode("utf-8")).hexdigest()
+        item["assignment"] = prospective
+        _append_event(
+            item,
+            kind="assignment",
+            text=f"launch assigned to subagent run {run_id} (attempt 1)",
+            now=now,
+        )
+        cycle["updated_at"] = now
+        _write_state(dir_path, key, state)
+        return copy.deepcopy(item), contract
+
+
+def _record_receipt(
+    session_key: str,
+    run_id: str,
+    mutate: Callable[[dict[str, Any], str, dict[str, Any]], list[tuple[str, str]] | None],
+) -> None:
+    """Apply one launch receipt to the item owning ``run_id``; a no-op otherwise.
+
+    Receipts are the manager's event stream: unknown runs, closed cycles, and
+    receipts that arrive after the assignment moved on must all be silent
+    no-ops, never errors, because the hook cannot know which are duplicates.
+    """
+    if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
+        raise WorkItemError("invalid subagent run ID")
+    key = ledger_key(session_key)
+    dir_path = coordinator_dir(key)
+    with _locked(dir_path):
+        state = _read_state_unlocked(dir_path)
+        _migrate_legacy_unlocked(dir_path, key, state)
+        state = _read_state_unlocked(dir_path)
+        cycle = state["active_cycle"]
+        if cycle is None:
+            return
+        now = _now_iso()
+        for item in cycle["items"]:
+            assignment = item["assignment"]
+            if assignment is None or assignment["worker_run_id"] != run_id:
+                continue
+            if item["state"] in TERMINAL_STATES:
+                return
+            events = mutate(item, now, assignment)
+            if not events:
+                return
+            for event_kind, event_text in events:
+                _append_event(item, kind=event_kind, text=event_text, now=now)
+            item["updated_at"] = now
+            cycle["updated_at"] = now
+            break
+        else:
+            return
+        _write_state(dir_path, key, state)
+
+
+def record_launch_accepted(session_key: str, run_id: str) -> None:
+    """Mark a pending launch as accepted by the manager; duplicates are no-ops."""
+
+    def mutate(item: dict[str, Any], now: str, assignment: dict[str, Any]):
+        if assignment["status"] != ASSIGNMENT_PENDING_DELIVERY:
+            return None
+        assignment["status"] = ASSIGNMENT_LAUNCH_QUEUED
+        return [
+            (
+                "assignment",
+                f"launch accepted; subagent run {run_id} queued (attempt {assignment['attempt']})",
+            )
+        ]
+
+    _record_receipt(session_key, run_id, mutate)
+
+
+def record_launch_delivered(session_key: str, run_id: str) -> None:
+    """Deliver the contract: the item is dispatched to the live subagent run."""
+
+    def mutate(item: dict[str, Any], now: str, assignment: dict[str, Any]):
+        if assignment["status"] not in {ASSIGNMENT_PENDING_DELIVERY, ASSIGNMENT_LAUNCH_QUEUED}:
+            return None
+        assignment["status"] = ASSIGNMENT_DELIVERED
+        assignment["delivered_at"] = now
+        item["state"] = STATE_DISPATCHED
+        item["finished_at"] = ""
+        return [
+            ("assignment", f"launch delivered to subagent run {run_id}"),
+            ("state", f"item dispatched to subagent run {run_id}"),
+        ]
+
+    _record_receipt(session_key, run_id, mutate)
+
+
+def record_launch_failed(session_key: str, run_id: str, failure_code: str) -> None:
+    """Record a launch refusal or capacity failure; the item stays open."""
+    code = _text(failure_code, _MAX_FAILURE_CODE, "failure_code", required=True)
+
+    def mutate(item: dict[str, Any], now: str, assignment: dict[str, Any]):
+        if assignment["status"] not in {ASSIGNMENT_PENDING_DELIVERY, ASSIGNMENT_LAUNCH_QUEUED}:
+            return None
+        assignment["status"] = ASSIGNMENT_FAILED
+        assignment["failed_at"] = now
+        assignment["failure_code"] = code
+        return [("assignment", f"launch failed for subagent run {run_id}: {code}")]
+
+    _record_receipt(session_key, run_id, mutate)
+
+
+def record_runtime_event(session_key: str, run_id: str, text: str) -> None:
+    """Append one bounded runtime note for a delivered or revoked worker run."""
+    event_text = _text(text, _MAX_TEXT, "text", required=True)
+
+    def mutate(item: dict[str, Any], now: str, assignment: dict[str, Any]):
+        if assignment["status"] not in {ASSIGNMENT_DELIVERED, ASSIGNMENT_REVOKED}:
+            return None
+        return [("runtime", event_text)]
+
+    _record_receipt(session_key, run_id, mutate)
+
+
+def arm_launch_retry(session_key: str, item_id: str) -> dict[str, Any]:
+    """Re-arm an undelivered or failed launch with one higher attempt number."""
+    key = ledger_key(session_key)
+    dir_path = coordinator_dir(key)
+    with _locked(dir_path):
+        state = _read_state_unlocked(dir_path)
+        _migrate_legacy_unlocked(dir_path, key, state)
+        state = _read_state_unlocked(dir_path)
+        cycle = state["active_cycle"]
+        if cycle is None:
+            raise WorkItemNotFound(f"work item {item_id!r} was not found")
+        item = _find_item(cycle, item_id)
+        if item["state"] in TERMINAL_STATES:
+            raise WorkItemError("a terminal work item cannot be retried")
+        assignment = item["assignment"]
+        if assignment is None or assignment["status"] not in {
+            ASSIGNMENT_PENDING_DELIVERY,
+            ASSIGNMENT_FAILED,
+        }:
+            raise WorkItemError("the assignment is not eligible for a launch retry")
+        if assignment["attempt"] >= _MAX_ATTEMPTS:
+            raise WorkItemError("the assignment has exhausted its launch attempts")
+        now = _now_iso()
+        assignment["attempt"] += 1
+        assignment["status"] = ASSIGNMENT_PENDING_DELIVERY
+        assignment["failed_at"] = ""
+        assignment["failure_code"] = ""
+        _append_event(
+            item,
+            kind="assignment",
+            text=(
+                "launch retry armed for subagent run "
+                f"{assignment['worker_run_id']} (attempt {assignment['attempt']})"
+            ),
+            now=now,
+        )
+        item["updated_at"] = now
+        cycle["updated_at"] = now
+        _write_state(dir_path, key, state)
+        return copy.deepcopy(item)
+
+
+def revoke_assignment(session_key: str, item_id: str) -> dict[str, Any]:
+    """Revoke the live assignment and return the item to the coordinator."""
+    key = ledger_key(session_key)
+    dir_path = coordinator_dir(key)
+    with _locked(dir_path):
+        state = _read_state_unlocked(dir_path)
+        _migrate_legacy_unlocked(dir_path, key, state)
+        state = _read_state_unlocked(dir_path)
+        cycle = state["active_cycle"]
+        if cycle is None:
+            raise WorkItemNotFound(f"work item {item_id!r} was not found")
+        item = _find_item(cycle, item_id)
+        if item["state"] in TERMINAL_STATES:
+            raise WorkItemError("a terminal work item cannot be revoked")
+        assignment = item["assignment"]
+        if assignment is None:
+            raise WorkItemError("the work item has no assignment to revoke")
+        if assignment["status"] == ASSIGNMENT_REVOKED:
+            raise WorkItemError("the assignment was already revoked")
+        now = _now_iso()
+        assignment["status"] = ASSIGNMENT_REVOKED
+        item["state"] = STATE_PROPOSED
+        item["finished_at"] = ""
+        _append_event(
+            item, kind="assignment", text=f"assignment {assignment['id']} revoked", now=now
+        )
+        item["updated_at"] = now
+        cycle["updated_at"] = now
+        _write_state(dir_path, key, state)
+        return copy.deepcopy(item)
+
+
+_WORKER_KEY_RE = re.compile(r"subagent:[0-9a-f]{8}\Z")
+
+
+def _check_worker_key(worker_key: str) -> None:
+    if not isinstance(worker_key, str) or not _WORKER_KEY_RE.fullmatch(worker_key):
+        raise WorkItemAssignmentDenied("the caller key is not a launched-subagent key")
+
+
+def _iter_store_states():
+    """Yield (dir, state) for every readable coordinator store, newest first.
+
+    This is a lockless existence scan for the worker surface: a torn read is
+    treated as no-match, and the authoritative locked write re-verifies
+    ownership before anything is persisted.
+    """
+    root = _root()
+    if not root.is_dir():
+        return
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        state_path = child / _STATE_FILE
+        try:
+            if state_path.stat().st_size > _MAX_STATE_BYTES * 2:
+                continue
+            raw = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(raw, dict):
+            yield child, raw
+
+
+def _find_worker_item(
+    worker_key: str, item_id: str
+) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Locate (dir, state, item, assignment) or refuse without leaking existence."""
+    _check_worker_key(worker_key)
+    if not isinstance(item_id, str) or not _ITEM_ID_RE.fullmatch(item_id):
+        raise WorkItemAssignmentDenied("the work item ID is not recognized")
+    for dir_path, raw in _iter_store_states():
+        cycle = raw.get("active_cycle")
+        if not isinstance(cycle, dict):
+            continue
+        items = cycle.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict) or item.get("id") != item_id:
+                continue
+            assignment = item.get("assignment")
+            if isinstance(assignment, dict) and assignment.get("worker_session_key") == worker_key:
+                return dir_path, raw, item, assignment
+            raise WorkItemAssignmentDenied("the work item is not assigned to this worker")
+    raise WorkItemAssignmentDenied("the work item is not assigned to this worker")
+
+
+def _read_coordinator_key(dir_path: Path) -> str:
+    key_path = dir_path / _KEY_FILE
+    try:
+        if key_path.stat().st_size > 4096:
+            raise WorkItemStoreCorrupt("coordinator key record is oversized")
+        key = key_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise WorkItemStoreCorrupt("coordinator key record is unreadable") from exc
+    if not key:
+        raise WorkItemStoreCorrupt("coordinator key record is empty")
+    return key
+
+
+def _worker_context(
+    dir_path: Path, worker_key: str, item_id: str
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]:
+    """Re-verify ownership under the store lock before a worker read or write."""
+    _check_worker_key(worker_key)
+    coordinator_key = _read_coordinator_key(dir_path)
+    with _locked(dir_path):
+        state = _read_state_unlocked(dir_path)
+        cycle = state["active_cycle"]
+        if cycle is None:
+            raise WorkItemAssignmentStale("the work cycle closed while the worker was acting")
+        try:
+            item = _find_item(cycle, item_id)
+        except WorkItemNotFound as exc:
+            raise WorkItemAssignmentStale("the work item is no longer active") from exc
+        assignment = item["assignment"]
+        if assignment is None or assignment["worker_session_key"] != worker_key:
+            raise WorkItemAssignmentDenied("the work item is not assigned to this worker")
+        if item["state"] in TERMINAL_STATES or assignment["status"] not in ASSIGNMENT_ACTIVE:
+            raise WorkItemAssignmentStale("the assignment is no longer active")
+        return state, item, assignment, coordinator_key
+
+
+def _worker_view(item: dict[str, Any]) -> dict[str, Any]:
+    """The worker's projection: its own assignment, never evaluator internals."""
+    assignment = item["assignment"]
+    return {
+        "id": item["id"],
+        "title": item["title"],
+        "state": item["state"],
+        "acceptance": copy.deepcopy(item["acceptance"]),
+        "canonical_ref": item["canonical_ref"],
+        "declared_resources": list(item["declared_resources"]),
+        "next_action": item["next_action"],
+        "assignment": {
+            "id": assignment["id"],
+            "status": assignment["status"],
+            "attempt": assignment["attempt"],
+            "contract_digest": assignment["contract_digest"],
+        },
+        "worker_handoff": copy.deepcopy(item["worker_handoff"]),
+        "events": copy.deepcopy(item["events"]),
+        "updated_at": item["updated_at"],
+    }
+
+
+def worker_assigned_list(worker_key: str) -> list[dict[str, Any]]:
+    """List this worker's live assignments without naming other workers' items."""
+    _check_worker_key(worker_key)
+    views: list[dict[str, Any]] = []
+    for _dir_path, raw in _iter_store_states():
+        cycle = raw.get("active_cycle")
+        if not isinstance(cycle, dict):
+            continue
+        items = cycle.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            assignment = item.get("assignment")
+            if not isinstance(assignment, dict):
+                continue
+            if assignment.get("worker_session_key") != worker_key:
+                continue
+            if assignment.get("status") not in ASSIGNMENT_ACTIVE:
+                continue
+            if item.get("state") in TERMINAL_STATES:
+                continue
+            try:
+                views.append(_worker_view(_coerce_item(item)))
+            except WorkItemStoreCorrupt:
+                continue
+    return views
+
+
+def worker_assigned_read(worker_key: str, item_id: str) -> dict[str, Any]:
+    """Read one live assignment exactly as the worker sees it."""
+    dir_path, _raw, _item, _assignment = _find_worker_item(worker_key, item_id)
+    _state, item, _assignment, _key = _worker_context(dir_path, worker_key, item_id)
+    return _worker_view(item)
+
+
+def worker_report_progress(
+    worker_key: str, item_id: str, text: str, kind: str
+) -> dict[str, Any]:
+    """Append one worker progress or blocker note under its worker fingerprint."""
+    if kind not in {"progress", "blocker"}:
+        raise WorkItemError("progress kind must be progress or blocker")
+    event_text = _text(text, _MAX_TEXT, "text", required=True)
+    dir_path, _raw, _item, _assignment = _find_worker_item(worker_key, item_id)
+    state, item, assignment, coordinator_key = _worker_context(dir_path, worker_key, item_id)
+    now = _now_iso()
+    _append_event(
+        item,
+        kind=kind,
+        text=event_text,
+        now=now,
+        actor=assignment["worker_fingerprint"],
+    )
+    item["updated_at"] = now
+    state["active_cycle"]["updated_at"] = now
+    _write_state(dir_path, coordinator_key, state)
+    return _worker_view(item)
+
+
+def _normalize_handoff_input(
+    outcome: Any,
+    next_action: Any,
+    verification: Any,
+    canonical_ref: Any,
+    blocker: Any,
+    release_condition: Any,
+) -> tuple[str, str, list[str], str, str, str]:
+    outcome_text = _text(outcome, _MAX_TEXT, "outcome", required=True)
+    action_text = _text(next_action, _MAX_TEXT, "next_action", required=True)
+    if (
+        not isinstance(verification, list)
+        or not verification
+        or len(verification) > _MAX_VERIFICATION
+        or not all(isinstance(entry, str) and entry.strip() for entry in verification)
+    ):
+        raise WorkItemError("verification must be 1-8 non-empty strings")
+    verification_text = [
+        _text(entry, _MAX_VERIFICATION_ENTRY, "verification entry", required=True)
+        for entry in verification
+    ]
+    ref_text = _text(canonical_ref, _MAX_REF, "canonical_ref")
+    blocker_text = _text(blocker, _MAX_TEXT, "blocker")
+    release_text = _text(release_condition, _MAX_TEXT, "release_condition")
+    if bool(blocker_text) != bool(release_text):
+        raise WorkItemError("blocker and release_condition must both be set or both be empty")
+    return outcome_text, action_text, verification_text, ref_text, blocker_text, release_text
+
+
+def worker_submit_handoff(
+    worker_key: str,
+    item_id: str,
+    *,
+    outcome: str,
+    next_action: str,
+    verification: list[str],
+    canonical_ref: str = "",
+    blocker: str = "",
+    release_condition: str = "",
+) -> dict[str, Any]:
+    """Record the worker's final handoff; the item state is never changed here.
+
+    Acceptance stays with the coordinator's typed evaluator; the handoff only
+    replaces the latest handoff record and appends one summary event.
+    """
+    (
+        outcome_text,
+        action_text,
+        verification_text,
+        ref_text,
+        blocker_text,
+        release_text,
+    ) = _normalize_handoff_input(
+        outcome, next_action, verification, canonical_ref, blocker, release_condition
+    )
+    dir_path, _raw, _item, _assignment = _find_worker_item(worker_key, item_id)
+    state, item, assignment, coordinator_key = _worker_context(dir_path, worker_key, item_id)
+    now = _now_iso()
+    fingerprint = assignment["worker_fingerprint"]
+    item["worker_handoff"] = {
+        "outcome": outcome_text,
+        "canonical_ref": ref_text,
+        "next_action": action_text,
+        "verification": verification_text,
+        "blocker": blocker_text,
+        "release_condition": release_text,
+        "at": now,
+        "actor": fingerprint,
+    }
+    _append_event(
+        item,
+        kind="worker_handoff",
+        text=outcome_text,
+        now=now,
+        actor=fingerprint,
+    )
+    item["updated_at"] = now
+    state["active_cycle"]["updated_at"] = now
+    _write_state(dir_path, coordinator_key, state)
+    return _worker_view(item)
 
 
 def _archive_path(dir_path: Path, cycle_id: str) -> Path:

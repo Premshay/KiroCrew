@@ -1500,6 +1500,10 @@ class SubagentManager:
         self._report_owners: dict[asyncio.Task, SubagentInfo] = {}  # type: ignore[type-arg]
         self._last_spawn_ts: float = 0.0  # monotonic time of the last actual start (stagger gate)
         self.hook_store: Any = None  # Optional ScriptHookStore, set by server.py
+        # Additional event sinks (e.g. work-dispatch receipts). Each observes
+        # the same (etype, info, extra) payload as ``_on_event``; a failing
+        # hook is logged and skipped, never fatal to the run.
+        self._event_hooks: list[Any] = []
         self._agents: dict[str, SubagentInfo] = {}
         # Continuable conversations: session_key ("subagent:<conv-id>") →
         # last-used unix ts. Drives the reaper's idle-TTL sweep. Rebuilt from
@@ -5294,11 +5298,51 @@ class SubagentManager:
             await self._fire_event("subagent_stalled", info, {"stalled": False})
 
     async def _fire_event(self, etype: str, info: SubagentInfo, extra: dict | None = None) -> None:
+        payload = extra or {}
         if self._on_event:
             try:
-                await self._on_event(etype, info, extra or {})
+                await self._on_event(etype, info, payload)
             except Exception:
                 logger.warning("on_event failed for %s/%s", etype, info.id, exc_info=True)
+        for hook in list(self._event_hooks):
+            try:
+                result = hook(etype, info, payload)
+                if result is not None and hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                logger.warning("event hook failed for %s/%s", etype, info.id, exc_info=True)
+
+    def add_event_hook(self, hook) -> None:
+        """Register an additional subagent event sink (idempotent by identity).
+
+        Hooks may be sync or async and receive ``(etype, info, extra)``; they
+        are best-effort observers and must not be the run's only delivery path
+        (the primary ``_on_event`` callback keeps its own error boundary).
+        """
+        if hook not in self._event_hooks:
+            self._event_hooks.append(hook)
+
+    def run_state(self, agent_id: str) -> str:
+        """Classify one run for dispatch recovery: queued|running|terminal|unknown.
+
+        ``running`` means this manager owns a live child for the ID. A
+        persisted folder with no live child is a dead run (completed, crashed,
+        or killed on a gateway restart) and classifies ``terminal``; a pruned
+        or never-persisted run is ``unknown`` so a caller may safely re-launch
+        under the same ID.
+        """
+        if not isinstance(agent_id, str) or not agent_id:
+            return "unknown"
+        info = self._agents.get(agent_id)
+        if info is not None:
+            return "terminal" if info.done else "running"
+        for params in self._queue:
+            if str(params.get("_preassigned_id") or "") == agent_id:
+                return "queued"
+        folder = agent_dir_for_display(agent_id)
+        if (folder / "state.json").exists() or (folder / "tombstone.json").exists():
+            return "terminal"
+        return "unknown"
 
     def _queued_depth(self, parent_session_key: str) -> int:
         """Number of spawns currently queued for *parent_session_key* (waiting

@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from aiohttp import web
 
-from kiro_crew import platform_compat, port_resolution
+from kiro_crew import platform_compat, port_resolution, work_dispatch
 from kiro_crew.apps.backend import start_enabled_app_backends
 from kiro_crew.apps.hooks_integration import (
     init_hooks_system,
@@ -1173,6 +1173,30 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_get("/api/work-items/archive", handlers.api_work_cycle_archive_list)
     app.router.add_get(
         "/api/work-items/archive/{cycle_id}", handlers.api_work_cycle_archive_read
+    )
+    app.router.add_get(
+        "/api/work-items/launch/candidates", handlers.api_work_item_launch_candidates
+    )
+    app.router.add_post(
+        "/api/work-items/items/{item_id}/launch", handlers.api_work_item_launch
+    )
+    app.router.add_post(
+        "/api/work-items/items/{item_id}/dispatch-retry",
+        handlers.api_work_item_dispatch_retry,
+    )
+    app.router.add_post(
+        "/api/work-items/items/{item_id}/revoke-assignment",
+        handlers.api_work_item_revoke_assignment,
+    )
+    app.router.add_get("/api/work-items/assigned", handlers.api_work_item_assigned_list)
+    app.router.add_get(
+        "/api/work-items/assigned/{item_id}", handlers.api_work_item_assigned_read
+    )
+    app.router.add_post(
+        "/api/work-items/assigned/{item_id}/progress", handlers.api_work_item_report_progress
+    )
+    app.router.add_post(
+        "/api/work-items/assigned/{item_id}/handoff", handlers.api_work_item_submit_handoff
     )
     app.router.add_get("/api/crons", handlers.api_crons)
     app.router.add_post("/api/crons", handlers.api_crons_create)
@@ -2744,6 +2768,7 @@ async def start_dashboard(
     # Wire script hooks into subagent tool execution path
     if state.subagents is not None:
         state.subagents.hook_store = state._hook_store
+        state.subagents.add_event_hook(work_dispatch.on_subagent_event)
 
     # Visible notice + pct reset when auto-compaction fires on a dashboard session
     state.wire_session_compact_callback()
@@ -3757,6 +3782,7 @@ async def start_api_server(
     # Wire script hooks into subagent tool execution path
     if state.subagents is not None:
         state.subagents.hook_store = state._hook_store
+        state.subagents.add_event_hook(work_dispatch.on_subagent_event)
 
     # Visible notice + pct reset when auto-compaction fires on a dashboard session
     state.wire_session_compact_callback()

@@ -82,6 +82,42 @@ routes reuse the ledger's recognized-session and restricted-mode gate, validate
 the complete shape through central validation schemas, and run locked I/O/evaluation
 off the event loop. Subagents have no inherited coordinator authority.
 
+## Launched-subagent dispatch (Slice 3)
+
+A coordinator may attach one governed native subagent run to one non-terminal
+item as its worker. It selects only from server-issued launch candidates (the
+live spawn roster, internal agents excluded) and never supplies an agent name,
+model, command, or other spawn input. The server renders the fixed contract
+from the item's immutable fields, arms a durable assignment with a
+preallocated run ID, and asks the subagent manager to create the child under
+that ID; the manager keeps its own governance, admission, queueing, and
+cancellation rules.
+
+| Tool | Effect |
+| --- | --- |
+| `work_item_launch_candidates` | List live spawn-roster agents as server-issued candidate handles. |
+| `work_item_launch` | Arm one assignment, request the governed launch, and record the receipt. |
+| `work_item_dispatch_retry` | Retry the same pending/failed assignment; never start a second child. |
+| `work_item_revoke_assignment` | Revoke the assignment, cancelling a queued run, returning the item to `proposed`. |
+| `work_item_assigned_list` / `work_item_assigned_read` | Worker-only reads for the exact assigned run. |
+| `work_item_report_progress` | Worker-only bounded progress or blocker note. |
+| `work_item_submit_handoff` | Worker-only bounded handoff proposal (no state change). |
+
+The assignment lifecycle is `pending_delivery` → `launch_queued` →
+`delivered`, with `failed` and `revoked` as named exits. Only the child-start
+receipt creates the `dispatched` item state; child exit records a bounded
+runtime event and never completes the item. A worker writes only under the
+manager-attributed `subagent:<run-id>` identity and only while the exact
+assignment is still active under the store lock; every other key is refused
+`assignment_access_denied` with no item data disclosed. A handoff replaces
+the latest proposal and appends a bounded event; the coordinator reviews it
+and only the typed evaluator can accept the item.
+
+SEL records the dispatch operation, the coordinator or worker fingerprint,
+the item and assignment fingerprints, and the outcome. It never records the
+contract body, progress text, handoff content, or transcript data. The
+existing-dashboard-session assignment half of Slice 3 is not implemented.
+
 ## Archive close protocol
 
 An active cycle closes only when every item is terminal. The server first writes
@@ -108,6 +144,8 @@ legacy compatibility only, not a new-cycle dependency.
 
 This store is not a worker queue, task runner, worktree manager, lane/mailbox
 system, dashboard board, liveness detector, or transcript archive. It records
-coordinator-owned outcomes and acceptance evidence only. Worker assignment,
-delivery receipts, cross-session reads, worker updates, and human-approval
-controls require a later explicit capability boundary.
+coordinator-owned outcomes and acceptance evidence only. Launched-subagent
+assignment and worker handoff now exist as the bounded Slice 3 surface;
+existing-dashboard-session assignment, cross-session reads beyond the exact
+assignment match, worker-initiated state changes, and human-approval
+controls remain later explicit boundaries.

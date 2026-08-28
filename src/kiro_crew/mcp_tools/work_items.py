@@ -138,6 +138,117 @@ def schemas() -> list[dict[str, Any]]:
                 "required": ["cycle_id"],
             },
         },
+        {
+            "name": "work_item_launch_candidates",
+            "description": (
+                "List server-issued launch candidates (live native spawn agents) that "
+                "work_item_launch may select. The candidate ID is the only accepted "
+                "target handle; raw agent, model, or command inputs are refused."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "work_item_launch",
+            "description": (
+                "Arm one launched-subagent assignment on an open item and ask the "
+                "governed manager to create the child run. Manager acceptance returns "
+                "launch_queued; only the child-start receipt creates dispatched. "
+                "A refusal leaves the item open with a named failed dispatch."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"item_id": item_id, "candidate_id": {"type": "string", "maxLength": 64}},
+                "required": ["item_id", "candidate_id"],
+            },
+        },
+        {
+            "name": "work_item_dispatch_retry",
+            "description": (
+                "Retry the SAME pending or failed launched assignment after target "
+                "revalidation. A live queued or running run is never duplicated; a "
+                "finished run is refused so it must be revoked and re-launched."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"item_id": item_id},
+                "required": ["item_id"],
+            },
+        },
+        {
+            "name": "work_item_revoke_assignment",
+            "description": (
+                "Explicitly revoke the item's current assignment, returning it to "
+                "proposed. A queued child run is cancelled; a running one is not."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"item_id": item_id},
+                "required": ["item_id"],
+            },
+        },
+        {
+            "name": "work_item_assigned_list",
+            "description": (
+                "Worker-only: list open work items currently assigned to THIS "
+                "subagent run. A dashboard session or another run sees nothing."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "work_item_assigned_read",
+            "description": (
+                "Worker-only: read one work item if it is currently assigned to "
+                "THIS subagent run, including its contract context."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"item_id": item_id},
+                "required": ["item_id"],
+            },
+        },
+        {
+            "name": "work_item_report_progress",
+            "description": (
+                "Worker-only: append one bounded progress or blocker note to the "
+                "assigned item. It cannot change state, acceptance, or assignment."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "item_id": item_id,
+                    "text": {"type": "string", "maxLength": 2000},
+                    "kind": {"type": "string", "enum": ["progress", "blocker"]},
+                },
+                "required": ["item_id", "text", "kind"],
+            },
+        },
+        {
+            "name": "work_item_submit_handoff",
+            "description": (
+                "Worker-only: store one bounded proposed handoff (outcome, next "
+                "action, 1-8 verification entries; blocker and release_condition "
+                "together or neither). It does not complete or accept the item; the "
+                "coordinator reviews it and the typed evaluator decides acceptance."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "item_id": item_id,
+                    "outcome": {"type": "string", "maxLength": 2000},
+                    "next_action": {"type": "string", "maxLength": 2000},
+                    "verification": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 512},
+                        "minItems": 1,
+                        "maxItems": 8,
+                    },
+                    "canonical_ref": {"type": "string", "maxLength": 2000},
+                    "blocker": {"type": "string", "maxLength": 2000},
+                    "release_condition": {"type": "string", "maxLength": 2000},
+                },
+                "required": ["item_id", "outcome", "next_action", "verification"],
+            },
+        },
     ]
 
 
@@ -214,6 +325,45 @@ def work_cycle_archive_read(name: str, args: dict[str, Any]) -> str:
     return _get(f"/api/work-items/archive/{args['cycle_id']}")
 
 
+def work_item_launch_candidates(name: str, args: dict[str, Any]) -> str:
+    return _get("/api/work-items/launch/candidates")
+
+
+def work_item_launch(name: str, args: dict[str, Any]) -> str:
+    item_id = args["item_id"]
+    return _post(f"/api/work-items/items/{item_id}/launch", {"candidate_id": args["candidate_id"]})
+
+
+def work_item_dispatch_retry(name: str, args: dict[str, Any]) -> str:
+    item_id = args["item_id"]
+    return _post(f"/api/work-items/items/{item_id}/dispatch-retry", {})
+
+
+def work_item_revoke_assignment(name: str, args: dict[str, Any]) -> str:
+    item_id = args["item_id"]
+    return _post(f"/api/work-items/items/{item_id}/revoke-assignment", {})
+
+
+def work_item_assigned_list(name: str, args: dict[str, Any]) -> str:
+    return _get("/api/work-items/assigned")
+
+
+def work_item_assigned_read(name: str, args: dict[str, Any]) -> str:
+    return _get(f"/api/work-items/assigned/{args['item_id']}")
+
+
+def work_item_report_progress(name: str, args: dict[str, Any]) -> str:
+    item_id = args["item_id"]
+    payload = {key: value for key, value in args.items() if key != "item_id"}
+    return _post(f"/api/work-items/assigned/{item_id}/progress", payload)
+
+
+def work_item_submit_handoff(name: str, args: dict[str, Any]) -> str:
+    item_id = args["item_id"]
+    payload = {key: value for key, value in args.items() if key != "item_id"}
+    return _post(f"/api/work-items/assigned/{item_id}/handoff", payload)
+
+
 HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "work_cycle_open": work_cycle_open,
     "work_item_create": work_item_create,
@@ -225,4 +375,12 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "work_cycle_close": work_cycle_close,
     "work_cycle_archive_list": work_cycle_archive_list,
     "work_cycle_archive_read": work_cycle_archive_read,
+    "work_item_launch_candidates": work_item_launch_candidates,
+    "work_item_launch": work_item_launch,
+    "work_item_dispatch_retry": work_item_dispatch_retry,
+    "work_item_revoke_assignment": work_item_revoke_assignment,
+    "work_item_assigned_list": work_item_assigned_list,
+    "work_item_assigned_read": work_item_assigned_read,
+    "work_item_report_progress": work_item_report_progress,
+    "work_item_submit_handoff": work_item_submit_handoff,
 }

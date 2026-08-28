@@ -1197,6 +1197,88 @@ WORK_CYCLE_ARCHIVE_READ_SCHEMA = ToolSchema(
     fields=[FieldSpec("cycle_id", str, required=True, max_len=64)],
 )
 
+# Slice 3 — launched-subagent dispatch (work_dispatch.py).  These schemas own
+# the outer request shape only: the store enforces the assignment state
+# machine, and the dispatch adapter enforces the manager receipt.  Worker
+# route schemas carry no worker-key or item fields beyond the path: the strict
+# caller identity is the owner, and the store revalidates it under lock.
+_WORK_ITEM_PROGRESS_KINDS = frozenset({"progress", "blocker"})
+
+WORK_ITEM_LAUNCH_CANDIDATES_SCHEMA = ToolSchema(tool_name="work_item_launch_candidates")
+WORK_ITEM_LAUNCH_ROUTE_SCHEMA = ToolSchema(
+    tool_name="work_item_launch_route",
+    fields=[FieldSpec("candidate_id", str, required=True, max_len=64)],
+)
+WORK_ITEM_LAUNCH_SCHEMA = ToolSchema(
+    tool_name="work_item_launch",
+    fields=[
+        FieldSpec("item_id", str, required=True, max_len=64),
+        FieldSpec("candidate_id", str, required=True, max_len=64),
+    ],
+)
+WORK_ITEM_DISPATCH_RETRY_ROUTE_SCHEMA = ToolSchema(tool_name="work_item_dispatch_retry_route")
+WORK_ITEM_DISPATCH_RETRY_SCHEMA = ToolSchema(
+    tool_name="work_item_dispatch_retry",
+    fields=[FieldSpec("item_id", str, required=True, max_len=64)],
+)
+WORK_ITEM_REVOKE_ROUTE_SCHEMA = ToolSchema(tool_name="work_item_revoke_route")
+WORK_ITEM_REVOKE_ASSIGNMENT_SCHEMA = ToolSchema(
+    tool_name="work_item_revoke_assignment",
+    fields=[FieldSpec("item_id", str, required=True, max_len=64)],
+)
+WORK_ITEM_ASSIGNED_LIST_SCHEMA = ToolSchema(tool_name="work_item_assigned_list")
+WORK_ITEM_ASSIGNED_READ_SCHEMA = ToolSchema(
+    tool_name="work_item_assigned_read",
+    fields=[FieldSpec("item_id", str, required=True, max_len=64)],
+)
+
+_WORK_ITEM_PROGRESS_FIELDS = [
+    FieldSpec("text", str, required=True, max_len=2000),
+    FieldSpec("kind", str, required=True, allowed=_WORK_ITEM_PROGRESS_KINDS),
+]
+WORK_ITEM_ASSIGNED_PROGRESS_ROUTE_SCHEMA = ToolSchema(
+    tool_name="work_item_assigned_progress_route", fields=_WORK_ITEM_PROGRESS_FIELDS
+)
+WORK_ITEM_REPORT_PROGRESS_SCHEMA = ToolSchema(
+    tool_name="work_item_report_progress",
+    fields=[FieldSpec("item_id", str, required=True, max_len=64), *_WORK_ITEM_PROGRESS_FIELDS],
+)
+
+_WORK_ITEM_HANDOFF_FIELDS = [
+    FieldSpec("outcome", str, required=True, max_len=2000),
+    FieldSpec("next_action", str, required=True, max_len=2000),
+    FieldSpec(
+        "verification",
+        list,
+        required=True,
+        max_items=8,
+        item_type=str,
+        item_max_len=512,
+    ),
+    FieldSpec("canonical_ref", str, max_len=2000),
+    FieldSpec("blocker", str, max_len=2000),
+    FieldSpec("release_condition", str, max_len=2000),
+]
+
+
+def _work_item_handoff_fields(cleaned: dict[str, Any]) -> None:
+    if bool(cleaned.get("blocker")) != bool(cleaned.get("release_condition")):
+        raise ValidationError(
+            "blocker", "blocker and release_condition must both be set or both be empty"
+        )
+
+
+WORK_ITEM_ASSIGNED_HANDOFF_ROUTE_SCHEMA = ToolSchema(
+    tool_name="work_item_assigned_handoff_route",
+    fields=_WORK_ITEM_HANDOFF_FIELDS,
+    custom_validator=_work_item_handoff_fields,
+)
+WORK_ITEM_SUBMIT_HANDOFF_SCHEMA = ToolSchema(
+    tool_name="work_item_submit_handoff",
+    fields=[FieldSpec("item_id", str, required=True, max_len=64), *_WORK_ITEM_HANDOFF_FIELDS],
+    custom_validator=_work_item_handoff_fields,
+)
+
 SPAWN_STATUS_SCHEMA = ToolSchema(
     tool_name="spawn_status",
     fields=[
@@ -2901,6 +2983,14 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "work_cycle_close": WORK_CYCLE_CLOSE_SCHEMA,
     "work_cycle_archive_list": WORK_CYCLE_ARCHIVE_LIST_SCHEMA,
     "work_cycle_archive_read": WORK_CYCLE_ARCHIVE_READ_SCHEMA,
+    "work_item_launch_candidates": WORK_ITEM_LAUNCH_CANDIDATES_SCHEMA,
+    "work_item_launch": WORK_ITEM_LAUNCH_SCHEMA,
+    "work_item_dispatch_retry": WORK_ITEM_DISPATCH_RETRY_SCHEMA,
+    "work_item_revoke_assignment": WORK_ITEM_REVOKE_ASSIGNMENT_SCHEMA,
+    "work_item_assigned_list": WORK_ITEM_ASSIGNED_LIST_SCHEMA,
+    "work_item_assigned_read": WORK_ITEM_ASSIGNED_READ_SCHEMA,
+    "work_item_report_progress": WORK_ITEM_REPORT_PROGRESS_SCHEMA,
+    "work_item_submit_handoff": WORK_ITEM_SUBMIT_HANDOFF_SCHEMA,
     "skill_search": SKILL_SEARCH_SCHEMA,
     "skill_discover": SKILL_DISCOVER_SCHEMA,
     "skill_fetch": SKILL_FETCH_SCHEMA,
