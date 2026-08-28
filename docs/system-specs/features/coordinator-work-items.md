@@ -85,17 +85,25 @@ off the event loop. Subagents have no inherited coordinator authority.
 ## Launched-subagent dispatch (Slice 3)
 
 A coordinator may attach one governed native subagent run to one non-terminal
-item as its worker. It selects only from server-issued launch candidates (the
-live spawn roster, internal agents excluded) and never supplies an agent name,
-model, command, or other spawn input. The server renders the fixed contract
-from the item's immutable fields, arms a durable assignment with a
-preallocated run ID, and asks the subagent manager to create the child under
-that ID; the manager keeps its own governance, admission, queueing, and
-cancellation rules.
+item as its worker. It selects only from server-issued launch candidates and
+never supplies an agent name, model, command, or other spawn input. The first
+and only worker class is `fast_recon`: the generated `kirocrew-fast` spec pins
+the fleet `fast` role and exposes read/search tools plus the exact worker
+handoff tools. Its managed-core policy excludes every other core tool, so it
+cannot recursively spawn, alter coordinator state, or call a generic executor.
+
+The server renders the fixed contract from the item's immutable fields, rejects
+it above 8 KiB before persisting an assignment, and starts the worker with at
+most 12 turns and no inherited memory, lessons, or project bundle. One
+coordinator can have only one live `fast_recon` assignment; the subagent manager
+continues to own global capacity, queueing, approval, and cancellation rules.
+The worker returns a bounded handoff rather than a transcript. A future fixed
+verification class requires its own server-owned command allowlist; there is no
+generic fast executor in this surface.
 
 | Tool | Effect |
 | --- | --- |
-| `work_item_launch_candidates` | List live spawn-roster agents as server-issued candidate handles. |
+| `work_item_launch_candidates` | List live, server-owned worker-class handles without agent or model identity. |
 | `work_item_launch` | Arm one assignment, request the governed launch, and record the receipt. |
 | `work_item_dispatch_retry` | Retry the same pending/failed assignment; never start a second child. |
 | `work_item_revoke_assignment` | Revoke the assignment, cancelling a queued run, returning the item to `proposed`. |
@@ -104,14 +112,22 @@ cancellation rules.
 | `work_item_submit_handoff` | Worker-only bounded handoff proposal (no state change). |
 
 The assignment lifecycle is `pending_delivery` → `launch_queued` →
-`delivered`, with `failed` and `revoked` as named exits. Only the child-start
-receipt creates the `dispatched` item state; child exit records a bounded
-runtime event and never completes the item. A worker writes only under the
-manager-attributed `subagent:<run-id>` identity and only while the exact
-assignment is still active under the store lock; every other key is refused
-`assignment_access_denied` with no item data disclosed. A handoff replaces
-the latest proposal and appends a bounded event; the coordinator reviews it
-and only the typed evaluator can accept the item.
+`delivered`, with `failed` and `revoked` as named exits. A live child revoked
+without cancellation enters `revoked_running` until its terminal manager event
+arrives, then becomes `revoked`; that interval blocks a replacement fast
+worker. Only the child-start receipt creates the `dispatched` item state; child
+exit records a bounded runtime event and never completes the item. A worker
+writes only under the manager-attributed `subagent:<run-id>` identity and only
+while the exact assignment is still active under the store lock; every other
+key is refused `assignment_access_denied` with no item data disclosed. A
+handoff replaces the latest proposal and appends a bounded event; the
+coordinator reviews it and only the typed evaluator can accept the item.
+
+Revoking a queued run first requires `SubagentManager.cancel()` to return true.
+If manager state or cancellation is unavailable, or cancellation reports false,
+the assignment stays `launch_queued` and the route returns a retryable named
+error; it is never recorded as revoked while the child may still start. A
+running child is not cancelled by revocation.
 
 SEL records the dispatch operation, the coordinator or worker fingerprint,
 the item and assignment fingerprints, and the outcome. It never records the

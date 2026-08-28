@@ -15,8 +15,8 @@ from aiohttp.test_utils import make_mocked_request
 from kiro_crew import work_items as wi
 
 COORDINATOR = "chat-route-1"
-AGENT = "crew-codex"
-CANDIDATE = hashlib.sha256(AGENT.encode("utf-8")).hexdigest()[:16]
+AGENT = "kirocrew-fast"
+CANDIDATE = hashlib.sha256(b"work-item-worker:fast-recon:v1").hexdigest()[:16]
 
 
 @pytest.fixture(autouse=True)
@@ -60,9 +60,14 @@ class QueuedManager:
     def add_event_hook(self, hook) -> None:
         pass
 
-    def spawn(self, contract, parent_session_key="", agent="", _preassigned_id=""):
+    def spawn(self, contract, parent_session_key="", agent="", _preassigned_id="", **kwargs):
         self.spawned.append(
-            {"agent": agent, "parent_session_key": parent_session_key, "run_id": _preassigned_id}
+            {
+                "agent": agent,
+                "parent_session_key": parent_session_key,
+                "run_id": _preassigned_id,
+                **kwargs,
+            }
         )
         self.run_states[_preassigned_id] = "queued"
         return MagicMock(error=None)
@@ -70,8 +75,9 @@ class QueuedManager:
     def run_state(self, run_id: str) -> str:
         return self.run_states.get(run_id, "unknown")
 
-    async def cancel(self, run_id: str) -> None:
+    async def cancel(self, run_id: str) -> bool:
         self.cancelled.append(run_id)
+        return True
 
 
 @pytest.fixture()
@@ -85,7 +91,9 @@ def routes(monkeypatch):
     monkeypatch.setattr(session_ledger, "_recognize_session", _recognized)
     monkeypatch.setattr(session_ledger, "_is_restricted_session", lambda *a: False)
     monkeypatch.setattr(
-        work_dispatch, "list_agents", lambda: [types.SimpleNamespace(name=AGENT)]
+        work_dispatch,
+        "list_agents",
+        lambda: [types.SimpleNamespace(name=AGENT, model="fast", mcp_servers=["kirocrew-core"])],
     )
     return work_items
 
@@ -118,7 +126,9 @@ async def test_launch_candidates_route_returns_stable_handles(routes):
     assert response.status == 200
     payload = json.loads(response.text)
     candidates = payload["result"]["candidates"]
-    assert [c["agent"] for c in candidates] == [AGENT]
+    assert [c["worker_class"] for c in candidates] == ["fast_recon"]
+    assert candidates[0]["contract_max_bytes"] == 8 * 1024
+    assert "agent" not in candidates[0]
     assert len(candidates[0]["id"]) == 16
 
 
@@ -142,6 +152,10 @@ async def test_launch_route_arms_and_reports_queued(routes):
     assert assignment["status"] == wi.ASSIGNMENT_LAUNCH_QUEUED
     assert manager.spawned[0]["run_id"] == assignment["worker_run_id"]
     assert manager.spawned[0]["agent"] == AGENT
+    assert manager.spawned[0]["max_turns"] == 12
+    assert manager.spawned[0]["include_memory"] is False
+    assert manager.spawned[0]["include_lessons"] is False
+    assert manager.spawned[0]["include_project"] is False
 
 
 @pytest.mark.asyncio

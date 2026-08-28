@@ -43,6 +43,7 @@ from kiro_crew.agent_files import (
     AGENT_FILENAME,
 )
 from kiro_crew.agent_files import CONSOLIDATE_AGENT_FILENAME as _CONSOLIDATE_AGENT_FILENAME
+from kiro_crew.agent_files import FAST_RECON_AGENT_FILENAME as _FAST_RECON_AGENT_FILENAME
 from kiro_crew.agent_files import HEARTBEAT_AGENT_FILENAME as _HEARTBEAT_AGENT_FILENAME
 from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_FILENAME
 from kiro_crew.agent_files import LITE_AGENT_FILENAME as _LITE_AGENT_FILENAME
@@ -4122,6 +4123,13 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     except Exception:
         logger.debug("kirocrew-heartbeat agent install failed", exc_info=True)
 
+    # Install the bounded CPU-fast reconnaissance identity used only by the
+    # coordinator work-item dispatcher.
+    try:
+        _install_fast_recon_agent()
+    except Exception:
+        logger.debug("kirocrew-fast agent install failed", exc_info=True)
+
     # Install kirocrew-consolidate agent (history consolidation's own identity)
     try:
         _install_consolidate_agent()
@@ -4685,6 +4693,103 @@ def _install_heartbeat_agent() -> None:
     # CC model for the heartbeat agent lives in the sidecar, not the kiro spec.
     agent_state.set_cc_model("kirocrew-heartbeat", _background_cc_model())
     logger.info("Installed heartbeat agent config: %s", path)
+
+
+_FAST_RECON_SYSTEM_PROMPT = """# KiroCrew Fast Reconnaissance Worker
+
+You are `kirocrew-fast`, a bounded reconnaissance worker for one assigned
+KiroCrew work item. Your parent remains responsible for design, edits,
+integration, and acceptance.
+
+## Charter
+
+- Inspect only the files and static project evidence necessary to answer the
+  assigned question. Do not run commands, modify files, use the network, or
+  start another worker; those capabilities are intentionally absent.
+- You receive no parent memory, lessons, or project bundle. Treat the contract
+  as the complete scope and report a blocker rather than guessing missing context.
+- Use `work_item_assigned_read` when needed, then finish with exactly one
+  `work_item_submit_handoff`. Keep the handoff concise: findings, exact file
+  references, and a next action for the parent. Do not return a transcript.
+- You cannot change work-item state, acceptance, or the assignment.
+"""
+
+_FAST_RECON_ALLOWED_CORE_TOOLS = frozenset(
+    {
+        "work_item_assigned_list",
+        "work_item_assigned_read",
+        "work_item_report_progress",
+        "work_item_submit_handoff",
+    }
+)
+
+
+def _fast_recon_excluded_core_tools() -> list[str]:
+    """Deny every managed core tool except the worker's fixed handoff surface."""
+    # Deliberately derive the complement from the live product tool registry:
+    # a later core tool is excluded by default until this narrow contract names
+    # it after review, rather than silently widening a read-only worker.
+    from kiro_crew.mcp_tools import build_tool_list
+
+    return sorted(
+        str(tool["name"])
+        for tool in build_tool_list()
+        if isinstance(tool.get("name"), str)
+        and tool["name"] not in _FAST_RECON_ALLOWED_CORE_TOOLS
+    )
+
+
+def _fast_recon_core_mcp() -> dict[str, dict]:
+    """Copy the resolved core server without inherited visibility filters."""
+    main_config = _load_json(kiro_agents_dir_path() / AGENT_FILENAME)
+    main_mcp = main_config.get("mcpServers", {}) or {}
+    entry = main_mcp.get("kirocrew-core")
+    if not isinstance(entry, dict):
+        return {}
+    cleaned = dict(entry)
+    args = entry.get("args") or []
+    if not isinstance(args, list):
+        return {"kirocrew-core": cleaned}
+    filters = ("--include-tools", "--include-tool-tags", "--exclude-tools")
+    retained: list[Any] = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if not isinstance(arg, str):
+            retained.append(arg)
+            continue
+        if any(arg == flag or arg.startswith(flag + "=") for flag in filters):
+            skip_next = "=" not in arg
+            continue
+        retained.append(arg)
+    cleaned["args"] = retained
+    return {"kirocrew-core": cleaned}
+
+
+def _install_fast_recon_agent() -> None:
+    """Install the fixed local-fast, read-only work-item reconnaissance worker."""
+    kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
+    path = kiro_agents_dir_path() / _FAST_RECON_AGENT_FILENAME
+    mcp = _fast_recon_core_mcp()
+    config: dict[str, object] = {
+        "name": "kirocrew-fast",
+        "description": (
+            "Bounded read-only reconnaissance worker for one coordinator work item. "
+            "It uses the local fast lane and can only inspect and submit a handoff."
+        ),
+        # ``fast`` is the fleet role. The router resolves it to the active CPU
+        # lane; the dispatcher separately verifies this exact spec at launch.
+        "model": "fast",
+        "includeMcpJson": False,
+        "prompt": _FAST_RECON_SYSTEM_PROMPT,
+        "mcpServers": mcp,
+        "tools": ["fs_read", "grep", "glob", *[f"@{name}" for name in mcp]],
+        "managedToolPolicy": {"exclude": _fast_recon_excluded_core_tools()},
+    }
+    _atomic_json_write(path, config)
+    logger.info("Installed fast reconnaissance agent config: %s", path)
 
 
 def sync_aim_packages() -> None:

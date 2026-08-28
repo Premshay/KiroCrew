@@ -25,6 +25,10 @@ CONDUCTOR_AGENT_FILENAME = "kirocrew-conductor.json"
 KNOWLEDGE_AGENT_FILENAME = "kirocrew-knowledge.json"
 RESEARCH_AGENT_FILENAME = "kirocrew-research.json"
 HEARTBEAT_AGENT_FILENAME = "kirocrew-heartbeat.json"
+# A tightly scoped CPU-fast reconnaissance worker. It is optional: the
+# coordinator dispatch surface advertises it only after this managed spec is
+# present and carries its required core MCP server.
+FAST_RECON_AGENT_FILENAME = "kirocrew-fast.json"
 # History consolidation's own identity. Same empty shell as lite, split out
 # because its payload class differs: consolidation feeds a whole session tail
 # into one prompt, so deployments route it to a large-context engine while
@@ -45,6 +49,7 @@ OWNED_KIRO_AGENT_FILES = (
     KNOWLEDGE_AGENT_FILENAME,
     RESEARCH_AGENT_FILENAME,
     HEARTBEAT_AGENT_FILENAME,
+    FAST_RECON_AGENT_FILENAME,
     CONSOLIDATE_AGENT_FILENAME,
 )
 OWNED_CC_AGENT_FILES = (CC_MCP_SIDECAR_FILENAME,)
@@ -59,7 +64,8 @@ OWNED_CC_AGENT_FILES = (CC_MCP_SIDECAR_FILENAME,)
 # The remaining OWNED_KIRO_AGENT_FILES entries are deliberately excluded: their
 # installers in ``agent.py`` already degrade to ``logger.debug`` on failure
 # because each one only disables its own feature (goal conducting, Knowledge
-# extraction, Research Lab, unattended heartbeat polling).
+# extraction, Research Lab, unattended heartbeat polling, or bounded fast
+# reconnaissance).
 REQUIRED_KIRO_AGENT_FILES = (
     AGENT_FILENAME,
     LITE_AGENT_FILENAME,

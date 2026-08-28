@@ -47,6 +47,7 @@ ASSIGNMENT_LAUNCH_QUEUED = "launch_queued"
 ASSIGNMENT_DELIVERED = "delivered"
 ASSIGNMENT_FAILED = "failed"
 ASSIGNMENT_REVOKED = "revoked"
+ASSIGNMENT_REVOKED_RUNNING = "revoked_running"
 ASSIGNMENT_STATUSES = frozenset(
     {
         ASSIGNMENT_PENDING_DELIVERY,
@@ -54,6 +55,7 @@ ASSIGNMENT_STATUSES = frozenset(
         ASSIGNMENT_DELIVERED,
         ASSIGNMENT_FAILED,
         ASSIGNMENT_REVOKED,
+        ASSIGNMENT_REVOKED_RUNNING,
     }
 )
 # The statuses a worker may act on: intent exists and nothing was revoked or
@@ -61,6 +63,9 @@ ASSIGNMENT_STATUSES = frozenset(
 ASSIGNMENT_ACTIVE = frozenset(
     {ASSIGNMENT_PENDING_DELIVERY, ASSIGNMENT_LAUNCH_QUEUED, ASSIGNMENT_DELIVERED}
 )
+# A revoked live child cannot write, but it may still consume the sole
+# fast-worker slot until the manager emits its terminal receipt.
+ASSIGNMENT_BLOCKS_RELAUNCH = ASSIGNMENT_ACTIVE | frozenset({ASSIGNMENT_REVOKED_RUNNING})
 ASSIGNMENT_SOURCE_LAUNCHED = "launched_subagent"
 ASSIGNMENT_SOURCE_EXISTING = "existing_session"
 
@@ -136,6 +141,14 @@ class WorkItemAssignmentDenied(WorkItemError):
 
 class WorkItemAssignmentStale(WorkItemError):
     """The assignment is no longer live for the calling worker."""
+
+
+class WorkItemContractTooLarge(WorkItemError):
+    """The selected worker class cannot safely receive this rendered contract."""
+
+
+class WorkItemWorkerClassBusy(WorkItemError):
+    """The selected exclusive worker class already has a live assignment."""
 
 
 def _now_iso() -> str:
@@ -1005,7 +1018,25 @@ def _render_acceptance(acceptance: dict[str, Any]) -> list[str]:
     return lines
 
 
-def render_contract(item: dict[str, Any], assignment: dict[str, Any]) -> str:
+def _contract_byte_limit(contract_max_bytes: int | None) -> int:
+    """Validate an optional worker-class contract cap against the store ceiling."""
+    if contract_max_bytes is None:
+        return _MAX_CONTRACT_BYTES
+    if (
+        not isinstance(contract_max_bytes, int)
+        or isinstance(contract_max_bytes, bool)
+        or not 1 <= contract_max_bytes <= _MAX_CONTRACT_BYTES
+    ):
+        raise WorkItemError("the worker contract byte limit is invalid")
+    return contract_max_bytes
+
+
+def render_contract(
+    item: dict[str, Any],
+    assignment: dict[str, Any],
+    *,
+    contract_max_bytes: int | None = None,
+) -> str:
     """Render the deterministic plain-text contract handed to a launched worker.
 
     The contract is product text, not protocol: it names the immutable
@@ -1044,15 +1075,18 @@ def render_contract(item: dict[str, Any], assignment: dict[str, Any]) -> str:
         "  only the coordinator's typed evaluator accepts the item.",
     ]
     contract = "\n".join(lines) + "\n"
-    if len(contract.encode("utf-8")) > _MAX_CONTRACT_BYTES:
-        raise WorkItemError("the rendered contract exceeds the byte limit")
+    if len(contract.encode("utf-8")) > _contract_byte_limit(contract_max_bytes):
+        raise WorkItemContractTooLarge("the rendered contract exceeds the worker byte limit")
     return contract
 
 
 def launch_item(
     session_key: str,
     item_id: str,
-    candidate_fingerprint: str = ""
+    candidate_fingerprint: str = "",
+    *,
+    contract_max_bytes: int | None = None,
+    exclusive_candidate_fingerprint: str = "",
 ) -> tuple[dict[str, Any], str]:
     """Arm a new launched-subagent assignment on one non-terminal item.
 
@@ -1063,6 +1097,12 @@ def launch_item(
     """
     if candidate_fingerprint and not _FINGERPRINT_RE.fullmatch(candidate_fingerprint):
         raise WorkItemError("the launch candidate fingerprint is invalid")
+    if (
+        exclusive_candidate_fingerprint
+        and not _FINGERPRINT_RE.fullmatch(exclusive_candidate_fingerprint)
+    ):
+        raise WorkItemError("the exclusive launch candidate fingerprint is invalid")
+    contract_limit = _contract_byte_limit(contract_max_bytes)
     key = ledger_key(session_key)
     dir_path = coordinator_dir(key)
     with _locked(dir_path):
@@ -1078,6 +1118,19 @@ def launch_item(
         assignment = item["assignment"]
         if assignment is not None and assignment["status"] != ASSIGNMENT_REVOKED:
             raise WorkItemError("an active assignment already exists for this work item")
+        if exclusive_candidate_fingerprint:
+            for existing in cycle["items"]:
+                if existing["id"] == item_id:
+                    continue
+                active = existing.get("assignment")
+                if (
+                    active is not None
+                    and active["candidate_fingerprint"] == exclusive_candidate_fingerprint
+                    and active["status"] in ASSIGNMENT_BLOCKS_RELAUNCH
+                ):
+                    raise WorkItemWorkerClassBusy(
+                        "the selected worker class already has a live assignment"
+                    )
         now = _now_iso()
         run_id = uuid.uuid4().hex[:8]
         worker_key = f"subagent:{run_id}"
@@ -1097,7 +1150,7 @@ def launch_item(
             "failed_at": "",
             "failure_code": "",
         }
-        contract = render_contract(item, prospective)
+        contract = render_contract(item, prospective, contract_max_bytes=contract_limit)
         prospective["contract_digest"] = hashlib.sha256(contract.encode("utf-8")).hexdigest()
         item["assignment"] = prospective
         _append_event(
@@ -1204,19 +1257,33 @@ def record_launch_failed(session_key: str, run_id: str, failure_code: str) -> No
 
 
 def record_runtime_event(session_key: str, run_id: str, text: str) -> None:
-    """Append one bounded runtime note for a delivered or revoked worker run."""
+    """Append one bounded runtime note and release a revoked live worker slot."""
     event_text = _text(text, _MAX_TEXT, "text", required=True)
 
     def mutate(item: dict[str, Any], now: str, assignment: dict[str, Any]):
-        if assignment["status"] not in {ASSIGNMENT_DELIVERED, ASSIGNMENT_REVOKED}:
+        if assignment["status"] not in {
+            ASSIGNMENT_DELIVERED,
+            ASSIGNMENT_REVOKED,
+            ASSIGNMENT_REVOKED_RUNNING,
+        }:
             return None
-        return [("runtime", event_text)]
+        events = [("runtime", event_text)]
+        if assignment["status"] == ASSIGNMENT_REVOKED_RUNNING:
+            assignment["status"] = ASSIGNMENT_REVOKED
+            events.append(("assignment", f"revoked subagent run {run_id} ended"))
+        return events
 
     _record_receipt(session_key, run_id, mutate)
 
 
-def arm_launch_retry(session_key: str, item_id: str) -> dict[str, Any]:
-    """Re-arm an undelivered or failed launch with one higher attempt number."""
+def arm_launch_retry(
+    session_key: str,
+    item_id: str,
+    *,
+    contract_max_bytes: int | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Re-arm an undelivered or failed launch after revalidating its contract."""
+    contract_limit = _contract_byte_limit(contract_max_bytes)
     key = ledger_key(session_key)
     dir_path = coordinator_dir(key)
     with _locked(dir_path):
@@ -1237,6 +1304,9 @@ def arm_launch_retry(session_key: str, item_id: str) -> dict[str, Any]:
             raise WorkItemError("the assignment is not eligible for a launch retry")
         if assignment["attempt"] >= _MAX_ATTEMPTS:
             raise WorkItemError("the assignment has exhausted its launch attempts")
+        # Check before writing the next attempt. A changed worker-class cap must
+        # not turn a failed assignment into a retryable one that cannot launch.
+        contract = render_contract(item, assignment, contract_max_bytes=contract_limit)
         now = _now_iso()
         assignment["attempt"] += 1
         assignment["status"] = ASSIGNMENT_PENDING_DELIVERY
@@ -1254,11 +1324,18 @@ def arm_launch_retry(session_key: str, item_id: str) -> dict[str, Any]:
         item["updated_at"] = now
         cycle["updated_at"] = now
         _write_state(dir_path, key, state)
-        return copy.deepcopy(item)
+        return copy.deepcopy(item), contract
 
 
-def revoke_assignment(session_key: str, item_id: str) -> dict[str, Any]:
-    """Revoke the live assignment and return the item to the coordinator."""
+def revoke_assignment(
+    session_key: str,
+    item_id: str,
+    *,
+    worker_may_still_run: bool = False,
+) -> dict[str, Any]:
+    """Revoke the assignment without releasing a known-running worker slot."""
+    if not isinstance(worker_may_still_run, bool):
+        raise WorkItemError("worker_may_still_run must be a boolean")
     key = ledger_key(session_key)
     dir_path = coordinator_dir(key)
     with _locked(dir_path):
@@ -1274,14 +1351,20 @@ def revoke_assignment(session_key: str, item_id: str) -> dict[str, Any]:
         assignment = item["assignment"]
         if assignment is None:
             raise WorkItemError("the work item has no assignment to revoke")
-        if assignment["status"] == ASSIGNMENT_REVOKED:
+        if assignment["status"] in {ASSIGNMENT_REVOKED, ASSIGNMENT_REVOKED_RUNNING}:
             raise WorkItemError("the assignment was already revoked")
         now = _now_iso()
-        assignment["status"] = ASSIGNMENT_REVOKED
+        assignment["status"] = (
+            ASSIGNMENT_REVOKED_RUNNING if worker_may_still_run else ASSIGNMENT_REVOKED
+        )
         item["state"] = STATE_PROPOSED
         item["finished_at"] = ""
+        suffix = " while its subagent run finishes" if worker_may_still_run else ""
         _append_event(
-            item, kind="assignment", text=f"assignment {assignment['id']} revoked", now=now
+            item,
+            kind="assignment",
+            text=f"assignment {assignment['id']} revoked{suffix}",
+            now=now,
         )
         item["updated_at"] = now
         cycle["updated_at"] = now

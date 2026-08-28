@@ -17,13 +17,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from kiro_crew import work_items
 from kiro_crew.agent_discovery import list_agents
 from kiro_crew.sel import sel
 from kiro_crew.session_ledger import ledger_key
-from kiro_crew.subagent import UNADVERTISED_AGENTS
 
 logger = logging.getLogger(__name__)
 
@@ -41,27 +41,68 @@ def _fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
-def _live_agent_names() -> set[str]:
-    names = {agent.name for agent in list_agents()}
-    return names - UNADVERTISED_AGENTS
+@dataclass(frozen=True)
+class LaunchCandidate:
+    """One product-owned worker class with its fixed runtime envelope."""
+
+    id: str
+    worker_class: str
+    agent_name: str
+    contract_max_bytes: int
+    max_turns: int
 
 
-def launch_candidates() -> list[dict[str, str]]:
-    """Live spawn-roster agents as server-issued candidates.
+_FAST_RECON = LaunchCandidate(
+    id=_fingerprint("work-item-worker:fast-recon:v1"),
+    worker_class="fast_recon",
+    agent_name="kirocrew-fast",
+    contract_max_bytes=8 * 1024,
+    max_turns=12,
+)
+_CANDIDATES = (_FAST_RECON,)
 
-    The candidate ID is the stable handle ``work_item_launch`` accepts; it
-    resolves against a fresh roster at launch time, so a stale candidate
-    cannot select a removed or renamed agent.
+
+def _live_candidates() -> tuple[LaunchCandidate, ...]:
+    """Return classes whose generated, model-pinned worker spec is live.
+
+    The roster is re-read for every candidate query and launch. A caller never
+    selects an arbitrary installed agent: the fixed class registry below owns
+    the internal agent name, context scope, turn cap, and contract ceiling.
     """
-    return [{"id": _fingerprint(name), "agent": name} for name in sorted(_live_agent_names())]
+    installed = {agent.name: agent for agent in list_agents()}
+    return tuple(
+        candidate
+        for candidate in _CANDIDATES
+        if (
+            (agent := installed.get(candidate.agent_name)) is not None
+            and agent.model == "fast"
+            and "kirocrew-core" in agent.mcp_servers
+        )
+    )
 
 
-def _resolve_candidate(candidate_id: str) -> str | None:
+def launch_candidates() -> list[dict[str, Any]]:
+    """Live product worker classes as opaque, server-issued candidates.
+
+    The handle resolves against a fresh registry at launch time. The response
+    deliberately contains neither an agent name nor a model name.
+    """
+    return [
+        {
+            "id": candidate.id,
+            "worker_class": candidate.worker_class,
+            "contract_max_bytes": candidate.contract_max_bytes,
+        }
+        for candidate in _live_candidates()
+    ]
+
+
+def _resolve_candidate(candidate_id: str) -> LaunchCandidate | None:
     if not isinstance(candidate_id, str) or not candidate_id:
         return None
-    for name in _live_agent_names():
-        if _fingerprint(name) == candidate_id:
-            return name
+    for candidate in _live_candidates():
+        if candidate.id == candidate_id:
+            return candidate
     return None
 
 
@@ -122,8 +163,8 @@ async def launch(
     session_key: str, item_id: str, candidate_id: str, manager: Any
 ) -> dict[str, Any]:
     """Arm the assignment, ask the governed manager to launch, record the receipt."""
-    agent_name = _resolve_candidate(candidate_id)
-    if agent_name is None:
+    candidate = _resolve_candidate(candidate_id)
+    if candidate is None:
         _audit_caller(session_key, "work_item.launch", "worker_target_unavailable")
         raise WorkDispatchError(
             "the launch candidate is not a live agent",
@@ -131,15 +172,39 @@ async def launch(
             status=400,
         )
     _register_hook(manager)
-    item, contract = await asyncio.to_thread(
-        work_items.launch_item, session_key, item_id, candidate_id
-    )
+    try:
+        item, contract = await asyncio.to_thread(
+            work_items.launch_item,
+            session_key,
+            item_id,
+            candidate_id,
+            contract_max_bytes=candidate.contract_max_bytes,
+            exclusive_candidate_fingerprint=candidate.id,
+        )
+    except work_items.WorkItemContractTooLarge as exc:
+        _audit_caller(session_key, "work_item.launch", "worker_contract_too_large")
+        raise WorkDispatchError(
+            "the selected worker class cannot receive this work item contract",
+            code="worker_contract_too_large",
+            status=400,
+        ) from exc
+    except work_items.WorkItemWorkerClassBusy as exc:
+        _audit_caller(session_key, "work_item.launch", "fast_worker_busy")
+        raise WorkDispatchError(
+            "the fast reconnaissance worker already has a live assignment",
+            code="fast_worker_busy",
+            status=409,
+        ) from exc
     run_id = item["assignment"]["worker_run_id"]
     try:
         info = manager.spawn(
             contract,
             parent_session_key=session_key,
-            agent=agent_name,
+            agent=candidate.agent_name,
+            max_turns=candidate.max_turns,
+            include_memory=False,
+            include_lessons=False,
+            include_project=False,
             _preassigned_id=run_id,
         )
     except Exception as exc:
@@ -216,26 +281,39 @@ async def dispatch_retry(session_key: str, item_id: str, manager: Any) -> dict[s
             code="worker_launch_refused",
             status=409,
         )
-    # Unknown: the manager has no record of this run. Re-arm the same run ID.
-    item = await asyncio.to_thread(work_items.arm_launch_retry, session_key, item_id)
-    agent_name = _resolve_candidate(assignment["candidate_fingerprint"])
-    if agent_name is None:
-        await asyncio.to_thread(
-            work_items.record_launch_failed, session_key, run_id, "worker_target_changed"
-        )
+    # Unknown: the manager has no record of this run. Re-arm the same run ID
+    # only after resolving its original server-owned class again.
+    candidate = _resolve_candidate(assignment["candidate_fingerprint"])
+    if candidate is None:
         _audit_caller(session_key, "work_item.dispatch_retry", "worker_target_changed", item)
         raise WorkDispatchError(
             "the launch candidate is no longer a live agent",
             code="worker_target_changed",
             status=409,
         )
-    item = await asyncio.to_thread(work_items.read_item, session_key, item_id)
-    contract = work_items.render_contract(item, item["assignment"])
+    try:
+        item, contract = await asyncio.to_thread(
+            work_items.arm_launch_retry,
+            session_key,
+            item_id,
+            contract_max_bytes=candidate.contract_max_bytes,
+        )
+    except work_items.WorkItemContractTooLarge as exc:
+        _audit_caller(session_key, "work_item.dispatch_retry", "worker_contract_too_large", item)
+        raise WorkDispatchError(
+            "the selected worker class cannot receive this work item contract",
+            code="worker_contract_too_large",
+            status=400,
+        ) from exc
     try:
         info = manager.spawn(
             contract,
             parent_session_key=session_key,
-            agent=agent_name,
+            agent=candidate.agent_name,
+            max_turns=candidate.max_turns,
+            include_memory=False,
+            include_lessons=False,
+            include_project=False,
             _preassigned_id=run_id,
         )
     except Exception as exc:
@@ -262,26 +340,105 @@ async def dispatch_retry(session_key: str, item_id: str, manager: Any) -> dict[s
 
 
 async def revoke_assignment(session_key: str, item_id: str, manager: Any) -> dict[str, Any]:
-    """Revoke the live assignment; cancel only a queued run, never a live one."""
+    """Revoke one assignment without allowing a still-running replacement race."""
     item = await asyncio.to_thread(work_items.read_item, session_key, item_id)
     assignment = item.get("assignment")
-    if assignment is not None and assignment["status"] == work_items.ASSIGNMENT_LAUNCH_QUEUED:
+    worker_may_still_run = False
+    if assignment is not None and assignment["status"] in work_items.ASSIGNMENT_ACTIVE:
         run_id = assignment["worker_run_id"]
-        state = await asyncio.to_thread(
-            getattr(manager, "run_state", lambda _id: "queued"), run_id
-        )
+        run_state = getattr(manager, "run_state", None)
+        if not callable(run_state):
+            if assignment["status"] == work_items.ASSIGNMENT_DELIVERED:
+                worker_may_still_run = True
+                state = "running"
+            else:
+                _audit_caller(session_key, "work_item.revoke_assignment", "queued_cancel_unavailable", item)
+                raise WorkDispatchError(
+                    "the queued worker cannot be cancelled until manager state is available",
+                    code="queued_cancel_unavailable",
+                    status=503,
+                )
+        else:
+            try:
+                state = await asyncio.to_thread(run_state, run_id)
+            except Exception as exc:
+                # A delivered child may still be running even though the
+                # manager's inspection surface is temporarily unavailable.
+                # Revoke its authority but retain the exclusive class slot.
+                # A queued launch, in contrast, must stay retryable: marking
+                # it revoked without confirming cancellation could let it
+                # start later under a supposedly-revoked assignment.
+                if assignment["status"] == work_items.ASSIGNMENT_DELIVERED:
+                    worker_may_still_run = True
+                    state = "running"
+                else:
+                    _audit_caller(
+                        session_key,
+                        "work_item.revoke_assignment",
+                        "queued_cancel_unavailable",
+                        item,
+                    )
+                    raise WorkDispatchError(
+                        "the queued worker cannot be cancelled until manager state is available",
+                        code="queued_cancel_unavailable",
+                        status=503,
+                    ) from exc
         if state == "queued":
             cancel = getattr(manager, "cancel", None)
-            if callable(cancel):
-                try:
-                    await cancel(run_id)
-                except Exception:
-                    logger.warning(
-                        "cancel of queued run %s failed; revocation recorded anyway", run_id, exc_info=True
-                    )
-    item = await asyncio.to_thread(work_items.revoke_assignment, session_key, item_id)
-    _audit_caller(session_key, "work_item.revoke_assignment", "revoked", item)
-    return {"code": "revoked", "item": item}
+            if not callable(cancel):
+                _audit_caller(session_key, "work_item.revoke_assignment", "queued_cancel_unavailable", item)
+                raise WorkDispatchError(
+                    "the queued worker cannot be cancelled until manager cancellation is available",
+                    code="queued_cancel_unavailable",
+                    status=503,
+                )
+            try:
+                cancelled = await cancel(run_id)
+            except Exception as exc:
+                logger.warning("cancel of queued run %s failed", run_id, exc_info=True)
+                _audit_caller(session_key, "work_item.revoke_assignment", "queued_cancel_unavailable", item)
+                raise WorkDispatchError(
+                    "the queued worker cancellation was unavailable; retry revocation",
+                    code="queued_cancel_unavailable",
+                    status=503,
+                ) from exc
+            if cancelled is not True:
+                _audit_caller(session_key, "work_item.revoke_assignment", "queued_cancel_failed", item)
+                raise WorkDispatchError(
+                    "the queued worker was not cancelled; retry revocation",
+                    code="queued_cancel_failed",
+                    status=409,
+                )
+        elif state == "running":
+            worker_may_still_run = True
+        elif state not in {"terminal", "unknown"}:
+            # Treat a malformed state exactly like an unavailable inspection:
+            # fail closed for queued work and preserve the class slot for a
+            # delivered child.  This keeps an unexpected manager regression
+            # from creating the same replacement race as a failed cancel.
+            if assignment["status"] == work_items.ASSIGNMENT_DELIVERED:
+                worker_may_still_run = True
+            else:
+                _audit_caller(
+                    session_key,
+                    "work_item.revoke_assignment",
+                    "queued_cancel_unavailable",
+                    item,
+                )
+                raise WorkDispatchError(
+                    "the queued worker cannot be cancelled until manager state is available",
+                    code="queued_cancel_unavailable",
+                    status=503,
+                )
+    item = await asyncio.to_thread(
+        work_items.revoke_assignment,
+        session_key,
+        item_id,
+        worker_may_still_run=worker_may_still_run,
+    )
+    outcome = "revoked_running" if worker_may_still_run else "revoked"
+    _audit_caller(session_key, "work_item.revoke_assignment", outcome, item)
+    return {"code": outcome, "item": item}
 
 
 async def on_subagent_event(etype: str, info: Any, extra: Any) -> None:

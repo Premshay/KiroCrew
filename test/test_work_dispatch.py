@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import types
 
@@ -13,7 +12,7 @@ from kiro_crew import work_dispatch as wd
 from kiro_crew import work_items as wi
 
 KEY = "dashboard_chat-9-999"
-AGENT = "crew-codex"
+AGENT = "kirocrew-fast"
 
 
 @pytest.fixture(autouse=True)
@@ -41,13 +40,14 @@ class FakeManager:
         if hook not in self.hooks:
             self.hooks.append(hook)
 
-    def spawn(self, contract, parent_session_key="", agent="", _preassigned_id=""):
+    def spawn(self, contract, parent_session_key="", agent="", _preassigned_id="", **kwargs):
         self.spawned.append(
             {
                 "contract": contract,
                 "parent_session_key": parent_session_key,
                 "agent": agent,
                 "run_id": _preassigned_id,
+                **kwargs,
             }
         )
         if self.behavior == "raise":
@@ -62,10 +62,17 @@ class FakeManager:
         return SpawnInfo()
 
     def run_state(self, run_id: str) -> str:
+        if self.behavior == "state_raises":
+            raise RuntimeError("manager state is unavailable")
+        if self.behavior == "state_invalid":
+            return "indeterminate"
         return self.run_states.get(run_id, "unknown")
 
-    async def cancel(self, run_id: str) -> None:
+    async def cancel(self, run_id: str) -> bool:
         self.cancelled.append(run_id)
+        if self.behavior == "cancel_raises":
+            raise RuntimeError("manager is unavailable")
+        return self.behavior != "cancel_false"
 
     async def fire(self, etype: str, run_id: str, outcome: str = "completed") -> None:
         info = SpawnInfo(outcome=outcome)
@@ -80,7 +87,10 @@ class FakeManager:
 
 @pytest.fixture()
 def manager(monkeypatch) -> FakeManager:
-    roster = [types.SimpleNamespace(name=AGENT), types.SimpleNamespace(name="kirocrew")]
+    roster = [
+        types.SimpleNamespace(name=AGENT, model="fast", mcp_servers=["kirocrew-core"]),
+        types.SimpleNamespace(name="kirocrew", model="agent", mcp_servers=["kirocrew-core"]),
+    ]
     monkeypatch.setattr(wd, "list_agents", lambda: list(roster))
     return FakeManager()
 
@@ -111,11 +121,26 @@ def _crash_back_to_pending(status: str) -> None:
     state_path.write_text(json.dumps(state), encoding="utf-8")
 
 
-def test_candidates_are_stable_handles_excluding_unadvertised(manager):
+def test_candidates_are_server_owned_fast_recon_handles(manager):
     candidates = wd.launch_candidates()
-    assert [c["agent"] for c in candidates] == [AGENT]
-    expected = hashlib.sha256(AGENT.encode("utf-8")).hexdigest()[:16]
-    assert candidates[0]["id"] == expected
+    assert candidates == [
+        {
+            "id": wd._FAST_RECON.id,
+            "worker_class": "fast_recon",
+            "contract_max_bytes": 8 * 1024,
+        }
+    ]
+    assert "agent" not in candidates[0]
+    assert "model" not in candidates[0]
+
+
+def test_candidates_require_the_generated_fast_core_worker_spec(monkeypatch):
+    monkeypatch.setattr(
+        wd,
+        "list_agents",
+        lambda: [types.SimpleNamespace(name=AGENT, model="agent", mcp_servers=["kirocrew-core"])],
+    )
+    assert wd.launch_candidates() == []
 
 
 def test_launch_unknown_candidate_raises_worker_target_unavailable(manager):
@@ -174,6 +199,10 @@ def test_launch_accepted_is_queued_until_child_start(manager):
     assert spawn["parent_session_key"] == KEY
     assert spawn["run_id"] == run_id
     assert item["title"] in spawn["contract"]
+    assert spawn["max_turns"] == 12
+    assert spawn["include_memory"] is False
+    assert spawn["include_lessons"] is False
+    assert spawn["include_project"] is False
 
     asyncio.run(manager.fire("subagent_spawn", run_id))
     read = wi.read_item(KEY, item["id"])
@@ -315,11 +344,126 @@ def test_revoke_running_run_records_without_killing_it(manager):
     manager.run_states[run_id] = "running"
 
     result = asyncio.run(wd.revoke_assignment(KEY, item["id"], manager))
-    assert result["code"] == "revoked"
+    assert result["code"] == "revoked_running"
     assert manager.cancelled == []
     read = wi.read_item(KEY, item["id"])
-    assert read["assignment"]["status"] == wi.ASSIGNMENT_REVOKED
+    assert read["assignment"]["status"] == wi.ASSIGNMENT_REVOKED_RUNNING
     assert read["state"] == wi.STATE_PROPOSED
+
+    second = wi.create_item(
+        KEY,
+        title="Inspect the second endpoint",
+        acceptance={"kind": "file", "path": "/tmp/proof2", "exists": True},
+        next_action="Report the static seams",
+    )
+    with pytest.raises(wd.WorkDispatchError) as exc:
+        _launch(manager, second)
+    assert exc.value.code == "fast_worker_busy"
+
+    manager.run_states[run_id] = "terminal"
+    asyncio.run(manager.fire("subagent_done", run_id))
+    released = wi.read_item(KEY, item["id"])
+    assert released["assignment"]["status"] == wi.ASSIGNMENT_REVOKED
+    assert _launch(manager, second)["code"] == "launch_queued"
+
+
+def test_revoke_queued_cancel_false_keeps_assignment_retryable(manager):
+    manager.behavior = "cancel_false"
+    item = _setup()
+    _launch(manager, item)
+    run_id = wi.read_item(KEY, item["id"])["assignment"]["worker_run_id"]
+
+    with pytest.raises(wd.WorkDispatchError) as exc:
+        asyncio.run(wd.revoke_assignment(KEY, item["id"], manager))
+
+    assert exc.value.code == "queued_cancel_failed"
+    assert exc.value.status == 409
+    assert manager.cancelled == [run_id]
+    read = wi.read_item(KEY, item["id"])
+    assert read["assignment"]["status"] == wi.ASSIGNMENT_LAUNCH_QUEUED
+    assert read["state"] == wi.STATE_PROPOSED
+
+
+def test_revoke_queued_cancel_exception_keeps_assignment_retryable(manager):
+    manager.behavior = "cancel_raises"
+    item = _setup()
+    _launch(manager, item)
+
+    with pytest.raises(wd.WorkDispatchError) as exc:
+        asyncio.run(wd.revoke_assignment(KEY, item["id"], manager))
+
+    assert exc.value.code == "queued_cancel_unavailable"
+    assert exc.value.status == 503
+    read = wi.read_item(KEY, item["id"])
+    assert read["assignment"]["status"] == wi.ASSIGNMENT_LAUNCH_QUEUED
+    assert read["state"] == wi.STATE_PROPOSED
+
+
+def test_revoke_queued_state_failure_keeps_assignment_retryable(manager):
+    item = _setup()
+    _launch(manager, item)
+    manager.behavior = "state_raises"
+
+    with pytest.raises(wd.WorkDispatchError) as exc:
+        asyncio.run(wd.revoke_assignment(KEY, item["id"], manager))
+
+    assert exc.value.code == "queued_cancel_unavailable"
+    assert exc.value.status == 503
+    read = wi.read_item(KEY, item["id"])
+    assert read["assignment"]["status"] == wi.ASSIGNMENT_LAUNCH_QUEUED
+    assert manager.cancelled == []
+
+
+def test_revoke_delivered_state_failure_preserves_worker_slot(manager):
+    item = _setup()
+    _launch(manager, item)
+    run_id = wi.read_item(KEY, item["id"])["assignment"]["worker_run_id"]
+    asyncio.run(manager.fire("subagent_spawn", run_id))
+    manager.behavior = "state_raises"
+
+    result = asyncio.run(wd.revoke_assignment(KEY, item["id"], manager))
+
+    assert result["code"] == "revoked_running"
+    assert wi.read_item(KEY, item["id"])["assignment"]["status"] == wi.ASSIGNMENT_REVOKED_RUNNING
+    assert manager.cancelled == []
+
+
+def test_fast_recon_contract_cap_refuses_before_persisting_assignment(manager):
+    wi.open_cycle(KEY, goal="Coordinate a focused repair", next_action="Launch a worker")
+    item = wi.create_item(
+        KEY,
+        title="Inspect a broad generated surface",
+        acceptance={"kind": "file", "path": "/tmp/proof", "exists": True},
+        declared_resources=[f"{index:02}" + "r" * 510 for index in range(32)],
+        next_action="Report the static seams",
+    )
+
+    with pytest.raises(wd.WorkDispatchError) as exc:
+        _launch(manager, item)
+
+    assert exc.value.code == "worker_contract_too_large"
+    assert exc.value.status == 400
+    assert wi.read_item(KEY, item["id"])["assignment"] is None
+    assert manager.spawned == []
+
+
+def test_fast_recon_allows_only_one_live_assignment_per_coordinator(manager):
+    first = _setup()
+    second = wi.create_item(
+        KEY,
+        title="Inspect the second endpoint",
+        acceptance={"kind": "file", "path": "/tmp/proof2", "exists": True},
+        next_action="Report the static seams",
+    )
+    _launch(manager, first)
+
+    with pytest.raises(wd.WorkDispatchError) as exc:
+        _launch(manager, second)
+
+    assert exc.value.code == "fast_worker_busy"
+    assert exc.value.status == 409
+    assert wi.read_item(KEY, second["id"])["assignment"] is None
+    assert len(manager.spawned) == 1
 
 
 def test_event_hook_ignores_unrelated_subagents(manager):

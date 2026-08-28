@@ -193,10 +193,11 @@ def test_arm_launch_retry_increments_attempt_and_clears_failure():
     run_id = item["assignment"]["worker_run_id"]
     wi.record_launch_failed(KEY, run_id, "launch_capacity")
 
-    armed = wi.arm_launch_retry(KEY, item["id"])
+    armed, contract = wi.arm_launch_retry(KEY, item["id"])
     assert armed["assignment"]["attempt"] == 2
     assert armed["assignment"]["status"] == wi.ASSIGNMENT_PENDING_DELIVERY
     assert armed["assignment"]["failure_code"] == ""
+    assert contract == wi.render_contract(armed, armed["assignment"])
 
     wi.record_launch_failed(KEY, run_id, "launch_capacity")
     # Delivered and revoked assignments are not retryable.
@@ -207,6 +208,47 @@ def test_arm_launch_retry_increments_attempt_and_clears_failure():
     wi.record_launch_delivered(key, launched2["assignment"]["worker_run_id"])
     with pytest.raises(wi.WorkItemError, match="eligible"):
         wi.arm_launch_retry(key, it2["id"])
+
+
+def test_worker_contract_cap_is_checked_before_an_assignment_is_written():
+    item = _create()
+    wi.update_item(
+        KEY,
+        item["id"],
+        declared_resources=[f"{index:02}" + "r" * 510 for index in range(32)],
+    )
+
+    with pytest.raises(wi.WorkItemContractTooLarge, match="worker byte limit"):
+        wi.launch_item(KEY, item["id"], contract_max_bytes=8 * 1024)
+
+    assert wi.read_item(KEY, item["id"])["assignment"] is None
+
+
+def test_exclusive_worker_class_blocks_a_second_live_assignment():
+    first = _create()
+    second = wi.create_item(
+        KEY,
+        title="Inspect a second endpoint",
+        acceptance={"kind": "file", "path": "/tmp/proof2", "exists": True},
+        next_action="Report static seams",
+    )
+    candidate = "a" * 16
+    wi.launch_item(
+        KEY,
+        first["id"],
+        candidate,
+        exclusive_candidate_fingerprint=candidate,
+    )
+
+    with pytest.raises(wi.WorkItemWorkerClassBusy, match="already has a live assignment"):
+        wi.launch_item(
+            KEY,
+            second["id"],
+            candidate,
+            exclusive_candidate_fingerprint=candidate,
+        )
+
+    assert wi.read_item(KEY, second["id"])["assignment"] is None
 
 
 def test_worker_isolation_across_keys_and_coordinators():
