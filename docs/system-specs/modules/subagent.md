@@ -289,6 +289,15 @@ On timeout (inner or outer):
 
 Native kiro-cli subagents run inside the parent ACP turn and are owned by the parent dashboard slot. `DashboardState.native_subagent_snapshots()` replays running native cards as `subagent_snapshot` and recent terminal cards as `subagent_done`. A native `subagent_done` payload may include optional `task`, `agent`, and `result` fields. `result` is a redacted output tail bounded to 8,000 characters, with an explicit truncation marker when earlier output was dropped. Running output retained for replay is bounded to 40,000 characters, with an 80,000-character hard accumulation ceiling. Terminal native records are retained globally up to 50 cards for at most one hour. The client treats `done` and `error` as monotonic terminal states, so a stale running snapshot interleaved after a live completion cannot demote the card.
 
+Provider-native child activity (Claude Task/Agent and Codex sub-agent activity)
+also projects into this card surface, but is not a `SubagentInfo` and does not
+alter the managed three-way terminal contract above. Claude's Task terminal can
+be `completed`, `failed`, or `stopped`; Codex only reports individual activity
+records, so its still-open cards settle as `reported` when the parent turn
+ends. `reported` means KiroCrew observed provider activity, not that the child
+is live, stopped, or finished. Provider cards are replayable but non-controllable
+and use opaque browser ids, never a provider thread id or agent path.
+
 **Redaction**: All subagent event payloads (running snapshots and done events) have the `agent` field redacted before sending to the dashboard. Task text is redacted before truncation to prevent credential patterns spanning the boundary.
 
 | Parent Session | Backend Delivery | Client Follow-up | User Sees |
@@ -447,6 +456,13 @@ kiro-cli process rather than as KiroCrew-owned sessions. KiroCrew surfaces
 those in the Activity tab too, by observing kiro-cli's sub-agent
 notifications — one card per sub-agent, with each inner tool call and its
 output attributed to the right card.
+
+Claude and Codex ACP adapters can fan out provider-native children as well.
+KiroCrew uses their structured ACP metadata to show those children in the same
+Activity tab. Claude cards include nested text and tool work. Codex cards show
+only reported activity because the adapter does not expose a child transcript
+or a child-session terminal boundary. Neither provider card can be stopped,
+steered, retried, or deleted through KiroCrew; its provider retains control.
 
 ```python
 spawn_sub_agents(agents=[

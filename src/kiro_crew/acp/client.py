@@ -108,6 +108,7 @@ from kiro_crew.acp.types import (
     AcpPromptStats,
     JsonRpcMessage,
     JsonRpcRequest,
+    ProviderChildActivity,
     TurnUsage,
 )
 from kiro_crew.agent import ensure_agent_materialized, session_capability_servers
@@ -4954,16 +4955,29 @@ class AcpClient:
                 await self._reject_unknown_server_request(msg)
             elif action == "update":
                 self._track_usage_update(msg)
+                provider_child = self._extract_provider_child_activity(msg)
                 chunk, is_thinking = self._extract_text_chunk(msg)
+                provider_child_text = bool(
+                    provider_child
+                    and provider_child.provider == "claude"
+                    and provider_child.phase == "activity"
+                    and chunk
+                    and not is_thinking
+                )
+                if provider_child and not provider_child_text:
+                    yield self._provider_child_event(msg, provider_child)
                 if chunk:
                     # Before yielding text, check for tool results from JSONL
                     for tr_event in await asyncio.to_thread(self._read_new_tool_results_sync):
                         yield tr_event
-                    kind = EVENT_THINKING_CHUNK if is_thinking else EVENT_TEXT_CHUNK
-                    if not is_thinking:
-                        self.last_prompt_stats.text_chunks += 1
-                        self._stale_eligible = True
-                    yield AcpEvent(kind=kind, text=chunk)
+                    if provider_child_text:
+                        yield self._provider_child_event(msg, provider_child, text=chunk)
+                    else:
+                        kind = EVENT_THINKING_CHUNK if is_thinking else EVENT_TEXT_CHUNK
+                        if not is_thinking:
+                            self.last_prompt_stats.text_chunks += 1
+                            self._stale_eligible = True
+                        yield AcpEvent(kind=kind, text=chunk)
                     if not is_thinking and _is_tool_interrupted_marker(chunk):
                         # kiro-cli's built-in security filter cancelled the turn's tools.
                         # It will not send a ``complete`` response — synthesize one so the
@@ -4978,7 +4992,9 @@ class AcpClient:
                             usage=TurnUsage(credits=self.last_prompt_stats.credits),
                         )
                         return
-                tool_event = self._extract_tool_event(msg)
+                tool_event = self._scrub_provider_child_tool_event(
+                    self._extract_tool_event(msg), provider_child
+                )
                 if tool_event:
                     self._stale_eligible = False
                     # Arm the tool-stall watchdog: if no further data arrives
@@ -5033,7 +5049,9 @@ class AcpClient:
                 # generic title like "Terminal"/"grep").  Yield as a refinement
                 # event so the dashboard pill + persisted message can be
                 # patched in place — see `EVENT_TOOL_CALL_UPDATE` in chat_runner.
-                tool_refine_event = self._extract_tool_call_refinement(msg)
+                tool_refine_event = self._scrub_provider_child_tool_event(
+                    self._extract_tool_call_refinement(msg), provider_child
+                )
                 if tool_refine_event:
                     await self._maybe_note_skill_read(tool_refine_event)
                     yield tool_refine_event
@@ -5536,6 +5554,123 @@ class AcpClient:
             text = content.get("text")
             return text, True
         return None, False
+
+    @staticmethod
+    def _provider_child_label(update: dict[str, Any], fallback: str) -> str:
+        """Return bounded, redacted task context for a provider child card."""
+        raw_input = update.get("rawInput")
+        label = ""
+        if isinstance(raw_input, dict):
+            for key in ("description", "prompt", "task"):
+                value = raw_input.get(key)
+                if isinstance(value, str) and value.strip():
+                    label = value
+                    break
+        if not label:
+            title = update.get("title")
+            label = title if isinstance(title, str) and title.strip() else fallback
+        label = label[:2000]
+        label, _ = redact_exfiltration_urls(label)
+        label, _ = redact_credentials(label)
+        return label
+
+    @staticmethod
+    def _provider_child_id(value: object) -> str:
+        """Accept only a bounded opaque provider identity for in-process joins."""
+        if not isinstance(value, str):
+            return ""
+        value = value.strip()
+        return value if 0 < len(value) <= 512 else ""
+
+    def _extract_provider_child_activity(self, msg: JsonRpcMessage) -> ProviderChildActivity | None:
+        """Recognize documented Claude/Codex child metadata without tool-prose parsing."""
+        params = msg.params or {}
+        update = params.get("update", {})
+        if not isinstance(update, dict):
+            return None
+        meta = update.get("_meta")
+        if not isinstance(meta, dict):
+            return None
+
+        claude = meta.get("claudeCode")
+        if isinstance(claude, dict):
+            tool_call_id = self._provider_child_id(update.get("toolCallId"))
+            if claude.get("subagent") is True and tool_call_id:
+                status = str(update.get("status") or "").lower()
+                if status == "completed":
+                    phase = "completed"
+                elif status in {"failed", "error"}:
+                    phase = "failed"
+                elif status in {"cancelled", "canceled", "interrupted"}:
+                    phase = "stopped"
+                else:
+                    phase = "started"
+                return ProviderChildActivity(
+                    provider="claude",
+                    child_id=tool_call_id,
+                    phase=phase,
+                    label=self._provider_child_label(update, "claude"),
+                )
+            parent_tool_use_id = self._provider_child_id(claude.get("parentToolUseId"))
+            if parent_tool_use_id:
+                return ProviderChildActivity(
+                    provider="claude",
+                    child_id=parent_tool_use_id,
+                    phase="activity",
+                )
+
+        codex = meta.get("codex")
+        subagent = codex.get("subagent") if isinstance(codex, dict) else None
+        if isinstance(subagent, dict):
+            thread_id = self._provider_child_id(subagent.get("threadId"))
+            activity = subagent.get("activity")
+            if thread_id and activity in {"started", "interacted", "interrupted"}:
+                # codex-acp creates one normal ACP tool lifecycle *per activity*
+                # (started/interacted/interrupted). Its later ``completed`` status
+                # closes that activity record, not the child thread. Therefore no
+                # Codex frame can assert that the child itself has completed.
+                return ProviderChildActivity(
+                    provider="codex",
+                    child_id=thread_id,
+                    phase="started" if activity == "started" else "activity",
+                )
+        return None
+
+    @staticmethod
+    def _scrub_provider_child_tool_event(
+        event: AcpEvent | None, child: ProviderChildActivity | None
+    ) -> AcpEvent | None:
+        """Keep adapter-only Codex thread metadata out of ordinary tool surfaces."""
+        if event is None or child is None or child.provider != "codex":
+            return event
+        # codex-acp's title is generated from the last segment of agentPath,
+        # and rawInput contains both that path and agentThreadId. The provider
+        # card deliberately uses an opaque browser id, so the generic tool path
+        # must not reintroduce either identifier.
+        event.title = "Subagent activity"
+        event.tool_input = ""
+        event.tool_input_redacted = False
+        event.raw_tool_params = None
+        event.tool_purpose = ""
+        return event
+
+    @staticmethod
+    def _provider_child_event(
+        msg: JsonRpcMessage,
+        child: ProviderChildActivity,
+        *,
+        text: str = "",
+    ) -> AcpEvent:
+        params = msg.params or {}
+        update = params.get("update", {})
+        tool_call_id = update.get("toolCallId") if isinstance(update, dict) else ""
+        return AcpEvent(
+            kind=EVENT_SUBAGENT_ACTIVITY,
+            text=text,
+            tool_call_id=tool_call_id if isinstance(tool_call_id, str) else "",
+            sub_session_id=f"provider:{child.provider}:{child.child_id}",
+            provider_child=child,
+        )
 
     def _track_usage_update(self, msg: JsonRpcMessage) -> None:
         """Track context usage and config updates from session update notifications."""

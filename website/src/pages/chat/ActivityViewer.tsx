@@ -34,6 +34,7 @@ const STATUS = {
   done: <CheckCircle size={12} className="text-green-400" />,
   error: <AlertCircle size={12} className="text-danger" />,
   stopped: <Square size={12} className="text-muted" />,
+  reported: <CircleDot size={12} className="text-muted" />,
 } as const
 
 // Resource-link type ('cr' | 'issue' | 'other', from extractChatLinks) is
@@ -90,17 +91,19 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
   const cardRef = useRef<HTMLDivElement>(null)
   const autoScroll = useRef(true)
   const isPending = a.status === 'pending'
-  const isDone = a.status === 'done' || a.status === 'error' || a.status === 'stopped'
+  const isReported = a.status === 'reported'
+  const isDone = a.status === 'done' || a.status === 'error' || a.status === 'stopped' || isReported
   // Native cards have no SubagentManager record to lazy-load from disk; their
   // output arrives inline on the done event (a.result).
   const isNative = a.id.startsWith('native:')
-  const [collapsed, setCollapsed] = useState(isDone)
+  const [collapsed, setCollapsed] = useState(isDone && !isReported)
   // Auto-collapse when transitioning to done (not on mount)
   const wasDone = useRef(isDone)
   useEffect(() => {
-    if (isDone && !wasDone.current) { const t = setTimeout(() => setCollapsed(true), 2000); wasDone.current = true; return () => clearTimeout(t) }
-  }, [isDone])
+    if (isDone && !isReported && !wasDone.current) { const t = setTimeout(() => setCollapsed(true), 2000); wasDone.current = true; return () => clearTimeout(t) }
+  }, [isDone, isReported])
   const isRunning = a.status === 'running' || a.status === 'tool'
+  const isControllable = a.controllable !== false
 
   // Approval handling for pending subagents
   const dispatch = useAppDispatch()
@@ -168,6 +171,7 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
       : a.status === 'running' ? (a.streaming ? i18nT('pages.chat.activityViewer.running') : i18nT('pages.chat.activityViewer.starting'))
         : a.status === 'done' ? i18nT('pages.chat.activityViewer.complete')
           : a.status === 'stopped' ? i18nT('pages.chat.activityViewer.stopped')
+            : isReported ? i18nT('pages.chat.activityViewer.activity')
             : a.error?.includes('Cancelled') ? i18nT('pages.chat.activityViewer.cancelled') : i18nT('pages.chat.activityViewer.error')
 
   return (
@@ -176,11 +180,11 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
     // keyboard/AT semantics. The outer div carries the scroll-to anchor for
     // chip-selected cards.
     <div ref={cardRef}>
-    <Clickable className={`mx-2 mb-3 rounded-lg border bg-card overflow-hidden shadow-sm transition-all animate-scale-in ${isRunning || isPending ? 'border-border-strong' : 'border-border opacity-60'}${selected ? ' ring-1 ring-accent' : ''}`} onClick={onClick}>
+    <Clickable className={`mx-2 mb-3 rounded-lg border bg-card overflow-hidden shadow-sm transition-all animate-scale-in ${isRunning || isPending ? 'border-border-strong' : isReported ? 'border-border' : 'border-border opacity-60'}${selected ? ' ring-1 ring-accent' : ''}`} onClick={onClick}>
       {/* Header — collapse toggle when the subagent is done */}
       <div
         className={`flex items-center gap-2 px-3 py-2.5${isDone ? ' cursor-pointer select-none hover:bg-bg-hover transition-colors' : ''}`}
-        {...(isDone
+        {...(isDone && !isReported
           ? {
               role: 'button' as const,
               tabIndex: 0,
@@ -197,8 +201,8 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
         {a.agent && <code className="text-[11px] text-muted/50 bg-bg-hover px-1.5 py-0.5 rounded shrink-[3] min-w-0 max-w-[6.5rem] truncate inline-block align-middle" title={a.agent}>{a.agent}</code>}
         {a.model && <code className="text-[11px] text-accent/70 bg-accent/10 px-1.5 py-0.5 rounded shrink-[4] min-w-0 max-w-[7rem] truncate inline-block align-middle [direction:rtl] [unicode-bidi:plaintext] text-left" data-testid="subagent-model" title={i18nT('pages.chat.activityViewer.model_label', { model: a.model })}>{a.model}</code>}
         {!isPending && <span className="text-[11px] text-muted/40 ml-auto font-mono shrink-0 whitespace-nowrap tabular-nums">{fmtElapsed}</span>}
-        {isRunning && <button data-testid="subagent-cancel-btn" className="text-[11px] px-1.5 py-0.5 rounded border border-danger/40 text-danger/70 hover:bg-danger-subtle hover:text-danger cursor-pointer transition-all shrink-0 whitespace-nowrap inline-flex items-center" onClick={onCancel}><X className="lucide-inline" /> {i18nT('pages.chat.activityViewer.cancel')}</button>}
-        {isDone && <span className="text-[14px] text-muted bg-bg-hover px-1.5 py-0.5 rounded shrink-0 ml-1">{collapsed ? '▸' : '▾'}</span>}
+        {isRunning && isControllable && <button data-testid="subagent-cancel-btn" className="text-[11px] px-1.5 py-0.5 rounded border border-danger/40 text-danger/70 hover:bg-danger-subtle hover:text-danger cursor-pointer transition-all shrink-0 whitespace-nowrap inline-flex items-center" onClick={onCancel}><X className="lucide-inline" /> {i18nT('pages.chat.activityViewer.cancel')}</button>}
+        {isDone && !isReported && <span className="text-[14px] text-muted bg-bg-hover px-1.5 py-0.5 rounded shrink-0 ml-1">{collapsed ? '▸' : '▾'}</span>}
       </div>
       {/* Input (task) */}
       {!collapsed && (
@@ -221,7 +225,7 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
       <div className="px-3 pb-2">
         <div className="text-[10px] text-muted/40 uppercase tracking-wider mb-1">{i18nT('pages.chat.activityViewer.output')}</div>
         <pre ref={bodyRef} onScroll={onScroll} className="px-2.5 py-2 bg-bg rounded-md text-[12px] font-mono whitespace-pre-wrap break-all max-h-[240px] overflow-y-auto text-muted/80 leading-relaxed">
-          {a.streaming || a.result || (isDone ? (isNative ? <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.output_shown_in_chat')}</span> : <DiskLoader id={a.id} autoLoad={selected} />) : <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.waiting_for_output')}</span>)}
+          {a.streaming || a.result || (isReported ? <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.activity')}</span> : isDone ? (isNative ? <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.output_shown_in_chat')}</span> : <DiskLoader id={a.id} autoLoad={selected} />) : <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.waiting_for_output')}</span>)}
           {a.lastTool && <div className="text-accent mt-1"><Wrench className="lucide-inline" /> {a.lastTool}</div>}
         </pre>
       </div>
@@ -753,7 +757,8 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
       if (a.status === 'pending') return 3
       if (a.status === 'running' || a.status === 'tool') return 4
       if (a.status === 'stopped') return 5
-      return 6 // done
+      if (a.status === 'reported') return 6
+      return 7 // done
     }
     return Object.keys(subagents).sort((x, y) => rank(subagents[x]) - rank(subagents[y]))
   }, [subagents])
@@ -778,8 +783,13 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
       setShowAllSubagents(true)
     }
   }, [selectedSubagentId, visibleIds, ids])
+  // Provider-native cards are terminal display records, not KiroCrew runs;
+  // dismissing them must never issue a control request to their provider.
   const terminalIds = useMemo(
-    () => ids.filter(id => ['done', 'error', 'stopped'].includes(subagents[id]?.status ?? '')),
+    () => ids.filter(id => (
+      ['done', 'error', 'stopped', 'reported'].includes(subagents[id]?.status ?? '')
+      && subagents[id]?.controllable !== false
+    )),
     [ids, subagents],
   )
   const failedRetryableIds = useMemo(

@@ -651,6 +651,8 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                     # snapshot that carries no outcome of its own.
                                     if native.get("stopped"):
                                         _outcome = "stopped"
+                                    elif native.get("reported"):
+                                        _outcome = "reported"
                                     elif _err:
                                         _outcome = "failed"
                                     else:
@@ -664,6 +666,12 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                                 "elapsed": native["elapsed"],
                                                 "error": _r(str(_err)) if _err else None,
                                                 "stopped": bool(native.get("stopped")),
+                                                "reported": bool(native.get("reported")),
+                                                **(
+                                                    {"controllable": False}
+                                                    if native.get("controllable") is False
+                                                    else {}
+                                                ),
                                                 "outcome": str(native.get("outcome") or _outcome),
                                                 "task": _r(str(native["task"])),
                                                 "agent": _r(str(native["agent"])),
@@ -683,6 +691,11 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                                 "streaming": _r(str(native["streaming"])),
                                                 "last_tool": _r(str(native["last_tool"])),
                                                 "started": native["started"],
+                                                **(
+                                                    {"controllable": False}
+                                                    if native.get("controllable") is False
+                                                    else {}
+                                                ),
                                             },
                                         }
                                     )

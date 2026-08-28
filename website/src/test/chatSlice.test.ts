@@ -1336,6 +1336,18 @@ describe('subagent reducers', () => {
     expect(state.subagents['a1'].elapsed).toBe(5.2)
   })
 
+  it('keeps provider-native activity observational after its parent turn ends', () => {
+    let state = reducer(withSlot, sseSubagentSpawn({
+      slot: 'slot-1', id: 'native:provider:codex:opaque', task: 'codex', agent: 'codex', controllable: false,
+    }))
+    state = reducer(state, sseSubagentDone({
+      slot: 'slot-1', id: 'native:provider:codex:opaque', elapsed: 5.2,
+      outcome: 'reported', reported: true, controllable: false,
+    }))
+    expect(state.subagents['native:provider:codex:opaque'].status).toBe('reported')
+    expect(state.subagents['native:provider:codex:opaque'].controllable).toBe(false)
+  })
+
   it('sseSubagentDone marks as error when error present', () => {
     let state = reducer(withSlot, sseSubagentSpawn({ slot: 'slot-1', id: 'a1', task: 'task', agent: '' }))
     state = reducer(state, sseSubagentDone({ slot: 'slot-1', id: 'a1', elapsed: 10, error: 'timeout' }))

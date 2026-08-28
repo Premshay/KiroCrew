@@ -697,6 +697,14 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
     """DELETE /api/spawn/{agent_id} — cancel a running subagent or remove a finished one."""
     state: DashboardState = request.app["state"]
     agent_id = request.match_info["agent_id"]
+    if agent_id.startswith("native:provider:"):
+        return web.json_response(
+            {
+                "error": "provider-native subagent activity cannot be controlled by Kiro Crew",
+                "code": "provider_subagent_uncontrollable",
+            },
+            status=409,
+        )
     # Handle native kiro-cli subagents (native:* IDs not in SubagentManager)
     if agent_id.startswith("native:") and hasattr(state, "_native_cards"):
         card_info = getattr(state, "_native_cards", {}).get(agent_id)

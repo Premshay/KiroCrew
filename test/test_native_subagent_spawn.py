@@ -18,6 +18,7 @@ from kiro_crew.dashboard.chat_runner import (
     _native_done_result,
     _native_subagent_close_all,
     _native_subagent_sync,
+    _provider_subagent_sync,
     _retain_terminal_native,
 )
 from kiro_crew.dashboard.state import (
@@ -26,6 +27,11 @@ from kiro_crew.dashboard.state import (
     NATIVE_SUBAGENT_TERMINAL_KEEP,
     DashboardState,
     native_subagent_output_tail,
+)
+from kiro_crew.acp.types import (
+    EVENT_SUBAGENT_ACTIVITY,
+    AcpEvent,
+    ProviderChildActivity,
 )
 
 
@@ -60,6 +66,20 @@ def _sub(session_id, name, role, query, status_type, message=""):
         "initialQuery": query,
         "status": {"type": status_type, "message": message},
     }
+
+
+def _provider_event(provider, child_id, phase, *, label="", text="", title=""):
+    return AcpEvent(
+        kind=EVENT_SUBAGENT_ACTIVITY,
+        text=text,
+        title=title,
+        provider_child=ProviderChildActivity(
+            provider=provider,
+            child_id=child_id,
+            phase=phase,
+            label=label,
+        ),
+    )
 
 
 class TestNativeSubagentSync:
@@ -465,6 +485,101 @@ class TestNativeCardRegistry:
         assert "native:s1" not in state._native_cards
 
 
+class TestProviderNativeChildCards:
+    """Structured adapter child activity reuses cards without claiming control."""
+
+    def test_codex_activity_uses_opaque_card_and_settles_as_reported(self):
+        state = _make_state()
+        slot = _make_slot()
+        state._slots = {slot.key: slot}
+        tracker = slot._native_subagent_tracker
+        raw_thread_id = "thread-secret-17"
+
+        _provider_subagent_sync(
+            state,
+            slot,
+            _provider_event("codex", raw_thread_id, "started"),
+            tracker,
+            slot._native_subagent_output,
+        )
+        _provider_subagent_sync(
+            state,
+            slot,
+            _provider_event(
+                "codex",
+                raw_thread_id,
+                "activity",
+                title="Interact with subagent provider-internal-name",
+            ),
+            tracker,
+            slot._native_subagent_output,
+        )
+
+        [spawn] = _ws_calls(state)["subagent_spawn"]
+        assert spawn["id"].startswith("native:provider:codex:")
+        assert raw_thread_id not in spawn["id"]
+        assert raw_thread_id not in spawn["task"]
+        assert spawn["controllable"] is False
+        assert "subagent_tool" not in _ws_calls(state)
+
+        # The Codex adapter closes activity records, not child threads. When the
+        # parent turn ends KiroCrew must describe that evidence as reported, not
+        # as a child completion or a remote cancellation.
+        _native_subagent_close_all(state, slot, tracker, slot._native_subagent_output)
+        [done] = _ws_calls(state)["subagent_done"]
+        assert done["outcome"] == "reported"
+        assert done["reported"] is True
+        assert done["controllable"] is False
+
+        [snapshot] = DashboardState.native_subagent_snapshots(state)
+        assert snapshot["outcome"] == "reported"
+        assert snapshot["reported"] is True
+        assert raw_thread_id not in str(snapshot)
+
+    def test_claude_task_terminal_completes_its_card_and_keeps_child_text(self):
+        state = _make_state()
+        slot = _make_slot()
+        tracker = slot._native_subagent_tracker
+        raw_tool_use_id = "toolu-private-child"
+
+        _provider_subagent_sync(
+            state,
+            slot,
+            _provider_event(
+                "claude",
+                raw_tool_use_id,
+                "started",
+                label="inspect the session bridge",
+            ),
+            tracker,
+            slot._native_subagent_output,
+        )
+        _provider_subagent_sync(
+            state,
+            slot,
+            _provider_event("claude", raw_tool_use_id, "activity", text="read the adapter"),
+            tracker,
+            slot._native_subagent_output,
+        )
+        _provider_subagent_sync(
+            state,
+            slot,
+            _provider_event("claude", raw_tool_use_id, "completed"),
+            tracker,
+            slot._native_subagent_output,
+        )
+
+        [spawn] = _ws_calls(state)["subagent_spawn"]
+        [chunk] = _ws_calls(state)["subagent_chunk"]
+        [done] = _ws_calls(state)["subagent_done"]
+        assert raw_tool_use_id not in spawn["id"]
+        assert spawn["task"] == "inspect the session bridge"
+        assert chunk["text"] == "read the adapter"
+        assert done["outcome"] == "completed"
+        assert done["reported"] is False
+        assert done["result"] == "read the adapter"
+
+
 class TestNativeCardFeedRedaction:
     """_native_card_feed joins, truncates, and redacts at the broadcast boundary."""
 
@@ -536,6 +651,21 @@ class TestNativeCancelHandler:
         audit_kwargs = m_sel.return_value.log_tool_invocation.call_args[1]
         assert audit_kwargs["tool_name"] == "cancel_native_subagent"
         assert audit_kwargs["outcome"] == "cancelled_by_user"
+
+    @pytest.mark.asyncio
+    async def test_provider_native_card_cannot_be_cancelled_as_a_kirocrew_run(self):
+        import json
+
+        from kiro_crew.dashboard.handlers.messaging import api_spawn_delete
+
+        state = _make_state()
+        response = await api_spawn_delete(
+            self._request(state, "native:provider:codex:opaque-child")
+        )
+
+        assert response.status == 409
+        assert json.loads(response.text)["code"] == "provider_subagent_uncontrollable"
+        state.broadcast_ws.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cancel_native_card_marks_tracker_stopped_for_replay(self):

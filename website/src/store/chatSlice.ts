@@ -3004,7 +3004,7 @@ const chatSlice = createSlice({
         if (b) { b.approving = action.payload.approving; return }
       }
     },
-    sseSubagentSpawn(state, action: PayloadAction<{ slot: string; id: string; task: string; agent: string; model?: string }>) {
+    sseSubagentSpawn(state, action: PayloadAction<{ slot: string; id: string; task: string; agent: string; model?: string; controllable?: boolean }>) {
       if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
       const subs = action.payload.slot !== state.activeSlot
         ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).subagents
@@ -3020,13 +3020,14 @@ const chatSlice = createSlice({
         // card's task is derived from the approval title, which may be empty
         // or just "spawn_run") — always prefer the spawn payload's task.
         if (action.payload.task) existing.task = action.payload.task
+        if (action.payload.controllable !== undefined) existing.controllable = action.payload.controllable
         return
       }
       subs[safeKey(action.payload.id)] = {
         id: action.payload.id, task: action.payload.task, agent: action.payload.agent || 'kirocrew',
         model: action.payload.model || '',
         status: 'running', streaming: existing?.streaming || '', lastTool: '', startedAt: existing?.startedAt || Date.now(), elapsed: 0,
-        toolCount: 0, stalled: false,
+        toolCount: 0, stalled: false, controllable: action.payload.controllable ?? existing?.controllable ?? true,
       }
     },
     sseSubagentChunk(state, action: PayloadAction<{ slot: string; id: string; text: string }>) {
@@ -3127,10 +3128,10 @@ const chatSlice = createSlice({
       if (!subs) return
       for (const id of Object.keys(subs)) {
         const st = subs[id]?.status
-        if (st === 'done' || st === 'error' || st === 'stopped') delete subs[id]
+        if (st === 'done' || st === 'error' || st === 'stopped' || st === 'reported') delete subs[id]
       }
     },
-    sseSubagentDone(state, action: PayloadAction<{ slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; result?: string }>) {
+    sseSubagentDone(state, action: PayloadAction<{ slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; reported?: boolean; controllable?: boolean; outcome?: 'completed' | 'failed' | 'stopped' | 'reported'; task?: string; agent?: string; model?: string; result?: string }>) {
       if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
       const subs = action.payload.slot !== state.activeSlot
         ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).subagents
@@ -3150,8 +3151,9 @@ const chatSlice = createSlice({
       // (spec: docs/system-specs/modules/subagent.md). `stopped`/`error`
       // derivation is kept ONLY as a fallback for old payloads that predate
       // the field (reconnect replays from a pre-upgrade gateway).
-      const doneStatus: 'stopped' | 'error' | 'done' =
-        action.payload.outcome === 'stopped' ? 'stopped'
+      const doneStatus: 'stopped' | 'error' | 'done' | 'reported' =
+        action.payload.outcome === 'reported' ? 'reported'
+          : action.payload.outcome === 'stopped' ? 'stopped'
           : action.payload.outcome === 'failed' ? 'error'
             : action.payload.outcome === 'completed' ? 'done'
               : action.payload.stopped ? 'stopped' : (action.payload.error ? 'error' : 'done')
@@ -3167,6 +3169,7 @@ const chatSlice = createSlice({
         // has resolved it by completion). Prefer a known value, but never
         // clobber a prior known id back to '' if this frame omits it.
         if (action.payload.model) a.model = action.payload.model
+        if (action.payload.controllable !== undefined) a.controllable = action.payload.controllable
         if (isNative && action.payload.result !== undefined) a.result = action.payload.result
       }
       else {
@@ -3182,6 +3185,7 @@ const chatSlice = createSlice({
           elapsed: action.payload.elapsed,
           error: doneStatus === 'stopped' ? undefined : action.payload.error,
           result: isNative ? action.payload.result : undefined,
+          controllable: action.payload.controllable ?? true,
         }
       }
     },
@@ -3432,7 +3436,7 @@ const chatSlice = createSlice({
       if (idx >= 0) side.messages.splice(idx, 1)
       side.pending = false
     },
-    sseSubagentSnapshot(state, action: PayloadAction<{ id: string; slot: string; task: string; agent: string; model?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean; idle_secs?: number }>) {
+    sseSubagentSnapshot(state, action: PayloadAction<{ id: string; slot: string; task: string; agent: string; model?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean; idle_secs?: number; controllable?: boolean }>) {
       const d = action.payload
       if (isUnsafeKey(d.slot) || isUnsafeKey(d.id)) return
       const subs = d.slot && d.slot !== state.activeSlot
@@ -3441,7 +3445,7 @@ const chatSlice = createSlice({
       const existing = subs[d.id]
       // Live events can interleave with replay because subscription starts before
       // snapshots are sent. Never let a stale running snapshot demote a terminal card.
-      if (existing?.status === 'done' || existing?.status === 'error') return
+      if (existing?.status === 'done' || existing?.status === 'error' || existing?.status === 'stopped' || existing?.status === 'reported') return
       const stalled = d.stalled ?? false
       subs[safeKey(d.id)] = {
         id: d.id, task: d.task, agent: d.agent || 'kirocrew',
@@ -3460,6 +3464,7 @@ const chatSlice = createSlice({
         idleSecs: stalled ? d.idle_secs : undefined,
         stalledAt: stalled && typeof d.idle_secs === 'number' ? Date.now() : undefined,
         approval_id: existing?.approval_id, approving: existing?.approving,
+        controllable: d.controllable ?? existing?.controllable ?? true,
       }
     },
     /** Fold a single dynamic-workflow run event into workflowRuns. */

@@ -5712,12 +5712,15 @@ class DashboardState:
                     "slot": slot.key,
                     "task": str(info.get("task") or ""),
                     "agent": str(info.get("agent") or ""),
+                    **({"controllable": False} if info.get("controllable") is False else {}),
                 }
                 if info.get("done"):
                     done_at = float(info.get("done_at") or 0.0)
                     if done_at and (now - done_at) > ttl_secs:
                         continue
-                    if info.get("stopped"):
+                    if info.get("reported"):
+                        outcome = "reported"
+                    elif info.get("stopped"):
                         outcome = "stopped"
                     elif info.get("error"):
                         outcome = "failed"
@@ -5730,6 +5733,7 @@ class DashboardState:
                             "elapsed": float(info.get("elapsed") or 0.0),
                             "error": info.get("error"),
                             "stopped": bool(info.get("stopped")),
+                            "reported": bool(info.get("reported")),
                             "outcome": outcome,
                             "result": str(info.get("result") or ""),
                             "done_at": done_at,

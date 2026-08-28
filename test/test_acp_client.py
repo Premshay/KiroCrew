@@ -8536,6 +8536,148 @@ class TestDispatchSubagentEvents:
     notifications."""
 
     @pytest.mark.asyncio
+    async def test_dispatch_routes_claude_child_text_to_its_task_card(self):
+        """Claude's opted-in nested transcript must not leak into parent text."""
+        from kiro_crew.acp.types import (
+            EVENT_SUBAGENT_ACTIVITY,
+            EVENT_TEXT_CHUNK,
+            JsonRpcMessage,
+        )
+
+        client = AcpClient(acp_backend=ACP_BACKEND_CLAUDE)
+        child_id = "toolu-provider-private"
+        frames = [
+            (
+                "update",
+                JsonRpcMessage(
+                    params={
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": child_id,
+                            "status": "in_progress",
+                            "title": "Agent",
+                            "rawInput": {"description": "inspect adapter lifecycle"},
+                            "_meta": {"claudeCode": {"subagent": True}},
+                        }
+                    }
+                ),
+            ),
+            (
+                "update",
+                JsonRpcMessage(
+                    params={
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "read the bridge"},
+                            "_meta": {"claudeCode": {"parentToolUseId": child_id}},
+                        }
+                    }
+                ),
+            ),
+            (
+                "update",
+                JsonRpcMessage(
+                    params={
+                        "update": {
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": child_id,
+                            "status": "completed",
+                            "_meta": {"claudeCode": {"subagent": True}},
+                        }
+                    }
+                ),
+            ),
+            ("complete", JsonRpcMessage(result={"stopReason": "end_turn"})),
+        ]
+
+        async def _fake_loop(req_id, timeout):
+            for frame in frames:
+                yield frame
+
+        client._prompt_loop = _fake_loop  # type: ignore[assignment]
+        events = [event async for event in client._dispatch_events(req_id=1, timeout=1.0)]
+        children = [
+            event.provider_child for event in events if event.kind == EVENT_SUBAGENT_ACTIVITY
+        ]
+
+        child_events = [child for child in children if child]
+        assert [child.phase for child in child_events] == ["started", "activity", "completed"]
+        assert child_events[0].label == "inspect adapter lifecycle"
+        assert [event.text for event in events if event.kind == EVENT_TEXT_CHUNK] == []
+        assert [event.text for event in events if event.provider_child and event.text] == [
+            "read the bridge"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_treats_codex_activity_completion_as_nonterminal(self):
+        """Codex closes activity records, not the underlying child thread."""
+        from kiro_crew.acp.types import EVENT_SUBAGENT_ACTIVITY, EVENT_TOOL_CALL, JsonRpcMessage
+
+        client = AcpClient(acp_backend=ACP_BACKEND_CLAUDE)
+        thread_id = "provider-thread-private"
+        meta = {
+            "codex": {
+                "subagent": {
+                    "threadId": thread_id,
+                    "path": "/internal/reviewer",
+                    "activity": "started",
+                }
+            }
+        }
+        frames = [
+            (
+                "update",
+                JsonRpcMessage(
+                    params={
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": "activity-1",
+                            "status": "in_progress",
+                            "title": "Start subagent reviewer",
+                            "kind": "other",
+                            "rawInput": {
+                                "agentThreadId": thread_id,
+                                "agentPath": "/internal/reviewer",
+                            },
+                            "_meta": meta,
+                        }
+                    }
+                ),
+            ),
+            (
+                "update",
+                JsonRpcMessage(
+                    params={
+                        "update": {
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": "activity-1",
+                            "status": "completed",
+                            "_meta": meta,
+                        }
+                    }
+                ),
+            ),
+            ("complete", JsonRpcMessage(result={"stopReason": "end_turn"})),
+        ]
+
+        async def _fake_loop(req_id, timeout):
+            for frame in frames:
+                yield frame
+
+        client._prompt_loop = _fake_loop  # type: ignore[assignment]
+        events = [event async for event in client._dispatch_events(req_id=1, timeout=1.0)]
+        children = [
+            event.provider_child for event in events if event.kind == EVENT_SUBAGENT_ACTIVITY
+        ]
+        [tool] = [event for event in events if event.kind == EVENT_TOOL_CALL]
+
+        assert [child.phase for child in children if child] == ["started", "started"]
+        assert all(child.label == "" for child in children if child)
+        assert tool.title == "Subagent activity"
+        assert tool.tool_input == ""
+        assert tool.raw_tool_params is None
+
+    @pytest.mark.asyncio
     async def test_dispatch_yields_subagent_list_and_activity(self):
         from kiro_crew.acp.types import (
             EVENT_SUBAGENT_ACTIVITY,

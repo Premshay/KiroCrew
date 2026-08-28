@@ -119,6 +119,18 @@ native Kiro CLI path unchanged.
 | `fs.readTextFile` / `fs.writeTextFile` | `false` | We serve no `fs/*` handler; advertising them would invite requests that hit `_reject_unknown_server_request`. |
 | `terminal` | `false` | Same — the agent uses its own tools. |
 | `elicitation` | omitted | KiroCrew does not implement `elicitation/create`. Omitting the capability keeps agents on the supported `session/request_permission` path for MCP confirmations; advertising it would make an agent select a request path that KiroCrew must reject with `-32601`. Add the handler and its transport tests before advertising this capability.
+| `_meta.subagent-transcript` | `true` | claude-agent-acp forwards nested Task/Agent text and tool updates only after this explicit opt-in. KiroCrew maps the standard `_meta.claudeCode` fields to the parent slot's existing Activity cards; it never parses Task output text to infer a child. |
+
+**Provider-native child activity.** Claude's outer Task/Agent update has
+`_meta.claudeCode.subagent=true`; its terminal status is the child card's
+terminal boundary. Nested child updates carry `parentToolUseId`, so their text
+and tools are attributed to that card instead of the parent transcript. Codex
+uses `_meta.codex.subagent` on activity records. A `completed` Codex frame ends
+one `started`/`interacted`/`interrupted` activity record, not the child thread,
+so KiroCrew records it only as activity and settles the card as `reported` when
+the parent turn ends. Browser payloads use an opaque card id and never expose a
+provider thread id or agent path; these observational cards are not controllable
+through KiroCrew's spawn APIs.
 
 **Request-id namespaces are independent.** Our outbound requests (prompt, initialize, set_model, ...) use `_next_req_id()`; the agent's inbound server→client requests (`session/request_permission`) carry their own id counter. The two collide on small integers, so `JsonRpcMessage.is_response_for(req_id)` requires both `id == req_id` **and** `method is None` — a response never has a `method`. Without the `method is None` guard, a permission request whose id equals the in-flight prompt's `req_id` was misclassified as that prompt's completion in `_process_message`, ending the turn early and leaving the tool's permission unanswered → the agent turn hangs on follow-up messages (the agent waits forever for a `session/request_permission` response that never comes).
 

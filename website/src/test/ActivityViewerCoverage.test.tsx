@@ -365,6 +365,32 @@ describe('ActivityViewer — subagent card controls', () => {
     expect(api.spawnDelete).toHaveBeenCalledWith('s1')
   })
 
+  it('does not offer cancellation for provider-native child activity', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ s1: mkAgent('s1', { status: 'running', controllable: false }) }}
+      />,
+    )
+
+    expect(screen.queryByTestId('subagent-cancel-btn')).toBeNull()
+  })
+
+  it('renders a reported provider card as activity without a disk transcript lookup', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ s1: mkAgent('s1', { status: 'reported', controllable: false }) }}
+      />,
+    )
+
+    expect(screen.getAllByText('Activity')).toHaveLength(2)
+    expect(screen.queryByTestId('dismiss-done-btn')).toBeNull()
+    expect(api.spawnStatus).not.toHaveBeenCalled()
+  })
+
   it('stops following the output once the user scrolls up, and resumes at the bottom', () => {
     const props = (streaming: string) => (
       <ActivityViewer

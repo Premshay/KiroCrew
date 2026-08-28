@@ -104,6 +104,10 @@ TODO_TEXT_MAX = 500
 ACP_CLIENT_CAPABILITIES: dict = {
     "fs": {"readTextFile": False, "writeTextFile": False},
     "terminal": False,
+    # claude-agent-acp only forwards nested Task/Agent transcript updates when
+    # the client explicitly opts in. The data still arrives as ordinary ACP
+    # session/update frames; this does not open a callback surface.
+    "_meta": {"subagent-transcript": True},
 }
 
 # ── ACP Backend Identifiers ──
@@ -206,7 +210,7 @@ PROVIDER_LABEL_KAS = "kas"
 # is opened, because that is how a client selects KAS feature flags.
 KAS_CLIENT_CAPABILITIES: dict = {
     **ACP_CLIENT_CAPABILITIES,
-    "_meta": {"kiro": {"settings": {}}},
+    "_meta": {**ACP_CLIENT_CAPABILITIES["_meta"], "kiro": {"settings": {}}},
 }
 
 # ── Claude backend permission modes ──
@@ -463,6 +467,21 @@ def _command_from_tool_params(params: dict) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class ProviderChildActivity:
+    """Validated provider-native child activity carried by a normal ACP update.
+
+    ``child_id`` remains gateway-internal: the dashboard derives an opaque card
+    id before sending any event to a browser. ``phase`` describes only evidence
+    the provider sent; in particular Codex activity is never child completion.
+    """
+
+    provider: str
+    child_id: str
+    phase: str
+    label: str = ""
+
+
 @dataclass
 class AcpEvent:
     """Structured event from kiro-cli ACP stream."""
@@ -505,6 +524,9 @@ class AcpEvent:
     # Owning sub-agent session id (EVENT_SUBAGENT_ACTIVITY) — ties a tool call
     # to a specific native sub-agent card.
     sub_session_id: str = ""
+    # Structured provider-native child activity (Claude Task/Agent or Codex
+    # subAgentActivity). The raw provider identity never reaches the browser.
+    provider_child: ProviderChildActivity | None = None
     # Agent TODO-list snapshot (EVENT_TODO_UPDATE) — normalised
     # {description, tasks:[{id,text,completed}]}. Every todo_list command
     # returns the WHOLE list, so this is a full snapshot, never a delta.

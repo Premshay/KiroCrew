@@ -29,6 +29,11 @@ def test_fs_and_terminal_stay_false() -> None:
     assert ACP_CLIENT_CAPABILITIES["terminal"] is False
 
 
+def test_claude_nested_subagent_transcript_is_opted_in() -> None:
+    """The Claude ACP adapter otherwise strips child text from normal updates."""
+    assert ACP_CLIENT_CAPABILITIES["_meta"]["subagent-transcript"] is True
+
+
 def test_both_acp_transports_send_capabilities() -> None:
     """Both transports must advertise, not just one.
 

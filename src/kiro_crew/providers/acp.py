@@ -1254,6 +1254,7 @@ class AcpProvider(LLMProvider):
             subagents=e.subagents,
             runtime_global=e.runtime_global,
             sub_session_id=e.sub_session_id,
+            provider_child=e.provider_child,
             is_shell=e.is_shell,
             # Canonical, non-model-authored tool identity (_meta.kiro). The
             # session-directive forgery gate in chat_runner keys on THESE, so

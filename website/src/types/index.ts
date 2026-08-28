@@ -899,7 +899,7 @@ export interface SubagentActivity {
    *  frames; shown beside the agent pill in the Subagents panel so a model-pinned
    *  run's real model is visible (#3582). */
   model?: string
-  status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped'
+  status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped' | 'reported'
   streaming: string; lastTool: string
   startedAt: number; elapsed: number; error?: string
   toolCount?: number      // observed tool calls (incl. auto-approved) — running-card progress
@@ -915,6 +915,8 @@ export interface SubagentActivity {
    *  while `stalled` holds there is by definition no activity to reset it. */
   stalledAt?: number
   retrying?: boolean      // transient-backend retry (or cancel auto-continue) in flight
+  /** False when the provider owns the child lifecycle and KiroCrew can only observe it. */
+  controllable?: boolean
   approval_id?: string
   approving?: boolean
   /** Inline terminal output for native (`native:*`) cards only. Native cards

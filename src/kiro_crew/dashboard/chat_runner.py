@@ -2069,6 +2069,8 @@ def _native_subagent_sync(state, slot, subagents, tracker, card_output=None) -> 
     for sid, info in list(tracker.items()):
         if info.get("done"):
             continue
+        if info.get("provider"):
+            continue
         if sid in _seen_sids:
             continue  # still reported by kiro-cli this update — not stale
         last_act = info.get("last_activity", info["started"])
@@ -2103,6 +2105,115 @@ def _native_subagent_sync(state, slot, subagents, tracker, card_output=None) -> 
             )
 
 
+def _provider_native_card_id(slot, provider: str, child_id: str) -> str:
+    """Make provider child identity inspectable without exposing its raw id."""
+    digest = hashlib.sha256(f"{slot.key}\0{provider}\0{child_id}".encode()).hexdigest()[:24]
+    return f"native:provider:{provider}:{digest}"
+
+
+def _finish_provider_subagent(
+    state,
+    slot,
+    info: dict,
+    card_output: dict[str, list[str]] | None,
+    *,
+    outcome: str,
+) -> None:
+    """Settle a provider card only at the lifecycle boundary the adapter proved."""
+    if info.get("done"):
+        return
+    card_id = str(info["id"])
+    info["done"] = True
+    info["done_at"] = time.time()
+    info["elapsed"] = info["done_at"] - float(info["started"])
+    info["reported"] = outcome == "reported"
+    info["stopped"] = outcome == "stopped"
+    info["error"] = "failed" if outcome == "failed" else None
+    info["result"] = _native_card_feed(card_output, card_id) if outcome != "reported" else ""
+    state.broadcast_ws(
+        "subagent_done",
+        {
+            "id": card_id,
+            "slot": slot.key,
+            "elapsed": info["elapsed"],
+            "error": info["error"],
+            "stopped": info["stopped"],
+            "outcome": outcome,
+            "reported": info["reported"],
+            "controllable": False,
+            "task": info["task"],
+            "agent": info["agent"],
+            "result": info["result"],
+        },
+    )
+
+
+def _provider_subagent_sync(state, slot, event, tracker, card_output=None) -> None:
+    """Project structured Claude/Codex child events into the native card model."""
+    child = event.provider_child
+    if child is None:
+        return
+    key = f"provider:{child.provider}:{child.child_id}"
+    now = time.time()
+    info = tracker.get(key)
+    if info is None:
+        task = child.label or child.provider
+        task, _ = redact_exfiltration_urls(task)
+        task, _ = redact_credentials(task)
+        agent, _ = redact_exfiltration_urls(child.provider)
+        agent, _ = redact_credentials(agent)
+        card_id = _provider_native_card_id(slot, child.provider, child.child_id)
+        info = tracker[key] = {
+            "id": card_id,
+            "started": now,
+            "done": False,
+            "agent": agent,
+            "task": task[:2000],
+            "last_activity": now,
+            "last_tool": "",
+            "provider": child.provider,
+            "controllable": False,
+        }
+        state.broadcast_ws(
+            "subagent_spawn",
+            {
+                "id": card_id,
+                "slot": slot.key,
+                "task": info["task"],
+                "agent": info["agent"],
+                "controllable": False,
+            },
+        )
+    if info.get("done"):
+        return
+    info["last_activity"] = now
+    if child.phase in {"completed", "failed", "stopped"}:
+        _finish_provider_subagent(state, slot, info, card_output, outcome=child.phase)
+        return
+    # codex-acp derives its title from the provider-internal agent path. The
+    # adapter card intentionally exposes neither that path nor thread id.
+    tool = (
+        event.title or (child.label if child.phase == "interacted" else "")
+        if child.provider != "codex"
+        else ""
+    )
+    if tool:
+        tool, _ = redact_exfiltration_urls(tool)
+        tool, _ = redact_credentials(tool)
+        info["last_tool"] = tool[:80]
+        state.broadcast_ws(
+            "subagent_tool", {"id": info["id"], "slot": slot.key, "tool": info["last_tool"]}
+        )
+    if event.text:
+        text, _ = redact_exfiltration_urls(event.text)
+        text, _ = redact_credentials(text)
+        card_id = str(info["id"])
+        output = card_output if card_output is not None else {}
+        output_len = sum(len(part) for part in output.get(card_id, []))
+        _append_native_output(output.setdefault(card_id, []), text, output_len)
+        state.broadcast_ws("subagent_chunk", {"id": card_id, "slot": slot.key, "text": text})
+
+
 def _register_native_card(state, card_id: str, slot_key: str, session_id: str) -> None:
     """Register a native subagent card in the state-level dict for cancel support."""
     if not hasattr(state, "_native_cards"):
@@ -2121,12 +2232,15 @@ def _unregister_native_card(state, card_id: str) -> None:
 
 
 def _native_subagent_close_all(state, slot, tracker, card_output=None) -> None:
-    """Complete any still-open native subagent cards (turn-end safety net)."""
+    """Settle still-open native cards at the parent turn boundary."""
     for sid, info in tracker.items():
         if info.get("done"):
             continue
+        if info.get("provider"):
+            _finish_provider_subagent(state, slot, info, card_output, outcome="reported")
+            continue
         info["done"] = True
-        _cid = f"native:{_redact_tool_field(sid)}"
+        _cid = str(info.get("id") or f"native:{_redact_tool_field(sid)}")
         _feed = _native_card_feed(card_output, _cid)
         _elapsed = time.time() - info.get("started", time.time())
         _result = _feed or "(output in chat)"
@@ -8020,6 +8134,19 @@ async def _run_chat(
                     _record_subagent_roster_timeline(slot, roster)
                     _timeline_subagent_roster = roster
             elif event.kind == EVENT_SUBAGENT_ACTIVITY:
+                if event.provider_child is not None:
+                    _provider_subagent_sync(
+                        state, slot, event, _native_tracker, _native_card_output
+                    )
+                    if event.tool_call_id:
+                        _child_key = (
+                            f"provider:{event.provider_child.provider}:"
+                            f"{event.provider_child.child_id}"
+                        )
+                        _child_info = _native_tracker.get(_child_key)
+                        if _child_info is not None:
+                            _native_tc_card[event.tool_call_id] = str(_child_info["id"])
+                    continue
                 # kiro-cli's _kiro.dev/session/update tags a sub-agent's inner
                 # tool call with its sessionId. This ALWAYS arrives before the
                 # corresponding flat tool_call/tool_call_update, so building the
