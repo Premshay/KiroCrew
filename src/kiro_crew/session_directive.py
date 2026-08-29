@@ -28,12 +28,13 @@ the subagent's session — never its parent's. There is no walk to get wrong.
 FORGERY: the marker payload is model-visible (it comes back as the tool result
 text), so a model *could* emit the literal bytes. The consumer defends by
 honouring a directive ONLY when the tool call it arrived under was recorded — by
-KiroCrew observing the tool CALL — as an MCP-served call whose CANONICAL name
-(``_meta.kiro`` or Claude's adapter-owned ``_meta.claudeCode`` tool identity) is
-one of :data:`DIRECTIVE_TOOLS`. That identity never comes from the ``title``
+KiroCrew observing the tool CALL — as an MCP-served call whose adapter-owned
+canonical identity (Kiro's ``_meta.kiro``, Claude's ``_meta.claudeCode``, or
+Codex's structured MCP frame) is one of :data:`DIRECTIVE_TOOLS`. That identity
+never comes from the ``title``
 (which is LLM-authored prose for shell tools — a shell
 command titled ``"monitor_start"`` whose stdout forges the marker must NOT be
-honoured). The gate fails closed when ``_meta`` identity is absent. The payload
+honoured). The gate fails closed when adapter identity is absent. The payload
 never carries a session key (the session is supplied by the consumer), and the
 consumer additionally refuses native-sub-agent tool calls, which surface as flat
 events in the parent loop but have no independently bindable slot. A model
@@ -168,8 +169,9 @@ def match_tool(raw: str) -> str:
     """Return the directive-tool name a recorded CANONICAL tool name refers to,
     or ``""``.
 
-    ``raw`` MUST be the trusted ``_meta.kiro.toolName`` (NOT the LLM-authored
-    title). For an MCP tool that name is the bare tool name (``"monitor_start"``);
+    ``raw`` MUST be a provenance-checked, adapter-owned canonical tool name
+    (NOT the LLM-authored title). For an MCP tool that name is the bare tool
+    name (``"monitor_start"``);
     some transports server-qualify it as ``"<server>___<name>"``. Accept exact
     membership plus that single ``___`` split — nothing wider, so a crafted
     string cannot smuggle a directive name in as a path/namespace tail.

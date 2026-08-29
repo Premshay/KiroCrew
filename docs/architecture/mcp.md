@@ -967,11 +967,15 @@ provider-specific bridge or a caller-supplied slot key.
 
 The directive marker is model-visible, since it comes back as tool-result text,
 so the consumer defends against forgery by honoring a directive only when the
-tool call it arrived under was recorded, from kiro-cli's out-of-band `_meta`
-channel, as an MCP-served call whose canonical name (`_meta.kiro.toolName`, with
-`_meta.kiro.mcpServerName` equal to `kirocrew-core`) is in `DIRECTIVE_TOOLS`. The
-LLM-authored `title` is explicitly not accepted, because a shell command titled
-`monitor_start` whose stdout forges the marker must not be honored. The gate fails
+tool call it arrived under was recorded from adapter-owned metadata as an
+MCP-served call from `kirocrew-core`. Kiro supplies the canonical pair through
+`_meta.kiro`; Claude supplies its adapter-owned core-tool identity; Codex supplies
+an adapter-created server/tool pair plus MCP-call provenance. These forms are
+normalized by the shared `directive_tool_for(..., trusted=...)` gate before the
+canonical tool name is compared with `DIRECTIVE_TOOLS`. The LLM-authored `title`
+is explicitly not accepted, because a
+shell command titled `monitor_start` whose stdout forges the marker must not be
+honored. The gate fails
 closed when `_meta` identity is absent, and refuses native-sub-agent tool calls,
 which surface as flat events in the parent's loop but have no independently
 bindable slot. The marker is ASCII-only: an earlier invisible-separator prefix was
