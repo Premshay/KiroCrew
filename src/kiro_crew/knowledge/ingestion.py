@@ -1075,6 +1075,12 @@ _REBUILD_BATCH_SIZE = 50
 # so the single-flight guard treats it as dead and lets a new rebuild start.
 _REBUILD_STALE_AFTER = timedelta(minutes=10)
 
+# Ordinary ingestion does not have a single-flight claimant, but a crashed job
+# can still pin its source against orphan cleanup forever. The deadline is much
+# longer than the largest normal extraction batch so a live low-concurrency
+# ingest is never reaped as a crash leftover.
+_INGESTION_JOB_STALE_AFTER = timedelta(hours=2)
+
 # Items that just failed a re-embed (vec is None) keep a stale sig but get an
 # `embedded_at` stamp; the watcher backs off from re-triggering on them until this
 # window elapses, so a perpetually-failing item (Ollama down) can't drive a fresh
@@ -1209,6 +1215,26 @@ def start_rebuild_job(store, *, now: datetime | None = None) -> str | None:
     except Exception:
         store.db.execute("ROLLBACK")
         raise
+
+
+def abandon_stale_ingestion_jobs(store, *, now: datetime | None = None) -> int:
+    """Finalize crashed ordinary ingestion jobs that can no longer make progress.
+
+    Corpus-wide embedding rebuilds have their own short single-flight lease and
+    are deliberately excluded. This only releases source-owned jobs whose
+    status has stayed ``processing`` beyond the ordinary ingestion deadline.
+    """
+    now = now or datetime.now()
+    ts = now.isoformat()
+    stale_before = (now - _INGESTION_JOB_STALE_AFTER).isoformat()
+    cur = store.db.execute(
+        "UPDATE ingestion_jobs SET status = 'abandoned', "
+        "error = 'abandoned: no progress before ingestion deadline', updated_at = ? "
+        "WHERE source_id IS NOT NULL AND status = 'processing' AND updated_at <= ?",
+        (ts, stale_before),
+    )
+    store.db.commit()
+    return int(cur.rowcount)
 
 
 def count_stale_items(store, sig: str, *, now: datetime | None = None) -> int:

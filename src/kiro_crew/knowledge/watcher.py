@@ -25,6 +25,7 @@ from .folder_watcher import FolderWatcher, folder_chunk_budget
 from .ingestion import (
     FileTooLargeError,
     IngestionPipeline,
+    abandon_stale_ingestion_jobs,
     count_stale_items,
     rebuild_embeddings,
     start_rebuild_job,
@@ -181,6 +182,12 @@ class KnowledgeWatcher:
 
     async def _scan(self):
         """Check all watched sources for changes."""
+        try:
+            abandoned = await asyncio.to_thread(abandon_stale_ingestion_jobs, self.store)
+            if abandoned:
+                logger.warning("Knowledge watcher abandoned %d stale ingestion job(s)", abandoned)
+        except Exception:
+            logger.warning("Knowledge watcher could not reconcile stale ingestion jobs", exc_info=True)
         # Pick up a newly-created workspace drop folder before scanning, so a
         # folder made since the last sweep is ingested in this same pass.
         await self._discover_drop_folder()

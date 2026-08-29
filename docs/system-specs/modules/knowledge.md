@@ -45,7 +45,7 @@ This is the boundary the two automatic write paths (§2b) capture against: verba
 
 ## Success criteria
 
-The Knowledge Library's job — surface the exact, cited chunk when memory's recall falls short — is judged on **two tiers**. No dedicated harness for either exists in-tree yet (see "What is measured today"); this section defines the target so a retrieval change (recency weighting, a reranker, content-typed TTL) can be judged against a fixed bar rather than by eye.
+The Knowledge Library's job — surface the exact, cited chunk when memory's recall falls short — is judged on **two tiers**. `kirocrew knowledge evaluate` provides the private Tier-1 ruler below; Tier 2 remains an explicit task-lift experiment. This keeps a retrieval change (recency weighting, a reranker, content-typed TTL) judged against a fixed bar rather than by eye.
 
 ### Tier 1 — intrinsic retrieval quality
 
@@ -82,9 +82,35 @@ A clean teach→recall set overstates quality: memory/KB systems break on the *h
 
 ### What is measured today
 
-The code computes and floors a retrieval **score**, but no Tier-1/Tier-2 metric and none of the hard query classes above:
+`kirocrew knowledge evaluate` runs a **private**, versioned golden set from
+`$KIROCREW_HOME/workspace/knowledge/evals/` through production `HybridRetriever`
+and writes a private JSON report to that same directory. The set is deliberately
+outside the repository: it names this operator's indexed sources and must never
+be published or used as a generic memory benchmark.
 
-- `HybridRetriever.search` fuses the keyword + graph + vector legs by RRF (`_rrf_fuse`, k=60; vector leg weighted `VECTOR_RRF_WEIGHT = 2.0`), tie-broken by `updated_at` recency — a secondary sort key, **not** a decay weight (`retrieval.py`, §4).
+- A fixture case declares `id`, `query`, `category`, and `expected`. Each expected
+  locator has a registered `source_uri` plus at least one stable `file_path`,
+  `section_title`, or `content_contains` anchor; it never records a volatile
+  database item id. An empty `expected` list is an abstention case.
+- An optional `scope_source_uri` exercises source-scoped retrieval. The evaluator
+  fails if either a scoped or expected source is no longer registered, reports a
+  scope leak when a returned item is not owned by or located in the scoped source,
+  and does not silently turn a stale fixture into a zero score.
+- It reports hit@k, recall@k, MRR, binary nDCG@k, abstention accuracy, source-scope
+  leak rate, p50/p95 latency, active-item count, and the active embedding signature.
+  Individual result records contain locators and scores but not chunk text.
+- It refuses to run when the shared embedding backend is unavailable. Production
+  search can gracefully fall back to FTS + graph; an evaluation that silently
+  changed retrieval mode would not be comparable to its baseline.
+
+The initial `golden-v1.json` is a seed, not a release gate. Add independently
+verified examples from the query classes above before changing retrieval behavior,
+then compare the private reports on the same fixture, corpus, score floor, and
+embedding signature.
+
+The system also computes and floors a retrieval **score**:
+
+- `HybridRetriever.search` fuses the keyword + graph + vector legs by RRF (`_rrf_fuse`, k=60; vector leg weighted `VECTOR_RRF_WEIGHT = 2.0`), tie-broken by `updated_at` recency — a secondary sort key, **not** a decay weight (`retrieval.py`, §4). A supplied `source_id` limits every returned leg to that source (including deduplicated source locations); graph traversal may still use cross-source entity connections, but cannot return another source's item.
 - Results below `min_score = 0.012` are dropped by the tool caller (`mcp_tools/knowledge.py`), not inside the retriever.
 - `kirocrew eval` ships four scenarios (`smoke_test`, `memory_recall_basic`, `lesson_application`, `context_accumulation`) scored per-assertion (`contains` / `regex` / `judge`) with an optional 1–5 LLM judge (`eval/judge.py`, pass ≥ 3.0). All four are clean single-fact teach→recall or accumulate→summarize flows; none exercises correction / contradiction / retraction / time-bound / reinforcement / hypothetical, and none reports recall@k, MRR, or task-lift.
 
@@ -368,7 +394,7 @@ The LLM reaches retrieval through the `kirocrew-core` MCP tool `local_knowledge_
 - DB path: `config_dir()/workspace/knowledge/knowledge.db`; a missing DB returns "Knowledge Library is not configured…" (SEL `not_configured`).
 - `_get_knowledge_search` caches the `(KnowledgeStore, embedder)` pair across calls and rebuilds only when the knowledge DB (or its `-wal`) or `config.json` changes — avoiding the per-call schema DDL / migrate / graph-load and the Ollama availability probe.
 - Default `limit` is 3; results below `min_score = 0.012` are dropped. Output is run through `redact_exfiltration_urls()` + `redact_credentials()` before returning, and every call emits an SEL audit event (`success` / `no_results` / `not_configured` / `unknown_source`). Input is validated against `LOCAL_KNOWLEDGE_SEARCH_SCHEMA` (`validation.py`).
-- Optional `source_id` scopes the SEED legs only (FTS5 keyword + vector similarity, via parameterized WHERE clauses in `HybridRetriever`); the graph leg stays unfiltered so cross-source entity connections still contribute traversal context. Scope membership is ownership OR location — `items.source_id` or a `source_locations` row, so an item surviving a cross-source dedup collapse still belongs to the losing source's scope (the same rule as `/api/knowledge/graph`'s filter). Omitting it keeps the unscoped behavior. A nonexistent id returns a guidance message naming `knowledge_list_sources` (SEL `unknown_source`), not an exception.
+- Optional `source_id` scopes every returned leg (FTS5 keyword, graph mentions, and vector similarity, via parameterized WHERE clauses in `HybridRetriever`). Graph traversal may still follow cross-source entity connections for context, but it cannot return another source's item. Scope membership is ownership OR location — `items.source_id` or a `source_locations` row, so an item surviving a cross-source dedup collapse still belongs to the losing source's scope (the same rule as `/api/knowledge/graph`'s filter). Omitting it keeps the unscoped behavior. A nonexistent id returns a guidance message naming `knowledge_list_sources` (SEL `unknown_source`), not an exception.
 - The companion tool `knowledge_list_sources` (no arguments; `KNOWLEDGE_LIST_SOURCES_SCHEMA`) returns one `name — id (N item(s))` line per source, counting **active** items only (superseded/deduped copies would overstate a source's coverage) — so agents discover valid `source_id` values instead of guessing.
 - **The response is written through a private stdout descriptor, not fd 1.** The first search's availability probe (`InProcessEmbedder.is_available` → `embed`) kicks the background GGUF load, and the vendored llama-cpp wraps that load in `suppress_stdout_stderr`, which `dup2`s **fd 1 process-wide to `/dev/null`** for the duration (~0.7s) *and* rebinds the `sys.stdout` object. Because the probe returns `None` immediately, the search answers keyword-only in milliseconds — so its JSON-RPC response raced that window and was silently destroyed: no exception, no short write, SEL still logging `success`, and the client hanging until the ACP tool-stall watchdog (`acp/client.py::_TOOL_STALL_TIMEOUT`, 600s) killed the turn. `mcp_shared.run_mcp_stdio_loop` now takes an `os.dup(1)` snapshot (`snapshot_stdout_fd`) at server startup before any tool can run, and `respond()` writes through it under a lock, so responses (and `ping` / `tools/list` replies, which were equally exposed) always reach the client. Falls back to `sys.stdout` when stdout is not fd-backed. Note that "has `sys.stdout` been swapped?" is *not* a usable guard — the suppressor swaps the object too, so it reads as swapped exactly inside the window that must be survived.
 
@@ -425,6 +451,7 @@ Returns the item count per source **under the active filters**:
 - **FTS query input is parameterized** — user query tokens are always double-quoted literals; the user never injects FTS5 operators.
 - **Embedding-dimension mismatches are skipped, not scored** — vector search excludes incomparable-dimension items so a model swap cannot fill the top-K with all-zero ghosts.
 - **The self-heal rebuild path never touches SQLite on the event loop** — `_maybe_reembed_stale`'s stale COUNT, `rebuild_embeddings`' total COUNT / page SELECTs / batch progress commits, and the success-path job finalize all run via `asyncio.to_thread` (`store.db` is a per-thread connection, so each worker thread uses its own connection to the same WAL db). On a large KB (observed: ~1.3GB after an embedder-sig change) an inline COUNT can stall past the 25s loop-watchdog threshold and crash-loop the gateway. The one deliberate exception is the CancelledError finalize in `_run_reembed_job`, which stays inline so cancellation cannot pre-empt the single-flight finalize. When the stale count exceeds `_LARGE_REBUILD_WARN_THRESHOLD` the watcher logs a prominent WARNING before starting the full re-embed.
+- **Ordinary crashed ingestion jobs are reconciled off-loop** — each watcher sweep marks source-owned `processing` jobs with no progress for two hours as `abandoned`, then logs the count. Corpus-wide re-embedding jobs are excluded because their separate single-flight lease owns their lifecycle.
 - **`__none__` is a shared wire contract** — the no-source sentinel is defined as `_NO_SOURCE` in `dashboard/handlers/knowledge.py` and mirrored as `NO_SOURCE` in `website/src/pages/knowledge/SourceGroup.tsx`. Both sides must change together; it is effectively un-renameable once shipped.
 - **A source-scoped `total` is scoped, never global** — `/items?source_id=` reports the count for that source alone, because the per-source pager computes its page count from it.
 - **Per-source badge counts are filter-aware** — list-view badges come from `/source-counts` (which honours `type`/`status`/`namespace`), not from `/sources.item_count`, so a badge never disagrees with the group's contents under a filter.
