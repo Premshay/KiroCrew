@@ -5381,7 +5381,7 @@ async def _run_chat(
     # only for PostToolUse hook name-matching — NOT trustworthy for security).
     _pending_tools: dict[str, str] = {}
     # tool_call_id -> canonical directive-tool name (forgery gate). Written
-    # ONLY at EVENT_TOOL_CALL, ONLY from the out-of-band _meta.kiro identity
+    # ONLY at EVENT_TOOL_CALL, ONLY from the trusted adapter identity
     # (event.tool_name + event.mcp_server_name), never from the title. This is
     # the ONLY map the session-directive gate below trusts.
     _pending_dir_tool: dict[str, str] = {}
@@ -6714,7 +6714,7 @@ async def _run_chat(
                 if event.tool_call_id:
                     _pending_tools[event.tool_call_id] = _raw
                     # Forgery gate: record the directive-tool name ONLY
-                    # from the trusted _meta.kiro identity — never the title.
+                    # from trusted adapter-owned identity — never the title.
                     # The single shared predicate (also used by the messaging
                     # TurnDriver) requires Kiro Crew's OWN core MCP server and a
                     # canonical directive-tool name; a shell tool (no
@@ -6723,7 +6723,9 @@ async def _run_chat(
                     # register here. Recorded at EVENT_TOOL_CALL only (the
                     # UPDATE refinement rewrites titles).
                     _cannon = session_directive.directive_tool_for(
-                        event.mcp_server_name, event.tool_name
+                        event.mcp_server_name,
+                        event.tool_name,
+                        trusted=event.mcp_identity_trusted,
                     )
                     if _cannon:
                         _pending_dir_tool[event.tool_call_id] = _cannon
@@ -6947,8 +6949,8 @@ async def _run_chat(
                 # tool's own return over the MCP pipe — this does NOT rewrite the
                 # model's tool result, which is why the tool's own message is
                 # written to not over-claim the (consumer-applied) effect.
-                # Gated on _pending_dir_tool — the CANONICAL _meta.kiro tool name
-                # for a genuine MCP call, NOT model-authored result/title text —
+                # Gated on _pending_dir_tool — the canonical tool name for a
+                # genuine MCP call, NOT model-authored result/title text —
                 # so a forged marker under a shell/non-directive tool is ignored.
                 # A native sub-agent's tool calls DO surface here (flat events
                 # tagged in _native_tc_card) but have no independently bindable
@@ -7045,7 +7047,12 @@ async def _run_chat(
                             _pending_dir_tool.pop(event.tool_call_id, None)
                             _out = _redact_tool_field(
                                 await apply_session_directive(
-                                    state, slot, session_key, _dir_tool, _dir_args
+                                    state,
+                                    slot,
+                                    session_key,
+                                    _dir_tool,
+                                    _dir_args,
+                                    producer_is_user_facing=_directive_user_origin,
                                 )
                             )
                             _dir_consumed_out[event.tool_call_id] = _out

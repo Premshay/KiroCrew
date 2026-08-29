@@ -3,11 +3,9 @@
 Three landed fixes are pinned here:
 
 1. **ACP identity plumbing** (``acp/types.py`` + ``acp/_dispatch.py``): an
-   ``AcpEvent`` now carries the NON-model-authored tool identity from
-   ``_meta.kiro`` — ``tool_name`` (``_kiro_tool_name``) and ``mcp_server_name``
-   (``_kiro_mcp_server_name``). A non-empty ``mcp_server_name`` is the trusted
-   "this was a real MCP tool call" discriminator; both are ``""`` when the
-   backend emits no ``_meta`` (fail-closed).
+   ``AcpEvent`` carries provenance-checked adapter tool identity. Kiro emits
+   ``_meta.kiro``; Claude and Codex have their own exact, adapter-owned shapes.
+   Missing or mismatched identity fails closed.
 
 2. **chat_runner directive gate** (``dashboard/chat_runner.py``): the
    ``EVENT_TOOL_CALL`` handler records ``_pending_dir_tool[id]`` ONLY when
@@ -22,6 +20,7 @@ The ``_meta.kiro`` fixture shape mirrors ``test_todo_list_surface.py``.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -29,7 +28,12 @@ import pytest
 from chat_test_helpers import _make_state
 
 from kiro_crew import session_directive
-from kiro_crew.acp._dispatch import _build_tool_call_event, _kiro_mcp_server_name
+from kiro_crew.acp._dispatch import (
+    _build_tool_call_event,
+    _kiro_mcp_server_name,
+    trusted_mcp_identity,
+)
+from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_SUBAGENT_ACTIVITY,
@@ -88,6 +92,7 @@ class TestBuildToolCallEventIdentity:
         assert event.kind == EVENT_TOOL_CALL
         assert event.tool_name == "monitor_start"
         assert event.mcp_server_name == "kirocrew-core"
+        assert event.mcp_identity_trusted is True
 
     def test_identity_is_meta_not_title(self) -> None:
         """The title is LLM prose; a shell tool could title itself "monitor_start"
@@ -98,6 +103,7 @@ class TestBuildToolCallEventIdentity:
         event = _build_tool_call_event(upd, None)
         assert event.tool_name == "execute_bash"
         assert event.mcp_server_name == ""  # NOT a real MCP call → gate fails closed
+        assert event.mcp_identity_trusted is False
 
     def test_shell_style_update_without_meta_yields_empty_identity(self) -> None:
         """A shell/exec tool_call with no ``_meta`` → both identity fields ''."""
@@ -111,8 +117,118 @@ class TestBuildToolCallEventIdentity:
         event = _build_tool_call_event(shell_update, None)
         assert event.tool_name == ""
         assert event.mcp_server_name == ""
+        assert event.mcp_identity_trusted is False
         # is_shell must still be derived from the kind (unrelated to identity).
         assert event.is_shell is True
+
+
+class TestClaudeCoreMcpIdentity:
+    """Claude carries real MCP identity under adapter-owned ``claudeCode`` metadata."""
+
+    def test_core_tool_is_recognized_without_kiro_metadata(self) -> None:
+        update = {
+            "_meta": {
+                "claudeCode": {"toolName": "mcp__kirocrew-core__session_checkpoint"}
+            }
+        }
+        assert trusted_mcp_identity(update) == (
+            "session_checkpoint",
+            "kirocrew-core",
+            True,
+        )
+
+    def test_other_claude_mcp_server_cannot_claim_core_authority(self) -> None:
+        update = {
+            "_meta": {"claudeCode": {"toolName": "mcp__third-party__session_checkpoint"}}
+        }
+        assert trusted_mcp_identity(update) == ("", "", False)
+
+    def test_direct_client_preserves_claude_identity_on_the_tool_event(self) -> None:
+        """The legacy direct-Claude reader is the production regression seam."""
+        client = object.__new__(AcpClient)
+        client._tool_call_inputs = {}
+        client._tool_call_input_redacted = {}
+        client._tool_call_params = {}
+        client._tool_call_is_shell = {}
+        client._tool_call_mcp_server = {}
+        client._tool_call_tool_name = {}
+        client.last_prompt_stats = SimpleNamespace(tool_calls=[])
+        message = SimpleNamespace(
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "claude-checkpoint",
+                    "title": "Record work state",
+                    "kind": "other",
+                    "rawInput": {"summary": "Needs an owner decision."},
+                    "_meta": {
+                        "claudeCode": {
+                            "toolName": "mcp__kirocrew-core__session_checkpoint"
+                        }
+                    },
+                }
+            }
+        )
+
+        event = client._extract_tool_event(message)
+
+        assert event is not None
+        assert event.tool_name == "session_checkpoint"
+        assert event.mcp_server_name == "kirocrew-core"
+        assert event.mcp_identity_trusted is True
+
+
+class TestCodexCoreMcpIdentity:
+    """Codex's adapter-owned MCP fields must agree before a directive is trusted."""
+
+    @staticmethod
+    def _update(**overrides):
+        update = {
+            "kind": "mcp.kirocrew-core.session_checkpoint",
+            "rawInput": {
+                "server": "kirocrew-core",
+                "tool": "session_checkpoint",
+                "arguments": {"summary": "Checkpoint"},
+            },
+            "_meta": {"is_mcp_tool_call": True},
+        }
+        update.update(overrides)
+        return update
+
+    def test_core_tool_is_recognized_from_adapter_provenance(self) -> None:
+        assert trusted_mcp_identity(self._update()) == (
+            "session_checkpoint",
+            "kirocrew-core",
+            True,
+        )
+
+    def test_raw_input_without_adapter_provenance_fails_closed(self) -> None:
+        assert trusted_mcp_identity(self._update(_meta={})) == ("", "", False)
+
+    def test_mismatched_kind_fails_closed(self) -> None:
+        assert trusted_mcp_identity(self._update(kind="execute")) == ("", "", False)
+
+    def test_direct_client_event_preserves_codex_core_identity(self) -> None:
+        client = object.__new__(AcpClient)
+        client._tool_call_inputs = {}
+        client._tool_call_input_redacted = {}
+        client._tool_call_is_shell = {}
+        client._tool_call_mcp_server = {}
+        client._tool_call_tool_name = {}
+        client._tool_call_params = {}
+        client.last_prompt_stats = SimpleNamespace(tool_calls=[])
+
+        event = client._extract_tool_event(
+            SimpleNamespace(
+                params={"update": {"sessionUpdate": "tool_call", **self._update()}},
+                method="session/update",
+            )
+        )
+
+        assert event is not None
+        assert event.tool_name == "session_checkpoint"
+        assert event.mcp_server_name == "kirocrew-core"
+        assert event.mcp_identity_trusted is True
 
 
 # ── Part 3: chat_runner directive gate (security regression, integration) ─────
@@ -202,10 +318,12 @@ class TestProviderConversionPreservesIdentity:
             title="Arming monitor",
             tool_name="monitor_start",
             mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
         )
         out = AcpProvider._to_llm_event(src)
         assert out.tool_name == "monitor_start"
         assert out.mcp_server_name == "kirocrew-core"
+        assert out.mcp_identity_trusted is True
 
     def test_to_llm_event_round_trips_every_dataclass_field(self) -> None:
         """Catch the NEXT dropped field too: every dataclass field must survive
@@ -221,6 +339,7 @@ class TestProviderConversionPreservesIdentity:
             tool_name="monitor_start",
             mcp_server_name="kirocrew-core",
             is_shell=True,
+            mcp_identity_trusted=True,
         )
         out = AcpProvider._to_llm_event(src)
         dropped = [
@@ -253,6 +372,7 @@ class TestChatRunnerDirectiveSeam:
                 title="Arming monitor",
                 tool_name="monitor_start",
                 mcp_server_name="kirocrew-core",
+                mcp_identity_trusted=True,
             ),
             AcpEvent(
                 kind=EVENT_TOOL_RESULT,
@@ -288,6 +408,7 @@ class TestChatRunnerDirectiveSeam:
                 title="Switching project",
                 tool_name="set_project",
                 mcp_server_name="kirocrew-core",
+                mcp_identity_trusted=True,
             ),
             AcpEvent(
                 kind=EVENT_TOOL_RESULT,
@@ -382,6 +503,7 @@ class TestChatRunnerDirectiveSeam:
                 title="Arming monitor",
                 tool_name="monitor_start",
                 mcp_server_name="kirocrew-core",
+                mcp_identity_trusted=True,
             ),
             # Same tool_call_id delivered twice — the duplicate frame.
             AcpEvent(
@@ -475,6 +597,7 @@ class TestChatRunnerDirectiveSeam:
                 title="Arming monitor",
                 tool_name="monitor_start",
                 mcp_server_name="kirocrew-core",
+                mcp_identity_trusted=True,
             ),
             # 4. The tool result carries a valid marker.
             AcpEvent(
@@ -522,6 +645,7 @@ class TestChatRunnerDirectiveSeam:
                 title="Stopping",
                 tool_name="autonudge_stop",
                 mcp_server_name="kirocrew-core",
+                mcp_identity_trusted=True,
             ),
             AcpEvent(
                 kind=EVENT_TOOL_RESULT,

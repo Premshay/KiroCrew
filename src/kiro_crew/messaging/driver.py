@@ -333,8 +333,8 @@ class TurnDriver:
         # auto/trust/YOLO ladder so a DENY can never be overridden.
         self.tool_gate = tool_gate
         # Session-directive consumer (see the class docstring). Applied on
-        # EVENT_TOOL_RESULT for a tool call whose trusted ``_meta.kiro``
-        # identity was recorded at EVENT_TOOL_CALL — the forgery gate.
+        # EVENT_TOOL_RESULT for a tool call whose trusted adapter identity was
+        # recorded at EVENT_TOOL_CALL — the forgery gate.
         self.directive_consumer = directive_consumer
 
     async def run(self, message: str) -> str:
@@ -350,8 +350,8 @@ class TurnDriver:
         pending_steer_events = 0
         unmatched_marker_events = 0
         # tool_call_id -> canonical directive-tool name, recorded at
-        # EVENT_TOOL_CALL from the trusted ``_meta.kiro`` identity and consumed
-        # at the matching EVENT_TOOL_RESULT. Only populated when a directive
+        # EVENT_TOOL_CALL from the trusted adapter identity and consumed at the
+        # matching EVENT_TOOL_RESULT. Only populated when a directive
         # consumer is injected, so a consumer-less turn does no extra work.
         pending_directives: dict[str, str] = {}
         # tool_call_ids owned by a NATIVE (in-session) sub-agent, announced via
@@ -441,8 +441,8 @@ class TurnDriver:
                     )
                 )
                 # Forgery gate: record the directive-tool name ONLY from the
-                # trusted ``_meta.kiro`` identity — never the LLM-authored
-                # title. The single shared predicate (also used by the
+                # trusted adapter identity — never the LLM-authored title. The
+                # single shared predicate (also used by the
                 # dashboard consumer in chat_runner) requires Kiro Crew's OWN
                 # core MCP server and a canonical directive-tool name; a shell
                 # tool (no mcp_server_name, canonical tool_name like
@@ -452,6 +452,7 @@ class TurnDriver:
                     canonical = session_directive.directive_tool_for(
                         getattr(event, "mcp_server_name", "") or "",
                         getattr(event, "tool_name", "") or "",
+                        trusted=bool(getattr(event, "mcp_identity_trusted", False)),
                     )
                     if canonical:
                         pending_directives[event.tool_call_id] = canonical

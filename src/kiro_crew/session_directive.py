@@ -28,12 +28,13 @@ the subagent's session — never its parent's. There is no walk to get wrong.
 FORGERY: the marker payload is model-visible (it comes back as the tool result
 text), so a model *could* emit the literal bytes. The consumer defends by
 honouring a directive ONLY when the tool call it arrived under was recorded — by
-KiroCrew observing the tool CALL — as an MCP-served call whose CANONICAL name
-(``_meta.kiro.toolName``, with ``_meta.kiro.mcpServerName`` set) is one of
-:data:`DIRECTIVE_TOOLS`. That identity comes from kiro-cli's out-of-band ``_meta``
-channel, NOT the ``title`` (which is LLM-authored prose for shell tools — a shell
+KiroCrew observing the tool CALL — as an MCP-served call whose adapter-owned
+canonical identity (Kiro's ``_meta.kiro``, Claude's ``_meta.claudeCode``, or
+Codex's structured MCP frame) is one of :data:`DIRECTIVE_TOOLS`. That identity
+never comes from the ``title``
+(which is LLM-authored prose for shell tools — a shell
 command titled ``"monitor_start"`` whose stdout forges the marker must NOT be
-honoured). The gate fails closed when ``_meta`` identity is absent. The payload
+honoured). The gate fails closed when adapter identity is absent. The payload
 never carries a session key (the session is supplied by the consumer), and the
 consumer additionally refuses native-sub-agent tool calls, which surface as flat
 events in the parent loop but have no independently bindable slot. A model
@@ -168,8 +169,9 @@ def match_tool(raw: str) -> str:
     """Return the directive-tool name a recorded CANONICAL tool name refers to,
     or ``""``.
 
-    ``raw`` MUST be the trusted ``_meta.kiro.toolName`` (NOT the LLM-authored
-    title). For an MCP tool that name is the bare tool name (``"monitor_start"``);
+    ``raw`` MUST be a provenance-checked, adapter-owned canonical tool name
+    (NOT the LLM-authored title). For an MCP tool that name is the bare tool
+    name (``"monitor_start"``);
     some transports server-qualify it as ``"<server>___<name>"``. Accept exact
     membership plus that single ``___`` split — nothing wider, so a crafted
     string cannot smuggle a directive name in as a path/namespace tail.
@@ -185,25 +187,25 @@ def match_tool(raw: str) -> str:
     return ""
 
 
-def directive_tool_for(mcp_server_name: str, tool_name: str) -> str:
+def directive_tool_for(mcp_server_name: str, tool_name: str, *, trusted: bool) -> str:
     """Return the directive-tool name for a recorded tool CALL, or ``""``.
 
     THE forgery-gate identity predicate, spelled once: a directive-tool name is
-    honoured ONLY when the call's trusted ``_meta.kiro`` identity says it was
-    served by Kiro Crew's OWN core MCP server (:data:`CORE_MCP_SERVER`) AND its
+    honoured ONLY when a provenance-checked adapter identity says it was served
+    by Kiro Crew's OWN core MCP server (:data:`CORE_MCP_SERVER`) AND its
     CANONICAL tool name resolves to a :data:`DIRECTIVE_TOOLS` member via
     :func:`match_tool`. Both ``EVENT_TOOL_CALL`` consumers (the dashboard's
     ``chat_runner`` and ``messaging.driver.TurnDriver``) MUST call this instead
     of inlining the two checks, so the boundary cannot silently diverge.
 
-    Both arguments MUST come from the out-of-band ``_meta.kiro`` channel
-    (``mcpServerName`` / ``toolName``) — never the LLM-authored title. A shell
+    Both arguments MUST come from adapter-owned metadata and ``trusted`` must
+    be set only by its parser — never the LLM-authored title. A shell
     tool has no MCP server name and a canonical tool name like
     ``execute_bash``, so it resolves to ``""``; so does a third-party MCP
     server that merely exposes a tool named e.g. ``monitor_start``. Absent
     identity (empty server name) fails closed.
     """
-    if mcp_server_name != CORE_MCP_SERVER:
+    if not trusted or mcp_server_name != CORE_MCP_SERVER:
         return ""
     return match_tool(tool_name or "")
 

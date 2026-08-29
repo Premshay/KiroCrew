@@ -1262,6 +1262,7 @@ class AcpProvider(LLMProvider):
             # effect (the gate sees an empty server name and never records).
             tool_name=e.tool_name,
             mcp_server_name=e.mcp_server_name,
+            mcp_identity_trusted=e.mcp_identity_trusted,
             diff_old_text=e.diff_old_text,
             diff_path=e.diff_path,
         )
