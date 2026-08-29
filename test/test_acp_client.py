@@ -1039,6 +1039,29 @@ class TestClaudeAutonomousReader:
         assert await client._read_message(timeout=0.01) is foreground
 
     @pytest.mark.asyncio
+    async def test_autonomous_turn_captures_the_slot_that_owned_its_raw_cycle(self, tmp_path):
+        client = AcpClient(
+            work_dir=tmp_path,
+            acp_backend=ACP_BACKEND_CLAUDE,
+            session_key="slot-a",
+        )
+        delivered = []
+
+        async def deliver(turn):
+            delivered.append(turn)
+
+        await client.set_claude_autonomous_turn_handler(deliver)
+        await client._route_claude_frame(
+            self._sdk_message({"type": "user", "origin": {"kind": "peer"}})
+        )
+        await client._route_claude_frame(self._text_update("slot A reply"))
+        await client._route_claude_frame(
+            self._sdk_message({"type": "result", "origin": {"kind": "peer"}})
+        )
+
+        assert [turn.session_key for turn in delivered] == ["slot-a"]
+
+    @pytest.mark.asyncio
     async def test_autonomous_permission_is_rejected_without_a_foreground_prompt(self, tmp_path):
         from kiro_crew.acp.types import JsonRpcMessage
 
@@ -1074,6 +1097,35 @@ class TestClaudeAutonomousReader:
         await client._deliver_claude_autonomous_turn(turn)
 
         assert list(client._pending_claude_autonomous_turns) == [turn]
+
+    @pytest.mark.asyncio
+    async def test_rekey_drops_pending_autonomous_output_from_the_prior_slot(self, tmp_path):
+        client = AcpClient(
+            work_dir=tmp_path,
+            acp_backend=ACP_BACKEND_CLAUDE,
+            session_key="old-slot",
+        )
+        turn = acp_client.ClaudeAutonomousTurn(
+            text="Old session routine.",
+            origin="task-notification",
+            timestamp="2026-08-28T00:00:00Z",
+            message_id="msg-old-slot",
+            session_key="old-slot",
+        )
+
+        await client._deliver_claude_autonomous_turn(turn)
+        assert list(client._pending_claude_autonomous_turns) == [turn]
+
+        client.rekey("new-slot")
+        delivered = []
+
+        async def deliver(new_turn):
+            delivered.append(new_turn)
+
+        await client.set_claude_autonomous_turn_handler(deliver)
+
+        assert delivered == []
+        assert list(client._pending_claude_autonomous_turns) == []
 
 
 class TestResolveClaudeAcpBin:

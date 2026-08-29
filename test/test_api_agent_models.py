@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -181,6 +182,40 @@ async def test_workspace_alias_resolves_policy_by_kiro_agent():
     assert policy_calls == ["codex"]
     # Discovery still binds the alias so its workspace and pins apply.
     assert sessions.agent == "codex-atlas"
+
+
+@pytest.mark.asyncio
+async def test_overlapping_discovery_requests_share_one_ephemeral_provider():
+    started = asyncio.Event()
+    unblock = asyncio.Event()
+
+    async def discover_models():
+        started.set()
+        await unblock.wait()
+        return [{"modelId": "gpt-5.6-sol", "name": "GPT-5.6 Sol"}]
+
+    provider = SimpleNamespace(
+        discover_models=AsyncMock(side_effect=discover_models),
+        get_valid_effort_levels=lambda: [],
+    )
+    sessions = _Sessions(provider)
+
+    with patch("kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load", return_value=_config()):
+        async with TestClient(
+            TestServer(_app({"model": "selectable", "effort": "selectable"}, sessions))
+        ) as client:
+            first = asyncio.create_task(client.get("/api/agents/codex/models"))
+            second = asyncio.create_task(client.get("/api/agents/codex/models"))
+            await started.wait()
+            provider.discover_models.assert_awaited_once()
+            unblock.set()
+            first_response, second_response = await asyncio.gather(first, second)
+            assert first_response.status == second_response.status == 200
+            assert await first_response.json() == await second_response.json()
+
+    provider.discover_models.assert_awaited_once()
+    sessions.release.assert_called_once_with("dashboard:model-discovery:codex")
+    sessions.destroy.assert_awaited_once_with("dashboard:model-discovery:codex")
 
 
 def test_dashboard_routes_register_agent_model_discovery():

@@ -46,15 +46,12 @@ def test_payload_includes_tokens_when_window_known():
     assert "reset" not in payload
 
 
-def test_payload_resets_when_window_unknown():
-    # Before the first usage_update, window is 0 → no token counts to ship, so
-    # the frame must reset the frontend's stored counts rather than update the
-    # percentage alone and leave stale tokens behind.
-    provider = _provider_with_stats(used=0, window=0, pct=0.0)
+def test_payload_keeps_exact_count_when_window_unknown():
+    provider = _provider_with_stats(used=88_000, window=0, pct=0.0)
     payload = _context_usage_payload("dashboard:1", provider)
-    assert payload == {"slot": "dashboard:1", "pct": 0.0, "reset": True}
-    assert "used_tokens" not in payload
+    assert payload == {"slot": "dashboard:1", "pct": 0.0, "used_tokens": 88_000}
     assert "window_tokens" not in payload
+    assert "reset" not in payload
 
 
 def test_payload_resets_for_provider_without_token_accessors():

@@ -2202,6 +2202,18 @@ class TestContextUsagePayload:
 
         assert chat_runner._context_usage_payload("chat-1", client)["reset"] is True
 
+    def test_exact_count_without_window_is_not_discarded(self):
+        client = MagicMock()
+        client.context_usage_pct = MagicMock(return_value=0.0)
+        client.context_window_tokens = MagicMock(return_value=0)
+        client.context_used_tokens = MagicMock(return_value=20_000)
+
+        assert chat_runner._context_usage_payload("chat-1", client) == {
+            "slot": "chat-1",
+            "pct": 0.0,
+            "used_tokens": 20_000,
+        }
+
 
 # ── _run_chat: local commands ─────────────────────────────────────────────
 

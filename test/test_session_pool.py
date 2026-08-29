@@ -50,6 +50,7 @@ def _make_provider() -> MagicMock:
     p = MagicMock()
     p.start = AsyncMock()
     p.shutdown = AsyncMock()
+    p.new_conversation = AsyncMock()
     p.is_process_alive = MagicMock(return_value=True)
     p.exit_code = None
     # session_map persistence reads provider.cwd (the LLMProvider ABC accessor);
@@ -323,7 +324,7 @@ class TestConfigWiring:
 class TestGetOrCreatePoolIntegration:
     @pytest.mark.asyncio
     async def test_claims_from_pool_when_agent_matches(self):
-        """get_or_create uses pooled provider, verifies rekey() called."""
+        """A pool claim resets provider context before admitting the new slot."""
         from kiro_crew.providers.acp import AcpProvider
 
         mgr, factory = _make_manager(pool_agent="kirocrew")
@@ -332,6 +333,13 @@ class TestGetOrCreatePoolIntegration:
         pooled.client = MagicMock()
         pooled.client.resumed = False
         pooled.client._session_id = "fake-sid"
+        order: list[str] = []
+        pooled.client.rekey.side_effect = lambda *args, **kwargs: order.append("rekey")
+
+        async def _reset() -> None:
+            order.append("fresh-conversation")
+
+        pooled.new_conversation.side_effect = _reset
         mgr._drain_and_claim = AsyncMock(return_value=pooled)
         mgr._schedule_replenish = MagicMock()
 
@@ -349,6 +357,8 @@ class TestGetOrCreatePoolIntegration:
         assert args == ("test-key", "ch-1")
         assert kwargs["crew_agent"] == ""
         assert isinstance(kwargs["watchdog"], WatchdogSettings)
+        pooled.new_conversation.assert_awaited_once()
+        assert order[:2] == ["rekey", "fresh-conversation"]
         mgr._schedule_replenish.assert_called_once()
         factory.assert_not_called()
 

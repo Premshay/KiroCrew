@@ -125,6 +125,14 @@ class TestContextReading:
         out = ch._context_reading(11.5, 0, 0, stale=False)
         assert out == {"context_pct": 11.5, "context_stale": False}
 
+    def test_exact_used_count_survives_an_unknown_window(self):
+        out = ch._context_reading(0, 88_000, 0, stale=False)
+        assert out == {
+            "context_pct": 0.0,
+            "context_stale": False,
+            "context_used_tokens": 88_000,
+        }
+
     def test_full_reading_carries_both_counts(self):
         out = ch._context_reading(44, 88_000, 200_000, stale=False)
         assert out["context_used_tokens"] == 88_000

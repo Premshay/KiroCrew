@@ -158,9 +158,10 @@ def inject_cron_result_to_dashboard(
         # token counts in independent slices, and a bare {slot, pct} frame
         # would leave stale counts beside a fresh percentage.
         payload: dict[str, Any] = {"slot": slot.key, "pct": context_reading["pct"]}
-        if context_reading.get("window_tokens"):
-            payload["used_tokens"] = context_reading.get("used_tokens", 0)
-            payload["window_tokens"] = context_reading["window_tokens"]
+        if context_reading.get("used_tokens"):
+            payload["used_tokens"] = context_reading["used_tokens"]
+            if context_reading.get("window_tokens"):
+                payload["window_tokens"] = context_reading["window_tokens"]
         else:
             payload["reset"] = True
         state.broadcast_context_usage(slot.key, payload)

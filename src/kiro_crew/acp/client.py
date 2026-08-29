@@ -978,6 +978,10 @@ class ClaudeAutonomousTurn:
     origin: str
     timestamp: str
     message_id: str
+    # Captured when the native SDK cycle starts, rather than at delivery time.
+    # A warm client can be re-keyed while idle, and a completed old cycle must
+    # never be attributed to the slot that claimed it afterwards.
+    session_key: str = ""
 
 
 def _is_shell_kind(kind: str | None) -> bool:
@@ -1080,6 +1084,15 @@ class AcpPromptBusy(AcpError):  # noqa: N818
     The backend still has an in-flight prompt (tool stall, timeout, or race
     between messages). Callers should reset the session so the next message
     cold-starts cleanly.
+    """
+
+
+class AcpProviderStreamInterrupted(AcpError):  # noqa: N818
+    """A provider ended a turn before it emitted a terminal result.
+
+    This is deliberately distinct from a content refusal: interactive callers
+    may cold-start and replay only when no text or tool activity was observed.
+    A normal reset would preserve the provider's broken native conversation.
     """
 
 
@@ -1360,6 +1373,11 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
     if _RE_AUTH.search(haystack):
         # Auth is terminal — a retry can't fix an expired/denied credential.
         return False
+    if _is_session_expired(haystack):
+        # An expired or rejected kiro-cli login is terminal too.  Keep this
+        # before connection/5xx handling because aborted requests often carry
+        # a transport wrapper beside the credential failure.
+        return False
     if _RE_CONNECTION.search(haystack):
         # Recognized terminal signals above take precedence; an otherwise unknown
         # cause with connection wording may consume only this bounded retry budget.
@@ -1586,6 +1604,13 @@ def _format_acp_error(error: object, available_models: Sequence[str] | None = No
                 "(e.g. re-run your SSO/login or 'aws sso login'), then retry. If "
                 "the failure persists, check that the configured AWS profile has "
                 "Bedrock InvokeModel access."
+                f"{req_id_suffix}"
+            )
+        elif _is_session_expired(haystack):
+            formatted = (
+                "Your kiro-cli session has expired or its credential was rejected. "
+                "Run `kiro-cli login` in a terminal, then start a new chat. "
+                "Retrying will not help until you sign in again."
                 f"{req_id_suffix}"
             )
         elif _RE_CONNECTION.search(haystack):
@@ -2276,9 +2301,11 @@ class AcpClient:
         self._claude_autonomous_text: list[str] = []
         self._claude_autonomous_timestamp = ""
         self._claude_autonomous_message_id = ""
+        self._claude_autonomous_session_key = ""
         self._claude_autonomous_handler: (
             Callable[[ClaudeAutonomousTurn], Awaitable[None]] | None
         ) = None
+        self._claude_autonomous_handler_owner = ""
         self._pending_claude_autonomous_turns: deque[ClaudeAutonomousTurn] = deque()
         # MCP OAuth requests collected during session init from
         # `_kiro.dev/mcp/oauth_request` notifications. Drained by callers via
@@ -2513,8 +2540,33 @@ class AcpClient:
     ) -> None:
         """Set the dashboard sink and replay any completed undelivered turns."""
         self._claude_autonomous_handler = handler
+        self._claude_autonomous_handler_owner = self._claude_autonomous_owner()
         if handler is not None:
             await self._flush_pending_claude_autonomous_turns()
+
+    def _claude_autonomous_owner(self) -> str:
+        """Return the dashboard slot currently entitled to autonomous output."""
+        return str(self._session_key or "")
+
+    def _discard_claude_autonomous_delivery(self, reason: str) -> None:
+        """Drop output that can no longer be attributed to its originating slot."""
+        pending = len(self._pending_claude_autonomous_turns)
+        partial = bool(self._claude_autonomous_origin or self._claude_autonomous_text)
+        if pending or partial:
+            logger.warning(
+                "Discarding Claude autonomous delivery at %s boundary (pending=%d, partial=%s)",
+                reason,
+                pending,
+                partial,
+            )
+        self._claude_autonomous_origin = None
+        self._claude_autonomous_text.clear()
+        self._claude_autonomous_timestamp = ""
+        self._claude_autonomous_message_id = ""
+        self._claude_autonomous_session_key = ""
+        self._pending_claude_autonomous_turns.clear()
+        self._claude_autonomous_handler = None
+        self._claude_autonomous_handler_owner = ""
 
     @property
     def is_ready(self) -> bool:
@@ -2566,6 +2618,7 @@ class AcpClient:
         AcpSessionProvider.rekey (session.py calls provider.client.rekey
         uniformly): this client's dispatch loop carries no per-agent watchdog
         snapshot, so both are accepted and deliberately not stored."""
+        self._discard_claude_autonomous_delivery("re-key")
         self._session_key = session_key
         self._channel_id = channel_id
         self._last_activity = time.monotonic()
@@ -2852,6 +2905,7 @@ class AcpClient:
         if isinstance(config_options, list):
             self._acp_config_options = config_options
             logger.debug("ACP config options loaded: %d entries", len(config_options))
+            self._capture_models_from_config_options(config_options)
             self._sync_effort_levels()
         # Capture advertised mode ids + whether a modes list was advertised at
         # all, so step 4's set_mode can fail closed against a requested agent the
@@ -3515,6 +3569,7 @@ class AcpClient:
             autonomous_text.clear()
         self._claude_autonomous_timestamp = ""
         self._claude_autonomous_message_id = ""
+        self._claude_autonomous_session_key = ""
         # Completed autonomous turns remain queued. The same client can be
         # reinitialized after this reset, and its registered dashboard sink can
         # then deliver them; clearing them here would silently lose a terminal
@@ -4085,6 +4140,7 @@ class AcpClient:
             self._claude_autonomous_text.clear()
             self._claude_autonomous_timestamp = str(sdk_message.get("timestamp") or "")
             self._claude_autonomous_message_id = ""
+            self._claude_autonomous_session_key = self._claude_autonomous_owner()
             return
         if kind == "assistant" and self._claude_autonomous_origin is not None:
             timestamp = sdk_message.get("timestamp")
@@ -4103,11 +4159,13 @@ class AcpClient:
                 origin=self._claude_autonomous_origin,
                 timestamp=self._claude_autonomous_timestamp,
                 message_id=self._claude_autonomous_message_id,
+                session_key=self._claude_autonomous_session_key,
             )
             self._claude_autonomous_origin = None
             self._claude_autonomous_text.clear()
             self._claude_autonomous_timestamp = ""
             self._claude_autonomous_message_id = ""
+            self._claude_autonomous_session_key = ""
             if turn.text:
                 await self._deliver_claude_autonomous_turn(turn)
 
@@ -4141,8 +4199,18 @@ class AcpClient:
                 self._claude_autonomous_text.append(text)
 
     async def _deliver_claude_autonomous_turn(self, turn: ClaudeAutonomousTurn) -> None:
+        owner = self._claude_autonomous_owner()
+        if turn.session_key != owner:
+            logger.error(
+                "Dropping Claude autonomous turn for a non-owning session "
+                "(turn_owner=%s, current_owner=%s, origin=%s)",
+                turn.session_key or "<unbound>",
+                owner or "<unbound>",
+                turn.origin,
+            )
+            return
         handler = self._claude_autonomous_handler
-        if handler is None:
+        if handler is None or self._claude_autonomous_handler_owner != owner:
             self._queue_pending_claude_autonomous_turn(turn)
             return
         try:
@@ -4161,6 +4229,16 @@ class AcpClient:
             return
         while self._pending_claude_autonomous_turns:
             turn = self._pending_claude_autonomous_turns.popleft()
+            owner = self._claude_autonomous_owner()
+            if turn.session_key != owner or self._claude_autonomous_handler_owner != owner:
+                logger.error(
+                    "Dropping queued Claude autonomous turn at a session ownership boundary "
+                    "(turn_owner=%s, current_owner=%s, origin=%s)",
+                    turn.session_key or "<unbound>",
+                    owner or "<unbound>",
+                    turn.origin,
+                )
+                continue
             try:
                 await handler(turn)
             except Exception:

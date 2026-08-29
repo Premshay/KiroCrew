@@ -454,7 +454,31 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     # agent itself decides whether to operate a browser or read with web_fetch
     # (the system prompt and the kirocrew-commands / web-browse skills tell it
     # how), so the backend injects nothing here.
-    slot.append("user", message, "msg msg-u", meta=_redact_meta(user_meta) if user_meta else None)
+    was_dirty = slot._dirty
+    user_row = slot.append(
+        "user",
+        message,
+        "msg msg-u",
+        retire_questions=False,
+        meta=_redact_meta(user_meta) if user_meta else None,
+    )
+    admission_dirty_gen = slot._dirty_gen
+    if not await asyncio.to_thread(state.flush_slot_now, slot):
+        slot.discard_failed_admission(
+            user_row,
+            was_dirty=was_dirty,
+            admission_dirty_gen=admission_dirty_gen,
+        )
+        slot._has_reader = False
+        logger.error("Refused unsaved dashboard turn for slot %s", slot.key)
+        return web.json_response(
+            {
+                "error": "message could not be saved; please retry",
+                "code": "history_unavailable",
+            },
+            status=503,
+        )
+    slot.retire_stateless_questions_for_turn()
 
     # Note: untitled slots display as "New Session…" via _ChatSlot.display_title
     # (serialization layer), so there's no bare chat-N flash to patch here. The
@@ -830,9 +854,13 @@ def _context_reading(pct: Any, used: Any, window: Any, *, stale: bool) -> dict[s
     fields: dict[str, Any] = {"context_pct": pct_num, "context_stale": stale}
     if window_num:
         fields["context_window_tokens"] = int(window_num)
-        if used_num and not stale:
-            fields["context_used_tokens"] = int(used_num)
-    if not pct_num and "context_window_tokens" not in fields:
+    if used_num and not stale:
+        fields["context_used_tokens"] = int(used_num)
+    if (
+        not pct_num
+        and "context_window_tokens" not in fields
+        and "context_used_tokens" not in fields
+    ):
         return {}
     return fields
 

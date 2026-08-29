@@ -54,23 +54,31 @@ export function composeContextReadout(
 ): string {
   const parts: string[] = []
   if (showPct) parts.push(fmtPercent(contextPctClamped(pct) / 100))
-  // Skip the token segment when the window size is unknown (total <= 0):
-  // rendering "96K/0" would be nonsense, so degrade to the remaining segments.
-  if (showTokens && Number.isFinite(total) && total > 0) parts.push(`${approx ? '~' : ''}${fmtTokens(used)}/${fmtTokens(total)}`)
+  if (showTokens && Number.isFinite(used) && used > 0) {
+    const prefix = approx ? '~' : ''
+    parts.push(Number.isFinite(total) && total > 0
+      ? `${prefix}${fmtTokens(used)}/${fmtTokens(total)}`
+      : `${prefix}${fmtTokens(used)}`)
+  }
   return parts.join(' · ')
 }
 
 /** Compact horizontal context-usage bar for the input bar. */
 export default function ContextBar(
-  { pct, width = 40, height = 3 }:
-    { pct: number; width?: number; height?: number },
+  { pct, width = 40, height = 3, decorative = false }:
+    { pct: number; width?: number; height?: number; decorative?: boolean },
 ) {
   const p = contextPctClamped(pct)
   const fill = contextColor(pct)
   const tip = contextTip(pct)
   const r = height / 2
   return (
-    <span title={tip} aria-label={tip} className="inline-flex shrink-0">
+    <span
+      title={decorative ? undefined : tip}
+      aria-label={decorative ? undefined : tip}
+      aria-hidden={decorative || undefined}
+      className="inline-flex shrink-0"
+    >
       <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" className="block">
         <rect x="0" y="0" width={width} height={height} rx={r} ry={r} fill="var(--text)" opacity="0.15" />
         <rect x="0" y="0" width={(width * p) / 100} height={height} rx={r} ry={r} fill={fill} style={{ transition: 'width 500ms' }} />

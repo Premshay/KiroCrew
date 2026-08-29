@@ -119,4 +119,10 @@ describe('slot-detail context seeding', () => {
     expect(state.slotContextPct['A']).toBe(11.4)
     expect(state.slotContextTokens['A']).toBeUndefined()
   })
+
+  it('seeds an exact count without fabricating a window', () => {
+    const state = switchTo({ ...initial, activeSlot: 'old' }, 'A', { pct: 0, used: 88_000 })
+    expect(state.slotContextPct['A']).toBe(0)
+    expect(state.slotContextTokens['A']).toEqual({ used: 88_000 })
+  })
 })

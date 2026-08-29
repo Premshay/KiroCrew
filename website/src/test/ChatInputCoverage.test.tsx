@@ -595,6 +595,15 @@ describe('ChatInput context-usage popover', () => {
     expect(screen.getByText('116K')).toBeInTheDocument()
   })
 
+  it('shows exact used tokens without inventing an unknown provider window', () => {
+    renderWithProviders(<ChatInput {...base} contextPct={0} contextUsedTokens={84_000} />)
+    fireEvent.click(screen.getByLabelText('Context usage'))
+    expect(screen.getByText('Context usage')).toBeInTheDocument()
+    expect(screen.getAllByText('84K')).toHaveLength(2)
+    expect(screen.queryByText('Context window')).toBeNull()
+    expect(screen.queryByText('0%')).toBeNull()
+  })
+
   it('derives an approximate used count when the host reports only a percentage', () => {
     renderWithProviders(<ChatInput {...base} contextPct={40} contextWindowTokens={100_000} />)
     fireEvent.click(screen.getByLabelText('Context usage'))

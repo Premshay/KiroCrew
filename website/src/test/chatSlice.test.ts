@@ -10,7 +10,6 @@ import reducer, {
   removeThinking,
   setSlotRunning,
   setSlotStopping,
-  interruptActiveTurn,
   startLocalTurn,
   syncSlotRunningFromServer,
   setSlotState,
@@ -220,22 +219,6 @@ describe('chatSlice reducers', () => {
     expect(state3.slotStatusDetail['test-slot'].kind).toBe('idle')
   })
 
-  it('interruptActiveTurn closes a dropped stream and exposes recovery', () => {
-    let state = reducer(initial, setActiveSlot('test-slot'))
-    state = reducer(state, appendMessage({ role: 'user', content: 'continue the work', cls: '' }))
-    state = reducer(state, updateStreamingMessage('partial answer'))
-    state = reducer(state, setSlotRunning(true))
-
-    state = reducer(state, interruptActiveTurn({ message: 'Connection interrupted. Reconnecting…' }))
-
-    expect(state.messages.map(message => message.role)).toEqual(['user', 'assistant', 'error'])
-    expect(state.messages[1].content).toBe('partial answer')
-    expect(state.messages[2].content).toBe('Connection interrupted. Reconnecting…')
-    expect(state.slotRunning).toBe(false)
-    expect(state.slotState).toBe('idle')
-    expect(state.slotStatusDetail['test-slot'].text).toBe('Reconnecting…')
-  })
-
   it('clearMessages resets messages and pagination', () => {
     let state = reducer(initial, appendMessage({ role: 'user', content: 'hi', cls: '' }))
     state = reducer(state, clearMessages())
@@ -312,6 +295,24 @@ describe('switchSlot.pending', () => {
     expect(state.messages).toHaveLength(1)
     expect(state.messages[0].content).toBe('B msg')
     expect(state.slotRunning).toBe(false)
+  })
+
+  it('keeps the newest same-slot response when an older request settles last', () => {
+    let state = { ...initial, activeSlot: 'old' }
+    state = reducer(state, { type: 'chat/switchSlot/pending', meta: { arg: 'B', requestId: 'r1', requestStatus: 'pending' } })
+    state = reducer(state, { type: 'chat/switchSlot/pending', meta: { arg: 'B', requestId: 'r2', requestStatus: 'pending' } })
+    state = reducer(state, {
+      type: 'chat/switchSlot/fulfilled',
+      meta: { arg: 'B', requestId: 'r2', requestStatus: 'fulfilled' },
+      payload: { key: 'B', messages: [{ role: 'assistant', content: 'latest reply', cls: '' }], running: false, stopping: false, hasMore: false, total: 1, queue: [] },
+    })
+    state = reducer(state, {
+      type: 'chat/switchSlot/fulfilled',
+      meta: { arg: 'B', requestId: 'r1', requestStatus: 'fulfilled' },
+      payload: { key: 'B', messages: [{ role: 'assistant', content: 'stale reply', cls: '' }], running: false, stopping: false, hasMore: false, total: 1, queue: [] },
+    })
+
+    expect(state.messages.map(message => message.content)).toEqual(['latest reply'])
   })
 
   it('fulfilled replaces empty messages with new slot data and updates cache', () => {
@@ -2079,12 +2080,15 @@ describe('sseContextUsage reducer', () => {
     expect(state.slotContextTokens['s1']).toEqual({ used: 88000, window: 200000 })
   })
 
-  it('stores pct only and leaves tokens untouched when window is 0/absent', () => {
+  it('stores pct only and leaves tokens untouched when counts are absent', () => {
     const state = reducer(initial, sseContextUsage({ slot: 's1', pct: 9 }))
     expect(state.slotContextPct['s1']).toBe(9)
     expect(state.slotContextTokens['s1']).toBeUndefined()
-    const zero = reducer(initial, sseContextUsage({ slot: 's1', pct: 9, used_tokens: 5, window_tokens: 0 }))
-    expect(zero.slotContextTokens['s1']).toBeUndefined()
+  })
+
+  it('stores an exact count when the provider window is unknown', () => {
+    const state = reducer(initial, sseContextUsage({ slot: 's1', pct: 0, used_tokens: 88_000 }))
+    expect(state.slotContextTokens['s1']).toEqual({ used: 88_000 })
   })
 
   it('falls back to used:0 when used_tokens omitted but window present', () => {

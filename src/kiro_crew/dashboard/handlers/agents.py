@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -84,6 +85,14 @@ from kiro_crew.sandbox import (
 from kiro_crew.validation import _AGENT_NAME_RE
 
 _MODEL_LIST_STDERR_TAIL_CHARS = 1000
+_MODEL_DISCOVERY_CACHE_TTL_SECS = 30.0
+
+# Model discovery starts a real subscription-backed ACP process. Browser remounts
+# routinely overlap these requests, so the result and its in-flight task must be
+# shared per live SessionManager instead of each request tearing down a provider
+# that another request is still using.
+_model_discovery_cache: dict[tuple[int, str], tuple[float, dict[str, Any]]] = {}
+_model_discovery_tasks: dict[tuple[int, str], asyncio.Task[dict[str, Any]]] = {}
 
 logger = logging.getLogger(__name__)
 
@@ -1686,20 +1695,8 @@ def _agent_runtime_policy(
     return policy if isinstance(policy, dict) else None
 
 
-async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
-    """GET /api/agents/{name}/models — discover a selectable crew's live options."""
-    name = request.match_info["name"]
-    cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    if name not in cfg.agents:
-        return web.json_response({"error": "agent not found", "code": "agent_not_found"}, status=404)
-    policy = _agent_runtime_policy(request, name, cfg.agents[name].kiro_agent or name)
-    if policy is None or policy.get("model") != "selectable":
-        return web.json_response({"models": [], "effort_levels": []})
-    state: DashboardState | None = request.app.get("state")
-    if state is None:
-        return web.json_response(
-            {"error": "session manager unavailable", "code": "session_manager_unavailable"}, status=503
-        )
+async def _discover_agent_models(state: DashboardState, name: str) -> dict[str, Any]:
+    """Discover models once and always release the ephemeral provider ourselves."""
     key = f"dashboard:model-discovery:{name}"
     try:
         provider, _is_new, _resumed = await asyncio.wait_for(
@@ -1707,9 +1704,7 @@ async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
         )
         available = await provider.discover_models()
         efforts = getattr(provider, "get_valid_effort_levels", lambda: [])()
-        configured_models = acp_model_config_options(
-            getattr(provider, "acp_config_options", [])
-        )
+        configured_models = acp_model_config_options(getattr(provider, "acp_config_options", []))
         if configured_models:
             available = configured_models
         models = [
@@ -1721,24 +1716,83 @@ async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
             for model in available
             if isinstance(model, dict) and model.get("modelId")
         ]
-        if not models:
-            return web.json_response(
-                {"error": "subscription returned no models", "code": "models_unavailable"}, status=503
-            )
+        return {
+            "models": models,
+            "effort_levels": [level for level in efforts if isinstance(level, str)],
+        }
+    finally:
+        if state.sessions.has_session(key):
+            state.sessions.release(key)
+            await state.sessions.destroy(key)
+
+
+async def _shared_agent_model_discovery(state: DashboardState, name: str) -> dict[str, Any]:
+    """Coalesce overlapping discovery requests and briefly reuse successes."""
+    cache_key = (id(state.sessions), name)
+    cached = _model_discovery_cache.get(cache_key)
+    if cached is not None and time.monotonic() - cached[0] < _MODEL_DISCOVERY_CACHE_TTL_SECS:
+        return cached[1]
+
+    task = _model_discovery_tasks.get(cache_key)
+    if task is None:
+
+        async def run() -> dict[str, Any]:
+            result = await _discover_agent_models(state, name)
+            _model_discovery_cache[cache_key] = (time.monotonic(), result)
+            return result
+
+        task = asyncio.create_task(run(), name=f"model-discovery:{name}")
+        _model_discovery_tasks[cache_key] = task
+
+        def clear_finished_task(completed: asyncio.Task[dict[str, Any]]) -> None:
+            if _model_discovery_tasks.get(cache_key) is completed:
+                _model_discovery_tasks.pop(cache_key, None)
+
+        task.add_done_callback(clear_finished_task)
+    try:
+        # A disconnected browser must not cancel shared provider startup for
+        # every other current requester.
+        return await asyncio.shield(task)
+    finally:
+        if task.done() and _model_discovery_tasks.get(cache_key) is task:
+            _model_discovery_tasks.pop(cache_key, None)
+
+
+async def api_kirocrew_agent_models(request: web.Request) -> web.Response:
+    """GET /api/agents/{name}/models — discover a selectable crew's live options."""
+    name = request.match_info["name"]
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    if name not in cfg.agents:
         return web.json_response(
-            {"models": models, "effort_levels": [level for level in efforts if isinstance(level, str)]}
+            {"error": "agent not found", "code": "agent_not_found"}, status=404
         )
+    policy = _agent_runtime_policy(request, name, cfg.agents[name].kiro_agent or name)
+    if policy is None or policy.get("model") != "selectable":
+        return web.json_response({"models": [], "effort_levels": []})
+    state: DashboardState | None = request.app.get("state")
+    if state is None:
+        return web.json_response(
+            {"error": "session manager unavailable", "code": "session_manager_unavailable"},
+            status=503,
+        )
+    try:
+        result = await _shared_agent_model_discovery(state, name)
     except asyncio.TimeoutError:
-        return web.json_response({"error": "model discovery timed out", "code": "models_timeout"}, status=503)
+        return web.json_response(
+            {"error": "model discovery timed out", "code": "models_timeout"}, status=503
+        )
     except Exception:
         logger.warning("Model discovery failed for crew %s", name, exc_info=True)
         return web.json_response(
             {"error": "model discovery unavailable", "code": "models_unavailable"}, status=503
         )
-    finally:
-        if state.sessions.has_session(key):
-            state.sessions.release(key)
-            await state.sessions.destroy(key)
+    if not result["models"]:
+        return web.json_response(
+            {"error": "subscription returned no models", "code": "models_unavailable"}, status=503
+        )
+    return web.json_response(result)
+
+
 _config_lock = LoopBoundLock()
 
 

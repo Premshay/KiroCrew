@@ -2681,6 +2681,23 @@ class _ChatSlot:
         """
         self._disk_tail_ts = latest_transcript_ts(self._disk_tail_ts, *candidates)
 
+    def retire_stateless_questions_for_turn(self) -> list[str]:
+        """Retire non-blocking question cards consumed by a new live turn."""
+        if not self._question_pending:
+            return []
+        retired = [cid for cid, rec in self._question_pending.items() if not rec.get("blocking")]
+        if not retired:
+            return []
+        self._question_pending = {
+            cid: rec for cid, rec in self._question_pending.items() if rec.get("blocking")
+        }
+        if self._on_question_retired:
+            try:
+                self._on_question_retired(self.key, retired)  # type: ignore[operator]
+            except Exception:
+                pass
+        return retired
+
     def append(
         self,
         role: str,
@@ -2690,6 +2707,7 @@ class _ChatSlot:
         *,
         broadcast: bool = True,
         broadcast_user: bool = False,
+        retire_questions: bool = True,
         meta: dict | None = None,
     ) -> dict[str, Any]:
         # A LIVE turn-consuming row retires every unanswered STATELESS question:
@@ -2717,22 +2735,12 @@ class _ChatSlot:
         # working while its tool call is still stuck on the answer. Those are
         # owned by the round-trip in request_question, which retires its own entry
         # on every exit.
-        if role in _QUESTION_RETIRING_ROLES and broadcast and self._question_pending:
-            retired = [
-                cid for cid, rec in self._question_pending.items() if not rec.get("blocking")
-            ]
-            self._question_pending = {
-                cid: rec for cid, rec in self._question_pending.items() if rec.get("blocking")
-            }
+        if role in _QUESTION_RETIRING_ROLES and broadcast and retire_questions:
             # Announce it: a retirement that only mutates state is invisible to a
             # second window and to a /pending response already in flight, either
             # of which would then re-render a card whose answer was just sent —
             # and submitting that card appends a duplicate turn.
-            if retired and self._on_question_retired:
-                try:
-                    self._on_question_retired(self.key, retired)  # type: ignore[operator]
-                except Exception:
-                    pass
+            self.retire_stateless_questions_for_turn()
         msg: dict[str, Any] = {
             "role": role,
             "content": content,
@@ -2846,6 +2854,27 @@ class _ChatSlot:
         # ids for one logical message. Read the id off the return with
         # :func:`row_mid`, never an inline ``meta`` poke.
         return msg
+
+    def discard_failed_admission(
+        self,
+        message: dict[str, Any],
+        *,
+        was_dirty: bool,
+        admission_dirty_gen: int,
+    ) -> bool:
+        """Remove a user row when its required pre-turn save did not complete."""
+        for index, candidate in enumerate(self.messages):
+            if candidate is message:
+                del self.messages[index]
+                self.total_messages = max(0, self.total_messages - 1)
+                self.invalidate_source_links()
+                self._pending[:] = [
+                    candidate for candidate in self._pending if candidate is not message
+                ]
+                if not was_dirty and self._dirty_gen == admission_dirty_gen:
+                    self._dirty = False
+                return True
+        return False
 
     def push_wire_frame(self, cls: str, content: str) -> None:
         """Queue an ephemeral wire-only frame for live SSE readers.
@@ -3337,14 +3366,23 @@ class _ChatSlot:
                 return item["content"]
         return None
 
-    def queue_edit_by_id(self, queue_id: str, content: str) -> bool:
+    def queue_edit_by_id(
+        self, queue_id: str, content: str, *, directive_user_origin: bool = False
+    ) -> bool:
         """Replace the content of a queue item by ID. Returns True if found.
 
-        Order is preserved — only the content of the matching item changes.
+        Order is preserved. Callback-owned entries have already bound their
+        content to a delivery side effect, so they cannot be edited.
         """
         for item in self._queue:
             if item["id"] == queue_id:
+                if item.get("_on_consumed") or item.get("_on_irreversibly_consumed"):
+                    return False
                 item["content"] = content
+                if directive_user_origin:
+                    item["_directive_user_origin"] = True
+                else:
+                    item.pop("_directive_user_origin", None)
                 return True
         return False
 
@@ -5267,7 +5305,7 @@ class DashboardState:
                 pass
             await asyncio.get_running_loop().run_in_executor(None, self._flush_dirty_slots)
 
-    def flush_slot_now(self, slot: _ChatSlot) -> None:
+    def flush_slot_now(self, slot: _ChatSlot) -> bool:
         """Write ONE dirty slot to disk, with the flush loop's bookkeeping.
 
         Shared with :meth:`_flush_dirty_slots` so the generation-compare contract
@@ -5281,8 +5319,10 @@ class DashboardState:
         wrote the bytes would leave the slot dirty, the loop would re-save it
         moments later, and the mtime would move again anyway.
         """
-        if not self.conversation_log or not slot._dirty or not slot.messages:
-            return
+        if not self.conversation_log:
+            return False
+        if not slot._dirty or not slot.messages:
+            return True
         from kiro_crew.dashboard.chat import _save_slot_to_history
 
         # Clear the dirty bit only if NOTHING re-marked the slot while this save
@@ -5305,9 +5345,11 @@ class DashboardState:
         except Exception:
             # Leave _dirty set so the next 5s pass retries.
             logger.warning("Flush failed for slot %s", slot.key, exc_info=True)
+            return False
         else:
             if slot._dirty_gen == gen:
                 slot._dirty = False
+            return True
 
     def _flush_dirty_slots(self) -> None:
         """Write any slot with new messages to its JSONL file."""

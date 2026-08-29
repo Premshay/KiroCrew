@@ -22,6 +22,7 @@ from kiro_crew.acp.client import (
     AcpConversationPayloadExceeded,
     AcpContextWindowExceeded,
     AcpError,
+    AcpProviderStreamInterrupted,
     AcpProcessDied,
     AcpPromptBusy,
     ClaudeAutonomousTurn,
@@ -1051,22 +1052,15 @@ def _clear_fallback_sticky_state(slot: Any, client: Any) -> None:
 def _context_usage_payload(slot_key: str, client: Any) -> dict[str, Any]:
     """Build the ``context_usage`` WS payload: pct plus real token counts.
 
-    The token counts let the frontend ring tooltip show "used / window" in
-    absolute tokens (sourced from the adapter's usage_update), so a 44%-of-200k
-    reading is not misread as 44%-of-1M.
+    The token counts let the frontend show exact usage from the adapter's usage
+    update; when a served window is known, a 44%-of-200k reading is not
+    misread as 44%-of-1M.
 
-    When real per-turn token counts are unavailable the payload carries
-    ``reset: True`` instead of the ``used_tokens``/``window_tokens`` pair. This
-    is load-bearing, not cosmetic: the frontend keeps the percentage and the
-    token counts in two independent slices (``slotContextPct`` vs
-    ``slotContextTokens``), so a bare ``{slot, pct}`` frame updates the
-    percentage while leaving whatever token counts the ring last stored in
-    place — a headline that disagrees with the count beside it. Emitting
-    ``reset`` whenever ``used`` is unknown — a fresh session before the first
-    ``usage_update``, or the post-compaction / post-model-switch state where the
-    provider zeroes ``used`` but keeps the window — moves the two fields
-    together: the ring drops its stored counts and the meter self-corrects on
-    the next turn's telemetry. Harmless when nothing is stored.
+    A provider may know the exact used count without attesting a context-window
+    denominator. In that case the payload ships ``used_tokens`` alone; the UI
+    shows the measured count but no percentage or capacity estimate. When the
+    used count itself is unavailable the payload carries ``reset: True`` so the
+    frontend drops counts that no longer describe this session.
     """
     pct = client.context_usage_pct()
     payload: dict[str, Any] = {"slot": slot_key, "pct": round(pct, 1)}
@@ -1080,11 +1074,17 @@ def _context_usage_payload(slot_key: str, client: Any) -> dict[str, Any]:
     # {used: 0, window: W} would assert a false "0 / W tokens", so we omit the
     # pair and signal a reset instead.
     used = 0
-    if window and hasattr(client, "context_used_tokens"):
-        used = client.context_used_tokens()
-    if window and used:
+    if hasattr(client, "context_used_tokens"):
+        try:
+            raw_used = client.context_used_tokens()
+            if isinstance(raw_used, int) and not isinstance(raw_used, bool) and raw_used > 0:
+                used = raw_used
+        except Exception:
+            logger.debug("context token accessor failed", exc_info=True)
+    if used:
         payload["used_tokens"] = used
-        payload["window_tokens"] = window
+        if window:
+            payload["window_tokens"] = window
     else:
         payload["reset"] = True
     return payload
@@ -3001,8 +3001,8 @@ def _extract_base_command(tool_title: str) -> str:
 
 
 def _extract_full_command(tool_title: str) -> str:
-    """Extract the full normalized command (strip display prefix)."""
-    return _normalize_tool_name(tool_title)
+    """Return the canonical command text without rewriting presentation words."""
+    return tool_title
 
 
 def _resolve_channel_target(state: Any, session_key: str, link: Any) -> Any:
@@ -3428,6 +3428,15 @@ async def _persist_claude_autonomous_turn(
     use it as the durable delivery id and retry the same row after a failed
     save instead of folding its text into whichever prompt happens next.
     """
+    if turn.session_key and turn.session_key != slot.key:
+        logger.error(
+            "Rejected Claude autonomous turn for another dashboard slot "
+            "(turn_owner=%s, target_slot=%s, origin=%s)",
+            turn.session_key,
+            slot.key,
+            turn.origin,
+        )
+        return
     if not turn.text.strip():
         return
     if turn.message_id:
@@ -9423,6 +9432,46 @@ async def _run_chat(
                 f"and answer it normally:\n\n{message}",
                 kind=SYNTHETIC_RECOVERY_KIND,
             )
+    except AcpProviderStreamInterrupted as exc:
+        logger.warning(
+            "Provider stream interrupted in slot %s (emitted=%s tools=%d): %s",
+            slot.key,
+            _turn_emitted,
+            _turn_tool_calls,
+            exc,
+        )
+        if assistant_text:
+            _safe, _ = redact_exfiltration_urls(assistant_text)
+            _safe, _ = redact_credentials(_safe)
+            slot.purge_chunks()
+            slot.append("assistant", _safe, "msg msg-a")
+        if _turn_emitted or _turn_tool_calls:
+            slot.append(
+                "error",
+                "Antigravity interrupted after activity. It was not retried automatically; "
+                "review the output before continuing.",
+                "msg msg-err",
+            )
+        elif _should_suppress_requeue(slot) or _prompt_depth != 0 or _synthetic_payload:
+            slot.append(
+                "error",
+                "Antigravity interrupted before it started. Please retry.",
+                "msg msg-err",
+            )
+        else:
+            needs_session_reset = True
+            needs_conversation_discard = True
+            slot.append(
+                "error",
+                "⟳ Antigravity interrupted before it started — rebuilding its session and retrying…",
+                "msg msg-err",
+            )
+            _queue_recovery(
+                0,
+                message,
+                kind=SYNTHETIC_RECOVERY_KIND,
+                payload=payload_for_replay(_is_synthetic),
+            )
     except AcpError as exc:
         # The exception CLASS is logged alongside the message because the
         # session-health scanner keys its prompt_stuck signal off this line, and
@@ -10135,6 +10184,8 @@ async def _run_chat(
         # runs stages as separate _run_chat calls, can mirror this same
         # "hold the queue for post-login resume" guard on its end-of-plan handoff.
         slot._last_turn_auth_required = _auth_required
+        if not await asyncio.to_thread(state.flush_slot_now, slot):
+            logger.error("Turn ended with unsaved dashboard state for slot %s", slot.key)
         next_turn_started = False
         if slot._queue and not _auth_required:
             # No readiness gate before the next queued turn. Readiness is latched

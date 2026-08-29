@@ -636,6 +636,9 @@ interface ChatState {
   slotSwitchRequestId: string | null
   /** Slot the in-flight switch targets; it only installs a cursor for that one. */
   slotSwitchTarget: string | null
+  /** Newest switch request, retained after it settles so an older same-slot
+   *  response cannot replace the newly fetched transcript. */
+  slotSwitchLatestRequestId: string | null
   loadingOlder: boolean
   /** Last older-history fetch was rejected; surfaced on the top-of-transcript bar. */
   slotOlderError: boolean
@@ -671,7 +674,7 @@ interface ChatState {
    *  knows the window but not a measured used-count, and both consumers render
    *  an absent `used` as an approximation (a `~` prefix, derived from pct)
    *  rather than asserting a precise figure. */
-  slotContextTokens: Record<string, { used?: number; window: number }>
+  slotContextTokens: Record<string, { used?: number; window?: number }>
   voicePlaying: boolean
   /** Synthesis, queued audio, or playback is active. */
   voiceBusy: boolean
@@ -857,6 +860,7 @@ const initialState: ChatState = {
   slotCursorKey: null,
   slotSwitchRequestId: null,
   slotSwitchTarget: null,
+  slotSwitchLatestRequestId: null,
   loadingOlder: false,
   slotOlderError: false,
   lastChunkSeq: undefined,
@@ -1350,7 +1354,9 @@ function seedContextUsage(
   const k = safeKey(key)
   if (state.slotContextPct[k] !== undefined || state.slotContextTokens[k] !== undefined) return
   state.slotContextPct[k] = context.pct
-  if (context.window) state.slotContextTokens[k] = { used: context.used, window: context.window }
+  if (context.used != null || context.window) {
+    state.slotContextTokens[k] = { used: context.used, window: context.window }
+  }
 }
 
 export const switchSlot = createAsyncThunk(
@@ -2587,8 +2593,13 @@ const chatSlice = createSlice({
       const { slot, pct, used_tokens, window_tokens, reset } = action.payload
       if (isUnsafeKey(slot)) return
       state.slotContextPct[safeKey(slot)] = pct
-      if (window_tokens && window_tokens > 0) {
-        state.slotContextTokens[safeKey(slot)] = { used: used_tokens ?? 0, window: window_tokens }
+      if (used_tokens != null && used_tokens > 0) {
+        state.slotContextTokens[safeKey(slot)] = {
+          used: used_tokens,
+          ...(window_tokens && window_tokens > 0 ? { window: window_tokens } : {}),
+        }
+      } else if (window_tokens && window_tokens > 0) {
+        state.slotContextTokens[safeKey(slot)] = { used: 0, window: window_tokens }
       } else if (reset) {
         // Model switch / compaction / session reset: the stored counts belong
         // to a window that no longer describes the session. Deleting re-enables
@@ -4135,6 +4146,7 @@ const chatSlice = createSlice({
         state.slotCursorKey = null
         state.slotSwitchRequestId = action.meta?.requestId ?? null
         state.slotSwitchTarget = action.meta?.arg ?? null
+        state.slotSwitchLatestRequestId = action.meta?.requestId ?? null
         // Save current slot's activity
         if (state.activeSlot) {
           state.slotActivity[state.activeSlot] = { toolLog: state.toolLog, subagents: state.subagents, activityTab: state.activityTab, activityOpen: state.activityOpen }
@@ -4182,6 +4194,7 @@ const chatSlice = createSlice({
         state._wsChunkedDuringFetch = false
       })
       .addCase(switchSlot.fulfilled, (state, action) => {
+        if (state.slotSwitchLatestRequestId !== null && state.slotSwitchLatestRequestId !== action.meta?.requestId) return
         // Before the guards below, so an early return still ends this claim. Keyed
         // on requestId, which a hand-rolled dispatch may omit, so read it safely.
         if (state.slotSwitchRequestId !== null && state.slotSwitchRequestId === action.meta?.requestId) { state.slotSwitchRequestId = null; state.slotSwitchTarget = null }
@@ -4285,6 +4298,7 @@ const chatSlice = createSlice({
         seedContextUsage(state, key, action.payload.context)
       })
       .addCase(switchSlot.rejected, (state, action) => {
+        if (state.slotSwitchLatestRequestId !== null && state.slotSwitchLatestRequestId !== action.meta?.requestId) return
         if (state.slotSwitchRequestId !== null && state.slotSwitchRequestId === action.meta?.requestId) { state.slotSwitchRequestId = null; state.slotSwitchTarget = null }
         if (state.activeSlot !== action.meta.arg) return
         state.messages = []

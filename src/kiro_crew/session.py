@@ -2863,7 +2863,9 @@ class SessionManager:
         if speculative and resume_sid and not speculative_resume:
             raise SpeculativeResumeRefused(key)
 
-        # Try warm pool first (no resume — pooled processes have no prior session)
+        # Try warm pool first.  A claimed ACP process must be reset onto a
+        # fresh native conversation before it is associated with this slot;
+        # rekeying its dashboard owner alone does not clear provider context.
         logger.info(
             "Pool decision: key=%s resume_sid=%s model=%s agent=%s pool_size=%d pool_qsize=%d cwd=%s pool_cwd=%s",
             key,
@@ -2949,6 +2951,12 @@ class SessionManager:
                         crew_agent=_claim_crew,
                         watchdog=_claim_wd,
                     )
+                    # A warm worker has previously owned another slot.  Do
+                    # this *after* rekey so the fresh native session inherits
+                    # the new agent identity, but before any user turn is
+                    # admitted.  Without it, the provider's prior transcript
+                    # is visible to the newly claimed slot.
+                    await provider.new_conversation()
                     # Switch model post-claim if caller requested non-default.
                     if model:
                         _pool_model = (

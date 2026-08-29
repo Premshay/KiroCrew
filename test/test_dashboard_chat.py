@@ -760,6 +760,57 @@ class TestApiChatDrainOnDisconnect:
 
 
 @pytest.mark.asyncio
+class TestApiChatDurableAdmission:
+    """A 200 chat receipt must mean the turn's user row is already on disk."""
+
+    async def test_ws_turn_starts_after_user_row_is_persisted(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        entered = asyncio.Event()
+
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            rows = st.conversation_log.read_messages_chained("dashboard:s1")
+            assert any(row.get("content") == "save this first" for row in rows)
+            entered.set()
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            response = await client.post(
+                "/api/chat?ws=1",
+                json={"message": "save this first", "slot": "s1"},
+            )
+            assert response.status == 200
+            assert (await response.json())["ok"] is True
+
+        await asyncio.wait_for(entered.wait(), timeout=1)
+
+    async def test_refuses_turn_when_user_row_cannot_be_persisted(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        started = False
+
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            nonlocal started
+            started = True
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
+        monkeypatch.setattr(state, "flush_slot_now", lambda _slot: False)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            response = await client.post(
+                "/api/chat?ws=1",
+                json={"message": "must not start", "slot": "s1"},
+            )
+            assert response.status == 503
+            assert (await response.json())["code"] == "history_unavailable"
+
+        await asyncio.sleep(0)
+        assert started is False
+        assert [row["content"] for row in state._slots["s1"].messages] == []
+
+
+@pytest.mark.asyncio
 class TestApiChatMemoryModeForwarding:
     """api_chat propagates body.memory_mode to auto-created slot.
 
@@ -4786,6 +4837,26 @@ class TestRunChatSegmentFlush:
         ws_types = [t for t, _ in ws_calls]
         assert "chat_segment" in ws_types
         assert "tool_call" in ws_types
+
+    @pytest.mark.asyncio
+    async def test_completed_turn_is_persisted_before_it_finishes(self, tmp_path, monkeypatch):
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        events = [
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="durable result"),
+            LLMEvent(kind=EVENT_COMPLETE),
+        ]
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        rows = state.conversation_log.read_messages_chained("dashboard:s1")
+        assert any(row.get("content") == "durable result" for row in rows)
 
     @pytest.mark.asyncio
     async def test_idle_turn_boundary_refreshes_source_status(self, tmp_path, monkeypatch):
@@ -14758,6 +14829,70 @@ class TestRunChatTransientRetry:
         state.sessions.discard_conversation.assert_awaited_once_with("dashboard:s1")
         state.sessions.reset.assert_not_awaited()
         assert any("rebuilt-result" in text for text in self._assistant_texts(slot))
+
+    @pytest.mark.asyncio
+    async def test_interrupted_provider_stream_discards_native_session_then_retries_once(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.acp.client import AcpProviderStreamInterrupted
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        call_count = 0
+
+        async def _stream(_msg):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise AcpProviderStreamInterrupted("provider ended the stream", transient=True)
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="rebuilt-result")
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        state = self._make_state(tmp_path, monkeypatch)
+        self._wire_sessions(state, self._client(_stream))
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+
+        await _run_chat(state, slot, "hello")
+        await self._drain_bg(state)
+
+        assert call_count == 2
+        state.sessions.discard_conversation.assert_awaited_once_with("dashboard:s1")
+        state.sessions.reset.assert_not_awaited()
+        assert any("rebuilt-result" in text for text in self._assistant_texts(slot))
+
+    @pytest.mark.asyncio
+    async def test_interrupted_provider_stream_after_tool_activity_is_not_retried(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.acp.client import AcpProviderStreamInterrupted
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.providers.base import EVENT_TOOL_CALL, LLMEvent
+
+        call_count = 0
+
+        async def _stream(_msg):
+            nonlocal call_count
+            call_count += 1
+            yield LLMEvent(
+                kind=EVENT_TOOL_CALL,
+                title="write_file",
+                tool_kind="write",
+                tool_call_id="tc-1",
+            )
+            raise AcpProviderStreamInterrupted("provider ended the stream", transient=True)
+
+        state = self._make_state(tmp_path, monkeypatch)
+        self._wire_sessions(state, self._client(_stream))
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+
+        await _run_chat(state, slot, "hello")
+        await self._drain_bg(state)
+
+        assert call_count == 1
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert any("not retried automatically" in text for text in self._err_texts(slot))
 
     @pytest.mark.asyncio
     async def test_attachment_payload_discards_native_session_then_retries_once(
