@@ -502,8 +502,10 @@ def schemas() -> list[dict[str, Any]]:
                 "view; milestone is appended to a seven-item server-capped trail. "
                 "Optional goal and progress describe the current objective. Whenever work "
                 "remains, include one concrete next_action; omit it only when there is "
-                "genuinely no known next step. This is session-bound: it updates only the "
-                "session that called the tool."
+                "genuinely no known next step. Set attention.status to unassigned only when "
+                "the operator needs to make a decision; use kind decision and a stable "
+                "decision_key when it identifies a distinct decision. This is session-bound: "
+                "it updates only the session that called the tool."
             ),
             "inputSchema": {
                 "type": "object",
@@ -545,6 +547,19 @@ def schemas() -> list[dict[str, Any]]:
                             "completed": {"type": "integer", "minimum": 0},
                             "total": {"type": "integer", "minimum": 1},
                             "label": {"type": "string", "maxLength": 160},
+                        },
+                        "additionalProperties": False,
+                    },
+                    "attention": {
+                        "type": "object",
+                        "description": (
+                            "Optional {status: none|unassigned, kind: none|decision, "
+                            "decision_key?}. Only use unassigned when the operator must act."
+                        ),
+                        "properties": {
+                            "status": {"type": "string", "enum": ["none", "unassigned"]},
+                            "kind": {"type": "string", "enum": ["none", "decision"]},
+                            "decision_key": {"type": "string", "maxLength": 120},
                         },
                         "additionalProperties": False,
                     },

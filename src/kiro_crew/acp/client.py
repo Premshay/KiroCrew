@@ -36,14 +36,13 @@ from typing import Any, AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequ
 
 from kiro_crew import agent_scratch, model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
-    _kiro_mcp_server_name,
-    _kiro_tool_name,
     build_permission_event,
     derive_edit_diff,
     extract_tool_purpose,
     make_unified_diff,
     parse_session_modes,
     parse_usage_update,
+    trusted_mcp_identity,
 )
 from kiro_crew.acp.liveness import (
     VERDICT_WORKING,
@@ -6141,14 +6140,17 @@ class AcpClient:
             # redaction so the later permission_request event (which carries no
             # kind) can inherit it via the toolCallId cache below.
             is_shell = _is_shell_kind(kind)
+            _tool_name, _mcp_server_name, _mcp_identity_trusted = trusted_mcp_identity(
+                update
+            )
             if tool_call_id:
                 self._tool_call_is_shell[tool_call_id] = is_shell
                 # Same lifecycle as is_shell: cache the trusted MCP server
                 # identity so the later permission event can inherit it.
-                self._tool_call_mcp_server[tool_call_id] = _kiro_mcp_server_name(update)
+                self._tool_call_mcp_server[tool_call_id] = _mcp_server_name
                 # Cache the trusted tool name too, so the permission event can
                 # rebuild mcp__<server>__<tool> for per-tool governance.
-                self._tool_call_tool_name[tool_call_id] = _kiro_tool_name(update)
+                self._tool_call_tool_name[tool_call_id] = _tool_name
             title = _select_tool_title(title, raw_input, kind, is_shell=is_shell) or ""
             if title:
                 title, _ = redact_exfiltration_urls(title)
@@ -6157,8 +6159,7 @@ class AcpClient:
                 kind, _ = redact_exfiltration_urls(kind)
                 kind, _ = redact_credentials(kind)
             self.last_prompt_stats.tool_calls.append((kind, title))
-            # Trusted identity from _meta.kiro (NOT the LLM-authored title) —
-            # shared with the _dispatch builder so both event paths carry it.
+            # Adapter-owned identity, never the LLM-authored title.
             return AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 title=title,
@@ -6169,8 +6170,9 @@ class AcpClient:
                 tool_call_id=tool_call_id,
                 raw_tool_params=raw_input if isinstance(raw_input, dict) else None,
                 is_shell=is_shell,
-                tool_name=_kiro_tool_name(update),
-                mcp_server_name=_kiro_mcp_server_name(update),
+                tool_name=_tool_name,
+                mcp_server_name=_mcp_server_name,
+                mcp_identity_trusted=_mcp_identity_trusted,
             )
         return None
 

@@ -65,6 +65,7 @@ SESSION_CHECKPOINT_MAIN_ITEM_MAX = 160
 SESSION_CHECKPOINT_MILESTONE_MAX = 220
 SESSION_CHECKPOINT_TRAIL_MAX = 7
 SESSION_CHECKPOINT_PROGRESS_LABEL_MAX = 160
+SESSION_CHECKPOINT_ATTENTION_KEY_MAX = 120
 SESSION_RESTART_CONTINUATION_MAX = 2_000
 
 # Allowed categories for lessons
@@ -1570,6 +1571,8 @@ def _validate_session_checkpoint(args: dict[str, Any]) -> None:
     if any(not item for item in items):
         raise ValidationError("main_items", "items must not be empty")
 
+    _validate_checkpoint_attention(args)
+
     progress = args.get("progress")
     if progress is None:
         return
@@ -1606,6 +1609,41 @@ def _validate_session_checkpoint(args: dict[str, Any]) -> None:
     progress["label"] = label
 
 
+def _validate_checkpoint_attention(args: dict[str, Any]) -> None:
+    """Validate an agent-raised operator-attention request."""
+    attention = args.get("attention")
+    if attention is None:
+        return
+    if not isinstance(attention, dict):
+        raise ValidationError("attention", "expected object")
+    allowed_attention = {"status", "kind", "decision_key"}
+    unknown_attention = set(attention) - allowed_attention
+    if unknown_attention:
+        raise ValidationError(
+            "attention", f"unknown fields: {', '.join(sorted(unknown_attention))}"
+        )
+    status = attention.get("status", "none")
+    if status not in {"none", "unassigned"}:
+        raise ValidationError("attention.status", "must be one of: none, unassigned")
+    kind = attention.get("kind", "none")
+    if kind not in {"none", "decision"}:
+        raise ValidationError("attention.kind", "must be one of: none, decision")
+    decision_key = attention.get("decision_key", "")
+    if not isinstance(decision_key, str):
+        raise ValidationError("attention.decision_key", "must be a string")
+    decision_key = sanitize_string(decision_key)
+    if len(decision_key) > SESSION_CHECKPOINT_ATTENTION_KEY_MAX:
+        raise ValidationError(
+            "attention.decision_key",
+            f"exceeds max length {SESSION_CHECKPOINT_ATTENTION_KEY_MAX}",
+        )
+    if decision_key and kind != "decision":
+        raise ValidationError(
+            "attention.decision_key", "requires attention.kind 'decision'"
+        )
+    attention.update({"status": status, "kind": kind, "decision_key": decision_key})
+
+
 SESSION_CHECKPOINT_SCHEMA = ToolSchema(
     tool_name="session_checkpoint",
     fields=[
@@ -1621,6 +1659,7 @@ SESSION_CHECKPOINT_SCHEMA = ToolSchema(
         ),
         FieldSpec("milestone", str, required=True, max_len=SESSION_CHECKPOINT_MILESTONE_MAX),
         FieldSpec("progress", dict),
+        FieldSpec("attention", dict),
     ],
     custom_validator=_validate_session_checkpoint,
 )

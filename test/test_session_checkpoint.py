@@ -66,6 +66,11 @@ class TestCheckpointDirectiveDispatch:
         ]
         assert schema["properties"]["main_items"]["maxItems"] == 4
         assert schema["properties"]["progress"]["additionalProperties"] is False
+        assert schema["properties"]["attention"]["additionalProperties"] is False
+        assert schema["properties"]["attention"]["properties"]["status"]["enum"] == [
+            "none",
+            "unassigned",
+        ]
 
     def test_emits_a_validated_checkpoint_directive_for_the_calling_session(self, monkeypatch) -> None:
         checkpoint = _checkpoint()
@@ -85,6 +90,13 @@ class TestCheckpointDirectiveDispatch:
             mcp_core._call_tool_inner(
                 "session_checkpoint",
                 _checkpoint(progress={"kind": "plan", "completed": 3, "total": 2}),
+            )
+
+    def test_rejects_unclaimable_attention_before_emitting_a_directive(self) -> None:
+        with pytest.raises(ValidationError):
+            mcp_core._call_tool_inner(
+                "session_checkpoint",
+                _checkpoint(attention={"status": "claimed", "kind": "decision"}),
             )
 
     def test_rejects_an_overlong_goal_before_emitting_a_directive(self) -> None:
@@ -147,6 +159,30 @@ class TestCheckpointSlotProjection:
             "label": "Checkpoint slice",
         }
         assert slot.to_dict()["session_checkpoint"] == payload
+
+    def test_checkpoint_projects_explicit_operator_attention(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot.set_session_checkpoint(
+            _checkpoint(
+                attention={
+                    "status": "unassigned",
+                    "kind": "decision",
+                    "decision_key": "adapter-identity",
+                }
+            )
+        )
+        payload = slot.session_checkpoint_payload()
+        assert payload is not None
+        assert payload["attention"] == {
+            "status": "unassigned",
+            "kind": "decision",
+            "decision_key": "adapter-identity",
+        }
+
+        update = _checkpoint(summary="Follow-up work.", milestone="Awaiting owner.")
+        update.pop("attention", None)
+        slot.set_session_checkpoint(update)
+        assert slot.session_checkpoint_payload()["attention"]["status"] == "unassigned"
 
     def test_checkpoint_goal_persists_until_explicitly_replaced_or_cleared(self) -> None:
         slot = _ChatSlot("checkpoint")

@@ -183,7 +183,16 @@ def test_directive_tool_for(server, tool, expected):
     names, and fails closed on a wrong or absent server identity. Both
     EVENT_TOOL_CALL consumers (chat_runner and TurnDriver) call it instead of
     inlining the two checks."""
-    assert sd.directive_tool_for(server, tool) == expected
+    assert sd.directive_tool_for(server, tool, trusted=True) == expected
+
+
+def test_directive_tool_for_rejects_unproven_identity():
+    assert (
+        sd.directive_tool_for(
+            sd.CORE_MCP_SERVER, "session_checkpoint", trusted=False
+        )
+        == ""
+    )
 
 
 def test_subagent_isolation_intent():

@@ -452,6 +452,7 @@ class TurnDriver:
                     canonical = session_directive.directive_tool_for(
                         getattr(event, "mcp_server_name", "") or "",
                         getattr(event, "tool_name", "") or "",
+                        trusted=bool(getattr(event, "mcp_identity_trusted", False)),
                     )
                     if canonical:
                         pending_directives[event.tool_call_id] = canonical

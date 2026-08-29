@@ -68,6 +68,7 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.validation import (
     SESSION_CHECKPOINT_GOAL_MAX,
+    SESSION_CHECKPOINT_ATTENTION_KEY_MAX,
     SESSION_CHECKPOINT_MAIN_ITEM_MAX,
     SESSION_CHECKPOINT_MAIN_ITEMS_MAX,
     SESSION_CHECKPOINT_MILESTONE_MAX,
@@ -2351,6 +2352,20 @@ class _ChatSlot:
             ),
         }
 
+    def _checkpoint_attention(self, value: object) -> dict[str, str]:
+        if not isinstance(value, dict):
+            return {"status": "none", "kind": "none", "decision_key": ""}
+        status = value.get("status")
+        kind = value.get("kind")
+        decision_key = self._checkpoint_text(
+            value.get("decision_key"), SESSION_CHECKPOINT_ATTENTION_KEY_MAX
+        )
+        if status not in {"none", "unassigned"} or kind not in {"none", "decision"}:
+            return {"status": "none", "kind": "none", "decision_key": ""}
+        if decision_key and kind != "decision":
+            return {"status": "none", "kind": "none", "decision_key": ""}
+        return {"status": status, "kind": kind, "decision_key": decision_key}
+
     def _timeline_entry(self, value: object) -> dict[str, Any] | None:
         """Normalize one persisted timeline entry without trusting its metadata."""
         if not isinstance(value, dict):
@@ -2598,6 +2613,13 @@ class _ChatSlot:
         )
         if "goal" not in checkpoint and self._session_checkpoint is not None:
             goal = self._session_checkpoint["goal"]
+        attention = (
+            self._checkpoint_attention(checkpoint.get("attention"))
+            if "attention" in checkpoint
+            else dict(self._session_checkpoint.get("attention", {}))
+            if self._session_checkpoint is not None
+            else self._checkpoint_attention(None)
+        )
         old_trail = self._session_checkpoint.get("trail", []) if self._session_checkpoint else []
         trail = [
             text
@@ -2611,6 +2633,7 @@ class _ChatSlot:
             "main_items": main_items,
             "trail": (trail + [milestone])[-SESSION_CHECKPOINT_TRAIL_MAX:],
             "progress": self._checkpoint_progress(checkpoint.get("progress")),
+            "attention": attention,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         self.append_session_timeline(milestone, "checkpoint", kind="checkpoint", priority=100)
@@ -2643,6 +2666,7 @@ class _ChatSlot:
                 if (text := self._checkpoint_text(item, SESSION_CHECKPOINT_MILESTONE_MAX))
             ][-SESSION_CHECKPOINT_TRAIL_MAX:],
             "progress": self._checkpoint_progress(checkpoint.get("progress")),
+            "attention": self._checkpoint_attention(checkpoint.get("attention")),
             "updated_at": updated_at if isinstance(updated_at, str) else "",
         }
         if not self._session_timeline:
@@ -2664,6 +2688,7 @@ class _ChatSlot:
             "main_items": list(self._session_checkpoint["main_items"]),
             "trail": list(self._session_checkpoint["trail"]),
             "progress": dict(self._session_checkpoint["progress"]),
+            "attention": dict(self._session_checkpoint["attention"]),
             "updated_at": self._session_checkpoint["updated_at"],
         }
 

@@ -545,8 +545,8 @@ class AcpEvent:
     #: classification (cache hit), not the miss-default False.
     raw_params_trusted: bool = False
     shell_classified: bool = False
-    # Canonical, NON-model-authored tool identity from ``_meta.kiro`` (see
-    # ``_dispatch._kiro_tool_name``). ``title`` is LLM-authored prose — for shell
+    # Canonical, NON-model-authored tool identity from provider metadata (see
+    # ``_dispatch.trusted_mcp_identity``). ``title`` is LLM-authored prose — for shell
     # tools ``select_tool_title`` even prefers the model's ``description`` — so a
     # security gate MUST key on these, never on ``title``. ``mcp_server_name`` is
     # populated ONLY for MCP-served tools (empty for built-ins/shell), so a
@@ -555,6 +555,10 @@ class AcpEvent:
     # (fail-closed: callers that gate on these get no match).
     tool_name: str = ""
     mcp_server_name: str = ""
+    # The adapter metadata parser sets this only after it recovered both fields.
+    # Callers must not infer provenance from non-empty strings, or an inline
+    # fallback could turn a forged directive marker into a state mutation.
+    mcp_identity_trusted: bool = False
     # Diff content block fields — authoritative before/after text from kiro-cli
     # for write tools. Used by chat_runner to derive the "before" snapshot
     # without a racy disk read (the write has already landed by the time the

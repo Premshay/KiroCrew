@@ -56,6 +56,7 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.session_directive import CORE_MCP_SERVER
 
 logger = logging.getLogger(__name__)
 
@@ -856,19 +857,18 @@ def _build_tool_call_event(
     is_shell = is_shell_kind(kind)
     if tool_call_id and shell_cache is not None and _kind_resolved:
         shell_cache[_ck] = is_shell
-    # Capture the TRUSTED MCP server identity (_meta.kiro.mcpServerName) so the
+    # Capture the trusted MCP server identity so the
     # later permission_request — the dashboard's gate path, which carries no
     # _meta — can inherit it via mcp_server_name_cache. This is what lets the
     # app-own-server auto-approve (hooks.on_tool_call) fire on the permission
     # path: without the cache, the permission event's mcp_server_name is always
     # "" and the branch never matches.
-    _mcp_server_name = _kiro_mcp_server_name(update)
+    _tool_name, _mcp_server_name, _mcp_identity_trusted = trusted_mcp_identity(update)
     if tool_call_id and mcp_server_name_cache is not None:
         mcp_server_name_cache[_ck] = _mcp_server_name
-    # Same lifecycle for the trusted tool name (_meta.kiro.toolName) so the
+    # Same lifecycle for the trusted tool name so the
     # permission event can reconstruct the canonical mcp__<server>__<tool> for
     # per-tool governance in the app-own-server auto-approve.
-    _tool_name = _kiro_tool_name(update)
     if tool_call_id and tool_name_cache is not None:
         tool_name_cache[_ck] = _tool_name
     # Initial tool input string from raw params.
@@ -934,9 +934,10 @@ def _build_tool_call_event(
         tool_call_id=tool_call_id,
         raw_tool_params=raw_input if isinstance(raw_input, dict) else None,
         is_shell=is_shell,
-        # Trusted identity from _meta.kiro (NOT the LLM-authored title).
+        # Trusted identity from adapter-owned metadata, never the display title.
         tool_name=_tool_name,
         mcp_server_name=_mcp_server_name,
+        mcp_identity_trusted=_mcp_identity_trusted,
         diff_old_text=_diff_old_text,
         diff_path=_diff_path,
     )
@@ -1064,6 +1065,75 @@ def _kiro_mcp_server_name(update: dict[str, Any]) -> str:
         return ""
     name = kiro.get("mcpServerName")
     return name if isinstance(name, str) else ""
+
+
+def _claude_core_mcp_tool_name(update: dict[str, Any]) -> str:
+    """Return a KiroCrew core tool from Claude adapter metadata, or ``""``.
+
+    ``claude-agent-acp`` obtains this field from an SDK ``mcp_tool_use``
+    record.  It is not the model-authored display title.  The exact core-server
+    prefix keeps generic Claude metadata from granting another MCP server the
+    authority to issue session directives.
+    """
+    meta = update.get("_meta")
+    if not isinstance(meta, dict):
+        return ""
+    claude = meta.get("claudeCode")
+    if not isinstance(claude, dict):
+        return ""
+    wire_name = claude.get("toolName")
+    prefix = f"mcp__{CORE_MCP_SERVER}__"
+    if not isinstance(wire_name, str) or not wire_name.startswith(prefix):
+        return ""
+    return wire_name.removeprefix(prefix)
+
+
+def _codex_core_mcp_tool_name(update: dict[str, Any]) -> str:
+    """Return a KiroCrew core tool from Codex ACP metadata, or ``\"\"``.
+
+    ``codex-acp`` constructs this update from an app-server ``mcpToolCall``
+    item. The provenance bit, raw server/tool pair, and canonical ACP kind must
+    all agree. This rejects an ordinary tool that merely places matching strings
+    in its model-visible input.
+    """
+    meta = update.get("_meta")
+    raw_input = update.get("rawInput")
+    if not isinstance(meta, dict) or meta.get("is_mcp_tool_call") is not True:
+        return ""
+    if not isinstance(raw_input, dict):
+        return ""
+    server_name = raw_input.get("server")
+    tool_name = raw_input.get("tool")
+    if not isinstance(server_name, str) or not isinstance(tool_name, str):
+        return ""
+    if server_name != CORE_MCP_SERVER:
+        return ""
+    if update.get("kind") != f"mcp.{server_name}.{tool_name}":
+        return ""
+    return tool_name
+
+
+def trusted_mcp_identity(update: dict[str, Any]) -> tuple[str, str, bool]:
+    """Return ``(tool, server, trusted)`` from adapter-owned metadata only.
+
+    Kiro emits the pair directly in ``_meta.kiro``. Claude emits its SDK tool
+    name as ``mcp__<server>__<tool>`` in ``_meta.claudeCode``. Codex emits an
+    adapter-created raw server/tool pair with an explicit MCP provenance bit.
+    Provider-specific fallbacks accept only KiroCrew's own core server. Missing
+    or malformed metadata fails closed rather than consulting the title or model
+    arguments.
+    """
+    tool_name = _kiro_tool_name(update)
+    server_name = _kiro_mcp_server_name(update)
+    if tool_name or server_name:
+        return tool_name, server_name, bool(tool_name and server_name)
+    tool_name = _claude_core_mcp_tool_name(update)
+    if tool_name:
+        return tool_name, CORE_MCP_SERVER, True
+    tool_name = _codex_core_mcp_tool_name(update)
+    if tool_name:
+        return tool_name, CORE_MCP_SERVER, True
+    return "", "", False
 
 
 def _todo_payload(raw_output: Any) -> dict[str, Any] | None:

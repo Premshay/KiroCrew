@@ -6714,7 +6714,7 @@ async def _run_chat(
                 if event.tool_call_id:
                     _pending_tools[event.tool_call_id] = _raw
                     # Forgery gate: record the directive-tool name ONLY
-                    # from the trusted _meta.kiro identity — never the title.
+                    # from trusted adapter-owned identity — never the title.
                     # The single shared predicate (also used by the messaging
                     # TurnDriver) requires Kiro Crew's OWN core MCP server and a
                     # canonical directive-tool name; a shell tool (no
@@ -6723,7 +6723,9 @@ async def _run_chat(
                     # register here. Recorded at EVENT_TOOL_CALL only (the
                     # UPDATE refinement rewrites titles).
                     _cannon = session_directive.directive_tool_for(
-                        event.mcp_server_name, event.tool_name
+                        event.mcp_server_name,
+                        event.tool_name,
+                        trusted=event.mcp_identity_trusted,
                     )
                     if _cannon:
                         _pending_dir_tool[event.tool_call_id] = _cannon
@@ -7045,7 +7047,12 @@ async def _run_chat(
                             _pending_dir_tool.pop(event.tool_call_id, None)
                             _out = _redact_tool_field(
                                 await apply_session_directive(
-                                    state, slot, session_key, _dir_tool, _dir_args
+                                    state,
+                                    slot,
+                                    session_key,
+                                    _dir_tool,
+                                    _dir_args,
+                                    producer_is_user_facing=_directive_user_origin,
                                 )
                             )
                             _dir_consumed_out[event.tool_call_id] = _out
