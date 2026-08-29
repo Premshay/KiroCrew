@@ -632,22 +632,23 @@ class TestHybridRetrieverSourceFilter:
         results = retriever.search("JWT")
         assert {r["title"] for r in results} == {"Auth A", "Auth B"}
 
-    def test_graph_leg_still_reaches_other_sources(self, store):
-        # The graph leg is deliberately unfiltered: an entity hit in another
-        # source still surfaces, marked as a graph match, while the keyword
-        # seeds stay scoped to the requested source.
+    def test_graph_leg_respects_source_scope(self, store):
+        # Entity traversal can cross sources, but a scoped search must not
+        # return an item outside its requested source.
         src_a = store.add_source("Docs A", "local_folder", "/tmp/a")
         src_b = store.add_source("Docs B", "local_folder", "/tmp/b")
         store.add_item("Auth A", "JWT tokens for service alpha", "doc", source_id=src_a)
+        item_a = store.add_item("Scope connection", "routing context", "doc", source_id=src_a)
         item_b = store.add_item("Gateway Doc", "routing notes", "doc", source_id=src_b)
         ent = store.add_entity("Gateway", "service")
+        store.add_mention(item_a, ent)
         store.add_mention(item_b, ent)
         retriever = HybridRetriever(store)
         results = retriever.search("JWT Gateway", source_id=src_a)
         by_title = {r["title"]: r for r in results}
         assert "Auth A" in by_title
-        assert "Gateway Doc" in by_title
-        assert by_title["Gateway Doc"]["match_type"] == "graph"
+        assert by_title["Scope connection"]["match_type"] == "graph"
+        assert "Gateway Doc" not in by_title
 
     def test_source_id_narrows_vector_seeds(self, store):
         # Identical embeddings in two sources; scoping keeps one. The query
@@ -2053,6 +2054,62 @@ class TestStartRebuildJobSingleFlight:
             "SELECT id FROM ingestion_jobs WHERE status = 'processing'"
         ).fetchall()
         assert [r["id"] for r in processing] == [job_id]
+
+
+class TestOrdinaryIngestionJobReconciliation:
+    def test_stale_source_job_is_abandoned_but_rebuild_is_preserved(self, store):
+        from kiro_crew.knowledge.ingestion import (
+            _INGESTION_JOB_STALE_AFTER,
+            abandon_stale_ingestion_jobs,
+        )
+
+        source_id = store.add_source("Docs", "local_folder", "/tmp/docs")
+        now = datetime.now()
+        stale = (now - _INGESTION_JOB_STALE_AFTER - timedelta(minutes=1)).isoformat()
+        fresh = now.isoformat()
+        store.db.executemany(
+            "INSERT INTO ingestion_jobs (id, source_id, status, created_at, updated_at) "
+            "VALUES (?, ?, 'processing', ?, ?)",
+            [
+                ("old-source", source_id, stale, stale),
+                ("fresh-source", source_id, fresh, fresh),
+                ("rebuild-job", None, stale, stale),
+            ],
+        )
+        store.db.commit()
+
+        assert abandon_stale_ingestion_jobs(store, now=now) == 1
+        statuses = {
+            row["id"]: row["status"]
+            for row in store.db.execute("SELECT id, status FROM ingestion_jobs")
+        }
+        assert statuses == {
+            "old-source": "abandoned",
+            "fresh-source": "processing",
+            "rebuild-job": "processing",
+        }
+
+    @pytest.mark.asyncio
+    async def test_watcher_reconciles_before_scanning_sources(self, store, monkeypatch):
+        from kiro_crew.knowledge.watcher import KnowledgeWatcher
+
+        class _Pipeline:
+            embedder = None
+
+        watcher = KnowledgeWatcher(store, _Pipeline())
+        seen: list[object] = []
+
+        def _reconcile(actual_store):
+            seen.append(actual_store)
+            return 0
+
+        monkeypatch.setattr(
+            "kiro_crew.knowledge.watcher.abandon_stale_ingestion_jobs", _reconcile
+        )
+
+        await watcher._scan()
+
+        assert seen == [store]
 
 
 @pytest.mark.asyncio

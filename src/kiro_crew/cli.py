@@ -30,6 +30,7 @@ import asyncio
 import faulthandler
 import importlib
 import importlib.machinery
+import json
 import logging
 import os
 import shutil
@@ -579,9 +580,13 @@ def _diagnostic_port(gw_kwargs: dict) -> int | None:
 
 
 def _knowledge(args) -> None:
-    """``kirocrew knowledge dedup [--apply]`` -- collapse cross-source duplicate docs."""
-    if getattr(args, "knowledge_action", None) != "dedup":
-        print("Usage: kirocrew knowledge dedup [--apply]")
+    """Run Knowledge Library maintenance and private retrieval evaluation commands."""
+    action = getattr(args, "knowledge_action", None)
+    if action == "evaluate":
+        _knowledge_evaluate(args)
+        return
+    if action != "dedup":
+        print("Usage: kirocrew knowledge {dedup,evaluate}")
         return
     apply = bool(getattr(args, "apply", False))
     db_path = config_dir() / "workspace" / "knowledge" / "knowledge.db"
@@ -612,6 +617,69 @@ def _knowledge(args) -> None:
     for r in results:
         print(f"  {verb}: {r['loser']}  ({r['items_deleted']} chunks)")
         print(f"      keep: {r['winner']}   [{r['reason']}]")
+
+
+def _knowledge_evaluate(args) -> None:
+    """Run a private Knowledge Library golden set without exposing its contents."""
+    from kiro_crew.knowledge.embedder import create_embedder_from_config, embedder_signature
+    from kiro_crew.knowledge.evaluation import (
+        GoldenSetError,
+        evaluate_golden_set,
+        evaluation_dir,
+        load_golden_set,
+        report_summary,
+        resolve_private_eval_path,
+        write_report,
+    )
+
+    root = config_dir()
+    try:
+        golden_path = resolve_private_eval_path(root, args.golden)
+        golden = load_golden_set(golden_path)
+        db_path = root / "workspace" / "knowledge" / "knowledge.db"
+        if not db_path.exists():
+            raise GoldenSetError("Knowledge Library is not configured; ingest documents first")
+        store = KnowledgeStore(str(db_path))
+        try:
+            cfg_path = root / "config.json"
+            try:
+                raw_config = (
+                    json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+                )
+            except (json.JSONDecodeError, OSError):
+                raise GoldenSetError(
+                    "could not read KiroCrew configuration for the embedding backend"
+                ) from None
+            if not isinstance(raw_config, dict):
+                raise GoldenSetError("KiroCrew configuration must be a JSON object")
+            embedder = create_embedder_from_config(raw_config)
+            if not embedder.is_available():
+                raise GoldenSetError(
+                    "embedding backend is unavailable; wait for it to become ready and retry"
+                )
+            embed_fn = embedder.embed
+            report = evaluate_golden_set(
+                store,
+                golden,
+                embedder=embed_fn,
+                embedding_signature=embedder_signature(embedder),
+                limit=args.limit,
+            )
+        finally:
+            store.db.close()
+        report_path = write_report(report, evaluation_dir(root), stem=args.stem)
+    except GoldenSetError as exc:
+        print(f"error: {exc}")
+        return
+    except OSError:
+        print("error: could not read the private golden set or write its report")
+        return
+    sel().log_tool_invocation(
+        session_key="cli", source="cli", tool_name="knowledge.evaluate", outcome="completed",
+        metadata={"golden_set": golden.name, "case_count": len(golden.cases)},
+    )
+    print(report_summary(report))
+    print(f"Private report: {report_path}")
 
 
 def _consolidate_cmd(args) -> None:
@@ -1538,6 +1606,15 @@ Examples:
         action="store_true",
         help="Apply the deletions (default: dry-run preview that changes nothing)",
     )
+    kn_eval = kn_sub.add_parser(
+        "evaluate", help="Measure private Knowledge Library retrieval against a golden set"
+    )
+    kn_eval.add_argument(
+        "--golden", default="golden-v1.json",
+        help="Golden-set filename under workspace/knowledge/evals (default: golden-v1.json)",
+    )
+    kn_eval.add_argument("--limit", type=int, default=5, help="Results per query (default: 5)")
+    kn_eval.add_argument("--stem", default=None, help="Private report filename stem")
 
     # secrets — encrypted vault maintenance. Only the migration importer lives
     # here; the set/list/rm surface is owned by a separate change.

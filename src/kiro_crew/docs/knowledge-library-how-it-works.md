@@ -116,7 +116,27 @@ see `memory.embedding_provider`). When the embedding model is present:
 The system degrades gracefully — graph + FTS works without any embedding model
 (e.g. while the model is still downloading in the background).
 
-## 5. Limitations & Future Improvements
+## 5. Private Retrieval Evaluation
+
+Use a private golden set to measure whether the production retriever returns
+the source section that should answer a query:
+
+```bash
+kirocrew knowledge evaluate --golden golden-v1.json --limit 5
+```
+
+Fixtures and JSON reports stay below
+`$KIROCREW_HOME/workspace/knowledge/evals/`; they are not source-controlled
+because they identify the operator's documents. Each expected result names a
+registered source URI and a stable file, section, or excerpt anchor. An empty
+expected-result list tests abstention. The command reports hit@k, recall@k,
+MRR, nDCG, abstention accuracy, scope leaks, and latency.
+
+Evaluation requires the shared embedding backend to be ready. Normal search can
+fall back to keyword and graph retrieval while it starts; the evaluator refuses
+that mode because it would make a baseline incomparable.
+
+## 6. Limitations & Future Improvements
 
 | Limitation | Impact | Future Fix |
 |-----------|--------|-----------|
@@ -125,7 +145,7 @@ The system degrades gracefully — graph + FTS works without any embedding model
 | Per-chunk extraction cost | ~0.4 credits per chunk (Haiku) | Already mitigated by larger chunks (400 tokens) |
 | No community detection | Can't identify clusters of related entities | Leiden algorithm on graph (like Graphify/MS GraphRAG) |
 
-## 6. Data Model
+## 7. Data Model
 
 ```
 ┌──────────────┐         ┌──────────────┐
@@ -145,7 +165,7 @@ The system degrades gracefully — graph + FTS works without any embedding model
                          └──────────────────┘
 ```
 
-## 7. Industry Comparison
+## 8. Industry Comparison
 
 | Product | Cross-chunk strategy | Cost model |
 |---------|---------------------|-----------|
@@ -155,7 +175,7 @@ The system degrades gracefully — graph + FTS works without any embedding model
 | **Cognee** | Shared names + entity resolution pass | Higher (merge pass) |
 | **Graphify** | AST edges for code + shared names for docs | Free for code, LLM for docs |
 
-## 8. Embedding Integration (Default-On)
+## 9. Embedding Integration (Default-On)
 
 ### What Changes With Embeddings
 

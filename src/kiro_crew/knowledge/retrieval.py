@@ -62,14 +62,13 @@ class HybridRetriever:
     def search(self, query: str, limit: int = 10, source_id: str | None = None) -> list[dict]:
         """Hybrid search with RRF fusion. Returns [{id, title, summary, content, score, source, match_type}].
 
-        ``source_id`` scopes the SEED legs only (FTS5 keyword + vector
-        similarity): it stops other sources from dominating the seeds when
-        vocabularies collide across a heterogeneous corpus. The graph leg is
-        deliberately left unfiltered so cross-source entity connections can
-        still contribute traversal context to the fused ranking.
+        ``source_id`` scopes every result leg: it stops another source from
+        dominating a project-specific search. Graph traversal may still use
+        cross-source entity connections, but only items belonging to the
+        requested source can enter the fused ranking.
         """
         kw = self._keyword_search(query, limit=limit * 2, source_id=source_id)
-        gr = self._graph_search(query, limit=limit * 2)
+        gr = self._graph_search(query, limit=limit * 2, source_id=source_id)
         vec = self._vector_search(query, limit=limit * 2, source_id=source_id)
 
         # Vector leg is weighted higher so semantic matches dominate when the
@@ -286,8 +285,10 @@ class HybridRetriever:
         quoted = ['"' + t.replace('"', '""') + '"' for t in tokens]
         return " OR ".join(quoted)
 
-    def _graph_search(self, query: str, limit: int = 20) -> list[tuple[str, int]]:
-        """Find entities matching query terms, traverse graph, rank items by mention count."""
+    def _graph_search(
+        self, query: str, limit: int = 20, source_id: str | None = None
+    ) -> list[tuple[str, int]]:
+        """Find matching entities, traverse the graph, and rank source-scoped mentions."""
         words = query.split()
         # Try individual words and consecutive pairs
         candidates = list(words)
@@ -312,11 +313,21 @@ class HybridRetriever:
         # Count item mentions
         item_counts: dict[str, int] = defaultdict(int)
         placeholders = ",".join("?" * len(all_entity_ids))
-        rows = self.store.db.execute(
-            f"SELECT item_id, COUNT(*) as cnt FROM mentions "  # noqa: S608
-            f"WHERE entity_id IN ({placeholders}) GROUP BY item_id ORDER BY cnt DESC LIMIT ?",
-            (*all_entity_ids, limit),
-        ).fetchall()
+        sql = (
+            "SELECT m.item_id, COUNT(*) as cnt FROM mentions m "
+            "JOIN items i ON i.id = m.item_id "
+            f"WHERE m.entity_id IN ({placeholders})"  # noqa: S608
+        )
+        params: list[object] = list(all_entity_ids)
+        if source_id is not None:
+            sql += (
+                " AND (i.source_id = ? OR m.item_id IN"
+                " (SELECT sl.item_id FROM source_locations sl WHERE sl.source_id = ?))"
+            )
+            params.extend([source_id, source_id])
+        sql += " GROUP BY m.item_id ORDER BY cnt DESC LIMIT ?"
+        params.append(limit)
+        rows = self.store.db.execute(sql, params).fetchall()
         for row in rows:
             item_counts[row["item_id"]] = row["cnt"]
 
