@@ -72,11 +72,41 @@ class TestCheckpointDirectiveDispatch:
             "unassigned",
         ]
 
-    def test_emits_a_validated_checkpoint_directive_for_the_calling_session(self, monkeypatch) -> None:
+    def test_persists_a_validated_checkpoint_for_the_calling_session(self, monkeypatch) -> None:
         checkpoint = _checkpoint()
+        post = MagicMock(return_value={"ok": True, "session_checkpoint": checkpoint})
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
+        monkeypatch.setattr(mcp_core, "_post", post)
+
         result = mcp_core._call_tool_inner("session_checkpoint", checkpoint)
-        assert result.startswith("Checkpoint requested for this session.")
-        assert session_directive.decode(result, "session_checkpoint") == checkpoint
+        assert result == "Checkpoint recorded for this session's Multiplex view."
+        post.assert_called_once_with(
+            "/api/session-checkpoint", checkpoint, session_key="dashboard:consumer"
+        )
+        assert (
+            session_directive.directive_tool_for(
+                session_directive.CORE_MCP_SERVER, "session_checkpoint", trusted=True
+            )
+            == ""
+        )
+
+    def test_refuses_a_checkpoint_without_a_verified_session_identity(self, monkeypatch) -> None:
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        post = MagicMock()
+        monkeypatch.setattr(mcp_core, "_post", post)
+
+        result = mcp_core._call_tool_inner("session_checkpoint", _checkpoint())
+
+        assert result == "Error: session_checkpoint requires a verified dashboard session identity."
+        post.assert_not_called()
+
+    def test_reports_gateway_checkpoint_failure(self, monkeypatch) -> None:
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
+        monkeypatch.setattr(mcp_core, "_post", lambda *args, **kwargs: {"error": "slot missing"})
+
+        result = mcp_core._call_tool_inner("session_checkpoint", _checkpoint())
+
+        assert result == "Error: checkpoint was not recorded: slot missing"
 
     def test_refuses_an_unverified_session_before_making_a_checkpoint_request(
         self, monkeypatch

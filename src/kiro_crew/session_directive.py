@@ -61,7 +61,6 @@ DIRECTIVE_TOOLS: frozenset[str] = frozenset(
         "set_project",
         "suggest_followup",
         "ask_question",
-        "session_checkpoint",
     }
 )
 
