@@ -238,7 +238,7 @@ function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
         </div>
         <div className="flex items-center gap-1 shrink-0">
           {alive && <Btn onClick={onClearContext} aria-label={i18nT('pages.channelPage.clear_context')} title={i18nT('pages.channelPage.clear_context')}><RotateCcw className="lucide-inline" /></Btn>}
-          {alive && <Btn onClick={onDismiss} aria-label={i18nT('pages.channelPage.dismiss')} danger title={i18nT('pages.channelPage.dismiss')}><X className="lucide-inline" /></Btn>}
+          <Btn onClick={onDismiss} aria-label={i18nT('pages.channelPage.dismiss')} danger title={i18nT('pages.channelPage.dismiss')}><X className="lucide-inline" /></Btn>
         </div>
       </div>
     </div>
@@ -586,7 +586,7 @@ export default function ChannelPage() {
         reload()
       } else if (type === 'channel_agent_left') {
         setChannels(prev => prev.map(c => c.id === data.channel_id ? {
-          ...c, agents: c.agents.map(a => a.id === data.agent_id ? { ...a, state: 'done' as const } : a)
+          ...c, agents: c.agents.filter(a => a.id !== data.agent_id)
         } : c))
       } else if (type === 'channel_context_cleared' && data.scope === 'all') {
         // Another client cleared shared context — drop our stale message buffer.
@@ -632,8 +632,13 @@ export default function ChannelPage() {
 
   const handleDismiss = async (agentId: string) => {
     if (!channel) return
-    setChannels(prev => prev.map(c => c.id !== channel.id ? c : { ...c, agents: c.agents.map(a => a.id === agentId ? { ...a, state: 'done' as const } : a) }))
-    try { await api.channelDismissAgent(channel.id, agentId) } catch { /* optimistic */ }
+    try {
+      const result = await api.channelDismissAgent(channel.id, agentId)
+      if (!result.ok) return
+      setChannels(prev => prev.map(c => c.id !== channel.id ? c : {
+        ...c, agents: c.agents.filter(a => a.id !== agentId)
+      }))
+    } catch { /* The server remains the source of truth; retain the member on failure. */ }
   }
 
   const handleListenChange = async (agentId: string, mode: ChannelAgent['listenMode']) => {

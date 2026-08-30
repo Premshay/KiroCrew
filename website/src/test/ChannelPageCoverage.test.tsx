@@ -396,21 +396,24 @@ describe('ChannelPage — agents sidebar', () => {
     await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument())
   })
 
-  it('dismisses an agent optimistically and calls the api', async () => {
+  it('removes an agent after the dismissal API confirms it', async () => {
     await renderPage()
     await openAgentsPanel()
     await userEvent.click(screen.getByTitle('Dismiss'))
     await waitFor(() => expect(vi.mocked(api).channelDismissAgent)
       .toHaveBeenCalledWith('ch1', 'a1'))
-    // A dismissed agent is `done`, so its row loses both action buttons.
+    // A dismissed agent leaves the channel, so its row no longer occupies capacity.
     await waitFor(() => expect(screen.queryByTitle('Dismiss')).not.toBeInTheDocument())
   })
 
-  it('hides the row actions for an already-finished agent', async () => {
+  it('keeps dismiss available for an already-finished agent', async () => {
     mockApi([channelOf({ members: { a1: member({ state: 'failed' }) } })])
     await renderPage()
     await openAgentsPanel()
-    expect(screen.queryByTitle('Dismiss')).not.toBeInTheDocument()
+    await userEvent.click(screen.getByTitle('Dismiss'))
+    await waitFor(() => expect(vi.mocked(api).channelDismissAgent)
+      .toHaveBeenCalledWith('ch1', 'a1'))
+    await waitFor(() => expect(screen.queryByTitle('Dismiss')).not.toBeInTheDocument())
     expect(screen.queryByTitle('Clear context')).not.toBeInTheDocument()
   })
 
@@ -663,12 +666,13 @@ describe('ChannelPage — socket events', () => {
     await waitFor(() => expect(vi.mocked(api).channelsList).toHaveBeenCalled())
   })
 
-  it('marks an agent done on channel_agent_left', async () => {
+  it('removes an agent on channel_agent_left', async () => {
     mockApi([channelOf({ members: { a1: member({ state: 'working' }) } })])
     await renderPage()
     expect(screen.getByText('is working…')).toBeInTheDocument()
     wsEvent('channel_agent_left', { channel_id: 'ch1', agent_id: 'a1' })
     await waitFor(() => expect(screen.queryByText('is working…')).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: '0 agents' })).toBeInTheDocument()
   })
 
   it('empties the transcript on a shared channel_context_cleared', async () => {
