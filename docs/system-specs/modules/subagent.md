@@ -54,6 +54,16 @@ Limitation: the per-spawn `spawn_min_memory_gb` admission gate
 (fails open) on non-Linux hosts. Auto-sizing and the runtime gate are
 independent guards; unifying them is out of scope for the sizing probe.
 
+### Per-agent child caps
+
+`agent.subagent_max_per_parent` remains the fallback limit for active children
+of one parent session. `agent.subagent_max_per_parent_by_agent` can override it
+for exact agent names or shell-style patterns. The manager resolves an explicit
+child agent before admission; otherwise it uses the parent's inherited agent.
+Exact names win, then the most-specific matching pattern, so a conservative `*`
+entry can keep unknown or local routes serial while named cloud agents fan out.
+The process-wide cap still applies after this policy.
+
 ## APIs
 
 ### `SubagentManager.__init__(sessions, ctx_builder, on_done, max_concurrent)`

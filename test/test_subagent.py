@@ -253,6 +253,70 @@ class TestSpawnWithoutApprovalCallback:
         assert second is not None and second.queued is True
         assert manager.queued_count_for("dashboard:parent") == 1
 
+    @pytest.mark.asyncio
+    async def test_agent_cap_overrides_keep_local_children_serial(self) -> None:
+        """A local child target cannot use the wider cloud-agent sibling cap."""
+        approval_callback = AsyncMock(return_value=True)
+        sessions = _mock_sessions()
+        sessions.get_agent.side_effect = lambda key: {
+            "dashboard:local": "crew-local",
+            "dashboard:cloud": "crew-claude",
+        }.get(key, "")
+        manager = SubagentManager(
+            sessions=sessions,
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=4,
+            on_spawn_approval=approval_callback,
+        )
+        manager._max_per_parent = 3
+        manager._max_per_parent_by_agent = {"*": 1, "crew-claude": 3}
+        manager._spawn_stagger_secs = 0
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            local_first = manager.spawn("local one", parent_session_key="dashboard:local")
+            local_second = manager.spawn("local two", parent_session_key="dashboard:local")
+            cloud_first = manager.spawn("cloud one", parent_session_key="dashboard:cloud")
+            cloud_second = manager.spawn("cloud two", parent_session_key="dashboard:cloud")
+
+        assert local_first is not None and local_first.queued is False
+        assert local_second is not None and local_second.queued is True
+        assert cloud_first is not None and cloud_first.queued is False
+        assert cloud_second is not None and cloud_second.queued is False
+
+    @pytest.mark.asyncio
+    async def test_explicit_child_agent_cap_beats_parent_agent(self) -> None:
+        """An explicit local child target applies its own cap before it starts."""
+        approval_callback = AsyncMock(return_value=True)
+        sessions = _mock_sessions()
+        sessions.get_agent = MagicMock(return_value="crew-claude")
+        manager = SubagentManager(
+            sessions=sessions,
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=3,
+            on_spawn_approval=approval_callback,
+        )
+        manager._max_per_parent = 3
+        manager._max_per_parent_by_agent = {"*": 1, "crew-claude": 3}
+        manager._spawn_stagger_secs = 0
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch(
+                "kiro_crew.subagent._validate_agent",
+                return_value=("crew-local", ""),
+            ),
+        ):
+            first = manager.spawn(
+                "local one", parent_session_key="dashboard:parent", agent="crew-local"
+            )
+            second = manager.spawn(
+                "local two", parent_session_key="dashboard:parent", agent="crew-local"
+            )
+
+        assert first is not None and first.queued is False
+        assert second is not None and second.queued is True
+
 
 class TestSpawnWithApprovalCallback:
     """When on_spawn_approval is set, spawns are gated behind approval."""

@@ -17,6 +17,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Protocol
 
@@ -1483,9 +1484,12 @@ class SubagentManager:
         self._completion_keep_chars = completion_keep_chars
         self._running_count = 0
         try:
-            self._max_per_parent = max(0, int(KiroCrewConfig.load().agent.subagent_max_per_parent))
+            agent_config = KiroCrewConfig.load().agent
+            self._max_per_parent = max(0, int(agent_config.subagent_max_per_parent))
+            self._max_per_parent_by_agent = dict(agent_config.subagent_max_per_parent_by_agent)
         except Exception:
             self._max_per_parent = 0
+            self._max_per_parent_by_agent: dict[str, int] = {}
         # Strong refs to in-flight shielded terminal reports (see
         # `_spawn_terminal_report`); drained in `cancel_all`.
         self._report_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
@@ -3387,7 +3391,7 @@ class SubagentManager:
 
         now = time.monotonic()
         should_queue, slot_free = self._should_stagger_queue(now)
-        parent_at_capacity = self._parent_at_capacity(parent_session_key)
+        parent_at_capacity = self._parent_at_capacity(parent_session_key, agent)
         should_queue = should_queue or parent_at_capacity
         slot_free = slot_free and not parent_at_capacity
         if should_queue:
@@ -3692,8 +3696,9 @@ class SubagentManager:
         too_soon = (now - self._last_spawn_ts) < self._spawn_stagger_secs
         return (not slot_free or too_soon, slot_free)
 
-    def _parent_at_capacity(self, parent_session_key: str) -> bool:
-        if not parent_session_key or self._max_per_parent <= 0:
+    def _parent_at_capacity(self, parent_session_key: str, agent: str = "") -> bool:
+        limit = self._max_per_parent_for(parent_session_key, agent)
+        if not parent_session_key or limit <= 0:
             return False
         return (
             sum(
@@ -3703,8 +3708,40 @@ class SubagentManager:
                 and not info.queued
                 and info.parent_session_key == parent_session_key
             )
-            >= self._max_per_parent
+            >= limit
         )
+
+    def _max_per_parent_for(self, parent_session_key: str, agent: str) -> int:
+        """Return the active-child cap for this spawn's effective agent.
+
+        Agent selection is resolved before admission so a local target cannot
+        borrow a cloud parent's wider cap. The global manager cap remains the
+        outer bound for every resolved value.
+        """
+        effective_agent = agent.strip() if isinstance(agent, str) else ""
+        if not effective_agent and parent_session_key:
+            try:
+                inherited = self._sessions.get_agent(parent_session_key)
+            except Exception:
+                inherited = ""
+            if isinstance(inherited, str):
+                effective_agent = inherited.strip()
+        if not effective_agent:
+            return self._max_per_parent
+
+        exact = self._max_per_parent_by_agent.get(effective_agent)
+        if exact is not None:
+            return min(exact, self._max_concurrent)
+
+        matches = [
+            (len(pattern.replace("*", "").replace("?", "")), pattern, limit)
+            for pattern, limit in self._max_per_parent_by_agent.items()
+            if fnmatchcase(effective_agent, pattern)
+        ]
+        if not matches:
+            return self._max_per_parent
+        _, _, limit = max(matches)
+        return min(limit, self._max_concurrent)
 
     # ── Continuable conversations (keep=True) ─────────────────────────────
 
@@ -4409,7 +4446,9 @@ class SubagentManager:
             (
                 index
                 for index, queued in enumerate(self._queue)
-                if not self._parent_at_capacity(str(queued.get("parent_session_key", "")))
+                if not self._parent_at_capacity(
+                    str(queued.get("parent_session_key", "")), str(queued.get("agent", ""))
+                )
             ),
             None,
         )

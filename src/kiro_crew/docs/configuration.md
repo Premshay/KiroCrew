@@ -194,6 +194,8 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `agent.log_level` | Persistent log level for the `kiro_crew` logger, applied at startup. The `--verbose` CLI flag overrides it | `"WARNING"` |
 | `agent.soft_stop_budget_secs` | Seconds to wait for a cooperative cancel before hard-killing the session | `10.0` |
 | `agent.max_subagents` | Max concurrent subagents. `0` auto-sizes the cap at startup from host memory/CPU and a learned per-agent cost. A pin of 1 or 2 is raised to 3, because a cap below 3 would disable auto-sizing and still run under the default | `0` |
+| `agent.subagent_max_per_parent` | Fallback cap for active child runs from one parent session. `0` leaves only the process-wide cap | `0` |
+| `agent.subagent_max_per_parent_by_agent` | Optional map of exact agent names or shell-style patterns to child-run caps. Exact names win, then the most-specific matching pattern; unmatched agents use `subagent_max_per_parent` | `{}` |
 | `agent.subagent_max_turns` | Default tool-call budget per subagent | `100` |
 | `agent.spawn_min_memory_gb` | Minimum available memory (GB) to spawn a subagent (0 disables the check) | `4.0` |
 | `agent.completion_keep` | Which end of the subagent transcript to keep in the completion event injected into the parent session: `"head"`, `"tail"`, or `"both"` (head + middle marker + tail) | `"head"` |
