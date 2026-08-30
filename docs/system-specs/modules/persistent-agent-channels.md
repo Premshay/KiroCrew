@@ -154,6 +154,7 @@ their persisted dashboard-slot identity.
 - Agent sidebar with state icons (⏳ pending, 🟢 working, 👂 listening, ✅ done, 💥 failed)
 - The empty preset opens the session picker immediately; it lists live dashboard slots and omits channel members already attached
 - Listen mode dropdown per agent
+- Dismiss remains available for terminal members; a successful dismissal removes the member from the visible list and frees channel capacity, while clear context remains limited to live members
 - Error modal for limit violations
 - Design tokens only (no hardcoded colors), `encodeURIComponent` on all URL params
 
