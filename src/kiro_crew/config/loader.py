@@ -346,6 +346,29 @@ def coerce_role_efforts(raw: object) -> dict[str, str]:
     return out
 
 
+def coerce_subagent_max_per_parent_by_agent(raw: object) -> dict[str, int]:
+    """Normalize per-agent child-run caps from operator-owned configuration.
+
+    Keys are exact agent names or shell-style patterns and values are positive
+    caps. Invalid entries are discarded so a malformed override cannot weaken
+    the fallback ``subagent_max_per_parent`` limit.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for pattern, limit in raw.items():
+        if (
+            isinstance(pattern, str)
+            and (clean_pattern := pattern.strip())
+            and len(clean_pattern) <= 128
+            and isinstance(limit, int)
+            and not isinstance(limit, bool)
+            and 1 <= limit <= SUBAGENT_AUTO_MAX_CEILING
+        ):
+            out[clean_pattern] = limit
+    return out
+
+
 def coerce_fallback_model(raw: object) -> str:
     """Normalize the throttle-fallback model (agent.fallback_model).
 
@@ -1767,6 +1790,16 @@ class AgentConfig:
             "serve one worker at a time.",
         ),
     )
+    subagent_max_per_parent_by_agent: dict[str, int] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Per-agent SubAgent Caps",
+            "Optional exact agent-name or shell-pattern overrides for the maximum "
+            "active child runs from one parent session. Exact names win; otherwise "
+            "the most specific matching pattern wins. Invalid entries are ignored "
+            "and an unmatched agent uses subagent_max_per_parent.",
+        ),
+    )
     max_stop_hook_nudges: int = field(
         default=100,
         metadata=_meta(
@@ -2026,6 +2059,9 @@ class AgentConfig:
         # feeds coerced input.
         self.role_models = coerce_role_models(self.role_models)
         self.role_efforts = coerce_role_efforts(self.role_efforts)
+        self.subagent_max_per_parent_by_agent = coerce_subagent_max_per_parent_by_agent(
+            self.subagent_max_per_parent_by_agent
+        )
         # Same defensive coercion for the throttle-fallback model: normalize to
         # ""/"auto"/acp id, so consumers can trust the stored shape.
         self.fallback_model = coerce_fallback_model(self.fallback_model)
@@ -7267,6 +7303,9 @@ class KiroCrewConfig:
                     0,
                     0,
                     SUBAGENT_AUTO_MAX_CEILING,
+                ),
+                subagent_max_per_parent_by_agent=coerce_subagent_max_per_parent_by_agent(
+                    agent_data.get("subagent_max_per_parent_by_agent")
                 ),
                 max_stop_hook_nudges=_safe_int(agent_data.get("max_stop_hook_nudges", 100), 100, 0),
                 subagent_mem_buffer_pct=_safe_int(

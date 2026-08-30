@@ -2676,6 +2676,7 @@ class TestDynamicSubagentSizingFields:
         assert a.subagent_cpu_cost_cores == 1.0
         assert a.subagent_auto_max == 32
         assert a.subagent_max_per_parent == 0
+        assert a.subagent_max_per_parent_by_agent == {}
         assert a.subagent_spawn_stagger_secs == 2.0
 
     def test_explicit_values_load(self) -> None:
@@ -2688,6 +2689,7 @@ class TestDynamicSubagentSizingFields:
                     "subagent_cpu_cost_cores": 0.8,
                     "subagent_auto_max": 24,
                     "subagent_max_per_parent": 1,
+                    "subagent_max_per_parent_by_agent": {"*": 1, "crew-claude": 3},
                     "subagent_spawn_stagger_secs": 1.5,
                 }
             }
@@ -2699,6 +2701,7 @@ class TestDynamicSubagentSizingFields:
         assert a.subagent_cpu_cost_cores == 0.8
         assert a.subagent_auto_max == 24
         assert a.subagent_max_per_parent == 1
+        assert a.subagent_max_per_parent_by_agent == {"*": 1, "crew-claude": 3}
         assert a.subagent_spawn_stagger_secs == 1.5
 
     def test_to_dict_round_trip(self) -> None:
@@ -2711,6 +2714,7 @@ class TestDynamicSubagentSizingFields:
                     "subagent_cpu_cost_cores": 0.9,
                     "subagent_auto_max": 12,
                     "subagent_max_per_parent": 1,
+                    "subagent_max_per_parent_by_agent": {"*": 1, "crew-claude": 3},
                     "subagent_spawn_stagger_secs": 3.0,
                 }
             }
@@ -2722,6 +2726,7 @@ class TestDynamicSubagentSizingFields:
             "subagent_cpu_cost_cores",
             "subagent_auto_max",
             "subagent_max_per_parent",
+            "subagent_max_per_parent_by_agent",
             "subagent_spawn_stagger_secs",
         ):
             assert key in agent_dict, f"{key} missing from to_dict()"
@@ -2735,7 +2740,25 @@ class TestDynamicSubagentSizingFields:
         assert a.subagent_cpu_cost_cores == 0.9
         assert a.subagent_auto_max == 12
         assert a.subagent_max_per_parent == 1
+        assert a.subagent_max_per_parent_by_agent == {"*": 1, "crew-claude": 3}
         assert a.subagent_spawn_stagger_secs == 3.0
+
+    def test_per_agent_cap_drops_malformed_entries(self) -> None:
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "subagent_max_per_parent_by_agent": {
+                        "crew-local": 1,
+                        "": 3,
+                        "crew-claude": 0,
+                        "crew-codex": True,
+                        "crew-antigravity": 65,
+                    }
+                }
+            }
+        )
+
+        assert cfg.agent.subagent_max_per_parent_by_agent == {"crew-local": 1}
 
 
 # ---------------------------------------------------------------------------
