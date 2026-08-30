@@ -315,6 +315,11 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
     if inbox_outcome != "queued":
         return inbox_outcome
 
+    if message.msg_type == "mention":
+        # A peer request can change the recipient's work, but its text is not
+        # adopted as a checkpoint. Mark only the freshness boundary.
+        slot.mark_checkpoint_activity()
+
     from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 
     await save_slot_off_loop(state, slot, force=True, best_effort=False)

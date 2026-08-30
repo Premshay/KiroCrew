@@ -1907,8 +1907,59 @@ async def api_session_restart_continuation(request: web.Request) -> web.Response
     return web.json_response({"ok": True})
 
 
+def _channel_memberships(state: DashboardState, session_key: str) -> list[tuple[Any, Any]]:
+    """Return only memberships proven by the gateway-authored caller key."""
+    manager = getattr(state, "channel_manager", None)
+    channels = getattr(manager, "_channels", None)
+    if not isinstance(channels, dict):
+        return []
+    memberships: list[tuple[Any, Any]] = []
+    for channel in channels.values():
+        member = next(
+            (item for item in channel.members.values() if item.session_key == session_key), None
+        )
+        if member is not None:
+            memberships.append((channel, member))
+    return memberships
+
+
+def _channel_status_payload(state: DashboardState, channel: Any, member: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": channel.id,
+        "topic": channel.topic,
+        "self": {"id": member.id, "role": member.role},
+        "coordinator": channel.is_active_coordinator(member),
+        "capacity": {"used": len(channel.members), "max": channel._max_agents},
+        "peers": [
+            {"id": peer.id, "role": peer.role, "state": peer.state}
+            for peer in channel.members.values()
+            if peer.id != member.id
+        ],
+    }
+    return payload
+
+
+async def _spawn_channel_member(state: DashboardState, channel: Any, agent: Any) -> None:
+    """Start the bounded channel worker through the same lifecycle as the UI."""
+    from kiro_crew.channel import run_channel_agent
+    from kiro_crew.dashboard.handlers_channel import _spawn_agent_task
+
+    _spawn_agent_task(
+        agent, run_channel_agent(agent, channel, state.sessions, is_yolo=lambda: state._yolo)
+    )
+
+
+def _mark_channel_membership_change(state: DashboardState, session_key: str) -> None:
+    """Make a coordinator-authored roster change visible to its next checkpoint."""
+    for slot in state._slots.values():
+        if effective_session_key(slot) == session_key:
+            slot.mark_checkpoint_activity()
+            slot._dirty = True
+            return
+
+
 async def api_session_channel(request: web.Request) -> web.Response:
-    """Read or post through the caller's attached persistent-agent channels."""
+    """Read, report, or coordinate through the caller's own persistent channel."""
     state: DashboardState = request.app["state"]
     session_key = request.headers.get("X-Session-Key", "").strip()
     if not session_key:
@@ -1916,7 +1967,7 @@ async def api_session_channel(request: web.Request) -> web.Response:
             {"error": "X-Session-Key required", "code": "missing_session_key"}, status=400
         )
     slots = [slot for slot in state._slots.values() if effective_session_key(slot) == session_key]
-    if len(slots) != 1:
+    if session_key.startswith("dashboard:") and len(slots) != 1:
         return web.json_response(
             {
                 "error": "the calling session has no unique live dashboard slot",
@@ -1933,47 +1984,32 @@ async def api_session_channel(request: web.Request) -> web.Response:
             {"error": "request body must be a JSON object", "code": "invalid_channel_request"},
             status=400,
         )
-    manager = getattr(state, "channel_manager", None)
-    if manager is None:
+    if getattr(state, "channel_manager", None) is None:
         return web.json_response(
             {"error": "persistent channels are unavailable", "code": "channels_unavailable"},
             status=503,
         )
-    attached = []
-    for channel in manager._channels.values():
-        member = next(
-            (
-                item
-                for item in channel.members.values()
-                if item.attached_session and item.session_key == session_key
-            ),
-            None,
+    attached = _channel_memberships(state, session_key)
+    if not attached and not session_key.startswith("dashboard:"):
+        return web.json_response(
+            {"error": "caller is not a persistent channel member", "code": "channel_membership_required"},
+            status=403,
         )
-        if member is not None:
-            attached.append((channel, member))
     action = body.get("action")
     if action == "status":
         return web.json_response(
             {
                 "ok": True,
-                "channels": [
-                    {
-                        "id": channel.id,
-                        "topic": channel.topic,
-                        "self": {"id": member.id, "role": member.role},
-                        "peers": [
-                            {"id": peer.id, "role": peer.role, "state": peer.state}
-                            for peer in channel.members.values()
-                            if peer.id != member.id
-                        ],
-                    }
-                    for channel, member in attached
-                ],
+                "channels": [_channel_status_payload(state, channel, member) for channel, member in attached],
             }
         )
-    if action != "post":
+    if action not in {"post", "add_agent", "remove_member"}:
         return web.json_response(
-            {"error": "action must be status or post", "code": "invalid_channel_action"}, status=400
+            {
+                "error": "action must be status, post, add_agent, or remove_member",
+                "code": "invalid_channel_action",
+            },
+            status=400,
         )
     channel_id = body.get("channel_id")
     if not isinstance(channel_id, str) or len(channel_id) > 32:
@@ -1986,6 +2022,67 @@ async def api_session_channel(request: web.Request) -> web.Response:
             {"error": "caller is not attached to that channel", "code": "channel_membership_required"},
             status=403,
         )
+    channel, member = selected
+    if action in {"add_agent", "remove_member"}:
+        if not channel.is_active_coordinator(member):
+            return web.json_response(
+                {
+                    "error": "only the active channel coordinator may change membership",
+                    "code": "channel_coordinator_required",
+                },
+                status=403,
+            )
+        if action == "add_agent":
+            role = body.get("role")
+            task = body.get("task")
+            agent_name = body.get("agent", "")
+            if not isinstance(role, str) or not role.strip() or len(role) > 100:
+                return web.json_response({"error": "role must be 1 to 100 characters"}, status=400)
+            if not isinstance(task, str) or not task.strip() or len(task) > 2000:
+                return web.json_response({"error": "task must be 1 to 2000 characters"}, status=400)
+            if not isinstance(agent_name, str) or len(agent_name) > 100:
+                return web.json_response({"error": "agent must be at most 100 characters"}, status=400)
+            if "approval" in body:
+                return web.json_response(
+                    {"error": "worker approval policy is fixed by the channel safety policy"},
+                    status=400,
+                )
+            agent = channel.add_agent(
+                role=sanitize_string(role).strip(),
+                agent_name=sanitize_string(agent_name).strip(),
+                task=sanitize_string(task).strip(),
+            )
+            if agent is None:
+                return web.json_response(
+                    {"error": "channel member limit reached", "code": "channel_capacity_reached"},
+                    status=409,
+                )
+            await _spawn_channel_member(state, channel, agent)
+            _mark_channel_membership_change(state, session_key)
+            state.push_slots_update()
+            return web.json_response({"ok": True, "agent": agent.to_dict()})
+        member_id = body.get("member_id")
+        force = body.get("force", False)
+        target = channel.members.get(member_id) if isinstance(member_id, str) else None
+        if target is None or target.id == member.id:
+            return web.json_response({"error": "select another current channel member"}, status=400)
+        if not isinstance(force, bool):
+            return web.json_response({"error": "force must be boolean"}, status=400)
+        if target.state not in {"done", "failed"} and not force:
+            return web.json_response(
+                {"error": "only terminal members can be removed without force"}, status=409
+            )
+        if force and not target.attached_session and target._task and not target._task.done():
+            target._task.cancel()
+            try:
+                await target._task
+            except asyncio.CancelledError:
+                pass
+        channel.remove_agent(target.id, reason="coordinator_removed")
+        _mark_channel_membership_change(state, session_key)
+        state.push_slots_update()
+        return web.json_response({"ok": True, "removed_member_id": target.id})
+
     recipients = body.get("recipients")
     if (
         not isinstance(recipients, list)
@@ -1998,7 +2095,6 @@ async def api_session_channel(request: web.Request) -> web.Response:
             {"error": "recipients must be one to eight distinct agent ids", "code": "invalid_recipients"},
             status=400,
         )
-    channel, member = selected
     if member.id in recipients or any(recipient not in channel.members for recipient in recipients):
         return web.json_response(
             {"error": "recipients must name other channel members", "code": "invalid_recipients"},

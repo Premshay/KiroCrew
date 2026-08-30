@@ -36,6 +36,7 @@ from kiro_crew.validation import (
     MONITOR_UPDATE_SCHEMA,
     REGISTER_HOOK_SCHEMA,
     SELECT_CREW_SCHEMA,
+    SESSION_CHANNEL_MANAGE_SCHEMA,
     SESSION_CHANNEL_POST_SCHEMA,
     SESSION_CHECKPOINT_SCHEMA,
     SESSION_RESTART_CONTINUATION_SCHEMA,
@@ -612,6 +613,32 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "session_channel_manage",
+            "description": (
+                "As the current channel coordinator only, add a bounded channel-owned agent, "
+                "or remove a terminal member. Attaching an existing dashboard session requires "
+                "the dashboard user's explicit action in the channel UI. Other channel members "
+                "may inspect and report but cannot use this to change membership."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add_agent", "remove_member"],
+                    },
+                    "channel_id": {"type": "string", "maxLength": 8},
+                    "role": {"type": "string", "maxLength": 100},
+                    "task": {"type": "string", "maxLength": 2000},
+                    "agent": {"type": "string", "maxLength": 100},
+                    "member_id": {"type": "string", "maxLength": 8},
+                    "force": {"type": "boolean"},
+                },
+                "required": ["action", "channel_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "session_restart_continuation",
             "description": (
                 "Before an intentional gateway restart, arm one concise verification "
@@ -1100,8 +1127,15 @@ def session_channel_status(name: str, args: dict[str, Any]) -> str:
             f"{peer.get('role', 'Peer')} ({peer.get('id', 'unknown')}, {peer.get('state', 'unknown')})"
             for peer in peers
         )
+        capacity = channel.get("capacity") or {}
+        capacity_text = (
+            f" Capacity: {capacity.get('used', 0)}/{capacity.get('max', 0)}."
+            if isinstance(capacity, dict)
+            else ""
+        )
         summaries.append(
-            f"{channel.get('id', 'unknown')} — {channel.get('topic', '')}: {peer_text or 'no peers'}"
+            f"{channel.get('id', 'unknown')} — {channel.get('topic', '')}: "
+            f"{peer_text or 'no peers'}.{capacity_text}"
         )
     return "Attached persistent-agent channels:\n" + "\n".join(summaries)
 
@@ -1122,6 +1156,20 @@ def session_channel_post(name: str, args: dict[str, Any]) -> str:
         suffix = f" Delivery: {receipt_text}." if receipt_text else ""
         return f"Peer report {message.get('id', 'recorded')}.{suffix}"
     return f"Error: peer report was not recorded: {result.get('error', 'unknown error')}"
+
+
+def session_channel_manage(name: str, args: dict[str, Any]) -> str:
+    args = validate_tool_args(args, SESSION_CHANNEL_MANAGE_SCHEMA)
+    result = _session_channel_post(args)
+    if result is None:
+        return "Error: session_channel_manage requires a verified session identity."
+    if result.get("ok") is not True:
+        return f"Error: channel membership was not changed: {result.get('error', 'unknown error')}"
+    action = args["action"]
+    if action == "add_agent":
+        agent = result.get("agent") or {}
+        return f"Channel agent added: {agent.get('role', 'Agent')} ({agent.get('id', 'unknown')})."
+    return f"Channel member removed: {result.get('removed_member_id', 'unknown')}."
 
 
 def session_restart_continuation(name: str, args: dict[str, Any]) -> str:
@@ -1199,6 +1247,7 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "session_checkpoint": session_checkpoint,
     "session_channel_status": session_channel_status,
     "session_channel_post": session_channel_post,
+    "session_channel_manage": session_channel_manage,
     "session_restart_continuation": session_restart_continuation,
     "maintenance_status": maintenance_status,
     "maintenance_acknowledge": maintenance_acknowledge,

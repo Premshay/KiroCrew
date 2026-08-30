@@ -1576,6 +1576,9 @@ class _ChatSlot:
         "_declared_goal",
         "_session_checkpoint",
         "_session_timeline",
+        "_checkpoint_activity_generation",
+        "_checkpoint_covered_generation",
+        "_checkpoint_reminder_generation",
         "_on_message",
         "_on_question_retired",
         "_has_reader_flag",
@@ -1645,6 +1648,7 @@ class _ChatSlot:
         "_pending_context",
         "_deferred_notes",
         "_peer_channel_inbox",
+        "_channel_collaboration_signature",
         "_post_restart_continuation",
         "_app",
         "_human_seen",
@@ -1819,6 +1823,9 @@ class _ChatSlot:
         self._declared_goal: str = ""
         self._session_checkpoint: dict[str, Any] | None = None
         self._session_timeline: list[dict[str, Any]] = []
+        self._checkpoint_activity_generation: int = 0
+        self._checkpoint_covered_generation: int = 0
+        self._checkpoint_reminder_generation: int = 0
         # Callback for broadcasting messages via global SSE
         self._on_message: object | None = None  # Callable[[str, dict], None] | None
         # Announce stateless question cards this slot retires, so every client
@@ -2027,6 +2034,10 @@ class _ChatSlot:
         self._pending_context: list[dict[str, Any]] = []
         self._deferred_notes: list[dict[str, Any]] = []
         self._peer_channel_inbox: list[dict[str, Any]] = []
+        # Runtime-only signature for deterministic channel-skill onboarding.
+        # A restart resets it, intentionally re-sending the contract before the
+        # first resumed turn without persisting private membership identifiers.
+        self._channel_collaboration_signature: str = ""
         self._post_restart_continuation: str = ""
         self._app: str = ""  # App identity tag (App Kit §5.2)
         # FIX 1 (unattended approval park). Evidence that a HUMAN has driven
@@ -2553,6 +2564,52 @@ class _ChatSlot:
         """Return a copy suitable for durable slot metadata."""
         return [dict(message) for message in self._peer_channel_inbox]
 
+    def peer_channel_attention_payload(self) -> list[dict[str, str]]:
+        """Project peer requests separately from passive inbox receipts."""
+        return [
+            {
+                "channel_id": str(message.get("channel_id", "")),
+                "from_role": str(message.get("from_role", "")),
+                "delivery": str(message.get("delivery", "next_turn")),
+            }
+            for message in self._peer_channel_inbox
+            if message.get("msg_type") == "mention"
+        ]
+
+    def mark_checkpoint_activity(self) -> None:
+        """Record a meaningful state change without inventing its narrative."""
+        self._checkpoint_activity_generation += 1
+
+    def checkpoint_freshness_payload(self) -> dict[str, int | bool]:
+        """Expose generation state so consumers can flag a stale checkpoint."""
+        return {
+            "activity_generation": self._checkpoint_activity_generation,
+            "covered_generation": self._checkpoint_covered_generation,
+            "overdue": self._checkpoint_activity_generation > self._checkpoint_covered_generation,
+        }
+
+    def restore_checkpoint_freshness(self, value: object) -> None:
+        """Restore bounded deterministic state, never trusting a stored overdue flag."""
+        if not isinstance(value, dict):
+            return
+        activity = value.get("activity_generation")
+        covered = value.get("covered_generation")
+        if not isinstance(activity, int) or isinstance(activity, bool) or activity < 0:
+            return
+        if not isinstance(covered, int) or isinstance(covered, bool) or covered < 0:
+            return
+        self._checkpoint_activity_generation = min(activity, 1_000_000)
+        self._checkpoint_covered_generation = min(covered, self._checkpoint_activity_generation)
+
+    def checkpoint_reminder_due(self) -> bool:
+        return (
+            self._checkpoint_activity_generation > self._checkpoint_covered_generation
+            and self._checkpoint_reminder_generation < self._checkpoint_activity_generation
+        )
+
+    def note_checkpoint_reminder(self) -> None:
+        self._checkpoint_reminder_generation = self._checkpoint_activity_generation
+
     def arm_post_restart_continuation(self, checklist: object) -> bool:
         """Arm one explicit post-restart verification turn for this slot."""
         value = self._checkpoint_text(checklist, SESSION_RESTART_CONTINUATION_MAX)
@@ -2581,6 +2638,7 @@ class _ChatSlot:
         if value == self._declared_goal:
             return False
         self._declared_goal = value
+        self.mark_checkpoint_activity()
         text = f"Goal declared: {value}" if value else "Goal cleared."
         self.append_session_timeline(text, "goal", kind="goal", priority=90)
         return True
@@ -2636,6 +2694,8 @@ class _ChatSlot:
             "attention": attention,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        self._checkpoint_covered_generation = self._checkpoint_activity_generation
+        self._checkpoint_reminder_generation = self._checkpoint_activity_generation
         self.append_session_timeline(milestone, "checkpoint", kind="checkpoint", priority=100)
         return True
 
@@ -2669,6 +2729,9 @@ class _ChatSlot:
             "attention": self._checkpoint_attention(checkpoint.get("attention")),
             "updated_at": updated_at if isinstance(updated_at, str) else "",
         }
+        # Legacy checkpoints predate activity generations. Treat their own
+        # restore as current until a new deterministic event occurs.
+        self._checkpoint_covered_generation = self._checkpoint_activity_generation
         if not self._session_timeline:
             self.restore_session_timeline(
                 [
@@ -3879,6 +3942,7 @@ class _ChatSlot:
             "artifact": self._artifact,
             "messages": len(self.messages),
             "peer_channel_inbox_count": len(self._peer_channel_inbox),
+            "peer_channel_attention": self.peer_channel_attention_payload(),
             "running": self.running,
             "orchestrating": self._in_stage_execution,
             "queue_depth": self.queue_depth,
@@ -3914,6 +3978,7 @@ class _ChatSlot:
             "plan_goal": self._checkpoint_text(self._plan_goal, SESSION_CHECKPOINT_GOAL_MAX),
             "session_checkpoint": self.session_checkpoint_payload(),
             "session_timeline": self.session_timeline_payload(),
+            "checkpoint_freshness": self.checkpoint_freshness_payload(),
             "has_options": has_options,
             "options": [_redact(o) for o in options],
             "prompt_preview": prompt_preview,

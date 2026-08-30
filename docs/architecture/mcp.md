@@ -628,6 +628,15 @@ answers `tools/list` from):
 - **Session-bound directives** (`session_directive.DIRECTIVE_TOOLS`):
   `ask_question`, `suggest_followup`, `monitor_start`, `monitor_update`,
   `autonudge_stop`, `set_project`
+- **Channel collaboration:** `session_channel_status`, `session_channel_post`,
+  `session_channel_manage`. Status and posts are bound to the caller's verified
+  channel membership and expose only channel-local member IDs. Management is a
+  separate, coordinator-only capability: it can add a channel-owned agent or
+  remove a terminal member (a non-terminal removal requires explicit force).
+  Existing dashboard sessions are attached only by the dashboard user's
+  explicit channel-UI action, never by an agent tool. It never exposes
+  dashboard session keys or grants the generic session-control tools to channel
+  agents.
 - **Crew routing:** `select_crew`
 - **Sessions and history:** `list_sessions`, `get_chat_session`,
   `search_chat_history`

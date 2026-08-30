@@ -377,14 +377,49 @@ def drain_peer_channel_inbox(
             f"{message['content']}\n"
             "[End KiroCrew Channel message]"
         )
-    slot.append_session_timeline(
-        f"Received {len(messages)} peer channel message(s).",
-        "channel",
-        kind="channel",
-        priority=90,
-    )
+    # Delivery receipts remain in durable inbox metadata. They are transport
+    # evidence, not an authored work milestone for Multiplex Updates.
     slot._dirty = True
     return "\n\n".join(blocks) + "\n"
+
+
+def channel_collaboration_prefix(
+    state: "DashboardState", slot: "_ChatSlot", session_key: str, *, include_skill: bool
+) -> str:
+    """Inject current channel identity without exposing dashboard session keys."""
+    manager = getattr(state, "channel_manager", None)
+    channels = getattr(manager, "_channels", None)
+    if not isinstance(channels, dict):
+        return ""
+    memberships = []
+    for channel in channels.values():
+        member = next(
+            (
+                candidate
+                for candidate in channel.members.values()
+                if candidate.attached_session and candidate.session_key == session_key
+            ),
+            None,
+        )
+        if member is not None:
+            memberships.append((channel, member))
+    memberships.sort(key=lambda row: row[0].id)
+    signature = "|".join(f"{channel.id}:{member.id}" for channel, member in memberships)
+    if not signature:
+        slot._channel_collaboration_signature = ""
+        return ""
+    first_membership = signature != slot._channel_collaboration_signature
+    slot._channel_collaboration_signature = signature
+    from kiro_crew.channel import channel_collaboration_context
+
+    return "\n\n".join(
+        channel_collaboration_context(
+            channel,
+            member,
+            include_skill=(include_skill or first_membership) and index == 0,
+        )
+        for index, (channel, member) in enumerate(memberships)
+    ) + "\n\n"
 
 
 def _turn_outcome(stop_reason: str | None, *, exhausted: bool = False) -> str:
@@ -430,6 +465,7 @@ def _record_plan_timeline(
     slot._stage_titles, slot._plan_goal, slot._stage_descriptions = current
     if current == previous:
         return
+    slot.mark_checkpoint_activity()
     label = f"Plan updated: {goal}" if goal else "Plan updated"
     slot.append_session_timeline(
         f"{label} ({len(titles)} stages).",
@@ -490,6 +526,7 @@ def _subagent_roster_snapshot(subagents: object) -> tuple[tuple[str, str], ...]:
 
 def _record_subagent_roster_timeline(slot: "_ChatSlot", roster: tuple[tuple[str, str], ...]) -> None:
     """Record a bounded count after a meaningful native-crew roster transition."""
+    slot.mark_checkpoint_activity()
     active = sum(
         status in ("", "working", "running", "pending", "queued", "in_progress")
         for _, status in roster
@@ -503,11 +540,15 @@ def _record_subagent_roster_timeline(slot: "_ChatSlot", roster: tuple[tuple[str,
 
 
 def _record_terminal_timeline(slot: "_ChatSlot", stop_reason: str | None) -> None:
-    """Record only non-normal terminal outcomes, never an ordinary completed turn."""
+    """Advance freshness for every recorded terminal outcome."""
     reason = stop_reason or ""
-    if reason in ("", STOP_REASON_END_TURN, "stop", "completed"):
-        return
     if reason == STOP_REASON_CANCELLED:
+        return
+    # A checkpoint written earlier in this turn cannot describe its terminal
+    # state, whether it completed, timed out, or failed. Keep the next regular
+    # turn eligible for its bounded reminder.
+    slot.mark_checkpoint_activity()
+    if reason in ("", STOP_REASON_END_TURN, "stop", "completed"):
         return
     elif "timeout" in reason:
         text = "Turn timed out."
@@ -5921,6 +5962,7 @@ async def _run_chat(
         # model list cannot have changed.
         spawned = bool(is_new or resumed)
         if resumed:
+            slot.mark_checkpoint_activity()
             slot.append_session_timeline("Session resumed.", "session")
             state.broadcast_ws(
                 "activity_event",
@@ -5933,6 +5975,7 @@ async def _run_chat(
             )
         else:
             if is_new:
+                slot.mark_checkpoint_activity()
                 slot.append_session_timeline("Session started.", "session")
             state.broadcast_ws(
                 "activity_event",
@@ -6289,6 +6332,34 @@ async def _run_chat(
             # context, taking the skills index with it. Read-and-clear the flag
             # here so this turn re-injects the index exactly once.
             _needs_reinjection = state.sessions.consume_needs_reinjection(session_key)
+            _channel_prefix = channel_collaboration_prefix(
+                state,
+                slot,
+                session_key,
+                include_skill=bool(is_new or resumed or _needs_reinjection),
+            )
+            if _channel_prefix:
+                message = _channel_prefix + message
+                _msg_len_pre_persona += len(_channel_prefix)
+            if not _synthetic_payload:
+                slot.mark_checkpoint_activity()
+            if not _synthetic_payload and slot.checkpoint_reminder_due():
+                slot.note_checkpoint_reminder()
+                slot._dirty = True
+                _checkpoint_reminder = (
+                    "[KiroCrew checkpoint reminder]\n"
+                    "Meaningful session state changed since the last checkpoint. Before ending "
+                    "this turn, publish a concise session_checkpoint that states the current "
+                    "work and explicit next_action; do not infer either from a peer receipt.\n"
+                    "[End KiroCrew checkpoint reminder]\n\n"
+                )
+                message = _checkpoint_reminder + message
+                _msg_len_pre_persona += len(_checkpoint_reminder)
+            # Channel context and any checkpoint reminder are also prepends.
+            # Recompute after all of them, but before build_message sees the
+            # prompt, so the context split attributes the typed user span rather
+            # than the injected collaboration material.
+            _user_prepend_offset = max(0, _msg_len_pre_persona - _core_msg_len)
             full_message, _ = await run_in_embed_pool(
                 state.context_builder.build_message,
                 message,
@@ -9976,13 +10047,7 @@ async def _run_chat(
         slot.append("error", str(exc), "msg msg-err")
     except Exception as exc:
         logger.exception("Dashboard chat error in slot %s", slot.key)
-        slot.append_session_timeline(
-            "Turn ended with an error.",
-            "terminal",
-            kind="terminal",
-            priority=90,
-            consequence="Inspect the conversation before retrying.",
-        )
+        _record_terminal_timeline(slot, "error")
         _err_text, _ = redact_exfiltration_urls(str(exc))
         _err_text, _ = redact_credentials(_err_text)
         slot.append("error", _err_text, "msg msg-err")
