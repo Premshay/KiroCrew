@@ -20,6 +20,7 @@ from kiro_crew.acp.client import AcpAuthRequired
 from kiro_crew.agent_discovery import warm_project_agent_names
 from kiro_crew.config.loader import (
     KiroCrewConfig,
+    normalize_agent_model,
     refresh_materialized_agents,
     resolve_agent_bindings,
 )
@@ -352,6 +353,8 @@ async def _run_side_turn(
         # a config-load failure degrades to the raw slot.agent rather than
         # crashing the turn.
         kiro_agent: str | None = None
+        crew_alias = ""
+        agent_model = ""
         # An app-owned slot whose agent never resolved (see the fail-loud guard
         # after this block). Captured inside the try so the raise lives OUTSIDE
         # it and is not swallowed by the resolve except.
@@ -364,6 +367,8 @@ async def _run_side_turn(
             await warm_project_agent_names(slot.project)
             bindings = resolve_agent_bindings(cfg, slot.agent or None, slot.project or None)
             kiro_agent = bindings.kiro_agent
+            crew_alias = bindings.resolved_alias
+            agent_model = normalize_agent_model(bindings.model)
             # SELF-HEAL an app-owned slot whose agent did not resolve, on the same
             # two escalating rungs `_run_chat` uses, for the same reason: an app's
             # agents live only in ``~/.kiro/agents/<app>--<agent>.json``, so the
@@ -388,11 +393,15 @@ async def _run_side_turn(
                     )
                 bindings = resolve_agent_bindings(cfg, slot.agent or None, slot.project or None)
                 kiro_agent = bindings.kiro_agent
+                crew_alias = bindings.resolved_alias
+                agent_model = normalize_agent_model(bindings.model)
                 if not bindings.requested_resolved:
                     bindings = await _recover_app_agent_binding(
                         cfg, slot, project=slot.project or None
                     )
                     kiro_agent = bindings.kiro_agent
+                    crew_alias = bindings.resolved_alias
+                    agent_model = normalize_agent_model(bindings.model)
             _app_agent_unresolved = bool(slot._app) and not bindings.requested_resolved
         except Exception:
             logger.warning(
@@ -418,6 +427,13 @@ async def _run_side_turn(
         provider, _is_new, _resumed = await state.sessions.get_or_create(
             side_key,
             agent=kiro_agent or slot.agent or None,
+            # A side conversation is isolated in history and tool authority, not
+            # in execution choice. The parent slot's selected model and effort
+            # must reach its new ACP session; otherwise a provider silently
+            # chooses its own default (for example Fable instead of the parent
+            # chat's selected Opus).
+            crew_agent=crew_alias,
+            model=slot.model or agent_model or None,
             # The session must run in the slot's project directory for a
             # project-scope agent resolved above to be loadable at all:
             # kiro-cli resolves --agent against $PWD/.kiro/agents, so creating
@@ -426,6 +442,7 @@ async def _run_side_turn(
             # chat_runner._run_chat, which passes the same cwd for the same
             # reason.
             cwd=slot.project or None,
+            reasoning_effort_override=slot.reasoning_effort or None,
         )
         acquired_key = side_key
         try:

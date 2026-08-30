@@ -444,6 +444,61 @@ async def test_side_turn_resolves_slot_agent_to_kiro_agent(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_side_turn_inherits_the_parent_execution_selection(tmp_path, monkeypatch):
+    """A sidecar keeps the parent agent, model, and effort selection.
+
+    Side history and tools are intentionally isolated, but execution selection
+    is not. Starting a fresh ACP session without the slot's model/effort makes
+    the provider select its own default, which can be a different subscription
+    model from the chat the user was looking at.
+    """
+    state = _make_state(tmp_path)
+    _capture_broadcasts(state)
+    parent = state.get_or_create_slot("parent")
+    parent.agent = "crew-claude-atlas"
+    parent.model = "opus"
+    parent.reasoning_effort = "xhigh"
+    parent._side = SideState(open=True, created_at="2026-01-01T00:00:00Z")
+    parent._side.append_user("q")
+    parent._side.last_run_id = "run-1"
+    parent._side.is_complete = False
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_get_or_create(key, **kwargs):
+        captured.update(kwargs)
+        return MagicMock(), True, False
+
+    state.sessions.get_or_create = _fake_get_or_create
+    state.sessions.release = MagicMock()
+
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.side.KiroCrewConfig.load",
+        lambda: MagicMock(),
+    )
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.side.resolve_agent_bindings",
+        lambda cfg, agent, project_dir=None: MagicMock(
+            kiro_agent="crew-claude",
+            resolved_alias="crew-claude-atlas",
+            model="",
+            requested_resolved=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.side.stream_and_collect",
+        AsyncMock(return_value="ok"),
+    )
+
+    await _run_side_turn(state, parent, "run-1", "q", is_first_turn=True)
+
+    assert captured["agent"] == "crew-claude"
+    assert captured["crew_agent"] == "crew-claude-atlas"
+    assert captured["model"] == "opus"
+    assert captured["reasoning_effort_override"] == "xhigh"
+
+
+@pytest.mark.asyncio
 async def test_side_turn_runs_in_the_slot_project_dir(tmp_path, monkeypatch):
     """The side session is created with ``cwd=slot.project``.
 
