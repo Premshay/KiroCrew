@@ -123,6 +123,22 @@ class TestCheckpointDirectiveDispatch:
         assert "outcome is indeterminate" in result
         assert "do not retry automatically" in result
 
+    def test_reports_checkpoint_persistence_failure_as_pending_durability(self, monkeypatch) -> None:
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
+        monkeypatch.setattr(
+            mcp_core,
+            "_post",
+            lambda *args, **kwargs: {
+                "error": "checkpoint persistence failed",
+                "code": "checkpoint_persistence_failed",
+            },
+        )
+
+        result = mcp_core._call_tool_inner("session_checkpoint", _checkpoint())
+
+        assert "accepted and is pending durable persistence" in result
+        assert "do not retry automatically" in result
+
     def test_refuses_an_unverified_session_before_making_a_checkpoint_request(
         self, monkeypatch
     ) -> None:
@@ -473,6 +489,28 @@ class TestCheckpointInternalEndpoint:
         assert response.status == 200
         assert json.loads(response.text)["ok"] is True
         assert slot.session_checkpoint_payload() is not None
+
+    @pytest.mark.asyncio
+    async def test_persistence_failure_reports_the_already_accepted_checkpoint(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("consumer")
+        request = MagicMock()
+        request.app = {"state": state}
+        request.headers = {"X-Session-Key": "dashboard:consumer"}
+        request.json = AsyncMock(return_value=_checkpoint())
+        failed_save = AsyncMock(side_effect=OSError("disk full"))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_persistence.save_slot_off_loop", failed_save
+        )
+
+        response = await api_session_checkpoint(request)
+
+        assert response.status == 500
+        assert json.loads(response.text)["code"] == "checkpoint_persistence_failed"
+        assert slot.session_checkpoint_payload() is not None
+        assert slot._dirty is True
 
     @pytest.mark.asyncio
     async def test_rejects_a_session_without_its_own_live_slot(self, tmp_path) -> None:

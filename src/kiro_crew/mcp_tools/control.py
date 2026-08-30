@@ -1104,6 +1104,11 @@ def session_checkpoint(name: str, args: dict[str, Any]) -> str:
                 "Checkpoint outcome is indeterminate because the gateway response was lost; "
                 "do not retry automatically."
             )
+        if result.get("code") == "checkpoint_persistence_failed":
+            return (
+                "Checkpoint was accepted and is pending durable persistence; "
+                "do not retry automatically."
+            )
         return f"Error: checkpoint was not recorded: {result.get('error', 'unknown error')}"
     return "Checkpoint recorded for this session's Multiplex view."
 
