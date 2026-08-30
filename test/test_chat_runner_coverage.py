@@ -2218,6 +2218,39 @@ class TestContextUsagePayload:
 # ── _run_chat: local commands ─────────────────────────────────────────────
 
 
+class TestRunChatCheckpointReminder:
+    @pytest.mark.asyncio
+    async def test_warm_user_turn_marks_activity_before_reminder(self, tmp_path):
+        context_builder = MagicMock()
+        context_builder.conversation_log = None
+        context_builder.build_message.side_effect = lambda message, *_args, **_kwargs: (
+            message,
+            None,
+        )
+        state, client = _runner_state(tmp_path, context_builder=context_builder)
+        client.pending_oauth_requests = []
+        state.sessions.get_or_create = AsyncMock(return_value=(client, False, False))
+        slot = _slot()
+        slot.set_session_checkpoint(
+            {
+                "summary": "The previous task is recorded.",
+                "milestone": "Checkpoint published.",
+                "main_items": ["Wait for the next task."],
+                "next_action": "Start the requested work.",
+            }
+        )
+        _set_stream(
+            client,
+            [LLMEvent(kind=EVENT_TEXT_CHUNK, text="Working on it."), _complete()],
+        )
+
+        await _drive(state, slot, "Start the next task.")
+
+        sent_prompt = client.stream.call_args.args[0]
+        assert "[KiroCrew checkpoint reminder]" in sent_prompt
+        assert slot.checkpoint_freshness_payload()["overdue"] is True
+
+
 class TestRunChatLocalCommands:
     @pytest.mark.asyncio
     async def test_blocked_slash_command_never_acquires_a_session(self, tmp_path):

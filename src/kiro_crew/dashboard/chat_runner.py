@@ -6341,6 +6341,8 @@ async def _run_chat(
             if _channel_prefix:
                 message = _channel_prefix + message
                 _msg_len_pre_persona += len(_channel_prefix)
+            if not _synthetic_payload:
+                slot.mark_checkpoint_activity()
             if not _synthetic_payload and slot.checkpoint_reminder_due():
                 slot.note_checkpoint_reminder()
                 slot._dirty = True
