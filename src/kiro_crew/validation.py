@@ -1720,6 +1720,31 @@ SESSION_CHANNEL_POST_SCHEMA = ToolSchema(
     custom_validator=_validate_session_channel_post,
 )
 
+
+SESSION_CHANNEL_MANAGE_SCHEMA = ToolSchema(
+    tool_name="session_channel_manage",
+    fields=[
+        FieldSpec(
+            "action",
+            str,
+            required=True,
+            allowed=frozenset({"add_agent", "remove_member"}),
+        ),
+        FieldSpec(
+            "channel_id",
+            str,
+            required=True,
+            max_len=8,
+            pattern=_PERSISTENT_AGENT_CHANNEL_ID_RE,
+        ),
+        FieldSpec("role", str, max_len=100),
+        FieldSpec("task", str, max_len=2000),
+        FieldSpec("agent", str, max_len=100),
+        FieldSpec("member_id", str, max_len=8, pattern=_PERSISTENT_AGENT_CHANNEL_ID_RE),
+        FieldSpec("force", bool),
+    ],
+)
+
 # --- Dynamic Workflows (M6) ---
 _WF_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
@@ -3057,6 +3082,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "session_checkpoint": SESSION_CHECKPOINT_SCHEMA,
     "session_restart_continuation": SESSION_RESTART_CONTINUATION_SCHEMA,
     "session_channel_post": SESSION_CHANNEL_POST_SCHEMA,
+    "session_channel_manage": SESSION_CHANNEL_MANAGE_SCHEMA,
     "artifact_save": ARTIFACT_SAVE_SCHEMA,
     "artifact_get": ARTIFACT_GET_SCHEMA,
     "artifact_update": ARTIFACT_UPDATE_SCHEMA,

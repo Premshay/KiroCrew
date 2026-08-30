@@ -139,6 +139,44 @@ class TestCheckpointDirectiveDispatch:
 
 
 class TestCheckpointSlotProjection:
+    def test_checkpoint_freshness_tracks_meaningful_changes_until_covered(self) -> None:
+        slot = _ChatSlot("checkpoint")
+
+        slot.mark_checkpoint_activity()
+        assert slot.checkpoint_freshness_payload() == {
+            "activity_generation": 1,
+            "covered_generation": 0,
+            "overdue": True,
+        }
+        assert slot.checkpoint_reminder_due() is True
+        slot.note_checkpoint_reminder()
+        assert slot.checkpoint_reminder_due() is False
+
+        slot.set_session_checkpoint(_checkpoint())
+        assert slot.checkpoint_freshness_payload() == {
+            "activity_generation": 1,
+            "covered_generation": 1,
+            "overdue": False,
+        }
+
+    def test_peer_mentions_project_as_attention_not_checkpoint_content(self) -> None:
+        slot = _ChatSlot("checkpoint")
+        slot.queue_peer_channel_message(
+            {
+                "channel_id": "deadbeef",
+                "message_id": "request01",
+                "from_role": "Verifier",
+                "content": "Please decide whether to ship.",
+                "msg_type": "mention",
+                "delivery": "interrupt",
+            }
+        )
+
+        assert slot.to_dict()["peer_channel_attention"] == [
+            {"channel_id": "deadbeef", "from_role": "Verifier", "delivery": "interrupt"}
+        ]
+        assert slot.session_checkpoint_payload() is None
+
     def test_replaces_current_view_and_caps_the_milestone_trail(self) -> None:
         slot = _ChatSlot("checkpoint")
         for number in range(9):
@@ -546,6 +584,50 @@ class TestCheckpointPersistence:
         assert restored is not None
         assert restored.session_checkpoint_payload() == expected
         assert restored.session_timeline_payload() == slot.session_timeline_payload()
+
+    def test_overdue_freshness_survives_direct_rehydrate(self, tmp_path, monkeypatch) -> None:
+        from kiro_crew.dashboard.chat_persistence import (
+            _rehydrate_slot_from_history,
+            _save_slot_to_history,
+        )
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("overdue-freshness")
+        slot.mark_checkpoint_activity()
+        slot.append("user", "continue the current task")
+        slot.drain()
+        _save_slot_to_history(state, slot)
+        del state._slots["overdue-freshness"]
+
+        restored = _rehydrate_slot_from_history(state, "overdue-freshness")
+
+        assert restored is not None
+        assert restored.checkpoint_freshness_payload() == {
+            "activity_generation": 1,
+            "covered_generation": 0,
+            "overdue": True,
+        }
+
+    def test_covered_freshness_survives_recent_session_restore(self, tmp_path, monkeypatch) -> None:
+        from kiro_crew.dashboard.chat_persistence import _save_slot_to_history, restore_recent_sessions
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("covered-freshness")
+        slot.mark_checkpoint_activity()
+        slot.set_session_checkpoint(_checkpoint())
+        slot.append("user", "checkpoint recorded")
+        slot.drain()
+        _save_slot_to_history(state, slot)
+        del state._slots["covered-freshness"]
+
+        assert restore_recent_sessions(state, window_minutes=0) >= 1
+        assert state._slots["covered-freshness"].checkpoint_freshness_payload() == {
+            "activity_generation": 1,
+            "covered_generation": 1,
+            "overdue": False,
+        }
 
     def test_declared_goal_survives_save_and_rehydrate(self, tmp_path, monkeypatch) -> None:
         from kiro_crew.dashboard.chat_persistence import (

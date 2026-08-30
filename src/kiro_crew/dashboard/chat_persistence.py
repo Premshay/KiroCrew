@@ -582,6 +582,7 @@ def _rehydrate_slot_from_history(
             slot._app = meta["app"]
         slot.restore_declared_goal(meta.get("declared_goal"))
         slot.restore_session_checkpoint(meta.get("session_checkpoint"))
+        slot.restore_checkpoint_freshness(meta.get("checkpoint_freshness"))
         slot.restore_session_timeline(meta.get("session_timeline"))
         slot.restore_peer_channel_inbox(meta.get("peer_channel_inbox"))
         slot.restore_post_restart_continuation(meta.get("post_restart_continuation"))
@@ -954,6 +955,7 @@ def _restore_recent_sessions_steps(
             slot._app = meta["app"]
         slot.restore_declared_goal(meta.get("declared_goal"))
         slot.restore_session_checkpoint(meta.get("session_checkpoint"))
+        slot.restore_checkpoint_freshness(meta.get("checkpoint_freshness"))
         slot.restore_session_timeline(meta.get("session_timeline"))
         slot.restore_peer_channel_inbox(meta.get("peer_channel_inbox"))
         slot.restore_post_restart_continuation(meta.get("post_restart_continuation"))
@@ -2004,6 +2006,9 @@ def _save_slot_to_history(
             checkpoint = slot.session_checkpoint_payload()
             if checkpoint is not None:
                 meta_line["session_checkpoint"] = checkpoint
+            freshness = slot.checkpoint_freshness_payload()
+            if freshness["activity_generation"]:
+                meta_line["checkpoint_freshness"] = freshness
             timeline = slot.session_timeline_payload()
             if timeline:
                 meta_line["session_timeline"] = timeline

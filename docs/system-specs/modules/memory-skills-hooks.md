@@ -658,6 +658,16 @@ Supports nested directories (e.g. `skills/utils/tiny-url/SKILL.md`). The skill n
 
 **Source precedence** (project-level wins): `$KIROCREW_PROJECT_DIR/skills/` → `builtin_skills/` (bundled). Auto-copied to `~/.kiro/crew/skills/` on first run. Copies entire skill directories (scripts, assets, etc.).
 
+**Channel collaboration is lifecycle-injected, not a best-effort discovery
+hint.** The bundled `channel-collaboration` skill is included when a
+channel-owned agent first receives work and when a dashboard session is created
+or attached to a persistent channel. Every later channel turn receives a compact
+fresh roster: the caller's channel-local member ID, peers' local IDs and states,
+capacity, and whether the caller is the coordinator. It intentionally excludes
+dashboard session keys. A compaction/reinjection repeats the full contract for
+an attached session, so channel membership does not depend on the model
+remembering a prior skill read.
+
 **Project skills (`<project>/.kiro/skills`) — a different source from the one above.**
 `$KIROCREW_PROJECT_DIR/skills/` is a *sync* source: its contents are copied into
 `~/.kiro/crew/skills/` and thereafter are ordinary local skills. `<project>/.kiro/skills`
@@ -1487,6 +1497,11 @@ Merge rules (implemented in `_merge_kiro_hooks()` in `agent.py`):
 Assembles all sources into prompts:
 - New session: `_CRITICAL_RULES` (runtime-conditional diff blocks + OPTIONS buttons) + agent prompt + memory (with citations) + skills + lessons + conversation history (last 20 messages, thread history at TOP with explicit framing)
 - Every message: channel history, episodic memory, hook transforms, triggered skills, context rules, OPTIONS hint (interactive sessions only)
+- A channel-attached dashboard turn additionally receives the deterministic
+  channel-collaboration prefix after ordinary reinjection state is resolved;
+  channel-owned worker turns receive the same prefix before their task. This is
+  host-authored membership context, not channel-message prose, and it is rebuilt
+  from the live channel roster for each turn.
 - Runtime identity is turn-aware rather than key-only. Channel and dashboard dispatchers pass trusted `runtime_source` metadata to `build_message()`. New sessions use it for `[RUNTIME]`; follow-up turns refresh `[RUNTIME]` outside the one-time session context. This is required because a stable `dashboard:*` session can be resumed from Discord and `messaging.dm_scope="unified"` intentionally removes the originating channel from the session key. When trusted metadata is absent, namespaced keys (`discord:*`, `telegram:*`, `wecom:*`, `weixin:*`, `webex:*`, `teams:*`, `slack:*`) are recognized directly; bare unknown keys keep the legacy Slack fallback.
 - Thread history is injected only at session start (via `build_session_context`). Within the same ACP session, kiro-cli manages conversation history natively — duplicate injection wastes context window and accelerates compaction.
 - `_CRITICAL_RULES` injected by DEFAULT for every agent (built-in `kirocrew` and custom alike) — it is the dashboard/Slack assistant's own output contract (runtime-conditional diff blocks — tool-made edits render as structured diff cards on the dashboard, so ```diff blocks are required only for non-tool edits or non-dashboard runtimes — `[OPTIONS:]` footer, absolute-path rule with a URL exclusion — a backticked URL renders as a click-to-copy chip rather than a link, so URLs must use markdown link syntax instead), so diff rendering and OPTIONS buttons work universally. A **custom** agent can OPT OUT by setting `includeCrewContext: false` in its materialized `~/.kiro/agents/<...>.json`: a custom app agent ships its own system prompt and output contract, so injecting this on top both conflicts with it and, on a safety-tuned model, reads as an identity override the model refuses as prompt injection. The flag is read through the same sensitive-path-gated scan as the agent prompt (matched by declared `name` or filename stem) and memoized by agent name; an absent/non-boolean flag, an unreadable/missing spec, and the built-in `kirocrew` agent all default to injecting (only an explicit boolean `false` on a custom agent suppresses it). The same opt-out also suppresses the dashboard tool nudges (`ask_question` / `suggest_followup`) that `build_message` adds on dashboard sessions, but NOT the provider-agnostic `[OPTIONS:]` reminder. The `[OPTIONS:]`/diff tags still RENDER for any agent that emits them (the dashboard parses them regardless); the gate only stops the host from MANDATING them where an agent has declared it does not want them.

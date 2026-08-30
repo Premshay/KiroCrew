@@ -57,6 +57,22 @@ class TestReportedSpanIsTheUserText:
         )
         assert _span_text(msg, span) == typed
 
+    def test_channel_and_checkpoint_prepends_are_excluded(self, tmp_path):
+        """An attached-session turn can receive both the channel roster and a
+        checkpoint reminder after the initial user-range calculation."""
+        builder = _make_builder(tmp_path)
+        channel = "[KiroCrew channel collaboration]\nRoster: Verifier.\n\n"
+        reminder = "[KiroCrew checkpoint reminder]\nRefresh work state.\n\n"
+        typed = "compare the current implementation"
+        span: list[int] = []
+        msg, _ = builder.build_message(
+            channel + reminder + typed,
+            is_new_session=False,
+            user_text_range=(len(channel + reminder), len(channel + reminder + typed)),
+            user_span_out=span,
+        )
+        assert _span_text(msg, span) == typed
+
     def test_multibyte_fold_before_the_user_text_does_not_shift_the_span(self, tmp_path):
         """Em dashes/ellipses in the PREPEND grow when folded (— -> --), so a span
         measured pre-fold would land short."""
