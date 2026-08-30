@@ -1092,13 +1092,25 @@ def suggest_followup(name: str, args: dict[str, Any]) -> str:
 
 
 def session_checkpoint(name: str, args: dict[str, Any]) -> str:
+    """Persist a checkpoint through the caller-bound gateway endpoint."""
     args = validate_tool_args(args, SESSION_CHECKPOINT_SCHEMA)
-    return session_directive.encode(
-        "session_checkpoint",
-        args,
-        "Checkpoint requested for this session. It will replace the concise "
-        "current view and append this milestone when the result is processed.",
-    )
+    session_key = mcp_core._resolve_session_key_strict()
+    if not session_key:
+        return "Error: session_checkpoint requires a verified dashboard session identity."
+    result = mcp_core._post("/api/session-checkpoint", args, session_key=session_key)
+    if result.get("ok") is not True:
+        if result.get("transport_error") is True:
+            return (
+                "Checkpoint outcome is indeterminate because the gateway response was lost; "
+                "do not retry automatically."
+            )
+        if result.get("code") == "checkpoint_persistence_failed":
+            return (
+                "Checkpoint was accepted and is pending durable persistence; "
+                "do not retry automatically."
+            )
+        return f"Error: checkpoint was not recorded: {result.get('error', 'unknown error')}"
+    return "Checkpoint recorded for this session's Multiplex view."
 
 
 def _session_channel_post(body: dict[str, Any]) -> dict[str, Any] | None:

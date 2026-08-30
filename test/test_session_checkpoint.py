@@ -72,11 +72,72 @@ class TestCheckpointDirectiveDispatch:
             "unassigned",
         ]
 
-    def test_emits_a_validated_checkpoint_directive_for_the_calling_session(self, monkeypatch) -> None:
+    def test_persists_a_validated_checkpoint_for_the_calling_session(self, monkeypatch) -> None:
         checkpoint = _checkpoint()
+        post = MagicMock(return_value={"ok": True, "session_checkpoint": checkpoint})
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
+        monkeypatch.setattr(mcp_core, "_post", post)
+
         result = mcp_core._call_tool_inner("session_checkpoint", checkpoint)
-        assert result.startswith("Checkpoint requested for this session.")
-        assert session_directive.decode(result, "session_checkpoint") == checkpoint
+        assert result == "Checkpoint recorded for this session's Multiplex view."
+        post.assert_called_once_with(
+            "/api/session-checkpoint", checkpoint, session_key="dashboard:consumer"
+        )
+        assert (
+            session_directive.directive_tool_for(
+                session_directive.CORE_MCP_SERVER, "session_checkpoint", trusted=True
+            )
+            == ""
+        )
+
+    def test_refuses_a_checkpoint_without_a_verified_session_identity(self, monkeypatch) -> None:
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        post = MagicMock()
+        monkeypatch.setattr(mcp_core, "_post", post)
+
+        result = mcp_core._call_tool_inner("session_checkpoint", _checkpoint())
+
+        assert result == "Error: session_checkpoint requires a verified dashboard session identity."
+        post.assert_not_called()
+
+    def test_reports_gateway_checkpoint_failure(self, monkeypatch) -> None:
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
+        monkeypatch.setattr(mcp_core, "_post", lambda *args, **kwargs: {"error": "slot missing"})
+
+        result = mcp_core._call_tool_inner("session_checkpoint", _checkpoint())
+
+        assert result == "Error: checkpoint was not recorded: slot missing"
+
+    def test_does_not_invite_retry_after_an_ambiguous_checkpoint_transport_failure(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
+        monkeypatch.setattr(
+            mcp_core,
+            "_post",
+            lambda *args, **kwargs: {"error": "timed out", "transport_error": True},
+        )
+
+        result = mcp_core._call_tool_inner("session_checkpoint", _checkpoint())
+
+        assert "outcome is indeterminate" in result
+        assert "do not retry automatically" in result
+
+    def test_reports_checkpoint_persistence_failure_as_pending_durability(self, monkeypatch) -> None:
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
+        monkeypatch.setattr(
+            mcp_core,
+            "_post",
+            lambda *args, **kwargs: {
+                "error": "checkpoint persistence failed",
+                "code": "checkpoint_persistence_failed",
+            },
+        )
+
+        result = mcp_core._call_tool_inner("session_checkpoint", _checkpoint())
+
+        assert "accepted and is pending durable persistence" in result
+        assert "do not retry automatically" in result
 
     def test_refuses_an_unverified_session_before_making_a_checkpoint_request(
         self, monkeypatch
@@ -428,6 +489,28 @@ class TestCheckpointInternalEndpoint:
         assert response.status == 200
         assert json.loads(response.text)["ok"] is True
         assert slot.session_checkpoint_payload() is not None
+
+    @pytest.mark.asyncio
+    async def test_persistence_failure_reports_the_already_accepted_checkpoint(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("consumer")
+        request = MagicMock()
+        request.app = {"state": state}
+        request.headers = {"X-Session-Key": "dashboard:consumer"}
+        request.json = AsyncMock(return_value=_checkpoint())
+        failed_save = AsyncMock(side_effect=OSError("disk full"))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_persistence.save_slot_off_loop", failed_save
+        )
+
+        response = await api_session_checkpoint(request)
+
+        assert response.status == 500
+        assert json.loads(response.text)["code"] == "checkpoint_persistence_failed"
+        assert slot.session_checkpoint_payload() is not None
+        assert slot._dirty is True
 
     @pytest.mark.asyncio
     async def test_rejects_a_session_without_its_own_live_slot(self, tmp_path) -> None:
