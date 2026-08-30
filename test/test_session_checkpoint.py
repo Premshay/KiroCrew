@@ -108,6 +108,21 @@ class TestCheckpointDirectiveDispatch:
 
         assert result == "Error: checkpoint was not recorded: slot missing"
 
+    def test_does_not_invite_retry_after_an_ambiguous_checkpoint_transport_failure(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
+        monkeypatch.setattr(
+            mcp_core,
+            "_post",
+            lambda *args, **kwargs: {"error": "timed out", "transport_error": True},
+        )
+
+        result = mcp_core._call_tool_inner("session_checkpoint", _checkpoint())
+
+        assert "outcome is indeterminate" in result
+        assert "do not retry automatically" in result
+
     def test_refuses_an_unverified_session_before_making_a_checkpoint_request(
         self, monkeypatch
     ) -> None:

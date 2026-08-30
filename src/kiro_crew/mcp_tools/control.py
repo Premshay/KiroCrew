@@ -1099,6 +1099,11 @@ def session_checkpoint(name: str, args: dict[str, Any]) -> str:
         return "Error: session_checkpoint requires a verified dashboard session identity."
     result = mcp_core._post("/api/session-checkpoint", args, session_key=session_key)
     if result.get("ok") is not True:
+        if result.get("transport_error") is True:
+            return (
+                "Checkpoint outcome is indeterminate because the gateway response was lost; "
+                "do not retry automatically."
+            )
         return f"Error: checkpoint was not recorded: {result.get('error', 'unknown error')}"
     return "Checkpoint recorded for this session's Multiplex view."
 
