@@ -268,7 +268,11 @@ class AcpSessionProvider(LLMProvider):
             raise AcpError(str(exc)) from exc
 
     async def steer(self, message: str) -> bool:
-        """Forward a mid-turn steer to the session handle (kiro _session/steer)."""
+        """Forward a mid-turn steer to the session handle (kiro ``_session/steer``).
+
+        AcpRuntime is the kiro-family path only; the claude backend steers
+        through AcpClient, which speaks ``_session/steering`` instead.
+        """
         return await self._guarded(self._handle.steer(message))
 
     @property

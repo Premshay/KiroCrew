@@ -65,6 +65,23 @@ METHOD_MCP_SERVER_INIT_FAILURE = "_kiro.dev/mcp/server_init_failure"
 METHOD_SUBAGENT_LIST_UPDATE = "_kiro.dev/subagent/list_update"
 METHOD_KIRO_SESSION_UPDATE = "_kiro.dev/session/update"
 METHOD_SET_CONFIG_OPTION = "session/set_config_option"
+#: Mid-turn steer, kiro-cli / KAS spelling. Takes ``{sessionId, message}`` where
+#: *message* is a single ``<user_message>``-wrapped string, and is answered by a
+#: ``steering_consumed`` echo that carries the injected blocks back.
+METHOD_STEER = "_session/steer"
+#: Mid-turn steer, claude-agent-acp spelling — a DIFFERENT method taking a
+#: DIFFERENT shape: ``{sessionId, prompt: ContentBlock[], _meta}``. Sending the
+#: kiro spelling to claude-agent-acp is answered with method-not-found, and the
+#: kiro *payload* under this name fails validation (``prompt`` must be a
+#: non-empty array), so the two cannot share a call. There is no consumed echo
+#: here: the request's own response is the settlement signal.
+METHOD_CLAUDE_STEER = "_session/steering"
+#: Ask claude-agent-acp to DECLINE a steer that arrives with no running turn
+#: instead of silently promoting it to a fresh turn (its default,
+#: ``startedNewTurn``). KiroCrew owns that fallback — an unconsumed steer is
+#: requeued as a visible, cancellable card — and a backend-started turn would
+#: run the text while the pending entry stayed registered, delivering it twice.
+CLAUDE_STEER_IDLE_BEHAVIOR = "promptRequired"
 #: ``configId`` under which KAS exposes the session model. KAS implements no
 #: ``session/set_model``, so this is the only way to switch a model on it.
 MODEL_CONFIG_ID = "model"
@@ -153,8 +170,23 @@ ACP_BACKENDS_SELECTABLE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # session) and is not a member.
 ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO})
 
-# Backends implementing the ``_session/steer`` extension (mid-turn steer).
-ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+# Backends implementing a mid-turn steer extension. Membership says only that a
+# wire format exists here AND that AcpClient.steer speaks it — the two spellings
+# are NOT interchangeable (see METHOD_STEER vs METHOD_CLAUDE_STEER), so adding a
+# member without adding its branch buys a silently dropped message rather than a
+# steer. claude-agent-acp joined once it shipped `_session/steering`; its
+# membership is confirmed per-connection by ACP_BACKENDS_STEER_ADVERTISED below.
+ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE})
+
+# Members whose handshake ANNOUNCES steering, so the capability is confirmed per
+# connection rather than assumed from the backend name. claude-agent-acp gained
+# `_session/steering` in 0.65.0 and advertises it at initialize
+# (``_meta.steering.supported``); an older build on PATH answers to the same
+# backend name and would take the steer nowhere, and the dashboard would report
+# it as steered. kiro-cli announces nothing, so absence of the flag is not
+# evidence THERE — which is why this is its own opt-in set and not a check
+# applied to every member.
+ACP_BACKENDS_STEER_ADVERTISED = frozenset({ACP_BACKEND_CLAUDE})
 
 # Backends carrying their OWN internal OS sandbox, which on macOS cannot nest
 # inside Kiro Crew's seatbelt (kernel EPERM) — so ``sandbox.wrap_argv`` skips

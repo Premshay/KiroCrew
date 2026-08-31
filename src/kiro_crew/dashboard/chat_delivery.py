@@ -111,8 +111,13 @@ async def steer_into_running_turn(
     """Inject *message* into the slot's RUNNING turn; return a ``STEER_*`` outcome.
 
     Requires a live, steer-capable inner ACP client that the turn published on
-    the slot. Fire-and-forget by design: the inline steer card materializes when
-    kiro-cli echoes ``steering_consumed``.
+    the slot. Fire-and-forget by design: this never awaits the backend's answer,
+    because the running turn's read loop is the sole consumer of that stream.
+    Settlement therefore arrives out of band, and which signal carries it is the
+    backend's business — kiro-cli echoes ``steering_consumed``; claude-agent-acp
+    answers the steer request itself, which the client turns into the same echo.
+    Either way an UNSETTLED steer is requeued as a visible card when the turn
+    ends, so no path here loses the text.
     """
     client = getattr(slot, "_acp_client", None)
     if client is None or not getattr(client, "supports_steer", False):

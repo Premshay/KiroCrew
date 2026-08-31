@@ -56,6 +56,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEER_ADVERTISED,
     ACP_CLIENT_CAPABILITIES,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
@@ -64,6 +65,7 @@ from kiro_crew.acp.types import (
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
+    EVENT_STEER_CONSUMED,
     EVENT_SUBAGENT_ACTIVITY,
     EVENT_SUBAGENT_LIST,
     EVENT_TEXT_CHUNK,
@@ -71,10 +73,12 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_CALL,
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
+    CLAUDE_STEER_IDLE_BEHAVIOR,
     JSONRPC_METHOD_NOT_FOUND,
     KNOWN_SESSION_UPDATES,
     METHOD_AGENT_SWITCHED,
     METHOD_CANCEL,
+    METHOD_CLAUDE_STEER,
     METHOD_CLEAR_STATUS,
     METHOD_COMMANDS_EXECUTE,
     METHOD_COMPACTION_STATUS,
@@ -91,6 +95,7 @@ from kiro_crew.acp.types import (
     METHOD_SESSION_UPDATE,
     METHOD_SET_MODE,
     METHOD_SET_MODEL,
+    METHOD_STEER,
     METHOD_SUBAGENT_LIST_UPDATE,
     OPTION_ALLOW_ALWAYS,
     OPTION_ALLOW_ONCE,
@@ -2327,6 +2332,17 @@ class AcpClient:
         self._resume_session_id: str | None = None
         self._resumed = False
         self._can_load_session = False
+        # Whether the backend ANNOUNCED mid-turn steering in its initialize
+        # response (`_meta.steering.supported`). Only consulted for members of
+        # ACP_BACKENDS_STEER_ADVERTISED; see supports_steer.
+        self._steering_advertised = False
+        # In-flight `_session/steering` requests: JSON-RPC id -> the raw steered
+        # text. claude-agent-acp answers a steer with a RESPONSE rather than a
+        # `steering_consumed` notification, so the response id is the only thing
+        # that says which pending steer was injected. Popped when the response is
+        # seen; an entry that never resolves (process died mid-turn) dies with
+        # this client, and its pending steer is requeued by the turn teardown.
+        self._pending_steer_requests: dict[int, str] = {}
         # Models advertised by the backend in the session/new (or session/load)
         # response. claude-agent-acp returns the real versioned Claude list
         # (Opus 4.8/4.7, Sonnet 4.6, …); kiro-cli returns its own. Captured so
@@ -3770,6 +3786,23 @@ class AcpClient:
         # Check if kiro-cli supports session/load
         self._can_load_session = init_resp.get("agentCapabilities", {}).get("loadSession", False)
 
+        # Steering rides in top-level `_meta`, a SIBLING of `agentCapabilities`
+        # rather than a field inside it — reading it off agentCapabilities finds
+        # nothing and reports every build as unsteerable. Only backends in
+        # ACP_BACKENDS_STEER_ADVERTISED are gated on this; for the rest it stays
+        # False and is never consulted.
+        _meta = init_resp.get("_meta")
+        if isinstance(_meta, dict):
+            _steering = _meta.get("steering")
+            if isinstance(_steering, dict):
+                self._steering_advertised = bool(_steering.get("supported"))
+        if self.backend in ACP_BACKENDS_STEER_ADVERTISED:
+            logger.info(
+                "ACP steering advertised=%s (backend=%r)",
+                self._steering_advertised,
+                self.backend,
+            )
+
         # 2. Try session/load if we have a resume ID and kiro-cli supports it
         self._resumed = False
         resume_sid = self._resume_session_id
@@ -4609,10 +4642,18 @@ class AcpClient:
         """Classify a message into an action string.
 
         Actions: "complete", "error", "permission", "update", "metadata",
-        "server_request_unknown", "skip".
+        "server_request_unknown", "steer_result", "skip".
         """
         if msg.is_response_for(req_id):
             return "error" if msg.error else "complete"
+
+        # A `_session/steering` response: a foreign-id RESPONSE that would
+        # otherwise fall through to "skip" and be dropped. It has to be claimed
+        # here rather than left to the caller, because the dropped frame is the
+        # only evidence the steer landed — without it every Claude steer stays
+        # pending and the turn teardown requeues it, delivering the text twice.
+        if msg.method is None and msg.id in self._pending_steer_requests:
+            return "steer_result"
 
         if msg.is_method(METHOD_REQUEST_PERMISSION):
             return "permission"
@@ -5030,6 +5071,10 @@ class AcpClient:
                 yield self._build_permission_event(msg)
             elif action == "server_request_unknown":
                 await self._reject_unknown_server_request(msg)
+            elif action == "steer_result":
+                steer_event = self._settle_steer_response(msg)
+                if steer_event is not None:
+                    yield steer_event
             elif action == "update":
                 self._track_usage_update(msg)
                 provider_child = self._extract_provider_child_activity(msg)
@@ -5447,13 +5492,74 @@ class AcpClient:
         text = (message or "").strip()
         if not text or not self._session_id:
             return False
-        wrapped = f"<user_message>\n{text}\n</user_message>"
-        await self._send_request(
-            "_session/steer", {"sessionId": self._session_id, "message": wrapped}
-        )
+        if not self.supports_steer:
+            return False
+        if self._is_claude:
+            # claude-agent-acp takes ACP content blocks and delivers them as a
+            # real user message at `now` priority, so the `<user_message>`
+            # envelope kiro-cli needs would arrive as literal markup INSIDE the
+            # user's own text. Sent raw; the envelope is re-applied only when the
+            # response is turned into a settlement echo, where the shared parser
+            # expects it.
+            req_id = await self._send_request(
+                METHOD_CLAUDE_STEER,
+                {
+                    "sessionId": self._session_id,
+                    "prompt": [{"type": "text", "text": text}],
+                    "_meta": {"steering": {"idleBehavior": CLAUDE_STEER_IDLE_BEHAVIOR}},
+                },
+            )
+            self._pending_steer_requests[req_id] = text
+        else:
+            wrapped = f"<user_message>\n{text}\n</user_message>"
+            await self._send_request(
+                METHOD_STEER, {"sessionId": self._session_id, "message": wrapped}
+            )
         # See AcpSessionHandle.steer for why the stamp is taken at the write.
         self._last_steer_monotonic = time.monotonic()
         return True
+
+    def _settle_steer_response(self, msg: JsonRpcMessage) -> AcpEvent | None:
+        """Turn a ``_session/steering`` response into a settlement echo, or None.
+
+        Returning None is the SAFE answer, not the failure answer: an unsettled
+        steer stays in the slot's pending list and the turn teardown requeues it
+        as a visible, cancellable card. Settling wrongly is the unrecoverable
+        direction — it suppresses that requeue, so a message the backend never
+        injected is reported as delivered and asked nowhere. Every outcome this
+        method cannot positively read as "the text ran" therefore returns None.
+
+        The echo re-applies the ``<user_message>`` envelope the wire message was
+        deliberately sent WITHOUT, because the settlement parser is shared with
+        kiro-cli's real echo and matches on those blocks.
+
+        Only ``_dispatch_events`` consumes this action; the non-streaming prompt
+        loops ignore it, which costs a stale dict entry and a requeue on a path
+        that cannot have a dashboard steer in flight to begin with.
+        """
+        text = self._pending_steer_requests.pop(msg.id, "")
+        if not text:
+            return None
+        if msg.error:
+            logger.warning("steer rejected by backend: %r", msg.error)
+            return None
+        result = msg.result if isinstance(msg.result, dict) else {}
+        outcome = result.get("outcome")
+        if outcome == "startedNewTurn":
+            # We asked for `promptRequired`, so a backend that starts its own
+            # turn anyway is one that ignored the request `_meta`. The text DID
+            # run, which is what settlement records — requeuing it here because
+            # the outcome was not the one requested would run it a second time.
+            logger.warning(
+                "steer started a new backend turn despite idleBehavior=%s",
+                CLAUDE_STEER_IDLE_BEHAVIOR,
+            )
+        elif outcome != "injected":
+            # `promptRequired` (no running turn) and any outcome a later version
+            # introduces both land here.
+            logger.info("steer not injected (outcome=%r); leaving it to requeue", outcome)
+            return None
+        return AcpEvent(kind=EVENT_STEER_CONSUMED, text=f"<user_message>\n{text}\n</user_message>")
 
     # Monotonic stamp of the last steer handed to the backend, 0.0 when never
     # steered. Mirrors AcpSessionHandle.last_steer_monotonic — the dashboard's
@@ -5471,8 +5577,20 @@ class AcpClient:
 
         Membership in ``ACP_BACKENDS_STEER`` (harness-parity H6), so a harness
         added later does not inherit the extension from ``not _is_claude``.
+
+        For a member of ``ACP_BACKENDS_STEER_ADVERTISED`` the handshake has the
+        final say. Membership there is a claim about the PROTOCOL; the flag is
+        what this connection's binary actually answers to, and the two differ on
+        a machine with an older claude-agent-acp on PATH. Reporting True on a
+        binary that has no handler is the one failure this whole path must not
+        have: the dashboard would show the message as steered while the backend
+        answered method-not-found and dropped it.
         """
-        return self.backend in ACP_BACKENDS_STEER
+        if self.backend not in ACP_BACKENDS_STEER:
+            return False
+        if self.backend in ACP_BACKENDS_STEER_ADVERTISED:
+            return self._steering_advertised
+        return True
 
     async def wait_turn_done(self, timeout: float) -> str:
         """Wait for the current prompt to finish. Returns stop_reason or raises TimeoutError."""

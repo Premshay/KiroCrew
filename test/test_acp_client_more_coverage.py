@@ -420,7 +420,11 @@ class TestClientAccessors:
         assert client._resume_session_id == "sid-1"
 
     def test_supports_steer_is_backend_dependent(self, tmp_path):
+        # kiro-cli announces nothing, so membership alone answers for it.
         assert _client(tmp_path).supports_steer is True
+        # Claude is a member, but an un-handshaked client has not yet seen the
+        # backend announce `_meta.steering.supported` — so it must not claim the
+        # capability on the strength of the backend NAME.
         assert _client(tmp_path, acp_backend=ACP_BACKEND_CLAUDE).supports_steer is False
 
     def test_rekey_rebinds_and_drops_previous_context(self, tmp_path):

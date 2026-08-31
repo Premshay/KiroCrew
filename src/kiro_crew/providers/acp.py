@@ -1371,8 +1371,10 @@ class AcpProvider(LLMProvider):
             return "timeout"
 
     async def steer(self, message: str) -> bool:
-        """Delegate a mid-turn steer to the inner client (kiro-cli
-        ``_session/steer``). Fire-and-forget; returns False if not steerable."""
+        """Delegate a mid-turn steer to the inner client, which picks the wire
+        method for its backend (``_session/steer`` on kiro-cli and KAS,
+        ``_session/steering`` on claude-agent-acp). Fire-and-forget in both
+        cases; returns False if not steerable."""
         return await self._client.steer(message)
 
     @property

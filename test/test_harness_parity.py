@@ -35,6 +35,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_SELECTABLE,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEER_ADVERTISED,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
     PROVIDER_LABEL_CLAUDE,
@@ -141,11 +142,46 @@ def test_session_sharing_is_opt_in() -> None:
 
 
 def test_steer_is_opt_in() -> None:
-    """H6: the ``_session/steer`` extension is claimed by membership."""
+    """H6: a mid-turn steer extension is claimed by membership.
+
+    Claude is a member now that ``AcpClient.steer`` speaks its spelling. The
+    assertion that used to stand here — Claude is NOT a member — was true about
+    the code and false about the harness: claude-agent-acp has implemented
+    ``_session/steering`` since 0.65.0, and the gate held only because nobody
+    brought the evidence back. What the set must keep out is a backend nobody
+    wrote a branch for, which is what the wire-format test below pins.
+    """
     source = inspect.getsource(acp_client.AcpClient.supports_steer.fget)
     assert "ACP_BACKENDS_STEER" in source
     assert ACP_BACKEND_KIRO in ACP_BACKENDS_STEER
-    assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_STEER
+    assert ACP_BACKEND_CLAUDE in ACP_BACKENDS_STEER
+
+
+def test_every_steer_member_has_a_wire_format() -> None:
+    """H6: membership without a branch in ``steer`` is a silently dropped message.
+
+    The two spellings are not interchangeable — a kiro-shaped payload sent under
+    the Claude method fails validation, and the Claude method sent to kiro-cli is
+    method-not-found. Either way ``steer`` returns True and the dashboard reports
+    the text as steered. So a new member has to arrive WITH its branch.
+    """
+    source = inspect.getsource(acp_client.AcpClient.steer)
+    assert "METHOD_CLAUDE_STEER" in source
+    assert "METHOD_STEER" in source
+    assert ACP_BACKENDS_STEER == {
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_CLAUDE,
+    }, "a new steer member needs its own wire format in AcpClient.steer"
+
+
+def test_advertised_steer_backends_are_steer_members() -> None:
+    """H8: the handshake confirmation only means something for a member.
+
+    ``ACP_BACKENDS_STEER_ADVERTISED`` narrows ``ACP_BACKENDS_STEER``; a name in
+    the first and not the second is dead config that grants nothing.
+    """
+    assert ACP_BACKENDS_STEER_ADVERTISED <= ACP_BACKENDS_STEER
 
 
 def test_steer_capability_declares_its_stamp() -> None:
@@ -226,6 +262,7 @@ def test_capability_sets_are_subsets_of_known_backends() -> None:
         ("ACP_BACKENDS_SELECTABLE", ACP_BACKENDS_SELECTABLE),
         ("ACP_BACKENDS_SESSION_SHARING", ACP_BACKENDS_SESSION_SHARING),
         ("ACP_BACKENDS_STEER", ACP_BACKENDS_STEER),
+        ("ACP_BACKENDS_STEER_ADVERTISED", ACP_BACKENDS_STEER_ADVERTISED),
         ("ACP_BACKENDS_INTERNAL_SANDBOX", ACP_BACKENDS_INTERNAL_SANDBOX),
         ("ACP_BACKENDS_ACP_RUNTIME", ACP_BACKENDS_ACP_RUNTIME),
     ):

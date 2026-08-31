@@ -4301,8 +4301,9 @@ def _settle_consumed_steers(slot: "_ChatSlot", snapshot: str) -> None:
 def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> None:
     """Degrade unconsumed mid-turn steers into ordinary queue cards.
 
-    Called from ``_run_chat``'s finally on every turn-exit path. A steer that
-    kiro-cli never confirmed via ``steering_consumed`` died with the turn
+    Called from ``_run_chat``'s finally on every turn-exit path. A steer the
+    backend never confirmed (kiro-cli's ``steering_consumed`` echo, or an
+    injected outcome on claude-agent-acp's steer response) died with the turn
     (stall-cancel, soft STOP, error, or a steer racing the turn's natural
     end); without this it would vanish silently.
 
