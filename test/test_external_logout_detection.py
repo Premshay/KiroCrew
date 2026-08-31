@@ -995,6 +995,23 @@ class TestLatchNarrowingPolicy:
             return ([], self._complete)
 
     @pytest.mark.asyncio
+    async def test_hung_identity_read_does_not_strand_the_turn(self, monkeypatch) -> None:
+        """Identity reconciliation is protective work, never an admission gate."""
+
+        from kiro_crew.dashboard import chat_runner
+
+        class _HungService:
+            async def identity_changed_since_sessions(self):
+                await asyncio.Event().wait()
+
+        sessions = self._Sessions()
+        monkeypatch.setattr(chat_runner, "_IDENTITY_RECONCILE_READ_TIMEOUT_SECS", 0.01)
+
+        await chat_runner._retire_sessions_on_identity_change(self._State(_HungService(), sessions))
+
+        assert sessions.calls == 0
+
+    @pytest.mark.asyncio
     async def test_a_switch_to_a_valid_account_does_not_narrow_readiness(
         self, tmp_path: Path
     ) -> None:

@@ -3126,6 +3126,9 @@ def _resolve_mirror_target(state: Any, session_key: str) -> Any:
     )
 
 
+_IDENTITY_RECONCILE_READ_TIMEOUT_SECS = 5.0
+
+
 async def _retire_sessions_on_identity_change(state: Any) -> None:
     """Recycle kiro-backed children when the signed-in account has changed.
 
@@ -3151,7 +3154,9 @@ async def _retire_sessions_on_identity_change(state: Any) -> None:
     if service is None or sessions is None:
         return
     try:
-        changed, live = await service.identity_changed_since_sessions()
+        changed, live = await asyncio.wait_for(
+            service.identity_changed_since_sessions(), timeout=_IDENTITY_RECONCILE_READ_TIMEOUT_SECS
+        )
         if not changed:
             return
         retired, complete = await sessions.retire_kiro_identity_sessions()
@@ -3189,6 +3194,11 @@ async def _retire_sessions_on_identity_change(state: Any) -> None:
                 "" if complete else " (incomplete, will retry next turn)",
                 ", ".join(retired) or "none",
             )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Kiro identity read exceeded %.0fs; continuing turn without session retirement",
+            _IDENTITY_RECONCILE_READ_TIMEOUT_SECS,
+        )
     except Exception:
         logger.debug("Could not apply a Kiro identity change", exc_info=True)
 
