@@ -3467,6 +3467,59 @@ def _flush_segment(
     _schedule_widget_registration(state, slot, redacted, str(last_msg.get("ts", "")))
 
 
+async def _render_claude_idle_event(
+    state: DashboardState,
+    slot: _ChatSlot,
+    event: "LLMEvent",
+) -> None:
+    """Persist and broadcast one row of between-turn work, as it happens.
+
+    Between-turn frames used to queue in the client's inbox with no consumer,
+    so a session could work for half an hour showing nothing, and the next
+    prompt then drained the backlog INTO its own turn — every row re-dated to
+    the drain and rendered below a message that had not caused it. Rendering
+    here removes both: the row lands when the work happens, and it lands above
+    whatever the operator types next.
+
+    Deliberately narrower than the turn consumer. It writes the two rows that
+    answer "is it working" — a tool call and a block of prose — and nothing
+    else. No turn bookkeeping is touched: there is no turn. `_turn_emitted`,
+    the retry gates, usage accounting and the stop machinery all belong to a
+    dispatch, and reaching into them from outside one is how a background frame
+    would end up cancelling or completing a turn it has nothing to do with.
+
+    Best-effort by contract: this runs on the client's reader loop, which owns
+    the transport for the whole session. A raise here would kill the loop and
+    take the session's stream with it, so a failed row is logged and dropped
+    rather than propagated.
+    """
+    try:
+        if event.kind == EVENT_TOOL_CALL:
+            payload = _tool_call_ws_payload(event)
+            payload["slot"] = slot.key
+            state.broadcast_ws("tool_call", payload)
+            slot.append("tool", f"🔧 {payload['tool']}", "msg msg-tool", meta=_tool_meta(event))
+        elif event.kind == EVENT_TEXT_CHUNK:
+            text = (event.text or "").strip()
+            if not text:
+                return
+            # Same redaction the autonomous path applies, for the same reason:
+            # this text has never passed through the turn consumer's scrubbing.
+            text, exfil = redact_exfiltration_urls(text)
+            for warning in exfil:
+                logger.warning("Exfiltration URL redacted in idle Claude output: %s", warning)
+            text, creds = redact_credentials(text)
+            for warning in creds:
+                logger.warning("Credential redacted in idle Claude output: %s", warning)
+            _flush_segment(state, slot, text)
+        else:
+            return
+        await save_slot_off_loop(state, slot, best_effort=False)
+        state.push_slots_update()
+    except Exception:
+        logger.warning("idle row render failed for slot %s", slot.key, exc_info=True)
+
+
 async def _persist_claude_autonomous_turn(
     state: DashboardState,
     slot: _ChatSlot,
@@ -5898,6 +5951,13 @@ async def _run_chat(
             await register_autonomous_turn(
                 lambda turn: _persist_claude_autonomous_turn(state, slot, turn)
             )
+        # Same lifecycle as the autonomous handler and for the same reason: it
+        # must OUTLIVE this turn, because the stretch it exists for is the one
+        # where no turn is running. Registered here rather than at session
+        # creation only because this is where the live client is reachable.
+        register_idle = getattr(slot._acp_client, "set_claude_idle_handler", None)
+        if callable(register_idle):
+            register_idle(lambda event: _render_claude_idle_event(state, slot, event))
         # This consumer implements the low-fidelity child downgrade (the
         # interactive card) — opt in so the handle-level fail-close gate
         # yields those events here instead of rejecting them itself.

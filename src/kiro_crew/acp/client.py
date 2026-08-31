@@ -2336,6 +2336,22 @@ class AcpClient:
         # response (`_meta.steering.supported`). Only consulted for members of
         # ACP_BACKENDS_STEER_ADVERTISED; see supports_steer.
         self._steering_advertised = False
+        # Depth of nested reads that own the inbox (`_prompt_loop` and
+        # `_wait_for_response`). Non-zero means a dispatch is consuming frames,
+        # so a frame belongs to it; zero means nobody is reading and the frame is
+        # between-turn work that would otherwise sit here unseen until the next
+        # prompt drained it and re-dated it. Depth rather than a bool because
+        # `_wait_for_response` runs INSIDE `_prompt_loop` for a deferred frame.
+        self._claude_dispatch_depth = 0
+        # Called with each AcpEvent translated from a between-turn frame. Set by
+        # the dashboard once a turn has published the client; None elsewhere, in
+        # which case idle frames fall back to the inbox exactly as before.
+        self._claude_idle_handler: Callable[[AcpEvent], Awaitable[None]] | None = None
+        # Text deltas accumulated since the last idle flush. Between-turn text
+        # arrives as many small chunks, and one row per chunk would be unusable;
+        # a row is cut at the next tool call, which is the boundary the reader
+        # can see without a timer.
+        self._claude_idle_text: list[str] = []
         # In-flight `_session/steering` requests: JSON-RPC id -> the raw steered
         # text. claude-agent-acp answers a steer with a RESPONSE rather than a
         # `steering_consumed` notification, so the response id is the only thing
@@ -2558,6 +2574,19 @@ class AcpClient:
         self._claude_autonomous_handler_owner = self._claude_autonomous_owner()
         if handler is not None:
             await self._flush_pending_claude_autonomous_turns()
+
+    def set_claude_idle_handler(
+        self, handler: Callable[[AcpEvent], Awaitable[None]] | None
+    ) -> None:
+        """Set the sink for between-turn work; None restores inbox queueing.
+
+        Registered by the dashboard alongside the autonomous handler and, like
+        it, deliberately OUTLIVES the turn that registered it — the whole point
+        is the stretch when no turn is running. A client with no handler behaves
+        exactly as before, which is what keeps every non-dashboard caller (app
+        pools, the CLI, tests) on the old path.
+        """
+        self._claude_idle_handler = handler
 
     def _claude_autonomous_owner(self) -> str:
         """Return the dashboard slot currently entitled to autonomous output."""
@@ -4148,9 +4177,63 @@ class AcpClient:
         if self._claude_autonomous_origin is not None:
             await self._collect_claude_autonomous_frame(msg)
             return
+        if self._claude_dispatch_depth == 0 and self._claude_idle_handler is not None:
+            # Nobody is reading. Queueing here is what made 25 minutes of work
+            # invisible and then re-dated it onto the next prompt, so render it
+            # now instead — the frame is translated by the SAME helpers the
+            # dispatch loop uses, so an idle row and a turn row are built from
+            # one implementation.
+            if await self._emit_claude_idle_frame(msg):
+                return
         inbox = self._claude_inbox
         if inbox is not None:
             await inbox.put(msg)
+
+    async def _emit_claude_idle_frame(self, msg: JsonRpcMessage) -> bool:
+        """Render one between-turn frame; False when it is not ours to render.
+
+        Returning False re-queues the frame on the inbox, which is the safe
+        direction: a frame the idle path does not understand still reaches the
+        next dispatch, so nothing is dropped by adding this path. Only the two
+        row-producing shapes are claimed — a tool call and assistant text —
+        because those are the whole of what "it was working" means to a reader.
+        Permission requests, usage and lifecycle frames deliberately fall
+        through: answering a permission prompt outside a turn has no UI to
+        answer it with, so it must stay queued for a dispatch that does.
+        """
+        handler = self._claude_idle_handler
+        if handler is None or not msg.is_method(METHOD_SESSION_UPDATE):
+            return False
+        try:
+            tool_event = self._extract_tool_event(msg)
+            if tool_event is not None:
+                # Cut the accumulated prose FIRST: the text explains the step
+                # that follows it, so flushing after would invert them.
+                await self._flush_claude_idle_text(handler)
+                await handler(tool_event)
+                return True
+            chunk, is_thinking = self._extract_text_chunk(msg)
+            if chunk and not is_thinking:
+                # Thinking is broadcast-only and never persisted (chat_runner),
+                # and there is no live socket to broadcast to between turns, so
+                # accumulating it here would build a row nothing else produces.
+                self._claude_idle_text.append(chunk)
+                return True
+        except Exception:
+            logger.warning("idle frame render failed; leaving it for the dispatch", exc_info=True)
+            return False
+        return False
+
+    async def _flush_claude_idle_text(
+        self, handler: Callable[[AcpEvent], Awaitable[None]]
+    ) -> None:
+        """Emit the accumulated between-turn prose as one row, if any."""
+        if not self._claude_idle_text:
+            return
+        text = "".join(self._claude_idle_text)
+        self._claude_idle_text.clear()
+        if text.strip():
+            await handler(AcpEvent(kind=EVENT_TEXT_CHUNK, text=text))
 
     async def _handle_claude_sdk_message(self, msg: JsonRpcMessage) -> None:
         params = msg.params if isinstance(msg.params, dict) else {}
@@ -4424,6 +4507,27 @@ class AcpClient:
         start = time.monotonic()
         deadline = start + timeout
         hard_deadline = start + max(timeout, _WAIT_RESPONSE_MAX_TIMEOUT)
+        # This reads the inbox too — a handshake, a session/load replay, a
+        # deferred frame inside a running turn — so it claims the dispatch for
+        # its duration. Without it the idle path would render frames out from
+        # under a wait that is the only thing able to answer them. Nested inside
+        # _prompt_loop on the deferred-frame path, which is why the claim is a
+        # depth and not a flag.
+        self._claude_dispatch_depth += 1
+        try:
+            return await self._wait_for_response_inner(
+                req_id, deadline, hard_deadline, timeout
+            )
+        finally:
+            self._claude_dispatch_depth = max(0, self._claude_dispatch_depth - 1)
+
+    async def _wait_for_response_inner(
+        self, req_id: int, deadline: float, hard_deadline: float, timeout: float
+    ) -> dict:
+        """The read loop of :meth:`_wait_for_response`, split so the dispatch
+        claim above is released on every exit path including a raise."""
+        from kiro_crew import shutdown_event
+
         # Frames that are not the awaited response but must survive this call.
         deferred: list[JsonRpcMessage] = []
 
@@ -4719,6 +4823,13 @@ class AcpClient:
         # through _prompt_loop), released in the finally — see the __init__
         # comment for the finalization + coverage caveats.
         await self._turn_lock.acquire()
+        # Claim the inbox for this dispatch, and cut any between-turn prose
+        # first so it becomes its own row ABOVE the turn instead of leaking into
+        # the turn's opening text. Paired with the decrement in the finally.
+        handler = self._claude_idle_handler
+        if handler is not None:
+            await self._flush_claude_idle_text(handler)
+        self._claude_dispatch_depth += 1
         try:
             # Retire the liveness state HERE, under the lock, because this is the
             # one point every prompt path funnels through: send_message (via
@@ -4852,6 +4963,10 @@ class AcpClient:
                 action = self._process_message(msg, req_id)
                 yield action, msg
         finally:
+            # Release the inbox claim before the lock, so a frame arriving in
+            # the gap is routed as between-turn work rather than queued for a
+            # dispatch that has already stopped reading.
+            self._claude_dispatch_depth = max(0, self._claude_dispatch_depth - 1)
             self._turn_lock.release()
             # Release any cooperative-stop waiter regardless of how the loop
             # ends. The callers set the precise stop reason on the clean
