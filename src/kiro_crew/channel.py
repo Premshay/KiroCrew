@@ -324,6 +324,7 @@ class Channel:
                 listen_mode = ListenMode(listen_mode)
             except ValueError:
                 listen_mode = ListenMode.MENTION
+        is_orchestrator = self.orchestrator_id is None and not self.members
         agent_id = uuid.uuid4().hex[:8]
         agent = ChannelAgent(
             id=agent_id,
@@ -332,10 +333,13 @@ class Channel:
             task="",
             session_key=session_key,
             state="listening",
+            is_orchestrator=is_orchestrator,
             listen_mode=listen_mode,
             attached_session=True,
         )
         self.members[agent_id] = agent
+        if is_orchestrator:
+            self.orchestrator_id = agent_id
         self._broadcast("channel_agent_joined", {"channel_id": self.id, "agent": agent.to_dict()})
         self._save()
         return agent
@@ -599,6 +603,13 @@ class Channel:
                 attached_session=bool(ad.get("attached_session")),
             )
             ch.members[aid] = agent
+        if ch.orchestrator_id not in ch.members:
+            # Attachment order is the only user-authored ownership signal in
+            # legacy session-only channels that were saved without a coordinator.
+            first_attached = next(
+                (member for member in ch.members.values() if member.attached_session), None
+            )
+            ch.orchestrator_id = first_attached.id if first_attached is not None else None
         # ``orchestrator_id`` is the authority record. Older persisted channel
         # data can retain an obsolete display flag after a coordinator transfer.
         for member in ch.members.values():
@@ -688,6 +699,8 @@ class ChannelManager:
                 )
                 ch._max_agents = self._max_agents
                 self._channels[ch.id] = ch
+                if data.get("orchestrator_id") != ch.orchestrator_id:
+                    self._save_channel(ch)
                 logger.info("Restored channel %s (%s)", ch.id, ch.topic)
             except Exception:
                 logger.exception("Failed to load channel from %s", path)

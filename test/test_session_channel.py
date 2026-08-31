@@ -328,6 +328,33 @@ class TestSessionChannelEndpoint:
         spawned.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_first_attached_session_can_manage_membership(self, monkeypatch, tmp_path) -> None:
+        state, channel, coordinator, _member, _slot = _channel_state(tmp_path)
+        assert coordinator is not None
+        spawned = AsyncMock()
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.sessions._spawn_channel_member", spawned
+        )
+
+        response = await api_session_channel(
+            _request(
+                state,
+                {
+                    "action": "add_agent",
+                    "channel_id": channel.id,
+                    "role": "Verifier",
+                    "agent": "crew-codex",
+                    "task": "Run the focused regression checks.",
+                },
+                session_key=coordinator.session_key,
+            )
+        )
+
+        assert response.status == 200
+        assert json.loads(response.text)["agent"]["role"] == "Verifier"
+        spawned.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_channel_management_rejects_worker_approval_override(self, tmp_path) -> None:
         state = _state(tmp_path)
         channel = Channel(id="deadbeef", topic="Multiplex validation")
