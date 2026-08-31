@@ -795,6 +795,24 @@ async def run_channel_agent(
     is_yolo: Any = None,  # callable returning bool
 ) -> None:
     """Two-phase agent lifecycle: working → listening."""
+    # An attached member IS a dashboard session, not a worker this function
+    # owns. Its slot already holds the provider session, and ``_deliver`` routes
+    # every message for it through ``_delivery_fn`` — never through ``inbox`` —
+    # so the subscribe loop below could never yield for it. What it WOULD do is
+    # call ``get_or_create``, whose contract hands back the key's per-session
+    # semaphore held until ``release``, and then park in that loop for the life
+    # of the channel. The slot's next dashboard turn would block inside
+    # ``get_or_create`` waiting for that permit, indefinitely and without
+    # logging a line: a spinner that never resolves, and a Stop that finds no
+    # live turn to cancel. Guarded here rather than at the call sites so no
+    # future caller can reintroduce it.
+    if agent.attached_session:
+        agent.state = "listening"
+        channel._broadcast(
+            "channel_agent_status",
+            {"channel_id": channel.id, "agent_id": agent.id, "state": "listening"},
+        )
+        return
     agent.state = "pending"
     channel._broadcast(
         "channel_agent_status",

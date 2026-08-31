@@ -3682,6 +3682,12 @@ async def start_dashboard(
     state.channel_manager = mgr
     for ch in mgr._channels.values():
         for agent in ch.members.values():
+            # Attached members are dashboard sessions the restore paths above
+            # already rehydrated; they need no worker and must not be flipped
+            # to "pending", which would render an idle slot as busy.
+            if agent.attached_session:
+                agent.state = "listening"
+                continue
             agent.state = "pending"
             _spawn_agent_task(
                 agent, run_channel_agent(agent, ch, state.sessions, is_yolo=lambda: state._yolo)
