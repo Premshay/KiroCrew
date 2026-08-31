@@ -5242,12 +5242,7 @@ class TestRunChatNativeSubagentAttribution:
 
 
 class TestRunChatCompactDeferredWait:
-    """The deferred-compaction wait at the end of _run_chat is a kiro-cli-only
-    protocol step. claude-agent-acp performs /compact synchronously inside
-    session/prompt and never emits ``_kiro.dev/compaction/status``, so the
-    handler must skip ``wait_for_compaction`` for that backend or it sits
-    blocked for 30 minutes and finally surfaces "Compaction timed out."
-    """
+    """Only backends that implement the deferred compaction protocol may wait."""
 
     @staticmethod
     def _make_mock_client(events):
@@ -5294,6 +5289,9 @@ class TestRunChatCompactDeferredWait:
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: True
         )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: False
+        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -5321,6 +5319,36 @@ class TestRunChatCompactDeferredWait:
         assert "context_usage" in ws_kinds
 
     @pytest.mark.asyncio
+    async def test_non_kiro_backend_does_not_enter_deferred_compaction_wait(
+        self, tmp_path, monkeypatch
+    ):
+        """A backend without Kiro's notification protocol must finish the turn."""
+        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client([LLMEvent(kind=EVENT_COMPLETE)])
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: False
+        )
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "/compact")
+
+        client.wait_for_compaction.assert_not_called()
+        assert not any(
+            c.args
+            and c.args[0] == "chat_message"
+            and c.args[1].get("role") == "compacting"
+            for c in state.broadcast_ws.call_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_kiro_backend_still_waits_for_compaction(self, tmp_path, monkeypatch):
         """kiro-cli backend keeps the original deferred-wait path."""
         from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
@@ -5341,6 +5369,9 @@ class TestRunChatCompactDeferredWait:
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: True
         )
 
         from kiro_crew.dashboard.chat import _run_chat
@@ -5387,6 +5418,9 @@ class TestRunChatCompactDeferredWait:
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
         )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: True
+        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -5425,6 +5459,9 @@ class TestRunChatCompactDeferredWait:
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: True
         )
 
         from kiro_crew.dashboard.chat import _run_chat
@@ -5472,6 +5509,9 @@ class TestRunChatCompactDeferredWait:
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_runner.is_claude_backend", lambda _provider: False
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.is_kiro_backend", lambda _provider: True
         )
 
         from kiro_crew.dashboard.chat import _run_chat

@@ -13,6 +13,7 @@ import chatReducer, {
   warmSlotCache,
   requestSlotReveal,
   clearSlotReveal,
+  startRemoteTurn,
 } from './chatSlice'
 import { extractSpawnRunLaunch, isSpawnRunTool } from '../pages/chat/SubagentRunCard'
 
@@ -23,6 +24,19 @@ function makeStore() {
     middleware: (getDefault) => getDefault({ serializableCheck: false, immutableCheck: false }),
   })
 }
+
+describe('startRemoteTurn', () => {
+  it('clears a stale compacting state when the server starts a successor turn', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseChatMessage({ slot: 'active', role: 'compacting', content: '' }))
+
+    store.dispatch(startRemoteTurn('active'))
+
+    expect(store.getState().chat.slotState).toBe('streaming')
+    expect(store.getState().chat.slotRunning).toBe(true)
+  })
+})
 
 describe('sseSubagentChunk — prototype-pollution guard (bug chatSlice.ts:931)', () => {
   it('ignores a poisoned __proto__ id and does not pollute Object.prototype', () => {

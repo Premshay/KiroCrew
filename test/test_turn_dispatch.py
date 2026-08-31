@@ -260,7 +260,7 @@ class TestFinishTurnTask:
         assert task not in state._background_tasks
 
     @pytest.mark.asyncio
-    async def test_other_exception_is_logged_not_dropped(self, caplog) -> None:
+    async def test_other_exception_ends_the_client_turn_with_an_error(self, caplog) -> None:
         state, slot = _state(), _slot()
 
         async def _boom():
@@ -268,10 +268,14 @@ class TestFinishTurnTask:
 
         with caplog.at_level(logging.ERROR, logger=td.logger.name):
             task = td.spawn_guarded_turn(state, slot, _boom(), timeout_secs=60)
+            slot.task = task
             with pytest.raises(ValueError):
                 await task
             await asyncio.sleep(0)
         assert "kaboom" in caplog.text
+        assert any(call.args[0] == "error" for call in slot.append.call_args_list)
+        state.broadcast_ws.assert_called_once_with("chat_done", {"slot": slot.key})
+        assert slot.task is None
 
     @pytest.mark.asyncio
     async def test_card_render_failure_cannot_break_the_callback(self) -> None:

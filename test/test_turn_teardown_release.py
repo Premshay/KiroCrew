@@ -46,6 +46,35 @@ async def test_start_next_holds_user_while_orchestrating(tmp_path) -> None:
     assert [i["content"] for i in slot._queue] == ["user typed mid-plan"]
 
 
+@pytest.mark.asyncio
+async def test_drained_queue_ids_repeat_on_successor_status(tmp_path) -> None:
+    """A reconnect that misses ``queue_pop`` can retire the exact card on the
+    successor's first status frame, without touching later queued prompts."""
+    state, slot, client = _state_and_slot(tmp_path)
+
+    async def _empty(_message):
+        return
+        yield  # pragma: no cover - generator shape only
+
+    client.stream = _empty
+    client.stream_command = _empty
+    client.client.set_claude_autonomous_turn_handler = None
+    queue_id = slot.queue_append("run this next")
+
+    assert await _start_next_queued_turn(state, slot) is True
+    assert slot.task is not None
+    await slot.task
+
+    assert any(
+        call.args
+        == (
+            "chat_status",
+            {"slot": slot.key, "status": "Thinking…", "queue_ids": [queue_id]},
+        )
+        for call in state.broadcast_ws.call_args_list
+    )
+
+
 def _state_and_slot(tmp_path: Path):
     state = _make_state(tmp_path)
     state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))

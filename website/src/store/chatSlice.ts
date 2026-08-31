@@ -2830,10 +2830,24 @@ const chatSlice = createSlice({
       state.pendingTurnSlot = slot
       if (slot === state.activeSlot) state.slotRunning = true
     },
+    startRemoteTurn(state, action: PayloadAction<string>) {
+      const slot = action.payload
+      if (isUnsafeKey(slot)) return
+      const run = ((state.slotRun ??= {})[safeKey(slot)] ??= { state: 'idle' })
+      run.state = 'streaming'
+      // A chat-status frame or an accepted HTTP receipt is emitted only after
+      // the server has admitted this turn. It therefore supersedes the brief
+      // pre-send window in which an older slots snapshot can still arrive.
+      if (state.pendingTurnSlot === slot) state.pendingTurnSlot = null
+      if (slot === state.activeSlot) {
+        state.slotState = 'streaming'
+        state.slotRunning = true
+        state.slotStopping = false
+      }
+    },
     /** Reconcile the active slot's running state from a WS slots broadcast.
-     *  running=true is always trusted (also catches Slack/cron-initiated turns);
-     *  running=false is ignored while a local turn is pending confirmation, since
-     *  the snapshot may predate the send. Turn end is owned by _done/refreshSlot. */
+     *  A local send keeps its optimistic state only until the server admits the
+     *  turn. After that receipt, an explicit ready snapshot wins. */
     syncSlotRunningFromServer(state, action: PayloadAction<{ slot: string; running: boolean; stopping: boolean }>) {
       const { slot, running, stopping } = action.payload
       if (slot !== state.activeSlot) return
@@ -4006,8 +4020,8 @@ const chatSlice = createSlice({
       if (cached) apply(cached)
     },
     /** Remove the first queued message matching content and append a user bubble at the end. */
-    removeQueuedMessage(state, action: PayloadAction<{ slot: string; content: string; queue_id?: string }>) {
-      const { slot, content, queue_id } = action.payload
+    removeQueuedMessage(state, action: PayloadAction<{ slot: string; content?: string; queue_id?: string }>) {
+      const { slot, content = '', queue_id } = action.payload
       const msgs = slot === state.activeSlot ? state.messages : state.slotMessages[slot]
       if (!msgs) return
       const idx = queue_id
@@ -4657,7 +4671,7 @@ const chatSlice = createSlice({
 
 export const {
   setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, confirmOptimisticSend, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
+  removeThinking, confirmOptimisticSend, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, startRemoteTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceBusy, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,

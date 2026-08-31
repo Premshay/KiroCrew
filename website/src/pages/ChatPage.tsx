@@ -22,7 +22,7 @@ import { useChatPopouts } from '../hooks/useChatPopouts'
 import {
   switchSlot, createSlot, deleteSlot, fetchHistory, loadOlderMessages, isSupersededPagingRejection,
   appendMessage, appendSlotMessage, resumeFromHistory, forkSlot,
-  setSlotRunning, startLocalTurn, syncSlotRunningFromServer, setPendingInput, setAgentSwitchNotice, resolveByApprovalId, clearPendingPermissions, cancelQueuedMessage, editQueuedMessage,
+  setSlotRunning, startLocalTurn, startRemoteTurn, syncSlotRunningFromServer, setPendingInput, setAgentSwitchNotice, resolveByApprovalId, clearPendingPermissions, cancelQueuedMessage, editQueuedMessage,
   selectComposerBusy,
   selectContinuable,
   selectTurnInterrupted,
@@ -4481,13 +4481,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         // The server explicitly accepted neither (`ok` nor `queued`), so nothing
         // was sent — recovering the composer cannot duplicate a delivered turn.
         restoreComposerAfterFailedSend()
-      } else if (outcome === 'accepted' && steerNow && _busy && !body.queued && !body.steered) {
-        // A steer-flagged send the server neither queued nor injected: it
-        // started a turn, so no `queue_push` or `steer_push` echo is coming and
-        // the busy rule above left the text with nothing to represent it.
-        // Append only once the answer rules out both echoes — a mid-plan send
-        // is queued, and a child turn that started while this POST was in
-        // flight is injected mid-turn, each of which brings its own bubble.
+      } else if (outcome === 'accepted' && _busy && !body.queued && !body.steered) {
+        // The client believed this slot was busy, so it skipped the optimistic
+        // bubble. If the server instead accepted an immediate turn, nothing
+        // will echo the user row: dashboard-originated user messages suppress
+        // `chat_message` precisely because the normal path already rendered
+        // one. This commonly occurs just after a gateway restart, when the
+        // browser has not yet reconciled its stale busy flag. Append only once
+        // the receipt rules out both queue and steer echoes.
         // Addressed to the SENDING slot, not the active one: the user can
         // switch sessions while the POST is in flight, and this text belongs to
         // the transcript it was typed into (same reason `steer_push` uses this).
@@ -4497,6 +4498,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             message: { role: 'user', content: displayTxt, cls: '', ts: new Date().toISOString(), meta: metaPayload },
           }))
         }
+      }
+      if (slot && body.ok && !body.queued && !body.steered) {
+        // The HTTP receipt is ordered after the server attached the turn task.
+        // It closes the small optimistic-send window in which an old slots
+        // frame may still say ready; later ready frames are authoritative.
+        dispatch(startRemoteTurn(slot))
       }
       if (slot && confirmedDelivered(body)) {
         // The response IS the delivery receipt (#4131). The server accepted the

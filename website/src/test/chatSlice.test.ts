@@ -11,6 +11,7 @@ import reducer, {
   setSlotRunning,
   setSlotStopping,
   startLocalTurn,
+  startRemoteTurn,
   syncSlotRunningFromServer,
   setSlotState,
   setSlotStatusDetail,
@@ -158,13 +159,14 @@ describe('chatSlice reducers', () => {
       expect(state.pendingTurnSlot).toBe('chat-1')
     })
 
-    it('server confirming running=true clears the pending guard', () => {
+    it('an admitted turn clears the pending guard so a later ready snapshot wins', () => {
       let state = active('chat-1')
       state = reducer(state, startLocalTurn('chat-1'))
-      state = reducer(state, syncSlotRunningFromServer({ slot: 'chat-1', running: true, stopping: false }))
+      state = reducer(state, startRemoteTurn('chat-1'))
       expect(state.slotRunning).toBe(true)
       expect(state.pendingTurnSlot).toBeNull()
-      // Once confirmed, a later running=false (genuine turn end) is honoured.
+      // A ready snapshot after the server has admitted the turn is not the
+      // pre-send race; it must clear a dead-turn spinner.
       state = reducer(state, syncSlotRunningFromServer({ slot: 'chat-1', running: false, stopping: false }))
       expect(state.slotRunning).toBe(false)
     })

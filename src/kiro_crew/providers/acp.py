@@ -1520,6 +1520,11 @@ def is_claude_backend(provider: Any) -> TypeGuard[AcpProvider]:
     return isinstance(provider, AcpProvider) and provider.is_claude_backend
 
 
+def is_kiro_backend(provider: Any) -> TypeGuard[AcpProvider]:
+    """Check whether *provider* implements kiro-cli's deferred protocol."""
+    return isinstance(provider, AcpProvider) and provider.is_kiro_backend
+
+
 def provider_label(provider: Any) -> str:
     """Backend identity key for *provider*.
 

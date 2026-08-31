@@ -206,7 +206,7 @@ from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.metrics.events import TURN_TIMEOUT_CAUSE, emit_counter
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform import redact_via_context
-from kiro_crew.providers.acp import is_claude_backend
+from kiro_crew.providers.acp import is_claude_backend, is_kiro_backend
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -4895,6 +4895,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         "_synthetic_payload": synthetic_payload,
         "_directive_user_origin": directive_user_origin,
         "_post_restart_continuation": is_post_restart_continuation,
+        "_drained_queue_ids": tuple(item["id"] for item in consumed),
     }
     if peer_channel_request_refs:
         _run_kwargs["_peer_channel_request_refs"] = peer_channel_request_refs
@@ -5122,6 +5123,7 @@ async def _run_chat(
     _directive_user_origin: bool = False,
     _post_restart_continuation: bool = False,
     _peer_channel_request_refs: tuple[tuple[str, str], ...] = (),
+    _drained_queue_ids: tuple[str, ...] = (),
     regenerate_hint: str = "",
     _on_consumed: "Callable[[bool], None] | None" = None,
     _on_irreversibly_consumed: "Callable[[], Awaitable[None] | None] | None" = None,
@@ -6522,7 +6524,14 @@ async def _run_chat(
             await _probe_fallback_restore_for_slot(slot, client)
 
         event_stream = client.stream_command(message) if is_slash else client.stream(full_message)
-        state.broadcast_ws("chat_status", {"slot": slot.key, "status": "Thinking…"})
+        status_payload: dict[str, Any] = {"slot": slot.key, "status": "Thinking…"}
+        if _drained_queue_ids:
+            # `queue_pop` is intentionally fire-and-forget, so a client that
+            # reconnects in the narrow gap before this successor starts can
+            # miss it and retain a card for text already being processed. The
+            # status event is the next live frame and repeats only opaque IDs.
+            status_payload["queue_ids"] = list(_drained_queue_ids)
+        state.broadcast_ws("chat_status", status_payload)
         state.broadcast_ws(
             "activity_event", {"slot": slot.key, "kind": "status", "text": "Thinking…"}
         )
@@ -8603,7 +8612,7 @@ async def _run_chat(
                 msg = "✅ Conversation compacted."
                 _append_compaction_notice(state, slot, msg)
                 state.broadcast_context_usage(slot.key, _context_usage_payload(slot.key, client))
-            else:
+            elif is_kiro_backend(client):
                 # Tell frontend to show compacting state and disable input
                 logger.info("Deferred compaction: waiting for compaction result")
                 state.broadcast_ws(

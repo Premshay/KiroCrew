@@ -26,8 +26,8 @@ import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import chatReducer, { startLocalTurn } from '../store/chatSlice'
-import dashboardReducer, { updateSlot } from '../store/dashboardSlice'
+import chatReducer, { startLocalTurn, startRemoteTurn } from '../store/chatSlice'
+import dashboardReducer, { sseSlots } from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import { ThemeProvider } from '../hooks/useTheme'
 
@@ -133,7 +133,7 @@ describe('ChatPage — session-resurrection thinking indicator', { timeout: 15_0
     // A WS 'slots' broadcast that predates the send arrives (running still
     // false — agent not started). Force a slots-array change to fire the
     // slots-sync effect while running stays false.
-    await act(async () => { store.dispatch(updateSlot({ key: 'slot-a', messages: 2 })) })
+    await act(async () => { store.dispatch(sseSlots([{ key: 'slot-a', messages: 2, running: false }])) })
 
     // Guard holds: footer stays. Pre-fix the indicator vanished here (the bug).
     expect(store.getState().chat.slotRunning).toBe(true)
@@ -149,15 +149,15 @@ describe('ChatPage — session-resurrection thinking indicator', { timeout: 15_0
     await act(async () => { store.dispatch(startLocalTurn('slot-a')) })
     expect(store.getState().chat.slotRunning).toBe(true)
 
-    // Server starts the agent — slots broadcast reports running=true.
-    await act(async () => { store.dispatch(updateSlot({ key: 'slot-a', running: true })) })
+    // The accepted send receipt confirms the server attached the turn task.
+    await act(async () => { store.dispatch(startRemoteTurn('slot-a')) })
     expect(store.getState().chat.slotRunning).toBe(true)
     expect(store.getState().chat.pendingTurnSlot).toBeNull()  // guard cleared
     expect(screen.queryByTestId('chat-footer')).not.toBeNull()
 
-    // Turn ends — slots broadcast reports running=false. Now honoured and the
-    // indicator disappears.
-    await act(async () => { store.dispatch(updateSlot({ key: 'slot-a', running: false })) })
+    // A ready slots broadcast now means the server has no task; it must clear
+    // the indicator instead of leaving a post-restart dead spinner forever.
+    await act(async () => { store.dispatch(sseSlots([{ key: 'slot-a', messages: 2, running: false }])) })
     expect(store.getState().chat.slotRunning).toBe(false)
     await waitFor(() => expect(screen.queryByTestId('chat-footer')).toBeNull())
   })

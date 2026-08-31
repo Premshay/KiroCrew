@@ -282,14 +282,27 @@ def finish_turn_task(
         except Exception:
             logger.debug("Failed to render turn-timeout card", exc_info=True)
         return
-    # Anything else escaped _run_chat's own handler chain. Log it rather than
-    # let it die as an unretrieved task exception.
+    # Anything else escaped _run_chat's own handler chain. It can happen before
+    # the runner reaches its own finalizer, so logging alone would leave the
+    # sidebar ready while the originating client keeps its pending spinner.
     logger.error(
         "Chat turn in slot %s failed: %s",
         getattr(slot, "key", "?"),
         exc,
         exc_info=exc,
     )
+    try:
+        if getattr(slot, "task", None) is task:
+            slot.task = None
+        slot.append(
+            "error",
+            "❌ This turn stopped before it could start. Please send the message again.",
+            "msg msg-err",
+        )
+        state.broadcast_ws("chat_done", {"slot": slot.key})
+        state.push_slots_update()
+    except Exception:
+        logger.debug("Failed to render escaped turn error", exc_info=True)
 
 
 async def _bounded_turn(coro: "Coroutine[Any, Any, Any]", timeout_secs: float) -> Any:

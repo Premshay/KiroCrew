@@ -518,6 +518,20 @@ describe('useWebSocket frame router', () => {
     expect(chat().messages.filter(m => m.role === 'queued')).toHaveLength(0)
   })
 
+  it('repairs a missed queue-pop from the successor turn status', () => {
+    const { ws } = mount()
+    act(() => {
+      ws.simulateMessage({ type: 'queue_push', data: { slot: ACTIVE, content: 'now running', ts: '1', queue_id: 'q1' } })
+      ws.simulateMessage({ type: 'queue_push', data: { slot: ACTIVE, content: 'still queued', ts: '2', queue_id: 'q2' } })
+      // The queue_pop frame was lost during reconnect. The following live
+      // status is enough to retire only the prompt the runner consumed.
+      ws.simulateMessage({ type: 'chat_status', data: { slot: ACTIVE, status: 'Thinking…', queue_ids: ['q1'] } })
+    })
+
+    expect(chat().messages.filter(m => m.role === 'queued').map(m => m.meta?.queueId)).toEqual(['q2'])
+    expect(chat().slotStatusDetail[ACTIVE]?.kind).toBe('thinking')
+  })
+
   it('echoes a mid-turn steer into the target transcript', () => {
     const { ws } = mount()
     act(() => {
@@ -1777,4 +1791,3 @@ describe('useWebSocket slots reconcile', () => {
     expect(testStore.getState().chat.slotMessages[BACKGROUND]).toBeDefined()
   })
 })
-
