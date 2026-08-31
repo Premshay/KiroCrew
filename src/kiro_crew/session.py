@@ -2623,7 +2623,12 @@ class SessionManager:
         For new sessions, tries the warm pool first for instant startup.
         If the session is mid-compaction, creates a fresh one instead.
         Acquires the per-session semaphore before returning — caller MUST
-        call ``release(key)`` when done.
+        call ``release(key)`` when done. That semaphore is the key's turn lock,
+        not a bookkeeping handle: while it is held, every other caller for the
+        same key blocks HERE, before any of them logs a line. A holder that
+        parks — a worker loop, a long await — therefore presents as a session
+        wedged on "thinking" with no server-side trace and no live turn for a
+        Stop to cancel. Hold it for one turn; never for the lifetime of a task.
 
         Args:
             agent: Optional agent name for ``session/set_mode``.  Non-default
