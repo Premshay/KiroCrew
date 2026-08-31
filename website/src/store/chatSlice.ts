@@ -3829,8 +3829,6 @@ const chatSlice = createSlice({
       // WS chunk — accumulate into streaming message, preserve rawText
       if (role === 'chunk') {
         state.slotState = 'streaming'
-        const run = (state.slotRun[safeKey(slot)] ??= { state: 'idle' })
-        run.state = 'streaming'
         state._wsChunkedDuringFetch = true
         // Drop only the empty "Thinking…" placeholder; keep content-bearing
         // reasoning blocks (from chat_thinking) so they persist as a collapsible
@@ -3870,8 +3868,6 @@ const chatSlice = createSlice({
       // WS done — finalize streaming into assistant, rawText preserved for reparse
       if (role === '_done') {
         state.slotState = 'idle'
-        const run = (state.slotRun[safeKey(slot)] ??= { state: 'idle' })
-        run.state = 'idle'
         state.lastChunkSeq = undefined
         for (let i = state.messages.length - 1; i >= 0; i--) {
           if (state.messages[i].role === 'streaming') {
@@ -3891,8 +3887,6 @@ const chatSlice = createSlice({
       if (role === 'compacting') {
         if (action.payload.slot && action.payload.slot !== state.activeSlot) return
         state.slotState = 'compacting'
-        const run = (state.slotRun[safeKey(slot)] ??= { state: 'idle' })
-        run.state = 'compacting'
         state.slotRunning = true
         return
       }
@@ -4208,17 +4202,7 @@ const chatSlice = createSlice({
         if (isUnsafeKey(key)) return
         if (state.activeSlot !== key) return  // user switched away during fetch
         retainServerTotal(state, key, action.payload.total, running)
-        // A newer compaction frame can arrive before this HTTP snapshot settles.
-        // Keep that slot-scoped phase instead of flattening it to generic
-        // streaming; the previous active slot's phase cannot leak here because
-        // `slotRun` is keyed by the incoming slot.
-        const liveRun = state.slotRun?.[safeKey(key)]
-        if (!running && liveRun) {
-          liveRun.state = 'idle'
-          liveRun.lastChunkSeq = undefined
-        }
-        const livePhase = liveRun?.state
-        state.slotState = running && livePhase === 'compacting' ? 'compacting' : running ? 'streaming' : 'idle'
+        state.slotState = running ? 'streaming' : 'idle'
         // Mark stale permissions as resolved so ApprovalBar ignores them
         if (!running) {
           for (const m of messages) {
