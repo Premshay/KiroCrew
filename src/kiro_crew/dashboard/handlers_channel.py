@@ -386,6 +386,10 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
         if slot.running or slot._in_stage_execution:
             await save_slot_off_loop(state, slot, force=True, best_effort=False)
             state.push_slots_update()
+            if message.delivery == "interrupt" and not slot._in_stage_execution:
+                from kiro_crew.dashboard.chat_handlers import preempt_slot_for_channel_interrupt
+
+                return await preempt_slot_for_channel_interrupt(state, slot)
             return "queued"
 
     if message.msg_type == "mention" and not slot.running and not slot._in_stage_execution:

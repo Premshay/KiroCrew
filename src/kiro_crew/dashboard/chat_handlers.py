@@ -2985,6 +2985,66 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "outcome": outcome})
 
 
+async def preempt_slot_for_channel_interrupt(state: DashboardState, slot: _ChatSlot) -> str:
+    """Cancel a live turn so an explicit peer interrupt can run next.
+
+    Claude ACP has no mid-turn steer capability.  Queueing an ``interrupt``
+    delivery for that backend leaves the peer card marked urgent while it waits
+    behind the very turn it was meant to supersede.  Preserve the queue and use
+    the same cooperative cancellation lifecycle as the dashboard interrupt
+    route, so the runner drains the already-promoted peer card on completion.
+    """
+    if not slot.running or slot._stop_state != "idle":
+        return "queued"
+
+    task_at_stop = slot.task
+    cancel_key = _cancel_target(slot)
+    slot._stop_state = "soft_pending"
+    slot._auto_run = False
+
+    stop_id = f"stop-{uuid.uuid4().hex}"
+    slot._stop_event_id = stop_id
+    now_ts = datetime.now(tz=timezone.utc).isoformat()
+    stop_data = {
+        "kind": "stop_event",
+        "id": stop_id,
+        "state": "interrupting",
+        "outcome": None,
+        "ts_start": now_ts,
+    }
+    stop_msg = json.dumps(stop_data)
+    slot.append("system", stop_msg, stop_msg)
+    state.push_slots_update()
+
+    _on_soft = _make_stop_resolver(state, slot, "soft", stop_id)
+    _on_hard = _make_stop_resolver(state, slot, "hard", stop_id)
+    _unblock_pending_waits(state, slot)
+    outcome = await state.sessions.stop_turn(
+        cancel_key,
+        force=False,
+        preserve_queue=True,
+        on_soft=_on_soft,
+        on_hard=_on_hard,
+    )
+    if outcome in {"hard", "idle"}:
+        await _cancel_terminal_stop_task(task_at_stop)
+    if outcome == "idle":
+        if slot._stop_event_id:
+            _resolve_stop_event(slot, "soft")
+        slot._stop_state = "idle"
+        state.push_slots_update()
+    sel().log_tool_invocation(
+        session_key=_history_key_for(slot.key),
+        agent=getattr(slot, "agent", "") or "kirocrew",
+        source="channel",
+        tool_name="channel_interrupt",
+        tool_kind="command",
+        outcome=outcome,
+        metadata={"slot": slot.key},
+    )
+    return "interrupted"
+
+
 async def api_chat_slot_queue_cancel(request: web.Request) -> web.Response:
     """DELETE /api/chat/slots/{slot}/queue/{queue_id} — cancel a queued message.
 

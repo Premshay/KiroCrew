@@ -880,7 +880,7 @@ class TestAttachedSessionWake:
         assert slot._queue == []
 
     @pytest.mark.asyncio
-    async def test_interrupt_mention_queues_at_head_when_steer_is_unavailable(
+    async def test_interrupt_mention_preempts_when_steer_is_unavailable(
         self, monkeypatch, tmp_path
     ) -> None:
         state = _state(tmp_path)
@@ -889,6 +889,7 @@ class TestAttachedSessionWake:
         slot.task.done.return_value = False
         slot._acp_client = SimpleNamespace(supports_steer=False)
         slot.queue_append("later")
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
         member = SimpleNamespace(session_key="dashboard:crew-codex")
         message = ChannelMessage(
             id="interrupt2",
@@ -905,13 +906,18 @@ class TestAttachedSessionWake:
             state, SimpleNamespace(id="deadbeef"), member, message
         )
 
-        assert outcome == "queued"
+        assert outcome == "interrupted"
+        state.sessions.stop_turn.assert_awaited_once()
+        stop_kwargs = state.sessions.stop_turn.call_args.kwargs
+        assert stop_kwargs["force"] is False
+        assert stop_kwargs["preserve_queue"] is True
+        assert slot._stop_state == "soft_pending"
         assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
         assert slot._queue[1]["content"] == "later"
         assert slot.peer_channel_inbox_payload()[0]["message_id"] == "interrupt2"
 
     @pytest.mark.asyncio
-    async def test_interrupt_mention_queues_at_head_after_expected_steer_failure(
+    async def test_interrupt_mention_preempts_after_expected_steer_failure(
         self, monkeypatch, tmp_path
     ) -> None:
         state = _state(tmp_path)
@@ -932,12 +938,15 @@ class TestAttachedSessionWake:
             content="Do not rely on the old premise.",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock())
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
 
         outcome = await deliver_attached_channel_message(
             state, SimpleNamespace(id="deadbeef"), member, message
         )
 
-        assert outcome == "queued"
+        assert outcome == "interrupted"
+        state.sessions.stop_turn.assert_awaited_once()
+        assert state.sessions.stop_turn.call_args.kwargs["preserve_queue"] is True
         assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
         assert slot.peer_channel_inbox_payload()[0]["message_id"] == "interrupt3"
 
