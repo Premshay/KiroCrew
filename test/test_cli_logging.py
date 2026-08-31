@@ -17,7 +17,9 @@ Covers:
 
 import logging
 import os
-from logging.handlers import RotatingFileHandler
+import threading
+import time
+from logging.handlers import QueueHandler, RotatingFileHandler
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -59,6 +61,31 @@ def _pristine_logging():
                 handler.close()
     root.handlers[:], root.level = saved_root
     kc.handlers[:], kc.level = saved_kc
+
+
+
+def _effective_handlers(logger_name: str) -> list:
+    """Handlers that ultimately write for *logger_name*, through any queue."""
+    import kiro_crew.cli as cli
+
+    resolved: list = []
+    for handler in logging.getLogger(logger_name).handlers:
+        if not isinstance(handler, QueueHandler):
+            resolved.append(handler)
+            continue
+        for listener in cli._LOG_QUEUE_LISTENERS:
+            if listener.queue is handler.queue:
+                resolved.extend(listener.handlers)
+    return resolved
+
+
+def _drain_log_queues() -> None:
+    """Stop the listeners so every queued record has reached its handler."""
+    import kiro_crew.cli as cli
+
+    for listener in cli._LOG_QUEUE_LISTENERS:
+        listener.stop()
+    cli._LOG_QUEUE_LISTENERS.clear()
 
 
 class TestFdTargetsFile:
@@ -237,21 +264,24 @@ class TestSetupCliLoggingDetached:
 
     def test_file_handler_on_root_not_kiro_crew(self):
         _setup_cli_logging("gateway", 1)
-        root_fhs = [h for h in logging.getLogger().handlers if isinstance(h, RotatingFileHandler)]
+        # Handlers now sit behind a per-logger QueueHandler, so ownership is
+        # read through the listener. The contract is unchanged: the file
+        # handler serves ROOT, so third-party warnings reach the file and
+        # kiro_crew records are not written twice.
+        root_fhs = [h for h in _effective_handlers("") if isinstance(h, RotatingFileHandler)]
         assert len(root_fhs) == 1
         assert Path(root_fhs[0].baseFilename) == config_dir() / "gateway.log"
         kc_fhs = [
-            h
-            for h in logging.getLogger("kiro_crew").handlers
-            if isinstance(h, RotatingFileHandler)
+            h for h in _effective_handlers("kiro_crew") if isinstance(h, RotatingFileHandler)
         ]
         assert kc_fhs == []
 
     def test_kiro_crew_record_written_exactly_once(self):
         _setup_cli_logging("gateway", 1)
         logging.getLogger("kiro_crew.test_doublewrite").warning("sentinel-record")
-        for h in logging.getLogger().handlers:
-            h.flush()
+        # Draining the listeners is the flush now — reading the file without
+        # it races the listener thread and passes only by luck.
+        _drain_log_queues()
         text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
         assert text.count("sentinel-record") == 1
         # And it is the PID-stamped file-handler copy, not the console format.
@@ -262,8 +292,7 @@ class TestSetupCliLoggingDetached:
         # stderr echo; the root-attached handler must keep them flowing.
         _setup_cli_logging("gateway", 1)
         logging.getLogger("somelib.test_doublewrite").warning("thirdparty-record")
-        for h in logging.getLogger().handlers:
-            h.flush()
+        _drain_log_queues()
         text = (config_dir() / "gateway.log").read_text(encoding="utf-8")
         assert text.count("thirdparty-record") == 1
 
@@ -290,7 +319,7 @@ class TestSetupCliLoggingDetached:
         cfg.agent.log_level = "ERROR"
         monkeypatch.setattr("kiro_crew.cli.KiroCrewConfig.load", staticmethod(lambda: cfg))
         _setup_cli_logging("gateway", 0)
-        fh = next(h for h in logging.getLogger().handlers if isinstance(h, RotatingFileHandler))
+        fh = next(h for h in _effective_handlers("") if isinstance(h, RotatingFileHandler))
         assert fh.level == logging.WARNING
         assert logging.getLogger("kiro_crew").level == logging.ERROR
 
@@ -307,13 +336,11 @@ class TestSetupCliLoggingForeground:
     def test_file_handler_on_kiro_crew_logger(self):
         _setup_cli_logging("gateway", 1)
         kc_fhs = [
-            h
-            for h in logging.getLogger("kiro_crew").handlers
-            if isinstance(h, RotatingFileHandler)
+            h for h in _effective_handlers("kiro_crew") if isinstance(h, RotatingFileHandler)
         ]
         assert len(kc_fhs) == 1
         assert kc_fhs[0].level == logging.INFO
-        root_fhs = [h for h in logging.getLogger().handlers if isinstance(h, RotatingFileHandler)]
+        root_fhs = [h for h in _effective_handlers("") if isinstance(h, RotatingFileHandler)]
         assert root_fhs == []
 
     def test_record_written_once_to_file(self):
@@ -331,3 +358,81 @@ class TestSetupCliLoggingForeground:
         assert (config_dir() / "gateway.log.prev").exists()
         # … but a foreground console must never be dup2'd into the log file.
         self.redirect.assert_not_called()
+
+
+class TestQueueRoutedLogging:
+    """No caller may perform handler I/O inline — that is what stalls the loop.
+
+    A handler holds its own lock across its write, so a thread inside a slow
+    handler blocks every other thread that logs. On 2026-08-31 the gateway's
+    event loop stalled 45.8s inside one ``logger.warning`` while another thread
+    sat in the security-event log's flush, and the stall watchdog killed the
+    process.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_logging(self):
+        import kiro_crew.cli as cli
+
+        root, kc = logging.getLogger(), logging.getLogger("kiro_crew")
+        saved = (list(root.handlers), list(kc.handlers), list(cli._LOG_QUEUE_LISTENERS))
+        cli._LOG_QUEUE_LISTENERS.clear()
+        yield
+        for listener in cli._LOG_QUEUE_LISTENERS:
+            listener.stop()
+        cli._LOG_QUEUE_LISTENERS.clear()
+        root.handlers[:] = saved[0]
+        kc.handlers[:] = saved[1]
+        cli._LOG_QUEUE_LISTENERS.extend(saved[2])
+
+    def test_emitting_does_not_touch_the_handler_inline(self):
+        import kiro_crew.cli as cli
+
+        emitted_on: list[str] = []
+
+        class _RecordingHandler(logging.Handler):
+            def emit(self, record):
+                emitted_on.append(threading.current_thread().name)
+
+        kc = logging.getLogger("kiro_crew")
+        kc.handlers[:] = [_RecordingHandler()]
+        kc.setLevel(logging.INFO)
+
+        cli._route_logging_through_queue()
+        assert isinstance(kc.handlers[0], QueueHandler)
+
+        caller = threading.current_thread().name
+        kc.warning("stall probe")
+
+        deadline = time.monotonic() + 5
+        while not emitted_on and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert emitted_on, "record never reached the handler"
+        # The whole point: the write happened on the listener thread, not here.
+        assert emitted_on[0] != caller
+
+    def test_console_and_file_handlers_keep_their_own_loggers(self, tmp_path):
+        import kiro_crew.cli as cli
+
+        console, file_handler = logging.Handler(), logging.Handler()
+        logging.getLogger().handlers[:] = [console]
+        logging.getLogger("kiro_crew").handlers[:] = [file_handler]
+
+        cli._route_logging_through_queue()
+
+        # Two listeners, each owning the handlers of the logger they came from:
+        # pooling them onto root would start writing third-party records into
+        # gateway.log, which the foreground topology deliberately avoids.
+        assert len(cli._LOG_QUEUE_LISTENERS) == 2
+        owned = [set(listener.handlers) for listener in cli._LOG_QUEUE_LISTENERS]
+        assert {console} in owned and {file_handler} in owned
+
+    def test_second_call_is_a_noop(self):
+        import kiro_crew.cli as cli
+
+        logging.getLogger("kiro_crew").handlers[:] = [logging.Handler()]
+        cli._route_logging_through_queue()
+        first = list(cli._LOG_QUEUE_LISTENERS)
+        cli._route_logging_through_queue()
+        assert cli._LOG_QUEUE_LISTENERS == first

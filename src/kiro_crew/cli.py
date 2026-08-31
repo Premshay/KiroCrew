@@ -27,16 +27,18 @@ _ensure_ssl_certs()
 
 import argparse
 import asyncio
+import atexit
 import faulthandler
 import importlib
 import importlib.machinery
 import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import sys
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import NoReturn
 
@@ -858,6 +860,52 @@ class _FdTrackingRotatingFileHandler(RotatingFileHandler):
         _redirect_fds_to(Path(self.baseFilename))
 
 
+_LOG_QUEUE_LISTENERS: "list[QueueListener]" = []
+
+
+def _route_logging_through_queue() -> None:
+    """Move every configured handler behind a queue, per originating logger.
+
+    A logging handler holds its own lock across its write, so a thread inside a
+    slow handler blocks every other thread that logs — including the event
+    loop. Observed 2026-08-31: the loop stalled 45.8s inside a single
+    ``logger.warning`` from the MCP gateway's liveness probe while another
+    thread sat in the security-event log's flush, and the stall watchdog killed
+    the process. Behind a queue the caller only enqueues; one listener thread
+    per logger owns the handlers and all of the I/O.
+
+    Handlers are re-attached to the logger they came from rather than pooled on
+    root: the console handler and the rotating file handler deliberately sit on
+    different loggers (see :func:`_setup_cli_logging`), and merging them would
+    start writing third-party records into ``gateway.log``.
+
+    Idempotent by construction rather than by a visited flag: a QueueHandler is
+    skipped, so a second call finds nothing left to route. A flag would instead
+    leave handlers added by a LATER call attached directly, doing inline I/O
+    again — the exact thing this exists to prevent.
+    """
+    for name in ("", "kiro_crew"):
+        logger = logging.getLogger(name)
+        handlers = [h for h in logger.handlers if not isinstance(h, QueueHandler)]
+        if not handlers:
+            continue
+        for handler in handlers:
+            logger.removeHandler(handler)
+        # Unbounded: dropping a record to bound memory would lose exactly the
+        # burst that precedes a crash, which is the run worth keeping.
+        relay = QueueHandler(queue.Queue(-1))
+        # NOTSET so the QueueHandler never filters ahead of the real handlers;
+        # respect_handler_level below applies each handler's own threshold.
+        relay.setLevel(logging.NOTSET)
+        logger.addHandler(relay)
+        listener = QueueListener(relay.queue, *handlers, respect_handler_level=True)
+        listener.start()
+        _LOG_QUEUE_LISTENERS.append(listener)
+    for listener in _LOG_QUEUE_LISTENERS:
+        # Drain on the way out so a crash's final records still reach the file.
+        atexit.register(listener.stop)
+
+
 def _setup_cli_logging(command: str | None, verbose: int) -> None:
     """Configure console echo + persistent ``gateway.log`` logging.
 
@@ -965,6 +1013,10 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     _LONG_LIVED_COMMANDS = {"serve", "gateway", "chat", None}
     if command in _LONG_LIVED_COMMANDS:
         install_log_redaction([])
+        # Only the long-lived commands: they are the ones that log from an
+        # event loop and worker threads at the same time, and they are the
+        # ones whose exit runs the atexit drain.
+        _route_logging_through_queue()
 
 
 def _builtin_mcp_server_available(name: str) -> bool:
