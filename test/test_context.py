@@ -76,6 +76,27 @@ class TestMemoryStoreOverrideProperty:
 
 
 class TestContextBuilder:
+    @pytest.mark.parametrize("provider_type", ["acp", "claude_code"])
+    def test_resumed_native_session_does_not_reinject_gateway_bootstrap(self, tmp_path, provider_type):
+        """A gateway restart must not duplicate the prompt ACP restored natively."""
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+
+        message, _ = builder.build_message(
+            "continue the lane",
+            is_new_session=True,
+            resumed=True,
+            provider_type=provider_type,
+            session_key="dashboard:lane-a",
+        )
+
+        assert "[AGENT SYSTEM PROMPT]" not in message
+        assert "[SESSION CONTEXT" not in message
+        assert "continue the lane" in message
+
     def test_session_history_can_be_omitted_without_losing_memory(self, tmp_path):
         store = MemoryStore(workspace=tmp_path / "ws")
         store.write("# Memory\n\nUser prefers concise replies.")

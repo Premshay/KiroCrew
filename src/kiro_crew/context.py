@@ -2618,8 +2618,22 @@ class ContextBuilder:
         _user_part_index: int | None = None
         is_cc = provider_type == "claude_code"
 
-        # Session context on first message only
-        if is_new_session:
+        # ``is_new_session`` means this gateway constructed a provider client,
+        # not necessarily that the provider constructed a conversation.  On a
+        # native provider resume, ACP has already restored the conversation
+        # (including its bootstrap prompt) and marks the first gateway turn as
+        # both ``is_new_session`` and ``resumed``.  Re-sending the 27KB prompt
+        # here makes an otherwise valid resumed wake exceed the provider's
+        # request limit before it can produce a token.
+        #
+        # Treat that combination as a follow-up.  This deliberately covers the
+        # whole bootstrap block, rather than only thread history: native history
+        # is already trusted below when ``resumed`` is true, and duplicating
+        # dynamic memory/rules would create a second source of truth as well.
+        resumed_native_session = resumed
+
+        # Session context on a genuinely fresh provider conversation only.
+        if is_new_session and not resumed_native_session:
             # Agent prompt goes BEFORE session context wrapper
             # so the LLM treats it as its identity, not background info.
             if is_cc:
