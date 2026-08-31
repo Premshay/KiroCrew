@@ -6143,6 +6143,14 @@ class AcpClient:
             _tool_name, _mcp_server_name, _mcp_identity_trusted = trusted_mcp_identity(
                 update
             )
+            # codex-acp creates this metadata while translating Codex's native
+            # contextCompaction event.  It is deliberately keyed on the adapter
+            # provenance bit rather than the visible title, which is not a safe
+            # identity channel for ordinary tool calls.
+            _meta = update.get("_meta")
+            is_context_compaction = (
+                isinstance(_meta, dict) and _meta.get("contextCompaction") is True
+            )
             if tool_call_id:
                 self._tool_call_is_shell[tool_call_id] = is_shell
                 # Same lifecycle as is_shell: cache the trusted MCP server
@@ -6173,6 +6181,7 @@ class AcpClient:
                 tool_name=_tool_name,
                 mcp_server_name=_mcp_server_name,
                 mcp_identity_trusted=_mcp_identity_trusted,
+                is_context_compaction=is_context_compaction,
             )
         return None
 
@@ -6198,6 +6207,17 @@ class AcpClient:
         tool_use_id = update.get("toolCallId", "")
         if not tool_use_id:
             return None
+
+        _meta = update.get("_meta")
+        is_context_compaction = (
+            isinstance(_meta, dict) and _meta.get("contextCompaction") is True
+        )
+        # The adapter reports native Codex compaction as a tool lifecycle, not
+        # ACP's compaction-status extension.  Drop the old measurement only on
+        # the terminal update; resetting at the start would falsely clear the
+        # meter while compaction is still in flight.
+        if is_context_compaction and update.get("status") == "completed":
+            self.last_prompt_stats.reset_after_compaction()
 
         output_parts: list[str] = []
 
@@ -6247,6 +6267,7 @@ class AcpClient:
             tool_call_id=tool_use_id,
             tool_output=final_output,
             tool_final=update.get("status") == "completed",
+            is_context_compaction=is_context_compaction,
         )
 
     def _extract_tool_call_refinement(self, msg: JsonRpcMessage) -> AcpEvent | None:

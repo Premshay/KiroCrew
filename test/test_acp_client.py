@@ -5375,6 +5375,28 @@ class TestExtractToolEvent:
         assert event.kind == EVENT_TOOL_CALL
         assert event.title == "Read"
 
+    def test_codex_native_compaction_is_tagged_from_adapter_metadata(self):
+        client = AcpClient()
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        event = client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "compact-1",
+                        "title": "Context compacting",
+                        "kind": "other",
+                        "_meta": {"contextCompaction": True},
+                    }
+                },
+            )
+        )
+
+        assert event is not None
+        assert event.is_context_compaction is True
+
     def test_tool_call_with_diff_content(self):
         client = AcpClient()
         from kiro_crew.acp.types import JsonRpcMessage
@@ -6855,6 +6877,44 @@ class TestExtractToolCallUpdate:
             }
         )
         assert client._extract_tool_call_update(msg) is None
+
+    def test_codex_native_compaction_completion_resets_usage_without_output(self):
+        client = self._client()
+        client.last_prompt_stats.context_pct = 76.0
+        client.last_prompt_stats.context_used_tokens = 760_000
+        client.last_prompt_stats.context_window_tokens = 1_000_000
+        client.last_prompt_stats.context_tokens_from_usage = True
+        msg = self._make_msg(
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "compact-2",
+                "status": "completed",
+                "_meta": {"contextCompaction": True},
+            }
+        )
+
+        assert client._extract_tool_call_update(msg) is None
+        assert client.last_prompt_stats.context_pct == 0.0
+        assert client.last_prompt_stats.context_used_tokens == 0
+        assert client.last_prompt_stats.context_pct_unknown is True
+
+    def test_codex_native_compaction_result_carries_provenance(self):
+        client = self._client()
+        event = client._extract_tool_call_update(
+            self._make_msg(
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "compact-3",
+                    "status": "completed",
+                    "_meta": {"contextCompaction": True},
+                    "content": [{"content": {"type": "text", "text": "done"}}],
+                }
+            )
+        )
+
+        assert event is not None
+        assert event.is_context_compaction is True
+        assert event.tool_final is True
 
     def test_output_truncated_to_8000(self):
         client = self._client()

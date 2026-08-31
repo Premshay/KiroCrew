@@ -3009,6 +3009,10 @@ async def preempt_slot_for_channel_interrupt(state: DashboardState, slot: _ChatS
         "kind": "stop_event",
         "id": stop_id,
         "state": "interrupting",
+        # This cancellation was requested by an attached channel message, not
+        # by the dashboard operator.  Keep the transport detail in durable
+        # metadata so the renderer can explain the interruption honestly.
+        "source": "channel",
         "outcome": None,
         "ts_start": now_ts,
     }

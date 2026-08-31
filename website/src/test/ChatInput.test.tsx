@@ -1214,6 +1214,24 @@ describe('ChatInput', () => {
   })
 
   describe('stop button', () => {
+    it('remounts Send as Stop when a turn starts', () => {
+      // A send may synchronously mark its slot busy.  These controls occupy
+      // the same position but must never reuse a DOM node or click handler: a
+      // late browser event on the old Send node must not become a Stop request.
+      const onStop = vi.fn()
+      const { rerender } = renderWithProviders(
+        <ChatInput {...defaultProps} value="start" onStop={onStop} />,
+      )
+      const send = screen.getByRole('button', { name: 'Send' })
+
+      rerender(<ChatInput {...defaultProps} isRunning onStop={onStop} />)
+
+      const stop = screen.getByTestId('stop-button-armed')
+      expect(stop).not.toBe(send)
+      expect(stop).toHaveAttribute('type', 'button')
+      expect(onStop).not.toHaveBeenCalled()
+    })
+
     it('shows armed Stop button while running, click calls onStop', () => {
       const onStop = vi.fn()
       renderWithProviders(<ChatInput {...defaultProps} isRunning onStop={onStop} />)

@@ -7006,6 +7006,15 @@ async def _run_chat(
                     )
             elif event.kind == EVENT_TOOL_RESULT:
                 _out = _redact_tool_field(event.tool_output)
+                # Codex reports its own compaction through an adapter-owned tool
+                # lifecycle rather than EVENT_COMPACTION_STATUS.  Its completion
+                # invalidates the old usage measurement, so publish the reset
+                # immediately instead of leaving a pre-compaction percentage in
+                # the sidebar until a later turn happens to report usage again.
+                if event.is_context_compaction and event.tool_final:
+                    state.broadcast_context_usage(
+                        slot.key, _context_usage_payload(slot.key, client)
+                    )
                 # Redact the join key once for the WS broadcast and the
                 # message-meta comparison below. `_tool_meta` stores the
                 # redacted form, so the comparison must use the redacted form

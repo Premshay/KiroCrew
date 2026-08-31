@@ -504,6 +504,11 @@ class AcpEvent:
     tool_input_redacted: bool = False
     tool_output: str = ""
     tool_final: bool = False  # True when this tool_result is the final (status=completed) update
+    # True only for the adapter-owned Codex context-compaction lifecycle tool.
+    # It is presentation/telemetry state, never a model-authored instruction.
+    # The completion frame invalidates pre-compaction context usage because the
+    # adapter does not immediately provide a replacement measurement.
+    is_context_compaction: bool = False
     usage: TurnUsage = field(default_factory=TurnUsage)
     raw_tool_params: dict | None = (
         None  # original tool params before diff conversion (for file-chip snapshots)

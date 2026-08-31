@@ -2735,6 +2735,7 @@ function ChatInput({
                 ) : (
                   <div className="flex items-center gap-1.5 shrink-0">
                     <button
+                      key="stop-escape-hatch"
                       type="button"
                       onClick={() => resolveSpawnApprovals('approve')}
                       className={approvalBtnClass}
@@ -3419,13 +3420,15 @@ function ChatInput({
                     <span className="text-xs text-muted whitespace-nowrap" data-testid="stop-escape-hint">{i18nT('components.chatInput.taking_longer_than_expected')}</span>
                   </div>
                 ) : (
-                  <button className="w-8 h-8 rounded-lg bg-danger text-danger-fg border-none flex items-center justify-center cursor-not-allowed transition-all" disabled title={i18nT('components.chatInput.killing')} aria-label={i18nT('components.chatInput.killing_session')} data-testid="stop-button-killing">
+                  <button key="stop-killing" type="button" className="w-8 h-8 rounded-lg bg-danger text-danger-fg border-none flex items-center justify-center cursor-not-allowed transition-all" disabled title={i18nT('components.chatInput.killing')} aria-label={i18nT('components.chatInput.killing_session')} data-testid="stop-button-killing">
                     <Loader2 size={18} className="animate-spin" />
                   </button>
                 )
               ) : stopState === 'soft_pending' ? (
                 <div className="flex items-center gap-1.5">
                   <motion.button
+                    key="stop-soft-pending"
+                    type="button"
                     className="w-8 h-8 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all"
                     onClick={onStop}
                     title={i18nT('components.chatInput.force_kill_discards_in_progress_work_and_queued')}
@@ -3439,7 +3442,7 @@ function ChatInput({
                   <span className="text-xs text-muted whitespace-nowrap" data-testid="stop-force-hint">{i18nT('components.chatInput.click_again_to_force_stop')}</span>
                 </div>
               ) : isQueued ? (
-                <button className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 transition-all" onClick={onStop} title={i18nT('components.chatInput.stopping')} aria-label={i18nT('components.chatInput.stopping_2')}>
+                <button key="stop-queued" type="button" className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 transition-all" onClick={onStop} title={i18nT('components.chatInput.stopping')} aria-label={i18nT('components.chatInput.stopping_2')}>
                   <Loader2 size={18} className="animate-spin" />
                 </button>
               ) :
@@ -3461,12 +3464,12 @@ function ChatInput({
                     disabled={disabled}
                   />
                 ) : (
-                  <button className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 disabled:opacity-30 disabled:cursor-not-allowed transition-all" onClick={fireComposer} disabled={disabled} title={i18nT('components.chatInput.queue_message')} aria-label={i18nT('components.chatInput.queue_message')}>
+                  <button key="queue-message" type="button" className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 disabled:opacity-30 disabled:cursor-not-allowed transition-all" onClick={fireComposer} disabled={disabled} title={i18nT('components.chatInput.queue_message')} aria-label={i18nT('components.chatInput.queue_message')}>
                     <ArrowUpFromLine size={18} />
                   </button>
                 )
               ) : onStop ? (
-                <button className="w-8 h-8 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all" onClick={onStop} title={i18nT('components.chatInput.stop_generation')} aria-label={i18nT('components.chatInput.stop_generation')} data-testid="stop-button-armed">
+                <button key="stop-armed" type="button" className="w-8 h-8 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all" onClick={onStop} title={i18nT('components.chatInput.stop_generation')} aria-label={i18nT('components.chatInput.stop_generation')} data-testid="stop-button-armed">
                   <Square size={18} fill="currentColor" />
                 </button>
               ) : (
@@ -3526,6 +3529,8 @@ function ChatInput({
               */}
               {continuable && onContinue && !value.trim() && !pendingFiles.length && !hasSessionRefs ? (
                 <button
+                  key="composer-continue"
+                  type="button"
                   className="primary h-8 px-3 rounded-full bg-accent text-accent-fg border-none inline-flex items-center gap-1.5 text-[12px] font-medium leading-none cursor-pointer hover:bg-accent-hover disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                   onClick={onContinue}
                   disabled={continuing || disabled || optimizing || !connected}
@@ -3538,6 +3543,8 @@ function ChatInput({
                 </button>
               ) : (
               <button
+                key="composer-send"
+                type="button"
                 className="primary w-8 h-8 rounded-full bg-accent text-accent-fg border-none flex items-center justify-center cursor-pointer hover:bg-accent-hover disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                 onClick={fireComposer}
                 disabled={(!value.trim() && !pendingFiles.length && !hasSessionRefs) || disabled || optimizing || !connected}

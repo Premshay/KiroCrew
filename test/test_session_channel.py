@@ -912,6 +912,12 @@ class TestAttachedSessionWake:
         assert stop_kwargs["force"] is False
         assert stop_kwargs["preserve_queue"] is True
         assert slot._stop_state == "soft_pending"
+        channel_stop_cards = [
+            json.loads(msg["cls"])
+            for msg in slot.messages
+            if msg.get("role") == "system" and msg.get("cls")
+        ]
+        assert channel_stop_cards[-1]["source"] == "channel"
         assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
         assert slot._queue[1]["content"] == "later"
         assert slot.peer_channel_inbox_payload()[0]["message_id"] == "interrupt2"

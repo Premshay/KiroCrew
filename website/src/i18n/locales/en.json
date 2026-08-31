@@ -5796,6 +5796,8 @@
         "turn_diff": "Turn Diff"
       },
       "stopEventCard": {
+        "incoming_message_interrupted": "Incoming message interrupted the prior turn",
+        "incoming_message_interrupting": "Incoming message interrupting current turn…",
         "stop_failed_session_reset": "Stop failed, session reset",
         "stop_failed_session_reset_2": "[Stop Failed, Session Reset]",
         "stopped": "Stopped",
