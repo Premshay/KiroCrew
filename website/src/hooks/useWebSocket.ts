@@ -1138,6 +1138,9 @@ export function useWebSocket() {
           case 'chat_message':
             flushChunks()
             dispatch(sseChatMessage(data))
+            if (data.slot && data.role === 'compacting') {
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'compacting', text: 'Compacting…', ts: Date.now() }))
+            }
             // Re-rank the sidebar the instant a session sees a message, instead of waiting
             // for the next full slots push. `last_ts` moves for agent output too (it feeds
             // "last message" reads); the ORDERING key moves only for an inbound prompt —

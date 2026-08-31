@@ -353,6 +353,30 @@ describe('switchSlot.pending', () => {
     expect(state.messages[1].content).toBe('streaming text')
   })
 
+  it('fulfilled preserves a newer compaction phase for the incoming slot', () => {
+    let state = { ...initial, activeSlot: 'old' }
+    state = reducer(state, { type: 'chat/switchSlot/pending', meta: { arg: 'new', requestId: 'r1', requestStatus: 'pending' } })
+    state = reducer(state, sseChatMessage({ slot: 'new', role: 'compacting', content: '' }))
+
+    state = reducer(state, {
+      type: 'chat/switchSlot/fulfilled',
+      meta: { arg: 'new', requestId: 'r1', requestStatus: 'fulfilled' },
+      payload: { key: 'new', messages: [], running: true, stopping: false, hasMore: false, total: 0, queue: [] },
+    })
+
+    expect(state.slotState).toBe('compacting')
+    expect(state.slotRun.new?.state).toBe('compacting')
+
+    state = reducer(state, {
+      type: 'chat/switchSlot/fulfilled',
+      meta: { arg: 'new', requestId: 'r1', requestStatus: 'fulfilled' },
+      payload: { key: 'new', messages: [], running: false, stopping: false, hasMore: false, total: 0, queue: [] },
+    })
+
+    expect(state.slotState).toBe('idle')
+    expect(state.slotRun.new?.state).toBe('idle')
+  })
+
   it('fulfilled sets slotRunning from server response', () => {
     let state = { ...initial, activeSlot: 'old', slotRunning: true }
     state = reducer(state, { type: 'chat/switchSlot/pending', meta: { arg: 'new', requestId: 'r1', requestStatus: 'pending' } })

@@ -149,6 +149,7 @@ const ROW_ICON_PX = 10
  *  raw tool title) via toolStatusLabel, so the row agrees with the inline tool
  *  pill in the transcript rather than always showing the purpose. */
 function slotStatusText(detail: { kind?: string; text?: string; toolName?: string } | undefined, simplifiedToolNames: boolean, uiLang: string): string {
+  if (detail?.kind === 'compacting') return i18nT('pages.chat.chatFooter.compacting')
   if (detail?.kind === 'streaming') return i18nT('pages.chatSidebar.streaming')
   if (detail?.kind === 'thinking' && detail.text === 'Thinking…') return i18nT('pages.chatSidebar.thinking')
   return toolStatusLabel(detail, simplifiedToolNames, uiLang) || i18nT('pages.chatSidebar.thinking')
