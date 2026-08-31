@@ -71,6 +71,42 @@ describe('j helper 429 mapping', () => {
     expect((err as ApiError).message).not.toContain('throttlingReasons')
   })
 
+  it('keeps a Kiro Crew capacity refusal instead of the tunnel text', async () => {
+    // The channel cap answers 429 with an actionable instruction. Replacing it
+    // on the status code alone told the operator the tunnel was throttling and
+    // to reload — for a refusal that no amount of waiting or reloading clears.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      '{"error": "Channel limit reached. Close an existing channel first."}',
+      { status: 429 },
+    )))
+    const err = await api.kiroUsage().catch((e: unknown) => e)
+    expect((err as ApiError).status).toBe(429)
+    expect((err as ApiError).message).toBe('Channel limit reached. Close an existing channel first.')
+    expect((err as ApiError).message).not.toContain('tunnel edge')
+  })
+
+  it('still shows the tunnel text when the edge answers with only `message`', async () => {
+    // The discriminator is the `error` FIELD, not the presence of JSON: API
+    // Gateway sets `message`, so unwrapping that too would resurrect the opaque
+    // "Rate exceeded" this mapping exists to hide.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      '{"message":"Rate exceeded","throttlingReasons":null}',
+      { status: 429 },
+    )))
+    const err = await api.kiroUsage().catch((e: unknown) => e)
+    expect((err as ApiError).message).toContain('Rate limited by the tunnel edge')
+    expect((err as ApiError).message).not.toContain('Rate exceeded')
+  })
+
+  it('falls back to the tunnel text for a non-JSON 429 body', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      'too many requests',
+      { status: 429 },
+    )))
+    const err = await api.kiroUsage().catch((e: unknown) => e)
+    expect((err as ApiError).message).toContain('Rate limited by the tunnel edge')
+  })
+
   it('unwraps a non-429 JSON error body to the human message', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
       '{"error": "boom"}',

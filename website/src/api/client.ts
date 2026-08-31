@@ -1164,15 +1164,49 @@ export const isAuthExpiredError = (e: unknown): boolean =>
   e instanceof ApiError && e.authRequired
 
 /**
+ * The `error` field of a JSON error envelope, or '' when the body is not JSON
+ * or carries no such field. Deliberately narrower than the unwrap below, which
+ * also accepts `detail`/`message`: this one is used to tell a Kiro Crew refusal
+ * apart from an edge throttle, and `message` is exactly the field the edge sets.
+ */
+const errorFieldOf = (body: string): string => {
+  const trimmed = body.trim()
+  if (!trimmed.startsWith('{')) return ''
+  try {
+    const msg = (JSON.parse(trimmed) as { error?: unknown })?.error
+    return typeof msg === 'string' && msg.trim() ? msg : ''
+  } catch { return '' }
+}
+
+/**
  * Map raw edge/proxy error bodies to a human-readable message. A dashboard
  * served through Builder Tunnels sits behind API Gateway, whose throttle
  * response is the opaque `{"message":"Rate exceeded","throttlingReasons":null}`
- * — rendering that verbatim in an error card is a terrible UX. The mapped
- * message only ever shows after the QueryClient's 429 retry ladder
- * (api/queryClient.ts) is exhausted.
+ * — rendering that verbatim in an error card is a terrible UX.
+ *
+ * The retry ladder in api/queryClient.ts absorbs edge throttles BEFORE this
+ * message is reached, but only for calls that go through React Query. Direct
+ * `post`/`put`/`del` handlers (channel create among them) have no retry at all,
+ * so for those this text is the FIRST thing the operator sees rather than the
+ * last resort — which is why it must not be shown unless the edge really is
+ * what answered.
  */
 export const friendlyErrText = (status: number, body: string): string => {
   if (status === 429) {
+    // 429 is NOT only the edge. Kiro Crew answers its own capacity refusals
+    // with it too — the channel cap, the live-slot cap, the fork cap, the auth
+    // throttle — and every one of those carries an actionable {"error": "…"}
+    // saying what to do ("Channel limit reached. Close an existing channel
+    // first."). Returning the tunnel text on the status code alone threw that
+    // away and sent the operator after a network problem they did not have.
+    //
+    // `error` is the discriminator, not a guess: every Kiro Crew refusal uses
+    // that field, while API Gateway's throttle body is `{"message":"Rate
+    // exceeded","throttlingReasons":null}` — no `error`, and its `message` is
+    // the opaque string this function exists to replace. So an `error` present
+    // means the gateway answered and the edge did not.
+    const serverMsg = errorFieldOf(body)
+    if (serverMsg) return serverMsg
     return i18nT('api.client.rate_limited_by_the_tunnel_edge_http_429_too_man')
   }
   // Backends return errors as {"error": "…"} (or detail/message). Unwrap the

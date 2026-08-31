@@ -22,8 +22,13 @@ import userEvent from '@testing-library/user-event'
 import ChannelPage from '../pages/ChannelPage'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
+import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
 
 vi.mock('../api/client')
+// SimpleSelect picks a native control on touch devices and a Radix popup
+// otherwise. The picker freshness tests below need the native one, where every
+// option is in the DOM rather than in an unmounted popup.
+vi.mock('../hooks/useIsTouchDevice')
 
 beforeAll(() => {
   // jsdom doesn't implement scrollIntoView
@@ -723,5 +728,68 @@ describe('ChannelPage — load failures', () => {
     vi.mocked(api).channelGet = vi.fn().mockRejectedValue(new Error('not found'))
     await renderPage()
     expect(screen.getByRole('heading', { name: 'Gamma rollout' })).toBeInTheDocument()
+  })
+})
+
+describe('attach-session picker freshness', () => {
+  // The app's QueryClient sets `staleTime: Infinity` (freshness comes from
+  // WebSocket pushes invalidating a key), and NOTHING invalidates
+  // ['channel-attachable-slots']. Inheriting that default froze the list at the
+  // first fetch of the page load, so a session opened afterwards could never be
+  // attached and one closed since kept its row. These tests run with the
+  // production default so the query's own staleTime is what they measure.
+  const slot = (key: string, title: string) => ({ key, title, agent: 'crew-claude' })
+  const isTouch = vi.mocked(useIsTouchDevice)
+
+  beforeEach(() => { isTouch.mockReturnValue(false) })
+
+  async function openPicker() {
+    await userEvent.click(await screen.findByRole('button', { name: 'Sessions' }))
+  }
+
+  it('refetches the slot list each time the picker is opened', async () => {
+    mockApi([channelOf()])
+    vi.mocked(api).chatSlots = vi.fn()
+      .mockResolvedValueOnce([slot('chat-1', 'Older session')])
+      .mockResolvedValue([slot('chat-2', 'agy-pro'), slot('chat-1', 'Older session')])
+
+    renderWithProviders(<ChannelPage />, { queryDefaults: { staleTime: Infinity } })
+    await waitFor(() => expect(screen.queryByText('Loading channels...')).not.toBeInTheDocument())
+    await openAgentsPanel()
+
+    await openPicker()
+    await waitFor(() => expect(vi.mocked(api).chatSlots).toHaveBeenCalledTimes(1))
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    // A session opened while the page was already loaded.
+    await openPicker()
+    await waitFor(() => expect(vi.mocked(api).chatSlots).toHaveBeenCalledTimes(2))
+  })
+
+  it('shows a session created after the page loaded', async () => {
+    mockApi([channelOf()])
+    vi.mocked(api).chatSlots = vi.fn()
+      .mockResolvedValueOnce([slot('chat-1', 'Older session')])
+      .mockResolvedValue([slot('chat-2', 'agy-pro'), slot('chat-1', 'Older session')])
+
+    renderWithProviders(<ChannelPage />, { queryDefaults: { staleTime: Infinity } })
+    await waitFor(() => expect(screen.queryByText('Loading channels...')).not.toBeInTheDocument())
+    await openAgentsPanel()
+
+    // SimpleSelect renders every option into the DOM only on its native-control
+    // path; the Radix path keeps them in a popup that is not mounted until it is
+    // opened. Both paths receive the SAME `options` prop, so asserting on the
+    // native one is asserting what the picker was given — and it is the only
+    // form where "is this session offered at all?" is directly observable.
+    isTouch.mockReturnValue(true)
+
+    await openPicker()
+    expect(await screen.findByRole('option', { name: /Older session/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /agy-pro/ })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    // A session opened in the folder after the page had already loaded.
+    await openPicker()
+    expect(await screen.findByRole('option', { name: /agy-pro/ })).toBeInTheDocument()
   })
 })

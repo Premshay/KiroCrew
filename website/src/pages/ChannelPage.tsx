@@ -451,6 +451,14 @@ function AttachSessionForm({ attachedSessionKeys, onAttach, onCancel }: {
   const { data: slots = [] } = useQuery<DashboardSlot[]>({
     queryKey: ['channel-attachable-slots'],
     queryFn: () => api.chatSlots(),
+    // The app default is `staleTime: Infinity` — freshness comes from
+    // WebSocket pushes invalidating a key. Nothing invalidates THIS key, so
+    // the inherited default froze the list at the first fetch of the page
+    // load: a session opened afterwards could never be attached, and one
+    // closed since kept a row. This form mounts only when the operator opens
+    // the picker, so refetching per mount is one request on a deliberate
+    // action rather than polling.
+    staleTime: 0,
   })
   const attachable = slots.filter(slot => slot.key && !attachedSessionKeys.has(`dashboard:${slot.key}`))
   const [selected, setSelected] = useState('')
