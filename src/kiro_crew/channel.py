@@ -254,6 +254,22 @@ class Channel:
         """Return true only for the channel's canonical coordinator identity."""
         return self.orchestrator_id is not None and member.id == self.orchestrator_id
 
+    def set_coordinator(self, agent_id: str) -> bool:
+        """Assign the channel's one coordinator to an existing member."""
+        agent = self.members.get(agent_id)
+        if not agent:
+            return False
+        for member in self.members.values():
+            member.is_orchestrator = member.id == agent_id
+        agent.listen_mode = ListenMode.ALL
+        self.orchestrator_id = agent_id
+        self._broadcast(
+            "channel_coordinator_changed",
+            {"channel_id": self.id, "agent_id": agent_id},
+        )
+        self._save()
+        return True
+
     def add_agent(
         self,
         role: str,

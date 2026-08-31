@@ -80,6 +80,7 @@ async def test_add_agent_rejects_invalid_fields_before_mutation(manager, spawn_s
             {"approval": "trusted", "listen": ["all"]},
             "channel_agent_listen_invalid",
         ),
+        ({"coordinator": False}, "channel_agent_coordinator_invalid"),
     ],
 )
 async def test_update_agent_rejects_invalid_enums_without_saving(
@@ -123,3 +124,21 @@ async def test_update_agent_still_applies_valid_enum_values(manager, monkeypatch
     assert agent.approval_policy is ApprovalPolicy.TRUSTED
     assert agent.listen_mode is ListenMode.SILENT
     save_spy.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_update_agent_can_transfer_coordinator(manager):
+    channel = manager.create("incident")
+    first = channel.add_agent(role="First", is_orchestrator=True)
+    second = channel.add_agent(role="Second")
+    assert first is not None and second is not None
+
+    response = await _invoke(
+        handlers.api_channel_update_agent,
+        _request(manager, {"coordinator": True}, id=channel.id, aid=second.id),
+    )
+
+    assert response.status == 200
+    assert channel.orchestrator_id == second.id
+    assert first.is_orchestrator is False
+    assert second.is_orchestrator is True

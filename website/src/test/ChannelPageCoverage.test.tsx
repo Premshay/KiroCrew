@@ -364,6 +364,21 @@ describe('ChannelPage — agents sidebar', () => {
     await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument())
   })
 
+  it('transfers coordinator authority from the agent controls', async () => {
+    mockApi([channelOf({
+      members: {
+        a1: member({ id: 'a1', role: 'Coordinator', is_orchestrator: true }),
+        a2: member({ id: 'a2', role: 'Worker' }),
+      },
+    })])
+    await renderPage()
+    await openAgentsPanel('2 agents')
+    await userEvent.click(screen.getByRole('button', { name: 'Make coordinator' }))
+    await waitFor(() => expect(vi.mocked(api).channelUpdateAgent)
+      .toHaveBeenCalledWith('ch1', 'a2', { coordinator: true }))
+    expect(screen.getAllByText('Coordinator')).toHaveLength(2)
+  })
+
   it('keeps the optimistic listen mode when the patch fails', async () => {
     vi.mocked(api).channelUpdateAgent = vi.fn().mockRejectedValue(new Error('nope'))
     await renderPage()
@@ -518,7 +533,7 @@ describe('ChannelPage — New Channel dialog', () => {
     await userEvent.click(within(dialog).getByText('Custom (empty)'))
     fireEvent.change(within(dialog).getByLabelText('Topic'), { target: { value: 'Scratch' } })
     await userEvent.click(within(dialog).getByRole('button', { name: 'Create' }))
-    await waitFor(() => expect(vi.mocked(api).channelCreate).toHaveBeenCalledWith('Scratch', []))
+    await waitFor(() => expect(vi.mocked(api).channelCreate).toHaveBeenCalledWith('Scratch', [], true))
   })
 
   it('labels a server preset this build has no catalog key for', async () => {

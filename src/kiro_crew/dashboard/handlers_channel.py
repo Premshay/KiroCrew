@@ -432,12 +432,37 @@ async def api_channel_post(request: web.Request) -> web.Response:
 async def api_channel_add_agent(request: web.Request) -> web.Response:
     ch, body = await _get_channel_body(request)
 
+    role = body.get("role", "Agent")
+    agent_name = body.get("agent", "")
+    task = body.get("task", ch.topic)
+    is_orchestrator = body.get("is_orchestrator", False)
+    approval = body.get("approval", "writes")
+    for value, code in (
+        (role, "channel_agent_role_type_invalid"),
+        (agent_name, "channel_agent_name_type_invalid"),
+        (task, "channel_agent_task_type_invalid"),
+    ):
+        if not isinstance(value, str):
+            return web.json_response({"error": "invalid field", "code": code}, status=400)
+    if not isinstance(is_orchestrator, bool):
+        return web.json_response(
+            {"error": "is_orchestrator must be boolean", "code": "channel_agent_orchestrator_type_invalid"},
+            status=400,
+        )
+    from kiro_crew.channel import ApprovalPolicy
+
+    if not isinstance(approval, str) or approval not in {policy.value for policy in ApprovalPolicy}:
+        return web.json_response(
+            {"error": "invalid approval policy", "code": "channel_agent_approval_invalid"},
+            status=400,
+        )
+
     agent = ch.add_agent(
-        role=body.get("role", "Agent")[:100],
-        agent_name=body.get("agent", ""),
-        task=body.get("task", ch.topic),
-        is_orchestrator=body.get("is_orchestrator", False),
-        approval_policy=body.get("approval", "writes"),
+        role=role[:100],
+        agent_name=agent_name,
+        task=task,
+        is_orchestrator=is_orchestrator,
+        approval_policy=approval,
     )
     if not agent:
         return web.json_response(
@@ -456,21 +481,40 @@ async def api_channel_update_agent(request: web.Request) -> web.Response:
     if not agent:
         return web.json_response({"error": "agent not found"}, status=404)
 
+    coordinator = body.get("coordinator")
+    if coordinator is not None and (not isinstance(coordinator, bool) or coordinator is not True):
+        return web.json_response(
+            {"error": "coordinator must be true", "code": "channel_agent_coordinator_invalid"},
+            status=400,
+        )
+
+    from kiro_crew.channel import ApprovalPolicy, ListenMode
+
+    approval = body.get("approval")
+    if approval is not None and (
+        not isinstance(approval, str) or approval not in {policy.value for policy in ApprovalPolicy}
+    ):
+        return web.json_response(
+            {"error": "invalid approval policy", "code": "channel_agent_approval_invalid"},
+            status=400,
+        )
+    listen = body.get("listen")
+    if listen is not None and (
+        not isinstance(listen, str) or listen not in {mode.value for mode in ListenMode}
+    ):
+        return web.json_response(
+            {"error": "invalid listen mode", "code": "channel_agent_listen_invalid"},
+            status=400,
+        )
+
     if "approval" in body:
-        from kiro_crew.channel import ApprovalPolicy
-
-        try:
-            agent.approval_policy = ApprovalPolicy(body["approval"])
-        except ValueError:
-            pass
+        agent.approval_policy = ApprovalPolicy(approval)
     if "listen" in body:
-        from kiro_crew.channel import ListenMode
-
-        try:
-            agent.listen_mode = ListenMode(body["listen"])
-        except ValueError:
-            pass
-    ch._save()
+        agent.listen_mode = ListenMode(listen)
+    if coordinator:
+        ch.set_coordinator(agent.id)
+    else:
+        ch._save()
     return web.json_response({"ok": True, "agent": agent.to_dict()})
 
 

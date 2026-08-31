@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo, type ReactNode } from 'react'
 import Clickable from '../components/Clickable'
-import { Hourglass, Ear, Check, X, Wrench, Radio, VolumeX, User, MessageSquare, Users, Zap, AlertTriangle, RotateCcw } from 'lucide-react'
+import { Hourglass, Ear, Check, X, Wrench, Radio, VolumeX, User, MessageSquare, Users, Zap, AlertTriangle, RotateCcw, Crown } from 'lucide-react'
 import { useAppSelector } from '../store'
 import type { RootState } from '../store'
 import { api } from '../api/client'
@@ -30,6 +30,7 @@ interface ChannelAgent {
   state: 'pending' | 'working' | 'listening' | 'done' | 'failed' | 'tool_running'
   listenMode: 'all' | 'mention' | 'silent'
   approvalPolicy: 'all' | 'writes' | 'trusted'
+  isCoordinator: boolean
 }
 
 interface ChannelMessage {
@@ -59,6 +60,7 @@ const mapAgent = (a: any): ChannelAgent => ({
   sessionKey: a.session_key || a.sessionKey,
   listenMode: a.listen_mode || a.listenMode || 'mention',
   approvalPolicy: a.approval_policy || a.approvalPolicy || 'writes',
+  isCoordinator: Boolean(a.is_orchestrator ?? a.isCoordinator),
 })
 
 interface DashboardSlot {
@@ -197,8 +199,8 @@ function MessageBubble({ msg, agents, onReply, onOpenThread, onApprove }: {
 
 const LISTEN_MODES: Array<ChannelAgent['listenMode']> = ['all', 'mention', 'silent']
 
-function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
-  agent: ChannelAgent; onDismiss: () => void; onListenChange: (m: ChannelAgent['listenMode']) => void; onClearContext: () => void
+function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext, onSetCoordinator }: {
+  agent: ChannelAgent; onDismiss: () => void; onListenChange: (m: ChannelAgent['listenMode']) => void; onClearContext: () => void; onSetCoordinator: () => void
 }) {
   const [menu, setMenu] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -220,7 +222,10 @@ function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
           <div className="text-sm font-medium text-text break-words" title={agent.role}>{agent.role}</div>
           {agent.agentName && <div className="text-[11px] text-muted font-mono break-all" title={agent.agentName}>{agent.agentName}</div>}
         </div>
-        <Badge variant={STATE_BADGE[agent.state]?.variant || 'warn'}>{STATE_BADGE[agent.state]?.label || agent.state}</Badge>
+        <div className="flex items-center gap-1">
+          {agent.isCoordinator && <Badge variant="aim">{i18nT('pages.channelPage.coordinator')}</Badge>}
+          <Badge variant={STATE_BADGE[agent.state]?.variant || 'warn'}>{STATE_BADGE[agent.state]?.label || agent.state}</Badge>
+        </div>
       </div>
       <div className="flex items-center justify-between gap-2 mt-1.5">
         <div className="relative inline-block" ref={menuRef}>
@@ -237,6 +242,7 @@ function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
           </div>}
         </div>
         <div className="flex items-center gap-1 shrink-0">
+          {!agent.isCoordinator && <Btn onClick={onSetCoordinator} aria-label={i18nT('pages.channelPage.make_coordinator')} title={i18nT('pages.channelPage.make_coordinator')}><Crown className="lucide-inline" /></Btn>}
           {alive && <Btn onClick={onClearContext} aria-label={i18nT('pages.channelPage.clear_context')} title={i18nT('pages.channelPage.clear_context')}><RotateCcw className="lucide-inline" /></Btn>}
           <Btn onClick={onDismiss} aria-label={i18nT('pages.channelPage.dismiss')} danger title={i18nT('pages.channelPage.dismiss')}><X className="lucide-inline" /></Btn>
         </div>
@@ -588,6 +594,10 @@ export default function ChannelPage() {
         setChannels(prev => prev.map(c => c.id === data.channel_id ? {
           ...c, agents: c.agents.filter(a => a.id !== data.agent_id)
         } : c))
+      } else if (type === 'channel_coordinator_changed') {
+        setChannels(prev => prev.map(c => c.id === data.channel_id ? {
+          ...c, agents: c.agents.map(a => ({ ...a, isCoordinator: a.id === data.agent_id }))
+        } : c))
       } else if (type === 'channel_context_cleared' && data.scope === 'all') {
         // Another client cleared shared context — drop our stale message buffer.
         setChannels(prev => prev.map(c => c.id === data.channel_id ? { ...c, messages: [] } : c))
@@ -818,6 +828,14 @@ export default function ChannelPage() {
                     <AgentControlRow key={agent.id} agent={agent}
                       onDismiss={() => handleDismiss(agent.id)}
                       onListenChange={m => handleListenChange(agent.id, m)}
+                      onSetCoordinator={async () => {
+                        try {
+                          await api.channelUpdateAgent(channel.id, agent.id, { coordinator: true })
+                          setChannels(prev => prev.map(c => c.id === channel.id ? {
+                            ...c, agents: c.agents.map(a => ({ ...a, isCoordinator: a.id === agent.id }))
+                          } : c))
+                        } catch (err) { setError(apiError(err, i18nT('pages.channelPage.failed_to_set_coordinator'))) }
+                      }}
                       onClearContext={async () => {
                         if (!confirm(i18nT('pages.channelPage.reset_role_s_llm_session_the_channel_s_shared_me', { role: agent.role }))) return
                         try {
