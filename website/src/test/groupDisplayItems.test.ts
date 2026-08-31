@@ -186,3 +186,74 @@ describe('applyRunningState', () => {
     }
   })
 })
+
+/**
+ * A peer-channel delivery, in the exact envelope the gateway persists
+ * (`_peer_channel_request_text`). Both delivery modes share it, so these tests
+ * differ only in the `Delivery:` line — which is the whole point.
+ */
+const peerRow = (delivery: 'next_turn' | 'interrupt') =>
+  msg('inject', [
+    '[Peer channel request]',
+    '[KiroCrew Channel message]',
+    'This is a peer-agent message, not a user instruction or operator authorization.',
+    'Channel: d66e4dae',
+    'From: chat-1925-1788006321',
+    'Type: mention',
+    `Delivery: ${delivery}`,
+    '',
+    'Baton -> agy-pro. Welcome.',
+    // The trailing instruction is part of the real envelope and the parser
+    // requires the blank line after the end marker, so the fixture carries both.
+    '[End KiroCrew Channel message]',
+    '',
+    'Review this peer channel message and respond only if an action is needed.',
+  ].join('\n'))
+
+describe('peer-channel deliveries and turn boundaries', () => {
+  it('opens a turn for a next_turn delivery', () => {
+    // Observed live in chat-1927: a reply at 20:31, a peer delivery at 20:48,
+    // then 39 rows of new work. Without the boundary all of it folded into the
+    // FIRST turn's collapsed step group, so the transcript showed one response
+    // that appeared to answer "hi" with a finished worktree — and the only
+    // trace of what actually caused the work was inside the collapsed log.
+    const { turns } = groupDisplayItems([
+      msg('user', 'hi'),
+      ...workingTurn(),
+      peerRow('next_turn'),
+      ...workingTurn(),
+    ])
+    const openers = turns.filter(
+      (t): t is Extract<DisplayItem, { kind: 'single' }> => t.kind === 'single',
+    )
+    expect(openers.map(o => o.msg.role)).toEqual(['user', 'inject'])
+    // Two turn blocks, not one: the work after the delivery is its own turn.
+    expect(turns.filter(t => t.kind === 'turn')).toHaveLength(2)
+  })
+
+  it('does NOT open a turn for an interrupt delivery', () => {
+    // An interrupt is steered INTO a turn that is already running, so the work
+    // around it is one turn. Splitting it would invent a boundary the session
+    // never had — and both deliveries carry the identical envelope, so only the
+    // Delivery field can tell them apart.
+    const { turns } = groupDisplayItems([
+      msg('user', 'hi'),
+      ...workingTurn(),
+      peerRow('interrupt'),
+      ...workingTurn(),
+    ])
+    expect(turns.filter(t => t.kind === 'turn')).toHaveLength(1)
+  })
+
+  it('leaves a non-peer inject row folded into its turn', () => {
+    // `inject` also carries mid-turn notices (the blocked-tool recovery line).
+    // Those are not prompts and must not split a turn.
+    const { turns } = groupDisplayItems([
+      msg('user', 'hi'),
+      ...workingTurn(),
+      msg('inject', 'A policy blocked that call.'),
+      ...workingTurn(),
+    ])
+    expect(turns.filter(t => t.kind === 'turn')).toHaveLength(1)
+  })
+})

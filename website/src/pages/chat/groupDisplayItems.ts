@@ -1,6 +1,7 @@
 import type { ChatMessage } from '../../types'
 import type { DisplayItem, TurnItem } from './types'
 import { isSubagentCompletionMessage } from './subagentCompletion'
+import { isPeerChannelTurnOpener } from './peerChannelRequest'
 
 /** Roles that fold into a collapsible group in the turn view. Thinking is NOT
  *  here: it carries real content and renders as its own standalone block (a
@@ -19,6 +20,25 @@ export const GROUPABLE = new Set(['permission'])
  * of them — measured at a 61-display-row gap in a loop-driven session.
  */
 export const TURN_OPENER_ROLES = new Set(['user', 'nudge', 'subagent'])
+
+/**
+ * Whether *msg* opens a turn — the single predicate both this pass and the
+ * pinned-prompt scan ask.
+ *
+ * Role alone was enough while every opener had its own role. A peer-channel
+ * delivery does not: it arrives as `inject`, a role that also carries mid-turn
+ * notices which must NOT split a turn, so the peer case needs its envelope
+ * inspected. Adding `inject` to the role set instead would break the refusal
+ * notice and the peer INTERRUPT, both of which are injected into a turn already
+ * running.
+ *
+ * A function rather than two call sites doing `ROLES.has(role) || peerCheck()`,
+ * for the reason TURN_OPENER_ROLES was exported in the first place: when the
+ * grouping and the pin scan disagree about what a turn is, the pin walks past
+ * every opener it does not recognise.
+ */
+export const isTurnOpener = (msg: ChatMessage): boolean =>
+  TURN_OPENER_ROLES.has(msg.role) || isPeerChannelTurnOpener(msg)
 
 export interface GroupedTurns {
   turns: DisplayItem[]
@@ -94,7 +114,7 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
     // collapsed step group and the cycle chip disappears. A sub-agent
     // completion is the same case: the gateway injects it as the next turn's
     // input, so the agent's reply belongs BELOW the card, not beside it.
-    if (item.kind === 'single' && TURN_OPENER_ROLES.has(item.msg.role)) {
+    if (item.kind === 'single' && isTurnOpener(item.msg)) {
       if (turnItems.length > 0) { flushTurn(turnItems, true); turnItems = [] }
       // Track whether this subagent completion has synthesis pending
       _lastSubagentHadSynthesis = item.msg.role === 'subagent' &&

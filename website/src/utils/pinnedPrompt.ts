@@ -1,5 +1,5 @@
 import type { DisplayItem } from '../pages/chat/types'
-import { TURN_OPENER_ROLES } from '../pages/chat/groupDisplayItems'
+import { isTurnOpener } from '../pages/chat/groupDisplayItems'
 import { mdImageDestToPath } from './fileTokens'
 
 /**
@@ -61,16 +61,17 @@ export function pinHandoffY(foldY: number, collapsedCardH: number): number {
 /**
  * Rows that can take the pin: the ones that OPEN a turn.
  *
- * Derived from `TURN_OPENER_ROLES` rather than restated, because the two lists
- * disagreeing is the defect this exists to prevent. A nudge and a subagent
- * completion are machine-injected, but each IS the thing that started the turn
- * being read, and a session made almost entirely of them (a babysit loop, a
- * workflow fan-out) otherwise offers no pinnable row cycle after cycle — the walk
- * upward skips every one and lands on the human's last typed message, dozens of
- * turns and tens of thousands of pixels away.
+ * Derived from `isTurnOpener` rather than restated, because the two rules
+ * disagreeing is the defect this exists to prevent. A nudge, a subagent
+ * completion and a peer-channel delivery are machine-injected, but each IS the
+ * thing that started the turn being read, and a session made almost entirely of
+ * them (a babysit loop, a workflow fan-out, a coordinated lane) otherwise offers
+ * no pinnable row cycle after cycle — the walk upward skips every one and lands
+ * on the human's last typed message, dozens of turns and tens of thousands of
+ * pixels away.
  */
 function isPrompt(item: DisplayItem | undefined): boolean {
-  return !!item && item.kind === 'single' && TURN_OPENER_ROLES.has(item.msg.role)
+  return !!item && item.kind === 'single' && isTurnOpener(item.msg)
 }
 
 /**
