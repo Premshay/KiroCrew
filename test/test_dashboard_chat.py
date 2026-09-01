@@ -34,6 +34,19 @@ from kiro_crew.dashboard.state import (
 from kiro_crew.history import ConversationLog
 
 
+def _arm_inner_client_handlers(inner):
+    """Model the two handlers `_run_chat` registers on the inner client.
+
+    They differ in kind and a mock has to match: the autonomous-turn setter is
+    ``async def`` in ``acp/client.py``, the idle setter is not, and awaiting a
+    bare MagicMock child raises. Both are fork-only, so upstream's own client
+    mocks do not model them.
+    """
+    inner.set_claude_autonomous_turn_handler = AsyncMock()
+    inner.set_claude_idle_handler = MagicMock()
+    return inner
+
+
 def test_tool_call_ws_payload_preserves_shell_capability_signal():
     """The dashboard receives an explicit shell signal for indeterminate UX.
 
@@ -5607,10 +5620,16 @@ class TestRunChatSegmentFlush:
         from kiro_crew.dashboard.chat import _run_chat
 
         turn = asyncio.create_task(_run_chat(state, slot, "run ls"))
-        for _ in range(10):
+        # Wait for the request to be registered rather than spinning a fixed
+        # number of zero-sleep yields: how many yields `_run_chat` takes before
+        # the permission event is a function of what it awaits on the way in, so
+        # a fixed budget silently turns into "resolve an id that is not there
+        # yet" and fails on the resolve rather than on the timeline this covers.
+        for _ in range(500):
             if "req-1" in slot._approval_futures:
                 break
             await asyncio.sleep(0)
+        assert "req-1" in slot._approval_futures
         assert state.resolve_approval("req-1", True) is True
         await turn
 
@@ -6248,7 +6267,7 @@ class TestTokenPersistenceBackfill:
         # Expose `client.client._model` like the real provider wrappers
         inner = MagicMock()
         inner._model = prov_model
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
 
         async def _stream(msg):
             for ev in events:
@@ -6456,7 +6475,7 @@ class TestTokenPersistenceBackfill:
         client.context_usage_pct = MagicMock(return_value=10.0)
         inner = MagicMock()
         inner._model = ""  # empty at session-create time
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
 
         async def _stream(msg):
             # Simulate CC's `init` system event arriving mid-turn, after the
@@ -6725,7 +6744,7 @@ class TestKiroBackfillProfileGuard:
         client = MagicMock()
         inner = MagicMock()
         inner._model = prov_model
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
         return client
 
     def test_predicate_flags_bedrock_profile_ids(self):
@@ -6792,7 +6811,7 @@ class TestKiroBackfillProfileGuard:
         client.context_usage_pct = MagicMock(return_value=10.0)
         inner = MagicMock()
         inner._model = ""  # empty at create; kiro learns the profile mid-turn
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
 
         async def _stream(msg):
             # kiro resolves the picked alias to a concrete Bedrock profile id.
@@ -6918,7 +6937,7 @@ class TestPinnedModelWithheld:
         )
         inner = MagicMock()
         inner._model = ""
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
 
         async def _stream(msg):
             for ev in events:
@@ -7011,7 +7030,7 @@ class TestPinnedModelWithheld:
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-5"}])
         inner = MagicMock()
         inner._model = ""
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
 
         async def _stream(msg):
             for ev in events:
@@ -7058,7 +7077,7 @@ class TestPinnedModelWithheld:
         )
         inner = MagicMock()
         inner._model = ""
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
 
         async def _stream(msg):
             for ev in events:
@@ -7110,7 +7129,7 @@ class TestPinnedModelWithheld:
         client.available_models = MagicMock(return_value=[{"modelId": "claude-sonnet-5"}])
         inner = MagicMock()
         inner._model = ""
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
 
         async def _stream(msg):
             for ev in events:
@@ -7169,7 +7188,7 @@ class TestPinnedModelWithheld:
         )
         inner = MagicMock()
         inner._model = ""
-        client.client = inner
+        client.client = _arm_inner_client_handlers(inner)
 
         async def _stream(msg):
             for ev in events:
@@ -9760,6 +9779,13 @@ class TestOrchestratorPlanGateArming:
         client.available_models = MagicMock(return_value=[])
         client.client = MagicMock()
         client.client.pop_pending_oauth_requests = MagicMock(return_value=[])
+        # `_run_chat` publishes this inner client onto the slot and registers two
+        # handlers on it. They differ in kind and the mock has to match, because a
+        # bare MagicMock child is not awaitable: the autonomous-turn setter is
+        # `async def` (acp/client.py), the idle setter is not. Upstream's helper
+        # models neither -- upstream's `_run_chat` registers neither.
+        client.client.set_claude_autonomous_turn_handler = AsyncMock()
+        client.client.set_claude_idle_handler = MagicMock()
 
         async def _stream(msg):
             for ev in events:
@@ -15080,6 +15106,11 @@ class TestStopDuringSessionPrep:
 
         client = MagicMock()
         client.shutdown = AsyncMock()
+        # The fork's `_run_chat` registers an ASYNC autonomous-turn handler on the
+        # inner client; a bare MagicMock child is not awaitable. Modelled here so
+        # this test fails on the stop gate it is about, not on the registration.
+        client.client.set_claude_autonomous_turn_handler = AsyncMock()
+        client.client.set_claude_idle_handler = MagicMock()
 
         async def _stream(msg):
             stream_calls.append(msg)
