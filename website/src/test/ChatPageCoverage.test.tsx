@@ -180,6 +180,10 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       })),
       isAtBottom: false,
       getFollow: () => true,
+      // ChatPage's selection-retention effect calls this on every slot switch.
+      // Omitting it makes the stub narrower than the real hook, so the effect
+      // throws instead of the test asserting what it came to assert.
+      retainRange: vi.fn(),
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(() => false),
       measureRef: () => () => {},
@@ -309,6 +313,11 @@ function renderChatPage(messages: ChatMessage[], opts: RenderOpts = {}) {
       pendingInput: null, slotContextPct: {}, voicePlaying: false, voiceAudio: null,
       subagents: {}, toolLog: [], activityOpen: false, activityTab: 'logs',
       slotActivity: {}, slotHistory: [],
+      // Real initialState nulls these. Leaving them undefined makes
+      // switchSlot.fulfilled's staleness guard (`latestRequestId !== null`) read
+      // as "a newer switch superseded this one" and bail before the reducer sets
+      // the paging cursor.
+      slotSwitchRequestId: null, slotSwitchTarget: null, slotSwitchLatestRequestId: null,
       ...chat,
     },
   } as unknown as Partial<RootState>)

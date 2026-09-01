@@ -708,7 +708,16 @@ class SessionLifecycleService:
         try:
             if session:
                 await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
-                await session.provider.shutdown()
+                try:
+                    await session.provider.shutdown()
+                except Exception:
+                    # A native provider can already be dead. The durable map
+                    # boundary (the clear_sid above) is what prevents a later
+                    # session/load, and it has already run — a shutdown failure
+                    # must not abort the discard or propagate to the caller.
+                    self._deps.logger.warning(
+                        "Native shutdown failed while discarding %s", key, exc_info=True
+                    )
             await owner.release_subagent_runtime(key)
         finally:
             self._deps.logger.info(

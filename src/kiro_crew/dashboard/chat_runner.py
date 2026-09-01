@@ -7970,7 +7970,12 @@ async def _run_chat(
                 if slot._trusted_patterns and not _child_low_fidelity:
                     _tp_cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""
                     if _tp_cmd:
-                        _tp_check_title = f"Running: {_tp_cmd}"
+                        # The canonical command, with no display prefix.
+                        # ``matches_trusted_pattern`` treats its input as the
+                        # text that would run, so a "Running: " prefix is
+                        # matched as executable text and no bare-command
+                        # pattern can ever cover it.
+                        _tp_check_title = _tp_cmd
                     elif not event.tool_input:
                         _tp_check_title = event.title
                     else:

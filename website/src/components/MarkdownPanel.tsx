@@ -1616,8 +1616,8 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       // cannot see, and Cmd+S would let a hidden dirty editor answer a save the
       // user aimed at the tab in front of them.
       if (!active) return
-      // MERGE-REVIEW: upstream also guards on `confirmOpen` from its `useConfirm()`
-      // dialog. This fork still uses the blocking `window.confirm()`, which owns the
+      // Upstream also guards on `confirmOpen` from its `useConfirm()` dialog.
+      // This fork still uses the blocking `window.confirm()`, which owns the
       // event loop while open, so there is no such state to read here.
       if (e.key === 'Escape') { if (popover) { setPopover(null); clearHighlightMarks() } else if (fullscreen) setFullscreen(false); else guardedClose() }
       if ((e.metaKey || e.ctrlKey) && e.key === 's' && editing && dirty) { e.preventDefault(); handleSaveRef.current() }

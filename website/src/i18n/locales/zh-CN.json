@@ -11430,7 +11430,7 @@
         "insider": "Insider",
         "install_failed": "无法安装更新",
         "install_update_restart_app": "安装更新并重启应用",
-        "installing_quiet_note": "正在安装——Kiro Crew 会安静一两分钟，然后自动重启。",
+        "installing_quiet_note": "正在安装——{{productName}} 会安静一两分钟，然后自动重启。",
         "is_available": "可用。",
         "loading_changelog": "正在加载更新日志…",
         "manual_install_fallback": "如果更新无法完成，你可以{{link}}并覆盖安装。你的设置、对话和文件都会保留。",

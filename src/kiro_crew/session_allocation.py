@@ -1245,6 +1245,13 @@ class SessionAllocationService:
                         crew_agent=claim_crew,
                         watchdog=claim_watchdog,
                     )
+                    # A pooled worker has previously owned another slot, and its
+                    # transcript travels with the provider, not the slot. Reset it
+                    # AFTER rekey, so the fresh native session inherits the new
+                    # agent identity, and before any user turn is admitted --
+                    # without this the previous owner's conversation is readable
+                    # from the slot that just claimed it.
+                    await provider.new_conversation()
                     if model:
                         pool_model = (
                             owner._resolve_agent_model(owner._pool_agent)
@@ -1325,15 +1332,20 @@ class SessionAllocationService:
                     provider_switched = True
                     owner._session_map.clear_sid(key)
 
+            # Hand the resume id to the provider uniformly, before start()
+            # triggers session initialization. ``set_resume_session_id`` is
+            # declared on the provider base class, where it deliberately
+            # ignores the request for providers with no durable native
+            # conversation, and each provider that HAS one overrides it with
+            # its own exact-resume operation. Dispatching on is-ACP/is-Claude
+            # here instead skips every other provider that owns its resume
+            # (anything exposing ``session_provider_label``), which silently
+            # cold-starts a session that had a mapped conversation to restore.
             if resume_sid:
-                if self._deps.is_acp_provider(provider):
-                    cast(Any, provider).client.set_resume_session_id(resume_sid)
-                    self._deps.logger.info(
-                        "Attempting session/load for %s (sid=%s)", key, resume_sid
-                    )
-                elif self._deps.is_claude_provider(provider):
-                    cast(Any, provider).set_resume_session_id(resume_sid)
-                    self._deps.logger.info("CC resume for %s (sid=%s)", key, resume_sid)
+                provider.set_resume_session_id(resume_sid)
+                self._deps.logger.info(
+                    "Attempting provider resume for %s (sid=%s)", key, resume_sid
+                )
             async with self._start_sem:
                 try:
                     await provider.start()
@@ -1357,9 +1369,14 @@ class SessionAllocationService:
         won_race_session: Any | None = None
         duplicate_provider: LLMProvider | None = None
         try:
-            resumed = False
-            if self._deps.is_acp_provider(provider):
-                resumed = cast(Any, provider).client.resumed
+            # Ask the PROVIDER whether startup restored the conversation, via
+            # the provider-agnostic ``session_resumed`` property. Reaching into
+            # ``provider.client.resumed`` behind an is-ACP test answers False
+            # for every provider that owns its own exact-resume operation
+            # (anything exposing ``session_provider_label``), so a genuine
+            # resume reports as a cold start. ``is True`` because a provider
+            # need not return a strict bool.
+            resumed = provider.session_resumed is True
             if speculative and speculative_resume and not resumed:
                 raise SpeculativeResumeRefused(key)
 

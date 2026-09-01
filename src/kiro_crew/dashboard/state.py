@@ -3703,7 +3703,7 @@ class _ChatSlot:
         )
 
         source_links = self._pr_source_links() if session_card_source_links_enabled() else []
-        return self._projection.to_dict(
+        payload = self._projection.to_dict(
             self,
             include_check_status=include_check_status,
             source_links=source_links,
@@ -3729,6 +3729,26 @@ class _ChatSlot:
                 )
             ),
         )
+        # Session-intent fields the Multiplex card renders. They are ours, not
+        # upstream's, so they are layered on here rather than inside
+        # slot_projection.py: that module is upstream-owned and every sync
+        # rewrites it, and the same reasoning already keeps the dashboard_user
+        # gate above out of it. The three goal fields are deliberately separate
+        # -- `declared_goal` is what the owner typed, `plan_goal` is parsed from
+        # a plan header, and the checkpoint's own goal is what the agent last
+        # asserted -- so the card can show a disagreement instead of hiding it.
+        payload.update(
+            {
+                "peer_channel_inbox_count": len(self._peer_channel_inbox),
+                "peer_channel_attention": self.peer_channel_attention_payload(),
+                "declared_goal": self.declared_goal_payload(),
+                "plan_goal": self._checkpoint_text(self._plan_goal, SESSION_CHECKPOINT_GOAL_MAX),
+                "session_checkpoint": self.session_checkpoint_payload(),
+                "session_timeline": self.session_timeline_payload(),
+                "checkpoint_freshness": self.checkpoint_freshness_payload(),
+            }
+        )
+        return payload
 
 
 class DashboardState:

@@ -304,7 +304,7 @@ class TestSpawnWithoutApprovalCallback:
             patch("kiro_crew.subagent.sel"),
             patch(
                 "kiro_crew.subagent._validate_agent",
-                return_value=("crew-local", ""),
+                return_value=("crew-local", "", ""),
             ),
         ):
             first = manager.spawn(

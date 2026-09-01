@@ -231,7 +231,7 @@ class TestVoiceConfig:
     async def test_selecting_pocket_sets_a_compatible_default_voice(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
-            global_enabled=False, provider="piper", default_voice="Ruth",
+            global_enabled=False, auto_speak=False, provider="piper", default_voice="Ruth",
             default_engine="generative", default_rate="100%", default_pitch="+0%",
             aws_profile="", region="", piper_binary="", piper_model="",
             piper_model_config="", piper_length_scale=1.0,

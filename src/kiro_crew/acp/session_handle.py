@@ -54,11 +54,12 @@ from kiro_crew.acp.client import (
     acp_config_option,
     acp_config_option_values,
     compaction_failure_detail,
-    # MERGE-REVIEW: upstream also imports parse_slash_command and
-    # format_command_result here, for a slash-command path this fork replaced
-    # with its own executor (see _run_slash_command below) in a region upstream
-    # never touched — so the merge kept ours and theirs would be two dead names.
-    # If the fork's implementation is ever dropped for upstream's, both return.
+    # Upstream also imports parse_slash_command and format_command_result here,
+    # for its ``stream_command`` method. This handle has never carried that
+    # method, so both names would be dead imports; they return only if
+    # ``stream_command`` is added. That absence is a live defect rather than a
+    # deliberate omission -- ``session_provider`` calls ``stream_command`` on
+    # this handle -- but it predates this merge and is tracked separately.
     prompt_timeout_for_ceiling,
     resolve_usable_model,
 )

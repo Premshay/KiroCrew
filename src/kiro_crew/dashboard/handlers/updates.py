@@ -1422,9 +1422,6 @@ async def _restart_gateway(state: DashboardState) -> bool:
     claim is made synchronously before the first await.  A successful exec does
     not return; a refused, failed, or test-double exec releases the claim.
     """
-    # MERGE-REVIEW: read via getattr because the flag is declared in upstream's
-    # DashboardState.__init__ and this merge's state.py is resolved separately.
-    # Drop the default once that declaration is confirmed present.
     if state._gateway_restart_in_progress:
         logger.info("Gateway restart already in progress; coalescing duplicate request")
         return False

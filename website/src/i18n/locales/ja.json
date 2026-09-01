@@ -11433,7 +11433,7 @@
         "insider": "Insider",
         "install_failed": "更新をインストールできませんでした",
         "install_update_restart_app": "更新をインストールしてアプリを再起動",
-        "installing_quiet_note": "インストール中 — Kiro Crew は 1 ～ 2 分間沈黙してから自動的に再起動します。",
+        "installing_quiet_note": "インストール中 — {{productName}} は 1 ～ 2 分間沈黙してから自動的に再起動します。",
         "is_available": "が利用可能です。",
         "loading_changelog": "変更ログを読み込み中…",
         "manual_install_fallback": "更新がうまくいかない場合は、{{link}} をして、このコピーの上に再インストールできます。設定、チャット、ファイルは保持されます。",

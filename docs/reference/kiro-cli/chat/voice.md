@@ -214,7 +214,7 @@ Settings are in **Settings > Voice**, or directly in
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `enabled` | `false` | Turn on voice replies for **every** Kiro Crew response (text-triggered). Also seeds the `auto_reply_to_voice` default — see below. |
-| `provider` | `"piper"` | TTS backend: `"pocket"` (local on-demand replay), `"piper"` (local, offline), or `"polly"` (AWS, cloud, and billed). An unrecognized value falls back to `piper` with a warning logged: reaching for a paid service is not a choice a typo may make for you. <!-- MERGE-REVIEW: fork documented the fallback as `polly`, upstream as `piper`; neither `voice_reply.synthesize_speech` nor the config loader implements a fallback on either side (both log "unknown provider" and return None). Upstream's wording kept as the safer claim — confirm against the merged code. --> |
+| `provider` | `"piper"` | TTS backend: `"pocket"` (local on-demand replay), `"piper"` (local, offline), or `"polly"` (AWS, cloud, and billed). An unrecognized value falls back to `piper` with a warning logged: reaching for a paid service is not a choice a typo may make for you. |
 | `auto_reply_to_voice` | _follows `enabled`_ | **Voice-triggered**: when the user sends a voice memo, auto-respond with voice. Defaults to whatever `enabled` is — set explicitly to override. |
 | **Polly-specific** | | ignored by Piper; Pocket uses only `voice_id` |
 | `voice_id` | `Ruth` | Any [Amazon Polly voice](https://docs.aws.amazon.com/polly/latest/dg/voicelist.html); Pocket's supplied local voice is `michael` |

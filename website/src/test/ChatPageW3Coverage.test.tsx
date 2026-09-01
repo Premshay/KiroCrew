@@ -185,6 +185,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       })),
       isAtBottom: true,
       getFollow: () => true,
+      retainRange: vi.fn(),
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(() => false),
       measureRef: () => () => {},

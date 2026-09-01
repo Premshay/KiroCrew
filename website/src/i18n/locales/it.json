@@ -11766,7 +11766,7 @@
         "insider": "Insider",
         "install_failed": "Non è stato possibile installare l'aggiornamento",
         "install_update_restart_app": "Installa l'aggiornamento e riavvia l'app",
-        "installing_quiet_note": "Installazione in corso — Kiro Crew resterà inattivo per un minuto o due, poi si riavvierà da solo.",
+        "installing_quiet_note": "Installazione in corso — {{productName}} resterà inattivo per un minuto o due, poi si riavvierà da solo.",
         "is_available": "è disponibile.",
         "loading_changelog": "Caricamento del changelog…",
         "manual_install_fallback": "Se l'aggiornamento non funziona, puoi {{link}} e reinstallare sopra questa copia. Le tue impostazioni, chat e file vengono mantenuti.",

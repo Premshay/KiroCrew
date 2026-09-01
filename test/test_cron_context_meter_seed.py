@@ -165,9 +165,7 @@ def test_inject_exact_count_without_window_keeps_the_measurement():
     state.get_or_create_slot.return_value = slot
     state.conversation_log = None
 
-    inject_cron_result_to_dashboard(
-        state, _make_job(), "result", context_reading={"pct": 0.0, "used_tokens": 88_000}
-    )
+    _inject(state, _make_job(), "result", context_reading={"pct": 0.0, "used_tokens": 88_000})
 
     state.broadcast_context_usage.assert_called_once_with(
         "cron-abc123", {"slot": "cron-abc123", "pct": 0.0, "used_tokens": 88_000}

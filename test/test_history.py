@@ -2383,7 +2383,7 @@ class TestConsolidationToolPolicy:
 
     @pytest.mark.asyncio
     async def test_call_llm_timeout_cancels_and_retires_dedicated_session(self, monkeypatch):
-        import kiro_crew.history as history_mod
+        import kiro_crew.history_consolidation as consolidation_mod
         from kiro_crew.history import _CONSOLIDATE_SESSION_KEY
 
         provider = MagicMock()
@@ -2402,8 +2402,11 @@ class TestConsolidationToolPolicy:
             finally:
                 cancelled.set()
 
-        monkeypatch.setattr(history_mod, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01)
-        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S", 0.01)
+        # These constants are read as module globals of history_consolidation;
+        # kiro_crew.history only re-exports them, so patching the facade binds a
+        # name nothing reads and the turn would run to the real 180s timeout.
+        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S", 0.01)
         with patch("kiro_crew.history.stream_and_collect_json", side_effect=_stalled_stream):
             result = await consolidator._call_llm("some prompt")
 
@@ -2502,7 +2505,8 @@ class TestConsolidationToolPolicy:
             return {"content": [{"type": "text", "text": '{"history_entry": "done"}'}]}
 
         with patch(
-            "kiro_crew.history._post_consolidation_request", side_effect=blocked_request
+            "kiro_crew.history_consolidation._post_consolidation_request",
+            side_effect=blocked_request,
         ) as post:
             first = asyncio.create_task(consolidator._call_direct_endpoint("first"))
             await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
@@ -2606,7 +2610,7 @@ class TestConsolidationChunkAdmission:
         self, tmp_path, monkeypatch
     ):
         from kiro_crew.memory import MemoryStore
-        import kiro_crew.history as history_mod
+        import kiro_crew.history_consolidation as consolidation_mod
 
         log = ConversationLog(base_dir=tmp_path / "sessions")
         log.init()
@@ -2615,7 +2619,10 @@ class TestConsolidationChunkAdmission:
         key = "dashboard:chunked"
         log.append(key, "user", "first " + "a" * 30)
         log.append(key, "assistant", "second " + "b" * 30)
-        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 80)
+        # Read as a module global of history_consolidation; kiro_crew.history
+        # only re-exports it, so patching the facade leaves the real 64 KiB
+        # budget in force and both messages fit one chunk.
+        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 80)
         consolidator = HistoryConsolidator(log=log, memory=memory)
         prompts: list[str] = []
 
@@ -2642,7 +2649,7 @@ class TestConsolidationChunkAdmission:
     @pytest.mark.asyncio
     async def test_oversized_message_defers_without_advancing_offset(self, tmp_path, monkeypatch):
         from kiro_crew.memory import MemoryStore
-        import kiro_crew.history as history_mod
+        import kiro_crew.history_consolidation as consolidation_mod
 
         log = ConversationLog(base_dir=tmp_path / "sessions")
         log.init()
@@ -2650,7 +2657,10 @@ class TestConsolidationChunkAdmission:
         memory.init()
         key = "dashboard:too-large"
         log.append(key, "user", "x" * 100)
-        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 50)
+        # See the sibling test: the facade re-export is inert, so patching it
+        # would leave the 100-char message well under the real budget and the
+        # oversized-defer branch would never be reached.
+        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 50)
         consolidator = HistoryConsolidator(log=log, memory=memory)
 
         with patch.object(consolidator, "_call_llm", new_callable=AsyncMock) as llm:
