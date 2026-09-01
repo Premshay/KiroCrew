@@ -298,6 +298,8 @@ async def test_two_turn_frame_sequence_has_finalize_between_chunks(tmp_path):
     client.shutdown = AsyncMock()
     client.context_usage_pct = MagicMock(return_value=0.0)
     client._client = client
+    client.client.set_claude_autonomous_turn_handler = AsyncMock()
+    client.client.set_claude_idle_handler = MagicMock()
     client.last_prompt_stats = None
     turn1 = [
         LLMEvent(kind=EVENT_TEXT_CHUNK, text="Pick a path.\n"),
