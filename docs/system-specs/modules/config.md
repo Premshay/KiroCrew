@@ -209,8 +209,13 @@ release that changed it. `superseded_default_drift(base_data)` returns the entri
 whose stored value equals the old default, comparing type as well as value so a
 stored `0` is not read as `False`.
 
-Registered so far: `mcp_gateway.forward_declared_env` (False -> True, #4566) and
-`session.autocompact_pct` (90.0 -> 70.0, #4388).
+Registered so far: `mcp_gateway.forward_declared_env` (False -> True, #4566),
+`session.autocompact_pct` (90.0 -> 70.0, #4388), `stt.streaming` (False -> True,
+0.5.0) and `stt.model` ("turbo" -> "base", 0.5.0).
+
+`stt.provider` is deliberately absent even though its default moved to `local`:
+`_validated_stt_provider` coerces a retired value at parse time, so the stored
+value never wins and there is no drift for an operator to adopt.
 
 Both sides of an entry are **history**, so both are literals: a later change to
 the same key APPENDS a new entry rather than editing an existing one, which keeps
@@ -490,9 +495,31 @@ finishing second cannot resurrect a deleted agent). A lookup with no snapshot ye
 builds one lazily **only** in a synchronous context; on a running loop it falls
 back for that turn rather than block.
 
+### Effective-agent report (`resolve_effective_agent`)
+`resolve_agent_bindings` stores the REQUESTED agent verbatim and only logs when
+nothing dispatches it, because rewriting the stored name was destructive: the
+resolution behind the rewrite can be momentarily stale while the overwrite is
+permanent. `resolve_effective_agent(agent_name, project_dir)` is the
+non-destructive other half — it names the agent that will actually answer, and
+`""` for "nothing to report".
+
+Two properties, both pinned by tests:
+
+- **No filesystem I/O**, for the same reason rung 2 has none: it is called from
+  `_ChatSlot.to_dict()` for every slots frame on the event loop. It reads only the
+  materialized snapshot, the alias snapshot published by `KiroCrewConfig.load()`
+  (`publish_agent_alias_snapshot`), and `cached_project_agent_names` — never a
+  scan, stat or config re-read.
+- **Fails closed to `""`.** A cold alias snapshot, a cold materialized snapshot
+  and a cold project cache all report no divergence. A false "your agent was
+  substituted" marker sends the user chasing a substitution that never happened,
+  so silence during a boot window is the correct answer, not a guess.
+
+Consumers: the sidebar's session-row marker, and `mochi`'s `ensureSlot`, which
+refuses to send into a slot whose effective agent is someone else.
+
 Known follow-up (#1429): the snapshot makes this module a second home for agent
-discovery beside `apps/registry`, and `_resolve_named_agent_model` below still
-reads that directory without the sensitive-path gate.
+discovery beside `apps/registry`.
 
 ### `KiroCrewConfig.create_provider_factory() -> Callable`
 Returns a factory for LLMProvider instances. Resolves `"auto"` model
@@ -540,20 +567,30 @@ this is what closes the torn-read window for everyone else. Mode-preserving
 because tmp+rename creates a NEW inode, so the umask default (typically `0644`)
 would silently replace an operator's tightened `0600`; `config.json` can hold
 inline credentials, so a settings write must never widen who can read it. An
-existing file's mode carries over and a newly created one is owner-only. It
-deliberately does NOT call `platform_compat.restrict_to_owner`: that helper shells
-out to `icacls` on Windows, and this function runs inside async request handlers
-and `save()`, so calling it would put a blocking subprocess on the gateway event
-loop (`no-blocking-call-on-event-loop`). Omitting it is no worse than the
-truncate-then-write it replaced, which applied no DACL either.
+existing file's mode carries over and a newly created one is owner-only. On
+Windows it also applies a real owner-only DACL via
+`platform_compat.restrict_to_owner` (`restrict_on_error="warn"`, so a DACL that
+cannot be applied warns rather than making the config unwritable).
+
+That is a reversal of an earlier ruling recorded here, and the reason it changed
+is worth keeping: the lockdown used to shell out to `icacls`, a blocking
+subprocess this function could not afford because it runs inside async request
+handlers and `save()` (`no-blocking-call-on-event-loop`). It is now applied
+in-process through `advapi32` (measured 0.24 ms against 313 ms for the
+subprocess), so the cost that forced the omission is gone and `config.json` --
+which can hold inline provider tokens -- is no longer left under whatever DACL it
+inherits from its parent. Follow-up work that touches the other owner-only call
+sites should treat this as settled rather than re-deriving the old constraint.
 
 **Mode preservation is POSIX-only.** `atomic_write`'s `mode` routes through
 `fchmod_safe`, a documented no-op on Windows, where access is carried by the DACL
-instead. Applying one would mean an `icacls` subprocess, which this function must
-not run (above) — so on Windows the replacement file inherits the directory's ACL,
-exactly as the `write_text` it replaced did. The three mode/symlink tests in
+instead. The two guarantees therefore do not collide -- they apply on different
+platforms -- which is why the writer branches on `IS_POSIX` rather than passing
+both to `atomic_write`, which refuses `restrict_to_owner=True` alongside a wider
+explicit `mode`. The three mode/symlink tests in
 `test_config_rmw_preserves_settings.py` are `skipif(not IS_POSIX)` for this reason;
-the data-loss and AST-guard tests are platform-independent and run everywhere.
+its Windows counterpart asserts the DACL by reading the descriptor back, and the
+data-loss and AST-guard tests are platform-independent and run everywhere.
 
 **Symlinks are followed, not replaced.** `os.replace` renames over the link
 itself, so a symlinked `config.json` would become a regular file and its target
@@ -701,11 +738,19 @@ class ChannelConfig:
 
 @dataclass
 class SttConfig:
-    enabled: bool = True           # enabled by default; gated by whisper availability
-    whisper_path: str = ""         # auto-detected if empty
-    model: str = "turbo"           # turbo (~1.6 GB, 809M params, ~8x faster than large)
-    device: str = "cpu"            # "cpu" or "cuda"
+    enabled: bool = True           # on by default: the default provider needs no account
+    provider: str = "local"        # "local" | "apple" | "transcribe"; a retired value degrades to "local"
+    model: str = "base"            # a kiro_crew.stt.models CATALOG name; a superseded name resolves via its alias table
+    language_code: str = "en-US"
+    streaming: bool = True         # live partials; every provider produces them
+    silence_ms: int = 700          # end-of-phrase pause; clamped to _STT_INTERVAL_MS_MIN.._MAX
+    partial_interval_ms: int = 400 # live-transcript refresh cadence; same clamp
+    idle_evict_secs: int = 600     # release the resident local model after this idle; 0 = at end of recording
+    endpointing: bool = False      # semantic auto-submit on a complete utterance; needs streaming
+    dictation_panel: bool = True   # animated recording panel; falls back to the status bar
     timeout_secs: int = 300
+    transcribe_region: str = "us-east-1"   # transcribe provider only
+    transcribe_profile: str = ""           # transcribe provider only; empty = default credential chain
 
 @dataclass
 class ComputerUseConfig:
@@ -900,6 +945,52 @@ could exhaust host memory/CPU/the process table (DoS). The dashboard write gate
 (`dashboard/handlers/core.py`) and the runtime pool cap **import these same
 constants**, so write-gate / load-clamp / runtime-cap cannot drift apart —
 closing the direct-config-edit DoS gap.
+
+### `resource_limits`: one block, three mechanisms, two meanings of `0`
+
+`ResourceLimitsConfig` (`config/loader.py`) carries the kernel confinement
+ceilings for spawned agent processes. It is the one config block whose keys are
+read by more than one enforcement mechanism, and two of those keys mean
+**different things** to two of them:
+
+| Key | POSIX rlimit (`security.apply_resource_limits`) | cgroup v2 scope (`sandbox.cgroup_scope_argv`) | xdist (`resource_status`) |
+|---|---|---|---|
+| `max_open_files` | `RLIMIT_NOFILE`; `0` = leave inherited | — | — |
+| `max_processes` | `RLIMIT_NPROC`; `0` = leave inherited | `TasksMax` (counts THREADS); `0` = use default | — |
+| `max_memory_mb` | `RLIMIT_AS`; `0` = leave inherited | `MemoryMax`; `0` = use default | — |
+| `max_cpu_seconds` | `RLIMIT_CPU`; `0` = leave inherited | — | — |
+| `cpu_weight` | — | `CPUWeight`, 1..10000 | — |
+| `max_cpu_percent` | — | `CPUQuota`, opt-in: unset emits no property | — |
+| `max_total_memory_mb` | — | slice `MemoryMax` (all trees together) | — |
+| `max_total_processes` | — | slice `TasksMax` | — |
+| `xdist_auto_cap` | — | — | `-1` auto, `0` off, `N` fixed |
+
+`0` cannot be normalised away in either direction. On the rlimit path it is a
+documented request ("leave the inherited limit unchanged") with existing configs
+behind it; on the cgroup path systemd **rejects** a zero property and the scope
+never starts, so `0` there has to mean "use the module default" and the ceiling
+is never left unset. Every field is therefore `int | None`, and `None` ("not
+configured") stays distinct from `0`.
+
+Defaults deliberately do NOT live in the dataclass. Each mechanism keeps its own
+(`security._RLIMIT_DEFAULTS`, `sandbox._CGROUP_DEFAULT_*` /
+`_default_max_memory_mb()`), because a copy here would be a third default set
+that could drift from both.
+
+**Single parse site.** `ResourceLimitsConfig.from_raw()` is the only code that
+coerces these keys; `_limit_int` is its rule. Before #3474 six readers each had
+their own, which is how the two meanings of `0` drifted apart with nothing
+recording it. The rule: bools are not numbers (`True` would become a 1-task
+ceiling); a non-integral float truncates toward zero (`512.5` -> `512`, so a
+stricter parse can never loosen a ceiling); a value in `(0, 1)` is REFUSED
+because `int()` would turn it into the `0` that already means something else;
+NaN and `±Infinity` (both producible by `json.loads`) are refused before `int()`
+can raise on them; and an out-of-range value is refused rather than clamped, so
+a confinement ceiling is never silently moved away from the number in the
+operator's file. Every refusal is logged once per key per process.
+
+`test_resource_limits_schema.py::TestSingleParseSite` fails if a seventh reader
+appears.
 
 ### Dashboard theme persistence
 

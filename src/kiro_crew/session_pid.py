@@ -1124,6 +1124,192 @@ _MARKED_MCP_LAUNCHER_MARKERS = (
     b"mcp start-server",  # generic ``<launcher> mcp start-server <name>`` shims
 )
 
+# ── Stranded playwright-cli browser daemon (issue #5986) ─────────────────────
+# playwright-core spawns its browser daemon as
+#   ``node <...>/playwright-core/lib/entry/cliDaemon.js <session-name> [flags]``
+# with ``detached: true`` and no ``env`` override (cli-client/session.js
+# ``startDaemon``). Two consequences make it its own orphan class:
+#
+# * detached => it is its own SESSION and PROCESS-GROUP leader, so it is
+#   invisible to the teardown child snapshot, to ``kill_process_tree``, and to
+#   the SID-based ownership test the work class uses (its SID is its own pid).
+# * no env override => it inherits the spawning agent's environment verbatim,
+#   so its EXEC-TIME environ carries both ``KIROCREW_SPAWNED`` and the
+#   generated ``PLAYWRIGHT_CLI_SESSION``. Exec-time environ is kernel-held and
+#   immutable after exec, so it is ownership evidence no process can forge for
+#   another -- unlike any on-disk registry or claim file, which a same-UID
+#   agent can write.
+#
+# Deliberately NOT keyed on the socket path the way the gatewayd class is:
+# ``Session._connect`` UNLINKS the socket whenever a connect fails, so an
+# absent socket means "a client already cleaned up after a refused connect",
+# not "the daemon is unreachable" -- and the daemon holds its listening fd
+# regardless, so absence proves nothing about the browser tree.
+_BROWSER_DAEMON_ENTRY = b"cliDaemon.js"
+
+#: Must track :data:`kiro_crew.browser_cli.launch.SESSION_ENV`. Duplicated as a
+#: literal rather than imported because ``session_pid`` is imported early by
+#: ``acp.runtime`` and must not pull the browser package's import graph onto
+#: that path; a test asserts the two stay equal.
+_BROWSER_SESSION_ENV = "PLAYWRIGHT_CLI_SESSION"
+
+#: Generated-session prefix from ``browser_cli.launch`` (``kc-<8hex>``).
+_BROWSER_SESSION_PREFIX = b"kc-"
+
+# Grace given to a TERMed browser-daemon GROUP before escalating to SIGKILL.
+# Chromium exits on TERM within a second or two; this leaves room for a profile
+# flush without letting a wedged tree hold the sweep's budget.
+_BROWSER_DAEMON_TERM_GRACE_SECONDS = 5.0
+
+
+def _is_generated_browser_session(name: bytes) -> bool:
+    """True for a Kiro-Crew-generated ``kc-<8hex>`` session name.
+
+    Mirrors ``browser_cli.launch._session_leaf``. ONLY generated names are
+    ever sweepable: an operator who named a session (``default``, ``chrome``,
+    an ``attach`` workflow) owns its lifetime, and the ``kc-`` prefix is
+    reserved precisely so the two populations cannot be confused.
+    """
+    if not name.startswith(_BROWSER_SESSION_PREFIX):
+        return False
+    leaf = name[len(_BROWSER_SESSION_PREFIX) :]
+    return len(leaf) == 8 and all(c in b"0123456789abcdef" for c in leaf)
+
+
+def _browser_daemon_session_arg(cmdline: bytes) -> bytes | None:
+    """Generated session name from a cliDaemon cmdline, or ``None``.
+
+    The daemon's argv is ``node <entry>/cliDaemon.js <session-name> [flags]``,
+    so the name is the element immediately following the entry script --
+    matched on the script's BASENAME so an npx/global/vendored install path
+    all resolve. NUL-separated argv ONLY: the space-joined ``ps`` fallback
+    cannot delimit a path containing spaces, and a mis-split argv could pair
+    the script with the wrong token, so anything without NULs fails closed.
+    """
+    args = [a for a in cmdline.split(b"\x00") if a]
+    if len(args) <= 1:
+        return None
+    for index, arg in enumerate(args[:-1]):
+        if arg.rsplit(b"/", 1)[-1] == _BROWSER_DAEMON_ENTRY:
+            name = args[index + 1]
+            return name if _is_generated_browser_session(name) else None
+    return None
+
+
+def _env_value(pid: int, key: str) -> bytes | None:
+    """Exec-time environment value for *key* in *pid*, or ``None`` if unset.
+
+    Deliberately PROPAGATES ``OSError`` instead of swallowing it like
+    :func:`_env_has_kirocrew_marker`: the callers here need to tell "read
+    said the key is absent" apart from "the read failed", because those two
+    outcomes must fail closed in OPPOSITE directions -- an absent owner
+    permits a kill, an unreadable one must forbid it. Linux-only; returns
+    ``None`` elsewhere so every caller fails closed off Linux.
+    """
+    if sys.platform != "linux":
+        return None
+    prefix = key.encode() + b"="
+    environ = Path(f"/proc/{pid}/environ").read_bytes()
+    for item in environ.split(b"\x00"):
+        if item.startswith(prefix):
+            return item[len(prefix) :]
+    return None
+
+
+def _browser_session_owner_alive(pid: int, session: bytes) -> bool:
+    """True while any live process OUTSIDE *pid*'s own tree holds *session*.
+
+    This is the ownership proof, and it is drawn entirely from the kernel.
+    Kiro Crew injects the generated ``PLAYWRIGHT_CLI_SESSION`` into exactly
+    one spawned agent process, so that value in a live process's EXEC-TIME
+    environ means the browser still has an owner. Scanning the whole process
+    table (not a manager-local set) is what makes a peer gateway sharing this
+    data home see its own live sessions and protect them.
+
+    The daemon's own tree is excluded by SID: it is spawned ``detached``, so
+    it is its own session leader and every Chromium child inherits that SID --
+    those inherit the variable too and must not be mistaken for owners.
+
+    FAIL-CLOSED to "alive": an unreadable ``/proc`` listing or an inconclusive
+    per-process read (EACCES, EIO) returns ``True``, so the sweep never kills
+    on a failed probe. A process that VANISHES mid-scan is simply not an
+    owner, which is the one error that is safe to skip.
+    """
+    if sys.platform != "linux":
+        return True
+    try:
+        entries = [e for e in Path("/proc").iterdir() if e.name.isdigit()]
+    except OSError:
+        return True
+    my_uid = os.getuid()
+    for entry in entries:
+        try:
+            other = int(entry.name)
+        except ValueError:
+            continue
+        if other == pid:
+            continue
+        try:
+            if entry.stat().st_uid != my_uid:
+                continue
+        except _PID_VANISHED_ERRORS:
+            continue
+        except OSError:
+            return True
+        if _linux_pid_sid(other) == pid:
+            continue  # the daemon's own detached tree, not an owner
+        try:
+            if _env_value(other, _BROWSER_SESSION_ENV) == session:
+                return True
+        except _PID_VANISHED_ERRORS:
+            continue
+        except OSError:
+            return True
+    return False
+
+
+def _is_sweepable_orphan_browser_daemon(pid: int, cmdline: bytes, age_seconds: float) -> bool:
+    """Fifth positive-identity path: a browser daemon whose owner is gone.
+
+    Positive identity is the conjunction of:
+
+    1. a structural cliDaemon argv carrying a GENERATED ``kc-<8hex>`` session
+       name (:func:`_browser_daemon_session_arg`, NUL-argv only) -- an
+       operator-named session is structurally excluded and never signalled;
+    2. that same name in the process's exec-time environ, which ties this
+       daemon to a name Kiro Crew itself generated rather than one an agent
+       passed with ``-s=``;
+    3. the ``KIROCREW_SPAWNED`` environ marker, proving Kiro Crew spawned the
+       tree (:func:`_env_has_kirocrew_marker`, Linux-only, fail-closed);
+    4. NO live process outside the daemon's own tree still holding that
+       session (:func:`_browser_session_owner_alive`);
+    5. age past :data:`_ORPHAN_WORK_MIN_AGE_SECONDS` -- the generous work-class
+       floor, not the 120s MCP one, so a daemon whose agent is mid-spawn or
+       briefly detached is never raced.
+
+    Every signal is a kernel fact (argv, exec-time environ, SID, process
+    liveness). Nothing here reads agent-writable filesystem state, which is
+    what made the previously withdrawn reapers unsafe.
+    """
+    if age_seconds < _ORPHAN_WORK_MIN_AGE_SECONDS:
+        return False
+    if not cmdline:
+        return False  # kernel thread / zombie — nothing meaningful to kill
+    normalized = cmdline.replace(b"\x00", b" ")
+    if any(marker in normalized for marker in _GATEWAY_MARKERS):
+        return False
+    session = _browser_daemon_session_arg(cmdline)
+    if session is None:
+        return False
+    try:
+        if _env_value(pid, _BROWSER_SESSION_ENV) != session:
+            return False
+    except OSError:
+        return False  # inconclusive — fail closed
+    if not _env_has_kirocrew_marker(pid):
+        return False
+    return not _browser_session_owner_alive(pid, session)
+
 
 def _our_orphan_pids() -> list[int]:
     """PIDs owned by current user whose parent is init (pid 1) or systemd --user.
@@ -1395,6 +1581,57 @@ def _kill_orphan_gatewayd(pid: int, cmdline: bytes) -> int:
     return 1
 
 
+def _kill_orphan_browser_daemon(pid: int, cmdline: bytes) -> int:
+    """Group-TERM a stranded browser daemon, escalating to a group SIGKILL.
+
+    Signals the process GROUP, not the pid. The daemon is spawned
+    ``detached``, so it is its own group leader and its Chromium children
+    inherit that group -- the browser tree is the whole point of the reclaim
+    (it is where the gigabytes are), and a pid-only signal would kill the
+    supervisor and leave Chromium reparented to init as a fresh, now
+    completely unattributable leak.
+
+    TERM first so Chromium exits through its own shutdown path and flushes
+    its profile. The group is signalled only when the daemon is genuinely an
+    isolated leader (``pgid == pid``, not our own group, not init's), so
+    ``killpg`` can never reach a foreign process; identity is re-verified
+    before the escalation so a PID recycled inside the grace window is never
+    SIGKILLed.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, OSError):
+        return 0
+    if not (pgid == pid and pgid != os.getpgrp() and pgid > 1):
+        # Not an isolated group leader: killpg would reach processes this
+        # predicate never identified. Leave it for a later sweep.
+        return 0
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return 0
+    deadline = time.monotonic() + _BROWSER_DAEMON_TERM_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        # platform_compat.pid_exists, not a raw `os.kill(pid, 0)`: on Windows a
+        # signal-zero "probe" TERMINATES the target instead of testing it. This
+        # path is POSIX-only in practice, but routing through the shim keeps it
+        # correct on its own terms rather than depending on a caller's early-out.
+        if not platform_compat.pid_exists(pid):
+            _sel_orphan_kill(pid, pgid, cmdline, "browser-daemon-sigterm")
+            return 1
+        time.sleep(0.1)
+    try:
+        if sys.platform == "linux":
+            if Path(f"/proc/{pid}/cmdline").read_bytes() != cmdline:
+                _sel_orphan_kill(pid, pgid, cmdline, "browser-daemon-sigterm")
+                return 1
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    _sel_orphan_kill(pid, pgid, cmdline, "browser-daemon-sigterm+sigkill")
+    return 1
+
+
 def _work_orphan_basename(cmdline: bytes) -> bytes:
     """argv0 basename from a raw cmdline (NUL-separated Linux, space macOS)."""
     args = cmdline.split(b"\x00")
@@ -1458,6 +1695,113 @@ def _is_sweepable_orphan_work(pid: int, cmdline: bytes, age_seconds: float) -> b
     return _env_has_kirocrew_marker(pid)
 
 
+# PIDs already reported by the untracked-runtime detector, so a persisting
+# orphan costs ONE log line rather than one line per sweep. Replaced wholesale
+# at the end of each scan with the set still detected, which bounds the set by
+# the live orphan count and re-arms the report if the PID disappears and a
+# later process reappears under the same detection.
+_reported_untracked_agent_pids: set[int] = set()
+
+
+# Per tracking file, the index of the colon-field naming the process a reaper
+# actually TERMINATES for that entry. Only that field counts as tracked: the
+# other one names the OWNER whose death makes the entry reapable
+# (``_sweep_pid_entries`` skips a session entry while its gateway lives;
+# ``_cleanup_orphaned_mcp_servers`` kills the child once its parent is gone), and
+# an owner is never reclaimed *through* the entry that names it. Counting an
+# owner field would let a stale entry whose owner has died and had its PID
+# recycled silently suppress a genuine leak report — exactly the silence issue
+# #2930 is about. A bare line names its own process, whichever file it is in.
+_REAPABLE_PID_FIELD: tuple[tuple[str, int], ...] = (
+    ("session", 1),  # kiro_session_pids.txt: <gateway_pid>:<child_pid>[:start-id]
+    ("child", 0),  # kiro_pids.txt: <child_pid>:<parent_pid>
+)
+
+
+def _tracked_agent_pids() -> set[int]:
+    """PIDs a reaper can terminate, per both tracking files.
+
+    Both files are read because a runtime absent from BOTH is exactly what
+    :func:`_is_untracked_managed_agent_orphan` reports, and each reaper keys off
+    only one of them. Within a line only the reapable field counts — see
+    :data:`_REAPABLE_PID_FIELD` for which, and why the owner field does not. A
+    session entry's third field is a start-time identity, numeric on Linux, and
+    is never read as a PID.
+
+    Deliberately read WITHOUT either file lock. Readers cannot tear: rewrites
+    go through :func:`_rewrite_pid_file` (temp file + rename, so a reader sees
+    either the whole old or the whole new content) and tracking appends are
+    single short lines. Locking here would put a lock acquisition inside the
+    sweep's per-scan path for a purely diagnostic read. Any read failure yields
+    the entries found so far — the detector is report-only, so the worst
+    outcome is one spurious or one missing log line, never a kill.
+    """
+    tracked: set[int] = set()
+    paths = (_session_pid_file_path(), _pid_file_path())
+    for path, (_label, reapable_index) in zip(paths, _REAPABLE_PID_FIELD):
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            continue  # absent or unreadable — nothing this file can claim
+        for line in raw.split():
+            fields = line.split(":")
+            index = 0 if len(fields) == 1 else reapable_index
+            if index >= len(fields):
+                continue  # truncated entry — no reapable field to read
+            try:
+                value = int(fields[index])
+            except ValueError:
+                continue  # malformed or partially-appended line
+            if value > 0:
+                tracked.add(value)
+    return tracked
+
+
+def _is_untracked_managed_agent_orphan(pid: int, cmdline: bytes, tracked_pids: set[int]) -> bool:
+    """REPORT-ONLY: a managed agent runtime that no reaper can reach.
+
+    Every existing reaper declines this process, which is why a leaked runtime
+    has no reproduction:
+
+    * :func:`cleanup_orphaned_sessions` and :func:`_periodic_pid_sweep` iterate
+      ``kiro_session_pids.txt`` and cannot see a PID the file never recorded.
+    * :func:`_is_sweepable_orphan_mcp` declines it — a runtime argv is not an
+      MCP entrypoint.
+    * :func:`_is_sweepable_orphan_work` NEGATIVE-gates
+      :data:`_MANAGED_AGENT_MARKERS` (runtimes are owned by their tracked-PID
+      lifecycle, not by the marker sweep) and separately requires a test-runner
+      argv.
+
+    Positive identity is the conjunction of: reparenting to init/``systemd
+    --user`` — guaranteed by the caller, which only iterates
+    :func:`_our_orphan_pids`, so ownership is not re-derived here — an argv0
+    basename naming a managed runtime (:data:`_MANAGED_AGENT_MARKERS`), the
+    ``KIROCREW_SPAWNED`` environ marker (:func:`_env_has_kirocrew_marker`,
+    Linux-only and fail-closed elsewhere), and absence from BOTH PID files
+    (:func:`_tracked_agent_pids`). Peer gateways and CLIs
+    (:data:`_GATEWAY_MARKERS`) are excluded: they are not agent runtimes and
+    are never tracked as such.
+
+    This grants NO kill authority and is wired to nothing that terminates — a
+    hit only logs. Blast radius is therefore zero, which is what makes the
+    detector safe to ship ahead of a maintainer's ruling on whether an
+    untracked runtime may be reaped at all. It also means a cross-data-home
+    false positive (a second install's live runtime, tracked in ITS config dir
+    and so absent from ours) is diagnostic noise rather than a wrong kill.
+    """
+    if not cmdline:
+        return False  # kernel thread / zombie — no argv to identify
+    normalized = cmdline.replace(b"\x00", b" ")
+    if any(marker in normalized for marker in _GATEWAY_MARKERS):
+        return False
+    basename = _work_orphan_basename(cmdline)
+    if not any(marker.encode() in basename for marker in _MANAGED_AGENT_MARKERS):
+        return False
+    if pid in tracked_pids:
+        return False  # a reaper can already reach it
+    return _env_has_kirocrew_marker(pid)
+
+
 def _work_orphan_session_leader_alive(pid: int) -> bool:
     """True when *pid*'s session LEADER still exists as a session leader.
 
@@ -1492,12 +1836,25 @@ def find_orphan_mcp_candidates(active_pids: set[int]) -> list[int]:
 
     Returns candidate PIDs. Caller should re-verify against fresh active PIDs
     before killing (two-phase pattern to eliminate races).
+
+    Also REPORTS — never returns as a candidate — any untracked managed-agent
+    runtime orphan (:func:`_is_untracked_managed_agent_orphan`). That class is
+    unreachable by every reaper, so it would otherwise leak silently with no
+    reproduction; the report deliberately carries no kill authority, which is
+    why such a PID is excluded from ``candidates``.
     """
     candidates: list[int] = []
     my_pid = os.getpid()
     now = time.time()
 
-    for pid in _our_orphan_pids():
+    orphan_pids = _our_orphan_pids()
+    # Read once per scan, not per PID: the files are small but the scan is not.
+    # Empty on Windows and on any run with no orphans, so the diagnostic read is
+    # skipped entirely in the common case.
+    tracked_pids = _tracked_agent_pids() if orphan_pids else set()
+    untracked_seen: set[int] = set()
+
+    for pid in orphan_pids:
         if pid == my_pid or pid in active_pids:
             continue
         try:
@@ -1535,13 +1892,39 @@ def find_orphan_mcp_candidates(active_pids: set[int]) -> list[int]:
             continue
         if pid_age < _ORPHAN_MIN_AGE_SECONDS:
             continue
+        # Report-only arm. Placed AFTER the age gate so a runtime whose tracking
+        # append has not landed yet is never reported: the gate is orders of
+        # magnitude wider than the spawn-to-append window. Reported PIDs are
+        # deliberately NOT appended to ``candidates`` — this arm has no kill
+        # authority (see the predicate's docstring).
+        if _is_untracked_managed_agent_orphan(pid, cmdline, tracked_pids):
+            untracked_seen.add(pid)
+            if pid not in _reported_untracked_agent_pids:
+                # %r, not %s: argv0 is set by the process itself, so a newline
+                # in it would forge whole log lines in gateway.log and through
+                # /api/logs. repr escapes control characters.
+                logger.error(
+                    "Leaked agent runtime pid=%s (argv0 %r, age %.0fs): reparented "
+                    "to init/systemd with a KIROCREW_SPAWNED environ marker but "
+                    "recorded in NEITHER PID file, so no reaper can reclaim it. "
+                    "Not terminated — report only.",
+                    pid,
+                    _work_orphan_basename(cmdline).decode("utf-8", "replace"),
+                    pid_age,
+                )
         if not (
             _is_sweepable_orphan_mcp(pid, cmdline)
             or _is_sweepable_orphan_gatewayd(cmdline)
             or _is_sweepable_orphan_work(pid, cmdline, pid_age)
+            or _is_sweepable_orphan_browser_daemon(pid, cmdline, pid_age)
         ):
             continue
         candidates.append(pid)
+
+    # Keep only what is still detected, so a persisting orphan stays deduped
+    # while a vanished PID re-arms the report for a future process.
+    _reported_untracked_agent_pids.clear()
+    _reported_untracked_agent_pids.update(untracked_seen)
 
     return candidates
 
@@ -1667,6 +2050,14 @@ def kill_orphan_mcps(pids: list[int]) -> int:
                 killed += _kill_orphan_work_tree(
                     pid, cmdline, work_age, budget=_ORPHAN_SWEEP_MAX_KILLS - killed
                 )
+                continue
+            # Stranded browser daemon. Re-verify the FULL identity — argv
+            # shape, exec-time environ, live-owner probe and the age floor —
+            # immediately before signalling, so a PID recycled since the find
+            # phase cannot inherit the verdict.
+            daemon_age = _linux_pid_age(pid, time.time()) if sys.platform == "linux" else 0.0
+            if _is_sweepable_orphan_browser_daemon(pid, cmdline, daemon_age):
+                killed += _kill_orphan_browser_daemon(pid, cmdline)
         except (
             ProcessLookupError,
             PermissionError,

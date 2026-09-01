@@ -149,6 +149,79 @@ system prompt states only the loop and the ref rule. The verbs:
 
 Sessions are selected with `-s=<name>` on any command.
 
+### Generated session reachability
+
+Each agent process receives a generated `PLAYWRIGHT_CLI_SESSION`
+(`kc-<random>`). For generated sessions only, `PWTEST_SOCKETS_DIR` and
+`PWTEST_DAEMON_SESSION_DIR` point at separate short namespaces under
+`<data-home>/pw/<8hex>/s` and `/d`. A `playwright-cli list` in one agent
+therefore cannot enumerate peer chat families. Operator-configured PWTEST roots
+are treated as base directories and receive the same generated-session
+namespace. Relative configured roots are rejected because the gateway and agent
+working directories can differ. Operator-provided non-`kc-` session names
+preserve their complete existing Playwright environment and are not redirected.
+
+Keeping both locations outside scratch means a daemon remains reachable after
+its agent process or scratch directory is gone. Operator cleanup supplies the
+generated session's `/s` and `/d` paths with the corresponding PWTEST variables
+and then uses the ordinary `playwright-cli -s=<name> close` protocol. Kiro Crew
+never executes the CLI or connects to the socket on its own: a stray has no
+registry entry to resolve and its socket is unlinked by the first refused
+connect, so a registry-driven `close` reclaims nothing.
+
+### Stranded daemon reclamation
+
+Reachability alone does not reclaim a daemon whose agent died, so the orphan
+sweep (`session_pid`) carries a browser-daemon class alongside its MCP,
+gatewayd and work classes. playwright-core spawns the daemon as `node
+<...>/entry/cliDaemon.js <session-name>` with `detached: true` and no `env`
+override, which decides both halves of the identity. Detachment makes it its
+own session and process-group leader, so it is invisible to the teardown child
+snapshot, to `kill_process_tree`, and to the SID ownership test the work class
+uses. Inheriting the environment verbatim puts the generated
+`PLAYWRIGHT_CLI_SESSION` and `KIROCREW_SPAWNED` in its exec-time environ, which
+the kernel holds immutable after exec.
+
+A daemon is reclaimed only when all of these hold: a structural cliDaemon argv
+whose following element is a generated `kc-<8hex>` name; that same name in its
+exec-time environ; the `KIROCREW_SPAWNED` marker; no live process outside the
+daemon's own SID still holding that session; and an age past the work-class
+floor. Ownership is therefore proven from kernel facts alone — argv, exec-time
+environ, session id, process liveness — never from filesystem state a same-UID
+agent could write, which is what made earlier reaper attempts unsafe. The probe
+scans the whole process table rather than a manager-local set, so a peer gateway
+sharing this data home sees and protects its own live sessions. An
+operator-named session is structurally excluded and never signalled; the `kc-`
+prefix is reserved so the two populations cannot be confused. Every stage fails
+closed: non-Linux, an unreadable `/proc`, and an inconclusive per-process read
+all read as "owner alive". The kill signals the process GROUP so the Chromium
+tree goes with the supervisor, TERM first for a clean profile flush, only for a
+genuine isolated group leader, with identity re-verified before escalating to
+SIGKILL and the result SEL-audited.
+
+Deliberately not keyed on the socket path the way the gatewayd class is:
+`Session._connect` unlinks the socket whenever a connect fails, so an absent
+socket records a refused connect rather than an unreachable daemon, and the
+daemon holds its listening descriptor either way.
+
+The generated socket root is rejected when its worst-case AF_UNIX path exceeds
+the upstream 103-byte budget. Before either variable is injected, the installed
+`@playwright/cli` package resolved from the active launcher is checked through
+the same package anchor as browser revision detection (a stale standalone
+fallback is never accepted), and its serving `playwright-core` sources must
+contain both hooks on their execution paths (`process.env.PWTEST_SOCKETS_DIR ||`
+and `process.env.PWTEST_DAEMON_SESSION_DIR`). A future upstream
+rename/removal therefore logs a warning and fails back instead of silently
+returning sockets to scratch. The source verdict is cached by path, mtime, and
+size so an upgrade invalidates it.
+
+Kiro-Crew-owned lifecycle directories are created
+owner-only and then restricted with the fail-loud platform helper before their
+environment variables are exported. A crash can leave a small per-session
+registry/socket namespace behind. Reclaiming the daemon does not delete that
+namespace: it is two empty directories, and pruning them would need its own
+liveness argument for no memory benefit.
+
 ### Auth
 
 Two paths, chosen by whose browser holds the session.
@@ -262,7 +335,15 @@ rather than relative to whatever working directory an agent happened to have.
 ### Dashboard integration
 
 `playwright-cli show --port <n> --host 127.0.0.1` serves the CLI's own dashboard
-over loopback HTTP, and the panel embeds that in an iframe. The served dashboard
+over loopback HTTP, and the panel embeds that in an iframe. The port is
+OS-assigned by default; `dashboard.browser_view_port` pins the public port, for
+remote-gateway deployments where the viewer reaches loopback through an SSH
+tunnel that forwards a fixed set of ports. The pin is never handed to the
+child: the supervisor claims the pinned port itself with a bound listener it
+keeps holding, an atomic ownership proof that makes the deterministic,
+operator-named port race-free, and relays byte-for-byte to the child's own
+ephemeral port. The child's OS-assigned port keeps the unpinned path's
+advisory bind window (unpredictable, loopback-local); both bind loopback only. The served dashboard
 provides the session grid with live screencast, a session detail view with tab bar
 and navigation controls, and full remote mouse and keyboard input, so a human can
 take over a session directly: this is the path for a CAPTCHA or a 2FA prompt that

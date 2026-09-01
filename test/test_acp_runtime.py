@@ -22,9 +22,11 @@ lines; the subprocess and stdin are mocked (no kiro-cli is launched).
 """
 
 import asyncio
+import gc
 import json
 import os
 import time
+import weakref
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -40,6 +42,7 @@ from kiro_crew.acp.runtime import (
     AcpRuntimeDead,
     AcpRuntimeError,
     AcpSessionHandle,
+    _ColdStartAdmission,
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
@@ -47,8 +50,8 @@ from kiro_crew.acp.types import (
     EVENT_TEXT_CHUNK,
     JSONRPC_METHOD_NOT_FOUND,
     METHOD_COMMANDS_EXECUTE,
-    METHOD_KAS_AUTH_GET_ACCESS_TOKEN,
     METHOD_MCP_OAUTH_REQUEST,
+    METHOD_REQUEST_PERMISSION,
     METHOD_SESSION_LOAD,
     METHOD_SESSION_NEW,
     METHOD_SESSION_TERMINATE,
@@ -111,6 +114,15 @@ async def _start_reader(rt: AcpRuntime) -> asyncio.Task:
     task = asyncio.ensure_future(rt._reader_loop())
     await asyncio.sleep(0)  # let the loop reach its first readline
     return task
+
+
+def _permission_msg(request_id: int) -> JsonRpcMessage:
+    """A server→client permission REQUEST, the shape the answerer is given."""
+    return JsonRpcMessage(
+        id=request_id,
+        method=METHOD_REQUEST_PERMISSION,
+        params={"sessionId": "sA", "options": []},
+    )
 
 
 async def _stop_reader(task: asyncio.Task) -> None:
@@ -334,9 +346,14 @@ async def test_ownerless_request_answered_once_not_broadcast():
 
 
 @pytest.mark.asyncio
-async def test_kas_auth_waits_for_shared_answer_capacity_then_answers():
-    """A temporary full cap delays, rather than drops, the next KAS answer."""
-    rt, reader, _ = _make_runtime()
+async def test_permission_answer_waits_for_shared_answer_capacity_then_answers():
+    """A temporary full cap delays, rather than drops, the next auto-answer.
+
+    Drives the unroutable-permission answerer, the one caller of the shared
+    admission wait. (It was written against KAS's credential callback, which was
+    the second caller until kiro-cli's ACP relay took ownership of auth.)
+    """
+    rt, _reader, _ = _make_runtime()
     rt._max_answer_tasks = 1
     first_started = asyncio.Event()
     second_started = asyncio.Event()
@@ -345,8 +362,9 @@ async def test_kas_auth_waits_for_shared_answer_capacity_then_answers():
     release_second = asyncio.Event()
     capacity_checks = 0
 
-    async def blocked_answer(request_id: int | str) -> None:
-        if request_id == 1:
+    async def blocked_answer(msg, session_id, *, reason="x") -> None:
+        del session_id, reason
+        if msg.id == 1:
             first_started.set()
             await release_first.wait()
         else:
@@ -362,20 +380,20 @@ async def test_kas_auth_waits_for_shared_answer_capacity_then_answers():
             second_capacity_check.set()
         return await wait_for_capacity(*args, **kwargs)
 
-    rt._answer_get_access_token = blocked_answer  # type: ignore[method-assign]
+    rt._answer_unroutable_permission = blocked_answer  # type: ignore[method-assign]
     rt._wait_for_answer_capacity = observed_capacity  # type: ignore[method-assign]
-    task = await _start_reader(rt)
     try:
-        _feed(reader, {"id": 1, "method": METHOD_KAS_AUTH_GET_ACCESS_TOKEN})
+        await rt._spawn_answer_task(_permission_msg(1), "sA")
         await asyncio.wait_for(first_started.wait(), timeout=1.0)
         assert len(rt._answer_tasks) == 1
 
-        _feed(reader, {"id": 2, "method": METHOD_KAS_AUTH_GET_ACCESS_TOKEN})
+        second = asyncio.ensure_future(rt._spawn_answer_task(_permission_msg(2), "sA"))
         await asyncio.wait_for(second_capacity_check.wait(), timeout=1.0)
         assert not second_started.is_set()
 
         release_first.set()
         await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        await second
         assert len(rt._answer_tasks) == 1
         assert sum(rt._dropped_frames.values()) == 0
 
@@ -389,7 +407,6 @@ async def test_kas_auth_waits_for_shared_answer_capacity_then_answers():
         release_first.set()
         release_second.set()
         await asyncio.gather(*rt._answer_tasks, return_exceptions=True)
-        await _stop_reader(task)
 
 
 @pytest.mark.asyncio
@@ -414,9 +431,9 @@ async def test_ownerless_response_with_null_result_is_not_answered():
 
 
 @pytest.mark.asyncio
-async def test_kas_auth_cap_timeout_marks_runtime_dead_without_growth():
-    """A wedged shared cap fails the runtime instead of losing a KAS request."""
-    rt, reader, _ = _make_runtime()
+async def test_answer_cap_timeout_marks_runtime_dead_without_growth():
+    """A wedged shared cap fails the runtime instead of losing a request."""
+    rt, _reader, _ = _make_runtime()
     rt._max_answer_tasks = 1
     rt._answer_cap_wait_secs = 0.0
     first_started = asyncio.Event()
@@ -425,8 +442,9 @@ async def test_kas_auth_cap_timeout_marks_runtime_dead_without_growth():
     marked_dead = asyncio.Event()
     dead_reasons: list[str] = []
 
-    async def blocked_answer(request_id: int | str) -> None:
-        if request_id == 1:
+    async def blocked_answer(msg, session_id, *, reason="x") -> None:
+        del session_id, reason
+        if msg.id == 1:
             first_started.set()
             await release_first.wait()
         else:
@@ -437,24 +455,22 @@ async def test_kas_auth_cap_timeout_marks_runtime_dead_without_growth():
         rt._dead = True
         marked_dead.set()
 
-    rt._answer_get_access_token = blocked_answer  # type: ignore[method-assign]
+    rt._answer_unroutable_permission = blocked_answer  # type: ignore[method-assign]
     rt._mark_dead = mark_dead  # type: ignore[method-assign]
-    task = await _start_reader(rt)
     try:
-        _feed(reader, {"id": 1, "method": METHOD_KAS_AUTH_GET_ACCESS_TOKEN})
+        await rt._spawn_answer_task(_permission_msg(1), "sA")
         await asyncio.wait_for(first_started.wait(), timeout=1.0)
 
-        _feed(reader, {"id": 2, "method": METHOD_KAS_AUTH_GET_ACCESS_TOKEN})
+        await rt._spawn_answer_task(_permission_msg(2), "sA")
         await asyncio.wait_for(marked_dead.wait(), timeout=1.0)
 
         assert not second_started.is_set()
         assert len(rt._answer_tasks) == 1
         assert sum(rt._dropped_frames.values()) == 0
-        assert dead_reasons and "KAS auth" in dead_reasons[0]
+        assert dead_reasons and "permission" in dead_reasons[0]
     finally:
         release_first.set()
         await asyncio.gather(*rt._answer_tasks, return_exceptions=True)
-        await _stop_reader(task)
 
 
 # ── Response routing by id ──
@@ -816,6 +832,239 @@ def test_runtime_uses_clients_augmented_kiro_bin_resolver():
     assert runtime_mod._resolve_kiro_bin_for_spawn is client_mod._resolve_kiro_bin_for_spawn
 
 
+@pytest.mark.parametrize("backend", [None, ACP_BACKEND_KAS])
+@pytest.mark.asyncio
+async def test_runtime_missing_kiro_bin_reports_the_directories_it_searched(backend):
+    """The runtime spawn path must DIAGNOSE a missing Kiro CLI, not just name it.
+
+    ``AcpClient._spawn`` already separates "this binary is not installed" from
+    "its install directory is outside the search" by naming every directory it
+    walked (see ``test_spawn_kiro_missing_bin_reports_only_resolver_search_dirs``
+    and ``env.describe_search_path``). The runtime sibling raised a bare
+    ``kiro-cli not found in PATH``, which is both less information and factually
+    wrong: resolution also walks ``%LOCALAPPDATA%\\Kiro-Cli``,
+    ``%ProgramFiles%\\Kiro-Cli`` and the ``KIROCREW_KIRO_BIN`` override, none of
+    which is PATH.
+
+    That gap is what produced #6497. A Windows reporter read "not found in PATH",
+    ran ``where kiro-cli``, got nothing, saw the gateway's OWN ``kirocrew.exe``
+    in the app bundle, and concluded the agent CLI had been renamed and this
+    lookup left stale. It had not been: ``kirocrew`` is Kiro Crew's own console
+    script and ``kiro-cli`` is a separate prerequisite the message never said it
+    was looking for anywhere but PATH.
+
+    Both spawn branches are covered because both resolve the same binary and both
+    have to answer the same question.
+    """
+    import kiro_crew.acp.client as client_mod
+    import kiro_crew.acp.runtime as runtime_mod
+
+    searched = [os.path.join(os.sep, "managed-bin"), os.path.join(os.sep, "path-bin")]
+    unsearched = os.path.join(os.sep, "never-checked")
+    rt = AcpRuntime(work_dir="/tmp")
+    if backend is not None:
+        rt._acp_backend = backend
+
+    async def _no_bin(*, environ=None, home=None):
+        return None
+
+    with (
+        patch.object(runtime_mod, "_resolve_kiro_bin_for_spawn", _no_bin),
+        patch.object(client_mod, "known_kiro_cli_dirs", return_value=searched),
+    ):
+        with pytest.raises(AcpRuntimeError) as raised:
+            await rt._resolve_spawn_argv()
+
+    message = str(raised.value)
+    assert "searched 2 directories" in message
+    assert searched[0] in message
+    assert searched[1] in message
+    assert unsearched not in message
+    # The remedy travels with the diagnosis, the rule env.MCP_PATH_HINT exists
+    # for: a reader who learns the search missed their install needs the one
+    # knob that covers it named here, not only in the source.
+    assert "KIROCREW_KIRO_BIN" in message
+
+
+async def _wait_for_queued(admission: _ColdStartAdmission, expected: int) -> None:
+    """Yield to scheduled starters until the coordinator exposes the queue."""
+    for _ in range(100):
+        if admission.queued == expected:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(
+        f"cold-start queue did not reach {expected}, active={admission.active}, "
+        f"queued={admission.queued}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cold_start_admission_caps_simultaneous_runtime_spawns(monkeypatch):
+    import kiro_crew.acp.runtime as runtime_mod
+
+    admission = _ColdStartAdmission(limit=2)
+    monkeypatch.setattr(runtime_mod, "_cold_start_admission", lambda: admission)
+    release = asyncio.Event()
+    first_two_entered = asyncio.Event()
+    running = 0
+    peak = 0
+
+    async def controlled_spawn(self):
+        nonlocal peak, running
+        running += 1
+        peak = max(peak, running)
+        if running == 2:
+            first_two_entered.set()
+        try:
+            await release.wait()
+        finally:
+            running -= 1
+
+    monkeypatch.setattr(AcpRuntime, "_spawn_admitted", controlled_spawn)
+    tasks = [asyncio.create_task(AcpRuntime().spawn()) for _ in range(3)]
+    try:
+        await asyncio.wait_for(first_two_entered.wait(), timeout=1.0)
+        await _wait_for_queued(admission, 1)
+
+        assert peak == 2
+        assert admission.active == 2
+        assert admission.queued == 1
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert peak == 2
+    assert admission.active == 0
+    assert admission.queued == 0
+
+
+@pytest.mark.asyncio
+async def test_cold_start_cancellation_releases_active_admission_slot(monkeypatch):
+    import kiro_crew.acp.runtime as runtime_mod
+
+    admission = _ColdStartAdmission(limit=1)
+    monkeypatch.setattr(runtime_mod, "_cold_start_admission", lambda: admission)
+    entered = asyncio.Event()
+    block = asyncio.Event()
+
+    async def blocked_spawn(self):
+        entered.set()
+        await block.wait()
+
+    monkeypatch.setattr(AcpRuntime, "_spawn_admitted", blocked_spawn)
+    task = asyncio.create_task(AcpRuntime().spawn())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    assert admission.active == 0
+    monkeypatch.setattr(AcpRuntime, "_spawn_admitted", AsyncMock(return_value=None))
+    await AcpRuntime().spawn()
+    assert admission.active == 0
+
+
+@pytest.mark.asyncio
+async def test_cold_start_queued_cancellation_does_not_consume_slot(monkeypatch):
+    import kiro_crew.acp.runtime as runtime_mod
+
+    admission = _ColdStartAdmission(limit=1)
+    monkeypatch.setattr(runtime_mod, "_cold_start_admission", lambda: admission)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_spawn(self):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(AcpRuntime, "_spawn_admitted", blocked_spawn)
+    active = asyncio.create_task(AcpRuntime().spawn())
+    queued = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        queued = asyncio.create_task(AcpRuntime().spawn())
+        await _wait_for_queued(admission, 1)
+
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        assert admission.active == 1
+        assert admission.queued == 0
+    finally:
+        release.set()
+        if queued is not None and not queued.done():
+            queued.cancel()
+        cleanup_tasks = [active] + ([] if queued is None else [queued])
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+    assert admission.active == 0
+
+
+@pytest.mark.asyncio
+async def test_cold_start_exception_releases_admission_slot(monkeypatch):
+    import kiro_crew.acp.runtime as runtime_mod
+
+    admission = _ColdStartAdmission(limit=1)
+    monkeypatch.setattr(runtime_mod, "_cold_start_admission", lambda: admission)
+
+    async def fail_spawn(self):
+        raise RuntimeError("initialize failed")
+
+    monkeypatch.setattr(AcpRuntime, "_spawn_admitted", fail_spawn)
+    with pytest.raises(RuntimeError, match="initialize failed"):
+        await AcpRuntime().spawn()
+    assert admission.active == 0
+
+    monkeypatch.setattr(AcpRuntime, "_spawn_admitted", AsyncMock(return_value=None))
+    await AcpRuntime().spawn()
+    assert admission.active == 0
+
+
+def test_cold_start_admission_registry_releases_contended_closed_loop(monkeypatch):
+    import kiro_crew.acp.runtime as runtime_mod
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "_cold_start_admissions",
+        runtime_mod.weakref.WeakKeyDictionary(),
+    )
+    monkeypatch.setattr(runtime_mod, "_COLD_START_MAX_CONCURRENT", 1)
+
+    loop = asyncio.new_event_loop()
+    loop_ref = weakref.ref(loop)
+    asyncio.set_event_loop(loop)
+
+    async def contend_and_drain():
+        admission = runtime_mod._cold_start_admission()
+        assert runtime_mod._cold_start_admission() is admission
+        await admission.acquire()
+        queued = asyncio.create_task(admission.acquire())
+        await _wait_for_queued(admission, 1)
+        admission_ref = weakref.ref(admission)
+        queued.cancel()
+        await asyncio.gather(queued, return_exceptions=True)
+        admission.release()
+        assert admission.active == 0
+        assert admission.queued == 0
+        return admission_ref
+
+    try:
+        admission_ref = loop.run_until_complete(contend_and_drain())
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+        del loop
+
+    gc.collect()
+    assert admission_ref() is None
+    assert loop_ref() is None
+
+
 @pytest.mark.asyncio
 async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
     tmp_path,
@@ -844,7 +1093,7 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
         wrapped["spawn_kwargs"] = kwargs
         raise _StopSpawn()
 
-    async def resolve_installed():
+    async def resolve_installed(*, environ=None, home=None):
         return launch_path
 
     monkeypatch.setattr(
@@ -853,6 +1102,8 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
         resolve_installed,
     )
     monkeypatch.setattr(runtime_mod, "wrap_argv", capture_wrap)
+    voice_guard = MagicMock()
+    monkeypatch.setattr(runtime_mod, "assert_voice_runtime_outside_agent_workspace", voice_guard)
     monkeypatch.setattr(
         runtime_mod,
         "cgroup_scope_argv",
@@ -870,6 +1121,7 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
         "strip_python_env": True,
         "is_kiro_cli": True,
     }
+    voice_guard.assert_called_once_with(runtime._work_dir)
     assert strip_spawn_shim(wrapped["spawn_args"]) == (
         "/usr/bin/cgroup-wrapper",
         "/usr/bin/sandbox-wrapper",
@@ -885,6 +1137,93 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
     # reachable beside the launch path.
     assert "pass_fds" not in spawn_kwargs
     assert (Path(launch_path).parent / "kiro-cli-chat").exists()
+
+
+@pytest.mark.asyncio
+async def test_bound_macos_runtime_hands_sessions_the_verified_pathname(monkeypatch, tmp_path):
+    """The ACP peer resolves this name itself, so it must be a name it can resolve.
+
+    It is returned only after the descriptor proves it still names the bound
+    identity. The earlier "/dev/fd/<n>" spelling is not resolvable on macOS -- the
+    only platform that binds -- so it reached the peer as an unusable cwd.
+    """
+    import kiro_crew.acp.runtime as runtime_mod
+
+    runtime = AcpRuntime(work_dir=tmp_path)
+    runtime._bound_workspace_fd = 71
+    runtime._spawn_work_dir = str(tmp_path)
+    target = AsyncMock(return_value="/canonical/workspace")
+    monkeypatch.setattr(runtime_mod, "resolve_bound_session_workspace", target)
+
+    # The DESCRIPTOR's own name, not the pathname the caller asked with: the peer
+    # re-resolves what it is handed, so the caller's spelling would leave the
+    # retarget window open.
+    assert await runtime._session_work_dir(tmp_path) == "/canonical/workspace"
+    target.assert_called_once_with(71, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_bound_macos_runtime_rejects_descendant_session_workspace(monkeypatch, tmp_path):
+    import kiro_crew.acp.runtime as runtime_mod
+
+    runtime = AcpRuntime(work_dir=tmp_path)
+    runtime._bound_workspace_fd = 71
+    runtime._spawn_work_dir = str(tmp_path)
+    descendant = tmp_path / "packages" / "app"
+    target = AsyncMock(side_effect=runtime_mod.BoundWorkspaceMismatch(str(descendant)))
+    monkeypatch.setattr(runtime_mod, "resolve_bound_session_workspace", target)
+
+    with pytest.raises(AcpRuntimeError, match="exact workspace"):
+        await runtime._session_work_dir(descendant)
+    target.assert_awaited_once_with(71, descendant)
+
+
+@pytest.mark.asyncio
+async def test_bound_macos_runtime_rejects_different_session_workspace(monkeypatch, tmp_path):
+    import kiro_crew.acp.runtime as runtime_mod
+
+    runtime = AcpRuntime(work_dir=tmp_path)
+    runtime._bound_workspace_fd = 72
+    runtime._spawn_work_dir = str(tmp_path)
+    monkeypatch.setattr(
+        runtime_mod,
+        "resolve_bound_session_workspace",
+        AsyncMock(side_effect=runtime_mod.BoundWorkspaceMismatch("retargeted")),
+    )
+
+    with pytest.raises(AcpRuntimeError, match="exact workspace"):
+        await runtime._session_work_dir(tmp_path / "retargeted")
+
+
+@pytest.mark.asyncio
+async def test_kill_cancellation_still_releases_bound_workspace(monkeypatch, tmp_path):
+    import kiro_crew.acp.runtime as runtime_mod
+
+    runtime = AcpRuntime(work_dir=tmp_path)
+    runtime._bound_workspace_fd = 73
+    runtime._spawn_work_dir = str(tmp_path)
+    entered = asyncio.Event()
+    closed: list[int] = []
+
+    async def stalled_teardown(*, expected=False):
+        entered.set()
+        await asyncio.Event().wait()
+
+    async def record_release(descriptor):
+        closed.append(descriptor)
+
+    monkeypatch.setattr(runtime, "_kill_inner", stalled_teardown)
+    monkeypatch.setattr(runtime_mod, "release_bound_agent_workspace", record_release)
+
+    task = asyncio.create_task(runtime.kill())
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert closed == [73]
+    assert runtime._bound_workspace_fd is None
+    assert runtime._spawn_work_dir == str(tmp_path)
 
 
 # ── Process death propagation ──
@@ -1252,16 +1591,20 @@ def test_get_rss_mb_real_process():
 
 
 def test_get_rss_tree_mb_real_process():
-    """_get_rss_tree_mb sums at least this process's RSS (>0); nonexistent
-    PID returns None. Skips where RSS introspection is unavailable (see
-    test_get_rss_mb_real_process)."""
-    from kiro_crew.acp.runtime import _get_rss_mb, _get_rss_tree_mb
+    """The real tree probe returns a positive sample for this process and None
+    for a nonexistent PID.
 
-    self_rss = _get_rss_mb(os.getpid())
-    if self_rss is None:
-        pytest.skip("RSS introspection unavailable in this environment")
+    Do not compare this sample with a separate single-process RSS read: resident
+    sets are live values and Windows may trim the working set between the two
+    calls.  The deterministic root-plus-descendants arithmetic is covered with
+    fixed values in ``test_platform_compat_coverage.py``.
+    """
+    from kiro_crew.acp.runtime import _get_rss_tree_mb
+
     tree = _get_rss_tree_mb(os.getpid())
-    assert tree is not None and tree >= self_rss  # tree includes self (+ children)
+    if tree is None:
+        pytest.skip("RSS introspection unavailable in this environment")
+    assert tree > 0.0
     assert _get_rss_tree_mb(2**31 - 1) is None
 
 
@@ -2538,6 +2881,110 @@ async def test_dispatch_usage_update():
         assert handle.last_prompt_stats.context_used_tokens == 5000
     finally:
         await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cost_and_prompt_tokens_reach_event_complete():
+    """claude seam billing: a session-cumulative usage_update cost and the
+    PromptResponse token counts are delta'd/folded into last_prompt_stats and
+    surfaced on EVENT_COMPLETE.usage — the wiring issue #6750 adds. Two turns
+    prove the delta: turn 2 is billed only its own movement of the cumulative
+    counter, and its own token counts."""
+    from kiro_crew.acp.types import EVENT_COMPLETE
+
+    rt, reader, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    task = await _start_reader(rt)
+    try:
+
+        async def run_turn(cost_amount, input_tokens, output_tokens):
+            events: list = []
+
+            async def drive():
+                async for ev in handle.prompt("hi", timeout=3.0):
+                    events.append(ev)
+
+            driver = asyncio.ensure_future(drive())
+            req_id = (await _await_routed(rt, "sA"))["sA"]
+            _feed(
+                reader,
+                {
+                    "method": METHOD_SESSION_UPDATE,
+                    "params": {
+                        "sessionId": "sA",
+                        "update": {
+                            "sessionUpdate": "usage_update",
+                            "used": 5000,
+                            "size": 10000,
+                            "cost": {"amount": cost_amount, "currency": "USD"},
+                        },
+                    },
+                },
+            )
+            _feed(
+                reader,
+                {
+                    "id": req_id,
+                    "result": {
+                        "stopReason": "end_turn",
+                        "inputTokens": input_tokens,
+                        "outputTokens": output_tokens,
+                        "cachedReadTokens": 7,
+                        "cachedWriteTokens": 3,
+                    },
+                },
+            )
+            await asyncio.wait_for(driver, timeout=3.0)
+            (complete,) = [ev for ev in events if ev.kind == EVENT_COMPLETE]
+            return complete
+
+        first = await run_turn(0.30, 100, 50)
+        assert first.usage.cost_usd == pytest.approx(0.30)
+        assert first.usage.input_tokens == 100
+        assert first.usage.output_tokens == 50
+        assert first.usage.cache_read_tokens == 7
+        assert first.usage.cache_creation_tokens == 3
+
+        # Turn 2: the cumulative counter moved 0.30 -> 0.50, so this turn's
+        # cost is the 0.20 delta, and the token counts are its own, not a sum.
+        second = await run_turn(0.50, 40, 20)
+        assert second.usage.cost_usd == pytest.approx(0.20)
+        assert second.usage.input_tokens == 40
+        assert second.usage.output_tokens == 20
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.parametrize(
+    "cost",
+    [
+        "0.5",  # cost not dict-shaped
+        {"amount": "0.5"},
+        {"amount": True},
+        {"amount": float("nan")},
+        {"amount": -0.01},
+        {"amount": 10**400},
+    ],
+)
+def test_handle_update_malformed_cost_is_noop(cost):
+    """A malformed agent-supplied cost must degrade to absent at the
+    parse_usage_cost chokepoint — no exception inside the prompt-turn dispatch
+    path, and no stats movement."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    msg = JsonRpcMessage(
+        method=METHOD_SESSION_UPDATE,
+        params={
+            "sessionId": "sA",
+            "update": {"sessionUpdate": "usage_update", "used": 1, "size": 2, "cost": cost},
+        },
+    )
+    events = handle._handle_update(msg)  # must not raise
+    assert events == []
+    assert handle.last_prompt_stats.cost_usd == 0.0
+    assert handle.last_prompt_stats.cost_session_usd == 0.0
 
 
 @pytest.mark.parametrize(
@@ -3891,6 +4338,15 @@ class TestAcpRuntimeLoadSession:
             return out
 
         builders = {**_builders(rt_mod), **_builders(client_mod)}
+        # Exempt: builders whose session exists only to read the session/new
+        # response and is terminated before any prompt. Such a session never
+        # calls a tool, so pooled broker stubs would add per-probe MCP boot
+        # churn without pooling anything. Everything a REAL conversation runs
+        # through must stay in the ratchet.
+        _NEVER_PROMPTS = {"probe_advertised_models"}
+        for name in _NEVER_PROMPTS:
+            assert name in builders, f"{name} no longer issues session/new — remove its exemption"
+            builders.pop(name)
         # The four known builders; a new one is included automatically.
         assert {
             "create_session",
@@ -4645,13 +5101,36 @@ async def test_send_command_redacts_output(monkeypatch):
 # ── Round-2 parity fixes: auth detection, exception translation, steer ──
 
 
-def test_saw_not_logged_in_detects_auth_failure():
-    """#1: AcpRuntime.saw_not_logged_in scans captured stderr for kiro-cli's
-    'not logged in' signal so a death can be surfaced as AcpAuthRequired."""
-    rt, _, _ = _make_runtime()
-    rt._stderr_lines = ["startup noise", "error: You are not logged in, please log in"]
+@pytest.mark.asyncio
+async def test_saw_not_logged_in_detects_auth_failure():
+    """#1: AcpRuntime.saw_not_logged_in reports kiro-cli's auth-failure signal on
+    stderr so a death can be surfaced as AcpAuthRequired.
+
+    Drives the real ``_drain_stderr`` rather than assigning ``_stderr_lines``
+    directly. The observation is now latched as each line arrives, because the
+    buffer is a 20-line ring and nothing asks about auth until a request has
+    already timed out -- by which point a chatty startup can have evicted the
+    line. ``_drain_stderr`` is the only production writer of that buffer, so
+    driving it is strictly closer to the real path than the previous assignment
+    was; the two assertions below are unchanged in intent.
+    """
+
+    class _Stderr:
+        def __init__(self, lines):
+            self._lines = [f"{ln}\n".encode() for ln in lines]
+
+        async def readline(self):
+            return self._lines.pop(0) if self._lines else b""
+
+    async def _drain(lines):
+        rt, _, proc = _make_runtime()
+        proc.stderr = _Stderr(lines)
+        await rt._drain_stderr()
+        return rt
+
+    rt = await _drain(["startup noise", "error: You are not logged in, please log in"])
     assert rt.saw_not_logged_in() is True
-    rt._stderr_lines = ["ordinary stderr", "mcp server ready"]
+    rt = await _drain(["ordinary stderr", "mcp server ready"])
     assert rt.saw_not_logged_in() is False
 
 
@@ -5491,7 +5970,7 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
         captured["env"] = kwargs.get("env")
         raise _StopSpawn()
 
-    async def resolve_kiro_bin():
+    async def resolve_kiro_bin(*, environ=None, home=None):
         return "/fake/kiro"
 
     monkeypatch.setattr(
@@ -5529,6 +6008,53 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
         assert key not in env, f"{key} leaked into runtime child env"
     assert env.get("KIROCREW_UNRELATED_KEEPME") == "keep-this-value"
     assert env.get("AWS_ACCESS_KEY_ID") == "FAKE-akid"
+
+
+@pytest.mark.asyncio
+async def test_runtime_spawn_names_its_own_browser_session(monkeypatch):
+    """A subagent gets its own playwright-cli browser, not the parent's.
+
+    AcpRuntime builds its child environment independently of AcpClient, so this
+    is the drift guard: without it a subagent's ``goto`` lands in whatever page
+    the parent was reading, and its ``close`` takes the parent's browser down.
+    """
+    import kiro_crew.acp.runtime as runtime_mod
+
+    monkeypatch.delenv("PLAYWRIGHT_CLI_SESSION", raising=False)
+    captured: dict[str, object] = {}
+
+    class _StopSpawn(Exception):
+        pass
+
+    async def _fake_exec(*_args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        raise _StopSpawn()
+
+    async def resolve_kiro_bin(*, environ=None, home=None):
+        return "/fake/kiro"
+
+    monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_kiro_bin)
+    monkeypatch.setattr(
+        runtime_mod,
+        "wrap_argv",
+        lambda argv, mode, strip_python_env=False, is_kiro_cli=None: (argv, None),
+    )
+    monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: argv)
+    monkeypatch.setattr(runtime_mod, "augmented_path", lambda p: p)
+    monkeypatch.setattr(runtime_mod, "resolve_krb5_ccname", lambda env: None)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    names = []
+    for _ in range(2):
+        rt = AcpRuntime(sandbox_mode="auto")
+        with pytest.raises(_StopSpawn):
+            await rt.spawn()
+        env = captured["env"]
+        assert isinstance(env, dict)
+        names.append(env["PLAYWRIGHT_CLI_SESSION"])
+
+    assert all(name.startswith("kc-") for name in names)
+    assert names[0] != names[1]
 
 
 # ── Unroutable-frame drop accounting (log-flood containment) ──
@@ -6679,6 +7205,269 @@ def test_child_low_fidelity_requires_structured_security_context():
     assert ev.child_low_fidelity is False
 
 
+def test_child_mcp_identity_trusted_isolates_verified_identity():
+    """The identity half of the fidelity split: verified server/tool pair on a
+    child event whose ARGUMENTS never reached the cache. Each requirement is
+    individually load-bearing (fail-closed on its own cache miss)."""
+    from kiro_crew.acp.types import AcpEvent
+
+    def _ev(**overrides):
+        base: dict = dict(
+            kind="permission_request",
+            sub_session_id="child-a",
+            shell_classified=True,
+            is_shell=False,
+            mcp_server_name="example-server",
+            tool_name="get-item",
+            mcp_identity_trusted=True,
+        )
+        base.update(overrides)
+        return AcpEvent(**base)
+
+    # The issue's shape: remote MCP tool_call streamed no rawInput — low
+    # fidelity (args unverified) but identity verified.
+    ev = _ev()
+    assert ev.child_low_fidelity is True
+    assert ev.child_mcp_identity_trusted is True
+    # A parent event never needs the split.
+    assert _ev(sub_session_id="").child_mcp_identity_trusted is False
+    # Unresolved shell classification: is_shell=False is only the miss
+    # default, so nothing proves this is not a shell tool.
+    assert _ev(shell_classified=False).child_mcp_identity_trusted is False
+    # A resolved SHELL tool: its deny gates need the command bytes this
+    # event lacks — never identity-eligible.
+    assert _ev(is_shell=True).child_mcp_identity_trusted is False
+    # Cache-missed identity halves are each fail-closed.
+    assert _ev(mcp_server_name="").child_mcp_identity_trusted is False
+    assert _ev(tool_name="").child_mcp_identity_trusted is False
+    # THE HARDENING: non-empty identity fields alone are NOT provenance. An
+    # event populated by any path that did not earn the explicit flag (e.g. a
+    # future inline/agent-authored fallback) stays untrusted.
+    assert _ev(mcp_identity_trusted=False).child_mcp_identity_trusted is False
+    # Full-fidelity child: the property may hold too, and grant callers use
+    # ``child_unconditional_grant_eligible`` — both True is consistent, not
+    # contradictory.
+    full = _ev(raw_params_trusted=True, raw_tool_params={"itemId": "i-1"})
+    assert full.child_low_fidelity is False
+    assert full.child_mcp_identity_trusted is True
+
+
+def test_mcp_identity_trusted_defaults_false():
+    """The provenance flag is opt-in at trusted population sites only: a bare
+    construction (the shape any future untrusted path would produce) reads
+    False."""
+    from kiro_crew.acp.types import AcpEvent
+
+    assert AcpEvent(kind="permission_request").mcp_identity_trusted is False
+
+
+def test_child_unconditional_grant_eligible_matches_consumer_shapes():
+    """The hoisted grant-eligibility property is exactly
+    ``not child_low_fidelity or child_mcp_identity_trusted`` — pinned across
+    every fidelity/identity combination the three approval surfaces
+    (dashboard runner, Slack gateway, subagent manager) can see."""
+    from kiro_crew.acp.types import AcpEvent
+
+    # Full-fidelity child (low_fidelity False): eligible regardless of identity.
+    full = AcpEvent(
+        kind="permission_request",
+        sub_session_id="child-a",
+        shell_classified=True,
+        is_shell=False,
+        raw_params_trusted=True,
+        raw_tool_params={"k": "v"},
+    )
+    assert full.child_low_fidelity is False
+    assert full.child_unconditional_grant_eligible is True
+    # Low-fidelity child with verified identity: eligible.
+    identity = AcpEvent(
+        kind="permission_request",
+        sub_session_id="child-a",
+        shell_classified=True,
+        is_shell=False,
+        mcp_server_name="example-server",
+        tool_name="get-item",
+        mcp_identity_trusted=True,
+    )
+    assert identity.child_low_fidelity is True
+    assert identity.child_unconditional_grant_eligible is True
+    # Low-fidelity child, identity unverified: NOT eligible.
+    blind = AcpEvent(kind="permission_request", sub_session_id="child-a")
+    assert blind.child_low_fidelity is True
+    assert blind.child_unconditional_grant_eligible is False
+    # Non-empty identity WITHOUT the provenance flag: still NOT eligible (the
+    # hardening the flag buys, seen from the grant surface).
+    forged = AcpEvent(
+        kind="permission_request",
+        sub_session_id="child-a",
+        shell_classified=True,
+        is_shell=False,
+        mcp_server_name="example-server",
+        tool_name="get-item",
+    )
+    assert forged.child_low_fidelity is True
+    assert forged.child_unconditional_grant_eligible is False
+    # Non-child events are always eligible.
+    assert AcpEvent(kind="permission_request").child_unconditional_grant_eligible is True
+    # Exhaustive equivalence against the un-hoisted expression.
+    for lf_overrides in (
+        {},  # low fidelity (no trusted params)
+        {"raw_params_trusted": True, "raw_tool_params": {"k": "v"}},  # full fidelity
+    ):
+        for id_overrides in (
+            {},
+            {
+                "mcp_server_name": "example-server",
+                "tool_name": "get-item",
+                "mcp_identity_trusted": True,
+            },
+        ):
+            ev = AcpEvent(
+                kind="permission_request",
+                sub_session_id="child-a",
+                shell_classified=True,
+                is_shell=False,
+                **lf_overrides,
+                **id_overrides,
+            )
+            assert ev.child_unconditional_grant_eligible == (
+                not ev.child_low_fidelity or ev.child_mcp_identity_trusted
+            )
+
+
+def test_remote_mcp_empty_rawinput_keeps_identity_through_dispatch():
+    """End-to-end through the real _dispatch functions: a remote MCP server's
+    tool_call frame with EMPTY/absent rawInput leaves the params cache empty
+    (low fidelity) while the _meta.kiro identity still reaches the permission
+    event's trusted fields — the split the grant paths rely on."""
+    from kiro_crew.acp._dispatch import build_permission_event, parse_session_update
+
+    for raw_input_shape in ({}, None):
+        caches: dict = {
+            "tool_input_cache": {},
+            "shell_cache": {},
+            "raw_params_cache": {},
+            "mcp_server_name_cache": {},
+            "tool_name_cache": {},
+        }
+        child_sid, tcid = "child-a", "tc-1"
+        update = {
+            "sessionUpdate": "tool_call",
+            "toolCallId": tcid,
+            "title": "@example-server/get-item",
+            "kind": "other",
+            "_meta": {"kiro": {"mcpServerName": "example-server", "toolName": "get-item"}},
+        }
+        if raw_input_shape is not None:
+            update["rawInput"] = raw_input_shape
+        parse_session_update(update, cache_scope=child_sid, **caches)
+
+        class _Msg:
+            id = 90
+            method = "session/request_permission"
+            params = {
+                "sessionId": child_sid,
+                "toolCall": {
+                    "toolCallId": tcid,
+                    "title": "@example-server/get-item",
+                    "input": {"itemId": "item-0001"},
+                },
+                "options": [
+                    {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                ],
+            }
+
+        event, _ = build_permission_event(_Msg(), cache_scope=child_sid, **caches)
+        event.sub_session_id = child_sid
+        assert event.raw_params_trusted is False
+        assert event.child_low_fidelity is True
+        assert event.mcp_server_name == "example-server"
+        assert event.tool_name == "get-item"
+        # The real permission builder earns the provenance flag: the identity
+        # pair resolved from the origin-scoped caches, never inline.
+        assert event.mcp_identity_trusted is True
+        assert event.child_mcp_identity_trusted is True
+        assert event.child_unconditional_grant_eligible is True
+
+
+def test_permission_event_cache_miss_does_not_earn_identity_flag():
+    """The provenance flag is HIT-derived, never availability-derived: a
+    permission frame whose toolCallId has NO cache entry (wired caches, no
+    preceding tool_call) must read mcp_identity_trusted False — the flag
+    reports where the values CAME FROM, so a future inline fallback that
+    populates the identity fields on a miss stays untrusted."""
+    from kiro_crew.acp._dispatch import build_permission_event
+
+    class _Msg:
+        id = 91
+        method = "session/request_permission"
+        params = {
+            "sessionId": "child-a",
+            "toolCall": {
+                "toolCallId": "tc-never-seen",
+                "title": "@example-server/get-item",
+                "input": {"itemId": "item-0001"},
+            },
+            "options": [{"optionId": "allow_once", "name": "Allow", "kind": "allow_once"}],
+        }
+
+    event, _ = build_permission_event(
+        _Msg(),
+        tool_input_cache={},
+        shell_cache={},
+        raw_params_cache={},
+        mcp_server_name_cache={},
+        tool_name_cache={},
+        cache_scope="child-a",
+    )
+    assert event.mcp_server_name == ""
+    assert event.tool_name == ""
+    assert event.mcp_identity_trusted is False
+    # Asymmetric hit: BOTH reads must hit — a lone server-name entry (a
+    # partial/older writer) earns nothing.
+    event2, _ = build_permission_event(
+        _Msg(),
+        tool_input_cache={},
+        shell_cache={},
+        raw_params_cache={},
+        mcp_server_name_cache={"child-a|tc-never-seen": "example-server"},
+        tool_name_cache={},
+        cache_scope="child-a",
+    )
+    assert event2.mcp_server_name == "example-server"
+    assert event2.tool_name == ""
+    assert event2.mcp_identity_trusted is False
+    event3, _ = build_permission_event(
+        _Msg(),
+        tool_input_cache={},
+        shell_cache={},
+        raw_params_cache={},
+        mcp_server_name_cache={},
+        tool_name_cache={"child-a|tc-never-seen": "get-item"},
+        cache_scope="child-a",
+    )
+    assert event3.mcp_server_name == ""
+    assert event3.tool_name == "get-item"
+    assert event3.mcp_identity_trusted is False
+    # The None-vs-"" distinction is the load-bearing half: a written entry may
+    # legitimately be "" (host shell/builtin tool_call caches "" for both), and
+    # that HIT still earns the flag — deriving trust from value non-emptiness
+    # instead of the hit is exactly the conflation the flag exists to remove.
+    event4, _ = build_permission_event(
+        _Msg(),
+        tool_input_cache={},
+        shell_cache={},
+        raw_params_cache={},
+        mcp_server_name_cache={"child-a|tc-never-seen": ""},
+        tool_name_cache={"child-a|tc-never-seen": ""},
+        cache_scope="child-a",
+    )
+    assert event4.mcp_server_name == ""
+    assert event4.tool_name == ""
+    assert event4.mcp_identity_trusted is True
+
+
 @pytest.mark.asyncio
 async def test_between_turns_child_permission_is_answered_not_queued():
     """With no in-flight prompt nothing consumes the slot queue until the next
@@ -7372,3 +8161,358 @@ async def test_cancel_during_drain_reject_does_not_wedge_handle():
     assert handle.is_turn_active is False  # not wedged
     # The stranded request went back on the queue for the next drain.
     assert not q["sA"].empty()
+
+
+# ── store_session_config: resolved-model capture (issue #5869) ──
+
+
+def test_store_session_config_adopts_sole_advertised_model_when_no_current_id():
+    """An unpinned session whose ``session/new`` advertises exactly one model
+    but omits ``currentModelId`` must still resolve that model, so ``served_model``
+    is non-empty for the whole run (the panel model chip depends on it)."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.store_session_config(
+        {"models": {"availableModels": [{"modelId": "kiro-model-x", "name": "X"}]}}
+    )
+    assert handle._resolved_model_id == "kiro-model-x"
+    assert handle.served_model == "kiro-model-x"
+
+
+def test_store_session_config_current_model_id_wins_over_sole_advertised():
+    """When the backend DOES echo ``currentModelId`` it is authoritative — the
+    sole-advertised fallback must not override it."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.store_session_config(
+        {
+            "models": {
+                "currentModelId": "kiro-current",
+                "availableModels": [{"modelId": "kiro-other", "name": "Other"}],
+            }
+        }
+    )
+    assert handle._resolved_model_id == "kiro-current"
+
+
+def test_store_session_config_leaves_model_empty_when_ambiguous():
+    """Two or more advertised models and no ``currentModelId`` is genuinely
+    ambiguous — do not guess; ``served_model`` stays empty."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.store_session_config(
+        {
+            "models": {
+                "availableModels": [
+                    {"modelId": "kiro-a", "name": "A"},
+                    {"modelId": "kiro-b", "name": "B"},
+                ]
+            }
+        }
+    )
+    assert handle._resolved_model_id == ""
+    assert handle.served_model == ""
+
+
+# ── probe_advertised_models (entitlement revalidation) ──
+
+
+_PROBE_RESP = {
+    "sessionId": "probe-1",
+    "models": {
+        "currentModelId": "claude-opus-5",
+        "availableModels": [
+            {"modelId": "auto", "name": "auto"},
+            {"modelId": "claude-opus-5", "name": "claude-opus-5"},
+        ],
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_probe_returns_fresh_set_and_terminates_probe_session():
+    """The probe re-asks entitlement with a throwaway minimal session/new
+    (mcpServers present-but-empty — kiro-cli treats a missing field as
+    malformed), reads the advertised set, and evicts the probe session so it
+    never accumulates in the shared process."""
+    rt, _, _ = _make_runtime()
+    rt._send_and_await = AsyncMock(side_effect=[_PROBE_RESP, {}])  # type: ignore[method-assign]
+    fresh = await rt.probe_advertised_models()
+    assert [m["modelId"] for m in fresh] == ["auto", "claude-opus-5"]
+    calls = rt._send_and_await.call_args_list
+    assert calls[0].args[0] == METHOD_SESSION_NEW
+    assert calls[0].args[1]["mcpServers"] == []
+    assert calls[1].args[0] == METHOD_SESSION_TERMINATE
+    assert calls[1].args[1] == {"sessionId": "probe-1"}
+    # Init scope closed — staged init notifications cannot leak into a later
+    # real session.
+    assert rt._session_inits_in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_returns_empty_and_closes_init_scope():
+    """A failed probe is not evidence: it returns [] (caller keeps its prior
+    snapshot) and must not leave the init-notification scope open."""
+    rt, _, _ = _make_runtime()
+    rt._send_and_await = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AcpRuntimeError("boom")
+    )
+    assert await rt.probe_advertised_models() == []
+    assert rt._session_inits_in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_advertising_nothing_returns_empty_but_still_terminates():
+    """A session/new that omits models yields [] — and the probe session is
+    still evicted, and the empty answer is NOT cached (the next call probes
+    again rather than repeating a non-answer)."""
+    rt, _, _ = _make_runtime()
+    rt._send_and_await = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[{"sessionId": "probe-2"}, {}, {"sessionId": "probe-3"}, {}]
+    )
+    assert await rt.probe_advertised_models() == []
+    assert rt._send_and_await.call_args_list[1].args[0] == METHOD_SESSION_TERMINATE
+    assert await rt.probe_advertised_models() == []
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 2
+
+
+@pytest.mark.asyncio
+async def test_probe_result_reused_within_ttl():
+    """A fresh non-empty answer is served from cache inside the TTL, so a burst
+    of rejections costs one round-trip."""
+    rt, _, _ = _make_runtime()
+    rt._send_and_await = AsyncMock(side_effect=[_PROBE_RESP, {}])  # type: ignore[method-assign]
+    first = await rt.probe_advertised_models()
+    second = await rt.probe_advertised_models()
+    assert second == first
+    # One session/new + one terminate total: the second call never hit the wire.
+    assert rt._send_and_await.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_probe_single_flight_concurrent_callers_share_one_probe():
+    rt, _, _ = _make_runtime()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_send(method, params, timeout=None):
+        if method == METHOD_SESSION_NEW:
+            started.set()
+            await release.wait()
+            return dict(_PROBE_RESP)
+        return {}
+
+    rt._send_and_await = AsyncMock(side_effect=slow_send)  # type: ignore[method-assign]
+    t1 = asyncio.ensure_future(rt.probe_advertised_models())
+    t2 = asyncio.ensure_future(rt.probe_advertised_models())
+    await started.wait()
+    release.set()
+    r1, r2 = await asyncio.gather(t1, t2)
+    assert r1 == r2 != []
+    news = [c for c in rt._send_and_await.call_args_list if c.args[0] == METHOD_SESSION_NEW]
+    assert len(news) == 1
+
+
+@pytest.mark.asyncio
+async def test_probe_on_dead_or_uninitialized_runtime_returns_empty():
+    rt, _, _ = _make_runtime()
+    rt._dead = True
+    assert await rt.probe_advertised_models() == []
+    rt2, _, _ = _make_runtime()
+    rt2._initialized = False
+    assert await rt2.probe_advertised_models() == []
+
+
+# ── AcpSessionHandle.refresh_available_models ──
+
+
+@pytest.mark.asyncio
+async def test_refresh_replaces_snapshot_on_nonempty_probe():
+    """One refresh heals every consumer of the handle's snapshot: the fresh
+    probe answer replaces the session-init availableModels in place."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.store_session_config(
+        {
+            "models": {
+                "availableModels": [
+                    {"modelId": "claude-sonnet-4"},
+                    {"modelId": "claude-sonnet-4.5"},
+                ]
+            }
+        }
+    )
+    fresh_set = [
+        {"modelId": "auto", "name": "auto", "description": ""},
+        {"modelId": "claude-opus-5", "name": "claude-opus-5", "description": ""},
+    ]
+    rt.probe_advertised_models = AsyncMock(return_value=fresh_set)  # type: ignore[method-assign]
+    fresh = await handle.refresh_available_models()
+    assert fresh == fresh_set
+    assert [m["modelId"] for m in handle.available_models] == [
+        "auto",
+        "claude-opus-5",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_snapshot_on_empty_probe():
+    """A failed/empty probe is not evidence — the prior snapshot survives so a
+    flaky probe can never WIDEN or clear entitlement."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle.store_session_config({"models": {"availableModels": [{"modelId": "claude-sonnet-4"}]}})
+    rt.probe_advertised_models = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    assert await handle.refresh_available_models() == []
+    assert [m["modelId"] for m in handle.available_models] == ["claude-sonnet-4"]
+
+
+class TestParseAdvertisedModels:
+    """Both response shapes normalize identically, so a probe answer and a
+    session-init snapshot are directly comparable."""
+
+    def test_models_object_shape(self):
+        from kiro_crew.acp.session_handle import parse_advertised_models
+
+        out = parse_advertised_models(_PROBE_RESP)
+        assert [m["modelId"] for m in out] == ["auto", "claude-opus-5"]
+        assert all(set(m) == {"modelId", "name", "description"} for m in out)
+
+    def test_bare_list_shape(self):
+        from kiro_crew.acp.session_handle import parse_advertised_models
+
+        out = parse_advertised_models({"availableModels": [{"modelId": "claude-sonnet-4"}]})
+        assert [m["modelId"] for m in out] == ["claude-sonnet-4"]
+
+    def test_absent_or_malformed_yields_empty(self):
+        from kiro_crew.acp.session_handle import parse_advertised_models
+
+        assert parse_advertised_models({}) == []
+        assert parse_advertised_models({"models": {"availableModels": "nope"}}) == []
+        assert parse_advertised_models({"models": 7}) == []
+
+
+class TestStoreSessionConfigParseConsolidation:
+    """Drift-pin (#6382): ``store_session_config`` sources its model list from
+    ``parse_advertised_models``, so the session-init snapshot can never drift
+    from what a pooled-runtime probe would parse out of the same payload."""
+
+    def _handle(self):
+        rt, _, _ = _make_runtime()
+        q = _register(rt, "sA")
+        return AcpSessionHandle("sA", q["sA"], rt)
+
+    def test_models_object_shape_matches_canonical_parser(self):
+        # Mixed modelId/value spellings + a missing description exercise every
+        # normalization branch; hard-coded expectation so a regression inside
+        # parse_advertised_models fails this pin too.
+        resp = {
+            "models": {
+                "currentModelId": "kiro-model-x",
+                "availableModels": [
+                    {"modelId": "kiro-model-x", "name": "X", "description": "d"},
+                    {"value": "kiro-model-y"},
+                    {"name": "no id — skipped"},
+                    "not-a-dict",
+                ],
+            }
+        }
+        handle = self._handle()
+        handle.store_session_config(resp)
+        assert handle.available_models == [
+            {"modelId": "kiro-model-x", "name": "X", "description": "d"},
+            {"modelId": "kiro-model-y", "name": "kiro-model-y", "description": ""},
+        ]
+
+    def test_bare_list_shape_matches_canonical_parser(self):
+        resp = {"availableModels": [{"modelId": "kiro-model-x"}, {"value": "kiro-model-y"}]}
+        handle = self._handle()
+        handle.store_session_config(resp)
+        assert handle.available_models == [
+            {"modelId": "kiro-model-x", "name": "kiro-model-x", "description": ""},
+            {"modelId": "kiro-model-y", "name": "kiro-model-y", "description": ""},
+        ]
+
+    def test_bare_list_under_models_key_matches_canonical_parser(self):
+        """The bare-list branch is the only site that RE-KEYS the payload
+        (``models`` list → ``{"availableModels": models}`` envelope) — reach
+        it via the ``models`` key so the re-key itself is pinned."""
+        handle = self._handle()
+        handle.store_session_config(
+            {"models": [{"modelId": "kiro-model-x"}, {"value": "kiro-model-y"}]}
+        )
+        assert handle.available_models == [
+            {"modelId": "kiro-model-x", "name": "kiro-model-x", "description": ""},
+            {"modelId": "kiro-model-y", "name": "kiro-model-y", "description": ""},
+        ]
+
+    def test_dict_branch_delegates_to_canonical_parser(self, monkeypatch):
+        """Anti-re-fork pin (#6382): the dict branch must SOURCE its list from
+        ``parse_advertised_models`` AND call it with the checked-binding
+        envelope — a restored inline walk, a whole-response re-resolution, or
+        a wrong envelope all fail this pin."""
+        import kiro_crew.acp.session_handle as sh
+
+        sentinel = [
+            {"modelId": "sentinel-a", "name": "A", "description": ""},
+            {"modelId": "sentinel-b", "name": "B", "description": ""},
+        ]
+        calls: list = []
+
+        def _fake(resp):
+            calls.append(resp)
+            return list(sentinel)
+
+        monkeypatch.setattr(sh, "parse_advertised_models", _fake)
+        handle = self._handle()
+        handle.store_session_config({"models": {"availableModels": [{"modelId": "real"}]}})
+        assert handle.available_models == sentinel
+        assert calls == [{"models": {"availableModels": [{"modelId": "real"}]}}]
+
+    def test_bare_list_branch_delegates_to_canonical_parser(self, monkeypatch):
+        import kiro_crew.acp.session_handle as sh
+
+        sentinel = [
+            {"modelId": "sentinel-a", "name": "A", "description": ""},
+            {"modelId": "sentinel-b", "name": "B", "description": ""},
+        ]
+        calls: list = []
+
+        def _fake(resp):
+            calls.append(resp)
+            return list(sentinel)
+
+        monkeypatch.setattr(sh, "parse_advertised_models", _fake)
+        handle = self._handle()
+        handle.store_session_config({"availableModels": [{"modelId": "real"}]})
+        assert handle.available_models == sentinel
+        assert calls == [{"availableModels": [{"modelId": "real"}]}]
+
+    def test_well_formed_empty_list_still_overwrites_prior_snapshot(self):
+        """Pre-existing call-site policy pinned through the consolidation: a
+        WELL-FORMED empty ``availableModels`` list DOES clear a prior snapshot
+        here (unlike ``AcpClient._capture_available_models``'s non-empty
+        guard). Switching this site to a client-style guard would be a
+        behavior change this test exists to catch."""
+        handle = self._handle()
+        handle.store_session_config({"models": {"availableModels": [{"modelId": "kiro-model-x"}]}})
+        assert [m["modelId"] for m in handle.available_models] == ["kiro-model-x"]
+        handle.store_session_config({"models": {"availableModels": []}})
+        assert handle.available_models == []
+
+    def test_malformed_inner_shape_does_not_clobber_prior_snapshot(self):
+        """The assignment guard survives the consolidation: a later response
+        whose ``availableModels`` is malformed must not clear an
+        already-captured list (the canonical parser returns ``[]`` for it, but
+        assignment policy is the call site's, not the parser's)."""
+        handle = self._handle()
+        handle.store_session_config({"models": {"availableModels": [{"modelId": "kiro-model-x"}]}})
+        assert [m["modelId"] for m in handle.available_models] == ["kiro-model-x"]
+        handle.store_session_config({"models": {"availableModels": "nope"}})
+        assert [m["modelId"] for m in handle.available_models] == ["kiro-model-x"]

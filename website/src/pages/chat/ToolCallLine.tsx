@@ -5,7 +5,7 @@ import { useAppSelector, useAppDispatch } from '../../store'
 import { clearFocusToolCallId, mcpAppKey } from '../../store/chatSlice'
 import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
 import { useLanguage } from '../../i18n/LanguageProvider'
-import { pickToolLabel } from '../../utils/toolLabel'
+import { DERIVE_LABEL_THRESHOLD_CHARS, deriveShellSummary, pickToolLabel } from '../../utils/toolLabel'
 import { LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
@@ -27,6 +27,15 @@ import { i18nT } from '../../i18n/t'
 import { fmtDateFields, fmtDuration as fmtDurationParts, fmtUnit } from '../../i18n/format'
 import { api } from '../../api/client'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
+import { isRejectedDecision } from '../../utils/approvalDecision'
+import { selectToolRowIndex, lookupLogEntry, denySiblingContent } from './toolRowIndex'
+import type { ToolActivity } from '../../types'
+
+// Stable empties for slots with no per-slot state yet. A fresh `[]` per
+// selector run would change identity every dispatch and defeat the
+// per-(messages, toolLog) memoization of selectToolRowIndex.
+const EMPTY_MESSAGES: ChatMessage[] = []
+const EMPTY_TOOL_LOG: ToolActivity[] = []
 
 // Tool-call ids that have already played their one-shot `.ft-block-reveal`
 // entrance fade. A CSS animation re-fires on every DOM *mount*, and a pill
@@ -70,6 +79,25 @@ const diffCardFoldChoice = new Map<string, boolean>()
 const SLIDE_DURATION = 0.22
 const SLIDE_EASE = [0.4, 0, 0.2, 1] as const
 
+// ── Collapsed label clamp ──
+// A tool title is whatever the transport hands us, and for a shell call that is
+// the WHOLE command — an inline heredoc or a chained one-liner is routinely
+// several kB. Rendered with `break-words` that wrapped to forty-odd lines, so a
+// single folded tool row could be taller than the answer it belongs to, and the
+// reader had to scroll a wall of quoting to reach the next message.
+//
+// A collapsed row is a STATUS line, exactly like ThinkingBlock's folded
+// "Thought process": it says which tool is running and that it is running, and
+// nothing more. So the collapsed label is pinned to one line with an ellipsis
+// and the full text lives one click away in ToolDetails, which already renders
+// the verbatim input. Expanding restores wrapping — the user asked to see it.
+//
+// `truncate` (not `line-clamp-1`) because the label is a plain flex child:
+// line-clamp would force `display: -webkit-box` on it and drop the flex
+// alignment the icon's centering depends on.
+const LABEL_COLLAPSED_CLASS = 'truncate'
+const LABEL_EXPANDED_CLASS = 'break-words'
+
 /**
  * A tool row's secondary status line (shell elapsed time, `wait` countdown).
  *
@@ -81,8 +109,13 @@ const SLIDE_EASE = [0.4, 0, 0.2, 1] as const
  * `children` are constructed by the caller even while hidden (ordinary JSX
  * evaluation) — they must therefore stay cheap and side-effect free, which the
  * two status lines are.
+ *
+ * `snap` disables the ease while the transcript is streaming at high
+ * frequency (see the `transcriptHot` prop): each animated frame costs a
+ * scrollTop re-pin, and during a hot stream those stack across rows. The ease
+ * stays for quiet-transcript transitions.
  */
-function StatusRow({ show, children }: { show: boolean; children: ReactNode }) {
+function StatusRow({ show, snap = false, children }: { show: boolean; snap?: boolean; children: ReactNode }) {
   const reduce = useReducedMotion()
   return (
     <AnimatePresence initial={false}>
@@ -91,7 +124,7 @@ function StatusRow({ show, children }: { show: boolean; children: ReactNode }) {
           initial={{ height: 0, opacity: 0 }}
           animate={{ height: 'auto', opacity: 1 }}
           exit={{ height: 0, opacity: 0 }}
-          transition={reduce
+          transition={reduce || snap
             ? { duration: 0 }
             : { height: { duration: SLIDE_DURATION, ease: SLIDE_EASE }, opacity: { duration: 0.15 } }}
           style={{ overflow: 'hidden' }}
@@ -105,7 +138,13 @@ function StatusRow({ show, children }: { show: boolean; children: ReactNode }) {
 
 /** Inline tool call pill. Click toggles an expanded panel below the pill that
  *  shows purpose / input / output. */
-export default memo(function ToolCallLine({ message, running: _running, slot, onFileOpen, disclosure, disclosureKey, onDisclosureChange, appInPanel, onOpenApp }: { message: ChatMessage; running: boolean; slot?: string; onFileOpen?: (path: string) => void; disclosure?: boolean; disclosureKey?: string; onDisclosureChange?: (key: string, expanded: boolean) => void; appInPanel?: boolean; onOpenApp?: (toolCallId: string) => void }) {
+export default memo(function ToolCallLine({ message, running: _running, slot, onFileOpen, disclosure, disclosureKey, onDisclosureChange, appInPanel, onOpenApp, transcriptHot = false }: { message: ChatMessage; running: boolean; slot?: string; onFileOpen?: (path: string) => void; disclosure?: boolean; disclosureKey?: string; onDisclosureChange?: (key: string, expanded: boolean) => void; appInPanel?: boolean; onOpenApp?: (toolCallId: string) => void;
+  /** True while the transcript is streaming at high frequency (host-derived
+   *  from useStreamIdle). Gates the entrance/status height eases: a hot-stream
+   *  mount lands at full height in one frame, a quiet-transcript mount keeps
+   *  the ease. Defaults to false so hosts without a heat signal keep the
+   *  animations unconditionally. */
+  transcriptHot?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const dispatch = useAppDispatch()
   const label = message.content.replace(/^🔧\s*/, '')
@@ -123,27 +162,25 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   })
 
   // Pull the matching toolLog entry. Returns purpose/input/output for the inline
-  // expansion as well as completion status for the icon.
+  // expansion as well as completion status for the icon. All transcript scans go
+  // through the shared per-slot index (see toolRowIndex.ts): built once per
+  // (messages, toolLog) identity change, O(1) per row per dispatch.
   const { effectiveId, isDone: logIsDone, isRejected, isAutoDenied, autoDenyReason, purpose, input, output, auto, ts, executionStartedAt, hasEntry, isShell, toolKind, toolName, fromLog } = useAppSelector(s => {
     // Slot-aware: for a non-active slot (split-view pane) read that slot's
     // per-slot tool log / messages / running state; `slot` undefined or equal to
     // the active slot → active-slot globals.
     const bg = slot && slot !== s.chat.activeSlot ? slot : null
-    const log = bg ? (s.chat.slotActivity[bg]?.toolLog ?? []) : s.chat.toolLog
+    const log = bg ? (s.chat.slotActivity[bg]?.toolLog ?? EMPTY_TOOL_LOG) : s.chat.toolLog
     const slotRunning = bg ? ((s.chat.slotRun[bg]?.state ?? 'idle') !== 'idle') : s.chat.slotRunning
-    const msgs = bg ? (s.chat.slotMessages[bg] ?? []) : s.chat.messages
+    const msgs = bg ? (s.chat.slotMessages[bg] ?? EMPTY_MESSAGES) : s.chat.messages
+    const index = selectToolRowIndex(msgs, log)
 
-    // Helper: check if this tool's permission was resolved as rejected
+    // Was this tool's permission resolved as rejected? Only the NEWEST
+    // permission message for the id carries the decision.
     const wasRejectedByPerm = () => {
       if (!toolCallId) return false
-      for (let j = msgs.length - 1; j >= 0; j--) {
-        const m = msgs[j]
-        if (m.role !== 'permission' || !m.meta?.tool_call_id) continue
-        if (m.meta.tool_call_id === toolCallId) {
-          return m.meta?.resolved === 'rejected'
-        }
-      }
-      return false
+      const perm = index.lastPermById.get(toolCallId)
+      return perm ? isRejectedDecision(perm.meta?.resolved) : false
     }
 
     // Auto-denied detection. When a security-policy deny rule or hook blocks a
@@ -160,52 +197,37 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     // that flow ALSO resolves a permission message as rejected —
     // wasRejectedByPerm() takes precedence below, so a user rejection still
     // shows red, not amber.
-    const autoDenySiblingContent = (): string => {
-      if (!toolCallId) return ''
-      for (let j = msgs.length - 1; j >= 0; j--) {
-        const m = msgs[j]
-        if (m.role !== 'tool' || m.meta?.tool_call_id !== toolCallId) continue
-        if (m.content.startsWith('🚫')) return m.content
-        // The pill's own 🔧 message reached without a 🚫 sibling above it —
-        // any earlier match would predate this call; stop scanning.
-        if (m === message) break
-      }
-      return ''
-    }
-    const denySibling = autoDenySiblingContent()
+    const denySibling = denySiblingContent(index, toolCallId, message)
     const autoDenied = !!denySibling
     const autoDenyReason = extractDenyDetail(denySibling)
 
-    for (let i = log.length - 1; i >= 0; i--) {
-      const e = log[i]
-      if (e.type !== 'tool') continue
-      if ((toolCallId && e.tool_call_id === toolCallId) || (!toolCallId && e.tool_call_id && label.includes(e.text))) {
-        const rejected = !!e.rejected || wasRejectedByPerm()
-        const isDone = e.output != null || rejected || autoDenied || !slotRunning
-        return {
-          effectiveId: e.tool_call_id || null,
-          isDone, isRejected: rejected,
-          isAutoDenied: !rejected && autoDenied,
-          autoDenyReason,
-          purpose: e.purpose || '',
-          input: e.input || '',
-          output: e.output || '',
-          auto: !!e.auto,
-          ts: e.ts || 0,
-          executionStartedAt: e.execution_started_at || 0,
-          hasEntry: true,
-          // Older ACP update frames may omit is_shell; execute is the stable
-          // tool-kind value used by the transport and keeps those frames live.
-          isShell: e.is_shell === true || e.kind === 'execute' || e.text.startsWith('Running:'),
-          // Raw ACP tool kind — gates the inline diff-card promotion below
-          // (only kind === 'edit' rows promote).
-          toolKind: e.kind || '',
-          // Raw transport tool name, kept separate from the display `label`:
-          // the label is simplified/localized for humans, so gating behaviour on
-          // it would break under `useSimplifiedToolNames` or a translated UI.
-          toolName: e.text || '',
-          fromLog: true,
-        }
+    const e = lookupLogEntry(index, toolCallId, label)
+    if (e) {
+      const rejected = !!e.rejected || wasRejectedByPerm()
+      const isDone = e.output != null || rejected || autoDenied || !slotRunning
+      return {
+        effectiveId: e.tool_call_id || null,
+        isDone, isRejected: rejected,
+        isAutoDenied: !rejected && autoDenied,
+        autoDenyReason,
+        purpose: e.purpose || '',
+        input: e.input || '',
+        output: e.output || '',
+        auto: !!e.auto,
+        ts: e.ts || 0,
+        executionStartedAt: e.execution_started_at || 0,
+        hasEntry: true,
+        // Older ACP update frames may omit is_shell; execute is the stable
+        // tool-kind value used by the transport and keeps those frames live.
+        isShell: e.is_shell === true || e.kind === 'execute' || e.text.startsWith('Running:'),
+        // Raw ACP tool kind — gates the inline diff-card promotion below
+        // (only kind === 'edit' rows promote).
+        toolKind: e.kind || '',
+        // Raw transport tool name, kept separate from the display `label`:
+        // the label is simplified/localized for humans, so gating behaviour on
+        // it would break under `useSimplifiedToolNames` or a translated UI.
+        toolName: e.text || '',
+        fromLog: true,
       }
     }
     // No toolLog entry — historical message. Check permission state for rejection.
@@ -258,13 +280,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   const hasPendingPerm = useAppSelector(s => {
     if (isDone || !toolCallId) return false
     const bg = slot && slot !== s.chat.activeSlot ? slot : null
-    const msgs = bg ? (s.chat.slotMessages[bg] ?? []) : s.chat.messages
-    for (let j = msgs.length - 1; j >= 0; j--) {
-      const m = msgs[j]
-      if (m.role !== 'permission' || m.meta?.resolved || !m.meta?.tool_call_id) continue
-      if (m.meta.tool_call_id === toolCallId) return true
-    }
-    return false
+    const msgs = bg ? (s.chat.slotMessages[bg] ?? EMPTY_MESSAGES) : s.chat.messages
+    const log = bg ? (s.chat.slotActivity[bg]?.toolLog ?? EMPTY_TOOL_LOG) : s.chat.toolLog
+    return selectToolRowIndex(msgs, log).pendingPermIds.has(toolCallId)
   })
 
   // Shell commands do not expose a reliable total, so their live indicator is
@@ -312,19 +330,16 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     // belonging to some other sleep the backend is tracking.
     if (!found?.running) return null
     const bg = slot && slot !== s.chat.activeSlot ? slot : null
-    const msgs = bg ? (s.chat.slotMessages[bg] ?? []) : s.chat.messages
+    const msgs = bg ? (s.chat.slotMessages[bg] ?? EMPTY_MESSAGES) : s.chat.messages
+    const log = bg ? (s.chat.slotActivity[bg]?.toolLog ?? EMPTY_TOOL_LOG) : s.chat.toolLog
     // Exactly one pill owns the countdown, and it must be the transcript's
     // newest TOOL call of any kind -- not merely its newest wait. Scanning only
     // for waits would let a completed wait from earlier in the turn light up
     // while the agent is busy in some later tool, which is the shape a sleep
     // belonging to a different ACP session on this same slot would take.
-    for (let j = msgs.length - 1; j >= 0; j--) {
-      const m = msgs[j]
-      if (m.role !== 'tool') continue
-      if (m.meta?.tool_call_id !== toolCallId) return null
-      return isWaitToolTitle(m.content.replace(/^🔧\s*/, '')) ? ws : null
-    }
-    return null
+    const last = selectToolRowIndex(msgs, log).lastToolMsg
+    if (!last || last.meta?.tool_call_id !== toolCallId) return null
+    return isWaitToolTitle(last.content.replace(/^🔧\s*/, '')) ? ws : null
   }, shallowEqual)
   const showWaitCountdown = !!waitState && waitState.deadline_ts > 0
   const [activityNow, setActivityNow] = useState(() => Date.now())
@@ -653,6 +668,21 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     const stripped = toolLabel.split(filePath).join('').replace(/\s+/g, ' ').trim()
     return stripped || toolLabel
   }, [showFileOpen, filePath, toolLabel])
+  // A purpose-less shell call's label is the raw command. The collapsed row's
+  // `truncate` (LABEL_COLLAPSED_CLASS) already bounds how much of it is
+  // visible, but a clipped wall of quoting says nothing — in simplified mode a
+  // flood-length shell label is substituted with a derived command digest
+  // (binaries + redirect target), so the visible line is meaningful. Short
+  // labels pass through untouched, and raw mode always shows the exact command.
+  const pillLabelText = useMemo(() => {
+    if (!simplified) return displayLabel
+    if (displayLabel.length <= DERIVE_LABEL_THRESHOLD_CHARS && !displayLabel.includes('\n')) {
+      return displayLabel
+    }
+    return deriveShellSummary(displayLabel, { bareCommand: isShell }) ?? displayLabel
+  }, [displayLabel, simplified, isShell])
+  // Hover reveals the verbatim command whenever the pill shows a substitute.
+  const pillLabelTitle = pillLabelText === displayLabel ? undefined : displayLabel
   // Both running and pending-approval pills shimmer — the highlight color
   // tracks the status so pending shimmers warn-yellow (matching the approval
   // bar) and running shimmers accent.
@@ -677,6 +707,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // user's intent for after the approval resolves, but the rendered panel
   // ignores it while pending.
   const effectivelyExpanded = expanded || hasPendingPerm
+
+  // One line while folded, full wrap once opened. See LABEL_COLLAPSED_CLASS.
+  const labelWrapClass = effectivelyExpanded ? LABEL_EXPANDED_CLASS : LABEL_COLLAPSED_CLASS
 
   // Stable per-instance fallback id for framer-motion's `LayoutGroup`. When a
   // pre-persistence historical message has neither `effectiveId` nor
@@ -743,7 +776,14 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // does, so the slide takes stable identity or nothing.
   const reduceMotion = useReducedMotion()
   const [slidePlayed, setSlidePlayed] = useState(false)
-  const sliding = !!revealId && animateEntrance && !slidePlayed && !reduceMotion
+  // Heat is sampled ONCE at mount: a row that mounts during a hot stream snaps
+  // to full height (each animated frame costs a scrollTop re-pin, and bursts
+  // of tool calls stack those), while a quiet-transcript mount keeps the ease.
+  // Captured in a state initializer so a heat flip mid-animation can neither
+  // cut a playing slide short nor start one retroactively — the one-shot
+  // revealedToolIds/slidePlayed machinery still prevents replays either way.
+  const [snapOnMount] = useState(() => transcriptHot)
+  const sliding = !!revealId && animateEntrance && !slidePlayed && !reduceMotion && !snapOnMount
   // Release from the effect rather than from the completion callback alone, so
   // the inline values are cleared however `sliding` ends — the animation
   // finishing, or the OS reduced-motion preference flipping mid-flight, which
@@ -798,6 +838,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         ref={pillButtonRef}
         className={`inline-flex ${ROW_PILL_BUTTON_CLASS} focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none ${hasPendingPerm ? 'cursor-default' : 'cursor-pointer hover:brightness-110'}`}
         aria-expanded={effectivelyExpanded}
+        title={pillLabelTitle}
         aria-label={hasPendingPerm
           ? i18nT('pages.chat.toolCallLine.aria_awaiting_approval', { label })
           : effectivelyExpanded
@@ -808,11 +849,12 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         {/* Deterministic vertical centering: the label spans pin leading-5
             (20px), so the 12px icon centers on the first line at exactly
             (20 − 12) / 2 = 4px. items-start keeps the icon on the first line
-            when the label wraps. */}
+            when the label wraps, which only an EXPANDED row now does. */}
         <Icon size={12} className={`shrink-0 ${iconClass}`} style={{ marginTop: '4px' }} />
         {isShimmering ? (
           <motion.span
-            className="break-words min-w-0 leading-5 bg-clip-text"
+            data-testid="tool-pill-label"
+            className={`${labelWrapClass} min-w-0 leading-5 bg-clip-text`}
             style={{
               backgroundImage: `linear-gradient(90deg, ${shimmerBase} 0%, ${shimmerBase} 40%, ${shimmerHighlight} 50%, ${shimmerBase} 60%, ${shimmerBase} 100%)`,
               backgroundSize: '300% 100%',
@@ -821,9 +863,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             }}
             animate={{ backgroundPosition: ['100% 0%', '-50% 0%'] }}
             transition={{ duration: 2.4, repeat: Infinity, ease: 'linear' }}
-          >{displayLabel}</motion.span>
+          >{pillLabelText}</motion.span>
         ) : (
-          <span className="break-words min-w-0 leading-5 text-muted hover:text-text transition-colors">{displayLabel}</span>
+          <span data-testid="tool-pill-label" className={`${labelWrapClass} min-w-0 leading-5 text-muted hover:text-text transition-colors`}>{pillLabelText}</span>
         )}
       </button>
 
@@ -900,7 +942,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         </div>
       )}
 
-      <StatusRow show={showShellActivity}>
+      <StatusRow show={showShellActivity} snap={transcriptHot}>
         {/* ml-5 = the pill's icon (12px) + the pill BUTTON's gap-2 (8px), so
             this secondary line starts exactly where the pill's label text
             does. (The outer wrapper's gap-1 is between pill and file chip —
@@ -912,7 +954,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           </span>
         </div>
       </StatusRow>
-      <StatusRow show={showWaitCountdown}>
+      <StatusRow show={showWaitCountdown} snap={transcriptHot}>
         {/* Same ml-5 anchor as the shell-activity line above: the countdown is
             a continuation of the pill's label text, not of its icon column. */}
         <div className="ml-5 mt-1 flex items-center gap-2 text-[12px] leading-5 text-muted" data-testid="wait-countdown">

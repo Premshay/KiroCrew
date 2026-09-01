@@ -29,7 +29,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 
+from kiro_crew.credential_patterns import AWS_KEY_ID, JWT_MULTI_SEGMENT
 from kiro_crew.executors import maintenance_executor
+from kiro_crew.identity_stores import fenced_home_dirs
 from kiro_crew.sel import SecurityEvent, SecurityEventLog
 from kiro_crew.trust_patterns import ENV_ASSIGNMENT_RE
 from kiro_crew.vector_memory_constants import _contains_injection
@@ -2823,6 +2825,43 @@ _CONTROL_OPERATOR_RE = re.compile(r"[;&|\n]+")
 # ``normalize_shell_command`` already undoes, but spelled with a substitution and
 # placed MID-WORD, where a prefix-only strip never sees it.
 _EMPTY_SUBST_RE = re.compile(r"\$\(\s*\)|`\s*`|\$\{\s*\}")
+# An OUTPUT redirect. Two small sets, enumerated from the shells' own grammars rather
+# than grown one spelling per review round, so the boundary is stated instead of implied:
+#
+#   DESCRIPTOR (optional prefix)  digits -- every shell
+#                                 ``&``    both streams (bash, zsh, ksh)
+#                                 ``{name}`` automatic descriptor (bash 4.1+, zsh)
+#                                 ``*``    all streams (PowerShell)
+#   OPERATOR                      ``>`` or ``>>``
+#   MODIFIER (optional suffix)    ``&``  duplicate (bash, zsh, ksh, csh)
+#                                 ``|``  noclobber override (bash, zsh, ksh)
+#                                 ``!``  noclobber override (zsh, csh, tcsh)
+#
+# NOT covered, deliberately and on the record: fish's historical ``^`` stderr prefix
+# (removed in fish 3.0 and this module has no fish handling), and cmd.exe's ``n>&m``
+# which the digit prefix already matches. If a shell outside that list reaches this gate,
+# this set is where it has to be added.
+#
+# ``*`` is included on the FAIL-CLOSED rule this floor states for itself ("any maybe
+# answers True -- the gate can over-trigger but never under-trigger"), because the two
+# shells disagree and only one of them is safe to be wrong about. In PowerShell ``*>`` is
+# the all-streams redirect, so the program arrives on stdin and must be scanned. In bash
+# ``*`` is a GLOB that expands to filenames, so the first becomes the script -- measured:
+# ``python *> out`` runs the globbed file, and it still does with a here-string present.
+# Reading ``*>`` as a redirect therefore over-triggers under bash, which costs a denial
+# of a command combining a glob-redirect with a payload-bearing carrier; reading it as a
+# positional under PowerShell lets a credential mint through. Recorded as an accepted
+# residual rather than left implicit.
+#
+# Matched on the RAW token because ``_normalize_operand`` leaves the descriptor behind
+# (``2>&1`` -> ``2``, ``{fd}>&1`` -> ``{fd}``), which reads as an ordinary file name.
+# The brace form requires a real identifier inside: ``{a,b}`` is a brace EXPANSION the
+# shell resolves before redirect parsing, and must not be mistaken for a descriptor.
+# No token matching this is ever a positional argument in the shell that spells it.
+#
+# No ``\A`` anchor: ``.match(raw, pos)`` anchors at *pos*, which is how a word holding a
+# chain of glued redirects is walked in one pass instead of being re-sliced per operator.
+_OUTPUT_REDIRECT_RE = re.compile(r"(?:\d+|&|\*|\{[A-Za-z_][A-Za-z0-9_]*\})?>{1,2}[&|!]?")
 # ``X=kirocrew; $X token`` assigns the program name to a variable and invokes it
 # through the expansion, so neither the literal name nor the expansion alone looks
 # dangerous.  The assignment and the use are in the SAME command text, so the
@@ -3187,6 +3226,49 @@ def _is_shell_command_flag(token: str) -> bool:
     return token == "--command" or bool(_SHELL_COMMAND_FLAG_RE.match(token))
 
 
+def _is_shell_command_flag_or_herestring(token: str) -> bool:
+    """True where the shell-program scan in :func:`_nested_shell_payloads` stops.
+
+    Exactly the three conditions that loop broke on, in one predicate: a command
+    flag, the spaced herestring operator, and the glued spelling.  Kept together so
+    the precomputed stop index and the handling at that index cannot drift apart.
+    """
+    return _is_shell_command_flag(token) or token == "<<<" or token.startswith("<<<")
+
+
+def _is_env_split_flag(token: str) -> bool:
+    """True where the ``env -S`` scan in :func:`_nested_shell_payloads` stops."""
+    flag = token.lower()
+    return (
+        flag in {"-s", "--split-string"}
+        or (flag.startswith("-s") and len(token) > 2)
+        or flag.startswith("--split-string=")
+    )
+
+
+def _is_not_double_dash(token: str) -> bool:
+    """True where the ``--`` skip in :func:`_nested_shell_payloads` stops.
+
+    Named for the same reason the other two stop conditions are: the precomputed
+    index and the token the caller then reads must not drift apart.
+    """
+    return token != "--"
+
+
+def _next_stop_indexes(tokens: "list[str]", is_stop: "Callable[[str], bool]") -> "list[int]":
+    """For each index, the first index at or after it where *is_stop* holds.
+
+    One backward pass, so a forward scan per program token becomes a lookup and the
+    caller stays linear in token count.  Position ``len(tokens)`` means "no such
+    token", which reads the same as the original loops running off the end.
+    """
+    limit = len(tokens)
+    table = [limit] * (limit + 1)
+    for index in range(limit - 1, -1, -1):
+        table[index] = index if is_stop(tokens[index]) else table[index + 1]
+    return table
+
+
 def _nested_shell_payloads(tokens: "list[str]") -> "list[str]":
     """Literal shell-script payloads carried as an argument inside *tokens*.
 
@@ -3197,51 +3279,61 @@ def _nested_shell_payloads(tokens: "list[str]") -> "list[str]":
     this function.
     """
     payloads: list[str] = []
+    # Both scans below look for the FIRST token after a program that satisfies a stop
+    # predicate, handle it, and stop.  Walking forward per program made the function
+    # QUADRATIC in token count: in a run of interpreter tokens with no flag among them
+    # every one of them re-walks the whole tail, so a command padded with them stalls
+    # the synchronous permission gate (measured: 13.2 s for 16 000 tokens, ~4x per
+    # doubling).  The first-stop index is precomputed once per predicate in a single
+    # backward pass instead, which makes the whole function O(N) while returning the
+    # identical payload list -- the loops' only exits were that first stop token or the
+    # end of the list, so nothing else can change.
+    shell_stop = _next_stop_indexes(tokens, _is_shell_command_flag_or_herestring)
+    env_stop = _next_stop_indexes(tokens, _is_env_split_flag)
+    # ``--`` runs are precomputed for the same reason: a long run of them after the
+    # command flag is walked once per program token otherwise, which is quadratic even
+    # though the two scans above are not.
+    past_dashes = _next_stop_indexes(tokens, _is_not_double_dash)
+    limit = len(tokens)
     for i, token in enumerate(tokens):
         base = _program_basename(token)
         # A shell reached through a VARIABLE (``$SHELL -c '<payload>'``) runs the
         # payload exactly as a named shell does.  The recognizer already used for the
         # ``| $SHELL`` evaluator sink applies here too.
         if base in _NESTED_SHELL_PROGRAMS or _is_shell_variable_reference(token):
-            for j in range(i + 1, len(tokens)):
+            j = shell_stop[i + 1]
+            if j < limit:
                 if _is_shell_command_flag(tokens[j]):
                     # ``bash -c -- '<script>'`` is legal: ``--`` ends option parsing
                     # and the script is the token AFTER it.  Skip any run of them.
-                    k = j + 1
-                    while k < len(tokens) and tokens[k] == "--":
-                        k += 1
-                    if k < len(tokens):
+                    k = past_dashes[j + 1]
+                    if k < limit:
                         payloads.append(tokens[k])
-                    break
                 # A HERESTRING feeds the script on stdin instead of as an argument
                 # (``bash <<< '<script>'``), so its text is a command just the same.
                 # Both the spaced and glued spellings arrive here.
-                if tokens[j] == "<<<":
-                    if j + 1 < len(tokens):
+                elif tokens[j] == "<<<":
+                    if j + 1 < limit:
                         payloads.append(tokens[j + 1])
-                    break
-                if tokens[j].startswith("<<<"):
+                elif tokens[j].startswith("<<<"):
                     payloads.append(tokens[j][3:])
-                    break
         elif base in _ENV_SPLIT_PROGRAMS:
             # ``env -S '<script>'`` / ``env --split-string '<script>'`` splits the
             # payload into a command and runs it, so its text is a command line.
-            for j in range(i + 1, len(tokens)):
+            j = env_stop[i + 1]
+            if j < limit:
                 # ``is_denied`` lowercases its input, so compare case-insensitively:
                 # the real flag is ``-S`` but it arrives here as ``-s``.
                 flag = tokens[j].lower()
                 if flag in {"-s", "--split-string"}:
-                    if j + 1 < len(tokens):
+                    if j + 1 < limit:
                         payloads.append(tokens[j + 1])
-                    break
-                if flag.startswith("-s") and len(tokens[j]) > 2:
+                elif flag.startswith("-s") and len(tokens[j]) > 2:
                     payloads.append(tokens[j][2:])
-                    break
-                if flag.startswith("--split-string="):
+                elif flag.startswith("--split-string="):
                     payloads.append(tokens[j].split("=", 1)[1])
-                    break
         elif base in _NESTED_SHELL_VERBS or token in _NESTED_SHELL_VERBS:
-            if i + 1 < len(tokens):
+            if i + 1 < limit:
                 payloads.append(tokens[i + 1])
     # ``bash<<<'<payload>'`` glues the program, the operator and the payload into ONE
     # token, so the program never appears as a token of its own for the walk above to
@@ -3398,19 +3490,79 @@ def _xargs_reconstructed_command(tokens: "list[str]") -> str:
 _PRINTF_ESCAPES = (("\\n", " "), ("\\t", " "), ("\\r", " "), ("\\v", " "), ("\\f", " "))
 
 
-# ``printf`` numeric escapes: octal (``\\NNN``, ``\\0NNN``) and hex (``\\xHH``).
-_NUMERIC_ESCAPE_RE = re.compile(r"\\(?:x([0-9a-f]{1,2})|0?([0-7]{1,3}))", re.IGNORECASE)
+# ``printf`` / ``$'…'`` numeric escapes: octal (``\\NNN``, ``\\0NNN``), hex
+# (``\\xHH``) and Unicode (``\\uHHHH``, ``\\UHHHHHHHH``).
+#
+# The Unicode widths are EXACT and CASE-SENSITIVE, as bash defines them: ``\\u``
+# consumes at most 4 hex digits and ``\\U`` at most 8, so ``$'\\u0072f'`` is ``r``
+# followed by a literal ``f`` -- NOT a 5-digit code point.  Reading more digits than
+# the spelling allows is a bypass, because the wrong character replaces the two the
+# shell actually passes.  The pattern therefore carries no ``re.IGNORECASE`` (which
+# would conflate the two widths) and spells its own classes; ``\\x`` keeps accepting
+# either case, as it always did.
+#
+# This requires the caller to have preserved case: see ``_deny_segment_views``,
+# which decodes BEFORE lowercasing for exactly this reason.
+_NUMERIC_ESCAPE_RE = re.compile(
+    r"\\(?:[xX]([0-9a-fA-F]{1,2})"
+    r"|u([0-9a-fA-F]{1,4})"
+    r"|U([0-9a-fA-F]{1,8})"
+    r"|0?([0-7]{1,3}))"
+)
+
+# ANSI-C quoting (``$'...'``) spells octal as ``\nnn`` -- one to three octal digits
+# TOTAL, where a leading zero is simply one of the three.  The ``\0nnn`` form above
+# (zero plus up to three more digits) belongs to ``echo -e``/``printf %b`` ONLY;
+# sharing that pattern here consumed a fourth digit, so ``$'\06777'`` -- which bash
+# reads as ``\067`` ('7') followed by the literal ``77``, i.e. ``777`` -- decoded to
+# a single non-ASCII byte and the deny view diverged from what the shell runs
+# (BLOCKING from the GPT 5.6 lane).  Group order matches _NUMERIC_ESCAPE_RE so
+# ``_numeric_escape_code`` reads either match.
+_ANSI_C_NUMERIC_ESCAPE_RE = re.compile(
+    r"\\(?:[xX]([0-9a-fA-F]{1,2})"
+    r"|u([0-9a-fA-F]{1,4})"
+    r"|U([0-9a-fA-F]{1,8})"
+    r"|([0-7]{1,3}))"
+)
+
+
+def _escape_code_is_inert(code: int) -> bool:
+    """True for a code point that must be left ENCODED rather than decoded.
+
+    A NUL cannot appear in an argv the shell builds.  A LONE SURROGATE is refused
+    for a second reason: it is not a character bash can pass either, and a decoded
+    one would travel into the SEL audit record, whose JSON encoder raises on it --
+    turning a denial into a crash.
+    """
+    return code == 0 or code > 0x10FFFF or 0xD800 <= code <= 0xDFFF
+
+
+def _numeric_escape_code(match: "re.Match[str]") -> "int | None":
+    """The code point an octal / hex / Unicode escape resolves to, or None.
+
+    Split out so :func:`_numeric_escape_char` and :func:`_decode_ansi_c_body` cannot
+    disagree about what a match means -- the body decoder has to recognise a NUL to
+    truncate at it, and re-deriving that separately is how two code paths drift.
+
+    Octal is masked to ONE BYTE, which is bash's semantics and was measured rather
+    than assumed: ``$'\\555'`` is ``m`` (0o555 & 0xFF == 0x6D), ``$'\\777'`` is
+    0xFF, and ``$'\\400'`` masks to a NUL.  Converting the full value instead gave
+    ``$'r\\555'`` the character ``u``-breve where bash passes ``rm``, so
+    ``$'r\\555' -rf /`` ran while the view matched nothing (BLOCKING from the GPT
+    5.6 lane).
+    """
+    hex_digits, u4_digits, u8_digits, octal_digits = match.groups()
+    digits = hex_digits or u4_digits or u8_digits
+    try:
+        return int(digits, 16) if digits else (int(octal_digits, 8) & 0xFF)
+    except (TypeError, ValueError):  # pragma: no cover - the pattern admits only digits
+        return None
 
 
 def _numeric_escape_char(match: "re.Match[str]") -> str:
-    """One decoded character for an octal or hex ``printf`` escape."""
-    hex_digits, octal_digits = match.group(1), match.group(2)
-    try:
-        code = int(hex_digits, 16) if hex_digits else int(octal_digits, 8)
-    except (TypeError, ValueError):  # pragma: no cover - the pattern admits only digits
-        return match.group(0)
-    if code == 0 or code > 0x10FFFF:
-        # A NUL cannot appear in an argv the shell builds, so leave it inert.
+    """One decoded character for an octal, hex or Unicode escape."""
+    code = _numeric_escape_code(match)
+    if code is None or _escape_code_is_inert(code):
         return match.group(0)
     return chr(code)
 
@@ -3428,6 +3580,12 @@ def _decode_printf_escapes(text: str) -> str:
     escapes closed, and ``\\x6b`` can spell a character of the program name itself.  What
     the shell will actually run is the decoded text, so the comparison is made against
     that.
+
+    The Unicode forms (``\\uHHHH``, ``\\UHHHHHHHH``) are decoded for the same reason and
+    were missing: ``$'\\u0074\\u006f\\u006b\\u0065\\u006e'`` is the same word as the
+    ``\\x``-spelled form this already caught, so the argv-structural floors compared
+    against an encoded string and a spelling of a self-protection verb slipped past
+    while its hex twin was refused (found by the GPT 5.6 lane on the deny-view change).
     """
     for esc, sub in _PRINTF_ESCAPES:
         text = text.replace(esc, sub)
@@ -3548,6 +3706,96 @@ def _substitution_bodies(text: str) -> "list[str]":
         else:
             i += 1
     return bodies
+
+
+def _redirect_glue_point(word: str) -> "int | None":
+    """Index where an OUTPUT redirect glued to the END of another word begins, else None.
+
+    A redirect needs no whitespace in front of it, so it can ride on the back of any
+    word: ``python -u> /dev/null <<< '<program>'`` is the flag ``-u`` plus ``> /dev/null``,
+    and bash runs the here-string. The detector only recognised a redirect at the START of
+    a word, so ``-u>`` fell through to "an ordinary interpreter flag", the redirect target
+    in the next token became the script path, and the stdin program went unscanned. The
+    ``<`` branch has always looked for its operator ANYWHERE in the word; this is the same
+    rule for the ``>`` family, and that asymmetry was the gap.
+
+    The word is SPLIT rather than skipped, because what precedes the redirect decides the
+    answer and only the caller's own branches can classify it: ``-u`` is a flag and the
+    scan continues, but ``script.py>out`` means the script supplies the program and the
+    answer is False. Measured in bash: ``python script.py> out <<< '<program>'`` runs the
+    script, not the here-string. Splitting and re-reading both halves reuses that
+    classification instead of duplicating it, so the two cannot drift apart.
+
+    None when the word has no ``>`` at all, or already begins with a redirect -- a leading
+    file descriptor belongs to the redirect, and the shell only reads digits as one when
+    they are the whole prefix (``2>err`` is fd 2; ``x2>err`` is the word ``x2``).
+    """
+    position = word.find(">")
+    if position <= 0:
+        return None
+    if _OUTPUT_REDIRECT_RE.match(word) is not None:
+        return None
+    return position
+
+
+def _output_redirect_scan(raw: str, start: int = 0) -> "tuple[str, int] | None":
+    """``(target, end)`` for the OUTPUT redirect at *start* in *raw*, or None.
+
+    ``python 2>&1 <<< '<program>'`` runs the here-string, but the detector had no branch
+    for the ``>`` family at all: it handles ``<`` and heredocs off the raw token and let
+    everything else fall through to "this is a script path". The unnumbered glued form
+    only survived by accident, because ``_normalize_operand`` reduces ``>out.txt`` to the
+    empty string and the loop skips empties -- while ``2>&1`` reduces to ``2``, a
+    perfectly good file name, so the interpreter looked like it was running a script
+    called ``2`` and the program on its stdin went unscanned.
+
+    Every spelling is a redirect and none is ever a positional: an optional leading file
+    DESCRIPTOR -- a number, ``&`` for both streams, or a ``{name}`` automatic descriptor
+    -- then ``>`` or ``>>``, then an optional ``&`` for the duplicating form or ``|`` for
+    the noclobber override.
+
+    The target STOPS at the next redirect operator, and *end* is that position, because
+    the shell starts a new redirect there: in ``python 2>/dev/null<<EOF`` the word is one
+    token, and taking all of ``/dev/null<<EOF`` as the target swallows the heredoc marker
+    and loses the program that arrives on stdin.
+
+    Only at substitution depth ZERO, though. A redirect inside ``$(...)``, ``${...}`` or
+    backticks belongs to that inner command and is not a boundary of this word:
+    ``python 2>$(echo>/dev/null;printf /dev/null) <<< '<program>'`` really is
+    ``python 2>/dev/null`` once the shell has run the substitution, and cutting the target
+    at the inner ``>`` left the tail of the substitution to be read as a script path,
+    which put the stdin program back out of view. The whole substitution is one shell
+    WORD, and :func:`_operand_span_end` is what carries it across the tokens it spans.
+
+    Depth counts EVERY ``(`` and ``{``, not only a ``$``-prefixed one, because a subshell
+    nested inside a substitution (``$( (true); printf /dev/null)``) closes with its own
+    ``)`` -- counting the opener but not that one would drop the depth to zero early and
+    reopen exactly the hole this closes. *raw* must therefore reach here with its
+    substitution delimiters intact; see the caller.
+
+    An INDEX is returned rather than the remaining text so a word holding a chain of
+    them (``>a>a>a...``) can be walked once. Re-slicing the word per operator was
+    quadratic in its length, on a floor that runs for every command -- the same defect
+    class this module pins against elsewhere, so it is not reintroduced here.
+    """
+    match = _OUTPUT_REDIRECT_RE.match(raw, start)
+    if match is None:
+        return None
+    cut = match.end()
+    depth = 0
+    in_backtick = False
+    while cut < len(raw):
+        char = raw[cut]
+        if char == "`":
+            in_backtick = not in_backtick
+        elif char in "({":
+            depth += 1
+        elif char in ")}" and depth:
+            depth -= 1
+        elif char in "<>" and not depth and not in_backtick:
+            break
+        cut += 1
+    return raw[match.end() : cut], cut
 
 
 def _here_string_payload(raw: str) -> "str | None":
@@ -3908,6 +4156,60 @@ def _python_reads_stdin(later_tokens: list[str]) -> bool:
             else:
                 expect_tag = True  # a bare `<<` splits its tag into the next token
             continue
+        # Scanned on a form that keeps the SUBSTITUTION delimiters. `raw` has had
+        # `_SHELL_WRAPPER_CHARS` stripped, and those include `(` and `)` -- so the word
+        # `2>$(` (the tokenizer splits on the space inside `$( (true); printf x)`) arrived
+        # here as `2>$`, with the opener gone. The scan then saw an ordinary one-character
+        # target, never entered a substitution, and the tail of the substitution was read
+        # as a script path, putting the stdin program back out of view. Quotes still come
+        # off, since a quoted redirect is still a redirect.
+        redirect_word = tok.strip("\"'")
+        glue = _redirect_glue_point(redirect_word)
+        if glue is not None:
+            # The redirect rides on the back of another word (`-u>`). Split it and let the
+            # loop read both halves, so the part BEFORE the redirect is classified by the
+            # same flag/positional branches as any other word -- `-u` continues the scan,
+            # `script.py` ends it. Once per word, since neither half can split again.
+            later_tokens = [
+                *later_tokens[:idx],
+                redirect_word[:glue],
+                redirect_word[glue:],
+                *later_tokens[idx:],
+            ]
+            continue
+        redirect = _output_redirect_scan(redirect_word)
+        if redirect is not None:
+            # An OUTPUT redirect and its target are not this command's arguments, and
+            # neither says anything about where the program comes from -- so the walk has
+            # to step over both and keep looking, exactly as it does for a stdin
+            # redirect. Falling through instead read the leftover descriptor digits of
+            # `2>&1` as a script path and answered False, so `python 2>&1 <<< '<program>'`
+            # had its stdin program go unscanned. Bash runs every one of these.
+            redirect_target, position = redirect
+            # A chain of output redirects glued into ONE word (`>a>a>a...`) is walked
+            # here, in place. Re-injecting each remainder into the token stream instead
+            # re-sliced the word per operator, which is quadratic in its length on a
+            # floor that runs for every command.
+            while position < len(redirect_word):
+                further = _output_redirect_scan(redirect_word, position)
+                if further is None:
+                    break
+                redirect_target, position = further
+            remainder = redirect_word[position:]
+            if remainder:
+                # What is left starts with a STDIN operator (`2>/dev/null<<EOF`), which
+                # the branches above know how to read. Hand it back as its own token --
+                # once per word, not once per operator -- because swallowing it loses the
+                # heredoc and with it the program on stdin.
+                later_tokens = [*later_tokens[:idx], remainder, *later_tokens[idx:]]
+            elif not redirect_target:
+                if idx >= len(later_tokens):
+                    break
+                redirect_target = later_tokens[idx].strip(_SHELL_WRAPPER_CHARS)
+                idx += 1
+            if redirect_target:
+                idx = _operand_span_end(later_tokens, idx, redirect_target)
+            continue
         if "<" in raw:
             # A stdin REDIRECT and its operand are not this command's arguments either,
             # and the redirect is what supplies the program: `python < prog.py` reads its
@@ -4264,6 +4566,122 @@ def _shell_join_continuations(text: str) -> str:
     return _SHELL_LINE_CONTINUATION_RE.sub("", text)
 
 
+def _fold_line_continuations(text: str) -> str:
+    """Remove ``\\<newline>`` exactly where a shell removes it -- quote-aware.
+
+    A shell folds a backslash-newline while lexing, so ``"r\\<newline>m" -rf /``
+    runs ``rm -rf /``.  The deny tiers match text and ``_split_segments`` cuts on
+    the newline, so without folding the continuation is severed before any view is
+    built and every rule authored as a command shape misses that spelling.
+
+    ``_shell_join_continuations`` above looks like the answer and is NOT: it is a
+    bare regex that folds inside SINGLE quotes too, and its comment scopes it
+    deliberately to the self-protection floor's tokenizer input rather than to the
+    matched text of the whole catalog.  Applying it here would fold
+    ``echo 'r\\<newline>m -rf /'`` -- which bash prints literally -- into a denial.
+
+    The contexts were measured against bash rather than assumed (``printf %q`` on
+    the resulting argv):
+
+    ======================  ==================  ========
+    spelling                bash argv           folded?
+    ======================  ==================  ========
+    ``A\\<nl>A BB``          ``<AA><BB>``        yes
+    ``"A\\<nl>A" BB``        ``<AA><BB>``        yes
+    ``'A\\<nl>A' BB``        ``<A\\<nl>A><BB>``   no
+    ``$'A\\<nl>A' BB``       ``<A\\<nl>A><BB>``   no
+    ======================  ==================  ========
+
+    So: fold unquoted and inside double quotes; preserve inside single quotes and
+    inside ANSI-C (``$'…'``) spans.  ``$"…"`` follows the double-quote rule, which
+    falls out of the scan because only ``$'`` opens a preserving span.
+
+    Runs BEFORE the ANSI-C decode, which is the shell's own order: continuations
+    are removed while lexing, and the escape body is interpreted after -- so a
+    preserved ``\\<newline>`` inside ``$'…'`` stays part of that literal.
+
+    An unterminated quote simply runs to the end in that state; the scan never
+    raises, because it feeds the permission gate.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    # None = unquoted, "'" = single, '"' = double, "$'" = ANSI-C.
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if quote is None:
+            if text.startswith("$'", i):
+                quote = "$'"
+                out.append("$'")
+                i += 2
+                continue
+            if ch in "'\"":
+                quote = ch
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "\\" and i + 1 < n:
+                folded = _continuation_width(text, i)
+                if folded:
+                    i += folded
+                    continue
+                # The backslash escapes the next character, so that character
+                # cannot open a quote -- consume the pair together.
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n:
+                folded = _continuation_width(text, i)
+                if folded:
+                    i += folded
+                    continue
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            out.append(ch)
+            i += 1
+            continue
+        if quote == "$'":
+            # A backslash escapes the next character (including the closing quote),
+            # and a continuation inside this span is LITERAL -- both are consumed
+            # as a pair, which preserves them.
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            if ch == "'":
+                quote = None
+            out.append(ch)
+            i += 1
+            continue
+        # Single quotes: nothing is special, not even a backslash.
+        if ch == "'":
+            quote = None
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _continuation_width(text: str, i: int) -> int:
+    """Characters to drop for a continuation at *i*, or 0 if there is none.
+
+    ``text[i]`` is known to be a backslash.  Handles both ``\\n`` and ``\\r\\n``
+    line endings so a CRLF command is folded the same way.
+    """
+    if text.startswith("\\\n", i):
+        return 2
+    if text.startswith("\\\r\n", i):
+        return 3
+    return 0
+
+
 def _redirect_consumes_next(token: str) -> "tuple[bool, bool]":
     """Classify *token* as a shell redirection sitting in argv position.
 
@@ -4347,7 +4765,53 @@ def _operands_lead_with(operands: "list[str]", spec: "tuple[object, ...]") -> bo
     return True
 
 
-def _self_module_name_index(tokens: "list[str]", i: int) -> "int | None":
+class _SelfModuleScan(NamedTuple):
+    """One token list's normalized forms plus its module-flag stop index.
+
+    ``norm[j]`` is what :func:`_normalize_operand` makes of token *j*, and ``stops[j]``
+    is the first index at or after *j* where the module-flag scan in
+    :func:`_self_module_name_index` stops.  Both are computed once per token list so
+    the scan does not repeat them for every interpreter token in it.
+    """
+
+    norm: "list[str]"
+    stops: "list[int]"
+
+
+def _is_self_module_flag(tok: str) -> bool:
+    """True where the module-flag scan in :func:`_self_module_name_index` stops.
+
+    The attached spelling only stops when the regex actually matches: ``-msomething``
+    that is not our module is an ordinary interpreter flag and the scan continues past
+    it, so the regex is part of the stop condition rather than a check made after it.
+    """
+    return tok == "-m" or (
+        tok.startswith("-m") and len(tok) > 2 and bool(_SELF_IMPORT_RE.search(tok[2:]))
+    )
+
+
+def _self_module_flag_scan(tokens: "list[str]") -> "_SelfModuleScan":
+    """Precompute one token list's normalized forms and module-flag stop indexes.
+
+    ``_self_module_name_index`` walked forward from each interpreter token to the first
+    module flag, normalizing every token it passed.  Called once per interpreter token
+    by ``_self_program_index``, that made the self-protection floor QUADRATIC in token
+    count: a command of interpreter words with no module flag among them re-walked and
+    re-normalized the whole tail every time.  Measured on the floor path, with one
+    product word present so its keyword gate opens: 0.03 s / 0.12 s / 0.49 s / 1.92 s
+    at 250 / 500 / 1000 / 2000 tokens -- about 4x per doubling, which reaches the
+    gateway's loop watchdog well inside a command an agent could emit.  Both passes
+    here are single and linear.
+    """
+    limit = len(tokens)
+    norm = [_normalize_operand(token).strip("\"'") for token in tokens]
+    stops = [limit] * (limit + 1)
+    for index in range(limit - 1, -1, -1):
+        stops[index] = index if _is_self_module_flag(norm[index]) else stops[index + 1]
+    return _SelfModuleScan(norm=norm, stops=stops)
+
+
+def _self_module_name_index(tokens: "list[str]", i: int, scan: "_SelfModuleScan") -> "int | None":
     """Index of the product module-name token in a ``python -m kiro_crew ...``
     invocation whose interpreter is at *i*, or None.
 
@@ -4355,26 +4819,35 @@ def _self_module_name_index(tokens: "list[str]", i: int) -> "int | None":
     scanning past other interpreter flags. The ``-c`` inline-program form has no
     positional subcommand token (the program builds its own argv), so it is left to
     the credential-mint import gate rather than matched here.
+
+    *scan* is REQUIRED, and must be :func:`_self_module_flag_scan` of the same *tokens*.
+    It is not optional-with-a-fallback on purpose: this function is called once per
+    token by a loop over those tokens, so a caller that could omit the scan could
+    silently reintroduce the quadratic this precompute exists to remove.  Requiring it
+    makes that a type error instead of a performance regression nobody notices.
     """
-    for j in range(i + 1, len(tokens)):
-        tok = _normalize_operand(tokens[j]).strip("\"'")
-        if tok == "-m":
-            nxt = _normalize_operand(tokens[j + 1]).strip("\"'") if j + 1 < len(tokens) else ""
-            return j + 1 if _SELF_IMPORT_RE.search(nxt) else None
-        if tok.startswith("-m") and len(tok) > 2 and _SELF_IMPORT_RE.search(tok[2:]):
-            return j  # attached -mkiro_crew
-    return None
+    limit = len(tokens)
+    j = scan.stops[i + 1]
+    if j >= limit:
+        return None
+    if scan.norm[j] == "-m":
+        nxt = scan.norm[j + 1] if j + 1 < limit else ""
+        return j + 1 if _SELF_IMPORT_RE.search(nxt) else None
+    return j  # attached -mkiro_crew
 
 
-def _self_program_index(tokens: "list[str]", i: int) -> "int | None":
+def _self_program_index(tokens: "list[str]", i: int, scan: "_SelfModuleScan") -> "int | None":
     """The argv index whose trailing operands the product CLI receives when the token
     at *i* launches it: *i* itself for the direct ``kirocrew`` form, or the module-name
     index for ``python -m kiro_crew``; else None.
+
+    *scan* is threaded through to :func:`_self_module_name_index` and is required for
+    the reason given there.
     """
     if _is_self_program(tokens[i]):
         return i
     if _PYTHON_PROGRAM_RE.match(_program_basename(tokens[i])):
-        return _self_module_name_index(tokens, i)
+        return _self_module_name_index(tokens, i, scan)
     return None
 
 
@@ -4390,8 +4863,11 @@ def _matches_self_subcommand(text_lower: str, spec: "tuple[object, ...]") -> boo
         return False
     for tokens in _self_token_frames(_shell_join_continuations(text_lower)):
         programs = _argv_programs(tokens)
+        # Once per FRAME, not once per token: this is the loop whose per-token scan
+        # made the floor quadratic.
+        scan = _self_module_flag_scan(tokens)
         for i in range(len(tokens)):
-            prog_idx = _self_program_index(tokens, i)
+            prog_idx = _self_program_index(tokens, i, scan)
             if prog_idx is None:
                 continue
             # ``echo kirocrew restart`` / ``echo python -m kiro_crew restart`` print words.
@@ -4798,21 +5274,21 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     # The internal reader opens the DB read-only + SEL-audited (NOT via
     # is_sensitive_path), so it still works; the sandbox bind-mount list
     # (sandbox.py) is SEPARATE, so kiro-cli's own auth is unaffected.
-    ".local/share/kiro-cli",
-    ".local/share/amazon-q",
-    "Library/Application Support/kiro-cli",
-    "Library/Application Support/amazon-q",
-    # Windows layouts of the same stores. Current kiro-cli writes the local,
-    # non-roaming app-data directory (%LOCALAPPDATA% defaults to
-    # ~/AppData/Local); the Roaming entries cover layouts that used
-    # %APPDATA% (defaults to ~/AppData/Roaming). These matchers are
-    # home-anchored, so a profile redirected outside the home directory is not
-    # covered -- the default location is what agent file tools can reach by a
-    # fixed relative path.
-    "AppData/Local/kiro-cli",
-    "AppData/Local/amazon-q",
-    "AppData/Roaming/kiro-cli",
-    "AppData/Roaming/amazon-q",
+    # The identity-store directories come from the single canonical table
+    # (``identity_stores.IDENTITY_STORE_ROOTS``) so this fence and the five other
+    # readers cannot drift apart (#6352). The splice emits all eight in table
+    # order (``.local/share`` -> ``Library/Application Support`` ->
+    # ``AppData/Local`` -> ``AppData/Roaming``, kiro-cli before amazon-q), which
+    # is the exact order this list carried before the refactor -- a golden test
+    # freezes that the final list is unchanged.
+    #
+    # Windows layouts: current kiro-cli writes the local, non-roaming app-data
+    # directory (%LOCALAPPDATA% defaults to ~/AppData/Local); the Roaming entries
+    # cover layouts that used %APPDATA% (defaults to ~/AppData/Roaming). These
+    # matchers are home-anchored, so a profile redirected outside the home
+    # directory is not covered -- the default location is what agent file tools
+    # can reach by a fixed relative path.
+    *fenced_home_dirs(),
 ]
 
 # ── KiroCrew's own data-home secrets & governance trust-root ──
@@ -4862,6 +5338,12 @@ _SENSITIVE_HOME_DIRS: list[str] = [
 _CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
 _CREW_SECRET_LEAVES: list[str] = [
     ".env",
+    # Owner-authored meetings edits are deliberately outside the meeting
+    # directories agents write. They are returned verbatim to the owner and may
+    # contain credential-shaped examples or private corrections, so an agent must
+    # neither read nor overwrite them through file tools. The Meetings backend
+    # opens this directory directly, so its save/overlay/revert flow is unaffected.
+    "apps/meetings/data/edits",
     # The Notes builtin stores a GitHub Personal Access Token here so it can
     # push a vault. Owner-only mode (0600) does not isolate another process
     # running as the same UID, and the token is a live bearer credential for the
@@ -4903,6 +5385,22 @@ _CREW_SECRET_LEAVES: list[str] = [
     # HMAC-gated ``PUT /api/settings``; the app's own backend opens the file
     # directly rather than through this gate, so it keeps working.
     "workspace/md-notebook/settings.json",
+    # The AWS Control builtin's app data directory. ``backup.json`` in here holds
+    # ``nightly``, the bit that AUTHORIZES the app's startup loop to upload the
+    # gateway's memory and workspace to S3 unattended, so a prompt-injected agent
+    # that could write it would schedule an owner-billed export the owner never
+    # asked for -- routing around the owner-only HTTP surface that is supposed to
+    # be the only way to turn it on. Exactly the ``autoSync`` escalation above,
+    # one app over.
+    #
+    # Classified as the whole DIRECTORY, not that one file, for the reason the
+    # ``whatsapp`` entry above is: an atomic write goes through a temporary in the
+    # same directory and is then renamed, so fencing only the final name leaves a
+    # writable path to the same bytes. Its siblings (the cost cache, the library
+    # ledger) have no legitimate file-tool reader either -- the app's own backend
+    # opens every one of them directly rather than through this gate, so the app
+    # keeps working and future state files are covered without a new entry.
+    "apps/aws-control/data",
     "browser-cookies.txt",
     "playwright-storage-state.json",
     # Per-session work ledgers (session_ledger.py). Not credentials, but each
@@ -4952,6 +5450,18 @@ _CREW_SECRET_LEAVES: list[str] = [
     "app_admission.json",
     "security_policy.json",
     "profiles",
+    # The centrally-distributed ceiling's last-known-good cache
+    # (``platform/policy_distribution.py``). Gated as a DIRECTORY, and the reason
+    # is not just that it holds a copy of the policy: the sidecar metadata records
+    # the SOURCE the copy came from, and the loader honours that source when
+    # deciding whether the cache is this host's last-known-good. An agent able to
+    # write here could publish itself a ceiling AND the provenance to make the next
+    # boot adopt it — a full escape from ``security_policy.json`` being unwritable,
+    # around the side. Read matters as much as write: the cache is a verbatim copy
+    # of the policy the trust-root entry above exists to keep unreadable, so
+    # leaving it open would hand over the exact deny patterns an evasion needs.
+    # policy_distribution.py opens both files directly, not through this gate.
+    "policy_cache",
     "admission_policy.json",
     "denied_commands.json",
     # The cron store. It holds access-control state, not just scheduling data:
@@ -4974,6 +5484,13 @@ _CREW_SECRET_LEAVES: list[str] = [
     # treatment ``webhooks`` and ``profiles`` already get.
     "crons.json",
     "cron-history",
+    # Saved workflow definitions are executable capabilities whose presence is
+    # authorized only by an explicit dashboard action. Same-UID owner-only file
+    # modes do not stop an agent file tool from planting or rewriting a valid
+    # definition, so fence the whole directory, including atomic-write temp
+    # files. The dashboard and workflow service open it directly and remain able
+    # to create, list, update, and execute definitions.
+    "workflow_library",
     # The operator's OAuth consent-endpoint extension
     # ({additional_authorization_endpoints: [{host, path}]}). Each entry widens
     # the banner-only OAuth entropy carve-out (_OAUTH_AUTHORIZATION_ENDPOINTS),
@@ -4987,6 +5504,13 @@ _CREW_SECRET_LEAVES: list[str] = [
     # directly, not through this gate; the operator hand-edits it out-of-band
     # (there is deliberately no dashboard writer).
     "oauth_endpoints.json",
+    # Per-session AgentCore Gateway inbound JWTs (directory name reserved
+    # before the writer lands). Owner-only ``0600`` does not isolate another
+    # process running as the same UID, so the directory belongs behind the
+    # shared floor like every other credential store. Classified as the
+    # whole DIRECTORY so atomic-write temps and every sidecar file are
+    # covered.
+    "agentcore-inbound",
     # Which checkout the gateway executes (Dev Fleet "Make live"). The pointer is
     # resolved during startup and exec'd into, so a writable one is arbitrary
     # code execution in the gateway's own identity — the agent must not be able
@@ -4995,6 +5519,21 @@ _CREW_SECRET_LEAVES: list[str] = [
     # gateway's own startup reader opens it directly rather than through this
     # gate, so both keep working.
     "live_target.json",
+    # Holds `backup/redaction.json`, the switch that decides whether a bundle
+    # leaving this machine is redacted first. An agent that could write it would
+    # turn redaction off and every later upload would carry the operator's
+    # secrets verbatim; an agent that could read it learns whether the memory
+    # store is currently being scrubbed. Flipping it is the attack and reading it
+    # is reconnaissance, so this needs read AND write protection, not just write.
+    #
+    # The DIRECTORY is classified, not just the leaf inside it. Naming only the
+    # leaf leaves the container writable, and a writable container is the same
+    # hole one level up: replace `backup/` with a symlink and the protected leaf
+    # now resolves somewhere unprotected, where the switch can be rewritten at
+    # will. Restore's rollback copies live at `pre-restore-<ts>/`, not here, so
+    # nothing legitimate is shut out, and the product's own reader opens the file
+    # directly rather than through this gate.
+    "backup",
     # The computer-use primary enable ({enabled, allowed_apps, extra_denied_apps}).
     # Same class of control as ``denied_commands.json`` directly above, and here
     # for the same reason: flipping ``enabled`` grants full desktop observation
@@ -5141,10 +5680,68 @@ _CREW_SECRET_LEAVES: list[str] = [
     # #2351). The verb-independent sensitive-path backstop covers a scripted
     # ``python -c "open('~/.kiro/crew/.vault/...')"`` too.
     ".vault",
+    # KAS-mode auth token store. In the KAS-embedded runtime Kiro Crew performs the
+    # Kiro OIDC lifecycle itself (there is no kiro-cli), and persists the resulting
+    # access/refresh tokens as ``0600`` files under this dir. They are live bearer
+    # credentials for the model service, so — like every other credential store —
+    # they sit behind the shared read+write floor: an auto-approved or sandboxed
+    # agent must not be able to read the token back or overwrite it. The auth
+    # module's own store opens these paths directly rather than through this gate,
+    # so login/refresh keep working. Fence the whole ``kas`` dir (not just
+    # ``kas/auth``): fencing only the leaf would let the agent rename ``kas`` and
+    # then read the relocated token store from outside the fence.
+    "kas",
 ]
 _SENSITIVE_HOME_DIRS += [
     f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in _CREW_SECRET_LEAVES
 ]
+
+# ── Publish artifacts of a keystone leaf ──
+# Every leaf above is published through ``atomic_write``, which writes a
+# ``tempfile.mkstemp(dir=path.parent, suffix=".tmp")`` sibling and renames it over the
+# target; several stores also take a lock file beside the leaf they guard
+# (``.policy.lock`` for the ops autonomy ceiling, ``ops_mission_control_secrets.json.lock``,
+# ``.crons.lock``). Those siblings carry the SAME bytes as the leaf -- the temp holds the
+# full payload for the whole write -- but a leaf entry matches its exact name only, so
+# they sat outside the fence while the guarantee was stated as absolute.
+#
+# A DIRECTORY leaf never had this gap: its temps land INSIDE the fenced directory, where
+# the ``startswith(target + os.sep)`` rule already covers them. That is exactly why
+# ``webhooks``, ``routing``, ``.vault``, ``kas``, ``run``, ``cron-history`` and
+# ``apps/aws-control/data`` are written as directories, and their comments say so. The gap
+# is the leaves whose parent is NOT itself fenced -- in practice the crew data-home root,
+# which cannot simply be fenced wholesale because reading ``config.json`` and
+# ``sessions.db`` there is routine and intended (see ``_WRITE_PROTECTED_HOME_PATHS``).
+#
+# So the fence is DERIVED FROM the leaf declarations rather than restated per leaf: an
+# artifact-shaped name sitting in the parent directory of any keystone leaf is protected.
+# A leaf added later inherits the protection with no second entry to remember, which is
+# the only version of this that stays true -- the reason the gap existed at all is that
+# the exception was invisible at every call site.
+#
+# Derived from ``_CREW_SECRET_LEAVES``, deliberately NOT from ``_SENSITIVE_HOME_DIRS``:
+# that list also carries ``.aws``, ``.ssh`` and the kiro-cli identity stores, whose parent
+# is ``$HOME`` ITSELF, so deriving from it would fence ``~/*.tmp`` and ``~/*.lock`` across
+# the user's entire home directory.
+#
+# Keyed on the artifact SHAPE, not on ``<leaf>.tmp``: the real mkstemp name is
+# ``tmpXXXXXXXX.tmp`` and carries no leaf name at all, so a leaf-derived temp name would
+# fence a spelling no writer produces. ``<leaf>.lock`` IS a real shape
+# (``ops_mission_control_secrets.json.lock``), and the suffix rule covers both.
+#
+# Not included: ``deploy/pending-deploys.lock``. Its directory holds no keystone leaf, so
+# there is no keystone payload beside it for the fence to protect.
+_KEYSTONE_ARTIFACT_SUFFIXES: tuple[str, ...] = (".tmp", ".lock")
+_KEYSTONE_ARTIFACT_PARENTS: list[str] = sorted(
+    {
+        # Every entry is ``<crew-prefix>/<leaf>`` so it always contains a separator,
+        # making the rsplit safe: a bare leaf yields the crew home root, a path-shaped
+        # leaf yields its own directory (``workspace/md-notebook``).
+        f"{prefix}/{leaf}".rsplit("/", 1)[0]
+        for prefix in _CREW_HOME_PREFIXES
+        for leaf in _CREW_SECRET_LEAVES
+    }
+)
 
 # ── Write-protected paths (block modification, allow reads) ──
 # Runtime config files carry security-relevant resource ceilings (concurrent
@@ -5235,6 +5832,29 @@ _WRITE_PROTECTED_HOME_PATHS += [
     for prefix in _CREW_HOME_PREFIXES
 ]
 _WRITE_PROTECTED_HOME_PATHS += [
+    # Downloaded MODEL WEIGHTS (speech recognition and embeddings both land here).
+    # WRITE-protected as a whole directory, not read+write sensitive: the weights hold
+    # no secret, and the settings surface and `kirocrew doctor` both read the directory
+    # to report what is installed.
+    #
+    # They are an INPUT TO A TRUST DECISION. Each store verifies its file against a
+    # pinned sha256 and then hands the PATH to a native loader, so a writable directory
+    # leaves a window between the digest and the open in which the bytes can be
+    # swapped -- and no amount of re-hashing closes it, because the loader re-opens by
+    # name. Removing the writability removes the window instead: the agent cannot
+    # modify the file at all, so the verified bytes are the loaded bytes. A poisoned
+    # model is persistent and invisible, and for speech it means the user's own words
+    # reaching the agent as something they did not say.
+    #
+    # Kiro Crew's own downloaders write here directly and do not route through this
+    # gate, so first-run fetches, re-downloads after a failed check and the embedding
+    # model install all keep working; only the agent's file-edit and shell tools are
+    # refused. Paired with the same entry in _WRITE_PROTECTED_BASH_LEAVES -- protected
+    # on one path only is not protected.
+    f"{prefix}/models"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
     # The Connections tool-alias OWNERSHIP RECORD, third instance of the same class as the
     # two above and with the same read/write asymmetry. It holds no secret and the rebuild
     # reads it on every run, so classifying it sensitive would break the feature — but it is
@@ -5255,6 +5875,45 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # through this gate, so both record writes still work; only the agent's own file-edit and
     # shell tools are refused.
     f"{prefix}/connections-tool-aliases.json"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The app-sources checkout root — the persistent tree every installed app
+    # EXECUTES from (``apps.registry.app_source_dir``). This is a whole DIRECTORY
+    # rather than a leaf, which the shared matcher already supports: it compares a
+    # resolved path against the entry and its ``entry + os.sep`` prefix, so every
+    # file under every checkout is covered without enumerating them.
+    #
+    # It is the strongest instance of the write-protection class, because the
+    # protected file IS the executed code rather than an input to a decision about
+    # it: an agent session with ordinary file-write tools could edit an installed
+    # app's source, and that source then runs with the app's privileges on the
+    # app's next launch. Nothing downstream neutralizes it — unlike ``config.json``,
+    # whose inflated values the loader clamps at load time, a modified checkout is
+    # simply run. Provenance does not catch it either: ``install_from_registry``
+    # records ``_resolved_clone_commit`` (the tree's real ``HEAD``), and an agent
+    # write dirties the worktree without moving ``HEAD``, so a modified tree still
+    # reports the pinned SHA.
+    #
+    # Write-only, NOT ``_SENSITIVE_HOME_DIRS``, and the asymmetry is load-bearing:
+    # app source carries no secret and is legitimately READ all the time — the
+    # dashboard file viewer lists ``app-sources`` as a browsable root
+    # (``apps.builtins.file_explorer.server``), knowledge indexing walks it, and
+    # reading an installed app's code is how anyone debugs one. Classifying it
+    # read+write sensitive would break those.
+    #
+    # Deliberately NOT added to ``_WRITE_PROTECTED_BASH_LEAVES`` below: that
+    # matcher blocks on a command NAMING the path, which denies bash reads too.
+    # That is harmless for the marker and the two Ops Mission Control files, whose
+    # only legitimate readers are Python; it is not harmless here, where reading
+    # app source with ``grep``/``cat`` is routine. Shell writes therefore sit on
+    # the same footing as ``config.json``'s, with the file-edit tool gate as the
+    # enforcement point.
+    #
+    # The gateway's own installer is unaffected: ``_clone_build_app`` clones,
+    # builds and prunes through direct Python/subprocess calls, which are not
+    # agent tool calls and never reach ``hooks.on_tool_call``.
+    f"{prefix}/app-sources"
     for prefix in _CREW_HOME_PREFIXES
 ]
 
@@ -5380,6 +6039,12 @@ _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
     # re-converges it. The residual ``cd``-relative form is the low-severity case
     # the scope note already accepts on purpose.
     "playwright-cli-config.json",
+    # Downloaded model weights, paired with the same entry in
+    # _WRITE_PROTECTED_HOME_PATHS so the file-edit and shell paths agree. A directory
+    # rather than a leaf: the trailing separator the pattern already accepts makes this
+    # cover everything beneath it, which is what the trust decision needs (any file the
+    # loader might open, not one filename).
+    "models",
 )
 
 # ── Anchor-INDEPENDENT leaf matching ──
@@ -5408,6 +6073,28 @@ _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
 # distinctive at all (their distinguishing part is the ``apps/.../data/``
 # subpath) and must stay anchored.
 _BARE_TOKEN_PROTECTED_LEAVES: tuple[str, ...] = ("connections-tool-aliases.json",)
+
+# Whisper weight files, matched as a NAME with no anchor, for the same reason as the
+# alias record above: the filename IS the grant. `stt.models` verifies a file's sha256
+# and then hands its PATH to a native loader that re-opens it by name, so the bytes a
+# C++ GGML parser actually consumes are whatever sits at ``ggml-<model>.bin`` at open
+# time, not the bytes that were hashed. The ``models`` entry in
+# _WRITE_PROTECTED_BASH_LEAVES fences the crew-home spelling of that path and is what
+# the file tools go through, but an anchored pattern falls to a single ``cd``:
+# ``cd ~/.kiro/crew/models; cp evil.bin ggml-base.bin`` names no home, no crew prefix
+# and no separator. Anchoring cannot be part of this contract, so it is not.
+#
+# A pattern rather than the four catalog filenames, so a model row added to
+# ``stt.models.CATALOG`` later is fenced without a second edit here -- a new row is
+# exactly the change nobody would think to mirror into this module.
+#
+# The SCOPE test above is met and the cost is stated rather than assumed: ``ggml-``
+# plus ``.bin`` is the whisper.cpp/llama.cpp artifact convention and appears in no
+# ordinary command line, but it is deliberately wider than the crew home, so an
+# unrelated checkout of someone else's GGML weights cannot be copied or renamed from
+# the agent's SHELL either. That is a denial rather than a grant, and the file tools
+# are untouched, which is the affordable direction for the trade.
+_WHISPER_WEIGHT_NAME = r"ggml-[A-Za-z0-9][A-Za-z0-9._-]*\.bin"
 
 # Regex for bash commands that read sensitive paths.
 # Matches: cat, head, tail, less, more, strings, xxd, base64, cp, scp, open,
@@ -5457,8 +6144,9 @@ def _build_sensitive_regex() -> re.Pattern[str]:
       3. a write-protected LEAF under the crew home, in POSIX and in
          Windows-native spelling, matched verb-independently;
       4. an anchor-INDEPENDENT bare path SEGMENT for the distinctive leaves in
-         ``_BARE_TOKEN_PROTECTED_LEAVES`` — the only strategy that survives a
-         ``cd`` into the crew home followed by a relative filename.
+         ``_BARE_TOKEN_PROTECTED_LEAVES``, and for a whisper weight filename
+         (``_WHISPER_WEIGHT_NAME``) — the only strategy that survives a ``cd``
+         into the crew home followed by a relative filename.
     The home anchor accepts ``~`` / ``$HOME`` / the literal ``Path.home()`` AND a
     generic ``/home/<user>`` / ``/Users/<user>`` literal so an unexpanded
     ``/home/$USER/...`` or another user's literal path is still caught.
@@ -5472,7 +6160,18 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     home_alts = f"(?:{home}|{tilde}|{home_var}|{generic_home})"
     escaped_dirs = [re.escape(d) for d in _SENSITIVE_HOME_DIRS]
     dirs_pattern = "|".join(escaped_dirs)
-    sensitive_path = rf"{home_alts}/(?:{dirs_pattern})(?:/|\s|$|['\"])"
+    # What may TERMINATE a sensitive path token. A path is very often the last thing
+    # before a shell metacharacter, and accepting only whitespace, a quote, ``/`` or
+    # end-of-string let punctuation defeat the gate outright: ``cd ~/.aws;`` and
+    # ``cd ~/.kiro/crew/models;`` were allowed, while the same commands written with
+    # ``&&`` were blocked -- for no better reason than that ``&&`` is preceded by a
+    # space and ``;`` is not. The asymmetry is the tell; nothing about a semicolon
+    # makes the path less named. So the class is every character a shell itself treats
+    # as the end of a word. Widening a DENY boundary can only ever deny more, which is
+    # the safe direction for this gate, and the rule it enforces is unchanged: naming a
+    # fenced path is the signal.
+    path_end = r"(?:/|\s|$|['\"]|[;&|()<>,:`])"
+    sensitive_path = rf"{home_alts}/(?:{dirs_pattern}){path_end}"
     # Write-protected leaves (e.g. the on-call schedule): a full home-anchored
     # path to a specific leaf file, matched verb-INDEPENDENTLY (below) so no
     # write form can bypass it. See _WRITE_PROTECTED_BASH_LEAVES for why reads
@@ -5483,7 +6182,41 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # trailing ``/`` is included so a ``mkdir -p <home>/<crew-prefix>/<leaf>/x``
         # (which also MATERIALISES the leaf as a directory) is caught, not just
         # the exact-leaf forms.
-        rf"{home_alts}/(?:{wp_prefixes})/(?:{wp_leaves})(?:/|\s|$|['\"])"
+        rf"{home_alts}/(?:{wp_prefixes})/(?:{wp_leaves}){path_end}"
+    )
+    # Publish artifacts of a keystone leaf, mirroring the tool-path clause in
+    # ``_is_keystone_publish_artifact``. Required, not optional: "protected on one path
+    # only is not protected" is stated three times in this module, and the leaf's temp
+    # holds the leaf's own bytes.
+    #
+    # Why ``sensitive_path`` above does not already catch these: ``path_end`` is the class
+    # of characters a SHELL treats as the end of a word, and ``.`` is deliberately not in
+    # it, so the literal leaf name followed by ``.tmp`` never satisfies the terminator.
+    # Matched on the artifact SHAPE rather than a leaf-derived name because the real
+    # mkstemp form (``tmpXXXXXXXX.tmp``) contains no leaf name at all.
+    #
+    # The filename run excludes ``/`` so this stays exactly one level deep -- a direct
+    # child of a keystone leaf's own parent, matching the equality test the tool path
+    # makes on the parent directory.
+    #
+    # The tail is a name-character LOOKAHEAD, not one of the enumerated terminator
+    # classes, and the separator before the filename is the generalized ``gsep`` that
+    # absorbs canonical no-op chains (``/./``, ``/x/../``). Both follow the
+    # ``bare_protected_path`` branch further down, whose comment states the reasoning:
+    # excluding name characters after the match keeps a DIFFERENT file out
+    # (``tmpAB.tmpx`` stays allowed) while a trailing ``.``, ``$``, metacharacter or
+    # separator is still a match. An enumerated class has to name every spelling a shell
+    # or filesystem treats as equivalent, and review found three it had missed in
+    # succession -- a metacharacter, an expanded-away ``$var``, and a ``/./`` segment.
+    # The lookahead closes that whole family instead of the members discovered so far,
+    # which is why this branch does not reuse ``path_end`` / ``win_path_end``.
+    artifact_parents_pattern = "|".join(re.escape(d) for d in _KEYSTONE_ARTIFACT_PARENTS)
+    artifact_suffix_alt = "|".join(
+        re.escape(suffix.lstrip(".")) for suffix in _KEYSTONE_ARTIFACT_SUFFIXES
+    )
+    artifact_path = (
+        rf"{home_alts}/(?:{artifact_parents_pattern})"
+        rf"/[^/\s'\"]*\.(?:{artifact_suffix_alt})(?![\w-])"
     )
     # Windows-native spellings of the same fenced dirs, matched in the RAW
     # command text. POSIX shlex consumes unquoted backslashes during
@@ -5498,6 +6231,26 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # itself the signal (same fail-safe posture as the branches above), so
     # over-matching an odd mixed-separator spelling is the safe direction.
     win_sep = r"[\\/]"
+    # Win32 collapses a repeated separator run, so ``kiro-cli`` and
+    # ``\\kiro-cli`` and ``//kiro-cli`` name the same entry. Matching only the
+    # single-separator spelling was a bypass of every store branch at once
+    # (#6350): a doubled separator at an inter-segment boundary named the fenced
+    # path while matching no branch.
+    #
+    # The patterns below deliberately still spell ONE separator, and the run is
+    # collapsed in the SUBJECT instead -- once, linearly, in
+    # ``is_sensitive_bash_command`` via ``_collapse_separator_runs``.
+    #
+    # Admitting a run in the PATTERNS (``{win_sep}+``) was tried first and is a
+    # denial-of-service on this very gate: the run appears inside the starred
+    # generalized separator below and again after it, so a long run can be split
+    # between them many ways and the engine consumes the whole run at every start
+    # offset. Measured, 6,000 backslashes in one command: 33s against 1.3s on
+    # base, past the gateway's 25s watchdog (found in review). Making the run
+    # maximal with a lookahead only halved it, and capping it at 64 bought speed
+    # by letting a 65-separator spelling escape the fence outright -- trading a
+    # hang for a bypass. Collapsing the subject is complete for any run length
+    # and leaves every pattern here exactly as tight as it already was.
     # Generalized separator: a plain separator, optionally preceded by any
     # chain of canonical no-ops — single-dot segments (``\.``) and same-level
     # down-up excursions (``\X\..``). This is what makes traversal spellings
@@ -5508,6 +6261,37 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # elsewhere — the safe direction for this gate, which blocks on naming
     # alone. The name run is length-capped to bound backtracking.
     win_gsep = rf"(?:{win_sep}(?:\.|[^\\/\s'\"]{{1,64}}{win_sep}\.\.))*{win_sep}"
+    # Shell word-end terminator for the Windows-native branches below. Mirrors the POSIX
+    # ``path_end`` above, INCLUDING the shell metacharacters, and for the reason stated
+    # there: the class is every character a shell itself treats as the end of a word, and
+    # widening a DENY boundary can only ever deny more, which is the safe direction for a
+    # gate that blocks on naming alone.
+    #
+    # Until this existed each Windows branch spelled its own ``(?:sep|space|$|quote)``,
+    # which a metacharacter walked straight through -- ``type <fenced path>&whoami`` named
+    # the file and was not matched, while the POSIX spelling of the same command was. Found
+    # by the GPT review lane on the artifact branch; applied to the whole family, because a
+    # fence that is tight on an atomic-write temp and loose on the keystone leaf beside it
+    # protects the transient copy and not the secret.
+    # ``$`` is a literal member of the class, not the regex end-anchor that appears
+    # earlier in the alternation: PowerShell (and cmd.exe with ``$env:``) EXPANDS a
+    # variable reference, so ``Get-Content <fenced path>$null`` removes the ``$null`` and
+    # reads the fenced file, while the matcher saw an unterminated path and allowed it.
+    # A literal ``$`` therefore ends a path for matching purposes. The POSIX side is
+    # already covered here by its own branches -- measured, not assumed -- so this is
+    # deliberately a Windows-only addition rather than a change to ``path_end``.
+    # ``.`` is deliberately NOT a member, though Windows does strip a trailing dot when
+    # opening a file. Adding it here refused ``ls -d ~/.kiro/crew/backup.tar``: these
+    # branches accept forward slashes too, so they also govern POSIX spellings, and
+    # ``backup`` is a fenced DIRECTORY leaf whose name prefixes unrelated filenames. A
+    # terminator sitting after a directory name cannot tell the alias ``backup.`` from the
+    # different file ``backup.tar``, and refusing the latter regressed the read-only
+    # listing that #6021 exists to allow. The artifact branches solve their own version of
+    # this with a name-character LOOKAHEAD instead, which is anchored at the end of a
+    # complete filename and so can make the distinction. The leaf branches' trailing-dot
+    # alias is therefore left open here rather than closed with a rule that costs a
+    # legitimate read.
+    win_path_end = rf"(?:{win_sep}|\s|$|['\"]|[;&|()<>,:`$])"
     win_dirs_pattern = "|".join(
         win_gsep.join(re.escape(part) for part in d.split("/"))
         for d in _SENSITIVE_HOME_DIRS
@@ -5522,21 +6306,39 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # shell's spelling) is the same home by definition.
     userprofile = (
         r"(?:%USERPROFILE(?::[^%\s]*)?%"
+        # cmd.exe delayed expansion (`cmd /V:ON`) names the same home as the `%…%`
+        # form, exactly as it does for `%APPDATA%` below. Without it every
+        # home-anchored branch here missed `!USERPROFILE!\.kiro\crew\…`.
+        r"|!USERPROFILE(?::[^!\s]*)?!"
         rf"|{re.escape('$env:USERPROFILE')}"
         rf"|{re.escape('${env:USERPROFILE}')}"
         r"|%HOMEDRIVE(?::[^%\s]*)?%%HOMEPATH(?::[^%\s]*)?%"
+        r"|!HOMEDRIVE(?::[^!\s]*)?!!HOMEPATH(?::[^!\s]*)?!"
         rf"|{re.escape('$env:HOMEDRIVE$env:HOMEPATH')}"
         rf"|{re.escape('${env:HOMEDRIVE}${env:HOMEPATH}')})"
     )
     win_home_alts = (
-        f"(?:{home}|{generic_win_home}|{unc_prefix}|{userprofile}|{tilde}|{home_var})"
+        f"(?:{home}|{generic_win_home}|{unc_prefix}|{userprofile}"
+        f"|{tilde}|{home_var})"
     )
     # Between the anchor and the fenced remainder, accept the same
     # canonical-no-op chains (``\.\``, ``\X\..\``): they are equivalent to a
     # plain separator, so ``%APPDATA%\.\kiro-cli\data.sqlite3`` and
     # ``...\AppData\Roaming\..\Roaming\kiro-cli\...`` still name the store.
     win_sensitive_path = (
-        rf"{win_home_alts}{win_gsep}(?:{win_dirs_pattern})(?:{win_sep}|\s|$|['\"])"
+        rf"{win_home_alts}{win_gsep}(?:{win_dirs_pattern}){win_path_end}"
+    )
+    # Windows-native spelling of the publish artifacts above. The pairing invariant
+    # applies to this spelling too, not only to POSIX-versus-tool: a native path is the
+    # one form the tokenizing passes cannot see, so leaving it out would fence the temp
+    # everywhere except in an embedded-script literal.
+    win_artifact_parents_pattern = "|".join(
+        win_gsep.join(re.escape(part) for part in d.split("/"))
+        for d in _KEYSTONE_ARTIFACT_PARENTS
+    )
+    win_artifact_path = (
+        rf"{win_home_alts}{win_gsep}(?:{win_artifact_parents_pattern})"
+        rf"{win_gsep}[^\\/\s'\"]*\.(?:{artifact_suffix_alt})(?![\w-])"
     )
     # ``%APPDATA%`` already points INTO ``AppData\Roaming``, so a spelling like
     # ``%APPDATA%\kiro-cli\data.sqlite3`` names a fenced store WITHOUT the
@@ -5560,7 +6362,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # right after it is a canonical no-op specific to this anchor.
     appdata_sensitive_path = (
         rf"{appdata_var}(?:{win_sep}\.\.{win_sep}Roaming)*"
-        rf"{win_gsep}(?:{appdata_remainders})(?:{win_sep}|\s|$|['\"])"
+        rf"{win_gsep}(?:{appdata_remainders}){win_path_end}"
     )
     # ``%LOCALAPPDATA%`` is the same shape one directory over: it points INTO
     # ``AppData\Local``, so ``%LOCALAPPDATA%\kiro-cli\data.sqlite3`` names a
@@ -5586,7 +6388,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # right after it is this anchor's canonical no-op.
     localappdata_sensitive_path = (
         rf"{localappdata_var}(?:{win_sep}\.\.{win_sep}Local)*"
-        rf"{win_gsep}(?:{localappdata_remainders})(?:{win_sep}|\s|$|['\"])"
+        rf"{win_gsep}(?:{localappdata_remainders}){win_path_end}"
     )
     # Windows-native spelling of the write-protected leaves. The POSIX leaf
     # branch above anchors on ``/`` separators, so on Windows the resolved home
@@ -5606,7 +6408,64 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     )
     win_write_protected_path = (
         rf"{win_home_alts}{win_gsep}(?:{win_wp_prefixes}){win_gsep}"
-        rf"(?:{win_wp_leaves})(?:{win_sep}|\s|$|['\"])"
+        rf"(?:{win_wp_leaves}){win_path_end}"
+    )
+    # A native spelling whose LEAF is an expansion: ``%USERPROFILE%\.kiro\crew\%F%``
+    # names the keystone without spelling any of its literal leaves, so no branch
+    # above can match it. The token-level rule for that shape
+    # (`_sensitive_under_unresolved_var`) does catch it, but only when the path is
+    # QUOTED -- POSIX shlex consumes unquoted backslashes before that rule ever
+    # runs, which is the same blind spot every branch here exists to cover.
+    #
+    # Anchored on the keystone's PARENT directory, because the leaf being a variable
+    # means there is no literal leaf to match: naming the parent, a separator, and
+    # any expansion is the signal. Scoped to the crew trust root and NOT to every
+    # entry in `_SENSITIVE_LEAF_PARENT_DIRS`, since that list also holds
+    # ``AppData/Roaming`` and ``Library/Application Support`` -- directories whose
+    # variable-leaf spellings (``%APPDATA%\%APP%``) are ordinary and constant.
+    win_crew_leaf_parents = "|".join(
+        win_gsep.join(re.escape(part) for part in d.split("/"))
+        for d in _SENSITIVE_LEAF_PARENT_DIRS
+        if any(d == p or d.startswith(f"{p}/") for p in _CREW_HOME_PREFIXES)
+    )
+    # Every spelling of "something that is computed at run time", because the LEAF
+    # being computed is what this branch exists to catch: the value cannot be read from
+    # the command text, so the only safe reading is that it might name a keystone file.
+    #
+    # The substitution forms are not optional. Without them
+    # ``…\.kiro\crew\$(Write-Output security_policy.json)`` read the governance
+    # policy: the token-level rule catches that shape through `_SHELL_SUBST_RE`, but
+    # only when the path is QUOTED, and this branch exists precisely for the unquoted
+    # spellings POSIX shlex destroys before any token rule runs.
+    #
+    # The bracketing forms match their OPENER and do not describe a body, which is the
+    # difference between a deny gate and a parser. This question is only ever "does an
+    # unresolved expansion start here", and any answer that has to model the contents
+    # can be out-nested: a body permitting one level missed
+    # ``$(a $(b $(c)))``, and `${[^}\s]+}` missed ``${My Var}`` because a PowerShell
+    # variable name may legally contain a space. Matching the opener cannot be
+    # out-nested, and it can only ever deny MORE -- which for the keystone directory
+    # costs nothing, since a resolvable leaf there is fenced by name anyway.
+    #
+    # The delimited forms below keep their closers on purpose: an unterminated ``%``,
+    # ``!`` or backtick is a LITERAL to cmd, PowerShell and sh respectively, so it
+    # names no expansion and matching it would refuse ordinary filenames.
+    any_expansion = (
+        r"(?:%[A-Za-z_][A-Za-z0-9_]*(?::[^%\s]*)?%"
+        r"|![A-Za-z_][A-Za-z0-9_]*(?::[^!\s]*)?!"
+        rf"|{re.escape('$')}\{{?env:[A-Za-z_][A-Za-z0-9_]*\}}?"
+        # PowerShell subexpression / POSIX command substitution, PowerShell's
+        # array-subexpression sibling, and the brace-delimited variable form.
+        r"|\$\{"
+        r"|\$\("
+        r"|@\("
+        # POSIX backtick substitution.
+        r"|`[^`]*`"
+        r"|\$[A-Za-z_][A-Za-z0-9_]*)"
+    )
+    win_crew_var_leaf_path = (
+        rf"{win_home_alts}{win_gsep}(?:{win_crew_leaf_parents})"
+        rf"{win_sep}{any_expansion}"
     )
     # ── ~/.kiro/agents WRITE-protection (a whole DIRECTORY, not a leaf) ──
     # A spec under this dir becomes a KIROCREW_MCP_TARGET_<SERVER> command the
@@ -5642,7 +6501,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     kiro_home_var = r"(?:\$KIRO_HOME|\$\{KIRO_HOME\})"
     agents_write_path = (
         rf"(?:{home_alts}/(?:{agents_dir_alt})"
-        rf"|{kiro_home_var}/(?:{agents_leaf_alt}))(?:/|\s|$|['\"])"
+        rf"|{kiro_home_var}/(?:{agents_leaf_alt})){path_end}"
     )
     win_agents_dir_alt = win_gsep.join(
         re.escape(part) for part in _KIRO_AGENTS_DIR.split("/")
@@ -5656,7 +6515,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     )
     win_agents_write_path = (
         rf"(?:{win_home_alts}{win_gsep}(?:{win_agents_dir_alt})"
-        rf"|{win_kiro_home_var}{win_gsep}(?:{agents_leaf_alt}))(?:{win_sep}|\s|$|['\"])"
+        rf"|{win_kiro_home_var}{win_gsep}(?:{agents_leaf_alt})){win_path_end}"
     )
     # Bare path-SEGMENT match for the globally distinctive leaves. Both branches
     # above require a home anchor and a crew prefix, so both are defeated by a
@@ -5678,6 +6537,11 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # blocks on naming alone.
     bare_leaves = "|".join(re.escape(leaf) for leaf in _BARE_TOKEN_PROTECTED_LEAVES)
     bare_protected_path = rf"(?<![\w.\-])(?:{bare_leaves})(?![\w\-])"
+    # Same token boundaries, and for the same reasons: the lookbehind keeps a name that
+    # merely ENDS with one of these out (``my-ggml-base.bin`` stays allowed), while a
+    # trailing ``.`` or separator still matches, so ``ggml-base.bin.tmp`` and the
+    # mkdir-as-directory form are covered.
+    bare_weight_path = rf"(?<![\w.\-]){_WHISPER_WEIGHT_NAME}(?![\w\-])"
     return re.compile(
         # (1) verb/redirect-anchored, OR (2) verb-independent: the sensitive path
         # appears anywhere as a token.  The token anchor accepts start-of-string
@@ -5693,6 +6557,11 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"{sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){write_protected_path}"
+        # (3b) publish artifacts of a keystone leaf -- the atomic-write temp and the lock
+        # sibling -- in both the POSIX and the Windows-native spelling. Verb-independent
+        # like (2)/(3): naming the artifact is the signal, so a redirect, a ``cp``, or an
+        # embedded ``open(...,'w')`` is caught without enumerating write verbs.
+        rf"|(?:^|.*[\s'\"=:,;]){artifact_path}"
         # (4) Windows-native spelling, verb-independent (same token anchor):
         # covers quoted backslash paths AND embedded-script literals that the
         # tokenizing passes cannot see. (5) the %APPDATA% / %LOCALAPPDATA%
@@ -5702,9 +6571,11 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # all, because branches (3) and (6) both fall to a ``cd`` plus a
         # relative name.
         rf"|(?:^|.*[\s'\"=:,;]){win_sensitive_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){win_artifact_path}"
         rf"|(?:^|.*[\s'\"=:,;]){appdata_sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){localappdata_sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){win_write_protected_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){win_crew_var_leaf_path}"
         # (8) ~/.kiro/agents (POSIX and Windows-native spelling, plus the
         # ``$KIRO_HOME`` override), matched verb-INDEPENDENTLY with the same token
         # anchor as (2)/(3): naming the dir is the signal, so ``curl -o``/``wget
@@ -5714,7 +6585,11 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # only); tool-path reads stay allowed.
         rf"|(?:^|.*[\s'\"=:,;]){agents_write_path}"
         rf"|(?:^|.*[\s'\"=:,;]){win_agents_write_path}"
-        rf"|{bare_protected_path})",
+        # (10) whisper weight FILENAMES, also with no anchor, because the digest the
+        # model store checks only binds the bytes if the name it then loads cannot be
+        # rewritten by a ``cd``-relative command.
+        rf"|{bare_protected_path}"
+        rf"|{bare_weight_path})",
         re.IGNORECASE,
     )
 
@@ -6030,6 +6905,42 @@ def _path_in_home_dirs(path_str: str, home_dirs: list[str], base_dir: str | None
     return False
 
 
+def _is_keystone_publish_artifact(path_str: str, base_dir: str | None = None) -> bool:
+    """Return True if *path_str* is the atomic-write temp or lock beside a keystone leaf.
+
+    Closes the gap between a keystone leaf's FINAL name, which
+    :data:`_SENSITIVE_HOME_DIRS` fences, and the intermediate inodes its publish
+    actually goes through -- see :data:`_KEYSTONE_ARTIFACT_PARENTS` for why the rule is
+    derived from the leaf list instead of restated per leaf.
+
+    Two properties are load-bearing:
+
+    - It reuses :func:`_candidate_forms` and :func:`_home_dir_targets`, so the
+      symlink-resolution, casefolding and ``KIROCREW_HOME`` re-anchoring cannot drift
+      from the main gate. A relocated crew home is covered because a
+      ``<crew-prefix>``-rooted entry hits the prefix-stripping arm in
+      :func:`_home_dir_targets_uncached`; a symlink aimed at a live temp is covered
+      because the resolved form is one of the candidates.
+    - The parent is compared for EQUALITY, not by prefix. An artifact is a direct child
+      of the leaf's own directory, and a prefix test would sweep every descendant of the
+      crew home whose name happens to end in ``.tmp`` -- far wider than this needs, in a
+      directory that must stay readable.
+    """
+    if not path_str:
+        return False
+    artifact_parents = _home_dir_targets(_KEYSTONE_ARTIFACT_PARENTS)
+    for cand in _candidate_forms(path_str, base_dir):
+        cand_cf = cand.casefold()
+        # Suffixes are authored lowercase and the candidate is casefolded, so this is
+        # the same case-insensitive comparison the rest of the gate makes -- on
+        # macOS/Windows ``FOO.TMP`` and ``foo.tmp`` are the same file.
+        if not cand_cf.endswith(_KEYSTONE_ARTIFACT_SUFFIXES):
+            continue
+        if os.path.dirname(cand_cf) in artifact_parents:
+            return True
+    return False
+
+
 def is_sensitive_path(path_str: str, base_dir: str | None = None) -> bool:
     """Return True if the path points to a read+write-sensitive location.
 
@@ -6038,8 +6949,16 @@ def is_sensitive_path(path_str: str, base_dir: str | None = None) -> bool:
     writes of credential files and the governance trust-root
     (:data:`_SENSITIVE_HOME_DIRS`). See :func:`_path_in_home_dirs` for the
     symlink/casefold matching contract.
+
+    Also covers a protected leaf's publish artifacts
+    (:func:`_is_keystone_publish_artifact`): the temp an ``atomic_write`` renames over
+    the leaf holds the leaf's full payload, so READ is blocked alongside write -- a
+    write-only fence there would still disclose ``.env`` or ``token_signing.key`` to a
+    reader that wins the race.
     """
-    return _path_in_home_dirs(path_str, _SENSITIVE_HOME_DIRS, base_dir)
+    return _path_in_home_dirs(
+        path_str, _SENSITIVE_HOME_DIRS, base_dir
+    ) or _is_keystone_publish_artifact(path_str, base_dir)
 
 
 def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:
@@ -6089,10 +7008,16 @@ def is_sensitive_write_path(path_str: str, base_dir: str | None = None) -> bool:
     written by the agent. Enforced at the file-edit tool gate
     (``hooks.on_tool_call`` on the ACP ``edit`` kind) — see
     :data:`_WRITE_PROTECTED_HOME_PATHS` for the rationale.
+
+    The publish-artifact clause is repeated from :func:`is_sensitive_path` rather than
+    left to be inherited, because this gate is documented as a SUPERSET of it: omitting
+    it here would leave a keystone temp writable through the edit gate while the
+    read+write gate refused it, the same one-path-only hole the pairing notes above warn
+    about.
     """
     return _path_in_home_dirs(
         path_str, _SENSITIVE_HOME_DIRS + _WRITE_PROTECTED_HOME_PATHS, base_dir
-    )
+    ) or _is_keystone_publish_artifact(path_str, base_dir)
 
 
 def sensitive_home_dirs() -> tuple[str, ...]:
@@ -6147,6 +7072,136 @@ _EXTRACT_INTO_TRUST_ROOT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The destination half above is deliberately left as the DEFAULT verdict, and
+# this carve-out is the only thing that overrides it.  That direction is the
+# whole design: ``-d`` is also ``ls``'s "show the directory entry itself, not its
+# contents", so the flag-only rule refused a read-only listing of the crew home
+# (issue #6021) while the same read spelled ``-l``, ``-lt``, a grep or a Python
+# ``open`` stayed allowed -- the flag character was never the boundary.
+#
+# Two earlier attempts tried to name the WRITERS instead (an archive-program
+# word, then that word in "command position").  Both were rejected because the
+# set of programs that write through ``-c``/``-C``/``-d``/``-D`` is open-ended,
+# so every program not enumerated became a silent permit against the old rule:
+# ``patch -d``, ``git -C ... apply`` and ``make -C`` were re-admitted into the
+# governance trust root, and a quote-split ``t""ar`` defeated the word match.
+# Enumerating writers fails OPEN, which is the wrong direction for this gate.
+#
+# So the exoneration is an allow-list of READ-ONLY listers instead, and it is
+# narrow by construction: a command qualifies only if it has no shell
+# composition at all AND its program is one of these.  Anything else -- an
+# unknown program, a pipeline, a quoted subshell, a redirection -- keeps the
+# destination-half verdict byte-for-byte, so a shape nobody anticipated
+# over-blocks rather than opening the trust root.
+#
+# Every entry here must be a program that cannot WRITE to the directory it is
+# given.  Do not add a program because it "usually" reads: ``find -delete`` and
+# ``install -d`` are why this is a hand-audited list and not a heuristic.
+_TRUST_ROOT_READ_LISTERS: frozenset[str] = frozenset(
+    {
+        "ls",  # -d: the directory entry itself, the reported false positive
+        "stat",
+        "du",
+        "readlink",
+        "basename",
+        "dirname",
+        "wc",
+    }
+)
+# ``file`` is deliberately ABSENT.  It looks like a pure reader but it is not:
+# ``file -C`` compiles a magic database, and ``file -C <crewhome> -m
+# <crewhome>/evil.magic`` writes ``evil.magic.mgc`` INTO the trust root while the
+# destination half matches on the ``-C`` argument.  That is a real write this
+# carve-out would have exonerated.  Every candidate for this set has to be
+# checked for a compile/output mode, not just for its usual reading role.
+
+# The exonerated shape is validated POSITIVELY: every character of the command
+# must come from a set that carries no meaning to any shell.  This replaced a
+# deny-list of metacharacters (``| & ; newline CR backtick < > ( )`` and
+# ``$(``), which lost four rounds in a row -- each review found one more spelling
+# the screen did not enumerate (a quoted program, an ``&`` inside a quoted
+# filename, a bare CR, then a PowerShell parenthesised group that RUNS in
+# argument position with no ``$`` sigil).  Enumerating what is dangerous cannot
+# terminate against an untrusted string and an unknown target shell; enumerating
+# what is INERT does, because a character absent from this set is refused whether
+# or not anyone has thought of a way to abuse it.
+#
+# So the set is deliberately tiny: letters, digits, and the punctuation a path or
+# a flag actually needs.  Everything else is out, including quotes, ``$``,
+# backslash, glob characters and every bracket -- a bare read listing needs none
+# of them.
+#
+# ``$HOME`` is the ONE exception, stripped before the check, because the
+# destination half of this rule enumerates that spelling itself
+# (``_EXTRACT_INTO_TRUST_ROOT_RE`` matches ``$HOME`` alongside ``~``), so
+# refusing it here would leave half of #6021 unfixed.  It is matched only when
+# followed by ``/``, whitespace or end of string, so ``$HOMEX``, ``${HOME}`` and
+# ``$(...)`` all keep their ``$`` and are refused.
+#
+# The residual cost is over-blocking a read whose PATH contains an excluded
+# character -- ``ls -d ~/.kiro/crew/foo(1)``, or a quoted path with a space.
+# Those keep the destination-half refusal exactly as they did at base: an
+# unfixed false positive of the #6021 family, not a new one. Fixing them would
+# mean telling a literal parenthesis from a grouping one inside an untrusted
+# string, which is the inference this rule has stopped making.
+# Named distinctly on purpose: this module already binds ``_HOME_VAR_RE`` further
+# down for the normalizer, with different semantics (it also accepts
+# ``${HOME}``, case-insensitively).  Reusing that name here silently redefined
+# it -- harmless only by accident of definition order -- so this rule carries its
+# own anchored spelling and cannot be moved out from under by an edit to the
+# other one.
+_TRUST_ROOT_HOME_VAR_RE = re.compile(r"\$HOME(?=[/\s]|\Z)")
+_SHELL_INERT_COMMAND_RE = re.compile(r"\A[A-Za-z0-9_@%+=:,./~^ \t-]+\Z")
+
+
+def _is_bare_trust_root_read(command: str) -> bool:
+    """True for a single simple command whose program only READS its argument.
+
+    Fails closed on anything it does not recognise, because the caller treats a
+    False here as "keep the destination-half refusal".
+    """
+    # Positive validation first: if the command carries a character that could
+    # mean anything to a shell, nothing below is trustworthy.
+    if not _SHELL_INERT_COMMAND_RE.match(_TRUST_ROOT_HOME_VAR_RE.sub("", command)):
+        return False
+    # Past that gate the string provably holds no quote, backslash or
+    # metacharacter, so a plain whitespace split IS the tokenisation -- there is
+    # no shlex-versus-shell disagreement left to exploit.
+    tokens = command.split()
+    if not tokens:
+        return False
+    program = tokens[0]
+    # A PATHNAME is never classified, because a basename says nothing about what
+    # the binary is: ``/tmp/ls`` and ``./ls`` end in ``ls`` and can write the
+    # trust root, so accepting them for the convenience of ``/bin/ls`` would
+    # exonerate an attacker-placed executable.  Only a bare command word counts;
+    # a path falls through to the destination-half refusal, which over-blocks a
+    # legitimate ``/bin/ls`` and is the direction this gate must fail in.
+    # A backslash cannot survive the charset above, so only ``/`` needs testing.
+    if "/" in program:
+        return False
+    # A bare word still resolves through PATH at execution time, so this
+    # carve-out cannot pin WHICH binary runs -- no string matcher can.  That is
+    # not a boundary this rule ever held: a planted shim named ``ls`` in an
+    # agent-writable PATH entry executes through every spelling this matcher
+    # never sees (``ls``, ``ls -l <crewhome>``), so refusing exactly the
+    # ``-d <crewhome>`` form defends nothing against it.  PATH integrity is the
+    # write-path policy's boundary, not this matcher's.
+    return program.lower() in _TRUST_ROOT_READ_LISTERS
+
+
+def _extracts_into_trust_root(command: str) -> bool:
+    """True when a command writes INTO the crew data home via a dest flag.
+
+    The destination match (:data:`_EXTRACT_INTO_TRUST_ROOT_RE`) is the verdict;
+    :func:`_is_bare_trust_root_read` is the single narrow exoneration for the
+    read-only listing that flag spelling made indistinguishable from a write.
+    """
+    if not _EXTRACT_INTO_TRUST_ROOT_RE.search(command):
+        return False
+    return not _is_bare_trust_root_read(command)
+
+
 # ── Symlink-staging to a sensitive target via RELATIVE traversal ──
 # The home-anchored ~/$HOME/absolute forms of ``ln -sf ~/.aws/credentials link``
 # are already caught by _build_sensitive_regex (the sensitive path appears as an
@@ -6162,12 +7217,16 @@ _SENSITIVE_SEGMENT_ALT = "|".join(re.escape(d) for d in _SENSITIVE_HOME_DIRS)
 # Windows-native relative spelling (``..\..\.aws\credentials``) is caught by
 # the traversal matcher below alongside the POSIX one. Forward-slash-only
 # entries still match (the class includes ``/``), so this strictly widens.
+# A repeated separator run is handled by collapsing the SUBJECT before this
+# matcher runs, not by admitting a run here (#6350) -- see
+# ``_collapse_separator_runs``.
 _SENSITIVE_SEGMENT_ALT_ANYSEP = "|".join(
     r"[\\/]".join(re.escape(part) for part in d.split("/"))
     for d in _SENSITIVE_HOME_DIRS
 )
 _RELATIVE_SENSITIVE_RE = re.compile(
-    rf"(?:^|[\s'\"=:,;])(?:\.\.?[\\/])+(?:{_SENSITIVE_SEGMENT_ALT_ANYSEP})(?:[\\/]|\s|$|['\"])",
+    rf"(?:^|[\s'\"=:,;])(?:\.\.?[\\/])+(?:{_SENSITIVE_SEGMENT_ALT_ANYSEP})"
+    rf"(?:[\\/]|\s|$|['\"])",
     re.IGNORECASE,
 )
 
@@ -6242,6 +7301,68 @@ _LINK_CREATE_VERBS: frozenset[str] = frozenset({"ln", "link"})
 _REDIR_PREFIX_RE = re.compile(r"^\d*(?:>>?|<(?!<))")
 
 
+_SEPARATOR_RUN_RE = re.compile(r"[\\/]{2,}")
+#: What a path token may start after, used to recognise a LEADING separator run
+#: (a UNC prefix) as opposed to an interior one.
+_PATH_TOKEN_BOUNDARY = " \t\"'=:,;(<>|&`"
+
+
+def _separator_collapsed_variants(command: str) -> tuple[str, ...]:
+    """Return *command* with separator runs collapsed, one copy per spelling.
+
+    Win32 collapses a repeated separator run, so ``%LOCALAPPDATA%\\\\kiro-cli``
+    and ``%LOCALAPPDATA%\\kiro-cli`` open the same file. The fence matches raw
+    text, so without this the doubled spelling named a fenced store while
+    matching no branch (#6350).
+
+    Collapsing is done to the SUBJECT rather than by admitting a run in the
+    patterns, because a run inside the patterns is a denial-of-service on this
+    gate: it appears both inside the starred generalized separator and after it,
+    so the engine walks the splits and re-consumes the whole run at every start
+    offset (measured 33s on 6,000 backslashes against 1.3s on base, past the 25s
+    watchdog).
+
+    Up to FOUR copies, along two axes, because a single rewrite loses cases:
+
+    * **Which separator.** Not every pattern accepts either character -- the
+      resolved home literal is ``re.escape``-d and requires the platform's exact
+      separator -- so collapsing to one fixed character left a MIXED run
+      (``D:/\\profiles\\u``) matching neither spelling (found in review).
+    * **Whether a LEADING run stays a pair.** A UNC path begins with two
+      separators that its anchor requires, so collapsing them broke every UNC
+      spelling that ALSO had an interior run:
+      ``\\\\server\\share\\.kiro\\\\crew\\security_policy.json`` matched neither
+      the original (interior run) nor the collapsed copy (no UNC prefix left),
+      and the keystone read was permitted (found in review). The boundary form
+      keeps a run that starts a token at two characters and still collapses the
+      interior ones.
+
+    Empty tuple when there is no run to collapse, so the common command costs one
+    search and nothing else. Duplicates are dropped, so a command with only
+    interior backslash runs yields two copies rather than four.
+    """
+    if not _SEPARATOR_RUN_RE.search(command):
+        return ()
+
+    variants: list[str] = []
+    for sep in ("/", "\\"):
+        for keep_leading_pair in (False, True):
+
+            def _replace(
+                match: "re.Match[str]",
+                sep: str = sep,
+                keep_leading_pair: bool = keep_leading_pair,
+            ) -> str:
+                start = match.start()
+                leading = start == 0 or command[start - 1] in _PATH_TOKEN_BOUNDARY
+                return sep * 2 if (keep_leading_pair and leading) else sep
+
+            variant = _SEPARATOR_RUN_RE.sub(_replace, command)
+            if variant != command and variant not in variants:
+                variants.append(variant)
+    return tuple(variants)
+
+
 def is_sensitive_bash_command(command: str) -> str | None:
     """Check if a bash command reads sensitive paths, accesses IMDS, or leaks env creds.
 
@@ -6259,7 +7380,7 @@ def is_sensitive_bash_command(command: str) -> str | None:
     # ── Pass 1: regex fast-path ──
     if _get_sensitive_re().search(command):
         return "Blocked: command accesses sensitive credential path"
-    if _EXTRACT_INTO_TRUST_ROOT_RE.search(command):
+    if _extracts_into_trust_root(command):
         return "Blocked: command extracts into the governance trust-root directory"
     # Block ANY command referencing a sensitive path via relative traversal,
     # regardless of verb.  The home-anchored/absolute forms are already caught
@@ -6267,6 +7388,32 @@ def is_sensitive_bash_command(command: str) -> str | None:
     # it (was gated on ln/cp only, so dd/base64/xxd/head/tail slipped past).
     if _RELATIVE_SENSITIVE_RE.search(command):
         return "Blocked: command references a sensitive credential path via relative traversal"
+
+    # ── Pass 1b: the pass-1 matchers again over separator-COLLAPSED copies ──
+    # Win32 collapses a repeated separator run, so ``%LOCALAPPDATA%\\kiro-cli``
+    # opens the fenced store that ``%LOCALAPPDATA%\kiro-cli`` names -- and the
+    # patterns above spell one separator, so the doubled form matched no branch
+    # (#6350). Collapsing the subject closes that for every run length at linear
+    # cost; admitting a run in the patterns instead was measured as a
+    # watchdog-crossing hang on this gate (see ``_separator_collapsed_variants``).
+    #
+    # ALL THREE pass-1 checks are repeated, not just the path matcher: the
+    # extraction check is a separate control, and omitting it let
+    # ``tar -xf evil.tar -C $HOME//.kiro/crew`` overwrite governance files
+    # through the doubled separator (found in review).
+    #
+    # Run only after the original missed, so nothing that needs the run intact
+    # (a UNC ``\\server\share`` anchor) loses its match.
+    for collapsed in _separator_collapsed_variants(command):
+        if _get_sensitive_re().search(collapsed):
+            return "Blocked: command accesses sensitive credential path"
+        if _extracts_into_trust_root(collapsed):
+            return "Blocked: command extracts into the governance trust-root directory"
+        if _RELATIVE_SENSITIVE_RE.search(collapsed):
+            return (
+                "Blocked: command references a sensitive credential path "
+                "via relative traversal"
+            )
 
     # ── Pass 2: normalizer-based sensitive path detection ──
     normalizer_result = _check_sensitive_via_normalizer(command)
@@ -6313,6 +7460,24 @@ _SHELL_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)$", re.DOTALL
 _SHELL_VAR_REF_RE = re.compile(
     r"\$\{[!#]?([A-Za-z_][A-Za-z0-9_]*)(?:[^{}]|\$\{[^{}]*\})*\}"
     r"|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+# Windows-native spellings of an unresolved expansion: cmd.exe `%VAR%` (with the
+# expansion modifiers it tolerates), cmd.exe delayed expansion `!VAR!`, and
+# PowerShell `$env:VAR` braced or bare.
+#
+# Deliberately NOT folded into the pattern above, which also drives value
+# SUBSTITUTION: a cmd.exe or PowerShell name has no value the segment walk could
+# have tracked, so substituting it would rewrite a token on a hypothesis rather
+# than on something the command actually assigned. These names are only ever used
+# to ask "is something here unresolved", so they stay separate -- and are applied
+# FIRST, because the POSIX pattern matches `$env` on its own and would leave
+# `:USERPROFILE` behind as literal text.
+_WIN_VAR_REF_RE = re.compile(
+    r"%[A-Za-z_][A-Za-z0-9_]*(?::[^%\s]*)?%"
+    r"|![A-Za-z_][A-Za-z0-9_]*!"
+    r"|\$\{env:[A-Za-z_][A-Za-z0-9_]*\}"
+    r"|\$env:[A-Za-z_][A-Za-z0-9_]*"
 )
 
 #: Shell keywords whose whole job is to assign. The name they set persists just as
@@ -6375,9 +7540,11 @@ _CHDIR_VERBS: frozenset[str] = frozenset(
 #: ``%HOMEDRIVE%`` plus a stray tail.
 _WINDOWS_HOME_ANCHOR_RE = re.compile(
     r"^(?:%HOMEDRIVE(?::[^%\s]*)?%%HOMEPATH(?::[^%\s]*)?%"
+    r"|!HOMEDRIVE(?::[^!\s]*)?!!HOMEPATH(?::[^!\s]*)?!"
     r"|\$\{env:HOMEDRIVE\}\$\{env:HOMEPATH\}"
     r"|\$env:HOMEDRIVE\$env:HOMEPATH"
     r"|%USERPROFILE(?::[^%\s]*)?%"
+    r"|!USERPROFILE(?::[^!\s]*)?!"
     r"|\$\{env:USERPROFILE\}"
     r"|\$env:USERPROFILE)",
     re.IGNORECASE,
@@ -6828,6 +7995,33 @@ def _brace_operand_reading(token: str) -> str | None:
     return rewritten if count else None
 
 
+def _mark_unresolved(token: str) -> str:
+    """Replace every expansion that cannot be resolved from the command text with NUL.
+
+    Shared by the two rules below rather than spelled out in each, because they ask
+    different questions of the SAME marking: a spelling one of them recognizes and
+    the other does not is a bypass of whichever rule missed it, and nothing about
+    either rule's own tests would show it.
+    """
+    marked = _SHELL_SUBST_RE.sub("\x00", token)
+    marked = _WIN_VAR_REF_RE.sub("\x00", marked)
+    return _SHELL_VAR_REF_RE.sub("\x00", marked)
+
+
+def _parent_dir_either_separator(path: str) -> str:
+    """The directory part of *path*, cutting at the last separator of EITHER kind.
+
+    Cutting on ``/`` alone read ``<home>\\.kiro\\crew\\`` as the single directory
+    ``/Users`` -- everything after the anchor being backslash-separated -- so the
+    keystone's own directory never reached `_dir_holds_sensitive_leaf` and a
+    variable leaf beneath it was allowed through. Windows accepts either
+    separator, and this gate fences on naming alone, so honouring both is the
+    same fail-safe direction the native-spelling patterns already take.
+    """
+    cut = max(path.rfind("/"), path.rfind("\\"))
+    return path[:cut] if cut > 0 else ""
+
+
 def _unresolved_home_hypothesis(token: str) -> str | None:
     """Rewrite the first unresolved expansion in *token* as a home reference.
 
@@ -6844,8 +8038,7 @@ def _unresolved_home_hypothesis(token: str) -> str | None:
     Returns the hypothesis, or None when the token carries nothing unresolved or
     the hypothesis is not home-anchored.
     """
-    marked = _SHELL_SUBST_RE.sub("\x00", token)
-    marked = _SHELL_VAR_REF_RE.sub("\x00", marked)
+    marked = _mark_unresolved(token)
     if "\x00" not in marked:
         return None
     hypothesis = marked.replace("\x00", "~", 1).replace("\x00", "")
@@ -6903,6 +8096,13 @@ def _dir_holds_sensitive_leaf(directory: str) -> bool:
     taint pass, which tainted nothing because ``~/.kiro/crew`` is not itself
     sensitive.
     """
+    # A Windows spelling names the same directory with the other separator, and on
+    # POSIX neither `normpath` nor `realpath` rewrites it, so the comparison below
+    # -- whose targets are built with ``/`` -- never matched a native spelling.
+    # Folding is the safe direction: a genuine POSIX filename that happens to
+    # contain a backslash folds to a directory holding no protected leaf and stays
+    # clean, while a backslash spelling OF a keystone parent starts matching.
+    directory = directory.replace("\\", "/")
     probe = os.path.expanduser(directory) if directory.startswith("~") else directory
     if not probe:
         return False
@@ -6938,8 +8138,7 @@ def _sensitive_under_unresolved_var(token: str) -> bool:
     hypothesis = _unresolved_home_hypothesis(token)
     if hypothesis is not None and is_sensitive_path(hypothesis):
         return True
-    marked = _SHELL_SUBST_RE.sub("\x00", token)
-    marked = _SHELL_VAR_REF_RE.sub("\x00", marked)
+    marked = _mark_unresolved(token)
     if "\x00" not in marked:
         return False
     # An unset variable expands to nothing, so the empty reading is a real
@@ -6949,15 +8148,21 @@ def _sensitive_under_unresolved_var(token: str) -> bool:
     empty_reading = marked.replace("\x00", "")
     if empty_reading != token and is_sensitive_path(empty_reading):
         return True
-    # The variable sits in the leaf: block when the literal directory prefix --
-    # everything up to the first unresolved expansion -- is a directory whose
-    # sensitivity lives in its leaves, since the variable could name one. This
-    # runs even when the home hypothesis is None, because `${HOME}/.kiro/crew/$F`
-    # normalizes to an ABSOLUTE prefix (not `~`-anchored) yet is the same attack.
-    literal_prefix = marked.split("\x00", 1)[0]
-    directory = literal_prefix.rsplit("/", 1)[0] if "/" in literal_prefix else ""
-    if directory and _dir_holds_sensitive_leaf(directory):
-        return True
+    # The variable sits in the leaf: block when the directory before it is one whose
+    # sensitivity lives in its leaves, since the variable could name one. Two
+    # spellings of that directory are tested, and both are needed:
+    #
+    # * The LITERAL prefix -- everything up to the first unresolved expansion --
+    #   covers a path already anchored absolutely, because `${HOME}/.kiro/crew/$F`
+    #   normalizes to an absolute prefix rather than a `~`-anchored one.
+    # * The HYPOTHESIS covers the shape where the ANCHOR is itself an expansion, so
+    #   the literal prefix is empty and the rule above sees no directory at all.
+    #   That is every native spelling of the keystone -- `%USERPROFILE%\.kiro\crew\%F%`,
+    #   `$env:USERPROFILE\.kiro\crew\$F` -- each of which read it unchallenged.
+    for candidate in (marked.split("\x00", 1)[0], hypothesis or ""):
+        directory = _parent_dir_either_separator(candidate)
+        if directory and _dir_holds_sensitive_leaf(directory):
+            return True
     return False
 
 
@@ -8066,7 +9271,7 @@ _EXFIL_PATTERNS = re.compile(
     r"(?:"
     r"[A-Za-z0-9+/=]{40,}"  # base64-like blob (40+ chars)
     r"|%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2}){20,}"  # heavy URL-encoding (20+ encoded chars)
-    r"|(?:AKIA|ASIA)[A-Z0-9]{16}"  # AWS access key ID
+    f"|{AWS_KEY_ID}"  # AWS access key ID (shared spelling: credential_patterns)
     r"|(?:ssh-rsa|ssh-ed25519)[\s+%]"  # SSH public key
     r"|BEGIN[\s+%](?:RSA|DSA|EC|OPENSSH)[\s+%]PRIVATE[\s+%]KEY"  # private key header
     r"|xox[bpas]-[0-9a-zA-Z-]+"  # Slack token
@@ -8393,7 +9598,8 @@ def _approved_oauth_authorization_endpoint(host: str, path: str) -> bool:
 # amazonaws.com domain.  Values are validated to prevent spoofing.
 _S3_PRESIGNED_RE = re.compile(
     r"X-Amz-Algorithm=AWS4-HMAC-SHA256"
-    r".*X-Amz-Credential=(?:AKIA|ASIA)[A-Z0-9]{16}(?:%2F|/)"
+    f".*X-Amz-Credential={AWS_KEY_ID}"  # shared spelling: credential_patterns
+    r"(?:%2F|/)"
     r".*X-Amz-Expires=\d{1,6}"
     r".*X-Amz-Signature=[0-9a-f]{64}",
     re.IGNORECASE,
@@ -8419,7 +9625,8 @@ _S3_PRESIGNED_PARAMS = frozenset(
 # than exempted, so attacker-controlled data cannot be smuggled through.
 _STS_TOKEN_RE = re.compile(r"^(?:FwoGZX|IQoJb3JpZ2lu)[A-Za-z0-9+/=%]{1,2000}$")
 _CREDENTIAL_RE = re.compile(
-    r"^(?:AKIA|ASIA)[A-Z0-9]{16}(?:%2F|/)[0-9]{8}"
+    f"^{AWS_KEY_ID}"  # shared spelling: credential_patterns
+    r"(?:%2F|/)[0-9]{8}"
     r"(?:%2F|/)[a-z0-9-]+(?:%2F|/)s3(?:%2F|/)aws4_request$"
 )
 _SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -8463,7 +9670,7 @@ def _is_safe_presigned(domain: str, query: str) -> bool:
 # hashes — are benign).
 _HARD_CREDENTIAL_RE = re.compile(
     r"(?:"
-    r"(?:AKIA|ASIA)[A-Z0-9]{16}"  # AWS access key ID
+    f"{AWS_KEY_ID}"  # AWS access key ID (shared spelling: credential_patterns)
     r'|(?:SecretAccessKey|aws_secret_access_key)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
     r'|(?:SessionToken|aws_session_token)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
     r'|(?:AccessKeyId|aws_access_key_id)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
@@ -8848,11 +10055,37 @@ def redact_exfiltration_urls(text: str) -> tuple[str, list[str]]:
 # Catches raw credential patterns in LLM output / tool results,
 # including base64-encoded variants.  Applied on all output paths
 # alongside redact_exfiltration_urls().
-
+#
+# ⚠ THIS PATTERN HAS A DEPENDENT PRE-FILTER. `_might_contain_credential` below
+# gates the scan of this pattern on a cheap necessary condition, and
+# `redact_credentials` SKIPS the scan entirely when that gate returns False. The
+# gate is therefore part of the redaction boundary, not an optimisation detail:
+# any input a branch here accepts but the gate rejects is a silent leak.
+#
+# So EDITING A BRANCH IS A TWO-SITE CHANGE:
+#   * ADDING a branch     -> register a sample in `test_credential_prefilter.py`
+#                            and an anchor in `_might_contain_credential`.
+#                            `test_every_pattern_branch_has_a_prefilter_anchor`
+#                            fails on the branch count until you do.
+#   * WIDENING a branch   -> widen the corresponding anchor to match, because the
+#                            anchor must stay a SUPERSET of the branch. A widened
+#                            branch does NOT change the branch count, so the count
+#                            assertion cannot see it. Two tests cover this:
+#                            `test_a_widened_branch_cannot_outgrow_its_anchor`
+#                            enumerates each branch's own alternatives, so a NEW
+#                            alternative (a second token prefix) is caught; and
+#                            `test_widening_a_branch_cannot_outgrow_its_anchor`
+#                            perturbs each sample, so a case-fold or homoglyph
+#                            relaxation is caught.
+#   * Making a branch CASE-INSENSITIVE -> the anchor MUST use the same regex
+#                            engine. A case-sensitive literal cannot gate a
+#                            `(?i:…)` branch, and neither can `str.lower()` —
+#                            see `_CREDENTIAL_PREFILTER_AUTHORIZATION_RE` for the
+#                            bypass that cost.
 _CREDENTIAL_PATTERNS = re.compile(
     r"(?:"
     # ── AWS ──
-    r"(?:AKIA|ASIA)[A-Z0-9]{16}"  # AWS access key ID
+    f"{AWS_KEY_ID}"  # AWS access key ID (shared spelling: credential_patterns)
     # key-value forms: tolerate an optional closing quote after the key name and an
     # optional opening quote before the value so JSON (`"aws_secret_access_key": "v"`)
     # is redacted, not just bare `key=v` / `key: v`. Without the `["']?` the closing
@@ -8946,13 +10179,23 @@ _CREDENTIAL_PATTERNS = re.compile(
     r"|pypi-[A-Za-z0-9_-]{16,}"  # PyPI API token
     r"|do[opr]_v1_[A-Za-z0-9]{40,}"  # DigitalOcean PAT/OAuth/refresh
     r"|GOCSPX-[A-Za-z0-9_-]{20,}"  # Google OAuth client secret
-    # DB connection URIs with embedded credentials — redact the
-    # ``scheme://user:pass@`` prefix (the password lives here).
-    r"|(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis(?:s)?|amqp(?:s)?)"
+    # Connection/fetch URIs with embedded credentials — redact the
+    # ``scheme://user:pass@`` prefix (the password lives here). http(s)/ftp(s)
+    # are included because URL userinfo is a credential wherever it appears
+    # (e.g. a token-bearing artifact CDN base quoted by an update-failure
+    # message); the user:pass@ shape cannot false-positive on a bare URL — a
+    # port (``:8080``) is never followed by ``@`` within the authority.
+    r"|(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis(?:s)?|amqp(?:s)?"
+    r"|https?|ftps?)"
     # User portion is `*` (not `+`): empty-user connection strings (e.g. MongoDB
     # Atlas IAM `mongodb+srv://:secret@…`) still redact the password (ported
     # from the upstream project).
-    r"://[^\s:/@]*:[^\s/@]+@"
+    # Password segment allows ``@`` (``[^\s/]`` not ``[^\s/@]``): an unencoded
+    # ``@`` inside a password is common, and stopping the match at the FIRST
+    # ``@`` would redact only the head and leak the rest (``…ss@host``) to
+    # logs. ``/`` still bounds the authority, so greedy ``+`` consumes through
+    # the FINAL ``@`` — the real userinfo/host separator — and never past it.
+    r"://[^\s:/@]*:[^\s/]+@"
     # ── JWT / JWE / OAuth Bearer tokens ──
     # `eyJ` is the base64url encoding of every JWT header's `{"` prefix; a signed
     # JWT (JWS) is three `.`-separated base64url segments (header.payload.sig), an
@@ -9038,7 +10281,7 @@ _CREDENTIAL_PATTERNS = re.compile(
     # 6750 `b64token`) stops at whitespace/quotes, so neither over-captures. A
     # Bearer header carrying a JWT redacts as one match (the Bearer class subsumes
     # the JWT); a bare JWT is still caught independently (defense in depth).
-    r"|eyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*){2,4}"  # JWS (3-seg) / JWE (5-seg incl. dir/ECDH-ES)
+    f"|{JWT_MULTI_SEGMENT}"  # JWS (3-seg) / JWE (5-seg incl. dir/ECDH-ES), shared spelling
     r"|(?<![A-Za-z0-9_.-])eyJ[A-Za-z0-9_-]{96,}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"  # 2-seg link token
     r"|(?i:Authorization)[\"\']?\s*[:=]\s*[\"\']?(?i:Bearer)\s+[A-Za-z0-9._~+/-]+=*"  # HTTP/JSON bearer
     r")",
@@ -9055,6 +10298,116 @@ def get_credential_patterns() -> list[re.Pattern[str]]:
     combined compiled regex, so the list has one element.
     """
     return [_CREDENTIAL_PATTERNS]
+
+
+# ── Cheap pre-filter for `_CREDENTIAL_PATTERNS` (performance only) ──
+# `_CREDENTIAL_PATTERNS` is a 23-branch alternation, so `re` retries every branch
+# at essentially every position: measured 117 ns/char, and it is the single
+# hottest line in the gateway's event loop (38.2% of all py-spy samples, reached
+# per message per dirty-slot flush). The scan cost is paid in full even though
+# real text almost never contains a credential — measured 0 matches across 1,804
+# live session-history messages (1.47 MB).
+#
+# So `_might_contain_credential` answers the cheap question "could a match exist
+# at all?" and lets `redact_credentials` skip the expensive scan when the answer
+# is no. It is a strict SUPERSET of `_CREDENTIAL_PATTERNS`, i.e. for every string
+# the pattern matches, this returns True. That direction is the security
+# property: a false POSITIVE only costs a scan we would have run anyway, while a
+# false NEGATIVE would skip redaction and leak a credential into persisted chat
+# history. Every condition below is therefore a NECESSARY condition of a branch,
+# never a restatement of it — each is deliberately looser than the branch it
+# stands in for.
+#
+# THE MAINTENANCE HAZARD this is built against: adding a 24th branch to
+# `_CREDENTIAL_PATTERNS` without adding a matching anchor here would silently
+# disable redaction for it. Nothing about the pattern edit would look wrong, and
+# the failure is invisible in output — the branch simply stops firing. So
+# `test_credential_prefilter.py` splits `_CREDENTIAL_PATTERNS.pattern` on its
+# top-level `|`, asserts the branch count equals the number of registered sample
+# credentials, and asserts the pre-filter fires for each. A new branch fails that
+# count assertion loudly instead of quietly widening the leak.
+#
+# Literals are case-sensitive because the branches they stand for are (these
+# prefixes are issued in a fixed case); the sole case-insensitive branch
+# (`Authorization: Bearer`) is handled separately below.
+_CREDENTIAL_PREFILTER_LITERALS: tuple[str, ...] = (
+    "AKIA",  # AWS access key ID
+    "ASIA",  # AWS access key ID (STS)
+    "AccessKey",  # SecretAccessKey + AccessKeyId (shared substring)
+    "aws_secret_access_key",
+    "aws_session_token",
+    "aws_access_key_id",
+    "SessionToken",
+    "PRIVATE KEY-----",  # PEM header AND footer both carry it
+    "xox",  # Slack token
+    "github_pat_",
+    "glpat-",
+    "k_live_",  # sk_live_ / rk_live_ (shared substring)
+    "k_test_",  # sk_test_ / rk_test_ (shared substring)
+    "SG.",  # SendGrid
+    "sk-proj-",  # OpenAI
+    "sk-ant-",  # Anthropic
+    "npm_",
+    "pypi-",
+    "_v1_",  # do[opr]_v1_ DigitalOcean
+    "GOCSPX-",  # Google OAuth client secret
+    "eyJ",  # JWS / JWE / 2-segment link token
+)
+
+# Branches with no usable literal anchor. Each is the branch's own leading shape
+# with its expensive tail dropped, so it stays a superset while keeping a narrow
+# first-character set that `re` can skip on.
+#   `gh[opsur]_`     — GitHub PAT family; a bare "gh" literal matches ordinary
+#                      prose ("through", "might"), so the class is kept.
+#   `[0-9]{6,}:…{30}` — Telegram bot token. The trailing 30-char run matters: a
+#                      bare `[0-9]{6,}:` matches an epoch timestamp followed by a
+#                      colon, which fired on 29 of 614 real messages.
+#   `[MNO]…\.`        — Discord bot token (first segment is base64 of a snowflake).
+#   `://…:…@`         — URI userinfo. The scheme alternation is dropped, which is
+#                      what leaves a `://` literal prefix for `re` to search on;
+#                      a bare `://` would match every ordinary URL.
+_CREDENTIAL_PREFILTER_GH_RE = re.compile(r"gh[opsur]_")
+_CREDENTIAL_PREFILTER_TELEGRAM_RE = re.compile(r"[0-9]{6,}:[A-Za-z0-9_-]{30}")
+_CREDENTIAL_PREFILTER_DISCORD_RE = re.compile(r"[MNO][A-Za-z0-9_-]{22,30}\.")
+_CREDENTIAL_PREFILTER_URI_RE = re.compile(r"://[^\s:/@]*:[^\s/]+@")
+
+# The `Authorization: Bearer` branch is the ONLY case-insensitive branch, and it is
+# spelled `(?i:Authorization)`. This anchor reuses that exact sub-pattern, so it is
+# a superset of the branch BY CONSTRUCTION — same engine, same folding rules.
+#
+# `"authorization" in text.lower()` is NOT a valid anchor for it, because
+# `str.lower()` and `re.IGNORECASE` are two DIFFERENT case-folding
+# implementations and they disagree. `re` folds via `sre_compile._equivalences`,
+# which treats U+0131 (LATIN SMALL LETTER DOTLESS I) and U+0130 (LATIN CAPITAL
+# LETTER I WITH DOT ABOVE) as equivalent to `i`/`I`; `str.lower()` leaves U+0131
+# unchanged and expands U+0130 to two code points. So the branch MATCHES
+# `Authorızation: Bearer <token>` while a `.lower()` anchor MISSES it, which skips
+# pass 1 and leaves the bearer token verbatim in persisted chat history. The same
+# disagreement holds for U+017F/`s` and U+212A/`k`, so it is a class of defect
+# rather than one homoglyph: a case-insensitive branch is only safely anchored by
+# the SAME regex engine, never by a hand-rolled fold.
+# Pinned by `test_unicode_case_folding_cannot_bypass_the_prefilter`.
+_CREDENTIAL_PREFILTER_AUTHORIZATION_RE = re.compile(r"(?i:Authorization)")
+
+
+def _might_contain_credential(text: str) -> bool:
+    """Return True if *text* could contain a `_CREDENTIAL_PATTERNS` match.
+
+    A strict superset of `_CREDENTIAL_PATTERNS.search(text) is not None`: it may
+    return True where the pattern would not match, but it MUST NOT return False
+    where the pattern would match. Callers use it only to skip a scan whose
+    result is already known to be empty, so output is unchanged either way.
+    """
+    for literal in _CREDENTIAL_PREFILTER_LITERALS:
+        if literal in text:
+            return True
+    return (
+        _CREDENTIAL_PREFILTER_GH_RE.search(text) is not None
+        or _CREDENTIAL_PREFILTER_TELEGRAM_RE.search(text) is not None
+        or _CREDENTIAL_PREFILTER_DISCORD_RE.search(text) is not None
+        or _CREDENTIAL_PREFILTER_URI_RE.search(text) is not None
+        or _CREDENTIAL_PREFILTER_AUTHORIZATION_RE.search(text) is not None
+    )
 
 
 # Base64 alphabet: at least 40 chars of [A-Za-z0-9+/] ending with optional =
@@ -9341,6 +10694,24 @@ def _contains_bare_secret(run: str) -> bool:
     return False
 
 
+def _decode_b64_chunk(chunk: str) -> str:
+    """Decode ONE `_B64_CHUNK_RE` match; return decoded credential text or ''.
+
+    Equivalent to `_decode_b64_safe(chunk)` when *chunk* is itself a
+    `_B64_CHUNK_RE` match, but without re-scanning it. `_decode_b64_safe` exists
+    to find chunks inside arbitrary text; re-running that scan over a string that
+    IS already one chunk can only rediscover the same single span —
+    `[A-Za-z0-9+/]{40,}` is greedy so it consumes the whole run, and `={0,2}`
+    takes the padding — so the inner `finditer` was pure duplicate work on the
+    hot path, once per base64-looking run in every redacted message.
+    """
+    try:
+        decoded = base64.b64decode(chunk, validate=True).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    return decoded if _CREDENTIAL_PATTERNS.search(decoded) else ""
+
+
 def _decode_b64_safe(text: str) -> str:
     """Try to base64-decode chunks in text; return decoded content or ''."""
     for m in _B64_CHUNK_RE.finditer(text):
@@ -9508,24 +10879,47 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
     result = text
 
     # 1. Redact plaintext credential patterns
-    for m in _CREDENTIAL_PATTERNS.finditer(result):
-        matched = m.group()
-        tag = _REDACTED_CREDENTIAL_TAG
-        result = result.replace(matched, tag, 1)
-        # Emit ONLY non-sensitive metadata (length). Do NOT slice any part of
-        # `matched` into the warning: `_CREDENTIAL_PATTERNS` matches the raw
-        # secret value itself (e.g. `ghp_…`, `sk-ant-…`), so even a short prefix
-        # is genuine plaintext key material — a fixed-length token prefix leaves
-        # ~12-16 secret chars in a 20-char slice. The warnings list is a
-        # redaction-subsystem output expected to be safe to log/surface, so it
-        # must carry no secret bytes. Mirrors the base64 / bare-secret branches
-        # below, which already log length only.
-        warnings.append(f"Redacted credential pattern ({len(matched)} chars)")
+    #
+    # Gated on the cheap superset pre-filter: when no branch of
+    # `_CREDENTIAL_PATTERNS` can possibly match, `finditer` would yield nothing
+    # and the loop body would not run, so skipping it cannot change the output.
+    # This is the hot path — the alternation is 23 branches retried at nearly
+    # every position, and real text almost never contains a credential.
+    if _might_contain_credential(result):
+        for m in _CREDENTIAL_PATTERNS.finditer(result):
+            matched = m.group()
+            tag = _REDACTED_CREDENTIAL_TAG
+            result = result.replace(matched, tag, 1)
+            # Emit ONLY non-sensitive metadata (length). Do NOT slice any part of
+            # `matched` into the warning: `_CREDENTIAL_PATTERNS` matches the raw
+            # secret value itself (e.g. `ghp_…`, `sk-ant-…`), so even a short prefix
+            # is genuine plaintext key material — a fixed-length token prefix leaves
+            # ~12-16 secret chars in a 20-char slice. The warnings list is a
+            # redaction-subsystem output expected to be safe to log/surface, so it
+            # must carry no secret bytes. Mirrors the base64 / bare-secret branches
+            # below, which already log length only.
+            warnings.append(f"Redacted credential pattern ({len(matched)} chars)")
+
+    # Passes 2 and 3 both scan the ORIGINAL `text` for runs of the base64
+    # alphabet, and they select the SAME spans: `[A-Za-z0-9+/]{40,}` is greedy and
+    # leftmost, so it yields exactly the maximal runs of length >= 40 — which is
+    # also precisely what `_BARE_SECRET_RUN_RE`'s `(?<![A-Za-z0-9+/])` /
+    # `(?![A-Za-z0-9+/])` boundaries select. The only difference is the trailing
+    # `={0,2}` padding that `_B64_CHUNK_RE` additionally consumes, and `=` is not
+    # in the run's character class, so `rstrip("=")` recovers the bare run
+    # exactly. So one scan feeds both passes instead of two.
+    #
+    # The two loops stay SEPARATE and in their original order. Fusing them into a
+    # single per-run loop would interleave the passes, which changes both the
+    # order of `warnings` and — because each pass mutates `result` via
+    # `str.replace(…, 1)` — which occurrence each replacement lands on, and
+    # whether pass 3's `run not in result` guard sees pass 2's edits. Sharing the
+    # scan while keeping the loops ordered is what makes this byte-identical.
+    b64_chunks = [m.group() for m in _B64_CHUNK_RE.finditer(text)]
 
     # 2. Detect and redact base64-encoded credentials
-    for m in _B64_CHUNK_RE.finditer(text):
-        chunk = m.group()
-        decoded = _decode_b64_safe(chunk)
+    for chunk in b64_chunks:
+        decoded = _decode_b64_chunk(chunk)
         if decoded:
             result = result.replace(chunk, "[REDACTED: encoded credential]", 1)
             warnings.append(f"Redacted base64-encoded credential ({len(chunk)} chars)")
@@ -9536,8 +10930,8 @@ def redact_credentials(text: str) -> tuple[str, list[str]]:
     # a standalone secret value. Scan the ORIGINAL text (not the already-mutated
     # result) so match offsets are stable; skip any run whose text has already
     # been redacted away by an earlier pass.
-    for m in _BARE_SECRET_RUN_RE.finditer(text):
-        run = m.group()
+    for chunk in b64_chunks:
+        run = chunk.rstrip("=")
         # Slide a 40-char window across the run rather than gating the whole run
         # on len == 40: a real secret glued to an adjacent base64 char (no
         # delimiter) yields a 41+ char run that the exact-40 shape check would
@@ -9873,6 +11267,201 @@ def _deny_pattern_matches(pattern: str, text: str, is_regex: bool) -> bool:
     return fnmatch.fnmatch(text, pattern.lower())
 
 
+def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]:
+    """The views of ONE shell segment that the deny tiers are matched against.
+
+    *segment* arrives with its ORIGINAL CASE, and every view returned is
+    lowercased.  Case matters for exactly one step: bash's Unicode escape widths
+    are case-sensitive (``\\u`` up to 4 hex digits, ``\\U`` up to 8), so decoding
+    after a ``lower()`` would read ``$'\\u0072f'`` -- which bash passes as ``rf`` --
+    as a single 5-digit code point and miss the rule.  The decode therefore runs
+    FIRST, on the text as written, and the lowercasing happens after.
+
+    The first element is always the raw text (lowercased) -- matched exactly as it
+    was before this helper existed -- so nothing that was denied can stop being
+    denied.  Quote/escape-NORMALIZED re-joins are APPENDED when they differ.
+
+    *emit_self* False walks NESTED PAYLOADS ONLY, emitting no view for *segment*
+    itself.  That is how the whole command is inspected without joining across its
+    separators: ``_split_segments`` is deliberately quote-unaware, so a newline
+    inside a quoted payload (``bash -c 'r\\<newline>m -rf /'``) severs the command
+    into pieces before the payload can be extracted from it -- while re-joining the
+    whole command would fabricate a command that never ran.  Walking it for
+    payloads without emitting its own re-join gets the first without the second.
+
+    ── Why the extra view is needed ──
+    Both deny tiers match TEXT, and a shell removes quoting, escaping and
+    empty-string splices and collapses whitespace runs before the program ever
+    sees its argv.  So every rule authored as a command SHAPE (``rm -rf /``,
+    ``dd if=``, ``chmod 777``) was defeated by re-spelling any one token:
+    ``rm -rf "/"``, ``"rm" -rf /``, ``'rm' -rf /``, ``rm "-rf" /``,
+    ``r''m -rf /`` and ``rm  -rf /`` all run the identical command and none of
+    them CONTAINS the pattern's own text.  Of the ~140 built-in rules only the
+    six self-protection rules and git-publish had an argv-structural floor
+    closing this (see ``_SELF_PROTECTION_FLOOR_PATTERNS``); every other rule was
+    spelling-dependent.
+
+    ── Why the tokenizer is ``_shell_tokens`` and not ``normalize_shell_command``
+    Both share one tokenizer, but the deny view deliberately stops BEFORE
+    ``~``/``$HOME`` expansion, for two reasons.  Expansion is
+    platform-dependent, so it would make the view decide differently per host:
+    it DELETES the literal ``~`` that ``rm -rf ~.*`` is authored to match, and
+    on Windows it yields a drive path (``c:\\users\\…``) that no POSIX-anchored
+    rule matches — so ``rm -rf "~"`` would be caught on Linux by the sibling
+    ``rm -rf /.*`` rule and missed on Windows.  And a denied view becomes the
+    security event log's ``operation`` field, so expanding here would write the
+    operator's real home path into the audit trail on every such denial.  Path
+    IDENTITY (dot segments, ``..``, ``$HOME`` versus the resolved home) is
+    already decided by ``_check_sensitive_via_normalizer`` against the
+    sensitive-path keystone, which is the layer that resolves rather than
+    matches; this view answers only the narrower question of what the shell
+    hands over as argv.
+
+    ── Why this is a per-SEGMENT view, never a whole-command one ──
+    Re-joining tokens with single spaces erases the separators a shell uses to
+    END a command, so normalizing the whole input would FABRICATE a command that
+    was never run: ``echo rm`` + newline + ``-rf /`` is two commands, and a
+    whole-input re-join reads as ``echo rm -rf /``.  The heredoc frames pinned by
+    ``TestStdinProgramTextScoping.test_benign_neighbour_no_longer_reads_as_a_mint``
+    are the concrete case.  Segments come from ``_split_segments``, so no boundary
+    is ever crossed — including inside a nested payload, which is split the same
+    way before being viewed.
+
+    ── Nested shell payloads ──
+    A shell's ``-c`` argument is a COMMAND, and ``shlex`` strips only the OUTER
+    quoting level, so ``bash -c 'dd "if=/dev/zero" of=/dev/sda'`` re-joins with
+    its inner quotes intact and the ``dd if=`` rule still does not match (found
+    by the GPT 5.6 review lane on this change).  Each literal payload is
+    therefore walked and viewed in its own right, reusing
+    :func:`_nested_shell_payloads` — the extractor the self-protection floor
+    already uses, so the ``-c`` / ``eval`` / ``env -S`` / herestring /
+    ``$SHELL -c`` spellings and the ``bash -c -- <script>`` form are recognized
+    here by construction rather than re-enumerated.  Only LITERAL payloads exist
+    to walk: ``eval "$CMD"`` carries no visible script and stays the raw tier's
+    job.
+
+    The walk takes NO numeric depth cap, for the reason
+    :func:`_self_token_frames` records: whatever the number, one more wrapper
+    defeats it.  It terminates structurally instead — a payload is carried inside
+    ONE token of its parent, so it is strictly shorter than the parent's source
+    text, and a chain of strictly shorter strings is finite.
+
+    ── Fail-closed, and it never raises ──
+    This only ever ADDS views.  ``_shell_tokens`` already degrades to whitespace
+    splitting with quote stripping when ``shlex`` rejects the input (so even an
+    unbalanced-quote segment still normalizes), and every window is built inside a
+    guard: this runs in the permission gate, where an exception is a crash rather
+    than a security decision, so a failure drops that window and leaves the raw
+    view standing.  A failure can therefore lose the EXTRA match but never the raw
+    one, so it cannot turn a denied command into an allowed one.
+
+    ── Residual ──
+    Two shapes stay outside every view.  A token split by BOTH quoting and a
+    separator-shaped glue construct (``"rm"$(echo ' ')-rf /``) is in none of them:
+    the raw text is not contiguous and the glue lands on its own segment — the
+    whole-string raw pass covers the glue-ONLY spelling (``git$(echo ' ')push``),
+    and closing the combination needs a normalizer that models substitution,
+    which a re-join is not.  And a variable spelling of a path operand
+    (``rm -rf $HOME``) is by construction not expanded here, per the note above.
+    """
+    views: list[str] = [segment.lower()] if emit_self else []
+    seen_views: set[str] = set(views)
+    # Decode the case-sensitive escapes BEFORE folding case (see the docstring),
+    # then work entirely in lowercase from here on -- the tiers compare lowercased
+    # text, and the payload extractor recognizes lowercase program names.  Guarded
+    # like the walk below: this is the permission gate, so a decoder that raises
+    # must cost the extra view, never the decision.
+    try:
+        start = _decode_shell_quoted_literals(segment).lower()
+    except Exception:
+        logger.debug("deny-view quote decode failed; raw view only", exc_info=True)
+        start = segment.lower()
+    seen_sources: set[str] = {start}
+    # (source, parent_len, is_root): a payload lives inside one token of its parent,
+    # so it is strictly shorter than the parent's source text — which is what bounds
+    # this walk without a numeric cap.  ``is_root`` marks the source the caller
+    # handed in, whose own re-join ``emit_self=False`` suppresses.
+    pending: list[tuple[str, int, bool]] = [(start, len(start) + 1, True)]
+    while pending:
+        source, parent_len, is_root = pending.pop()
+        try:
+            tokens = _shell_tokens(source)
+            if not tokens:
+                continue
+            # No expansion happens above, so an already-lowercased source stays
+            # lowercased through the re-join and needs no second fold.
+            view = " ".join(tokens)
+            if not (is_root and not emit_self) and view not in seen_views:
+                seen_views.add(view)
+                views.append(view)
+            payloads = _nested_shell_payloads(tokens)
+            programs = _argv_programs(tokens) if payloads else []
+            for payload in payloads:
+                if len(payload) >= parent_len:
+                    continue
+                # ``echo bash -c '<script>'`` PRINTS the script, so descending into
+                # it refuses a command that runs nothing (raised as an advisory by
+                # the GPT 5.6 lane).  The repo's own exemption decides this, rather
+                # than a "launcher must be in command position" rule: the launcher
+                # is NOT in command position in ``sudo bash -c …``,
+                # ``timeout 5 bash -c …``, ``nohup``, ``ssh host``, ``xargs`` or
+                # ``env FOO=1 bash -c …``, all of which really do execute, so that
+                # rule would trade this false positive for six bypasses.
+                # ``_data_consumer_exempt`` is a DENYLIST of consumers with the
+                # executing cases already carved out (a piped evaluator, a
+                # substitution in program position, an ``awk``/``sed`` script that
+                # can execute), so a program it does not know stays walked.
+                #
+                # A payload is not necessarily a TOKEN.  ``_nested_shell_payloads``
+                # also returns SYNTHESIZED text — a ``sed`` ``e``-flag replacement,
+                # the tail of a glued herestring (``bash<<<'<script>'``), a glued
+                # ``env -S`` argument, an ``alias`` assignment — which is a
+                # substring or a re-join, not an element of ``tokens``.  Recovering
+                # a position with ``list.index`` therefore raised ``ValueError`` and
+                # propagated out of the permission gate on legitimate input
+                # (``sed 's/x/y/e' notes.txt``): found independently as BLOCKING by
+                # the GPT 5.6 and Opus 4.8 lanes.
+                #
+                # The exemption is decided per OCCURRENCE and fails closed: it is
+                # applied only when the payload appears as a token AND every
+                # occurrence sits in the argv of a data consumer.  A payload with no
+                # token position cannot be proven inert, so it is DESCENDED into —
+                # over-blocking, which is the safe direction here.  Deciding from a
+                # single recovered index would not be sound: a short synthesized
+                # payload can also be a coincidental substring of an unrelated
+                # token, and one wrong position could wrongly exempt a payload that
+                # really executes.
+                occurrences = [i for i, tok in enumerate(tokens) if tok == payload]
+                if occurrences and all(
+                    _data_consumer_exempt(i, payload, programs, tokens) for i in occurrences
+                ):
+                    continue
+                # A payload is a command LINE, so it gets the same PRE-LEX treatment
+                # the top level got: the shell that runs it folds ITS continuations
+                # before lexing, so fold before splitting or the split severs them.
+                # ``bash -c 'r\<newline>m -rf /'`` otherwise yields the pieces ``r``
+                # and ``m -rf /``, and no view holds the command that runs (BLOCKING
+                # from the GPT 5.6 lane).  A view must also not be joined across one
+                # of the payload's own separators.  Only the PIECES are recorded as
+                # walked — recording the payload itself would filter out the single
+                # piece that equals it.
+                for piece in _split_segments(_fold_line_continuations(payload)):
+                    piece = piece.strip()
+                    if piece and piece not in seen_sources:
+                        seen_sources.add(piece)
+                        pending.append((piece, len(source), False))
+        except Exception:
+            # This runs INSIDE the permission gate, where an exception is a crash
+            # rather than a security decision — the hazard ``_normalize_search_path``
+            # documents for the same reason.  Losing one view only costs the EXTRA
+            # match; the raw view is already in ``views`` and the raw tier decides
+            # exactly as it did before this helper existed, so a failure here can
+            # never turn a denied command into an allowed one.
+            logger.debug("deny-view construction failed for a window", exc_info=True)
+            continue
+    return tuple(views)
+
+
 # An interpreter binds the halves to its OWN variables
 # (``n = "<name>"; v = "<verb>"; run([n, v])``) and then uses the names.  Inlining those
 # bindings is the interpreter-side twin of the shell assignment resolution, and it is what
@@ -10007,6 +11596,12 @@ def is_denied(
       - Pass-2 splitting is purely textual; quoted strings and escaped
         separators are split anyway (over-blocking is the safer
         direction).
+      - Each pass-2 segment is matched in TWO views: the raw text, then a
+        quote/escape-normalized re-join of that segment
+        (``_deny_segment_views``), so a rule authored as a command shape is
+        not defeated by re-quoting a token (``rm -rf "/"``), splicing one
+        (``r''m -rf /``) or padding the whitespace.  Strictly additive, and
+        never applied across a separator — see that helper.
       - Heredoc bodies, ``eval``, ``bash -c``, etc., are not parsed
         specially.  If those become evasion vectors in practice, add
         explicit deny patterns for them.
@@ -10164,25 +11759,65 @@ def is_denied(
     # ``$(...)``) into its own segment so it matches the deny pattern in its own
     # right (chaining-bypass protection).  Segments that match a deny pattern
     # AND an exception are allowed with a SEL audit event.
-    segments = _split_segments(lower)
-    for segment in segments:
-        seg_lower = segment.strip()
-        if not seg_lower:
-            continue
-        for pattern, is_regex in all_patterns:
-            if _deny_pattern_matches(pattern, seg_lower, is_regex):
-                exceptions = _DENY_EXCEPTIONS.get(pattern, [])
-                if exceptions and any(fnmatch.fnmatch(seg_lower, e.lower()) for e in exceptions):
-                    if not _emit_deny_exception_event(tool_name, pattern):
-                        _emit_deny_event(tool_name, pattern, seg_lower)
-                        return _reason(pattern)
-                    # Exception granted for this pattern on this segment;
-                    # continue to evaluate any remaining patterns against
-                    # the same segment (a different pattern without an
-                    # exception must still cause a deny).
-                    continue
-                _emit_deny_event(tool_name, pattern, seg_lower)
-                return _reason(pattern)
+    #
+    # Each segment is evaluated in every view ``_deny_segment_views`` returns:
+    # the RAW text first (identical to what this pass matched before that helper
+    # existed), then a quote/escape-normalized re-join of the same segment when
+    # it differs.  The second view is what makes a rule authored as a command
+    # shape hold under re-spelling — ``rm -rf "/"`` and ``"rm" -rf /`` reach the
+    # ``rm -rf /`` rule as the one command they both are.  It is strictly
+    # additive: see that helper for why it is per-segment and why a
+    # normalization failure cannot widen what is allowed.
+    # Segments are split from the ORIGINAL-case input, not from ``lower``, so
+    # ``_deny_segment_views`` can decode bash's case-sensitive Unicode escape
+    # widths before folding case.  The split is unaffected: ``_split_segments``
+    # cuts on ``;`` ``&&`` ``||`` ``|`` newlines and substitution boundaries, none
+    # of which any case mapping produces, so splitting-then-lowercasing and
+    # lowercasing-then-splitting give the same pieces.
+    #
+    # Line continuations are folded FIRST, because the split cuts on the newline
+    # they contain: without this, ``"r\<newline>m" -rf /`` is severed into two
+    # segments and neither contains the command bash actually runs.  The fold is
+    # quote-aware (see ``_fold_line_continuations``) -- pass 1 above still matches
+    # the completely unfolded text, so this only ever adds reach.
+    # The WHOLE command is walked for nested payloads first, with its own re-join
+    # suppressed.  ``_split_segments`` is deliberately quote-unaware, so a newline
+    # inside a quoted payload severs the command before the payload can be
+    # extracted from it -- ``bash -c 'r\<newline>m -rf /'`` arrives as the pieces
+    # ``bash -c 'r\`` and ``m -rf /'`` and the ``-c`` script is never seen (BLOCKING
+    # from the GPT 5.6 lane).  Emitting no view for the command itself is what keeps
+    # this from fabricating one across its separators.
+    folded = _fold_line_continuations(tool_name)
+    segments = [seg.strip() for seg in _split_segments(folded)]
+    segments = [seg for seg in segments if seg]
+    work: list[tuple[str, tuple[str, ...]]] = []
+    # The whole-command payload walk is only needed when the split actually SPLIT
+    # something.  With a single segment the whole command IS that segment, so
+    # walking it twice doubles the payload scan -- which is quadratic in token
+    # count inside ``_nested_shell_payloads`` -- for no view the segment walk does
+    # not already produce.  Measured: skipping the duplicate halves the cost on a
+    # command padded with thousands of interpreter tokens (raised as a stall risk by
+    # the GPT 5.6 lane).
+    if len(segments) != 1 or segments[0] != folded.strip():
+        work.append(("", _deny_segment_views(tool_name, False)))
+    for seg_raw in segments:
+        work.append((seg_raw.lower(), _deny_segment_views(seg_raw)))
+    for seg_lower, segment_views in work:
+        for view in segment_views:
+            for pattern, is_regex in all_patterns:
+                if _deny_pattern_matches(pattern, view, is_regex):
+                    exceptions = _DENY_EXCEPTIONS.get(pattern, [])
+                    if exceptions and any(fnmatch.fnmatch(view, e.lower()) for e in exceptions):
+                        if not _emit_deny_exception_event(tool_name, pattern):
+                            _emit_deny_event(tool_name, pattern, view, raw_segment=seg_lower)
+                            return _reason(pattern)
+                        # Exception granted for this pattern on this segment;
+                        # continue to evaluate any remaining patterns against
+                        # the same segment (a different pattern without an
+                        # exception must still cause a deny).
+                        continue
+                    _emit_deny_event(tool_name, pattern, view, raw_segment=seg_lower)
+                    return _reason(pattern)
     # All windows cleared the deny passes — the input is allowed.  If it was a
     # feature-branch push, emit the deferred allow audit now (final outcome).
     if push_allow_pending:
@@ -10278,7 +11913,9 @@ def _split_segments(command_lower: str) -> list[str]:
     return _CMD_SPLIT_RE.split(command_lower)
 
 
-def _emit_deny_event(tool_name: str, deny_pattern: str, segment: str) -> None:
+def _emit_deny_event(
+    tool_name: str, deny_pattern: str, segment: str, raw_segment: str = ""
+) -> None:
     """Emit a SEL audit event when a command is denied.
 
     Records the operation, matched pattern, and (for pass-2 denials) the
@@ -10286,12 +11923,37 @@ def _emit_deny_event(tool_name: str, deny_pattern: str, segment: str) -> None:
     security-controls guideline that every permission decision — both
     grants and denials — must produce an audit trail.
 
+    *raw_segment* is the segment's UNNORMALIZED text, recorded as a separate
+    ``raw_segment`` field when it differs from *segment*.  A pass-2 match can now
+    come from a quote-normalized view (``_deny_segment_views``), and the view is
+    the more useful thing to show — it names the command that would have run —
+    but the evasion is only visible in the spelling the caller actually
+    submitted, so forensics needs both.  The full raw input is already carried in
+    ``operation``; this pins WHICH segment of it normalized into the match, which
+    a multi-segment command otherwise leaves the reader to re-derive.  Omitted
+    when the two are equal, so an ordinary denial's event does not grow.
+
     Best-effort: SEL logging failures are logged at WARNING and do not
     affect the deny decision (denials are inherently fail-closed; the
     block stands regardless of audit success).
     """
     try:
         sel = SecurityEventLog()
+        # ``redact_and_truncate``, never a bare slice: it redacts over the FULL text
+        # BEFORE cutting, which is the rule that function exists to enforce -- a
+        # credential straddling the 200-char boundary would otherwise be cut in half,
+        # and the fragment no longer matches the credential pattern, so SEL's own
+        # write-path redaction cannot catch it and the partial secret persists in a
+        # dashboard-readable log.  Both fields take it: ``raw_segment`` is new, and
+        # ``segment`` carried the same hazard from a bare slice (found by the GPT 5.6
+        # review lane on the new field).
+        metadata = {
+            "deny_pattern": deny_pattern,
+            "segment": redact_and_truncate(segment, 200) if segment else "",
+            "mechanism": "BUILTIN_DENY_PATTERNS",
+        }
+        if raw_segment and raw_segment != segment:
+            metadata["raw_segment"] = redact_and_truncate(raw_segment, 200)
         sel.log(
             SecurityEvent(
                 event_id=uuid.uuid4().hex[:16],
@@ -10303,11 +11965,7 @@ def _emit_deny_event(tool_name: str, deny_pattern: str, segment: str) -> None:
                 operation=tool_name,
                 outcome="denied",
                 resources=f"deny_pattern={deny_pattern}",
-                metadata={
-                    "deny_pattern": deny_pattern,
-                    "segment": segment[:200] if segment else "",
-                    "mechanism": "BUILTIN_DENY_PATTERNS",
-                },
+                metadata=metadata,
             )
         )
     except Exception:
@@ -10649,6 +12307,186 @@ _EMPTY_QUOTE_RE = re.compile(r'""|\'\'')
 # Regex for $HOME or ${HOME} variable expansion.
 _HOME_VAR_RE = re.compile(r"\$\{HOME\}|\$HOME", re.IGNORECASE)
 
+# ANSI-C (``$'…'``) and locale (``$"…"``) quoting.  Both are QUOTING forms whose
+# value the shell computes before the program sees it, so they are resolved as part
+# of tokenization.  Matched on the RAW text rather than after ``shlex``, which is
+# what makes it safe: ``shlex`` removes the quotes but leaves the ``$`` glued to the
+# content, and at that point ``$'/'`` -> ``$/`` is indistinguishable from a variable
+# reference like ``$HOME``, so stripping the ``$`` post-hoc would eat real variables.
+# Requiring the quote character here means a bare ``$HOME`` never matches.
+#
+# The negated classes EXCLUDE the backslash, and that is a ReDoS fix, not a style
+# choice.  With ``[^']`` a backslash could match either alternative -- ``\\.`` (two
+# characters) or the class (one) -- the textbook ambiguous quoted-string pattern, so
+# an unterminated ``$'`` followed by a run of backslashes forces the engine through
+# ~1.618**n tilings of that run.  This regex runs inside the PreToolUse gate on the
+# full, uncapped command, so that is a hang, not a slowdown (measured: 9 ms at 24
+# backslashes, growing ~1.6x per character).  Excluding the backslash makes the
+# alternation unambiguous -- a backslash is always consumed by ``\\.`` -- while
+# accepting exactly the same language.  Found by the Opus 4.8 review lane.
+_ANSI_C_QUOTE_RE = re.compile(r"\$'((?:\\.|[^'\\])*)'|\$\"((?:\\.|[^\"\\])*)\"", re.DOTALL)
+
+# Single-character ANSI-C escapes that stand for a LITERAL character.  These are
+# the ones bash resolves and a matcher must therefore see resolved: without them
+# ``$'rm -rf \"/\"'`` keeps its backslashes and the rule does not match, while bash
+# passes the plain quotes (BLOCKING from the GPT 5.6 lane).
+_ANSI_C_LITERAL_ESCAPES = {"\\": "\\", "'": "'", '"': '"', "?": "?"}
+# Escapes that stand for a control character.  Mapped to a SPACE rather than the
+# character itself, which is what ``_decode_printf_escapes`` has always done for
+# this family: the value of resolving them here is that a token boundary appears
+# where the shell puts one, and a literal control byte in a matched view would
+# only travel into the audit record.  Deliberate, and the reason this decoder is
+# not simply "what bash produces".
+_ANSI_C_SPACE_ESCAPES = frozenset("abefnrtvE")
+
+
+def _decode_ansi_c_body(body: str) -> str:
+    """Resolve the escapes inside one ``$'…'`` body, in a SINGLE left-to-right pass.
+
+    One pass is the whole point.  Sequential ``str.replace`` calls let one
+    substitution's OUTPUT be re-read as another's input: ``$'\\\\n'`` is an escaped
+    backslash followed by the letter ``n`` (two characters), but a chain that
+    resolves ``\\\\`` first and then looks for ``\\n`` collapses it to whitespace and
+    invents a separator bash never passed.  Consuming each escape atomically here
+    makes that impossible -- the same failure mode as the Unicode-width guess this
+    file already carries a note about.
+
+    Numeric forms keep bash's exact widths (``\\xHH``, ``\\nnn`` octal, ``\\uHHHH``,
+    ``\\UHHHHHHHH``) and the inert guard, so a NUL or lone surrogate stays encoded.
+    An unrecognised escape keeps both characters, as bash does.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        ch = body[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt in _ANSI_C_LITERAL_ESCAPES:
+            out.append(_ANSI_C_LITERAL_ESCAPES[nxt])
+            i += 2
+            continue
+        if nxt in _ANSI_C_SPACE_ESCAPES:
+            out.append(" ")
+            i += 2
+            continue
+        if nxt == "c" and i + 2 < n and body[i + 2].isascii():
+            # ``\cX`` is a CONTROL character, and ``\cI`` is a TAB -- so
+            # ``bash -c $'rm\\cI-rf /'`` hands the inner shell a tab-separated
+            # ``rm -rf /`` and it runs (BLOCKING from the GPT 5.6 lane; measured,
+            # the inner shell does split on it).  The mapping is MEASURED rather
+            # than derived: ``ord(upper(X)) & 0x1F``, with ``?`` special-cased to
+            # 0x7F -- an XOR-0x40 guess gets ``\\c0`` wrong (bash gives 0x10, not
+            # ``p``).  The result is always a control character, so it takes the
+            # same normalization to a SPACE as the named family above, which is
+            # what puts a token boundary where the shell puts one.
+            #
+            # Restricted to a single ASCII character, because ``str.upper()`` is
+            # not length-preserving outside it: ``"ß".upper()`` is ``"SS"``, and
+            # ``ord`` of that raised ``TypeError`` straight out of the permission
+            # gate on ``echo $'\\cß'`` -- a crash where a security decision belongs
+            # (also BLOCKING, same lane).  A non-ASCII target falls through to the
+            # unrecognised branch and keeps both characters, as bash does for a
+            # spelling it does not define.
+            target = body[i + 2]
+            code = 0x7F if target == "?" else (ord(target.upper()) & 0x1F)
+            if code == 0:
+                # ``\c@`` is a NUL, and bash TRUNCATES the word there -- see the
+                # numeric branch below for the measurement.
+                return "".join(out)
+            out.append(" ")
+            i += 3
+            continue
+        match = _ANSI_C_NUMERIC_ESCAPE_RE.match(body, i)
+        if match:
+            # A NUL TRUNCATES the word -- bash cannot place one in an argv, and what
+            # it does instead is stop there.  Measured on every spelling that can
+            # reach zero: ``$'AA\\0junk'``, ``$'AA\\400junk'``, ``$'AA\\x00junk'``,
+            # ``$'AA\\u0000j'`` and ``$'AA\\c@junk'`` all yield ``AA``, and
+            # ``$'\\0AA'`` yields the empty word.  Leaving the escape encoded instead
+            # was a bypass: ``$'dd\\0junk' if=/dev/zero of=/dev/sda`` ran the
+            # destructive command while the view held ``dd\\0junk if=`` and matched
+            # nothing (BLOCKING from the GPT 5.6 lane).  The OTHER inert codes -- out
+            # of range, lone surrogate -- keep the escape rather than truncating,
+            # because bash does not produce them at all and guessing what it would do
+            # is what the measurements above exist to avoid.
+            numeric_code = _numeric_escape_code(match)
+            if numeric_code == 0:
+                return "".join(out)
+            out.append(_numeric_escape_char(match))
+            i = match.end()
+            continue
+        # Unrecognised: bash keeps the backslash and the character.
+        out.append(body[i : i + 2])
+        i += 2
+    return "".join(out)
+
+
+def _decode_shell_quoted_literals(cmd: str) -> str:
+    """Resolve each ``$'…'`` span, and reduce each ``$"…"`` to plain double quotes.
+
+    ``rm -rf $'/'`` runs exactly what ``rm -rf /`` runs, and ``$'\\x2d\\x76'`` is
+    ``-v``, so a matcher that has not resolved these is reading a spelling the
+    shell never hands over.  An ANSI-C value is re-quoted with ``shlex.quote`` so a
+    value containing whitespace or a quote stays ONE token through ``shlex.split``.
+
+    ``$"…"`` is LOCALE TRANSLATION, and it is NOT ANSI-C -- measured, because
+    treating the two alike was a bypass (BLOCKING from the GPT 5.6 lane).  Bash
+    gives ``$"\\r\\mAA"`` the word ``\\r\\mAA``, byte-identical to plain
+    ``"\\r\\mAA"``: inside double quotes a backslash escapes only ``$``, `````,
+    ``"``, ``\\`` and a newline, so ``\\r`` is a literal backslash-r and NOT a
+    carriage return.  Decoding it as ANSI-C turned that ``\\r`` into whitespace and
+    the command vanished from the view, while the inner shell of
+    ``bash -c $"\\r\\m -rf /"`` resolves the backslashes in its OWN lexing pass and
+    runs the destructive command (measured: it executes ``rmAA`` for
+    ``bash -c $"\\r\\mAA"``).  So the ``$`` is dropped and the double-quoted text is
+    left for ``shlex`` to resolve by double-quote rules -- which also keeps
+    ``rm -rf $"/"`` reaching the rule, since bash's operand there is ``/``.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        ansi_c_body = match.group(1)
+        if ansi_c_body is not None:
+            return shlex.quote(_decode_ansi_c_body(ansi_c_body))
+        return '"' + (match.group(2) or "") + '"'
+
+    return _ANSI_C_QUOTE_RE.sub(_replace, cmd)
+
+
+def _shell_tokens(cmd: str) -> list[str]:
+    """Tokenize *cmd* the way a POSIX shell hands argv to a program.
+
+    Quote removal, backslash de-escaping (``shlex`` POSIX mode), ANSI-C / locale
+    quoting (``$'…'``, ``$"…"`` -- see :func:`_decode_shell_quoted_literals`),
+    empty-string concatenation (``g""it`` -> ``git``) and whitespace-run collapsing
+    -- and NOTHING else: no tilde, no ``$HOME``, no path resolution.  This is the
+    shared core of two callers that need the same token identity but must stop at
+    different points:
+
+    * :func:`normalize_shell_command` continues on to expand ``~``/``$HOME``,
+      because it feeds path matchers that decide FILE identity.
+    * :func:`_deny_segment_views` stops here, because expansion is
+      platform-dependent and would land the operator's real home path in the
+      audit trail -- see that function.
+
+    On parse failure (unbalanced quotes) falls back to whitespace splitting with
+    quote/backslash stripping, so a hostile unterminated quote yields a degraded
+    view rather than no view.
+    """
+    if not cmd or not cmd.strip():
+        return []
+    cmd = _decode_shell_quoted_literals(cmd)
+    try:
+        tokens = shlex.split(cmd, posix=True)
+    except ValueError:
+        # Unbalanced quotes or other parse errors — fall back to basic split.
+        tokens = [t.strip("\"'\\") for t in cmd.split()]
+    # Strip empty-string concatenation artifacts: ca""t -> cat, g''it -> git
+    return [_EMPTY_QUOTE_RE.sub("", token) for token in tokens]
+
 
 def normalize_shell_command(cmd: str) -> list[str]:
     """Normalize a shell command string into a resolved token list.
@@ -10662,10 +12500,11 @@ def normalize_shell_command(cmd: str) -> list[str]:
 
     Returns a list of resolved tokens.  On parse failure (unmatched quotes)
     falls back to basic whitespace splitting with quote/backslash stripping.
-    """
-    if not cmd or not cmd.strip():
-        return []
 
+    Tokenization — everything up to and including the empty-quote collapse — is
+    :func:`_shell_tokens`; the EXPANSION below is what makes this the path
+    normalizer rather than the plain argv view the deny tiers use.
+    """
     # NOTE: $HOME expansion happens AFTER tokenization (in the per-token loop
     # below), NOT here.  The previous pre-shlex expansion inserted the raw home
     # path (e.g. ``C:\Users\name`` on Windows) into the command string before
@@ -10675,20 +12514,9 @@ def normalize_shell_command(cmd: str) -> list[str]:
     # handled: shlex strips quotes and produces a literal ``$HOME/...`` token,
     # which the loop then expands safely without backslash reinterpretation.
 
-    # Tokenize using POSIX shlex — handles quoting, escaping, etc.
-    try:
-        tokens = shlex.split(cmd, posix=True)
-    except ValueError:
-        # Unbalanced quotes or other parse errors — fall back to basic split.
-        tokens = cmd.split()
-        tokens = [t.strip("\"'\\") for t in tokens]
-
     home = os.path.expanduser("~")
     resolved: list[str] = []
-    for token in tokens:
-        # Strip empty-string concatenation artifacts: ca""t -> cat, g''it -> git
-        token = _EMPTY_QUOTE_RE.sub("", token)
-
+    for token in _shell_tokens(cmd):
         # Expand $HOME/${HOME} per-token (after shlex, so Windows backslashes
         # in the expanded path are never reinterpreted as escape characters).
         # Uses a callable replacement to avoid re.error on Windows where the
@@ -10701,28 +12529,6 @@ def normalize_shell_command(cmd: str) -> list[str]:
 
         resolved.append(token)
 
-    return resolved
-
-
-def resolve_command_paths(tokens: list[str]) -> list[str]:
-    """Resolve path-like tokens to their canonical absolute form.
-
-    Runs os.path.realpath() on tokens that look like filesystem paths
-    (start with /, ~, ./, or ../) to resolve symlinks and directory traversal.
-    Non-path tokens are returned unchanged.
-
-    Args:
-        tokens: List of shell tokens (typically from normalize_shell_command).
-
-    Returns:
-        New list with path-like tokens resolved to their realpath.
-    """
-    resolved: list[str] = []
-    for token in tokens:
-        if _is_path_like(token):
-            resolved.append(os.path.realpath(token))
-        else:
-            resolved.append(token)
     return resolved
 
 
@@ -10953,14 +12759,6 @@ _IMDS_IP = "169.254.169.254"
 # SSRF gate which also blocks it (CWE-918 dual-stack parity).
 _IMDS_IPV6 = "fd00:ec2::254"
 
-# HTTP tools that can fetch IMDS -- broader than just curl/wget
-_HTTP_TOOLS_RE = re.compile(
-    r"(?:curl|wget|http|https|fetch|lwp-request|lynx|links|"
-    r"python|ruby|perl|node|nc|ncat|socat|telnet|"
-    r"Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\b",
-    re.IGNORECASE,
-)
-
 
 def _check_imds_access(command: str) -> str | None:
     """Detect attempts to access the IMDS endpoint via any encoding.
@@ -11145,16 +12943,35 @@ def resource_limit_spec(config: dict | None = None) -> list[tuple[str, int]]:
 
     Names, not ``resource`` constants: the consumer resolves them with
     ``getattr`` and skips any its platform lacks. A value of ``0`` means "leave
-    inherited" and is dropped here.
+    inherited" and is dropped here -- the OPPOSITE of what ``0`` means on the
+    cgroup path, which reads two of these same keys and treats ``0`` as "use the
+    module default" because systemd rejects a zero property. Both domains are
+    stated on ``ResourceLimitsConfig``, which is where the coercion lives.
     """
     limits = dict(_RLIMIT_DEFAULTS)
-    if config and isinstance(config.get("resource_limits"), dict):
-        rl_config = config["resource_limits"]
+    if config:
+        # The one validated parse for this block. Two things this replaces a
+        # local ``val >= 0`` test to get: an Infinity from json.loads used to
+        # pass that test and then raise OverflowError inside ``int()`` -- with no
+        # try/except on this path, so it propagated out of resource_limit_preexec
+        # and failed the spawn; and a fraction in (0, 1) used to floor to 0,
+        # which is this path's "leave inherited" sentinel, silently dropping a
+        # limit the operator had asked for. from_raw refuses both and says so.
+        # circular import: config.loader reaches back into this module (it
+        # imports security.is_sensitive_path function-locally for the same
+        # reason), so importing the loader at security's module scope would
+        # close the cycle. Kept function-level, matching sandbox and
+        # resource_status, which read the same block under the same constraint.
+        from kiro_crew.config.loader import ResourceLimitsConfig
+
+        parsed = ResourceLimitsConfig.from_raw(config.get("resource_limits"))
         for key in _RLIMIT_DEFAULTS:
-            val = rl_config.get(key)
-            # Accept 0 (explicit disable) and positive ints; ignore junk.
-            if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
-                limits[key] = int(val)
+            # None means "not usable" -- keep the documented default rather than
+            # inventing a number. An explicit 0 survives, because disabling a
+            # limit is a real request here.
+            val = getattr(parsed, key, None)
+            if val is not None:
+                limits[key] = val
 
     # (rlimit name, requested soft/hard value in the rlimit's native unit).
     max_memory_bytes = limits["max_memory_mb"] * 1024 * 1024

@@ -107,14 +107,49 @@ DEFAULT_MAX_CONSECUTIVE_ERRORS = 6
 #: a converged state that never happened.
 DEFAULT_COALESCE_SECS = 240.0
 
-#: Hard wall-clock bound on a coalescing window, measured from the FIRST anomaly.
-#: Reached only when ``pending`` never drains (a check wedged in queued, or a
-#: phantom pending row). Independent of ``pending`` on purpose: it is what
-#: guarantees a delayed wake rather than a lost one.
+#: Hard wall-clock bound on a coalescing window, measured from the OLDEST entry
+#: still in it. Reached only when ``pending`` never drains (a check wedged in
+#: queued, or a phantom pending row). Independent of ``pending`` on purpose: it
+#: is what guarantees a delayed wake rather than a lost one, and reading the
+#: oldest entry keeps that guarantee per entry -- ``oldest`` is never below any
+#: single entry's age, so nothing outlives this bound counted from its own
+#: arrival.
 DEFAULT_COALESCE_MAX_SECS = 1800.0
 
 #: Cap on how many observation labels a coalesced wake spells out.
 _MAX_LIST = 8
+
+#: Every dedupe key the kernel stores carries exactly one of these sentinels,
+#: so an epoch reset can keep the epoch-independent half without inspecting the
+#: probe's key text. A probe never writes the sentinel itself and its keys are
+#: opaque to the kernel, so prefixing unconditionally is what makes the two
+#: spaces impossible to confuse -- a scheme that only prefixed the sticky half
+#: could be spoofed by a probe whose own key happened to start with it.
+_EPOCH_SENTINEL = "="
+_STICKY_SENTINEL = "~"
+
+
+def _dedupe_key(obs: "Observation") -> str:
+    """The key an observation is remembered under, sentinel included."""
+    return (_EPOCH_SENTINEL if obs.epoch_scoped else _STICKY_SENTINEL) + obs.key
+
+
+def _migrate_key(key: str) -> str:
+    """Adopt a dedupe key written before the sentinels existed.
+
+    State persisted by an earlier version carries bare probe keys. Read as-is
+    they would never match a key this version computes, so every armed watch
+    would wake once more for anomalies it had already reported -- a small but
+    entirely avoidable upgrade blip. A bare key is adopted as epoch scoped,
+    which is what every pre-sentinel key was: the sticky space did not exist.
+
+    ``blind`` is the kernel's own error-backstop marker rather than a probe key,
+    and it is looked up by that literal name, so it must stay unprefixed.
+    """
+    if key == "blind" or key.startswith((_EPOCH_SENTINEL, _STICKY_SENTINEL)):
+        return key
+    return _EPOCH_SENTINEL + key
+
 
 _SAFE_LABEL_RE = re.compile(r"[^\w .,:()\[\]/+#-]")
 _FOLD_RE = re.compile(r"[^A-Za-z0-9_-]")
@@ -170,11 +205,26 @@ class Observation:
             at most once per re-alert window.
         severity: See :class:`Severity`.
         brief: Operator-facing text delivered if this observation wakes.
+        epoch_scoped: Whether this observation describes the CURRENT epoch.
+
+            True (the default) is the check-rollup shape: the anomaly is a
+            property of the thing the epoch names, so when the epoch changes
+            the observation is about something that no longer exists and its
+            dedupe memory is correctly wiped.
+
+            False is for a signal observed through the same probe that is
+            NOT a property of the epoch -- a comment on a pull request belongs
+            to the conversation, not to the commit under review. Left epoch
+            scoped, every such signal would be re-reported in full the tick
+            after any epoch change: a force-push would replay every comment
+            ever seen as though it had just arrived. The kernel keeps these
+            keys across an epoch reset instead.
     """
 
     key: str
     severity: Severity
     brief: str = ""
+    epoch_scoped: bool = True
 
 
 @dataclass
@@ -257,6 +307,27 @@ class Probe:
         """
         return {}
 
+    def wake_suffix(self) -> str:
+        """Optional text appended ONCE per wake, after every brief.
+
+        A brief describes ONE observation; this describes the WAKE. Standing
+        instructions to the woken agent ("the watch stays armed", "read the
+        ledger first") and the operator's own context note belong here, because
+        they are true of the delivery rather than of any single signal.
+
+        Putting them in the brief instead is what the split exists to prevent:
+        the kernel joins N briefs into one body, so per-observation text is
+        repeated N times, and the better coalescing works the more it repeats.
+        Measured on a real six-observation wake, that duplication was 56% of the
+        delivered bytes -- context the woken agent pays for and cannot use.
+
+        Called after :meth:`identity`, so a probe may derive it from its own
+        cron message. A value that is not a string, or one that raises, is
+        dropped rather than allowed to kill the tick: a wake with no footer is
+        recoverable, a watch that raises every tick is auto-paused.
+        """
+        return ""
+
 
 def _state_dir() -> Path:
     home = os.environ.get("KIROCREW_HOME")
@@ -326,20 +397,37 @@ def load_state(path: Path) -> dict:
                 continue
             ts = _coerce_ts(raw)
             if ts is not None:
-                kept[key] = ts
+                kept[_migrate_key(key)] = ts
         state["alerted"] = kept
     errors = data.get("errors")
     if isinstance(errors, int) and not isinstance(errors, bool) and errors >= 0:
         state["errors"] = errors
+    # Read, never stored: the local value below seeds legacy window rows with the
+    # age they were persisted with, and nothing reads the key back out of state.
+    # Not storing it is what lets the legacy field fall off at the first
+    # post-upgrade write instead of riding along until the window closes.
     started = _coerce_ts(data.get("coalesce_started_at"))
-    if started is not None:
-        state["coalesce_started_at"] = started
     window_rows = data.get("coalescing")
     if isinstance(window_rows, dict):
-        pending_wakes: dict[str, str] = {}
-        for key, brief in window_rows.items():
-            if isinstance(key, str) and isinstance(brief, str):
-                pending_wakes[key] = brief
+        pending_wakes: dict[str, dict] = {}
+        for key, row in window_rows.items():
+            if not isinstance(key, str):
+                continue
+            if isinstance(row, str):
+                # Written before an entry carried its own open time: the whole
+                # window shared one stamp, so seed every entry from it. Reading
+                # the old shape as unstamped instead would restart the clock of
+                # a window already open on disk, and an in-flight watch would
+                # serve a second floor across the version change.
+                brief, opened = row, started
+            elif isinstance(row, dict) and isinstance(row.get("brief"), str):
+                brief, opened = row["brief"], _coerce_ts(row.get("opened_at"))
+            else:
+                continue
+            entry: dict = {"brief": brief}
+            if opened is not None:
+                entry["opened_at"] = opened
+            pending_wakes[_migrate_key(key)] = entry
         state["coalescing"] = pending_wakes
     return state
 
@@ -364,6 +452,24 @@ _PERSIST_WARNING = (
     "deduplication is degraded (repeats possible). Fix permissions on the "
     "watch directory under the data home."
 )
+
+
+def _install_window(state: dict, window: dict[str, dict]) -> None:
+    """Store the open coalescing window, or close it when nothing is left.
+
+    Every entry carries its OWN ``opened_at``, because one window legitimately
+    holds signals of different ages: a partial fire leaves entries that have
+    already waited, and the next tick can add one that has not waited at all.
+    That per-entry stamp is the only age this module stores.
+
+    There is deliberately no window-level stamp to write or clear:
+    ``coalesce_started_at`` is read once in :func:`load_state`, to seed entries
+    persisted before they carried their own, and never stored again.
+    """
+    if window:
+        state["coalescing"] = window
+        return
+    state.pop("coalescing", None)
 
 
 def _coalesced_brief(briefs: list[str]) -> str:
@@ -433,9 +539,22 @@ def run(
     with an unrelated structural move; here the timing change IS the change.
 
     Coalescing semantics -- a window opens on the first non-exempt anomaly of the
-    current epoch and fires when::
+    current epoch and every entry carries its own open time. An entry TRIGGERS a
+    wake when::
 
-        elapsed >= coalesce_secs and (pending == 0 or elapsed >= coalesce_max_secs)
+        age >= coalesce_secs and (pending == 0 or the entry is epoch-independent)
+
+    and the wake then carries every entry the same population gate admits, aged
+    or not. ``pending`` gates epoch-scoped entries only, because it counts CHECKS
+    and a comment is complete the moment it is posted. Separately, when the OLDEST
+    entry's age passes ``coalesce_max_secs`` the whole window flushes: that cap is
+    an absolute wall and is not gated behind the floor.
+
+    The trigger is per ENTRY because one window holds signals of different ages --
+    a partial fire leaves entries that have already waited, and the next tick can
+    add one that has not waited at all, which must not wake the agent on its own.
+    The payload stays generous for the opposite reason: riding along never adds a
+    wake, while holding an admitted entry back guarantees another one later.
 
     ``coalesce_secs`` is a FLOOR rather than a timeout, which is the difference
     that matters: a subject that just changed epoch may report ``pending ==
@@ -491,6 +610,25 @@ def run(
         bounds[name] = _usable_bound(name, raw, defaults[name])
     coalesce_secs = bounds["coalesce_secs"]
     coalesce_max_secs = bounds["coalesce_max_secs"]
+
+    # The per-wake footer, read once here for the same reason tuning() is: after
+    # identity(), so a probe may derive it from its cron message. Guarded the
+    # same way too -- a footer is not worth a crash loop, and a probe that
+    # returns a non-string would otherwise blow up inside the join.
+    try:
+        raw_suffix = probe.wake_suffix()
+    except Exception:
+        logger.warning("irq: probe wake_suffix() raised; wake has no footer", exc_info=True)
+        raw_suffix = ""
+    wake_suffix = raw_suffix if isinstance(raw_suffix, str) else ""
+
+    def body(briefs: list[str]) -> str:
+        """The delivered wake: every brief, then the footer ONCE."""
+        joined = _coalesced_brief(briefs)
+        if not wake_suffix:
+            return joined
+        return f"{joined}\n\n{wake_suffix}" if joined else wake_suffix
+
     realert_secs = bounds["realert_secs"]
     max_consecutive_errors = int(bounds["max_consecutive_errors"])
 
@@ -567,13 +705,78 @@ def run(
 
     if tick.epoch and state.get("epoch") != tick.epoch:
         # The subject became a different subject: fresh epoch, fresh memory.
-        # The in-flight coalescing window belongs to the old epoch and is dropped
-        # with it -- its anomalies were observations of something that no
-        # longer exists.
-        state = {"epoch": tick.epoch, "alerted": {}, "errors": 0}
+        #
+        # Sticky state is the exception, and the reason the sentinel exists: a
+        # signal that is not a property of the epoch (a comment on the pull
+        # request rather than a check on the commit) has not stopped being true
+        # just because the head moved. Wiping those would replay the entire
+        # conversation on the tick after every force-push. ``blind`` is
+        # deliberately NOT carried over: it records that the probe could not
+        # observe at all, and a fresh epoch deserves a fresh judgement on that.
+        #
+        # BOTH halves of sticky state have to survive, which is easy to get half
+        # right. `alerted` is what stops a delivered signal repeating. The open
+        # `coalescing` window is a signal that has NOT been delivered yet, and
+        # dropping it destroys the wake outright: the probe may no longer report
+        # that observation (a comment ages past its horizon), so nothing puts it
+        # back. Epoch-scoped window entries ARE dropped -- they describe checks
+        # on a commit that is no longer under review.
+        #
+        # The carried entry's own stamp is deliberately NOT kept, so its clock
+        # restarts on the new epoch. A freshly pushed commit briefly shows an
+        # almost-empty rollup, so ``pending == 0`` can be true while nothing has
+        # run, which is the entire reason DEFAULT_COALESCE_SECS is a floor;
+        # re-installing an aged stamp left that floor already satisfied, so a
+        # ``ready`` observation on the new head fired at once and announced
+        # "all checks green" before its checks existed. Per-entry ages now keep
+        # the two apart on their own -- the fresh ``ready`` gets its own floor
+        # regardless -- so keeping the carried stamp is a one-line change. It is
+        # left out of this change on purpose: it is a shift in WAKE TIMING on a
+        # different trigger (a push cadence faster than the floor re-delaying a
+        # carried comment), and this module's rule is that a timing change ships
+        # as its own attributable step rather than riding along with a
+        # structural one.
+        #
+        # Restarting costs the carried entry one more floor of latency after a
+        # force-push. That is a DELAY, and the invariant that matters is that it
+        # is not a LOSS: the entry itself is carried, so it still fires.
+        carried = {
+            key: value
+            for key, value in (state.get("alerted") or {}).items()
+            if isinstance(key, str) and key.startswith(_STICKY_SENTINEL)
+        }
+        carried_window = {
+            key: {"brief": row["brief"]}
+            for key, row in (state.get("coalescing") or {}).items()
+            if isinstance(key, str)
+            and key.startswith(_STICKY_SENTINEL)
+            and isinstance(row, dict)
+            and isinstance(row.get("brief"), str)
+        }
+        state = {"epoch": tick.epoch, "alerted": carried, "errors": 0}
+        if carried_window:
+            state["coalescing"] = carried_window
 
     alerted = state.setdefault("alerted", {})
     now = time.time()
+
+    # Epoch-scoped keys are bounded by the epoch reset that wipes them. Sticky
+    # keys have no such bound, so a long-lived watch on a busy subject would
+    # accumulate them forever. Drop the ones already past the re-alert window:
+    # they no longer suppress anything (``should_alert`` would return True for
+    # them anyway), so this frees state without changing any decision. A probe
+    # that must never re-report such a signal has to filter it out on its own
+    # side -- which is why the pull-request probe ignores comments older than
+    # its horizon, and why that horizon has to stay under ``realert_secs``.
+    for stale in [
+        key
+        for key, value in alerted.items()
+        if isinstance(key, str)
+        and key.startswith(_STICKY_SENTINEL)
+        and (ts := _coerce_ts(value)) is not None
+        and now - ts >= realert_secs
+    ]:
+        alerted.pop(stale, None)
 
     def should_alert(key: str) -> bool:
         ts = _coerce_ts(alerted.get(key))
@@ -588,18 +791,18 @@ def run(
     terminal = [o for o in tick.observations if o.severity is Severity.TERMINAL]
     if terminal:
         persist()
-        raise Done(with_warning(_coalesced_brief([o.brief for o in terminal if o.brief])))
+        raise Done(with_warning(body([o.brief for o in terminal if o.brief])))
 
     for obs in tick.observations:
-        if obs.severity is Severity.NMI and should_alert(obs.key):
-            alerted[obs.key] = now
+        if obs.severity is Severity.NMI and should_alert(_dedupe_key(obs)):
+            alerted[_dedupe_key(obs)] = now
             persist()
-            raise Report(with_warning(obs.brief))
+            raise Report(with_warning(body([obs.brief])))
 
     fresh_wakes = {
-        o.key: o.brief
+        _dedupe_key(o): o.brief
         for o in tick.observations
-        if o.severity is Severity.WAKE and should_alert(o.key)
+        if o.severity is Severity.WAKE and should_alert(_dedupe_key(o))
     }
 
     if coalesce_secs <= 0:
@@ -607,7 +810,7 @@ def run(
             for key in fresh_wakes:
                 alerted[key] = now
             persist()
-            raise Report(with_warning(_coalesced_brief(list(fresh_wakes.values()))))
+            raise Report(with_warning(body(list(fresh_wakes.values()))))
         persist()
         raise Skip(tick.detail or f"{tick.pending} pending")
 
@@ -617,17 +820,53 @@ def run(
     # potentially in the same brief as the all-green observation that replaced
     # it -- a wake that contradicts itself, and the operator has no way to tell
     # which half is current.
-    observed_wakes = {o.key for o in tick.observations if o.severity is Severity.WAKE}
-    window: dict[str, str] = {
-        key: brief
-        for key, brief in (state.get("coalescing") or {}).items()
-        if key in observed_wakes
+    # The window, ``observed_wakes`` and ``alerted`` all key on the SENTINEL-
+    # prefixed form, so the prune below compares like with like. Mixing raw and
+    # prefixed keys here would make every entry look cleared and silently
+    # disable coalescing.
+    #
+    # STICKY entries are exempt from the prune, and the asymmetry is the point.
+    # For an epoch-scoped observation, "the probe stopped reporting it" means the
+    # condition cleared, which is what makes pruning correct. For an
+    # epoch-independent one it means the probe stopped LOOKING -- a comment ages
+    # out of the pull-request probe's horizon while remaining just as true -- so
+    # pruning on that DESTROYS a wake rather than delaying it. A signal first
+    # observed shortly before its horizon expires is exactly the case that hits
+    # this, and it is reachable on the shipped defaults.
+    #
+    # The cost accepted is staleness instead of loss: a decision-style sticky key
+    # superseded inside one window (CHANGES_REQUESTED, then APPROVED) now fires
+    # alongside its successor rather than vanishing. Both land in one brief and
+    # the woken agent reads live state regardless, which is strictly better than
+    # never being told a human had blocked the PR.
+    observed_wakes = {_dedupe_key(o) for o in tick.observations if o.severity is Severity.WAKE}
+    window: dict[str, dict] = {
+        key: row
+        for key, row in (state.get("coalescing") or {}).items()
+        if key in observed_wakes or key.startswith(_STICKY_SENTINEL)
     }
-    window.update(fresh_wakes)
+    # A fresh signal joins with its OWN open time. Re-observing an entry already
+    # in the window refreshes its BRIEF and never its stamp: a probe reports an
+    # unresolved anomaly on every tick until it clears, so restamping here would
+    # reset its clock each time and the window would never reach its floor.
+    for key, brief in fresh_wakes.items():
+        row = window.get(key)
+        if row is None:
+            window[key] = {"brief": brief, "opened_at": now}
+        else:
+            row["brief"] = brief
     if window:
-        state["coalescing"] = window
-        if not _coerce_ts(state.get("coalesce_started_at")):
-            state["coalesce_started_at"] = now
+        # A row with no usable stamp opens its clock now. Two producers reach
+        # here: a sticky entry carried across an epoch reset, which restarts by
+        # design (see above), and persisted state whose window stamp was itself
+        # unusable. A stamp in the FUTURE is a clock rollback, and treating it as
+        # opening now is what keeps it from firing at once or never. Both cost a
+        # delay, never a loss.
+        for row in window.values():
+            opened = _coerce_ts(row.get("opened_at"))
+            if opened is None or opened > now:
+                row["opened_at"] = now
+        _install_window(state, window)
         # Persist BEFORE evaluating the fire condition, so ``persist_ok`` below
         # reflects this tick's write rather than a stale initial value: whether
         # the window can be remembered is exactly what decides if delaying it is
@@ -637,46 +876,110 @@ def run(
         # Everything in flight cleared. Close the window rather than leaving a
         # start stamp behind, or the NEXT anomaly would inherit this window's
         # age and could fire without any settling time of its own.
-        state.pop("coalescing", None)
-        state.pop("coalesce_started_at", None)
+        _install_window(state, window)
         persist()
         raise Skip(tick.detail or f"{tick.pending} pending")
 
-    started = _coerce_ts(state.get("coalesce_started_at"))
-    if started is None or started > now:
-        # No start stamp, or one in the future (clock rollback): treat the
-        # window as starting now rather than firing immediately or never.
-        started = now
-        state["coalesce_started_at"] = now
-    elapsed = now - started
     converged = tick.pending == 0
-    # The cap is an ABSOLUTE wall, so it must not be gated behind the floor.
-    # Written as `elapsed >= floor and (converged or elapsed >= cap)` it was:
-    # a caller passing a floor above the cap (legal, both finite and positive)
-    # plus a pending count that never drains meant the cap could never be
-    # reached first, and the guarantee it exists to make -- a delayed wake
-    # rather than a dropped one -- was quietly void for those values.
-    if (elapsed >= coalesce_secs and converged) or elapsed >= coalesce_max_secs:
-        for key in window:
+    ages = {key: now - float(row["opened_at"]) for key, row in window.items()}
+    oldest = max(ages.values(), default=0.0)
+    # The cap is an ABSOLUTE wall, and it stays a WINDOW-level one that flushes
+    # everything. It must not be gated behind the floor -- written as
+    # `age >= floor and (converged or age >= cap)` it was, a caller passing a
+    # floor above the cap (legal, both finite and positive) plus a pending count
+    # that never drains meant the cap could never be reached first, and the
+    # guarantee it exists to make -- a delayed wake rather than a dropped one --
+    # was quietly void for those values.
+    #
+    # Making the cap per entry too was tried and reverted: withholding an
+    # unconverged neighbour from a cap wake turns ONE flush into one wake per
+    # entry for a subject whose ``pending`` never drains, which is the per-wake
+    # cost this window exists to remove and the opposite of what the payload rule
+    # below is for. So the cap's PAYLOAD is what it always was: everything.
+    #
+    # Its CLOCK does move, and the one scenario is worth naming. Base measured
+    # the cap from a window stamp deliberately retained across a partial fire;
+    # this reads the oldest SURVIVING entry, so a partial fire that delivers the
+    # entry which opened the window defers the cap wake by that entry's head
+    # start. Keeping the delivered entry's stamp alive just to preserve the old
+    # instant would rebuild the very conflation this change removes -- a later
+    # joiner would then flush on a clock it never spent. What the cap actually
+    # promises is a bound, and the bound survives per entry: ``oldest`` is never
+    # below any single entry's age, so no entry outlives the cap measured from
+    # its own arrival. The shift is therefore always toward a LATER wake, never
+    # an earlier one and never a lost one.
+    if oldest >= coalesce_max_secs:
+        fire = {key: row["brief"] for key, row in window.items()}
+        triggered = True
+    else:
+        # Two separate questions, and keeping them separate is the whole change.
+        #
+        # (1) May an entry TRIGGER a wake? Only once it has served a floor of its
+        #     OWN. One window-level age could not answer that, because one window
+        #     holds signals of different ages: a partial fire leaves entries that
+        #     have already waited, and the next tick can add one that has not
+        #     waited at all. The joining entry inherited an age it never spent and
+        #     woke the agent on the very next tick, so a burst arriving one at a
+        #     time cost one wake each.
+        #
+        # (2) Given that a wake IS going out, which entries ride along? Every
+        #     entry this tick's population gate admits, aged or not, which is
+        #     unchanged. Riding along never ADDS a wake, and holding an admitted
+        #     entry back would guarantee another one later, so the answer here has
+        #     to stay generous or coalescing stops coalescing.
+        #
+        # The population gate: past the floor, an epoch-scoped entry additionally
+        # waits for ``pending`` to drain and a STICKY one does not. ``pending``
+        # counts CHECKS, which makes it the right gate for an epoch-scoped anomaly
+        # -- a draining check is exactly what can still resolve one -- and the
+        # wrong gate for a comment, which is complete the moment it is posted and
+        # does not become truer when a check finishes. Measured on a real pull
+        # request with 18 checks in flight, a fresh review comment was held the
+        # full 30 minutes for no observation it could have gained. Admitting the
+        # epoch-scoped half on a sticky signal's readiness instead would announce
+        # a `ready` before the new head's checks existed -- the
+        # convergence-that-never-happened the floor was added to prevent.
+        fire = {}
+        triggered = False
+        for key, row in window.items():
+            if not (converged or key.startswith(_STICKY_SENTINEL)):
+                continue
+            fire[key] = row["brief"]
+            if ages[key] >= coalesce_secs:
+                triggered = True
+        if not triggered:
+            fire = {}
+    # `persist_ok` gates the partial fire, and the reason is the fallback below.
+    # Withholding the epoch-scoped half is only a DELAY while the window can be
+    # remembered; with an unwritable state directory the next tick reloads an
+    # empty window, so withholding becomes a LOSS -- the exact hazard the
+    # persistence fallback exists to close, reintroduced for the half this branch
+    # holds back. When the write failed, fall through and deliver everything now.
+    if fire and persist_ok:
+        for key in fire:
             alerted[key] = now
-        state.pop("coalescing", None)
-        state.pop("coalesce_started_at", None)
+        remaining = {k: v for k, v in window.items() if k not in fire}
+        # The remainder keeps its OWN stamps, so a partial fire never pushes it
+        # out: those entries have been waiting since they opened, and restarting
+        # their clock each time a sticky signal arrives would turn a talkative
+        # pull request into an indefinite delay for the check anomaly beside it.
+        _install_window(state, remaining)
         persist()
-        raise Report(with_warning(_coalesced_brief(list(window.values()))))
+        raise Report(with_warning(body(list(fire.values()))))
 
     if not persist_ok:
         # A window needs to REMEMBER when it opened, so an unwritable state
         # directory does not merely degrade coalescing -- it destroys it. Every
-        # cron subprocess reloads an empty window, `elapsed` is always zero, and
+        # cron subprocess reloads an empty window, every age is always zero, and
         # the fire condition can never be reached: the wake is not delayed, it
         # is lost. Deliver now instead, with the warning that says why the
         # operator is about to see repeats. Without coalescing this hazard did
         # not exist (an unwritable directory only caused duplicate wakes), so it
         # arrived with the window and is guarded where the window is.
-        raise Report(with_warning(_coalesced_brief(list(window.values()))))
+        raise Report(with_warning(body([row["brief"] for row in window.values()])))
 
     persist()
     raise Skip(
-        f"coalescing window open {int(elapsed)}s/{int(coalesce_secs)}s, "
+        f"coalescing window open {int(oldest)}s/{int(coalesce_secs)}s, "
         f"{len(window)} anomaly(ies) coalescing, {tick.pending} pending"
     )

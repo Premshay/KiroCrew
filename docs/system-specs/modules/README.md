@@ -36,6 +36,7 @@ agent loads only the one it needs.
 | [governance.md](governance.md) | The two-level governance model, the scope catalog, and the PreToolUse gate. |
 | [platform-context.md](platform-context.md) | The Composed Platform Providers seam, edition resolution, and signed-plugin admission. |
 | [computer-use.md](computer-use.md) | Native desktop GUI automation, its keystone opt-in, and the in-band refusals. |
+| [kas-auth.md](kas-auth.md) | KAS-mode auth: the Kiro OIDC login/refresh/storage lifecycle Kiro Crew runs itself when there is no kiro-cli. |
 
 ## Agents and orchestration
 
@@ -73,6 +74,7 @@ agent loads only the one it needs.
 | [app-kit-platform.md](app-kit-platform.md) | App contracts: MCP scoping, agent JSON composition, permissions, and dependencies. |
 | [mcp-apps.md](mcp-apps.md) | Apps that surface as MCP servers. |
 | [mcp-shareability.md](mcp-shareability.md) | Predicting which MCP servers can share one backend, from local evidence. |
+| [mcp-gateway-backend-replacement.md](mcp-gateway-backend-replacement.md) | Validating a replacement MCP backend's tool set before a live session adopts it. |
 | [artifacts.md](artifacts.md) | Artifact identity, versioning, and the companion chat panel. |
 | [themes.md](themes.md) | The theme tier model and the CSS variable contract. |
 | [md-notebook.md](md-notebook.md) | The inline markdown viewer and editor. |

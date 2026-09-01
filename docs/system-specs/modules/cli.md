@@ -49,6 +49,19 @@ and of macOS signing/notarization.
   SubjectPublicKeyInfo DER bytes.
 - Signed fields: `algorithm`, `channel`, `key_id`, `pub_date`,
   `python_requires`, `schema`, `sha256`, `version`, and `wheel_url`.
+- Optional signed field: `min_version` — the forced-update floor for a
+  breaking release, declared in `packaging/MIN_VERSION` at publish time. Must
+  be a bare release (`0.6.0`, no prerelease suffix) and must not exceed the
+  manifest's own `version`; both are enforced by
+  `packaging/signing/cli-manifest.py` before signing. The installer verifies
+  its format but does not act on it (it always installs the signed version);
+  running gateways read it from the channel feed and mark the update
+  REQUIRED when their own version sits below the floor — but only after
+  `platform/feed_trust.py` verifies the manifest signature against the same
+  pinned key, because the floor coerces the dashboard UI and an unverified
+  one must degrade to the ordinary dismissible prompt. Absent means no
+  floor, and the canonical payload omits the key entirely so no-floor
+  manifests stay byte-identical to the pre-floor format.
 - Signature field: base64 RSA signature over sorted, compact UTF-8 JSON of all
   signed fields; `signature` itself is excluded.
 - Channel source: `feed/<channel>/latest-cli.json`. Pinned-version source:
@@ -134,6 +147,7 @@ choice blob makes the usage line unreadable.
 | `kirocrew gateway` | Start the Kiro Crew server (dashboard + messaging channels) |
 | `kirocrew gateway --slack-only` | Start without dashboard or SSH tunnel instructions |
 | `kirocrew gateway --no-crons` | Start without cron scheduler (use when another instance handles crons) |
+| `kirocrew gateway --no-tunnel` | Never publish a tunnel: refuses to start or provision one for the life of the process, whatever `tunnel.enabled` says. SCOPED TO TUNNELS — it does not change where the dashboard binds, so a config that widens `dashboard.url` off loopback still does, with token auth as the control there; do not read `publish_disabled()` as "no published surface of any kind". Reach the instance on the loopback port it binds (`ssh -L` from another host). A Dev Fleet pod boots with this whenever its own checkout declares the flag — the pod's argv is built by the control plane but executed by the target worktree's gateway, so `pod.runtime.target_supports_flag` probes that checkout first and DROPS the flag when it is absent (passing it would make argparse exit 2, which the unit's `Restart=on-failure`/`RestartSec=5` turns into a 5s restart loop). Such a checkout keeps the tunnel behaviour it had before this flag existed and is not given the guarantee — see `security.md` for why no config-side substitute is applied. |
 | `kirocrew setup` | Install agent config, save project dir, configure credentials |
 | `kirocrew setup --agent-only` | Only install agent config (skip credentials) |
 | `kirocrew setup --slack` | Run the guided Slack credential + slash-command setup (opt-in) |
@@ -751,6 +765,24 @@ runtime that still ships the API keeps the mitigation. Without that guard the
 Linux pidfd branch raised `AttributeError` and `kirocrew gateway` died before
 binding its port, while every other subcommand kept working.
 
+### Linux gateway heap reclamation
+
+The event-loop heartbeat offers a self-gating maintenance object a tick every
+five seconds. At most once every ten minutes on Linux, it reads current RSS
+directly from procfs. When RSS is at least 1.5 GiB, it asks glibc
+`malloc_trim(0)` to return wholly-free heap pages to the OS and logs reductions
+of at least 16 MiB. The probe and allocator call run in a worker thread, after
+the dashboard socket has bound, so maintenance cannot delay readiness or block
+the event loop. Healthy gateways remain below the threshold and do no
+allocator-wide work.
+
+The heartbeat waits at most two seconds for a pass. A timed-out worker keeps the
+single in-flight slot until it exits, preventing repeated submissions or a
+watchdog-triggering wait when the executor is saturated. Missing `ctypes`,
+non-glibc libc, failed current-RSS probes, and rejected trim calls are
+best-effort no-ops: reclamation must never stop the liveness heartbeat or make
+the gateway unavailable. macOS and Windows are unchanged.
+
 ### Live-target bootstrap
 
 On the `gateway` command path only, immediately after `_JAILED_COMMANDS`
@@ -821,12 +853,13 @@ Each step checks if the tool is already installed and skips if present.
 6. **Global mcp.json**: kirocrew MCP servers present with valid binary paths — auto-fixes stale paths
 7. **Python environment**: checks Python 3.9+ availability and dependency installation
 8. **Vector memory (in-process embeddings)**: vendored llama-cpp-python runtime importable, embedding model file present (downloads in background on gateway start; when absent, a light HTTPS-reachability probe of the resolved model URL runs); embeddings are always-on (`embeddings:  ✅ always-on`). On platforms with no vendored native libs (`_platform_libs_dirname()` returns None, e.g. darwin/x86_64 — Intel Macs or a Rosetta interpreter), the runtime line reports `⏹ unsupported platform … — memory uses keyword search` and is NOT counted as an issue (designed degradation per `embeddings.py`); only a load failure on a supported platform flags `embedding runtime`. When that failure is an INCOMPLETE shipped payload, doctor additionally names the absent files (`Missing native libs for <platform>: …`, from `embeddings.verify_vendored_libs()`) and says it is a packaging defect rather than an unsupported platform — the two are indistinguishable in ctypes' own `Shared library with base name 'llama' not found`, which reads as an architecture problem and misdirects diagnosis. When `LLAMA_CPP_LIB_PATH` is set, doctor reports THAT directory as the thing to check instead (mirroring the loader's exemption): the libs load from there, so blaming the bundled tree would send the operator to reinstall a package they are deliberately not loading from. A `faiss:` line reports whether the optional FAISS accelerator is importable — never an issue on any platform (episodic recall falls back to the stdlib cosine scan); when absent it suggests `pip install faiss-cpu`
-9. **Speech-to-Text (optional)**: whisper + ffmpeg presence when STT is enabled. On Windows these are reported as non-fatal `⚠️` notes (neither is a Kiro Crew dependency there, and STT ships enabled-by-default) so a healthy first install exits 0 and the guide's `kirocrew doctor && kirocrew gateway` chain proceeds; on macOS/Linux a missing binary still flags an issue. Fix hints are OS-aware (`brew` / `winget` / Linux)
+9. **Speech-to-Text (optional)**: recognizer, selected model and audio-decoder presence when STT is enabled. Supported desktop releases bundle and build-gate the recognizer plus the pinned `imageio-ffmpeg` executable; a missing decoder there is a corrupt payload whose remedy is reinstalling Kiro Crew, never Homebrew/Winget/Apt. Source installs use `kirocrew[voice]` for the recognizer and a fixed system FFmpeg path for compressed audio. Windows preserves its non-fatal `⚠️` marker for an optional-extra gap so enabled-by-default STT cannot block gateway startup; on macOS/Linux a missing active runtime still flags an issue.
 10. Slack credentials (optional)
 11. **Discord (optional)**: the channel's enabled flag, whether a bot token is present (never any part of its value), the three allow-lists, the privileged Message Content intent, the live connection, and the install URL. Blocking issues are enabled-without-a-token, an empty `discord.allowed_user_ids` (the transport fails closed, so every message is denied while it is empty), a thread or channel allow-list with Message Content OFF, and a reachable gateway whose Discord connection recorded a `connect_error`. The intent state comes from `discord/intent_probe.py`: one read-only `GET /oauth2/applications/@me` that decodes Discord's application-flags bitfield as a tri-state per intent PAIR (`enabled` / `limited` / `disabled`, since a limited grant still delivers the data) and degrades to `unknown` on any failure rather than aborting the report. Granted-but-unused Server Members / Presence intents are hardening notes, never issues. The install URL comes from `discord/install_url.py`, the OAuth-authorize analogue of Slack's app manifest: named permission bits OR'd to `309237711936` for a thread-capable install (the number [`discord-integration.md`](../../../src/kiro_crew/docs/discord-integration.md) publishes), and none at all for the recommended DM-only install
 12. **WhatsApp (optional)**: printed whether or not the channel is enabled, because a channel that is invisible in the preflight is the failure this section exists to catch. When enabled it reports the optional `neonize` extra, checked with `find_spec` and never imported (importing it loads a ~19 MB ctypes CDLL plus protobuf descriptors, and a health check must not initialize the subsystem it inspects, nor construct a client), and whether the linked-device session store exists at `<data home>/whatsapp/session.db`, resolved from the same expression the channel opens it with so the two can never describe different files. A missing extra IS an issue: the channel is enabled, cannot start, and the fix is one offline `pip install`. An absent store is a `⚠️` note and never an issue, because pairing is a QR scan served BY the running gateway, so failing here would break the documented `kirocrew doctor && kirocrew gateway` chain at the one moment the operator has to start the gateway to make progress. Group membership is not knowable offline, so the section reports the configured count and the gateway logs the unmatched JIDs on connect
 13. kiro-cli connectivity
 14. Gateway running status
+15. **Cron job health**: names cron jobs that auto-paused after repeated failures (`Fix: kirocrew cron resume <id>`) and jobs whose last run errored while still scheduled (`Fix: kirocrew cron trigger <id>`), with an aggregate count each and the named list capped at 5 plus a `+N more` tail. Read-only — doctor never resumes or triggers a job, because an auto-pause after `_AUTO_PAUSE_THRESHOLD` consecutive failures is usually load-bearing and lifting it silently would hide the problem the run is meant to find. The scan is `cron.unhealthy_jobs_from_disk()`, which reads `crons.json` directly rather than via the gateway API: the dashboard's per-job `err` badge and the gateway's hourly failure re-alert both run inside the gateway, so neither can report a wedged one, and that out-of-process property is the point of this check. A job the user paused explicitly is never reported (only `auto_paused` is a health signal, and both flags can be set at once since pausing an auto-paused job preserves `auto_paused`). Silent on a healthy store and on a fresh install with no `crons.json`. A store that EXISTS but yields no readable job list — unparseable, non-UTF-8, wrong shape, or holding no usable record — is reported instead, because the scheduler can load nothing from it and every job has stopped; reporting that as a clean bill of health would reproduce the silence this check exists to break. No corruption aborts the run
 
 ## Update Command
 
@@ -851,7 +884,13 @@ Each step checks if the tool is already installed and skips if present.
    edits in another terminal to rescue them is the natural response to the
    prompt, and is exactly what would otherwise be reset away). Only `HEAD` can
    move in that window, so the re-check needs no second fetch.
-2. Rebuilds the dashboard via `build_frontend_sync()` (npm; non-fatal on failure)
+2. Rebuilds the dashboard via `build_frontend_sync()` (npm; non-fatal on failure).
+   Non-fatal also means non-destructive: `npm ci` deletes `node_modules` before it
+   installs, so the tree is moved aside and restored unless the install succeeds
+   (`node_modules_txn.NodeModulesBackup`). A failed install therefore costs the
+   rebuild, not the dependency tree -- which matters because the registry needed
+   to rebuild one is usually what was unavailable. The gateway's unattended
+   auto-apply takes the async sibling and is protected the same way.
 3. Reinstalls backend via `pip install -e .`
 
 ## Client Port Resolution
@@ -992,6 +1031,15 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
    already has it to install it. That case carries SEL
    `reason=<tool>_outside_trusted_dirs`, distinct from `<tool>_not_found`, so
    the two are separable in the audit log.
+   When the trusted lookup tool exists but returns no pid, stop makes one
+   fixed-loopback `POST /api/shutdown` request carrying the gateway generation's
+   local secret. That handler independently requires loopback origin and a
+   constant-time secret match, then triggers the same graceful shutdown event as
+   SIGTERM. The acknowledgement body is capped at 4 KiB before JSON parsing;
+   excessive nesting is treated as malformed input. A successful acknowledgement
+   ends the stop command; a missing secret, refusal, malformed response, or
+   transport failure retains the ordinary no-gateway diagnostic. This fallback never converts the pid sidecar into
+   authority to signal a process.
 3. `platform_compat.process_command_line(pid)` to verify it's a KiroCrew process —
    `/proc/<pid>/cmdline` (Linux), `ps -o command=` (macOS), `Win32_Process.CommandLine`
    via WMI (Windows). The Windows venv `kirocrew.exe` re-execs `python.exe`, so the
@@ -1024,12 +1072,19 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
      on Windows) to detect a running gateway. If found — OR if the lookup
      tool is absent (`not listening_pid_tool_available()`, so a missing
      tool is not mistaken for a dead gateway) — run the existing `_stop`
-     kill-by-port path. If not (e.g. the user runs `restart` after a
-     crash), skip the stop step rather than erroring — the user expects to
-     end up with a running gateway either way. The `_stop` call is wrapped
-     in a `try / except SystemExit` so a TOCTOU race (gateway exits between
-     the listener check and `_stop`'s own lookup → `_stop` calls
-     `sys.exit(1)`) does not abort the restart before the spawn.
+     path. When the trusted lookup tool exists but returns no pid, restart
+     independently attempts the authenticated shutdown request. An acknowledged
+     request always refuses the immediate replacement and tells the operator to
+     retry after shutdown completes: neither an absent pid sidecar nor a live
+     same-user pid from that sidecar can prove singleton-lock release, because a
+     stale pid may be recycled and exit before the incumbent. The second restart
+     sees no incumbent and safely starts the replacement.
+   - If no incumbent evidence exists (e.g. the user runs `restart` after a
+     crash), skip the stop step rather than erroring — the user expects to end
+     up with a running gateway either way. The `_stop` call is wrapped in a
+     `try / except SystemExit` so a TOCTOU race (gateway exits between the
+     listener check and `_stop`'s own lookup → `_stop` calls `sys.exit(1)`)
+     does not abort the restart before the spawn.
    - Spawn a detached `kirocrew gateway` via `subprocess.Popen`, stdin set
      to `subprocess.DEVNULL`, and stdout + stderr redirected to
      `~/.kiro/crew/gateway.log` (the same file the `kirocrew logs` command
@@ -1219,7 +1274,8 @@ contract — its path and format are internal and may change without notice.
 ## Computer Use Commands
 
 `kirocrew computer {doctor [--json] | apps | call}` — hand-rolled dispatch
-mirroring `browser/cli.py` (see [computer-use.md](computer-use.md)).
+rather than argparse subparsers, because the parent CLI forwards `REMAINDER`
+(see [computer-use.md](computer-use.md)).
 
 **`doctor`** reports, in order: whether the platform is supported (macOS today;
 Windows and Linux report a typed refusal), whether the keystone primary enable at

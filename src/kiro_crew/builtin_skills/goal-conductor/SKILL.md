@@ -36,9 +36,27 @@ and handle the work in this session instead.
 
 ## Round 0 — agree the plan
 
+Your FIRST reply to a goal is the plan itself — never a round of questions.
 Restate the goal, list the proposed outcomes and their typed acceptance
-conditions, and state the intended small concurrency. Wait for the user's
-approval before opening child sessions or creating the durable cycle.
+conditions, state the intended small concurrency, and list your assumptions as
+**Assumptions** the user can correct in the same breath. Then stop and wait for
+exactly one go-ahead before opening child sessions or creating the durable cycle.
+
+**Decide, do not ask.** Anything you can settle yourself is an assumption, not a
+question: which repo, how many items per round, which crew, how to phrase an
+acceptance condition, what to do about an ambiguous candidate. Pick the sensible
+default, write it under Assumptions, and let the user overrule it. A question is
+warranted only when a wrong guess is unrecoverable AND no default exists —
+credentials, spend, deleting or overwriting someone's work, or a goal so
+underspecified you cannot name a single work item. At most **one** such question,
+folded into the plan message, never a separate turn.
+
+**Skip the gate when the user already gave one.** If the goal message itself
+authorizes execution — "just do it", "go ahead", "don't ask me", a re-send of a
+plan you already showed — open the cycle and dispatch round 1 immediately and
+report the plan as part of that same turn. Do not re-ask for permission you
+already hold. Otherwise one confirmation is all you get: after the go-ahead, run
+rounds without re-gating each one.
 
 After approval:
 
@@ -60,6 +78,13 @@ For a focused item, create a persistent child session with a title that names
 the intended outcome, select the appropriate crew first, and send a complete
 seed prompt. The seed names the outcome, the acceptance condition, relevant
 resources, and where to report. Send it before claiming useful progress.
+
+Call `select_crew` first and pass the agent it names — the matched crew when the
+item is clearly a specialist's job, otherwise the `default_agent` it returns.
+**Do NOT leave `agent` unset to "inherit the default":** the value inherited is
+YOUR agent, `kirocrew-conductor`, whose spec deliberately has no `fs_write` — so
+the child could not write a file even though writing one is the work you
+dispatched it to do, and the item would look stalled rather than misconfigured.
 
 Do not write a child session key, message cursor, or “dispatched” state back
 into a work item. Those are worker-assignment semantics and are intentionally
@@ -121,9 +146,93 @@ migration warnings rather than guessed work.
 The old codec remains packaged for one compatibility release so already-copied
 skills do not break. It is not part of this skill's new-item or patrol path.
 
+<!-- MERGE-REVIEW: upstream's "The ledger item-entry codec" section (encode/decode/validate/rotate
+     for `item-<n>` artifacts entries) was dropped here because this skill declares that path legacy
+     above. Restore it only if the ledger codec becomes the supported item store again. -->
+
 ## Stop conditions
 
-Stop and report when all items are accepted, the user-set budget is spent, a
-typed condition cannot settle the needed decision, or an item keeps failing and
-the user must choose whether to retry, reject, or cancel it. Call
-`autonudge_stop` when the coordinating loop ends.
+Stop and report when ANY of these fire. Do not push past one.
+
+1. Every item is accepted — the goal is met.
+2. The same item has failed acceptance three times, and the user must choose
+   whether to retry, reject, or cancel it.
+3. The round or time budget the user set is spent.
+4. **A decision is needed that no typed acceptance condition can settle.**
+   Stopping to ask is correct here. Guessing is the failure.
+
+Call `autonudge_stop` when the coordinating loop ends. Reaching `max_cycles` is
+a runaway backstop, not a finish.
+
+## How the ledger actually behaves
+
+The ledger holds the conductor's OWN goal, phase, and resumable next step — never
+the work items, which live in the product work-item store. Three mechanics decide
+how you must use it. All three are load-bearing.
+
+**The injected snapshot is a teaser, not the record.** On a nudge-driven turn the
+composer prefixes a `[work ledger]` block, capped at **1600 chars total**, with
+each field truncated to **300 chars** and only the **last 3** `tried` entries.
+So the snapshot tells you *what you were doing*; `work_item_list` is how you get
+*the items*, and `session_ledger_read` is how you get your own full record. Both
+reads are O(record), not O(loop history), which is exactly why the loop's cost
+stops growing.
+
+**The snapshot only arrives on nudge turns.** It is rendered from one call site
+in the autonudge handler. When the USER messages you mid-flight, there is no
+snapshot — read the ledger and the work-item list yourself before answering
+anything about item state.
+
+**A terminal phase silences the snapshot.** `render_snapshot` returns empty when
+the phase is terminal. Do NOT mark your ledger's phase terminal until the goal
+is genuinely finished, or you will silently stop receiving your own state on
+every later cycle.
+
+What goes where:
+
+- `goal` — the user's goal, one line.
+- `phase` — which round you are in and what it is waiting on.
+- `next` — a resumable intent, not a status. "round 2: A awaiting acceptance,
+  B still running" beats "monitoring".
+- `artifacts` — advisory pointers only. Work items, their acceptance conditions,
+  their state and their evidence are owned by the product work-item store; do
+  not encode them here. See "Legacy compatibility" above.
+- `tried` — approaches you rejected and why, so a later round does not repeat them.
+
+## Cost discipline
+
+A patrol loop that re-reads transcripts every cycle costs more than the work it
+watches, and that cost grows with the loop's own history.
+
+- Read transcripts with `since`, never from the top. Store `next_since`.
+- Write only deltas to the ledger.
+- Stay silent on a quiet cycle.
+- The ledger and work-item reads are cheap and bounded — those you do every cycle.
+
+## Known limits of this version
+
+- **The session surface sits behind one config switch.** `agent.session_control`
+  defaults to OFF and fails closed — every session tool answers
+  `session_control_disabled` until the user sets it to `true` in config.json.
+  If you see that error, say which switch to flip; do not retry.
+- **Reads and creates do not prompt; anything that touches another session does.**
+  Auto-approved by name: `chat_folder_tree`, `chat_folder_create`,
+  `session_create`, `session_read_message` — so a patrol cycle that wakes on a
+  nudge with nobody at the keyboard never blocks, and filing rides the create
+  itself (the `folder` argument), so it costs no extra approval. **`session_send`
+  and `session_stop` are deliberately NOT auto-approved**, because each writes to
+  a session that is not yours: a seed runs as the target's own turn, and a stop
+  discards the target's in-flight work. You ingest external content by design, so
+  the prompt is the only call-time check on both. Expect one approval per item at
+  dispatch (the seed) and one if you ever stop an item — all of which happen
+  right after the user approved a plan, not mid-patrol. Batch instead of
+  trickling: one `work_item_evaluate` call per cycle carrying every open item.
+  On a host with a governance ceiling even the granted verbs prompt; if you see
+  approvals where this says you should not, that is why.
+- **`session_send` reports delivery, not completion.** `started: true` means the
+  target began a turn on your message; `started: false` means it queued. Neither
+  says the work succeeded — acceptance is still the typed condition's job.
+- **Some targets are out of bounds by design.** Incognito/temporary sessions,
+  app-scoped sessions, channel-linked or mirrored sessions, crew-mode sessions,
+  and sessions in another workspace are all refused by the shared guard. Plan
+  work items onto plain persistent dashboard sessions only.

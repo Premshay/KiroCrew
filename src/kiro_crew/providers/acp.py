@@ -23,7 +23,6 @@ from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeError
 from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
-    ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
@@ -37,6 +36,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
 )
+from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
@@ -51,6 +51,7 @@ from kiro_crew.providers.base import (
     CancelOutcome,
     LLMEvent,
     LLMProvider,
+    resolve_billing_stats,
 )
 from kiro_crew.providers.cleanup import _is_safe_path
 
@@ -449,8 +450,14 @@ class AcpProvider(LLMProvider):
 
     @property
     def is_claude_backend(self) -> bool:
-        """True when this ACP provider talks to claude-agent-acp (vs kiro-cli)."""
-        return self._client.backend == ACP_BACKEND_CLAUDE
+        """True when this ACP provider talks to claude-agent-acp (vs kiro-cli).
+
+        The comparison lives in ``agent_sdk.backend_identity`` so this property,
+        ``session._is_claude_backend`` and ``provider_label`` cannot drift about
+        what "the claude backend" means. Reading ``self._client.backend`` stays
+        here because only this class knows where its own backend string lives.
+        """
+        return is_claude_backend_name(self._client.backend)
 
     @property
     def is_kas_backend(self) -> bool:
@@ -475,8 +482,8 @@ class AcpProvider(LLMProvider):
         the "kiro or kas" set positively so the shared-runtime start path, the
         cli.json overlay recovery, and the skip-live-effort branch stop being
         spelled ``not is_claude_backend`` — which would hand the kiro-family
-        path to every harness added later. The dormant claude AcpClient seam is
-        not a member.
+        path to every harness added later. The claude AcpClient is deliberately
+        not a member: it runs one process per session and shares no runtime.
         """
         return self._client.backend in ACP_BACKENDS_ACP_RUNTIME
 
@@ -1246,9 +1253,12 @@ class AcpProvider(LLMProvider):
             # child_low_fidelity to True for EVERY child permission event that
             # crosses this provider — the full-fidelity half of the feature
             # (mode-parity auto-approval, unannotated card) would be inert on
-            # the primary interactive surface.
+            # the primary interactive surface. Same trap for
+            # mcp_identity_trusted: dropping it revokes the verified-identity
+            # half (child_mcp_identity_trusted) for every crossing event.
             raw_params_trusted=e.raw_params_trusted,
             shell_classified=e.shell_classified,
+            mcp_identity_trusted=e.mcp_identity_trusted,
             server_name=e.server_name,
             oauth_url=e.oauth_url,
             subagents=e.subagents,
@@ -1262,7 +1272,6 @@ class AcpProvider(LLMProvider):
             # effect (the gate sees an empty server name and never records).
             tool_name=e.tool_name,
             mcp_server_name=e.mcp_server_name,
-            mcp_identity_trusted=e.mcp_identity_trusted,
             diff_old_text=e.diff_old_text,
             diff_path=e.diff_path,
         )
@@ -1304,6 +1313,21 @@ class AcpProvider(LLMProvider):
 
     def context_used_tokens(self) -> int:
         return self._client.last_prompt_stats.context_used_tokens
+
+    def billing_stats(self) -> object | None:
+        """Live per-turn billing stats (public — see LLMProvider).
+
+        Forwards the inner client's own DECLARATION rather than reading an
+        attribute off it: this provider wraps whichever client the backend
+        installs (a raw ``AcpClient`` for claude / pre-startup, an
+        ``AcpSessionProvider`` after kiro startup replaces the placeholder), and
+        forwarding the capability is what keeps the wrapper from re-introducing
+        the attribute-name dependency the accounting path just shed. Resolved
+        through the shared helper so this forward cannot diverge from the reader
+        it feeds, and per call because the placeholder client is replaced at
+        runtime startup.
+        """
+        return resolve_billing_stats(getattr(self, "_client", None))
 
     async def compact(self, context: str = "") -> None:
         """Trigger native /compact with optional context-preserving prompt."""
@@ -1555,7 +1579,7 @@ def provider_label(provider: Any) -> str:
         backend = getattr(getattr(provider, "client", None), "backend", "")
     else:
         return PROVIDER_LABEL_DEFAULT
-    if backend == ACP_BACKEND_CLAUDE:
+    if is_claude_backend_name(backend):
         return PROVIDER_LABEL_CLAUDE
     if backend == ACP_BACKEND_KAS:
         return PROVIDER_LABEL_KAS

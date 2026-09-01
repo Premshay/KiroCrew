@@ -69,12 +69,68 @@ class TestConductorInstaller:
         assert data["name"] == "kirocrew-conductor"
         assert "work item" in data["prompt"]
 
-    def test_no_write_or_shell_tool_and_dashboard_not_preapproved(self, tmp_path, monkeypatch):
-        """The two deliberate security properties of the spec.
+    def test_prompt_carries_the_verbosity_placeholder(self, tmp_path, monkeypatch):
+        """The conductor is a custom agent, so it gets its OWN prompt.
+
+        ``build_message`` reads a custom agent's prompt from its spec instead of
+        ``config/prompt.md``, and ``_resolve_prompt_templates`` only expands the
+        token where it appears. Without the token here the user's
+        ``dashboard.verbosity`` setting silently never reaches this agent, so
+        every conductor turn answers at ``default`` length no matter what the
+        person picked. Pinned, not commented, because the omission is invisible.
+        """
+        data = self._install(tmp_path, monkeypatch)
+        assert "{{VERBOSITY_BLOCK}}" in data["prompt"]
+
+    def test_prompt_drives_patrol_with_monitor_start_not_wait(self, tmp_path, monkeypatch):
+        """A patrol round outlives a turn, so the loop must own the turn boundary.
+
+        An in-turn ``wait`` + re-poll loop spends the turn budget on latency and
+        dies at the turn cap mid-round, which loses the loop. Both halves of the
+        contract are pinned: ``monitor_start`` drives the round, and the
+        conductor knows the tool it needs to stop the loop it armed. Whitespace
+        is normalised so re-wrapping the prompt cannot fail this for a
+        formatting reason.
+        """
+        data = self._install(tmp_path, monkeypatch)
+        prompt = " ".join(data["prompt"].split())
+        assert "Patrol with `monitor_start`, never with `wait`" in prompt
+        assert "autonudge_stop" in prompt
+
+    def test_prompt_names_the_tools_it_expects_to_be_used(self, tmp_path, monkeypatch):
+        """The charter mounts whole servers, so the prompt must name what it wants.
+
+        ``@kirocrew-core`` puts ~70 tools in front of this agent. Naming only the
+        session-control ones left the rest unaddressed, which is how a conductor
+        talks itself into running a work item in its own turn. Both directions are
+        pinned: the tools the four jobs need, and the four that would end-run the
+        no-write property by executing the work here.
+        """
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        for named in (
+            "session_create",
+            "session_ledger_record",
+            "monitor_update",
+            "resource_status",
+            "ask_question",
+            "skill_search",
+            "tool_search",
+        ):
+            assert named in prompt, named
+        for forbidden in ("spawn_run", "spawn_sub_agents", "workflow_run", "task_run"):
+            assert forbidden in prompt, forbidden
+        assert "never goes to" in prompt
+
+    def test_no_write_tool_and_shell_not_preapproved(self, tmp_path, monkeypatch):
+        """The security properties of the spec, in one place.
 
         No ``fs_write``: the conductor cannot do a work item's work itself.
-        ``@kirocrew-dashboard`` remains approval-gated. The new product
-        work-item evaluator removes shell from the conductor entirely.
+        ``@kirocrew-dashboard`` is MOUNTED whole but never granted whole — the
+        auto-approve list names verbs, so the destructive ones keep prompting.
+        ``execute_bash`` is neither mounted nor granted: the work-item evaluator
+        removed the conductor's need for shell, and ``allowedTools`` has no
+        argument matching, so a mounted shell could not be scoped to the two
+        bundled scripts anyway.
         """
         data = self._install(tmp_path, monkeypatch)
         assert "fs_write" not in data["tools"]
@@ -82,6 +138,91 @@ class TestConductorInstaller:
         assert "@kirocrew-dashboard" not in data["allowedTools"]
         assert "execute_bash" not in data["tools"]
         assert "execute_bash" not in data["allowedTools"]
+
+    def test_only_create_and_read_verbs_are_auto_approved(self, tmp_path, monkeypatch):
+        """The grant invariant: create or read, never mutate someone else's thing.
+
+        Every auto-approved verb is reachable by content the conductor ingested
+        (its charter reads issue text; it holds ``web_fetch`` for that), with no
+        human in the loop on a nudge-driven cycle. So a granted verb may make a
+        NEW folder or session, or read — never write a resource the user already
+        arranged, because that destroys state no prompt asked about.
+
+        Pinned as literal names rather than by importing the tuple: the point is
+        that WIDENING the tuple fails a test, which a tautological assertion
+        against the tuple itself could never catch. Each withheld verb below is
+        withheld for a reason recorded next to it in ``agent.py``:
+        ``chat_folder_move_session`` PATCHes another session's ``folder_id``
+        (target comes from the arguments, not the caller), ``session_send`` runs
+        text as a peer's turn, ``session_stop`` discards a peer's in-flight work,
+        and ``chat_folder_move`` reparents an existing tree.
+        """
+        granted = self._install(tmp_path, monkeypatch)["allowedTools"]
+        for verb in (
+            "chat_folder_move_session",
+            "chat_folder_move",
+            "session_send",
+            "session_stop",
+        ):
+            assert f"@kirocrew-dashboard/{verb}" not in granted, verb
+        for verb in (
+            "chat_folder_tree",
+            "chat_folder_create",
+            "session_create",
+            "session_read_message",
+        ):
+            assert f"@kirocrew-dashboard/{verb}" in granted, verb
+
+    def test_no_dashboard_verb_is_granted_outside_the_named_set(self, tmp_path, monkeypatch):
+        """Nothing reaches ``allowedTools`` that the audit above did not rule on.
+
+        Guards the gap the per-verb lists cannot: a NEW tool added to the
+        dashboard server, or a stray entry added to the grant tuple, would
+        otherwise be auto-approved without anyone deciding it should be. The
+        expected set is spelled out so adding a grant is a deliberate edit here.
+        """
+        granted = self._install(tmp_path, monkeypatch)["allowedTools"]
+        dashboard = {g for g in granted if g.startswith("@kirocrew-dashboard")}
+        assert dashboard == {
+            "@kirocrew-dashboard/chat_folder_tree",
+            "@kirocrew-dashboard/chat_folder_create",
+            "@kirocrew-dashboard/session_create",
+            "@kirocrew-dashboard/session_read_message",
+        }
+        # The bare server must never appear: it would grant every verb, including
+        # the four the test above withholds.
+        assert "@kirocrew-dashboard" not in granted
+
+    def test_template_grants_never_leak_into_the_conductor_list(self, tmp_path, monkeypatch):
+        """No-op proof for #7401: the conductor replaces ``allowedTools``
+        wholesale with its own filtered ``granted`` list, so the ceiling filter
+        moving into ``build_agent_config`` changes nothing here — and template
+        grants (filtered or not) can never leak through.
+        """
+        monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+        monkeypatch.setattr(
+            agent,
+            "build_agent_config",
+            lambda: {
+                "name": "kirocrew",
+                "prompt": "file://x",
+                "mcpServers": {
+                    "kirocrew-core": {"command": "/resolved/kirocrew", "args": ["mcp-core"]}
+                },
+                "tools": ["fs_read", "@kirocrew-core"],
+                # A template list carrying floor builtins — as if the build-time
+                # filter did not exist. None of it may survive the replacement.
+                "allowedTools": ["fs_read", "code", "glob", "grep", "@kirocrew-core"],
+            },
+        )
+        monkeypatch.setattr(
+            agent, "_kirocrew_mcp_invocation", lambda sub: ("/resolved/kirocrew", [sub])
+        )
+        monkeypatch.setattr(agent, "_may_auto_approve", lambda ref: True)
+        agent._install_conductor_agent()
+        data = json.loads((tmp_path / CONDUCTOR_AGENT_FILENAME).read_text(encoding="utf-8"))
+        for template_grant in ("fs_read", "code", "glob", "grep"):
+            assert template_grant not in data["allowedTools"], template_grant
 
     def test_mounts_no_tool_the_charter_never_names(self, tmp_path, monkeypatch):
         """An unused grant is surface the charter cannot account for.
@@ -165,26 +306,64 @@ class TestConductorInstaller:
         )
         assert "@kirocrew-core" in data["tools"]
         assert "@kirocrew-core" not in data["allowedTools"]
-        assert data["allowedTools"] == ["session", "report"]
+        assert data["allowedTools"] == [
+            "session",
+            "report",
+            "tool_search",
+            "@kirocrew-dashboard/chat_folder_tree",
+            "@kirocrew-dashboard/chat_folder_create",
+            "@kirocrew-dashboard/session_create",
+            "@kirocrew-dashboard/session_read_message",
+        ]
 
     def test_kas_permissions_are_derived_from_the_filtered_grants(self, tmp_path, monkeypatch):
         """The KAS block is derived, not restated — so the ceiling reaches it too.
 
-        Ungoverned: the ``@kirocrew-core`` grant projects to an ``mcp`` allow
-        rule. Governed: the grant is gone, so the rule is too — and the key is
-        still present, because its mere presence is what makes KAS load the spec.
+        Ungoverned: the per-tool dashboard grants project to EXACT ``server/tool``
+        resources rather than a ``kirocrew-dashboard/*`` wildcard, which is what
+        makes the narrowing real on the KAS backend as well as on kiro-cli — a
+        wildcard here would re-grant the ``session_stop`` / ``session_send`` that
+        ``allowedTools`` deliberately withholds. Governed against
+        ``@kirocrew-core``: that pattern is gone while the dashboard ones survive,
+        which is the property a rule list restated as a literal would have lost.
         """
+        dashboard_resources = [
+            "kirocrew-dashboard/chat_folder_create",
+            "kirocrew-dashboard/chat_folder_tree",
+            "kirocrew-dashboard/session_create",
+            "kirocrew-dashboard/session_read_message",
+        ]
         data = self._install(tmp_path, monkeypatch)
         assert data["permissions"] == {
-            "rules": [{"capability": "mcp", "match": ["kirocrew-core/*"], "effect": "allow"}]
+            "rules": [
+                {
+                    "capability": "mcp",
+                    "match": ["kirocrew-core/*", *dashboard_resources],
+                    "effect": "allow",
+                }
+            ]
         }
+        assert "kirocrew-dashboard/*" not in data["permissions"]["rules"][0]["match"]
 
         governed = self._install(
             tmp_path,
             monkeypatch,
             may_auto_approve=lambda ref: ref != "@kirocrew-core",
         )
-        assert governed["permissions"] == {"rules": []}
+        assert governed["permissions"] == {
+            "rules": [{"capability": "mcp", "match": dashboard_resources, "effect": "allow"}]
+        }
+
+    def test_a_fully_governed_host_still_emits_the_permissions_key(self, tmp_path, monkeypatch):
+        """``{"rules": []}`` when nothing qualifies — the key's PRESENCE loads the spec.
+
+        Split from the test above once the dashboard grant meant a ceiling on
+        ``@kirocrew-core`` alone no longer empties the rule list: without this,
+        the empty-policy branch would have silently lost its coverage.
+        """
+        data = self._install(tmp_path, monkeypatch, may_auto_approve=lambda ref: False)
+        assert data["permissions"] == {"rules": []}
+        assert data["allowedTools"] == []
 
     def test_withholding_a_grant_is_audit_logged(self, tmp_path, monkeypatch):
         """A withheld grant is a permission DECISION and must leave a record.
@@ -230,7 +409,44 @@ class TestConductorInstaller:
         data = self._install(
             tmp_path, monkeypatch, may_auto_approve=lambda ref: ref != "@kirocrew-core"
         )
-        assert data["allowedTools"] == ["session", "report"]
+        assert data["allowedTools"] == [
+            "session",
+            "report",
+            "tool_search",
+            "@kirocrew-dashboard/chat_folder_tree",
+            "@kirocrew-dashboard/chat_folder_create",
+            "@kirocrew-dashboard/session_create",
+            "@kirocrew-dashboard/session_read_message",
+        ]
+
+    def test_skill_gates_the_plan_once_instead_of_interrogating(self):
+        """Round 0 must be ONE plan message, not a round of questions.
+
+        The first live run opened with a clarification round: the previous
+        wording ("restate the plan, wait for the user") left room for one ahead
+        of the plan, and every question spent there is latency on work the
+        conductor could have assumed and let the user correct. Pinned as a doc
+        ratchet because the instruction, not the code, is what would drift.
+        """
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        # What the conductor can settle itself is an assumption, not a question.
+        assert "Decide, do not ask" in text
+        assert "Assumptions" in text
+        # And a goal that already authorizes execution must not be re-gated.
+        assert "Skip the gate when the user already gave one" in text
+
+    def test_skill_states_the_real_approval_cost(self):
+        """The cost note must match the spec, or patrol plans for wrong prompts.
+
+        The granted verbs run silently while `session_send` / `session_stop` and
+        the bundled scripts prompt, so a skill that claimed either "everything
+        prompts" or "nothing prompts" would have the conductor sizing its nudge
+        interval around approvals it does not pay — or walking into ones it does.
+        """
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        assert "Reads and creates do not prompt" in text
+        assert "`session_send`\n  and `session_stop` are deliberately NOT auto-approved" in text
+        assert "accept_eval.py` invocation" in text
 
     def test_skill_uses_product_work_items_and_labels_the_codec_legacy_only(self):
         """New coordination state cannot regress into a string-artifact codec."""
@@ -269,6 +485,26 @@ class TestConductorInstaller:
         assert SKILL_DIR.is_dir()
         assert not (_BUILTIN_SKILLS_DIR / "conductor").exists()
         assert "name: goal-conductor" in (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+
+    def test_skill_files_the_session_at_creation_not_by_a_move(self):
+        """Dispatch passes ``folder`` to ``session_create``; no move step exists.
+
+        ``session_create`` files the slot atomically at creation (#6118), which
+        is what closed the create-then-move window a folder delete could land
+        in. The instruction layer must not resurrect the workaround: a separate
+        ``chat_folder_create`` precondition or ``chat_folder_move_session`` step
+        reopens exactly the non-atomic window the tool argument removed. Pinned
+        as a doc ratchet because the instruction, not the code, is what would
+        drift back.
+        """
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        assert "1. `session_create`" in text, "dispatch must open with the atomic create"
+        assert "`folder`" in text, "dispatch must name the folder argument at create"
+        assert "chat_folder_move_session" not in text, "the move workaround must stay deleted"
+        # Scoped to the dispatch STEP, not the whole document: a future
+        # legitimate mention of the tool elsewhere in the skill must not fail a
+        # pin whose intent is only that the precreation step stay deleted.
+        assert "1. `chat_folder_create`" not in text, "no folder-precreation dispatch step"
 
 
 def _load_adapter():

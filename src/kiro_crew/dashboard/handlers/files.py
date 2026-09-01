@@ -29,13 +29,19 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.multipart import BodyPartReader
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import atomic_write, open_access_control_source
+from kiro_crew.config import loader as config_loader
 from kiro_crew.config.loader import KiroCrewConfig, WorkspaceConfig, config_dir, data_home
-from kiro_crew.dashboard import part_stream
+from kiro_crew.dashboard import part_stream, upload_destination
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
 from kiro_crew.dashboard.file_index import _SKIP_DIRS as _WALK_SKIP_DIRS
+from kiro_crew.dashboard.handlers._shared import _probe_persisted_session
+from kiro_crew.dashboard.origin import is_direct_local_request
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.hooks import safe_read_prefix
-from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.doc_parser import extract_text
+from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, safe_read_prefix
+from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.outbound_files import OutboundFile
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
@@ -48,10 +54,10 @@ from kiro_crew.security import (
 from kiro_crew.slack.handler import is_tracked_channel
 from kiro_crew.validation import (
     FILE_READ_SCHEMA,
-    FILE_SEND_SCHEMA,
     ValidationError,
     validate_tool_args,
 )
+from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory_bytes
 
 # Register OOXML office MIME types explicitly. The system mimetypes
 # database on AL2/AL2023 build hosts does NOT include .docx, .xlsx, or
@@ -81,6 +87,41 @@ def _sel():
     return _pkg.sel()
 
 
+def _audit_file_send(
+    *,
+    leg: str,
+    outcome: str,
+    error: str | None = None,
+    downstream: str | None = None,
+    resources: str | None = None,
+) -> None:
+    """The one audit shape both ``file_send`` delivery legs write.
+
+    Every record the Slack and channel endpoints emit is the same tool
+    invocation under a different ``tool_kind`` (the leg), so the shape lives
+    here rather than being spelled out at each of the dozen decision sites it
+    used to be copied to -- one drifted field was previously a one-line edit
+    away. Optional fields are OMITTED when unset, exactly as the shipped call
+    sites omitted them: skips carry no ``downstream_service``, refusals and
+    deliveries do.
+    """
+    extra: dict[str, str] = {}
+    if error is not None:
+        extra["error"] = error
+    if downstream is not None:
+        extra["downstream_service"] = downstream
+    if resources is not None:
+        extra["resources"] = resources
+    _sel().log_tool_invocation(
+        session_key="api",
+        source="api",
+        tool_name="file_send",
+        tool_kind=leg,
+        outcome=outcome,
+        **extra,
+    )
+
+
 async def api_reveal_path(request: web.Request) -> web.Response:
     """POST /api/reveal — reveal a file/folder in Finder or open with default app."""
     try:
@@ -97,6 +138,18 @@ async def api_reveal_path(request: web.Request) -> web.Response:
             outcome="denied", error="sensitive_path",
             resources=path, metadata={"action": action})
         return web.json_response({"error": "access denied"}, status=403)
+    # Gate: only spawn native openers from direct-local requests. Remote/tunneled
+    # callers get the copy-to-clipboard fallback — spawning Finder on a machine
+    # the user is not looking at is surprising and useless.
+    if not is_direct_local_request(request):
+        _sel().log_tool_invocation(
+            session_key="api", source="api", tool_name="reveal_path",
+            outcome="denied", error="remote_request",
+            resources=path, metadata={"action": action})
+        # Degrade to a clipboard copy: `copy` is the path to write. The remote
+        # cause is recorded in the SEL audit above (error="remote_request"); the
+        # response body carries no path, host, or exception detail beyond `copy`.
+        return web.json_response({"ok": True, "copy": path})
     # Every ALLOWED outcome leaves through the single audited return below —
     # including the clipboard answer, which is a granted decision whose host
     # simply had no file manager. An early return here would drop that decision
@@ -118,7 +171,11 @@ async def api_reveal_path(request: web.Request) -> web.Response:
     _sel().log_tool_invocation(
         session_key="api", source="api", tool_name="reveal_path",
         outcome="success", resources=path, metadata={"action": action})
-    return web.json_response({"ok": True, "copy": path} if copied else {"ok": True})
+    # A local grant whose host had no working file manager degrades to the
+    # clipboard; `copy` is the path to write.
+    if copied:
+        return web.json_response({"ok": True, "copy": path})
+    return web.json_response({"ok": True})
 
 
 async def api_outbox_notify(request: web.Request) -> web.Response:
@@ -415,95 +472,102 @@ async def api_outbox_list(request: web.Request) -> web.Response:
     return web.json_response({"files": entries[:50]})
 
 
-async def api_slack_upload_file(request: web.Request) -> web.Response:
-    """POST /api/slack/upload-file — upload a file to Slack (internal, called by file_send)."""
-    from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes  # noqa: F811
+def _gate_upload_file(
+    file_path: str, filename: str, *, tool_kind: str
+) -> tuple[web.Response | None, Path | None, bytes | None]:
+    """The shared admission gate for shipping a local file to a channel.
 
-    state: DashboardState = request.app["state"]
-    slack = state.slack_client
-    if not slack:
+    One site computes the judgment for every channel-upload endpoint —
+    containment (outbox or workspace root), the descriptor-safe read, the
+    binary MIME allowlist, and the content credential scans — so the Slack
+    and channel legs cannot drift apart gate by gate. Returns
+    ``(error_response, None, None)`` on refusal, ``(None, resolved, bytes)``
+    when the file may ship. *tool_kind* keys the SEL records so each caller
+    keeps its own audit lane.
+
+    Blocking by design (a full read of up to ``MAX_FILE_BYTES`` plus content
+    regex scans): async handlers MUST run it off the event loop via
+    ``asyncio.to_thread`` — SEL appends are internally locked, so the audit
+    calls are thread-safe. The loader is called through its module so tests
+    (and config reloads) resolve at call time, not import time.
+    """
+
+    def _audit_denial(error: str, *, outcome: str = "denied") -> None:
         _sel().log_tool_invocation(
             session_key="api",
             source="api",
             tool_name="file_send",
-            tool_kind="slack",
-            outcome="skipped",
-            error="no_slack_client",
+            tool_kind=tool_kind,
+            outcome=outcome,
+            downstream_service=tool_kind,
+            error=error,
         )
-        return web.json_response({"ok": True, "skipped": "no_slack"})
-    try:
-        body = await request.json()
-    except ValueError:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            error="invalid_json_body",
+
+    if not file_path or not filename:
+        _audit_denial("missing_required_fields")
+        return (
+            web.json_response(
+                {"error": "file_path, filename required", "code": "missing_required_fields"},
+                status=400,
+            ),
+            None,
+            None,
         )
-        return web.json_response({"error": "Invalid JSON body"}, status=400)
-    file_path_raw = body.get("file_path", "")
-    filename = body.get("filename", "")
-    thread_ts = body.get("thread_ts")
-    if not file_path_raw or not filename:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            error="missing_required_fields",
+    # The name is DELIVERED (Slack upload title, Telegram document name,
+    # Discord message text fallback), so a credential embedded in it leaves
+    # with the file. Checked in the shared gate so no leg can drift from the
+    # others, and before path resolution so a sensitive name never even
+    # selects a file. Mirrors the MCP-side file_send refusal.
+    if redact(filename) != filename:
+        _audit_denial("sensitive_filename_rejected")
+        return (
+            web.json_response(
+                {
+                    "error": "filename contains sensitive content",
+                    "code": "sensitive_filename",
+                },
+                status=400,
+            ),
+            None,
+            None,
         )
-        return web.json_response({"error": "file_path, filename required"}, status=400)
-    file_path = file_path_raw
     resolved = Path(file_path).resolve()
-    from kiro_crew.config.loader import outbox_dir, workspace_root  # noqa: F811
-
-    allowed_outbox = outbox_dir().resolve()
-    allowed_workspace = workspace_root().resolve()
+    allowed_outbox = config_loader.outbox_dir().resolve()
+    allowed_workspace = config_loader.workspace_root().resolve()
     if not (resolved.is_relative_to(allowed_outbox) or resolved.is_relative_to(allowed_workspace)):
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            downstream_service="slack",
-            error=f"path_not_allowed: {file_path}",
-        )
-        return web.json_response(
-            {
-                "error": "file_path must be under the outbox directory or the workspace root",
-                "code": "path_not_allowed",
-            },
-            status=403,
+        _audit_denial(f"path_not_allowed: {file_path}")
+        return (
+            web.json_response(
+                {
+                    "error": "file_path must be under the outbox directory or the workspace root",
+                    "code": "path_not_allowed",
+                },
+                status=403,
+            ),
+            None,
+            None,
         )
     try:
         raw = safe_read_file_bytes(str(resolved))
     except FileTooLargeError as e:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            downstream_service="slack",
-            error=f"file_too_large: {e}",
+        _audit_denial(f"file_too_large: {e}")
+        return (
+            web.json_response({"error": str(e), "code": "file_too_large"}, status=413),
+            None,
+            None,
         )
-        return web.json_response({"error": str(e)}, status=413)
     if raw is None:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            downstream_service="slack",
-            error=f"safe_read_file_bytes rejected: {file_path}",
-        )
-        return web.json_response(
-            {"error": f"File not found or access denied: {file_path}"}, status=404
+        _audit_denial(f"safe_read_file_bytes rejected: {file_path}")
+        return (
+            web.json_response(
+                {
+                    "error": f"File not found or access denied: {file_path}",
+                    "code": "file_not_found",
+                },
+                status=404,
+            ),
+            None,
+            None,
         )
     try:
         text = raw.decode("utf-8")
@@ -511,184 +575,148 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
         # Binary file — only allow known-safe media types
         guessed_type = mimetypes.guess_type(filename)[0] or ""
         if guessed_type not in BINARY_MIME_ALLOWLIST:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="denied",
-                downstream_service="slack",
-                error=f"binary_mime_not_allowed: {guessed_type}",
-            )
-            return web.json_response(
-                {"error": f"Binary file type not allowed: {guessed_type or 'unknown'}"}, status=400
+            _audit_denial(f"binary_mime_not_allowed: {guessed_type}")
+            return (
+                web.json_response(
+                    {
+                        "error": f"Binary file type not allowed: {guessed_type or 'unknown'}",
+                        "code": "binary_mime_not_allowed",
+                    },
+                    status=400,
+                ),
+                None,
+                None,
             )
         text = None  # signal: skip text redaction path
         # Scan binary content for embedded credentials (e.g. base64-encoded keys in PDFs)
         binary_text = raw.decode("latin-1")
         if redact(binary_text) != binary_text:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="denied",
-                downstream_service="slack",
-                error="binary_credential_detected",
-            )
-            return web.json_response(
-                {"error": "binary file contains embedded credentials"}, status=400
+            _audit_denial("binary_credential_detected")
+            return (
+                web.json_response(
+                    {
+                        "error": "binary file contains embedded credentials",
+                        "code": "binary_credential_detected",
+                    },
+                    status=400,
+                ),
+                None,
+                None,
             )
     if text is not None:
         try:
             redacted = redact(text)
             if redacted != text:
-                _sel().log_tool_invocation(
-                    session_key="api",
-                    source="api",
-                    tool_name="file_send",
-                    tool_kind="slack",
-                    outcome="denied",
-                    downstream_service="slack",
-                    error="content_redacted",
-                )
-                return web.json_response(
-                    {"error": "file content was redacted; upload aborted"}, status=400
+                _audit_denial("content_redacted")
+                return (
+                    web.json_response(
+                        {
+                            "error": "file content was redacted; upload aborted",
+                            "code": "content_redacted",
+                        },
+                        status=400,
+                    ),
+                    None,
+                    None,
                 )
         except Exception as redact_err:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="error",
-                downstream_service="slack",
-                error=f"redaction_failed: {redact_err}",
+            _audit_denial(f"redaction_failed: {redact_err}", outcome="error")
+            return (
+                web.json_response(
+                    {"error": f"Redaction failed: {redact_err}", "code": "redaction_failed"},
+                    status=500,
+                ),
+                None,
+                None,
             )
-            return web.json_response({"error": f"Redaction failed: {redact_err}"}, status=500)
-    # Resolve thread_ts and channel from linked slot when not explicitly provided
-    target_channel = body.get("channel", "")
-    channel_from_session_map = False
-    session_key = request.headers.get("X-Session-Key", "").strip()
-    # A dashboard session carries its Slack link in the session map; a
-    # channel-born one is linked under that same channel key by the Slack
-    # handler, so both resolve their thread from the one lookup. Skipping the
-    # channel case would DM the owner instead of landing the file in the thread
-    # the conversation is happening in.
-    linkable = session_key.startswith("dashboard:") or is_channel_session_key(session_key)
-    if not thread_ts and linkable and state.sessions:
-        link_ts, link_ch = state.sessions.get_slack_link(session_key)
-        if link_ts and (not target_channel or target_channel == link_ch):
-            thread_ts = link_ts
-            if not target_channel and link_ch:
-                target_channel = link_ch
-                channel_from_session_map = True
-    # Resolve channel: use explicit channel if provided, else owner DM
-    channel = ""
-    if target_channel:
-        try:
-            validate_tool_args(
-                {"path": "x", "channel": target_channel}, FILE_SEND_SCHEMA
-            )
-        except ValidationError:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="denied",
-                downstream_service="slack",
-                error="channel_validation_failed",
-            )
-            return web.json_response(
-                {"error": "invalid channel value"}, status=400
-            )
-        # Session-map-sourced channels are trusted (system created the link).
-        # Only enforce tracking check for user-supplied channels.
-        # Defense-in-depth: session-map channels must be DMs (D-prefix) or tracked.
-        if not channel_from_session_map:
-            try:
-                tracked = is_tracked_channel(target_channel)
-            except Exception:
-                tracked = False  # deny-by-default extends to uncertainty
-            if not tracked:
-                _sel().log_tool_invocation(
-                    session_key="api",
-                    source="api",
-                    tool_name="file_send",
-                    tool_kind="slack",
-                    outcome="denied",
-                    downstream_service="slack",
-                    error=f"channel_not_tracked: {target_channel}",
-                )
-                return web.json_response(
-                    {"error": "channel not in tracked channels"}, status=403
-                )
-        else:
-            try:
-                allowed = target_channel.startswith("D") or is_tracked_channel(target_channel)
-            except Exception:
-                allowed = False  # deny-by-default extends to uncertainty
-            if not allowed:
-                _sel().log_tool_invocation(
-                    session_key="api",
-                    source="api",
-                    tool_name="file_send",
-                    tool_kind="slack",
-                    outcome="denied",
-                    downstream_service="slack",
-                    error=f"session_map_channel_not_authorized: {target_channel}",
-                )
-                return web.json_response(
-                    {"error": "channel not authorized"}, status=403
-                )
-        channel = target_channel
-    else:
-        try:
-            creds = KiroCrewConfig.load().load_credentials()
-            owner_id = creds.get("KIROCREW_OWNER_ID", "")
-            if owner_id:
-                channel = await slack.open_dm(owner_id)
-        except Exception:
-            pass
-    if not channel:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="skipped",
-            error="no_channel",
-        )
-        return web.json_response({"ok": True, "skipped": "no_channel"})
+    return None, resolved, raw
+
+
+async def api_slack_upload_file(request: web.Request) -> web.Response:
+    """POST /api/slack/upload-file — upload a file to Slack (internal, called by file_send).
+
+    Destination and authorization come from the shared oracle
+    (:func:`kiro_crew.dashboard.upload_destination.resolve_slack`), which holds
+    this leg's ladder — request-named channel, session-map-linked thread,
+    owner-DM fallback, tracked-channel authorization — next to the non-Slack
+    leg's, so the two cannot drift apart rung by rung (issue #6060). What stays
+    here is what only this leg can answer: the Slack client, its upload verb,
+    and the response shapes.
+
+    The client-presence check stays AHEAD of the body parse, where it shipped: a
+    gateway with no Slack client answers ``skipped: no_slack`` even for a
+    malformed body.
+    """
+    state: DashboardState = request.app["state"]
+    slack = state.slack_client
+    if not slack:
+        _audit_file_send(leg="slack", outcome="skipped", error="no_slack_client")
+        return web.json_response({"ok": True, "skipped": "no_slack"})
     try:
-        safe_filename = filename
-        if redact(safe_filename) != safe_filename:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="denied",
-                downstream_service="slack",
-                error="sensitive_filename_rejected",
-            )
-            return web.json_response({"error": "filename contains sensitive content"}, status=400)
-        await slack.upload_file(
-            channel,
-            thread_ts or "",
-            str(resolved),
-            safe_filename,
-            safe_filename,
+        body = await request.json()
+    except ValueError:
+        _audit_file_send(leg="slack", outcome="denied", error="invalid_json_body")
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+    file_path_raw = body.get("file_path", "")
+    filename = body.get("filename", "")
+    # Off-loop: the gate reads up to MAX_FILE_BYTES and regex-scans the content
+    # (no-blocking-call-on-event-loop).
+    error_resp, resolved, raw = await asyncio.to_thread(
+        _gate_upload_file, file_path_raw, filename, tool_kind="slack"
+    )
+    if error_resp is not None:
+        return error_resp
+    assert resolved is not None and raw is not None  # narrowed by the gate
+    # ``is_tracked_channel`` is handed to the oracle rather than imported there:
+    # one binding site, and the module stays free of the Slack handler's config
+    # dependency (same contract as ``persisted_probe`` below).
+    destination = await upload_destination.resolve_slack(
+        state,
+        slack,
+        session_key=request.headers.get("X-Session-Key", "").strip(),
+        requested_channel=body.get("channel", ""),
+        thread_ts=body.get("thread_ts"),
+        tracked_probe=is_tracked_channel,
+    )
+    if isinstance(destination, upload_destination.Refusal):
+        _audit_file_send(
+            leg="slack",
+            outcome="denied",
+            error=destination.audit_error,
+            downstream=destination.downstream,
         )
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
+        # One branch per literal status, body inline. `status=<expression>` and a
+        # body hoisted into a variable are both invisible to the error-code
+        # contract scanner, which counts either as its own bucket
+        # (test_error_code_contract) -- so the refusal says WHICH answer it is
+        # and each answer is spelled out here.
+        if destination.status == 400:
+            return web.json_response(
+                {"error": destination.error, "code": destination.code}, status=400
+            )
+        return web.json_response(
+            {"error": destination.error, "code": destination.code}, status=403
+        )
+    if isinstance(destination, upload_destination.Skip):
+        _audit_file_send(leg="slack", outcome="skipped", error=destination.reason)
+        return web.json_response({"ok": True, "skipped": destination.reason})
+    try:
+        # The filename was already cleared by the shared admission gate above —
+        # same predicate, same value, strictly earlier in this function — so the
+        # leg no longer re-checks it. #6044 made that gate the one site for the
+        # rule; a second copy here could only drift from it.
+        await slack.upload_file(
+            destination.channel,
+            destination.thread_ts,
+            str(resolved),
+            filename,
+            filename,
+        )
+        _audit_file_send(
+            leg="slack",
             outcome="completed",
-            downstream_service="slack",
-            resources=f"channel={channel} file={file_path}",
+            downstream="slack",
+            resources=f"channel={destination.channel} file={file_path_raw}",
         )
         return web.json_response({"ok": True})
     except Exception as e:
@@ -697,16 +725,116 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
         # reaches the client or the audit record (see api_slack_pins).
         safe_error, _ = redact_credentials(str(e))
         safe_error, _ = redact_exfiltration_urls(safe_error)
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
+        _audit_file_send(leg="slack", outcome="error", downstream="slack", error=safe_error)
+        return web.json_response({"error": safe_error}, status=500)
+
+
+async def api_channel_upload_file(request: web.Request) -> web.Response:
+    """POST /api/channel/upload-file — deliver a file to the caller's own
+    conversation on a non-Slack channel (internal, called by file_send).
+
+    Destination and authorization come from the shared oracle
+    (:func:`kiro_crew.dashboard.upload_destination.resolve_channel`), which for
+    this leg is the SAME send ladder the cross-surface reply mirror uses
+    (``_resolve_mirror_target``): channel-scope governance, transport
+    registration, proactive-send capability, and ``may_send_to`` recipient
+    re-authorization, all fail-closed and SEL-audited in one place — plus the
+    restricted-session ceiling the renderers' extraction path enforces, on the
+    same shared predicate. The destination comes exclusively from the caller's
+    session map entry — a request cannot name an arbitrary conversation, which is
+    what keeps this endpoint from being a broadcast primitive. The oracle also
+    resolves the delivery verb, since which channels have one is part of "can
+    this file land here": Telegram and Discord today, each via its own
+    purpose-built name-preserving ``send_document``; every other channel is a
+    skip until its transport grows that verb. The Slack counterpart above
+    resolves through the same module, one rung table away (issue #6060).
+
+    "Cannot deliver here" is a SKIP (``delivered: false``), not an error: most
+    sessions mirror nowhere, and the caller falls back to the dashboard card
+    and the Slack leg exactly as before this endpoint existed.
+    """
+    state: DashboardState = request.app["state"]
+    try:
+        body = await request.json()
+    except ValueError:
+        _audit_file_send(leg="channel", outcome="denied", error="invalid_json_body")
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+    def _skip(reason: str) -> web.Response:
+        _audit_file_send(leg="channel", outcome="skipped", error=reason)
+        return web.json_response({"ok": True, "delivered": False, "skipped": reason})
+
+    destination = await upload_destination.resolve_channel(
+        state,
+        request.headers.get("X-Session-Key", "").strip(),
+        persisted_probe=_probe_persisted_session,
+    )
+    if isinstance(destination, upload_destination.Skip):
+        return _skip(destination.reason)
+    link, deliver = destination.link, destination.deliver
+    # Off-loop: the gate reads up to MAX_FILE_BYTES and regex-scans the content
+    # (no-blocking-call-on-event-loop).
+    error_resp, resolved, raw = await asyncio.to_thread(
+        _gate_upload_file,
+        body.get("file_path", ""),
+        body.get("filename", ""),
+        tool_kind="channel",
+    )
+    if error_resp is not None:
+        return error_resp
+    assert resolved is not None and raw is not None  # narrowed by the gate
+    filename = body.get("filename", "")
+    # Display-form redaction, not just literal: redact() scans bytes, and the
+    # channel's renderer strips markup at display time — ``AKIA**…**`` passes
+    # a literal scan and displays as an intact key. Same boundary rule every
+    # renderer sink applies (``redact_for_display``) before text reaches a
+    # transport.
+    description, _ = redact_for_display(body.get("description", "") or "", redact)
+    outbound = OutboundFile(
+        path=str(resolved),
+        data=raw,
+        alt=description,
+        mime=mimetypes.guess_type(filename)[0] or "application/octet-stream",
+    )
+    try:
+        mid = await deliver(
+            link.channel_id,
+            outbound,
+            caption=description,
+            thread_id=link.thread_id,
+        )
+    except Exception as e:
+        # A transport / network exception can carry file paths, host and URL
+        # fragments, or credentials embedded in a URL. Sanitize before it
+        # reaches the client or the audit record (see api_slack_upload_file).
+        safe_error, _ = redact_credentials(str(e))
+        safe_error, _ = redact_exfiltration_urls(safe_error)
+        _audit_file_send(
+            leg="channel",
             outcome="error",
-            downstream_service="slack",
+            downstream=link.channel_type,
             error=safe_error,
         )
-        return web.json_response({"error": safe_error}, status=500)
+        return web.json_response({"error": safe_error}, status=502)
+    if not mid:
+        # The transport reported failure without raising (the clients return
+        # an empty id on an API-level refusal).
+        _audit_file_send(
+            leg="channel",
+            outcome="error",
+            downstream=link.channel_type,
+            error="delivery_reported_no_message_id",
+        )
+        return web.json_response({"error": "channel delivery failed"}, status=502)
+    _audit_file_send(
+        leg="channel",
+        outcome="completed",
+        downstream=link.channel_type,
+        resources=f"channel_type={link.channel_type} file={body.get('file_path', '')}",
+    )
+    return web.json_response(
+        {"ok": True, "delivered": True, "channel_type": link.channel_type}
+    )
 
 
 async def api_upload(request: web.Request) -> web.Response:
@@ -2125,6 +2253,241 @@ async def api_file_download(request: web.Request) -> web.Response:
     )
 
 
+# Extensions previewable via kiro_crew.doc_parser (OOXML docx/pptx). Legacy
+# binary formats (.doc, .ppt), the OpenDocument family (.odt/.ods/.odp), and
+# spreadsheet formats (.xls/.xlsx) fall through to the download card because
+# doc_parser only understands ZIP+XML OOXML, and adding openpyxl or a legacy
+# OLE reader would grow the dependency tree noticeably for a preview feature.
+_OFFICE_PREVIEWABLE_EXT = {".docx", ".pptx"}
+# Cap the returned text so a huge .docx doesn't blow the JSON payload / DOM.
+# Mirrors api_file_read's 512 KB read cap. Anything larger is truncated and
+# the frontend shows a "Download for full contents" affordance.
+_OFFICE_PREVIEW_CAP = 512_000
+
+
+class _PreviewUnsupported(Exception):
+    """The validated path's extension is outside :data:`_OFFICE_PREVIEWABLE_EXT`.
+
+    Endpoint-local, mirroring :class:`_SheetRefusal`: ``_OpenDenied``'s codes
+    are the SHARED file-serving boundary's vocabulary, and this is this
+    endpoint's own FORMAT policy rather than a security refusal, so it does
+    not belong in that enum. Raised from inside the worker callback so the
+    checked file object is closed by its ``with`` block on the same thread.
+    """
+
+
+async def api_file_office_preview(request: web.Request) -> web.Response:
+    """GET /api/file-office-preview?path=... — extract inline text preview from a .docx/.pptx.
+
+    Sibling of /api/file-download. file-download streams original bytes for
+    saving to disk; this endpoint returns plaintext extracted from the
+    OOXML XML inside so the dashboard can render a scrollable preview of
+    the document contents in place of the "can't view a binary" download
+    card — a common ask for anyone browsing shared reports in the file
+    tree without wanting to save each one.
+
+    Uses ``kiro_crew.doc_parser.extract_text`` which parses the .docx /
+    .pptx ZIP+XML with hardened defusedxml (XXE-safe) and returns "" on
+    any failure. python-docx / python-pptx are not required.
+
+    Not supported (fall through to download): .doc, .ppt, .xls, .xlsx,
+    .odt, .ods, .odp. The frontend keeps the download card for these.
+
+    Security: the open-and-check prefix is the SHARED
+    :func:`_open_checked_file` (dashboard path validation, sensitive-path
+    block, is-file, symlink-refusing ``_open_rb_nofollow`` — atomic
+    O_NOFOLLOW on POSIX, lstat guard on Windows — then fstat), never a
+    hand-rolled second spelling of it, so a future hardening change to that
+    boundary lands here too. This endpoint's own POLICY on top is the 50 MB
+    ``fstat_cap``, the ``.docx``/``.pptx`` format gate, the aggregate
+    extraction budget, and credential redaction before the preview cap is
+    applied. All of it — validation, open, fstat, ZIP+XML parsing,
+    redaction — runs in ONE worker-thread hop, like ``api_file_sheet``.
+    """
+    raw_path = request.query.get("path", "")
+
+    def _log(outcome: str, res: str, error: str = "") -> None:
+        kw = {"error": error} if error else {}
+        _sel().log_tool_invocation(
+            session_key="dashboard", tool_name="file_office_preview",
+            outcome=outcome, resources=res, **kw,
+        )
+
+    # Resolve relative paths against project dir when resolve=1. Uses the
+    # shared helper (same as api_file_read / api_file_download / file-raw):
+    # it passes Windows-absolute/UNC shapes through to the validator, whose
+    # network-path gate runs BEFORE realpath — never re-implement this inline.
+    if request.query.get("resolve") == "1":
+        raw_path, _resolve_err = _resolve_project_relative(raw_path)
+        if _resolve_err == "cannot_resolve":
+            _log("denied", request.query.get("path", ""), "cannot_resolve")
+            return web.json_response(
+                {"error": "cannot resolve: no project dir configured", "code": "no_project_dir"},
+                status=400,
+            )
+        if _resolve_err == "outside_project":
+            _log("denied", request.query.get("path", ""), "outside_project")
+            return web.json_response(
+                {"error": "path outside project directory", "code": "path_outside_project"},
+                status=400,
+            )
+
+    try:
+        validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
+    except ValidationError:
+        _log("denied", raw_path)
+        return web.json_response({"error": "invalid input", "code": "invalid_input"}, status=400)
+
+    # The validated path once the shared prefix produces one -- exported by
+    # the worker callback so the exception handlers log the same SEL resource
+    # the success path does.
+    res_path = raw_path
+
+    def _open_and_extract() -> dict[str, object] | _OpenDenied:
+        """Open-and-check plus extract, in ONE worker-thread hop.
+
+        Everything here is blocking I/O or CPU-bound — realpath validation,
+        the sensitive-path screen, the open, the fstat, ZIP decompression,
+        XML parsing, redaction — so none of it may run on the event loop: an
+        NFS/FUSE-backed document makes even the validate/open envelope block
+        for seconds, stalling every session's streaming and the liveness
+        heartbeat.
+
+        The checked open file object never crosses back to the event loop:
+        every path that opens it also closes it on THIS thread (refusals
+        close inside the prefix; the ``with`` block below covers the rest,
+        the format refusal included). A cancellation of the awaiting task
+        therefore cannot strand an open file in a discarded future or
+        finalize one on the loop — the future's result is only ever a
+        payload dict or a typed refusal.
+        """
+        nonlocal res_path
+        # fstat_cap is this endpoint's size gate, enforced on the fd BEFORE
+        # any ZIP parsing: zipfile.ZipFile materializes the archive's central
+        # directory in memory, bounded only by the file itself, so a crafted
+        # archive could otherwise exhaust memory before doc_parser's
+        # per-entry and aggregate budgets ever apply. Same 50 MB ceiling as
+        # file uploads. log_open_failure=False: this endpoint answers a coded
+        # refusal, so a request loop against a known-unreadable path cannot
+        # amplify into the log.
+        checked = _open_checked_file(
+            raw_path,
+            tool_name="file_office_preview",
+            fstat_cap=_MAX_UPLOAD_BYTES,
+            log_open_failure=False,
+        )
+        if isinstance(checked, _OpenDenied):
+            return checked
+        res_path = checked.path
+        with checked.file as fobj:
+            if os.path.splitext(checked.path)[1].lower() not in _OFFICE_PREVIEWABLE_EXT:
+                raise _PreviewUnsupported(checked.path)
+            # extract_text parses through the SAME handle the prefix opened
+            # and fstat-ed (its opt-in fileobj parameter), so the bytes
+            # parsed are exactly the bytes measured — no stat→open TOCTOU
+            # window. max_chars bounds AGGREGATE extraction (cap + 1 keeps
+            # the truncation flag detectable): a deck with thousands of
+            # slides stops parsing at the budget instead of accumulating
+            # unbounded text. It never raises — returns "" on any failure.
+            text = extract_text(
+                checked.path,
+                filename=os.path.basename(checked.path),
+                max_chars=_OFFICE_PREVIEW_CAP + 1,
+                fileobj=fobj,
+            )
+        truncated = len(text) > _OFFICE_PREVIEW_CAP
+        # Redact BEFORE truncating: slicing first could cut a credential
+        # across the cap boundary, leaving an unmatched prefix the redactor
+        # no longer recognizes. Redaction may change the length, so the
+        # truncation flag is computed from the raw extraction above.
+        text = redact(text)
+        if truncated:
+            text = text[:_OFFICE_PREVIEW_CAP]
+        return {
+            "text": text,
+            "truncated": truncated,
+            # No `empty` field: doc_parser returns "" for both a genuinely
+            # blank document and a parse failure, so the two are
+            # indistinguishable here. The frontend treats empty `text` as
+            # "no preview available" and falls back to the download card.
+        }
+
+    try:
+        result = await asyncio.to_thread(_open_and_extract)
+    except asyncio.CancelledError:
+        # Gateway shutdown / client disconnect while the worker thread is
+        # parsing: the access attempt already happened, so record it before
+        # propagating — CancelledError is a BaseException and would bypass
+        # the Exception handler below, leaving the access unaudited. No
+        # resource handling here: the worker callback owns the file's whole
+        # lifetime.
+        _log("cancelled", res_path)
+        raise
+    except _PreviewUnsupported:
+        # 415 (not 400) so the frontend can distinguish "unsupported format,
+        # keep showing the download card" from "invalid input, something's
+        # actually wrong". The frontend short-circuits known-unsupported
+        # extensions client-side, so this branch is the safety net (direct
+        # API calls, frontend/backend list drift).
+        _log("denied", res_path, "unsupported_preview_format")
+        return web.json_response(
+            {
+                "error": "unsupported format for inline preview",
+                "code": "unsupported_preview_format",
+            },
+            status=415,
+        )
+    except Exception:  # noqa: BLE001  # last-resort guard; doc_parser already logs
+        logger.exception("file_office_preview extract_text failed for %s", res_path)
+        _log("failure", res_path)
+        return web.json_response(
+            {"error": "failed to extract preview", "code": "preview_extraction_failed"},
+            status=500,
+        )
+    if isinstance(result, _OpenDenied):
+        # The shared prefix's typed refusals, mapped onto this endpoint's SEL
+        # outcomes and response vocabulary — the part that legitimately
+        # differs per endpoint.
+        code, res = result.code, result.path
+        if code == "invalid_path":
+            _log("denied", res)
+            return web.json_response(
+                {"error": "invalid or forbidden path", "code": "forbidden_path"}, status=400,
+            )
+        if code == "sensitive_path":
+            _log("denied", res, "sensitive_path")
+            return web.json_response(
+                {"error": "sensitive path blocked", "code": "sensitive_path"}, status=403,
+            )
+        if code == "not_found":
+            _log("not_found", res)
+            return web.json_response({"error": "not found", "code": "not_found"}, status=404)
+        if code == "symlink_refused":
+            _log("denied", res, "symlink_rejected")
+            return web.json_response(
+                {"error": "symlinks not allowed", "code": "symlink_rejected"}, status=403,
+            )
+        if code == "file_too_large":
+            _log("denied", res, "file_too_large")
+            return web.json_response(
+                {
+                    "error": (
+                        "file too large for preview "
+                        f"(max {_MAX_UPLOAD_BYTES // 1024 // 1024}MB)"
+                    ),
+                    "code": "file_too_large",
+                },
+                status=413,
+            )
+        # read_failed: the residual code.
+        _log("failure", res)
+        return web.json_response(
+            {"error": "cannot read file", "code": "file_read_failed"}, status=500,
+        )
+    _log("success", res_path)
+    return web.json_response(result)
+
+
 async def api_file_raw(request: web.Request) -> web.Response:
     """GET /api/file-raw?path=... — serve a file with its native content type (images, etc.)."""
     # Envelope (validate -> sensitive -> nofollow-open -> bounded read) is
@@ -2480,6 +2843,58 @@ async def api_file_stream(request: web.Request) -> web.StreamResponse:
             await asyncio.to_thread(f.close)
 
 
+def _file_write_blocking(path: str, content: str) -> str | None:
+    """Replace *path*'s contents atomically, carrying its access controls.
+
+    Returns ``None`` on success or ``"notfound"`` when the target was rejected;
+    any other failure propagates for the caller to log.
+
+    Split out of :func:`api_file_write` so the whole transaction runs OFF the
+    event loop. Every call in here is a blocking filesystem call, and on a
+    network-backed path (an SMB share, a stalled FUSE mount) each one can take
+    seconds, which on the loop thread freezes chat and the heartbeat alongside
+    it. Being on a worker thread also re-arms the Windows rename retry inside
+    ``atomic_write``, which deliberately degrades to a single attempt when it
+    finds a running loop in its own thread.
+
+    Routing through ``open_access_control_source`` rather than a bare ``os.open``
+    is what keeps this working on Windows: it returns ``None`` where the xattr
+    syscalls do not exist, and a read handle held open across the write would
+    make ``os.replace`` fail with ``PermissionError`` on every save there.
+
+    ``path`` is already canonicalized by ``_validate_dashboard_path``
+    (``realpath``), so its final component is symlink-free and the helper's
+    ``O_NOFOLLOW`` rejects nothing legitimate -- it closes the window where that
+    component is swapped for a link after the check. That refusal is a rejected
+    target rather than a server fault, hence ``"notfound"`` and not an exception.
+    """
+    try:
+        src_fd = open_access_control_source(path)
+    except OSError:
+        return "notfound"
+    try:
+        src_stat = os.fstat(src_fd) if src_fd is not None else os.stat(path)
+        # mode= keeps the previous copymode behaviour (permission bits), and
+        # preserve_access_control_from is ADDITIVE to it: copymode carried BITS
+        # only, so a named POSIX ACL (system.posix_acl_access) the owner set was
+        # silently dropped the moment the replace installed a fresh inode. The
+        # carry is allowlisted to the ACL and user.* names -- it must NOT replay a
+        # privilege-bearing security.capability onto caller-supplied content.
+        atomic_write(
+            path,
+            content,
+            mode=_stat_mod.S_IMODE(src_stat.st_mode),
+            preserve_access_control_from=src_fd,
+        )
+    finally:
+        if src_fd is not None:
+            try:
+                os.close(src_fd)
+            except OSError:
+                pass
+    return None
+
+
 async def api_file_write(request: web.Request) -> web.Response:
     """POST /api/file-write — write file content from the markdown panel."""
     from kiro_crew.validation import (  # noqa: F811
@@ -2524,24 +2939,17 @@ async def api_file_write(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "not found"}, status=404)
     try:
-        import shutil  # noqa: F811
-        import tempfile  # noqa: F811
-
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
-        try:
-            try:
-                shutil.copymode(path, tmp_path)
-            except OSError:
-                pass
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                f.write(body.get("content", ""))
-            os.replace(tmp_path, path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        # Off the event loop: see _file_write_blocking's own note on why the
+        # whole transaction is offloaded rather than each call individually.
+        outcome = await asyncio.to_thread(_file_write_blocking, path, body.get("content", ""))
+        if outcome == "notfound":
+            _sel().log_tool_invocation(
+                session_key="dashboard",
+                tool_name="file_write",
+                outcome="not_found",
+                resources=path,
+            )
+            return web.json_response({"error": "not found", "code": "not_found"}, status=404)
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_write", outcome="success", resources=path
         )
@@ -2863,6 +3271,14 @@ async def api_file_diff(request: web.Request) -> web.Response:
                 cwd=dirpath, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=5, check=True, env=_env,
             )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, UnicodeDecodeError):
+            # Only a failed repository preflight may claim "not a git repo":
+            # the client renders not_git as "there is no baseline", which is a
+            # statement about the file, not about git's health. Failures past
+            # this point (a timeout on a slow repo, git disappearing mid-flight)
+            # are computation failures and must report "error" instead.
+            return {"diff": "", "original": "", "status": "not_git"}
+        try:
             # Get HEAD content
             root = subprocess.run(
                 [*_git, "rev-parse", "--show-toplevel"],
@@ -2898,10 +3314,21 @@ async def api_file_diff(request: web.Request) -> web.Response:
                     )
                     diff = r3.stdout if r3.stdout else ""
                     return {"diff": diff, "original": "", "status": "untracked"}
+            if r.returncode != 0:
+                # `git diff` failed and the untracked probe above did not claim
+                # the file. This must stay distinguishable from a genuinely
+                # unmodified file: falling through would report status "clean",
+                # presenting a git failure as "no changes" — a false negative on
+                # a question users act on. The probe runs FIRST because the
+                # dominant non-zero exit is `fatal: bad revision 'HEAD'` in a
+                # freshly-initialized repo with no commits, where every file is
+                # simply untracked and the all-added diff is the true answer.
+                # Still HTTP 200: the request succeeded, only the diff did not.
+                return {"diff": "", "original": original, "status": "error"}
             status = "modified" if diff else "clean"
             return {"diff": diff, "original": original, "status": status}
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, UnicodeDecodeError):
-            return {"diff": "", "original": "", "status": "not_git"}
+            return {"diff": "", "original": "", "status": "error"}
 
     result = await asyncio.to_thread(_run)
     _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources=f"path={raw_path}")
@@ -3245,6 +3672,17 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
     """GET/PUT /api/dashboard/config — read or write dashboard settings."""
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
 
+    # Owner gate for PUT: reject non-owner writes before paying the config-load
+    # I/O cost. The check is cheap (in-memory predicate + optional off-thread
+    # SEL audit on denial) compared to the KiroCrewConfig.load() thread hop
+    # below, so non-owner PUT requests are rejected immediately.
+    if request.method == "PUT":
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, "dashboard_config.write")
+        if owner_denied is not None:
+            return owner_denied
+
     # Offloaded: KiroCrewConfig.load() stats, reads, parses, and validates config
     # files. The client polls this endpoint on an interval to pick up externally
     # edited dashboard.gitlab_hosts, so a slow or network-backed config directory
@@ -3280,7 +3718,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
             )
             return web.json_response({"error": "request body must be a JSON object"}, status=400)
-        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled"}
+        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled", "session_card_source_links"}
         # One-release backward-compat shim for removed key; delete after all clients update.
         deprecated_ignored_keys = {"tail_fork_head_handling"}
         # Read-only keys the GET exposes: both settings surfaces save with
@@ -3464,6 +3902,20 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             updates["auto_open_git_panel"] = val
+        if "session_card_source_links" in body:
+            val = body["session_card_source_links"]
+            if not isinstance(val, bool):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": "session_card_source_links must be a boolean",
+                        "code": "invalid_session_card_source_links",
+                    },
+                    status=400,
+                )
+            updates["session_card_source_links"] = val
         # Serialize the read-modify-write under BOTH config locks so no concurrent
         # writer -- in-process OR another process -- can clobber it:
         #  * update_config_locked holds the cross-process advisory file lock
@@ -3534,6 +3986,38 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="dashboard_config_write", outcome="success"
         )
+        chips_written = updates.get("session_card_source_links")
+        if isinstance(chips_written, bool):
+            # Publish the new value NOW instead of leaving it to the next
+            # allowlist refresh. That refresh is on a 30s TTL, so without this
+            # the sidebar keeps rendering chips for up to half a minute after an
+            # explicit click -- the switch acknowledges itself instantly and
+            # nothing appears to happen, which reads as broken. This handler
+            # already knows the value, so polling for it is the wrong shape.
+            #
+            # The push is the other half: the publisher bumps the shared
+            # generation, but the owner websocket only compares that generation
+            # once per TTL round, so a push here is what re-serializes the slots
+            # with the new answer.
+            #
+            # The value is read OUTSIDE the try on purpose: only the publish and
+            # the push may fail silently, so a body that never carried this key
+            # cannot reach the publisher at all -- and a test can tell the two
+            # apart instead of a swallowed KeyError standing in for the guard.
+            try:
+                from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
+                    publish_session_card_chips_now,
+                )
+
+                await publish_session_card_chips_now(chips_written)
+                state = request.app.get("state")
+                if state is not None:
+                    state.push_slots_update()
+            except Exception:
+                # Best-effort: the write itself succeeded, and the next refresh
+                # round picks the value up within one TTL. Failing the request
+                # here would report a saved setting as unsaved.
+                logger.debug("chip-switch snapshot publish failed", exc_info=True)
         return web.json_response({"ok": True})
     _sel().log_tool_invocation(
         session_key="dashboard", tool_name="dashboard_config_read", outcome="success"
@@ -3550,6 +4034,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "session_grid": cfg.dashboard.session_grid,
             "mcp_app_panel": cfg.dashboard.mcp_app_panel,
             "auto_open_git_panel": cfg.dashboard.auto_open_git_panel,
+            "session_card_source_links": cfg.dashboard.session_card_source_links,
             "tail_fork_enabled": cfg.dashboard.tail_fork_enabled,
             "link_previews": cfg.dashboard.link_previews,
             "folder_suggestions_enabled": cfg.dashboard.folder_suggestions_enabled,
@@ -3692,33 +4177,25 @@ def _vet_zip_eocd(data: bytes) -> None:
     """Refuse archives whose end-of-central-directory record declares an
     oversized inventory, BEFORE zipfile.ZipFile is constructed.
 
-    ZipFile.__init__ walks the whole central directory and allocates a
-    ZipInfo per entry, so a crafted archive with hundreds of thousands of
-    entries exhausts memory during construction -- ahead of any infolist()
-    check. The EOCD carries both the entry count and the central-directory
-    byte size; capping both bounds that allocation regardless of which field
-    lies (zipfile itself iterates the directory by its byte size).
+    Delegates to the shared vet (kiro_crew.zip_vet) so this endpoint, knowledge
+    ingest, and document parsing share one implementation of the preflight --
+    only the caps and the error channel stay per-caller. This endpoint's
+    observable behaviour is unchanged: a tail with no usable EOCD still reads as
+    "not a spreadsheet" (415), an over-cap inventory as an expansion refusal
+    (413).
     """
-    # EOCD (PK\x05\x06) sits within the last 22 + 65535 bytes (fixed record
-    # plus maximum comment length).
-    tail_start = max(0, len(data) - (22 + 65535))
-    eocd = data.rfind(b"PK\x05\x06", tail_start)
-    if eocd < 0 or len(data) < eocd + 22:
-        raise _SheetRefusal(415, "not an OOXML spreadsheet", "not_a_spreadsheet")
-    count = int.from_bytes(data[eocd + 10 : eocd + 12], "little")
-    cdir_size = int.from_bytes(data[eocd + 12 : eocd + 16], "little")
-    if count == 0xFFFF or cdir_size == 0xFFFFFFFF:
-        # Saturated classic fields mean the archive declares >= 65535 entries
-        # or a >= 4 GiB central directory -- both orders of magnitude past
-        # this endpoint's caps, so the ZIP64 records that would carry the
-        # real numbers can never change the verdict. Refusing outright keeps
-        # the vet free of a second record-location protocol to get right.
-        raise _SheetRefusal(413, "workbook expands too large", "workbook_expands_too_large")
-    if (
-        count > _SHEET_MAX_MEMBERS
-        or cdir_size > _SHEET_MAX_MEMBERS * _SHEET_MAX_CDIR_ENTRY_BYTES
-    ):
-        raise _SheetRefusal(413, "workbook expands too large", "workbook_expands_too_large")
+    try:
+        vet_zip_inventory_bytes(
+            data,
+            max_members=_SHEET_MAX_MEMBERS,
+            max_cdir_entry_bytes=_SHEET_MAX_CDIR_ENTRY_BYTES,
+        )
+    except ZipInventoryRejected as exc:
+        if exc.reason in ("missing_eocd", "truncated_eocd", "unreadable"):
+            raise _SheetRefusal(
+                415, "not an OOXML spreadsheet", "not_a_spreadsheet") from exc
+        raise _SheetRefusal(
+            413, "workbook expands too large", "workbook_expands_too_large") from exc
 
 
 def _parse_workbook_grid(data: bytes) -> dict:

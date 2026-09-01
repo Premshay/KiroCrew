@@ -16,7 +16,7 @@ import threading
 import time
 import traceback
 import uuid
-from collections.abc import Coroutine, Iterator
+from collections.abc import Coroutine, Iterable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, TypeVar
@@ -25,17 +25,34 @@ from aiohttp import web
 
 from kiro_crew.acp.types import STOP_REASON_CANCELLED
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import DASHBOARD_PORT, _raw_config, config_dir
+from kiro_crew.config.loader import (
+    DASHBOARD_PORT,
+    _raw_config,
+    config_dir,
+    resolve_effective_agent,
+)
 from kiro_crew.constants import (
     OPTIONS_RE_LINE,
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
 )
 from kiro_crew.dashboard.chat_compaction_notice import deliver_channel_compaction_notice
+from kiro_crew.dashboard.dashboard_persistence import DashboardPersistenceCoordinator
+from kiro_crew.dashboard.folder_repository import FOLDERS_FILE, FolderRepository
+from kiro_crew.dashboard.interaction_coordinator import (
+    ApprovalCoordinator,
+    QuestionCoordinator,
+)
+from kiro_crew.dashboard.notification_coordinator import NotificationCoordinator
 from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.dashboard.session_pulse_counter import increment_user_session_count_off_loop
 from kiro_crew.dashboard.side_state import SideState
+from kiro_crew.dashboard.slot_buffers import SlotBufferCoordinator
+from kiro_crew.dashboard.slot_projection import SlotProjection
+from kiro_crew.dashboard.slot_queue_repository import SlotQueueRepository
+from kiro_crew.dashboard.slot_registry import SlotRegistry
 from kiro_crew.dashboard.system_notices import is_system_notice
+from kiro_crew.dashboard.websocket_hub import WebSocketHub
 from kiro_crew.history import latest_transcript_ts, monotonic_transcript_ts
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.loop_lock import LoopBoundLock
@@ -44,6 +61,7 @@ from kiro_crew.messaging.link import (
     UNBIND_REASON_DASHBOARD_UNLINK,
     UNBIND_REASON_ENTRY_DELETED,
     UNBIND_REASON_ORIGIN_REBIND,
+    UNBIND_REASON_PRUNED_STALE,
     UNBIND_REASON_SESSION_DESTROYED,
     UNBIND_REASON_UNSPECIFIED,
     UNBIND_REASON_USER_UNLINK,
@@ -97,6 +115,104 @@ if TYPE_CHECKING:
     from kiro_crew.slack.outbound import PostedOptions  # noqa: F401
 
 logger = logging.getLogger(__name__)
+_FOLDER_REPOSITORY = FolderRepository(lambda: logger)
+
+
+def _new_notification_coordinator() -> NotificationCoordinator:
+    """Build a coordinator whose providers resolve facade seams at call time."""
+    return NotificationCoordinator(
+        logger_provider=lambda: logger,
+        payload_from_legacy=lambda *args, **kwargs: payload_from_legacy(*args, **kwargs),
+        validation_error=NotificationValidationError,
+        redact_value=lambda value: _redact_note_value(value),
+        sweep_expired=lambda notes: sweep_expired_notifications(notes),
+        persist_one=lambda note: _persist_notification(note),
+        rewrite_all=lambda notes: _rewrite_notifications(notes),
+        executor_provider=lambda: _notification_io_executor(),
+        max_persisted=_MAX_PERSISTED_NOTIFICATIONS,
+    )
+
+
+def _notifications_for(state: Any) -> NotificationCoordinator:
+    """Return the per-state coordinator, including for ``__new__`` test states."""
+    coordinator = getattr(state, "_notification_coordinator", None)
+    if not isinstance(coordinator, NotificationCoordinator):
+        coordinator = _new_notification_coordinator()
+        state._notification_coordinator = coordinator
+    return coordinator
+
+
+def _approvals_for(state: Any) -> ApprovalCoordinator:
+    coordinator = getattr(state, "_approval_coordinator", None)
+    if not isinstance(coordinator, ApprovalCoordinator):
+        coordinator = ApprovalCoordinator()
+        state._approval_coordinator = coordinator
+    return coordinator
+
+
+def _questions_for(state: Any) -> QuestionCoordinator:
+    coordinator = getattr(state, "_question_coordinator", None)
+    if not isinstance(coordinator, QuestionCoordinator):
+        coordinator = QuestionCoordinator()
+        state._question_coordinator = coordinator
+    return coordinator
+
+
+def _permission_marker() -> Callable[[list[dict], str, str], bool]:
+    """Resolve the module-level marker lazily for monkeypatched tests/callers."""
+    return _mark_permission_resolved
+
+
+def _new_websocket_hub(state: Any) -> WebSocketHub:
+    """Build a hub whose providers resolve facade seams at call time."""
+    return WebSocketHub(
+        state,
+        serving_loop_provider=lambda: state.serving_loop,
+        running_loop_provider=lambda: state._running_loop(),
+        logger_provider=lambda: logger,
+        redact_credentials_provider=lambda: redact_credentials,
+        redact_exfiltration_urls_provider=lambda: redact_exfiltration_urls,
+        scope_state_provider=lambda: state,
+    )
+
+
+def _websocket_for(state: Any) -> WebSocketHub:
+    """Return the per-state hub, including for ``__new__`` test states."""
+    hub = getattr(state, "_websocket_hub", None)
+    if not isinstance(hub, WebSocketHub):
+        hub = _new_websocket_hub(state)
+        state._websocket_hub = hub
+    return hub
+
+
+def _new_dashboard_persistence() -> DashboardPersistenceCoordinator:
+    """Build persistence providers that preserve module monkeypatch seams."""
+    return DashboardPersistenceCoordinator(
+        config_dir_provider=lambda: config_dir(),
+        atomic_write_provider=lambda: atomic_write,
+        logger_provider=lambda: logger,
+        json_codec_provider=lambda: json,
+        wall_time_provider=lambda: time.time(),
+    )
+
+
+def _persistence_for(state: Any) -> DashboardPersistenceCoordinator:
+    """Return the per-state coordinator, including for ``__new__`` test states."""
+    coordinator = getattr(state, "_persistence_coordinator", None)
+    if not isinstance(coordinator, DashboardPersistenceCoordinator):
+        coordinator = _new_dashboard_persistence()
+        state._persistence_coordinator = coordinator
+    return coordinator
+
+
+def _registry_for(state: Any) -> SlotRegistry:
+    """Return the per-state registry boundary for facade-compatible test states."""
+    registry = getattr(state, "_slot_registry", None)
+    if not isinstance(registry, SlotRegistry):
+        registry = SlotRegistry()
+        state._slot_registry = registry
+    return registry
+
 
 #: The single ceiling on live slots, owned by the module that owns the slot
 #: table (see :meth:`DashboardState.live_slot_count`). Every path that allocates
@@ -104,6 +220,23 @@ logger = logging.getLogger(__name__)
 #: against this one number, so raising the ceiling is a single edit and no entry
 #: point can silently drift to a different limit.
 MAX_LIVE_SLOTS = 500
+
+#: The most live slots ONE creator may hold, as a sub-ceiling under
+#: :data:`MAX_LIVE_SLOTS`. The global ceiling alone bounds the total but not the
+#: distribution, so a single automated creator working through a nudge loop can
+#: reach 500 on its own and every later create -- including the person opening a
+#: new chat tab -- gets the 429. That is the availability half of the cap: a
+#: bounded resource that one caller may exhaust entirely is not bounded from
+#: anybody else's point of view.
+#:
+#: Deliberately far above real use and far below the global ceiling: a decomposed
+#: goal runs on the order of ten concurrent sessions, so 50 never binds honest
+#: work, while 450 slots stay reachable by everyone else no matter what one
+#: caller does. Enforced in ``session_control.create_session``, which is the only
+#: entry point that creates on some OTHER caller's behalf; a person's own new tab
+#: and a fork are attributed to nobody and so are bounded by the global ceiling
+#: alone.
+MAX_SLOTS_PER_CREATOR = 50
 
 #: Return type of a mutate_folders callback.
 _T = TypeVar("_T")
@@ -128,17 +261,56 @@ _CHANNEL_LABELS = {
 def _safe_folder_tree(folders: object) -> list[dict[str, Any]]:
     """Well-formed folder entries safe to ship on the slots broadcast frame.
 
-    ``load_folders`` does a bare ``json.loads`` with no shape validation, so a
-    corrupt ``folders.json`` can leave ``_folders`` as a non-list (``list()``
-    would then raise ``TypeError`` on the broadcast hot path) or a list holding
-    non-dicts / dicts without an ``id`` (which the client's grouping keys on).
-    Keep only dict entries carrying a string ``id`` so a corrupt store degrades
-    to a smaller/empty tree rather than crashing every slot push. A non-list
-    (including ``None`` from an unset/partially-constructed state) yields ``[]``.
+    The loader validates disk rows, but lightweight states and test doubles can
+    bypass it. Keep the broadcast hot path tolerant of an unset or malformed
+    in-memory value.
     """
     if not isinstance(folders, list):
         return []
     return [f for f in folders if isinstance(f, dict) and isinstance(f.get("id"), str)]
+
+
+def _slots_ws_frame(
+    slots: object,
+    *,
+    yolo: bool,
+    channel_trusted: bool,
+    gitlab_hosts_gen: object,
+    folders: object,
+    folders_gen: object,
+) -> str:
+    """Serialize the dashboard-user ``slots`` WS frame.
+
+    ONE builder for the two sites that send this frame — the generic fan-out in
+    :meth:`DashboardState._broadcast` and the owner frame in
+    :meth:`DashboardState._do_slots_broadcast` — because they must carry the SAME
+    keys and nothing else enforces that. ``_send_ws_all`` skips owner sockets for
+    ``slots``, so the generic frame no longer backstops an owner: a key present in
+    one envelope and not the other silently deprives every owner window, with no
+    error anywhere. Hand-building both is exactly how they drifted before (the
+    owner frame was a strict subset, missing ``folders`` and
+    ``gitlabHostsGeneration``), so the remedy is one builder rather than a second
+    careful copy — drift becomes impossible by construction instead of merely
+    detectable.
+
+    DELIBERATELY NOT used for the app-token frame in
+    :meth:`DashboardState._serialize_for_client`. That envelope diverges on
+    purpose: it omits ``folders`` (apps do not render the chat folder tree) and
+    gates ``yolo`` / ``channelTrusted`` behind the token's declared scope. Routing
+    it through here would widen an app's payload, so it is a third shape by
+    design, not a duplicate awaiting cleanup.
+    """
+    return json.dumps(
+        {
+            "type": "slots",
+            "data": slots,
+            "yolo": yolo,
+            "channelTrusted": channel_trusted,
+            "gitlabHostsGeneration": gitlab_hosts_gen,
+            "folders": folders,
+            "foldersGeneration": folders_gen,
+        }
+    )
 
 
 def _split_namespaced_channel_id(channel_id: str | None) -> tuple[str, str] | None:
@@ -860,6 +1032,7 @@ _INBOUND_UNBIND_WHY: dict[str, str] = {
     UNBIND_REASON_ORIGIN_REBIND: "this conversation was relinked to a new session",
     UNBIND_REASON_SESSION_DESTROYED: "that session was deleted",
     UNBIND_REASON_ENTRY_DELETED: "that session's record was removed",
+    UNBIND_REASON_PRUNED_STALE: "that session's record was no longer on disk",
     UNBIND_REASON_UNSPECIFIED: "the link was cleared",
 }
 _INBOUND_UNBIND_WHY_DEFAULT = "the link was cleared"
@@ -889,9 +1062,29 @@ def stuck_turn_notice(parked_secs: float) -> str:
 
 _MAX_SLOT_MESSAGES = 10000  # Keep all messages — virtual scrolling handles performance
 
+#: Transient/streaming roles that are never persisted by the save path
+#: (``chat_persistence._build_message_entry`` returns ``None`` for them) and are
+#: skipped by durable readers. Defined here — beside the trim path that must
+#: count the durable rows it folds into the frozen prefix — and re-exported by
+#: ``chat_persistence`` as ``_TRANSIENT_ROLES`` for its readers, so there is one
+#: definition rather than two that can drift.
+_TRANSIENT_ROLES = frozenset({"chunk", "done", "streaming", "queued", "permission"})
+
+
+def durable_row_count(rows: Iterable[dict]) -> int:
+    """How many of *rows* a durable read returns: everything non-transient.
+
+    The one shared counting rule for the durable-only frozen-prefix counter
+    (``_disk_older_durable_count``): every site that sets or advances it counts
+    with this, so the restore paths, the channel restore and the trim path can
+    never disagree about which rows are durable.
+    """
+    return sum(1 for m in rows if m.get("role") not in _TRANSIENT_ROLES)
+
+
 #: Roles that exist only on the wire: appended so a reader/flush can see them,
 #: never broadcast as a `chat_message` and never persisted (the mirror of
-#: ``chat_persistence._TRANSIENT_ROLES`` minus the rows that ARE broadcast).
+#: ``_TRANSIENT_ROLES`` above minus the rows that ARE broadcast).
 #: They get no ``meta.mid`` — see ``_ChatSlot.append``.
 _WIRE_ONLY_ROLES = frozenset({"chunk", "done", "streaming"})
 
@@ -961,7 +1154,63 @@ def _source_links_by_kind(links: list[dict]) -> tuple[list[dict], list[dict]]:
     return changes, issues
 
 
-def _project_source_links(links: list[dict], include_check_status: bool) -> list[dict]:
+# Deduplicated SEL audit of the non-owner public-repo status grant. This runs on
+# the per-link serialization path (every push broadcast), so an un-deduplicated
+# write would be unbounded — collapse to one event per URL per window, mirroring
+# ws_event_scope._audit_decision. AUTOSDE (backend-security-controls) requires a
+# SEL event for every permission decision, grants included.
+_PUBLIC_STATUS_GRANT_AUDIT: dict[str, float] = {}
+_PUBLIC_STATUS_DENY_AUDIT: dict[str, float] = {}
+_PUBLIC_STATUS_GRANT_WINDOW_SECS = 300.0
+
+
+def _audit_public_status_grant(url: str) -> None:
+    now = time.monotonic()
+    last = _PUBLIC_STATUS_GRANT_AUDIT.get(url)
+    if last is not None and (now - last) < _PUBLIC_STATUS_GRANT_WINDOW_SECS:
+        return
+    _PUBLIC_STATUS_GRANT_AUDIT[url] = now
+    try:
+        sel().log_api_access(
+            caller="dashboard-user",
+            operation="source_link_public_status",
+            outcome="allowed",
+            source="source_links",
+            resources=url,
+        )
+    except Exception:
+        logger.debug("SEL audit for public-status grant failed", exc_info=True)
+
+
+def _audit_public_status_denied(url: str) -> None:
+    # Symmetric to the grant audit: AUTOSDE backend-security-controls requires a
+    # SEL event for every permission DECISION, denials included. A non-owner
+    # dashboard user requested status on a repo that is NOT confirmed public
+    # (private / unknown / stale) and was denied — record it, deduplicated per
+    # URL per window (same hot per-link broadcast path as the grant).
+    now = time.monotonic()
+    last = _PUBLIC_STATUS_DENY_AUDIT.get(url)
+    if last is not None and (now - last) < _PUBLIC_STATUS_GRANT_WINDOW_SECS:
+        return
+    _PUBLIC_STATUS_DENY_AUDIT[url] = now
+    try:
+        sel().log_api_access(
+            caller="dashboard-user",
+            operation="source_link_public_status",
+            outcome="denied",
+            source="source_links",
+            resources=url,
+        )
+    except Exception:
+        logger.debug("SEL audit for public-status denial failed", exc_info=True)
+
+
+def _project_source_links(
+    links: list[dict],
+    include_check_status: bool,
+    *,
+    dashboard_user: bool = False,
+) -> list[dict]:
     """Attach cached chip status to each link, gated on kind and on the caller.
 
     The chip-status cache is pull-request-only: it holds a {ci, state}
@@ -969,20 +1218,63 @@ def _project_source_links(links: list[dict], include_check_status: bool) -> list
     URL it never stores -- and if a PR and an issue ever normalized to the same
     key, the issue chip would inherit the PR's CI glyph. Gate on kind.
 
+    ``include_check_status`` is the OWNER gate: the owner sees status for every
+    link, public or private. ``dashboard_user`` is the weaker, PUBLIC-ONLY gate:
+    a non-owner but authenticated dashboard user sees status only for a link
+    whose repository is KNOWN public, because that lifecycle state is already
+    world-visible on the provider's website. Private and not-yet-known repos
+    fall through to owner-only (fail closed). App tokens pass neither flag and
+    keep bare chips.
+
     Shared by the budgeted slots payload and the unbudgeted overflow-expand
     read so the two cannot decorate the same link differently.
     """
-    return [
-        {
-            **link,
-            **(
-                (_cached_check_status(link["url"]) or {})
-                if include_check_status and link.get("kind", "change") == "change"
-                else {}
-            ),
-        }
-        for link in links
-    ]
+
+    def _attach(link: dict) -> bool:
+        if link.get("kind", "change") != "change":
+            return False
+        if include_check_status:
+            return True
+        granted = dashboard_user and _repo_is_public(link["url"]) is True
+        if granted:
+            # SEL-audit the AUTHORIZATION DECISION (AUTOSDE
+            # backend-security-controls: every permission decision, grants
+            # included). This grants a non-owner status on a repo whose public
+            # visibility we positively confirmed — a real access-control
+            # decision, so it must leave an allow event. Deduplicated per URL per
+            # window because this runs per-link on every push broadcast; an
+            # un-deduplicated write here would be unbounded on the hot path.
+            _audit_public_status_grant(link["url"])
+        elif dashboard_user:
+            # DENY decision: a non-owner dashboard user requested status on a
+            # change link but the repo is not confirmed public (private /
+            # unknown / stale), so status is withheld. AUTOSDE requires the
+            # denial to be audited too — deduplicated the same way (GPT #6789
+            # round-15). include_check_status (owner) paths never reach here, and
+            # app tokens set neither flag so they are not "denied dashboard-user"
+            # decisions.
+            _audit_public_status_denied(link["url"])
+        return granted
+
+    def _status(url: str) -> dict:
+        # Project ONLY the known chip-status keys, never the raw cache dict.
+        # Splatting ``**cache`` was fail-open: the cache payload already outgrew
+        # its docstring once (mergeStateStatus), so the next field would ride
+        # silently into every frame — including, via the general broadcast, an
+        # app-token frame (ws_event_scope strips the same names on the far end,
+        # but the two lists must not be the sole guarantee). Enumerating here
+        # fails closed at the source: an unlisted field is simply not emitted.
+        cached = _cached_check_status(url) or {}
+        return {k: cached[k] for k in _CHIP_STATUS_KEYS if k in cached}
+
+    return [{**link, **(_status(link["url"]) if _attach(link) else {})} for link in links]
+
+
+# The only fields the chip-status cache is allowed to project onto a source
+# link. Kept in step with ws_event_scope._SOURCE_LINK_STATUS_KEYS (the app-token
+# strip) and the frontend SidebarSourceLink type; a field absent here is never
+# emitted, so widening the cache cannot leak a new field into any frame.
+_CHIP_STATUS_KEYS = ("ci", "state", "mergeable", "mergeStateStatus")
 
 
 _NON_DURABLE_SOURCE_LINK_ROLES = frozenset({"chunk", "done", "streaming", "queued", "permission"})
@@ -1531,6 +1823,9 @@ class _ChatSlot:
     """Independent chat session that runs server-side."""
 
     __slots__ = (
+        "_buffers",
+        "_projection",
+        "_queue_repository",
         "_source_links_cache",
         "_source_links_revision",
         "key",
@@ -1568,6 +1863,7 @@ class _ChatSlot:
         "_summary_turn_mark",
         "_detail_render_lock",
         "_last_stop_reason",
+        "_created_by",
         "_artifact",
         "_channel_folder_filed",
         "_resumed_count",
@@ -1587,11 +1883,13 @@ class _ChatSlot:
         "_stop_event_id",
         "_stop_escalated_card_id",
         "_pending_reset_history_key",
+        "_pending_discard_conversation_key",
         "_eager_spawn_task",
         "_prefetch_ttl_task",
         "_dirty_flag",
         "_dirty_gen",
         "_orch_tracker",
+        "_plan_cancelled",
         "_auto_run",
         "_in_stage_execution",
         "_last_turn_auth_required",
@@ -1661,7 +1959,9 @@ class _ChatSlot:
         "_tab_id",
         "_channel_window_mtime",
         "_disk_older_count",
+        "_disk_older_durable_count",
         "_disk_window_len",
+        "_disk_meta_created_at",
         "_disk_tail_ts",
         "_frozen_prefix_cache",
         "_pending_rewrite",
@@ -1710,6 +2010,14 @@ class _ChatSlot:
         self.project: str = ""
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self.messages: list[dict[str, Any]] = []
+        self._buffers = SlotBufferCoordinator()
+        self._projection = SlotProjection()
+        self._queue_repository = SlotQueueRepository(
+            id_provider=lambda: uuid.uuid4().hex[:12],
+            timestamp_provider=lambda: datetime.now(timezone.utc).isoformat(),
+            delivery_key=lambda content: _delivery_key(content),
+            max_pending_deliveries=lambda: _MAX_PENDING_SUBAGENT_DELIVERIES,
+        )
         # (content revision, links) cache for the sidebar PR chips scan.
         self._source_links_revision = 0
         self._source_links_cache: tuple[tuple[int, int], list[dict]] | None = None
@@ -1787,6 +2095,11 @@ class _ChatSlot:
         # finish, and deriving anything from it would describe work that was
         # interrupted mid-flight as if it had concluded.
         self._last_stop_reason: str = ""
+        #: The resolved slot key of the caller that asked for this session via the
+        #: session-control create verb, or "" for a slot nobody asked for -- a
+        #: person's own tab, a fork, a restore. Read by
+        #: ``DashboardState.creator_slot_count`` for ``MAX_SLOTS_PER_CREATOR``.
+        self._created_by: str = ""
         # Artifact companion binding: set when this slot is a
         # companion chat session for an artifact (slug). At most one
         # non-archived slot per slug by convention — the frontend flow
@@ -1859,6 +2172,11 @@ class _ChatSlot:
         # inline because the endpoint can be reached from inside the kiro-cli
         # process group via the set_project MCP tool.
         self._pending_reset_history_key: str | None = None
+        # Set by the reset_conversation directive; consumed alongside the
+        # project-change reset above. Deferred for the same reason: the tool is
+        # called from inside the turn it wants to end, and the immediate route
+        # refuses a busy slot rather than tearing down a turn mid-write.
+        self._pending_discard_conversation_key: str | None = None
         # Debounced speculative session-creation task (session.eager_spawn).
         # At most one per slot: scheduling a new one cancels the previous, so
         # rapid signals (create + project set) collapse into a single spawn.
@@ -1871,6 +2189,16 @@ class _ChatSlot:
         # "the True I started this save under" from "a NEW True set during it".
         self._dirty_gen: int = 0
         self._orch_tracker: Any = None  # OrchestrationTracker, set by gateway
+        # Plan-cancel latch closing the cancel/Go race (#6046): the Cancel
+        # handler can only stop a tracker that exists, but _stage_loop creates
+        # the tracker lazily, so a cancel processed between a Go POST being
+        # accepted and its _stage_loop coroutine starting would no-op on the
+        # tracker and the plan would advance anyway. The handler sets this flag
+        # unconditionally; _stage_loop checks it before creating a tracker and
+        # exits without advancing. Cleared ONLY when a new plan is armed
+        # (_reset_auto_run_for_new_plan) — never on Go, so a Go on a cancelled
+        # plan cannot resurrect it (that would just invert the race).
+        self._plan_cancelled: bool = False
         self._auto_run: bool = False  # "Go All" — skip stage gates
         # True only while _stage_loop is driving a stage-execution turn. Gates
         # the end-of-turn plan detector so a stage turn whose output happens to
@@ -2077,12 +2405,34 @@ class _ChatSlot:
         self._disk_older_count: int = (
             0  # count of disk messages OLDER than in-memory window (stable, set at restore/resume)
         )
+        # Durable-only frozen-prefix counter: how many durable rows (role not
+        # in ``_TRANSIENT_ROLES``) have LEFT the in-memory window off the front.
+        # Absolute message positions (``session_control.read_messages``) are
+        # built over durable rows, so they base on THIS counter;
+        # ``_disk_older_count`` keeps its save-model contract (the frozen
+        # prefix saves must not rewrite) untouched. The two also draw the
+        # unpersisted-overflow line differently — see the trim path below.
+        # Maintained at every site that sets or advances ``_disk_older_count``,
+        # always via :func:`durable_row_count`. Never persisted — every restore
+        # path recomputes it from the messages on disk.
+        self._disk_older_durable_count: int = 0
         # Count of in-memory window messages the LAST save persisted to disk
         # (the on-disk window region). Trimming may only fold a leading window
         # message into the frozen prefix once it is known to be on disk; this
         # watermark is what makes the #8 trim credit safe. It is NOT a fragile
         # "what to append" counter — saves always re-serialize the WHOLE window.
         self._disk_window_len: int = 0
+        # The ``created_at`` of the on-disk metadata line this slot LAST
+        # OBSERVED (at restore or at its own save). This is the session file's
+        # identity: ``delete_session`` removes the file and a later writer
+        # (e.g. a channel/cron ``append_off_loop``) creates a FRESH one with a
+        # new ``created_at``, so a pending save comparing the current on-disk
+        # value against this field can tell "the same file I knew" from "a
+        # different file born after my session was permanently deleted" — the
+        # delete-won guard in ``_save_slot_to_history`` refuses to merge the
+        # deleted window into the latter. Empty means "never observed a disk
+        # identity" (fresh slot), which the guard treats as no evidence.
+        self._disk_meta_created_at: str = ""
         # The newest ``ts`` seen on disk at the last save, INCLUDING rows this
         # slot never observed. A subagent, cron, or CLI appending to a session a
         # live tab also has open writes rows that ``_save_slot_to_history``
@@ -2916,15 +3266,29 @@ class _ChatSlot:
         # Trim old messages to bound memory usage
         if len(self.messages) > _MAX_SLOT_MESSAGES:
             excess = len(self.messages) - _MAX_SLOT_MESSAGES
-            del self.messages[:excess]
-            self._resumed_count = max(0, self._resumed_count - excess)
             # A trimmed leading window message may only join the frozen prefix
             # once it is actually on disk. Credit _disk_older_count only
             # for the persisted portion; the unpersisted overflow (should not
             # happen between 5s flushes) is logged rather than silently counted
             # as on-disk, which would have stranded those turns.
             persisted_trim = min(excess, self._disk_window_len)
+            # The durable counter counts the WHOLE evicted slice, including the
+            # unpersisted overflow the disk counter excludes. The two draw
+            # different lines because they answer different questions:
+            # ``_disk_older_count`` claims on-disk lines (its save contract), so
+            # counting a row that never reached disk would corrupt the frozen
+            # prefix. ``_disk_older_durable_count`` is a POSITION base with no
+            # disk contract — if a durable row leaves the window uncounted,
+            # every later absolute position shifts down and a poller's cursor
+            # silently skips rows. Counting the lost rows instead makes a cursor
+            # that pointed at them refuse loudly (``since < base``), which is
+            # the recoverable outcome. Counted BEFORE the ``del`` below —
+            # afterwards the slice is gone.
+            durable_trim = durable_row_count(self.messages[:excess])
+            del self.messages[:excess]
+            self._resumed_count = max(0, self._resumed_count - excess)
             self._disk_older_count += persisted_trim
+            self._disk_older_durable_count += durable_trim
             self._disk_window_len = max(0, self._disk_window_len - excess)
             if persisted_trim < excess:
                 logger.warning(
@@ -2965,61 +3329,21 @@ class _ChatSlot:
         return False
 
     def push_wire_frame(self, cls: str, content: str) -> None:
-        """Queue an ephemeral wire-only frame for live SSE readers.
-
-        Unlike ``append_message`` this touches NOTHING durable: the frame is
-        not added to ``messages``, not counted in ``total_messages``, not
-        persisted, and not WS-broadcast. It only lands in ``_pending`` so an
-        attached HTTP stream reader drains it before the turn's ``done``.
-        Use for out-of-band signals (e.g. the context meter) that a WebSocket
-        client gets via a typed broadcast but an SSE-only client would miss.
-        The queue/ordering contract lives here so callers never hand-roll a
-        raw ``_pending`` append at a distance.
-        """
-        self._pending.append({"role": cls, "content": content, "cls": cls, "ts": ""})
-        self.event.set()
+        """Queue an ephemeral frame for live SSE readers only."""
+        self._buffers.push_wire_frame(self, cls, content)
 
     def drain(self) -> list[dict[str, str]]:
         """Return and clear pending messages."""
-        out = self._pending[:]
-        self._pending.clear()
-        self.event.clear()
-        return out
+        return self._buffers.drain(self)
 
     @property
     def pending_has_consumer(self) -> bool:
-        """True while something can still deliver rows out of ``_pending``.
-
-        The queue serves two unrelated roles. For a WebSocket client it is dead
-        weight: every row it holds was already broadcast, and nothing reads the
-        queue again until the slot's next turn discards it. For an HTTP SSE
-        reader (``/api/chat``) or an OpenAI-compatible reader
-        (``/v1/chat/completions``) it IS the delivery queue -- a row still in it
-        has NOT reached the client, so dropping one truncates the answer.
-
-        So a release may only drop rows while no consumer is attached, and the
-        answer needs two signals because they arm at different moments:
-        ``_has_reader`` is set before the SSE turn is dispatched (covering the
-        window before the reader loop runs its first iteration), and
-        ``_pending_consumers`` is held for the span of each reader loop. The
-        OpenAI-compatible paths deliberately do not set ``_has_reader`` -- that
-        flag also suppresses the global message broadcast, which those slots
-        still want -- so the counter is the only thing that sees them.
-        """
-        return self._pending_consumers > 0 or self._has_reader
+        """True while something can still deliver rows out of the pending queue."""
+        return self._buffers.pending_has_consumer(self)
 
     @property
     def _has_reader(self) -> bool:
-        """True while an HTTP SSE stream is draining this slot.
-
-        A property, not a plain field, because clearing it LIFTS the release
-        guard: the SSE reader sets it before the turn is dispatched and clears
-        it on ``done`` or on the way out, and a deferred release has to be
-        retried at that moment or never. Routing every write through the setter
-        means a future assignment site inherits the retry instead of silently
-        reopening the leak -- the same reason ``pending_consumer`` retries in its
-        ``finally`` rather than trusting its callers to remember.
-        """
+        """True while an HTTP SSE stream is draining this slot."""
         return self._has_reader_flag
 
     @_has_reader.setter
@@ -3030,148 +3354,43 @@ class _ChatSlot:
             self._retry_deferred_release()
 
     def _retry_deferred_release(self) -> int:
-        """Re-attempt a release that a consumer previously refused. Returns rows freed.
-
-        Called at each point the guard can lift -- the last consumer detaching
-        and ``_has_reader`` clearing. A no-op unless a release was actually
-        deferred, so an ordinary reader that drained its queue cleanly costs one
-        boolean test and changes nothing.
-        """
-        if not self._pending_release_deferred:
-            return 0
-        return self.release_pending_chunks()
+        """Retry a release refused while a delivery consumer was attached."""
+        return self._buffers.retry_deferred_release(self)
 
     @contextlib.contextmanager
     def pending_consumer(self) -> Iterator[None]:
-        """Hold ``_pending`` as an attached delivery queue for the block.
-
-        Counted rather than boolean: nothing forbids two readers on one slot,
-        and a boolean would let the first to finish declare the queue unowned
-        while the second is still mid-stream.
-        """
-        self._pending_consumers += 1
-        try:
+        """Hold the pending list as an attached delivery queue for the block."""
+        with self._buffers.pending_consumer(self):
             yield
-        finally:
-            self._pending_consumers = max(0, self._pending_consumers - 1)
-            # The detaching consumer may have been the only thing holding the
-            # queue. A consumer that drained cleanly leaves nothing to free; one
-            # that went away mid-stream (client hung up, exception) leaves the
-            # rows the turn-end purge already tried to drop, and this is the only
-            # moment anything looks at them again.
-            self._retry_deferred_release()
 
     def release_pending_chunks(self) -> int:
-        """Drop undelivered ``chunk`` rows from ``_pending``; return how many.
-
-        ``append`` puts each streamed token row in BOTH ``messages`` and
-        ``_pending`` -- the same dict object in two lists -- so rewriting
-        ``messages`` alone frees nothing: the queue still holds a reference to
-        every chunk dict. On the WebSocket transport no reader ever drains, so
-        those references live until the slot takes another turn, and a slot
-        abandoned after a long streamed turn holds its whole token stream for
-        the process lifetime. Releasing here is what makes a window rewrite
-        actually reclaim the stream.
-
-        A no-op while a consumer is attached (see ``pending_has_consumer``):
-        there those rows are undelivered output, not garbage. The refusal is
-        RECORDED rather than forgotten, and retried when the guard lifts -- a
-        refusal that is silent and final would leave the OpenAI-compatible and
-        SSE transports leaking exactly as before, since their turn-end purge
-        lands while their reader is still attached and never runs again.
-        """
-        if self.pending_has_consumer:
-            self._pending_release_deferred = True
-            return 0
-        self._pending_release_deferred = False
-        before = len(self._pending)
-        if not before:
-            return 0
-        self._pending = [m for m in self._pending if m.get("role") != "chunk"]
-        return before - len(self._pending)
+        """Release chunk rows unless a live consumer still owns the queue."""
+        return self._buffers.release_pending_chunks(self)
 
     def purge_chunks(self) -> int:
-        """Drop every ``chunk`` row from the window and release the queue.
-
-        The single owner of "this turn's streamed tokens are now represented by
-        a finalized assistant message, so the raw chunk rows are dead". Callers
-        that rewrite ``messages`` themselves must still call
-        ``release_pending_chunks`` -- a window rewrite on its own leaves the
-        queue as the sole owner of every chunk dict.
-        """
-        self.messages = [m for m in self.messages if m.get("role") != "chunk"]
-        return self.release_pending_chunks()
+        """Drop finalized stream chunks from the transcript and live queue."""
+        return self._buffers.purge_chunks(self)
 
     def append_pending_context(self, entry: dict[str, Any]) -> None:
-        """Append one built context entry, pruning and FIFO-evicting first.
-
-        Shared by /context, /note, and the deferred-note promotion so the three
-        cannot drift on the ceiling. Expired entries are pruned BEFORE the
-        eviction because FIFO evicts by POSITION: without the prune a live entry
-        at index 0 is dropped while newer already-dead ones survive. An entry
-        that arrives already expired is dropped outright rather than seated.
-        """
-        now = time.time()
-        # A held note's maxAge can elapse while its turn runs, so an entry can
-        # arrive dead; seating it would evict a live one the drain would keep.
-        if context_entry_expired(entry, now):
-            return
-        self._pending_context[:] = [
-            e for e in self._pending_context if not context_entry_expired(e, now)
-        ]
-        while len(self._pending_context) >= _MAX_PENDING_CONTEXT:
-            self._pending_context.pop(0)
-        self._pending_context.append(entry)
+        """Append one live context entry after expiry pruning and FIFO eviction."""
+        self._buffers.append_pending_context(
+            self,
+            entry,
+            max_pending_context=_MAX_PENDING_CONTEXT,
+            entry_expired=context_entry_expired,
+        )
 
     def drop_foreign_authorized_notes(self) -> int:
-        """Discard note content authorized against a session this slot has left.
-
-        An immediate note is written while the slot routes to one session, but
-        BOTH halves resolve their destination late -- the queued half at the
-        next turn's drain, the visible row at the next save. An unbound slot can
-        acquire a foreign binding in between (a cron result or workflow
-        injection claims an empty ``linked_session_key`` with no running gate),
-        so content authorized for one conversation would otherwise be read as
-        belonging to another. Same rule the deferred flush applies, moved to the
-        seams the immediate writes actually resolve at. Returns the count
-        dropped. Unstamped entries are left alone: ``/context`` and the Slack
-        backfill share this queue and record no session.
-        """
-        # circular import: chat_utils imports state at module scope
-        from kiro_crew.dashboard.chat_utils import effective_session_key
-
-        live = effective_session_key(self)
-        dropped = 0
-        keep_ctx = [e for e in self._pending_context if not _note_authorized_elsewhere(e, live)]
-        if len(keep_ctx) != len(self._pending_context):
-            dropped += len(self._pending_context) - len(keep_ctx)
-            self._pending_context[:] = keep_ctx
-        keep_msgs = [
-            m for m in self.messages if not _note_authorized_elsewhere(m.get("meta"), live)
-        ]
-        if len(keep_msgs) != len(self.messages):
-            dropped += len(self.messages) - len(keep_msgs)
-            self.messages[:] = keep_msgs
-        if dropped:
-            sel().log_api_access(
-                caller="dashboard",
-                operation="note_rebind_drop",
-                outcome="denied",
-                source="app_isolation",
-                resources=f"slot={self.key} dropped={dropped}",
-                error="slot was rebound to another session after the note was written",
-            )
-            logger.warning(
-                "Slot %s dropped %d note item(s): authorized elsewhere, slot now routes to %s",
-                self.key,
-                dropped,
-                live,
-            )
-        return dropped
+        """Drop note content whose authorization belongs to another session."""
+        return self._buffers.drop_foreign_authorized_notes(
+            self,
+            authorized_elsewhere=_note_authorized_elsewhere,
+            logger=logger,
+        )
 
     def deferred_context_count(self) -> int:
         """Held notes whose context half has not reached the queue yet."""
-        return sum(1 for n in self._deferred_notes if n.get("context") is not None)
+        return self._buffers.deferred_context_count(self)
 
     def flush_deferred_notes(self) -> int:
         """Append notes that were held while a turn ran. Returns the count written.
@@ -3198,72 +3417,15 @@ class _ChatSlot:
         successor began would let the note shape a turn its visible line appears
         below. The stage loop's exit also covers the paused and cancelled paths.
         Idempotent -- a no-op when nothing is held.
-        """
-        if not self._deferred_notes:
-            return 0
-        # circular import: chat_utils imports state at module scope
-        from kiro_crew.dashboard.chat_utils import effective_session_key
 
-        held = self._deferred_notes[:]
-        self._deferred_notes.clear()
-        live_session = effective_session_key(self)
-        written = 0
-        for note in held:
-            # A held note carries the session it was authorized against. An
-            # unbound slot can acquire a foreign binding while the note waits
-            # (a cron result or workflow injection claims an empty
-            # linked_session_key with no running gate), and both the transcript
-            # path and the next turn's session resolve that binding HERE, not at
-            # the POST. Writing anyway would surface content authorized for one
-            # conversation inside another, so a rebound slot drops the note and
-            # its context together rather than retargeting them.
-            authorized = note.get("session")
-            if authorized is not None and authorized != live_session:
-                sel().log_api_access(
-                    caller="dashboard",
-                    operation="note_flush",
-                    outcome="denied",
-                    source="app_isolation",
-                    resources=f"slot={self.key}",
-                    error="slot was rebound to another session while the note was held",
-                )
-                logger.warning(
-                    "Slot %s dropped a held note: authorized for %s, slot now routes to %s",
-                    self.key,
-                    authorized,
-                    live_session,
-                )
-                continue
-            # The context half is promoted HERE, not at the POST, because the
-            # drain runs inside the turn: an entry queued while that turn was
-            # starting is consumed by it, so the note shapes the request it was
-            # written after and the next turn never sees it at all.
-            ctx = note.get("context")
-            if ctx is not None:
-                ctx["noteSession"] = live_session
-                self.append_pending_context(ctx)
-            self.append(
-                role="inject",
-                content=note["content"],
-                cls=note["cls"],
-                broadcast=True,
-                meta={"noteSession": live_session},
-            )
-            written += 1
-        return written
+        Delegates to the shared buffer coordinator, which also restores the
+        unwritten suffix if a visible row fails mid-flush.
+        """
+        return self._buffers.flush_deferred_notes(self, logger=logger)
 
     def mark_permission_resolved(self, approval_id: str, decision: str = "approved") -> None:
-        """Update stored permission message cls JSON with resolved flag."""
-        for m in self.messages:
-            if m.get("role") == "permission":
-                try:
-                    cls_data = json.loads(m.get("cls", ""))
-                    if isinstance(cls_data, dict) and cls_data.get("request_id") == approval_id:
-                        cls_data["resolved"] = decision
-                        m["cls"] = json.dumps(cls_data)
-                        return
-                except (json.JSONDecodeError, TypeError):
-                    pass
+        """Update the matching stored permission row without marking it dirty."""
+        self._buffers.mark_permission_resolved(self, approval_id, decision)
 
     def update_message(
         self,
@@ -3272,23 +3434,13 @@ class _ChatSlot:
         content: str | None = None,
         meta: dict | None = None,
     ) -> dict | None:
-        """Replace fields on a previously-appended message identified by ts.
-
-        ``meta`` replaces the whole meta dict (so callers can also remove keys);
-        pass ``None`` to leave it untouched. Returns the mutated message or None.
-        """
-        if not ts:
-            return None
-        for m in self.messages:
-            if m.get("ts") == ts:
-                if content is not None:
-                    m["content"] = content
-                    self.invalidate_source_links()
-                if meta is not None:
-                    m["meta"] = meta
-                self._dirty = True
-                return m
-        return None
+        """Replace fields on a previously appended message identified by ts."""
+        return self._buffers.update_message(
+            self,
+            ts,
+            content=content,
+            meta=meta,
+        )
 
     # ── Queue helpers (dict-based queue items) ──
 
@@ -3315,35 +3467,18 @@ class _ChatSlot:
         structured header — see gateway ``_subagent_done``) keeps them instead of
         forcing the drain to re-derive them from the prose.
         """
-        qid = uuid.uuid4().hex[:12]
-        # dict[str, Any]: the base entry is all strings, but ``meta`` adds a dict
-        # value, so the homogeneous str inference would reject the assignment.
-        item: dict[str, Any] = {"id": qid, "content": content, "kind": kind}
-        if meta:
-            item["meta"] = meta
-        if directive_user_origin:
-            item["_directive_user_origin"] = True
-        if peer_channel_id and peer_message_id:
-            item["peer_channel_id"] = peer_channel_id
-            item["peer_message_id"] = peer_message_id
-        self._queue.append(item)
-        self._note_enqueue()
-        return qid
+        return self._queue_repository.queue_append(
+            self,
+            content,
+            kind,
+            meta,
+            directive_user_origin=directive_user_origin,
+            peer_channel_id=peer_channel_id,
+            peer_message_id=peer_message_id,
+        )
 
     def _note_enqueue(self) -> None:
-        """Record that work was just queued for this slot.
-
-        Held BESIDE the queue rather than on the entry: an entry dict is compared
-        wholesale in a great many places, and widening its shape would make every
-        one of those comparisons depend on a clock.
-
-        Read only while ``_queue`` is non-empty (see ``to_dict``), so the value
-        cannot outlive the queue it describes. Individual removals leave it
-        pointing at the most recent enqueue rather than at the oldest surviving
-        entry, which is the same statement for ranking purposes: work is waiting,
-        and it was asked for at this instant.
-        """
-        self._last_enqueue_ts = datetime.now(timezone.utc).isoformat()
+        self._queue_repository.note_enqueue(self)
 
     def queue_insert(
         self,
@@ -3366,93 +3501,35 @@ class _ChatSlot:
         ``is_synthetic_payload_item``; a recovery entry that replays the user's own
         message shares the recovery kind but is not machine speech.
         """
-        qid = uuid.uuid4().hex[:12]
-        entry: dict[str, Any] = {"id": qid, "content": content, "kind": kind, "payload": payload}
-        if meta:
-            entry["meta"] = dict(meta)
-        if on_consumed is not None:
-            entry["_on_consumed"] = on_consumed
-        if on_irreversibly_consumed is not None:
-            entry["_on_irreversibly_consumed"] = on_irreversibly_consumed
-        if directive_user_origin:
-            entry["_directive_user_origin"] = True
-        if peer_channel_id and peer_message_id:
-            entry["peer_channel_id"] = peer_channel_id
-            entry["peer_message_id"] = peer_message_id
-        self._queue.insert(index, entry)
-        self._note_enqueue()
-        return qid
+        return self._queue_repository.queue_insert(
+            self,
+            index,
+            content,
+            kind,
+            payload,
+            meta,
+            on_consumed,
+            on_irreversibly_consumed,
+            directive_user_origin,
+            peer_channel_id=peer_channel_id,
+            peer_message_id=peer_message_id,
+        )
 
-    def queue_pop(self, index: int = 0) -> dict[str, str]:
-        """Pop a queue item by index. Returns {"id": ..., "content": ...}."""
-        return self._queue.pop(index)
+    def queue_pop(self, index: int = 0) -> dict[str, Any]:
+        """Pop a queue item by index. Returns the exact entry at *index*."""
+        return self._queue_repository.queue_pop(self, index)
 
     def note_pending_subagent_delivery(self, content: str, agent_ids: list[str]) -> None:
-        """Record that a queued completion still owes *agent_ids* a delivery mark.
-
-        Called by the gateway when a sub-agent completion could not be injected
-        because the slot was busy. Until the row drains AND its turn consumes the
-        prompt, the result is not in the parent's context, so no ``delivered``
-        tombstone is written for those agents -- which is also what keeps their
-        ``result.txt`` alive across an arbitrarily long queue wait (issue #4839).
-
-        Keyed on the ANNOUNCE CONTENT, not the queue-entry id: a turn that fails
-        before the model consumed the prompt re-queues that same announce under a
-        freshly minted id (``build_recovery_requeue`` replays the message verbatim
-        while nothing has been emitted), and a debt keyed on the old id could never
-        be claimed by the retry that actually delivers it. The content embeds the
-        agent ids and their result paths, so it is the identity that survives.
-
-        An empty *agent_ids* records nothing: a stopped or failed member keeps the
-        tombstone its own terminal path wrote, and there is nothing to settle.
-
-        Entries are only ever removed by the row that settles them, because
-        anything cleverer races the drain: a turn's tail-drain pops the NEXT row
-        before the current turn's settlement callback runs, so "no longer queued"
-        does not mean "abandoned". A row that leaves the queue unconsumed therefore
-        leaves its entry behind, so the ledger is capped and evicts oldest-first --
-        in the fail-safe direction, since an unsettled agent keeps its folder and
-        is recovered by the next start's reconciliation.
-        """
-        if not content or not agent_ids:
-            return
-        key = _delivery_key(content)
-        owed = self._subagent_delivery_pending.setdefault(key, [])
-        owed.extend(a for a in agent_ids if a not in owed)
-        while len(self._subagent_delivery_pending) > _MAX_PENDING_SUBAGENT_DELIVERIES:
-            self._subagent_delivery_pending.pop(next(iter(self._subagent_delivery_pending)))
+        self._queue_repository.note_pending_subagent_delivery(self, content, agent_ids)
 
     def owes_subagent_delivery(self, contents: list[str]) -> bool:
-        """Whether any of *contents* still owes a delivery mark. Read-only.
-
-        Lets the drain leave a row's dispatch completely untouched when it owes
-        nothing -- the overwhelmingly common case, including every ordinary
-        recovery replay -- instead of arming settlement machinery for it.
-        """
-        return any(_delivery_key(c) in self._subagent_delivery_pending for c in contents)
+        return self._queue_repository.owes_subagent_delivery(self, contents)
 
     def take_pending_subagent_deliveries(self, contents: list[str]) -> list[str]:
-        """Claim the delivery marks owed by the given consumed completion rows.
-
-        Returns the agent ids whose result is now in the parent's context, in
-        drain order, and forgets them. Only the named rows are touched: sweeping
-        entries whose row is "no longer queued" would delete a SUCCESSOR's debt,
-        because the tail-drain at the end of a turn pops the next row while this
-        turn's settlement callback has not run yet -- and a consumed result left
-        unsettled is re-announced as an orphan by the next start.
-        """
-        claimed: list[str] = []
-        for content in contents:
-            claimed.extend(self._subagent_delivery_pending.pop(_delivery_key(content), []))
-        return claimed
+        return self._queue_repository.take_pending_subagent_deliveries(self, contents)
 
     def queue_remove_by_id(self, queue_id: str) -> str | None:
-        """Remove a queue item by ID. Returns the content or None if not found."""
-        for i, item in enumerate(self._queue):
-            if item["id"] == queue_id:
-                del self._queue[i]
-                return item["content"]
-        return None
+        return self._queue_repository.queue_remove_by_id(self, queue_id)
 
     def queue_edit_by_id(
         self, queue_id: str, content: str, *, directive_user_origin: bool = False
@@ -3462,32 +3539,15 @@ class _ChatSlot:
         Order is preserved. Callback-owned entries have already bound their
         content to a delivery side effect, so they cannot be edited.
         """
-        for item in self._queue:
-            if item["id"] == queue_id:
-                if item.get("_on_consumed") or item.get("_on_irreversibly_consumed"):
-                    return False
-                item["content"] = content
-                if directive_user_origin:
-                    item["_directive_user_origin"] = True
-                else:
-                    item.pop("_directive_user_origin", None)
-                return True
-        return False
+        return self._queue_repository.queue_edit_by_id(
+            self,
+            queue_id,
+            content,
+            directive_user_origin=directive_user_origin,
+        )
 
     def queue_promote_by_id(self, queue_id: str) -> bool:
-        """Move a queue item to the front by ID. Returns True if found.
-
-        Used by the interrupt endpoint's "run this next" path: the promoted
-        item is what the dequeue loop picks up after the current turn stops.
-        Like every ``*_by_id`` helper, this matches the storage key (``id``)
-        that :meth:`queue_append` / :meth:`queue_insert` write — callers
-        translate the wire-side ``queue_id`` field to it at the boundary.
-        """
-        for i, item in enumerate(self._queue):
-            if item["id"] == queue_id:
-                self._queue.insert(0, self._queue.pop(i))
-                return True
-        return False
+        return self._queue_repository.queue_promote_by_id(self, queue_id)
 
     @property
     def task(self) -> asyncio.Task[Any] | None:
@@ -3602,141 +3662,16 @@ class _ChatSlot:
         self._source_links_revision += 1
 
     def _pr_source_links(self) -> list[dict]:
-        """PR/MR/issue links found in this slot's messages, for sidebar wayfinding chips.
-
-        Linear scan (no regex backtracking) validated by the source-provider
-        URL parser and cached behind an explicit content revision.
-
-        Ordered MOST RECENTLY MENTIONED FIRST, which is what makes the sidebar's
-        chip budget useful. Only ``_SERIALIZED_SOURCE_LINKS_PER_SLOT`` chips per
-        kind are serialized and the rest collapse into a "+N" pill, so a
-        first-mention order handed those slots to the OLDEST pull requests in the
-        session and hid the one being worked on -- the longer the session ran, the
-        more certain it was to hide the interesting chip. Scanning backwards also
-        means the ``_MAX_SOURCE_LINKS_PER_SLOT`` ceiling keeps the newest links
-        rather than the first 64 ever mentioned.
-
-        Recency is LAST mention, not first: a pull request under active work gets
-        re-mentioned as it progresses, which is exactly the signal wanted here.
-
-        Each entry carries a ``kind`` discriminator (``"change"`` for a pull or
-        merge request, ``"issue"`` for an issue). Readers that only handle pull
-        requests -- the chip-status cache and every path that reaches ``gh pr
-        view`` -- must filter on it.
-        """
-        # Local import: handlers.source_providers does not import state, but
-        # keep the dependency lazy to stay out of module-load ordering.
-        from kiro_crew.dashboard.handlers.source_providers import (
-            gitlab_hosts_generation,
-            parse_source_url,
+        """Return cached source links ordered by their most recent mention."""
+        return self._projection.source_links(
+            self,
+            max_links=_MAX_SOURCE_LINKS_PER_SLOT,
+            non_durable_roles=_NON_DURABLE_SOURCE_LINK_ROLES,
         )
 
-        # The self-managed GitLab allowlist is part of the cache key, not just the
-        # message revision: this runs synchronously and can execute BEFORE the
-        # first off-loop allowlist load, in which case a self-managed URL is
-        # rejected against the cold (empty) snapshot. Without the generation, that
-        # rejection would stay memoized until the next message mutation and the
-        # chip would be missing even after the allowlist loaded.
-        cache_key = (self._source_links_revision, gitlab_hosts_generation())
-        if self._source_links_cache and self._source_links_cache[0] == cache_key:
-            return self._source_links_cache[1]
-
-        stop_chars = set(" \t\n<>()[]{}\"'")
-        found: dict[str, dict] = {}
-        # Hard ceiling on parse attempts for the WHOLE call, not per message and not
-        # only on success. `len(found)` advances only for a new valid url, so a
-        # message repeating one rejected candidate (or one valid one) never advanced
-        # it and every occurrence reached the parser: a 58 MB accepted body froze the
-        # event loop for ~13.6s, and this runs synchronously inside `to_dict` on
-        # `push_slots_update`. A budget bounds every flood shape at once -- rejected,
-        # repeated and distinct -- which a dedup set could not, because remembering
-        # candidates in order to skip them is itself unbounded memory.
-        #
-        # Sized far above any real transcript: 64 serialized chips come from a
-        # handful of occurrences each, so 4096 attempts is ~64x headroom while
-        # capping worst-case work in the tens of milliseconds. The walk is
-        # newest-first, so a truncated flood keeps the most recent candidates.
-        parse_budget = _MAX_SOURCE_LINKS_PER_SLOT * 64
-        # Newest message first, and newest url first WITHIN a message, so the
-        # dedup below keeps each url's LAST mention and `found` comes out in
-        # descending recency. One message mentioning several urls is ordered by
-        # position in the text, its only available proxy for "later".
-        for msg in reversed(self.messages):
-            if len(found) >= _MAX_SOURCE_LINKS_PER_SLOT or parse_budget <= 0:
-                break
-            if not isinstance(msg, dict) or msg.get("role") in _NON_DURABLE_SOURCE_LINK_ROLES:
-                continue
-            content = msg.get("content")
-            if not isinstance(content, str) or "https://" not in content:
-                continue
-            # Walk this message's urls from the END with `rfind`, so the newest
-            # mention is admitted first and the cap below can stop the walk. An
-            # earlier draft collected the whole message's urls and reversed the
-            # list, which allocated in proportion to the message and parsed every
-            # occurrence before the cap was consulted -- a single message carrying
-            # thousands of urls would stall slot serialization on the event loop.
-            #
-            search_end = len(content)
-            while len(found) < _MAX_SOURCE_LINKS_PER_SLOT and parse_budget > 0:
-                idx = content.rfind("https://", 0, search_end)
-                if idx == -1:
-                    break
-                # A candidate ends at the first stop char OR where the NEXT
-                # occurrence begins, whichever comes first. The bound is what keeps
-                # the whole walk linear: without it, content like "https://" repeated
-                # thousands of times has no stop char until the very end, so every
-                # occurrence would rescan the entire tail -- quadratic, on a path
-                # `to_dict` runs synchronously during push_slots_update, which is
-                # enough to trip the event-loop watchdog. Bounded this way each
-                # character is examined once across the whole message.
-                token_limit = search_end
-                search_end = idx
-                end = idx
-                while end < token_limit and content[end] not in stop_chars:
-                    end += 1
-                # Also strip markdown emphasis (**bold**, *italic*, `code`,
-                # _underscore_, ~~strike~~): agent messages routinely wrap PR
-                # URLs in emphasis and a trailing "**" fails the numeric tail
-                # check. Valid PR/MR URLs end in a number, so these chars can
-                # never belong to a legitimate link tail.
-                candidate = content[idx:end].rstrip(".,!?;:*_~`")
-                if (
-                    "/pull/" not in candidate
-                    and "/merge_requests/" not in candidate
-                    and "/issues/" not in candidate
-                    and "/browse/" not in candidate
-                ):
-                    continue
-                # Every attempt is charged, whether it parses or not -- that is
-                # what makes the bound hold on a rejected-candidate flood.
-                parse_budget -= 1
-                try:
-                    ref = parse_source_url(candidate)
-                except ValueError:
-                    continue
-                # First writer wins, and because the walk is backwards the first
-                # writer IS the most recent mention.
-                if ref.url not in found:
-                    found[ref.url] = {
-                        "provider": ref.provider,
-                        "number": ref.number,
-                        "url": ref.url,
-                        # "change" or "issue". Absent on the wire means
-                        # "change" for older payloads, so the frontend defaults
-                        # rather than requires it.
-                        "kind": ref.kind,
-                        # Jira chips label as PROJECT-NUMBER, so the project key
-                        # (carried in ``repo``) is identity, not decoration.
-                        # Sent only for Jira: GitHub/GitLab chips label by
-                        # number alone and their repo would be payload for
-                        # nothing on every slots push.
-                        **({"repo": ref.repo} if ref.provider == "jira" else {}),
-                    }
-        links = list(found.values())
-        self._source_links_cache = (cache_key, links)
-        return links
-
-    def source_links_payload(self, *, include_check_status: bool = False) -> dict:
+    def source_links_payload(
+        self, *, include_check_status: bool = False, dashboard_user: bool = False
+    ) -> dict:
         """Every source link this slot carries — the unbudgeted read.
 
         ``to_dict`` serializes at most ``_SERIALIZED_SOURCE_LINKS_PER_SLOT`` per
@@ -3750,258 +3685,50 @@ class _ChatSlot:
         links = self._pr_source_links()
         changes, issues = _source_links_by_kind(links)
         return {
-            "links": _project_source_links(changes + issues, include_check_status),
+            "links": _project_source_links(
+                changes + issues, include_check_status, dashboard_user=dashboard_user
+            ),
             "total": len(links),
         }
 
-    def to_dict(self, *, include_check_status: bool = False) -> dict:
-        last_ts = self.messages[-1].get("ts", "") if self.messages else ""
-        # Single reverse scan for last_msg, options, and last_activity_ts.
-        last_msg = ""
-        has_options = False
-        options: list[str] = []
-        prompt_preview = ""
-        last_conv_role = ""
-        last_activity_ts = ""
-        found_conv = False
-        for m in reversed(self.messages):
-            role = m.get("role")
-            # Compute meta/system-notice flag once for both guards below
-            msg_meta = m.get("meta") or {}
-            is_notice = is_system_notice(role, msg_meta)
-            # Capture last_activity_ts from the most recent actionable message
-            if (
-                not last_activity_ts
-                and role in ("tool_call", "tool_result", "assistant")
-                and not is_notice
-            ):
-                last_activity_ts = m.get("ts") or ""
-            # Capture the last conversational message (role/options once, and
-            # the newest non-empty preview). Skip system notices:
-            # assistant-role status rows tagged with a kind in
-            # SYSTEM_NOTICE_KINDS — the auto-compact notice
-            # ("Auto-compacted at N%.", _AUTO_COMPACT_NOTICE), the /compact
-            # result banner (chat_utils._append_compaction_notice), and the
-            # session-reload confirmation (api_chat_slot_reload).
-            # This keeps the sidebar showing the last real message and mirrors
-            # the frontend's deriveFollowUpOptions skip so preview/options
-            # stay consistent.
-            if role in ("user", "assistant") and not is_notice:
-                txt = m.get("content") or ""
-                if txt:
-                    if not found_conv:
-                        found_conv = True
-                        last_conv_role = role
-                        if role == "assistant":
-                            options = _parse_options(txt)
-                            has_options = bool(options)
-                            if has_options:
-                                stripped = _redact(_OPTIONS_RE.sub("", txt).strip())
-                                prompt_preview = (
-                                    stripped[:240] + "…" if len(stripped) > 240 else stripped
-                                )
-                    if not last_msg:
-                        # Preview is plain text in a one-line truncate div —
-                        # strip markdown so raw markers (**, ```, links) don't
-                        # leak into the sidebar. Options/prompt keep raw text.
-                        # ORDER MATTERS: strip BEFORE redacting — markdown
-                        # markers inside a secret (e.g. AKIA**…**) would split
-                        # the credential signature past the scanner, and
-                        # stripping afterwards would rejoin the fragments into
-                        # a valid credential in the broadcast preview.
-                        # A message that is ONLY stripped syntax (e.g. just an
-                        # [OPTIONS:] block or a --- rule) yields '' — keep
-                        # scanning older messages for a visible preview, like
-                        # history.last_message_preview does, so live and
-                        # archived previews stay consistent.
-                        redacted = _redact(strip_markdown_preview(txt))
-                        last_msg = (redacted[:80] + "…") if len(redacted) > 80 else redacted
-            if found_conv and last_msg and last_activity_ts:
-                break
-        pending_approval = any(not f.done() for f in self._approval_futures.values())
-        # Ordering instant for the session list: the last time this session
-        # SETTLED -- work was asked of it, or a turn finished. Deliberately not
-        # ``last_ts``, which is the newest row of ANY role and therefore advances
-        # on every streamed tool call: a list ranked by that reshuffles
-        # continuously whenever several sessions are working, so rows swap under
-        # the pointer. A turn in flight instead holds the rank of the prompt that
-        # started it, and the single re-rank lands when the turn ends -- at which
-        # point the newest row IS the completion.
-        #
-        # A send that arrived behind a running turn is QUEUED, not appended, so
-        # the message scan alone would not see it and this snapshot would rank the
-        # session by the older prompt -- overwriting the client's own bump and
-        # dropping the row the user just typed into. Ranking queued entries here
-        # makes this the single owner of the key instead of racing the client.
-        #
-        # Both scans are running-only, so an idle slot (the common case in a long
-        # sidebar) costs nothing, and a running one is bounded by its own turn.
-        last_turn_ts = last_ts
-        if self.running:
-            prompt_ts = next(
-                (
-                    m.get("ts") or ""
-                    for m in reversed(self.messages)
-                    if m.get("role") in _PROMPT_ROLES
-                ),
-                "",
-            )
-            queued_ts = self._last_enqueue_ts if self._queue else ""
-            last_turn_ts = prompt_ts
-            if queued_ts:
-                # Parse-based, not string ``max``: rows carry both aware and naive
-                # isoformat, and comparing those as strings can pick the earlier
-                # one. Consulted only while something is queued, so a prompt row
-                # whose own ``ts`` is unparseable still ranks the session instead
-                # of being discarded by the combiner.
-                last_turn_ts = latest_transcript_ts(prompt_ts, queued_ts) or queued_ts
-        # waiting_for_input: turn ended (not running), no options, no approval,
-        # and the last conversational message is from the assistant (not user).
-        waiting_for_input = (
-            not self.running
-            and not has_options
-            and not pending_approval
-            and bool(self.messages)
-            and last_conv_role == "assistant"
+    def to_dict(self, *, include_check_status: bool = False, dashboard_user: bool = False) -> dict:
+        # Skip extraction itself when the chips are off, not just the two fields
+        # the projection derives from it: `_pr_source_links()` scans the transcript
+        # under a per-call parse budget, and paying for a payload nothing renders
+        # is the cost this switch exists to remove. The getter is a cache-only
+        # snapshot lookup -- it never touches config, which is what makes it safe
+        # to call from this synchronous per-slot path on the event loop.
+        from kiro_crew.dashboard.handlers.source_providers import (
+            session_card_source_links_enabled,
         )
-        # needs_input: an unanswered question CARD is on screen and the agent
-        # cannot move past it.
-        #
-        # Scoped to the card on purpose. It exists to correct a status that would
-        # otherwise be WRONG, not to add one: a blocking ask_question parks the
-        # turn mid-flight, so `self.running` stays true and the row would read
-        # "Thinking…" forever while nothing can advance without the user. That is
-        # why it is NOT gated on `self.running`.
-        #
-        # A turn that merely ENDED — including one ending in an [OPTIONS:] tag —
-        # is not this. Every finished turn is waiting on the user, so a status
-        # that lights on them says nothing (the same reason `waiting_for_input`
-        # cannot carry a badge), and the row already carries the last message plus
-        # the unread dot. Raising it there only displaced the message and hid the
-        # live turn status behind a constant string.
-        #
-        # Separate from `pending_approval`, whose answer is allow/deny on a tool
-        # rather than input, and which keeps its own precedence and label.
-        needs_input = bool(self._question_pending)
-        # interrupted: the transcript shows the last turn ending without the
-        # assistant handing the floor back (trailing error row, or an unanswered
-        # user row) — the state behind the composer's Resume button. Surfaced on
-        # the summary because the sidebar has no transcript to derive it from,
-        # and it must stop rendering a goal-loop session as actively working
-        # while the session actually sits dead until the user resumes it (or the
-        # loop's next idle-timer cycle fires, up to idle_secs away). Gated on
-        # ``not running``: while a turn is in flight the trailing error belongs
-        # to a superseded turn and the live status already tells the truth.
-        interrupted = not self.running and is_turn_interrupted(self.messages)
-        # If an approval is pending, surface the tool metadata from the most
-        # recent unresolved permission message so the Board can show inline
-        # Approve/Trust/Reject buttons without a second API call.
-        #
-        # LANE ASSIGNMENT NOTE: The frontend's inferLane() uses the boolean
-        # `pending_approval` field (not `pending_approval_info`) to assign
-        # sessions to the "Needs Approval" lane. `pending_approval_info` is
-        # supplementary UI metadata (tool name, input, kind) for rendering
-        # inline action buttons — it does NOT drive lane placement.
-        pending_approval_info: dict[str, str] | None = None
-        if pending_approval:
-            for m in reversed(self.messages):
-                if m.get("role") != "permission":
-                    continue
-                meta = parse_cls_meta(m.get("cls") or "") or {}
-                if meta.get("resolved"):
-                    continue
-                pending_approval_info = {
-                    "tool": _redact(m.get("content") or ""),
-                    "tool_input": _redact(meta.get("tool_input", "")),
-                    "tool_kind": _redact(meta.get("tool_kind", "")),
-                    "request_id": _redact(meta.get("approval_id", meta.get("request_id", ""))),
-                }
-                break
-        source_links = self._pr_source_links()
-        return {
-            "key": self.key,
-            "title": _redact(self.display_title),
-            "agent": self.agent,
-            "model": self.model,
-            "reasoning_effort": self.reasoning_effort,
-            "mode": self.mode,
-            # Forward-compat alias of `mode` for the frontend's surface
-            # registry. Today every slot's surface is identical to its mode
-            # (default chat -> "", autopilot -> "orchestrator"), but emitting
-            # a distinct field lets a future backend split the two — e.g. a
-            # mode that introduces new behavior without claiming its own nav
-            # destination, or two modes that share a destination — without
-            # another wire-format change. The frontend reads
-            # `slot.surface ?? slot.mode` for back-compat.
-            "surface": self.mode,
-            "workspace": self.workspace,
-            "project": self.project,
-            # Artifact companion binding. Flows into GET
-            # /api/chat/slots and the WS `slots` snapshot — the frontend
-            # resolves the active bound session for an artifact from here.
-            "artifact": self._artifact,
-            "messages": len(self.messages),
-            "peer_channel_inbox_count": len(self._peer_channel_inbox),
-            "peer_channel_attention": self.peer_channel_attention_payload(),
-            "running": self.running,
-            "orchestrating": self._in_stage_execution,
-            "queue_depth": self.queue_depth,
-            "stopping": self._stopping,
-            "pending_approval": pending_approval,
-            "pending_approval_info": pending_approval_info,
-            "last_activity_ts": last_activity_ts,
-            "waiting_for_input": waiting_for_input,
-            "needs_input": needs_input,
-            "interrupted": interrupted,
-            "stop_state": self._stop_state,
-            # In-flight `wait` sleep, or None. Carries the absolute deadline the
-            # transcript counts down against and the wait_id the "End wait"
-            # button must quote. Rides the slots payload rather than a bespoke
-            # WS event so a page reload mid-wait re-seeds it from
-            # GET /api/chat/slots for free.
-            "wait_state": self._wait_state,
-            "created": self.created_at,
-            "last_ts": last_ts,
-            "last_turn_ts": last_turn_ts,
-            "last_message": last_msg,
-            "source_links": _project_source_links(
-                _budgeted_source_links(source_links), include_check_status
+
+        source_links = self._pr_source_links() if session_card_source_links_enabled() else []
+        return self._projection.to_dict(
+            self,
+            include_check_status=include_check_status,
+            source_links=source_links,
+            prompt_roles=_PROMPT_ROLES,
+            redact=_redact,
+            parse_options=_parse_options,
+            strip_options=lambda text: _OPTIONS_RE.sub("", text).strip(),
+            parse_cls_meta=parse_cls_meta,
+            is_turn_interrupted=is_turn_interrupted,
+            is_system_notice=is_system_notice,
+            latest_transcript_ts=latest_transcript_ts,
+            strip_markdown_preview=strip_markdown_preview,
+            resolve_effective_agent=resolve_effective_agent,
+            budget_source_links=_budgeted_source_links,
+            # Bind the PUBLIC-only gate through the projection's positional
+            # (links, include_check_status) callable so slot_projection.py needs
+            # no change: the owner gate rides include_check_status as before, and
+            # dashboard_user (a non-owner authenticated dashboard user) unlocks
+            # status ONLY for links whose repo is known public.
+            project_source_links=(
+                lambda links, incl: _project_source_links(
+                    links, incl, dashboard_user=dashboard_user
+                )
             ),
-            "source_links_total": len(source_links),
-            # Agent TODO list. Absent-vs-empty is load-bearing: None means the
-            # agent never used its todo tool (no pill), [] means it cleared the
-            # list. Serialized here — the single dict feeding BOTH
-            # /api/chat/slots (cold load) and the WS `slots` snapshot — so the
-            # pill survives reconnect without a separate rehydration path.
-            "todo": self.todo_payload(),
-            "declared_goal": self.declared_goal_payload(),
-            "plan_goal": self._checkpoint_text(self._plan_goal, SESSION_CHECKPOINT_GOAL_MAX),
-            "session_checkpoint": self.session_checkpoint_payload(),
-            "session_timeline": self.session_timeline_payload(),
-            "checkpoint_freshness": self.checkpoint_freshness_payload(),
-            "has_options": has_options,
-            "options": [_redact(o) for o in options],
-            "prompt_preview": prompt_preview,
-            "trust": self._trust,
-            "trust_reads": self._trust_reads,
-            "trusted_patterns_count": len(self._trusted_patterns),
-            "slack_linked": self._slack_linked,
-            "slack_channel": self._slack_channel,
-            "slack_thread_ts": self._slack_thread_ts,
-            "folder_id": self.folder_id,
-            "pinned": self.pinned,
-            "tags": list(self.tags),
-            "color_index": self.color_index,
-            "color_hex": self.color_hex,
-            "color_theme": self.color_theme,
-            "theme_consent": self.theme_consent,
-            "theme_consent_sha": self.theme_consent_sha,
-            "memory_mode": self.memory_mode,
-            "forked_from": self.forked_from,
-            "linked_session_key": self.linked_session_key,
-            "app": self._app,
-            "origin": self._origin,
-        }
+        )
 
 
 class DashboardState:
@@ -4151,6 +3878,22 @@ class DashboardState:
         # error, immediate close on bad credentials, or server kick), empty
         # when connected or never attempted. Read by the settings badge.
         self.wecom_connect_error: str = ""
+        # True only while the Feishu (飞书/Lark) channel's WebSocket receiver
+        # thread is alive (kept truthful by LarkClient.on_state_change, wired in
+        # maybe_start_feishu). Read by the Feishu settings status badge.
+        #
+        # Receiver-liveness, NOT a credential probe: lark-oapi owns the socket
+        # and exposes no connect/subscribe transition to hook, and a REST
+        # tenant-token probe would have to pick a domain (open.feishu.cn vs
+        # open.larksuite.com), reporting a false failure for whichever tenant it
+        # guessed wrong. Liveness still catches rejected credentials, because
+        # lark's ws.start() RETURNS within seconds when the app is refused —
+        # which flips this to False with the reason attached.
+        self.feishu_connected: bool = False
+        # Short reason the Feishu channel is not running — a missing lark-oapi
+        # extra, rejected app credentials, or a receiver thread that died. Empty
+        # when connected or never attempted. Read by the settings badge.
+        self.feishu_connect_error: str = ""
         # True only while the Teams channel's credentials validated this
         # session (kept truthful by TeamsClient.on_state_change). Read by the
         # Teams settings status badge.
@@ -4209,6 +3952,7 @@ class DashboardState:
         self.unrestored_slot_keys: set[str] = set()
         self._notification_log: list[dict[str, Any]] = _load_notifications()
         self._unread_count: int = 0
+        self._notification_coordinator = _new_notification_coordinator()
         # Notification bus (schema v2) — notify() adapts legacy calls onto it;
         # _deliver_note is the delivery sink (log, count, broadcast, persist).
         self.notification_bus = NotificationBus(sink=self._deliver_note)
@@ -4229,6 +3973,14 @@ class DashboardState:
         # lifecycle matches the gateway instance.
         self.resource_pressure_notifier = ResourcePressureNotifier(self.notification_bus)
         self._slots: dict[str, _ChatSlot] = {}
+        self._slot_registry = SlotRegistry()
+        # Process-local Spec Builder outbox claims, keyed by directory + delivery.
+        # Directory scope matters because aliases use different slots for the same
+        # files; durable status remains owned by the app's decision ledger.
+        self._spec_decision_deliveries_inflight: set[tuple[str, str]] = set()
+        # Consumed claims whose durable finalization failed remain blocked from
+        # redispatch while a later Spec Builder detail poll retries the ledger write.
+        self._spec_decision_deliveries_consumed: set[tuple[str, str]] = set()
         # Slot keys that EXIST but are deliberately absent from ``_slots`` while
         # they are being built (see ``session_transfer``'s import path, which
         # retracts a slot so it is unreachable until its transcript and context
@@ -4277,6 +4029,11 @@ class DashboardState:
         self._folders: list[dict[str, Any]] = []  # project folder definitions
         self._cron_folders: list[dict[str, Any]] = []  # cron job folder groupings
         self._chat_pins: list[dict[str, Any]] = []  # pinned chat messages
+        # Malformed chat_pins.json entries dropped at load time, kept verbatim
+        # so save_chat_pins round-trips them back instead of erasing bytes a
+        # hand-edit left in a shape the loader could not validate (mirrors the
+        # cron-folder unparsed-entry preservation, #5768/#5792).
+        self._unparsed_chat_pin_entries: list[Any] = []
         # Serializes pin mutation + persistence so concurrent requests cannot
         # interleave snapshots and replace chat_pins.json out of order.
         # LoopBoundLock, not asyncio.Lock (#4800): DashboardState outlives any
@@ -4289,8 +4046,19 @@ class DashboardState:
         # construction, so building it off-loop is safe — and it stays valid
         # across the loop changes this long-lived state survives (#4800).
         self._folders_lock = LoopBoundLock()
+        # Identifies the current folder-TREE snapshot; bumped by mutate_folders
+        # (the store's only writer) on each confirmed write. See
+        # folders_generation() for what the client does with it.
+        self._folders_generation = 0
         # Tag vocabulary: list of {id, name, color, order}. User-managed.
         self._tags: list[dict[str, Any]] = []
+        # Malformed tags.json entries dropped at load time, kept verbatim so a
+        # save round-trips them back instead of erasing bytes a hand-edit left
+        # in a shape the loader could not validate. This store's save path runs
+        # DURING load (seed/back-fill), so without preservation a single
+        # hand-edited-but-malformed row is wiped at boot with no user action
+        # (#5792, the worst of the sibling cases).
+        self._unparsed_tag_entries: list[Any] = []
         # True once load_tags() parsed tags.json successfully (or seeded a
         # fresh install). False means the vocabulary state is UNKNOWN (parse
         # or I/O failure) — restore-time pruning must fail open then, because
@@ -4299,7 +4067,18 @@ class DashboardState:
         self._tags_authoritative: bool = False
         # Sidebar columns — flat list of {id, name, tag_ids, mode, order, include_untagged}
         self._tag_boards: list[dict[str, Any]] = []
+        # Malformed tag-board (sidebar column) entries dropped at load time,
+        # kept verbatim so a save round-trips them back rather than erasing a
+        # hand-edited-but-typo'd column (#5792).
+        self._unparsed_tag_board_entries: list[Any] = []
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # Gateway restart single-flight. The handler claims the flag before its
+        # first await and releases it in a finally, so a second restart request
+        # is refused rather than racing the first. Declared here so the initial
+        # state is defined by this object rather than by whichever handler
+        # happens to assign the attribute first.
+        self._gateway_restart_task: asyncio.Task[None] | None = None
+        self._gateway_restart_in_progress: bool = False
         # FIX 2: unattended-turn concurrency cap. Semaphore is created lazily
         # (see _background_turn_sema) because this object outlives / predates
         # the event loop in some hosts. The counters exist so a queued fleet is
@@ -4352,6 +4131,9 @@ class DashboardState:
         self._owner_ws_clients: set[web.WebSocketResponse] = set()
         self._ws_log_subscribers: set[web.WebSocketResponse] = set()
         self._ws_subagent_subscribers: set[web.WebSocketResponse] = set()
+        self._websocket_hub = _new_websocket_hub(self)
+        self._approval_coordinator = ApprovalCoordinator()
+        self._question_coordinator = QuestionCoordinator()
         # Pending tool approvals: id → asyncio.Future[bool]
         self._pending_approvals: dict[str, dict] = {}
         self._approval_futures: dict[str, asyncio.Future] = {}  # type: ignore[type-arg]
@@ -4362,6 +4144,7 @@ class DashboardState:
         self._pending_questions: dict[str, dict] = {}
         self._question_futures: dict[str, asyncio.Future] = {}  # type: ignore[type-arg]
         self._flush_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._persistence_coordinator = _new_dashboard_persistence()
         # Update progress tracking (shared across all connected clients)
         self._update_progress: dict[str, str] | None = None  # {step, detail}
         # Restricted (incognito/temporary): session keys with memory writes disabled
@@ -4539,6 +4322,17 @@ class DashboardState:
             # which is unbounded on slow storage.
             target = await asyncio.to_thread(_resolve_channel_target, self, key, link)
             if target is None:
+                # The docstring's "logged and dropped" promise, kept: an
+                # unreachable, ungoverned or unregistered channel means the user
+                # was NOT told their conversation lost its way back, and a silent
+                # return here leaves that undeliverable notice invisible to the
+                # operator too (the SEL event records the removal, not the
+                # delivery failure).
+                logging.getLogger(__name__).warning(
+                    "inbound-unbind notice for %s undeliverable: no governed %s transport",
+                    key,
+                    link.channel_type,
+                )
                 return
             resolved, transport = target
             notice = _INBOUND_UNBIND_NOTICE.format(
@@ -4657,10 +4451,19 @@ class DashboardState:
         update_can_apply: bool = False,
         update_check_status: str = "unchecked",
         update_command: str = "",
+        update_latest_version: str = "",
+        update_latest_version_display: str = "",
         update_channel: str = "",
+        update_channel_move_pending: bool = False,
         update_managed_by: str = "",
         update_commits_ahead: int = 0,
         update_commits_behind: int = 0,
+        update_last_checked_at: float | None = None,
+        update_check_interval_secs: int = 43200,
+        update_required: bool = False,
+        update_min_version: str = "",
+        update_can_arm: bool = False,
+        version_display: str = "",
     ) -> dict[str, Any]:
         """Core status fields shared by /api/status, SSE, and WebSocket pushes."""
         uptime = int(time.time() - self.start_time)
@@ -4693,6 +4496,15 @@ class DashboardState:
             # user on something actionable. Deriving it only from a manual check
             # left the badge pointing at an Update button that 409s.
             "update_command": update_command,
+            # The candidate release's version string ("" until a check finds a
+            # newer build). The proactive update popup keys its per-version
+            # snooze/skip on this, so it rides the hot-path subset; the
+            # changelog text deliberately does not.
+            "update_latest_version": update_latest_version,
+            # DISPLAY-ONLY fold of the candidate above (clean base on the
+            # stable channel); the popup's snooze/skip records key on the raw
+            # value. Empty string on emitters that don't pass it.
+            "update_latest_version_display": update_latest_version_display,
             # The release channel this INSTALL follows (the ``channel`` file
             # cli.sh wrote), empty when the layout has no channel at all (a git
             # checkout tracks a remote; a desktop bundle or container is updated
@@ -4702,6 +4514,16 @@ class DashboardState:
             # between switching channels and the new lane's build landing, so the
             # switcher must key on this one or it would snap back on every poll.
             "update_channel": update_channel,
+            # Is the running build ahead of everything ``update_channel``
+            # publishes? True means that lane never shipped these bytes, so the
+            # install is not on it yet and only re-running the installer moves
+            # it. Deliberately NOT derived by comparing ``update_channel``
+            # against ``release_channel`` below: promotion re-points the soaked
+            # candidate's bytes without re-stamping them, so a promoted stable
+            # build reports ``release_channel: insider`` while being a stable
+            # install with nothing pending. False on every layout with no feed
+            # answer.
+            "update_channel_move_pending": update_channel_move_pending,
             # Who manages updates on this host: "" (self-managed), or the
             # mechanism that owns them (e.g. "command" for a policy-pinned
             # provider). The panel keys its update copy on this — a
@@ -4715,6 +4537,25 @@ class DashboardState:
             # tell the two apart. 0/0 on non-git layouts and before any check.
             "update_commits_ahead": update_commits_ahead,
             "update_commits_behind": update_commits_behind,
+            "update_can_arm": update_can_arm,
+            "update_last_checked_at": update_last_checked_at,
+            "update_check_interval_secs": update_check_interval_secs,
+            # Mandatory-update verdict (enterprise governance pin OR the release
+            # feed's breaking-change floor) plus the floor that triggered it.
+            # The proactive update modal reads these off the status frame and
+            # drops its snooze/skip affordances while required — it must not
+            # depend on the user opening Settings to learn the update is
+            # mandatory.
+            "update_required": update_required,
+            "update_min_version": update_min_version,
+            # The RUNNING build's version folded for display (clean base on
+            # the stable channel; see `_display_version` in
+            # handlers/updates.py). DISPLAY-ONLY sibling of the raw `version`
+            # the WS frame appends after this snapshot — that one is what the
+            # SPA compares across pushes to force a reload over a gateway
+            # upgrade, so it must never be folded. Empty string on emitters
+            # that don't pass it (they render the raw version, as before).
+            "version_display": version_display,
             "no_crons": self.no_crons,
             "branch": branch,
             "commit": commit,
@@ -4959,200 +4800,68 @@ class DashboardState:
         slot: str = "",
         is_background: bool = False,
     ) -> bool:
-        """Request interactive approval. Returns True if approved, False if rejected/timeout.
-
-        ``is_background`` marks an unattended source (cron, heartbeat, taskrunner)
-        with no human responder. Those wait only ``_BACKGROUND_APPROVAL_TIMEOUT_SECS``
-        and then deny-fast, instead of burning the full 2h human window.
-        """
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[bool] = loop.create_future()
-        self._approval_futures[approval_id] = fut
-
-        # Sanitize LLM-sourced fields before broadcasting to dashboard clients
-        safe_tool, _ = redact_exfiltration_urls(tool)
-        safe_tool, _ = redact_credentials(safe_tool)
-        safe_input, _ = redact_exfiltration_urls(tool_input)
-        safe_input, _ = redact_credentials(safe_input)
-        safe_purpose, _ = redact_exfiltration_urls(tool_purpose)
-        safe_purpose, _ = redact_credentials(safe_purpose)
-
-        self._pending_approvals[approval_id] = {
-            "id": approval_id,
-            "source": source,
-            "tool": safe_tool,
-            "tool_input": safe_input,
-            "tool_purpose": safe_purpose,
-            "slot": slot,
-            "ts": time.time(),
-        }
-        self.broadcast_ws("approval", self._pending_approvals[approval_id])
-        # Background sources have no human present — deny-fast on a short window
-        # instead of pausing for the full 2h human window.
-        timeout = (
-            self._BACKGROUND_APPROVAL_TIMEOUT_SECS if is_background else self._APPROVAL_TIMEOUT
+        """Request interactive approval and deny on timeout or cancellation."""
+        return await _approvals_for(self).request(
+            self,
+            approval_id,
+            source,
+            tool,
+            tool_input=tool_input,
+            tool_purpose=tool_purpose,
+            slot=slot,
+            is_background=is_background,
+            redact_url=redact_exfiltration_urls,
+            redact_secret=redact_credentials,
         )
-        try:
-            # Timeout triggers deny → which pauses the run (not skip/fail) for
-            # interactive sources. This prevents indefinite hangs if notifications
-            # are lost or user disconnects, while still allowing the user to resume
-            # later. The run pauses gracefully rather than silently proceeding or
-            # permanently failing.
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            return False
-        except asyncio.CancelledError:
-            # Deny-by-default on shutdown/cancellation
-            return False
-        finally:
-            self._pending_approvals.pop(approval_id, None)
-            self._approval_futures.pop(approval_id, None)
 
     def _audit_and_broadcast_approval(
-        self, session_key: str, approval_id: str, approved: bool
+        self,
+        session_key: str,
+        approval_id: str,
+        approved: bool,
+        decision: str = "",
     ) -> None:
-        """Emit SEL audit event and broadcast WS notification for an approval decision."""
-        try:
-            sel().log_tool_invocation(
-                session_key=session_key,
-                tool_name="approval_decision",
-                outcome="approved" if approved else "rejected",
-                request_id=approval_id,
-                source="dashboard",
-            )
-        except Exception:
-            self._log.warning("SEL audit failed for approval resolution", exc_info=True)
-        try:
-            # ``approval_resolved`` is slot-scoped in the WS event-scope gate,
-            # which denies any frame it cannot attribute to a slot. Carry the
-            # owning slot key so an app token receives the resolution for its
-            # OWN approval; ``session_key == "state"`` is a background
-            # (cron/subagent/gateway) approval that no slot owns, so it stays
-            # unattributed and the gate correctly withholds it from app tokens.
-            payload: dict = {"id": approval_id, "approved": approved}
-            if session_key and session_key != "state":
-                payload["slot"] = session_key
-            self.broadcast_ws("approval_resolved", payload)
-        except Exception:
-            self._log.warning("WS broadcast failed for approval resolution", exc_info=True)
+        """Audit and broadcast one approval decision."""
+        _approvals_for(self).audit_and_broadcast(
+            self,
+            session_key,
+            approval_id,
+            approved,
+            decision,
+            audit_provider=sel,
+        )
 
     def resolve_state_approval(self, approval_id: str, approved: bool) -> bool:
-        """Resolve ONLY a state-level (background: cron/subagent/gateway) approval.
+        """Resolve only a state-level background approval."""
+        return _approvals_for(self).resolve_state(self, approval_id, approved)
 
-        Does NOT scan slot-level futures — so it carries no cross-slot authority.
-        Callers that have already located the owning slot under a session-identity
-        guard (e.g. the dashboard slot-approve handler's fallback) MUST use this
-        rather than :meth:`resolve_approval`: a bare id-match slot scan would let a
-        request-id collision resolve an unrelated slot's pending tool, bypassing
-        the owner's session-identity check. Returns False if no state-level future
-        owns ``approval_id``.
-        """
-        fut = self._approval_futures.get(approval_id)
-        if fut and not fut.done():
-            fut.set_result(approved)
-            self._audit_and_broadcast_approval("state", approval_id, approved)
-            return True
-        return False
-
-    def resolve_approval(self, approval_id: str, approved: bool) -> bool:
-        """Resolve a pending approval. Returns False if not found.
-
-        State-level futures receive ``bool`` (consumed by gateway, which converts to str).
-        Slot-level futures receive ``str`` ("approved"/"rejected", consumed by channel.py).
-
-        This scans slot-level futures by bare id-match with NO session-identity
-        check, so it is safe only for callers that legitimately own the id
-        (native gateway / Slack click / session-scoped handler). A caller that
-        addresses one slot but may hold a colliding id from another MUST use
-        :meth:`resolve_state_approval` instead (see the slot-approve handler).
-        """
-        decision = "approved" if approved else "rejected"
-        if self.resolve_state_approval(approval_id, approved):
-            return True
-        # Also check slot-level approval futures (chat tool approvals)
-        for slot in self._slots.values():
-            fut = slot._approval_futures.get(approval_id)
-            if fut and not fut.done():
-                fut.set_result(decision)
-                if _mark_permission_resolved(slot.messages, approval_id, decision):
-                    # The periodic flush skips non-dirty slots; without this the
-                    # in-place mutation can be lost and the answered card comes
-                    # back on reload with a future that no longer exists.
-                    slot._dirty = True
-                self._audit_and_broadcast_approval(slot.key, approval_id, approved)
-                self.push_slots_update()
-                return True
-        return False
+    def resolve_approval(
+        self,
+        approval_id: str,
+        approved: bool,
+        *,
+        rejected_once: bool = False,
+    ) -> bool:
+        """Resolve one state- or slot-level approval without widening authority."""
+        return _approvals_for(self).resolve(
+            self,
+            approval_id,
+            approved,
+            rejected_once=rejected_once,
+            permission_marker=_permission_marker(),
+        )
 
     def _redact_questions(self, questions: list[dict]) -> list[dict]:
-        """Redact model-authored question/option text (URLs, credentials) and
-        reject any pair that collapses to identical text after redaction — the
-        answer map is keyed by the rendered text, so an indistinguishable
-        question or option is unanswerable. Shared by request_question (the
-        blocking HTTP round-trip) and post_question_card (the stateless card)."""
-        safe_questions: list[dict] = []
-        seen_redacted: set[str] = set()
-        for q in questions:
-            sq = dict(q)
-            for field in ("question", "header"):
-                val, _ = redact_exfiltration_urls(str(sq.get(field) or ""))
-                val, _ = redact_credentials(val)
-                sq[field] = val
-            norm = " ".join(str(sq.get("question") or "").split()).casefold()
-            if norm in seen_redacted:
-                raise ValueError(
-                    "questions collapse to identical text after redaction; "
-                    "rephrase so each question is distinguishable"
-                )
-            seen_redacted.add(norm)
-            safe_opts: list[dict] = []
-            seen_redacted_labels: set[str] = set()
-            for o in sq.get("options") or []:
-                so = dict(o)
-                for field in ("label", "description"):
-                    val, _ = redact_exfiltration_urls(str(so.get(field) or ""))
-                    val, _ = redact_credentials(val)
-                    so[field] = val
-                norm_label = " ".join(str(so.get("label") or "").split()).casefold()
-                if norm_label in seen_redacted_labels:
-                    raise ValueError(
-                        "option labels collapse to identical text after redaction; "
-                        "rephrase so every option is distinguishable"
-                    )
-                seen_redacted_labels.add(norm_label)
-                safe_opts.append(so)
-            sq["options"] = safe_opts
-            safe_questions.append(sq)
-        return safe_questions
+        """Redact questions and reject text collisions introduced by redaction."""
+        return _questions_for(self).redact_questions(
+            questions,
+            redact_url=redact_exfiltration_urls,
+            redact_secret=redact_credentials,
+        )
 
     async def post_question_card(self, slot_key: str, questions: list[dict]) -> int:
-        """Broadcast a NON-BLOCKING question card (no ``ask_id``) to *slot_key*'s
-        owner clients; return the number delivered.
-
-        Unlike :meth:`request_question`, this registers no future and awaits no
-        answer: the frontend renders a legacy (ask_id-less) card whose submit
-        sends the answers as an ordinary chat message, so the agent resumes in a
-        fresh turn (#755 stateless ``ask_question``) rather than blocking. Shares
-        :meth:`_redact_questions` (may raise ``ValueError`` on a post-redaction
-        collapse). Owner-only, same grounds as request_question's broadcast."""
-        safe_questions = self._redact_questions(questions)
-        card_id = f"card-{uuid.uuid4().hex[:16]}"
-        # Recorded BEFORE the delivery await, and even when nothing is delivered.
-        # Ordering: delivery can park on a backpressured socket, and a user row
-        # landing in that window would find no record to retire — then the mark
-        # would arrive afterwards and strand an answered session in needs_input.
-        # Zero clients means no tab is open, not that the ask went away: the agent
-        # is still waiting, and the status is what says so when the user returns.
-        self.mark_question_pending(
-            slot_key, blocking=False, card_id=card_id, questions=safe_questions
-        )
-        payload = {
-            "slot": slot_key,
-            "card_id": card_id,
-            "questions": safe_questions,
-            "ts": time.time(),
-        }
-        return int(await self.deliver_ws_owners("question_card", payload))
+        """Post a non-blocking owner-only question card."""
+        return await _questions_for(self).post_card(self, slot_key, questions)
 
     def mark_question_pending(
         self,
@@ -5162,50 +4871,14 @@ class DashboardState:
         card_id: str,
         questions: list[dict] | None = None,
     ) -> None:
-        """Record an unanswered agent question on *slot_key* and push the status.
-
-        One entry per ask, keyed by *card_id*, so a blocking ask that overlaps
-        another adds to the status rather than replacing it. A stateless card is
-        the exception and supersedes any earlier stateless card — see below.
-
-        The map needs no capacity cap, and must not have one: an entry is only
-        ever dropped by a retirement path, because dropping a blocking entry would
-        clear the status of an ask_question call still parked on its future and
-        report a stuck session as idle. Its size is bounded by construction — at
-        most ONE stateless entry per slot, and one blocking entry per in-flight
-        ask_question request, each of which holds a live HTTP request bounded by
-        ``_QUESTION_TIMEOUT_MAX``.
-
-        *questions* (already redacted) is stored for a STATELESS card so a
-        reloaded tab can re-render it: the card is a one-shot broadcast with no
-        transcript row, so without this the status would outlive the only surface
-        that could answer or dismiss it. A blocking ask needs no copy — its
-        payload lives in ``_pending_questions`` for as long as the wait does.
-
-        Unknown slot keys are ignored: a question addressed at a slot that no
-        longer exists has nobody to show a status to, and the caller's own
-        no-slot handling (a 404 from the HTTP endpoint, a dropped broadcast)
-        already covers the case.
-        """
-        slot = self._slots.get(slot_key)
-        if slot is None or not card_id:
-            return
-        if not blocking:
-            # The frontend holds ONE card per slot, so a second stateless card
-            # REPLACES the first on screen. Keeping both records would leave the
-            # replaced one unreachable — no card to answer or dismiss — and its
-            # entry would hold needs_input true until some later message swept it
-            # up. Mirror the UI's own invariant instead. Blocking records are not
-            # collapsed: each parked round-trip is separately answerable and must
-            # keep its own entry.
-            for cid, rec in list(slot._question_pending.items()):
-                if not rec.get("blocking"):
-                    slot._question_pending.pop(cid, None)
-        entry: dict = {"ts": time.time(), "blocking": blocking}
-        if questions is not None:
-            entry["questions"] = questions
-        slot._question_pending[card_id] = entry
-        self._push_slots()
+        """Record one unanswered question and push the slot status."""
+        _questions_for(self).mark_pending(
+            self,
+            slot_key,
+            blocking=blocking,
+            card_id=card_id,
+            questions=questions,
+        )
 
     def clear_question_pending(
         self,
@@ -5214,72 +4887,21 @@ class DashboardState:
         blocking: bool | None = None,
         card_id: str | None = None,
     ) -> bool:
-        """Retire unanswered-question records on *slot_key*. True if any went.
-
-        Two independent filters, and a non-matching entry is LEFT IN PLACE rather
-        than cleared:
-
-        ``blocking`` — retire only entries with that flag, so the dismiss route
-        cannot report a session as unblocked while its tool call is still parked.
-
-        ``card_id`` — retire only THAT ask. Both halves of the identity matter: a
-        dismissal is a round-trip, so the card it was clicked on can be replaced
-        by a newer one before the request lands, and a resolving ask must not take
-        an overlapping ask's status with it.
-
-        The return value is the caller's proof that something changed, which is
-        what lets the dismiss endpoint answer 404 for a card that is already gone
-        instead of reporting a no-op as success.
-        """
-        slot = self._slots.get(slot_key)
-        if slot is None or not slot._question_pending:
-            return False
-        doomed = [
-            cid
-            for cid, rec in slot._question_pending.items()
-            if (card_id is None or cid == card_id)
-            and (blocking is None or bool(rec.get("blocking")) == blocking)
-        ]
-        if not doomed:
-            return False
-        for cid in doomed:
-            slot._question_pending.pop(cid, None)
-        # Same announcement the append path makes, for the same reason: every
-        # client must drop a retired card, including one whose /pending response
-        # was already in flight when the retirement landed.
-        self._broadcast_question_retired(slot_key, doomed)
-        self._push_slots()
-        return True
+        """Retire only question records matching both supplied filters."""
+        return _questions_for(self).clear_pending(
+            self,
+            slot_key,
+            blocking=blocking,
+            card_id=card_id,
+        )
 
     def _broadcast_question_retired(self, slot_key: str, card_ids: list[str]) -> None:
-        """Tell owner clients that *card_ids* on *slot_key* are retired.
-
-        Reuses the ``question_card_resolved`` event the blocking round-trip
-        already broadcasts, keyed by ``card_id`` instead of ``ask_id``, so the
-        frontend has one retirement path and one watermark for both kinds rather
-        than a parallel mechanism for each.
-        """
-        for cid in card_ids:
-            if not cid:
-                continue
-            try:
-                self.broadcast_ws_owners(
-                    "question_card_resolved", {"card_id": cid, "slot": slot_key}
-                )
-            except Exception:
-                self._log.warning("WS broadcast failed for card retirement", exc_info=True)
+        """Tell owner clients that question cards are no longer actionable."""
+        _questions_for(self).broadcast_retired(self, slot_key, card_ids)
 
     def _push_slots(self) -> None:
-        """Broadcast a slots snapshot, swallowing a failure.
-
-        A status marker is not worth propagating an exception into the question
-        round-trip it decorates: the payload is rebuilt from slot state on every
-        later push, so a dropped one self-corrects.
-        """
-        try:
-            self.push_slots_update()
-        except Exception:
-            self._log.debug("push_slots_update failed after question status change", exc_info=True)
+        """Push question status without failing the question lifecycle."""
+        _questions_for(self).push_slots(self)
 
     async def request_question(
         self,
@@ -5288,112 +4910,28 @@ class DashboardState:
         questions: list[dict],
         timeout: int | None = None,
     ) -> dict[str, str] | None:
-        """Ask the dashboard user a multiple-choice question and block for the answer.
-
-        Broadcasts a ``question_card`` carrying ``ask_id`` and awaits the
-        matching :meth:`resolve_question` call. Returns the user's answer map
-        (``{question: answer}``), or ``None`` when the wait timed out, the
-        caller was cancelled, or the user dismissed the card.
-
-        ``questions`` MUST already have passed
-        :func:`kiro_crew.validation.validate_ask_user_question` — this method
-        redacts but does not re-shape the payload.
-        """
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict[str, str] | None] = loop.create_future()
-
-        # Redact model-authored text (URLs/credentials) before it is rendered,
-        # rejecting post-redaction collapses. Shared with post_question_card.
-        safe_questions = self._redact_questions(questions)
-
-        payload = {
-            "ask_id": ask_id,
-            "slot": slot_key,
-            "questions": safe_questions,
-            "ts": time.time(),
-        }
-        self._pending_questions[ask_id] = payload
-        # Registered only now that the payload is known-good: an early raise
-        # above must not leave an orphan future nothing will ever resolve.
-        self._question_futures[ask_id] = fut
-        # Same record the stateless card sets, flagged blocking and identified by
-        # the ask_id: this turn is parked on the answer, so the session reads as
-        # running AND waiting. Marked before the broadcast, so no client can act
-        # on a card the status does not yet know about.
-        self.mark_question_pending(slot_key, blocking=True, card_id=ask_id)
-        # Owner-only: the payload carries the model-authored question text and
-        # options addressed to the dashboard owner. A plain broadcast_ws would
-        # also deliver it to non-owner sessions, which would defeat the
-        # owner-gating on the HTTP endpoints.
-        self.broadcast_ws_owners("question_card", payload)
-
-        window = timeout if timeout is not None else self._QUESTION_TIMEOUT_DEFAULT
-        window = max(1, min(int(window), self._QUESTION_TIMEOUT_MAX))
-        try:
-            return await asyncio.wait_for(fut, timeout=window)
-        except asyncio.TimeoutError:
-            return None
-        except asyncio.CancelledError:
-            return None
-        finally:
-            self._pending_questions.pop(ask_id, None)
-            self._question_futures.pop(ask_id, None)
-            # One retirement point for every exit — answered, dismissed, timed
-            # out, cancelled — so no path can leave the slot claiming it is
-            # still waiting on a question nothing is blocked on. Scoped to THIS
-            # ask's record (blocking, by ask_id), so a question that overlapped
-            # this one keeps its own status.
-            self.clear_question_pending(slot_key, blocking=True, card_id=ask_id)
-            # Tell every owner client to drop the card — otherwise a timed-out
-            # or cancelled question stays clickable and submitting it 404s.
-            # Owner-scoped to match the card broadcast: a non-owner never
-            # received the card, so it has nothing to drop.
-            try:
-                self.broadcast_ws_owners("question_card_resolved", {"ask_id": ask_id})
-            except Exception:
-                self._log.warning("WS broadcast failed for question resolution", exc_info=True)
+        """Run the legacy blocking owner question round-trip."""
+        return await _questions_for(self).request(
+            self,
+            ask_id,
+            slot_key,
+            questions,
+            timeout,
+        )
 
     def resolve_question(self, ask_id: str, answers: dict[str, str] | None) -> bool:
-        """Resolve a pending agent question. Returns False when no such question.
-
-        ``answers`` of ``None`` means the user dismissed the card without
-        answering; the blocked caller then sees the same result as a timeout.
-        """
-        fut = self._question_futures.get(ask_id)
-        if fut is None or fut.done():
-            return False
-        fut.set_result(answers)
-        return True
+        """Resolve one blocking question future if it is still pending."""
+        return _questions_for(self).resolve(self, ask_id, answers)
 
     def cancel_questions_for_slot(self, slot_key: str) -> int:
-        """Unblock every question pending on ``slot_key``. Returns how many.
-
-        Called when a slot's turn is stopped or reset so a blocked ask_question
-        cannot outlive the turn that issued it and strand its MCP call.
-        """
-        stale = [aid for aid, p in self._pending_questions.items() if p.get("slot") == slot_key]
-        cancelled = 0
-        for aid in stale:
-            if self.resolve_question(aid, None):
-                cancelled += 1
-        return cancelled
+        """Unblock every blocking question owned by one slot."""
+        return _questions_for(self).cancel_for_slot(self, slot_key)
 
     def start_flush_loop(self) -> None:
-        """Start background loop that flushes dirty slots to disk every 5s."""
-        if self._flush_task is None:
-            self._flush_task = asyncio.ensure_future(self._flush_loop())
+        _persistence_for(self).start_flush_loop(self)
 
     async def _flush_loop(self) -> None:
-        """Periodically save dirty slots so a crash loses at most 5s of chat."""
-        from kiro_crew import shutdown_event
-
-        while not shutdown_event.is_set():
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=self._FLUSH_INTERVAL)
-                return
-            except asyncio.TimeoutError:
-                pass
-            await asyncio.get_running_loop().run_in_executor(None, self._flush_dirty_slots)
+        await _persistence_for(self)._flush_loop(self)
 
     def flush_slot_now(self, slot: _ChatSlot) -> bool:
         """Write ONE dirty slot to disk, with the flush loop's bookkeeping.
@@ -5409,126 +4947,13 @@ class DashboardState:
         wrote the bytes would leave the slot dirty, the loop would re-save it
         moments later, and the mtime would move again anyway.
         """
-        if not self.conversation_log:
-            return False
-        if not slot._dirty or not slot.messages:
-            return True
-        from kiro_crew.dashboard.chat import _save_slot_to_history
-
-        # Clear the dirty bit only if NOTHING re-marked the slot while this save
-        # was running. This can run on an executor thread while the event loop
-        # keeps mutating the slot underneath it, so a plain post-save
-        # `_dirty = False` would overwrite a mark set DURING the save (e.g.
-        # _flush_file_changes attaching file_changes) — the stale snapshot would
-        # be the last thing written and every later pass would skip the slot, so
-        # the late mutation would never reach disk.
-        #
-        # The generation compare is used instead of consuming the bit up front
-        # because `_dirty` must stay True for the whole save: `chat_fork` reads
-        # it as "unpersisted state exists" (a False read makes it fork from
-        # stale disk), and `_save_slot_to_history`'s resumed-slot no-op guard is
-        # written assuming a dirty slot still reads dirty during the save.
-        # See the `_dirty` property for both contracts.
-        gen = slot._dirty_gen
-        try:
-            _save_slot_to_history(self, slot)
-        except Exception:
-            # Leave _dirty set so the next 5s pass retries.
-            logger.warning("Flush failed for slot %s", slot.key, exc_info=True)
-            return False
-        else:
-            if slot._dirty_gen == gen:
-                slot._dirty = False
-            return True
+        return _persistence_for(self).flush_slot_now(self, slot)
 
     def _flush_dirty_slots(self) -> None:
-        """Write any slot with new messages to its JSONL file."""
-        if not self.conversation_log:
-            return
-
-        for slot in list(self._slots.values()):
-            self.flush_slot_now(slot)
-        # Snapshot the live tab set so a gateway restart can restore exactly
-        # the tabs the user had open, regardless of last-message age. Without
-        # this, restore_recent_sessions only brings back sessions whose
-        # JSONL file was written within `restore_window_minutes` (default
-        # 30) — long-running tabs that haven't seen a new message in 30 min
-        # would silently drop to History on every restart. This file is
-        # cheap (~one short string per tab) and overwritten on every flush.
-        self._persist_open_slots()
-        # Same off-loop flush, same reason: a context-meter reading is recorded
-        # on the loop (pure dict write) and the file IO happens here.
-        self._persist_context_snapshots()
+        _persistence_for(self)._flush_dirty_slots(self)
 
     def _persist_open_slots(self) -> None:
-        """Atomically write the current open-slot keys to <config_dir>/open_slots.json.
-
-        The file shape is intentionally minimal:
-            {"keys": ["chat-1-...", "chat-2-..."], "ts": 1234567890.0}
-
-        Path resolves through ``config_dir()`` so the snapshot lives next to
-        every other dashboard persistence file and honors ``KIROCREW_HOME``
-        — non-default homes (dev/test instances) restore from their own file
-        instead of bleeding through ``~/.kiro/crew``.
-
-        Restored on startup by ``restore_open_slots`` in chat_persistence.
-        Failures are logged at debug level — losing the snapshot only
-        degrades restore behaviour back to the legacy 30-min mtime window,
-        it never breaks the gateway.
-
-        NO-OP while ``restoring_open_slots`` is set. The startup restore yields to
-        the event loop between tabs, and ``start_flush_loop()`` is already running
-        by then (every 5s), so without this guard a flush lands mid-restore and
-        snapshots a PARTIAL slot set over the very file being restored from —
-        measured 77 tabs collapsing to 70. A kill in that window would drop the
-        un-restored tabs from the sidebar permanently. Whatever is on disk is
-        already the authoritative set we are loading, so skipping is always safe.
-        """
-        if self.restoring_open_slots:
-            logger.debug("open_slots snapshot skipped: restore in progress")
-            return
-        try:
-            path = config_dir() / "open_slots.json"
-            # Only snapshot persistent-memory slots. Incognito/temporary tabs
-            # are ephemeral by contract ("closes when I'm done", no
-            # consolidation/lessons); persisting their keys would resurrect
-            # them on every restart indefinitely. Filter on the canonical
-            # "persistent" memory_mode so any non-default mode (incognito,
-            # temporary, future variants) is excluded.
-            keys = [
-                name
-                for name, slot in list(self._slots.items())
-                if getattr(slot, "memory_mode", "persistent") == "persistent"
-            ]
-            # Re-add keys the last restore could not READ. Without this, a tab
-            # dropped by a transient metadata failure is erased from the seed by
-            # the very next flush (this snapshot is taken from live _slots), so
-            # "recoverable on a later restore pass" stops being true and the tab
-            # is gone for good. Only keys that came out of open_slots.json land
-            # here, so the persistent-only filter above still holds for them.
-            #
-            # Iterating this set is safe ONLY because the restoring_open_slots
-            # early-return above covers the one writer: the restore mutates it
-            # between tabs, and this method runs from two threads (the 5s
-            # executor flush and the shutdown thread). That guard is therefore
-            # load-bearing for thread safety here, not just for partial
-            # snapshots — do not narrow it without giving this set its own lock.
-            seen = set(keys)
-            keys.extend(
-                k for k in getattr(self, "unrestored_slot_keys", frozenset()) if k not in seen
-            )
-            payload = json.dumps({"keys": keys, "ts": time.time()})
-            # Use the canonical atomic_write helper, not a deterministic
-            # ".json.tmp" name — _persist_open_slots can run concurrently from
-            # two threads (the periodic _flush_dirty_slots executor every 5s
-            # and the shutdown thread via save_all_slots_to_history). A shared
-            # fixed temp file would hit an ENOENT race between the two writers;
-            # atomic_write uses tempfile.mkstemp for unique names so they can't
-            # collide. mode=0o600 because open_slots.json holds session
-            # identifier keys — default umask perms (0o644) are too permissive.
-            atomic_write(path, payload, mode=0o600)
-        except Exception:
-            logger.debug("Failed to persist open_slots.json", exc_info=True)
+        _persistence_for(self)._persist_open_slots(self)
 
     def notify(
         self,
@@ -5540,285 +4965,68 @@ class DashboardState:
         url: str | None = None,
         actions: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Push a notification to ALL connected SSE clients and persist to disk.
-
-        Legacy adapter over the notification bus (see
-        docs/request-for-change/rfc-local-notification-bus.md): builds a
-        schema-v2 payload (source="system", channel="system.<kind>") and pushes
-        it through :class:`NotificationBus`, which validates and hands the
-        enriched note back to :meth:`_deliver_note`.
-
-        ``url`` (a dashboard-internal path that renders the detail panel's Open
-        button) and ``actions`` (up to four labelled navigation capsules on the
-        feed row) must be passed HERE, not inside ``meta``: the bus's meta merge
-        skips both names so ``meta`` cannot smuggle an unvalidated deep link,
-        so a ``meta={"url": ...}`` caller produces a note with no navigation at
-        all. Both are validated by the payload; an invalid one -- wrong type or
-        an off-dashboard path -- is dropped with a warning, so the never-raises
-        contract is preserved. That holds only because
-        :meth:`NotificationPayload.validate` turns BOTH bad values and bad types
-        into :class:`NotificationValidationError`; the payload build is inside
-        the guarded block so a future field that validates on construction
-        cannot reopen the hole either.
-        """
-        try:
-            payload = payload_from_legacy(kind, title, body, meta, url=url, actions=actions)
-            self.notification_bus.push(payload)
-        except NotificationValidationError:
-            # Legacy callers never validated inputs; keep the old
-            # never-raises contract and log instead.
-            logger.warning("Dropped invalid notification (kind=%s)", kind, exc_info=True)
+        """Validate and deliver a legacy notification without raising."""
+        _notifications_for(self).notify(
+            self,
+            kind,
+            title,
+            body,
+            meta=meta,
+            url=url,
+            actions=actions,
+        )
 
     def _deliver_note(self, note: dict[str, Any]) -> None:
-        """Delivery sink for the notification bus: log, count, broadcast, persist.
-
-        Central redaction point: notes can carry LLM-derived content (agent
-        results, cron summaries — including flat-merged meta values and
-        nested structures like action labels), so every string value is
-        scanned recursively before reaching any external surface (SSE
-        clients, JSONL on disk). Most callers already redact at the call
-        site; this is defense-in-depth ahead of Phase 2 app producers.
-        """
-        for key, value in note.items():
-            if key != "ts":
-                note[key] = _redact_note_value(value)
-        # Per-channel user settings (RFC Phase 3): mute stamps silenced=True
-        # + forces passive; priority override replaces the effective priority.
-        # Applied before append/broadcast so SSE clients and disk both see
-        # the user's view.
-        self.notification_channel_settings.apply(note)
-        # RFC Phase 5: lazily sweep expired passive rows on every delivery
-        # (the log is capped at a few hundred rows, so the scan is cheap).
-        # Disk catches up on the next full rewrite (ack/delete/clear paths).
-        sweep_expired_notifications(self._notification_log)
-        self._notification_log.append(note)
-        # Bound the in-memory list: only the disk load
-        # path capped it before, so sustained live deliveries grew the list
-        # without limit — and the per-delivery sweep above scans it, making
-        # delivery O(N²) over time. Same cap as the persisted file; oldest
-        # rows drop first (the file trim keeps disk consistent).
-        if len(self._notification_log) > _MAX_PERSISTED_NOTIFICATIONS:
-            del self._notification_log[: len(self._notification_log) - _MAX_PERSISTED_NOTIFICATIONS]
-        # Badge counts attention-worthy rows only (RFC Phase 3: passive rows
-        # -- including muted-channel notes -- are excluded).
-        if note.get("priority") != "passive":
-            self._unread_count += 1
-        self._broadcast(note)
-        # Persistence does blocking file I/O (append + possible trim). The
-        # bus sink is now externally drivable (Phase 2 app producers), so on
-        # a running event loop the write is offloaded to a dedicated
-        # single-worker executor (FIFO keeps on-disk order = delivery order).
-        # A snapshot copy is handed off because the in-memory note can be
-        # mutated afterwards on the loop (e.g. ack sets note["acked"]).
-        # The future is stashed so callers that need durability (the app
-        # push endpoint) can await it and read the success bool; legacy
-        # system producers stay fire-and-forget (best-effort history).
-        # Without a running loop (unit tests, sync callers) persist inline.
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            _persist_notification(note)
-            self.last_notification_persist = None
-        else:
-            self.last_notification_persist = loop.run_in_executor(
-                _notification_io_executor(), _persist_notification, dict(note)
-            )
+        """Deliver one bus-validated note to memory, clients, and disk."""
+        _notifications_for(self).deliver(self, note)
 
     def register_sse(self) -> asyncio.Queue[dict[str, Any]]:
         """Register a new SSE client and return its dedicated queue."""
-        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
-        self._sse_queues.append(q)
-        return q
+        return _notifications_for(self).register_sse(self)
 
     def unregister_sse(self, q: asyncio.Queue[dict[str, Any]]) -> None:
         """Remove an SSE client queue on disconnect."""
-        try:
-            self._sse_queues.remove(q)
-        except ValueError:
-            pass
-
-    def mark_notifications_read(self) -> None:
-        """Reset unread counter (called when client opens notification panel)."""
-        self._unread_count = 0
+        _notifications_for(self).unregister_sse(self, q)
 
     async def _rewrite_notifications_async(self) -> None:
-        """Rewrite the notifications file on the I/O executor and await it.
-
-        All disk mutations (appends from ``_deliver_note`` and rewrites from
-        delete/ack/clear) go through the same single-worker executor, so they
-        execute strictly in submission order — a rewrite submitted after an
-        append can never be overtaken by it (no resurrection of deleted
-        rows). Awaiting makes the mutation durable before the HTTP response
-        returns. A shallow per-row snapshot is handed off because rows are
-        mutated on the loop (e.g. ack flags).
-        """
-        snapshot = [dict(n) for n in self._notification_log]
-        await asyncio.get_running_loop().run_in_executor(
-            _notification_io_executor(), _rewrite_notifications, snapshot
-        )
+        """Rewrite notification storage after earlier FIFO append jobs."""
+        await _notifications_for(self).rewrite(self)
 
     async def delete_notification(self, ts: str) -> bool:
         """Remove a single notification by timestamp and persist to disk."""
-        before = len(self._notification_log)
-        self._notification_log = [n for n in self._notification_log if n.get("ts") != ts]
-        removed = len(self._notification_log) < before
-        if removed:
-            await self._rewrite_notifications_async()
-        return removed
+        return await _notifications_for(self).delete(self, ts)
 
     async def ack_notification(self, ts: str) -> bool:
-        """Mark a notification as acknowledged and persist."""
-        for n in self._notification_log:
-            if n.get("ts") == ts:
-                n["acked"] = True
-                await self._rewrite_notifications_async()
-                self.broadcast_ws("notification_ack", {"ts": ts})
-                return True
-        return False
+        """Mark a notification as acknowledged and persist it."""
+        return await _notifications_for(self).set_acknowledged(self, ts, acknowledged=True)
 
     async def unack_notification(self, ts: str) -> bool:
-        """Mark a notification as unread and persist."""
-        for n in self._notification_log:
-            if n.get("ts") == ts:
-                n["acked"] = False
-                await self._rewrite_notifications_async()
-                self.broadcast_ws("notification_unack", {"ts": ts})
-                return True
-        return False
+        """Mark a notification as unread and persist it."""
+        return await _notifications_for(self).set_acknowledged(self, ts, acknowledged=False)
 
     async def resolve_skill_review_notifications(self, slug: str, consumed_at: str) -> int:
-        """Ack every skill-review notification for a candidate that left the queue.
-
-        Approving, dismissing, or TTL-pruning a pending skill candidate retires
-        the review request the notification exists to surface. Left unread, the
-        row keeps the bell badge lit for something that can no longer be acted
-        on — its deep link lands on the "no longer awaiting review" banner.
-
-        ``consumed_at`` scopes the ack to the candidate GENERATION that was
-        actually consumed: it is stamped by the consumption site BEFORE the
-        pending directory is removed, and staging refuses to overwrite an
-        existing candidate — so a same-slug replacement staged afterwards
-        carries a strictly later ``ts`` and is never touched. Both timestamps
-        come from ``datetime.now(tz=timezone.utc).isoformat()``, so string
-        comparison is chronological. Rows with a missing/foreign ``ts`` and a
-        falsy cutoff are left alone (fail-safe: a stale unread row beats a
-        wrongly-acked actionable one). Matching is on ``channel ==
-        "system.skills"`` — the bus-validated field only the gateway's own
-        skill-review producer can carry (``system`` is a reserved app name) —
-        never on the derived legacy ``kind``, which an app channel named
-        ``<app>.skills`` would collide with. Acks — never deletes — so the feed
-        keeps its history, and broadcasts ``notification_ack`` per row so an
-        open feed updates live. Returns the number of rows acked.
-        """
-        if not slug or not consumed_at:
-            return 0
-        acked_ts: list[str] = []
-        for n in self._notification_log:
-            ts = n.get("ts")
-            if (
-                n.get("channel") == "system.skills"
-                and n.get("slug") == slug
-                and not n.get("acked")
-                and isinstance(ts, str)
-                and ts
-                and ts <= consumed_at
-            ):
-                n["acked"] = True
-                acked_ts.append(ts)
-        if not acked_ts:
-            return 0
-        await self._rewrite_notifications_async()
-        for ts in acked_ts:
-            self.broadcast_ws("notification_ack", {"ts": ts})
-        return len(acked_ts)
+        """Acknowledge the consumed generation of one skill review."""
+        return await _notifications_for(self).resolve_skill_reviews(self, slug, consumed_at)
 
     async def clear_notifications(self) -> None:
-        """Remove all notifications from memory and disk.
-
-        Broadcasts ``notifications_clear`` so every connected dashboard view
-        drops its copy of the list. Without the broadcast only the clearing
-        view converges — any other live view (second window, another tab, an
-        embedded viewport) keeps stale items and therefore a stale bell badge.
-        Clearing an already-empty list is a no-op on every client, never an
-        error.
-
-        The broadcast is emitted at the instant memory becomes empty, BEFORE
-        the awaited rewrite, unlike the ack path which broadcasts after it.
-        The difference is that an ack frame is ``ts``-scoped while this one is
-        global: awaiting first yields the loop, so a note delivered during the
-        rewrite would broadcast its own ``notification`` frame first and then
-        be discarded by a clear frame arriving after it — leaving the clients
-        empty while the backend (and the file, since the append lands after
-        the empty-snapshot rewrite on the same ordered executor) still holds
-        that note. Emitting first means any later delivery's frame sequences
-        after the clear and survives on both sides.
-        """
-        self._notification_log.clear()
-        self._unread_count = 0
-        self.broadcast_ws("notifications_clear", {})
-        await self._rewrite_notifications_async()
+        """Clear memory and clients before awaiting the durable rewrite."""
+        await _notifications_for(self).clear(self)
 
     def get_slot(self, name: str) -> _ChatSlot | None:
         """Look up a slot by name without creating it. Returns None if absent."""
-        return self._slots.get(name)
+        return _registry_for(self).get_slot(self, name)
 
     def running_session_keys(self) -> frozenset[str]:
-        """Session keys with a turn in flight right now.
-
-        This is the only signal for "something is using this session at this
-        instant", as distinct from "this session could be resumed" — which is what
-        a ``session_map`` entry means. Storage reclamation needs the first
-        question: moving a session's files is dangerous while a turn is running,
-        and merely being resumable is not.
-
-        Exposed as a method rather than leaving callers to read ``_slots`` so a
-        test double cannot invent the interface: a fake that grants an attribute
-        this class does not have would assert against a fiction while the feature
-        is dead at runtime.
-        """
-        # Local import: chat_utils imports from this module, so a top-level import
-        # would close a cycle. Same shape as the other call sites in this file.
+        """Return effective session keys whose current slots are running."""
         from kiro_crew.dashboard.chat_utils import effective_session_key
 
-        # Snapshot the values first. This is called from a worker thread (the
-        # storage scan runs off the event loop), so the loop can create or drop a
-        # slot mid-iteration — which raises RuntimeError and turns an inventory
-        # read into a 500. A list() copy is atomic enough for that.
-        return frozenset(
-            effective_session_key(slot) for slot in list(self._slots.values()) if slot.running
-        )
+        return _registry_for(self).running_session_keys(self, effective_session_key)
 
     def spend_slot_by_session(self) -> dict[str, str]:
-        """Map each live slot's SESSION key to the SLOT key its spend is filed under.
-
-        Per-turn usage is persisted under ``slot.key``
-        (``chat_runner.persist_token_record_async``), while a session is addressed
-        by :func:`effective_session_key`. For an ordinary dashboard slot those are
-        the same string modulo the ``dashboard:`` prefix, so a prefix rule is
-        enough. For a slot bound to a channel or cron conversation they are
-        UNRELATED: the turns run under ``linked_session_key`` while the spend rows
-        still carry the dashboard slot key, so a consumer joining spend by session
-        key finds nothing and renders "unknown" for a session that did spend.
-
-        This is the reverse index that closes that gap. It lives here because
-        DashboardState owns the slots and the identity rule; a consumer rebuilding
-        it would be a second owner of the rule, which is how the two sides drifted
-        apart in the first place.
-        """
-        # Local import: chat_utils imports FROM state at module level, so a
-        # top-level import here is a cycle. state.py already defers
-        # `dashboard_slot_key` the same way.
+        """Map live effective session identities to their spend-owning slot keys."""
         from kiro_crew.dashboard.chat_utils import effective_session_key
 
-        out: dict[str, str] = {}
-        for slot in list(self._slots.values()):
-            try:
-                session_key = effective_session_key(slot)
-            except Exception:  # pragma: no cover - defensive; a slot mid-teardown
-                continue
-            if session_key:
-                out[session_key] = slot.key
-        return out
+        return _registry_for(self).spend_slot_by_session(self, effective_session_key)
 
     def native_subagent_snapshots(
         self,
@@ -5893,59 +5101,15 @@ class DashboardState:
 
     def has_slot(self, name: str) -> bool:
         """Check if a slot exists by name."""
-        return name in self._slots
+        return _registry_for(self).has_slot(self, name)
 
     def get_linked_slot(self, session_key: str) -> "_ChatSlot | None":
-        """Look up a dashboard slot linked to a Slack thread. Cleans up stale mappings."""
-        slot_key = self._slack_to_slot.get(session_key)
-        if not slot_key:
-            return None
-        slot = self._slots.get(slot_key)
-        if not slot or not slot._slack_linked or slot._slack_thread_ts != session_key:
-            self._slack_to_slot.pop(session_key, None)
-            return None
-        return slot
+        """Resolve a Slack link and clean up a stale reverse-index entry."""
+        return _registry_for(self).get_linked_slot(self, session_key)
 
     def resolve_slot(self, name: str) -> _ChatSlot | None:
-        """Like :meth:`get_slot`, but also resolves bare ``chat-N`` labels.
-
-        Falls back to a prefix match so ``chat-2`` resolves to
-        ``chat-2-<timestamp>`` when no exact match exists. The fallback is
-        gated to names matching ``chat-\\d+`` to prevent broad-prefix
-        collisions (e.g. a bare ``chat`` binding to any ``chat-*`` slot).
-
-        Tie-break: when multiple slots share the same ``chat-N-`` prefix
-        (e.g. a stale slot re-created by a resume/restart alongside the live
-        one), return the slot with the largest trailing ``<timestamp>`` — the
-        newest. Iteration-order tie-break previously returned whichever slot
-        happened to be first in the dict, which could route a ``chat-N``
-        message to a long-closed slot after a restart.
-
-        Use this from trusted delivery paths (heartbeat, cron) where the
-        caller wants short-label addressing. Do NOT use from HTTP handlers
-        that pass the resolved name to key-derivation functions
-        (e.g. ``_history_key_for``) — those require the full slot key.
-        """
-        slot = self._slots.get(name)
-        if slot is not None:
-            return slot
-        if not _CHAT_N_RE.fullmatch(name):
-            return None
-        prefix = name + "-"
-        best_ts = -1
-        best_slot: _ChatSlot | None = None
-        for key, s in self._slots.items():
-            if not key.startswith(prefix):
-                continue
-            tail = key[len(prefix) :]
-            try:
-                ts = int(tail)
-            except ValueError:
-                ts = -1
-            # Prefer the newest timestamp; on a genuine tie keep the first seen.
-            if best_slot is None or ts > best_ts:
-                best_ts, best_slot = ts, s
-        return best_slot
+        """Resolve an exact key or the newest timestamped bare ``chat-N`` key."""
+        return _registry_for(self).resolve_slot(self, name, _CHAT_N_RE.fullmatch)
 
     def link_slack(self, slot_name: str, thread_ts: str, channel_id: str) -> None:
         """Update a slot's Slack link state and persist to SessionStore."""
@@ -6020,6 +5184,19 @@ class DashboardState:
         linked_session_key: str = "",
         channel_origin: bool = False,
         origin: str | None = None,
+        *,
+        # Opt-in for the survey's "new user" session counter, DISTINCT from the
+        # origin tag: ``SlotOrigin.USER`` carries the ``slots:user`` privacy
+        # semantics and is deliberately set by non-human paths too (the
+        # session-control create verb mints USER slots so agent-created
+        # sessions stay app-invisible), so origin alone cannot mean "a person
+        # started this chat". Only the human request-layer paths (chat-send
+        # auto-create, new-chat tab, fork) pass True. Default False is the
+        # chosen fail direction, matching
+        # the counter's own philosophy below: a future missed opt-in only
+        # delays the survey (lost signal); defaulting to count would let
+        # unattended agent activity satisfy the gate (corrupted signal).
+        count_user_session: bool = False,
     ) -> _ChatSlot:
         """Return existing slot or create a new one.
 
@@ -6030,40 +5207,21 @@ class DashboardState:
         binding applied later would hydrate against the wrong key and leave a
         channel-born tab looking unlinked.
         """
-        requested_name = ""
-        if name:
-            # Slot keys flow into the session key (``dashboard:{slot.key}``)
-            # that kirocrew-core sends as the ``X-Session-Key`` HTTP header
-            # (latin-1 per RFC 7230) AND into the persisted JSONL
-            # filename via the history layer's lossy ``_safe_key()`` fold.
-            # Normalize to the filename charset *before* the lookup so the key
-            # is header-, filesystem-, and restore-round-trip-safe: the key now
-            # equals its filename stem, so the two restart restore paths
-            # (open_slots.json replay vs filename-stem walk) converge on one
-            # slot instead of duplicating the session in the sidebar.
-            requested_name = name
-            name = _normalize_slot_key(name)
-            if not name:
-                # Degenerate input (e.g. a bare "dashboard:" prefix) — fall
-                # through to an auto-generated key without title seeding.
-                requested_name = ""
-        if name and name in self._slots:
-            existing = self._slots[name]
-            if memory_mode is not None and memory_mode != existing.memory_mode:
-                raise ValueError(
-                    f"Slot {name!r} already exists with memory_mode={existing.memory_mode!r}"
-                )
+        existing, creation = _registry_for(self).prepare_creation(
+            self,
+            name,
+            mode=mode,
+            memory_mode=memory_mode,
+            normalize_key=lambda value: _normalize_slot_key(value),
+            mint_key=lambda prefix, index, timestamp: _mint_slot_key(prefix, index, timestamp),
+            timestamp_provider=lambda: time.time(),
+        )
+        if existing is not None:
             return existing
-        # A brand-new chat arrives with no name and is auto-minted here; restore
-        # and rehydrate always pass the persisted key as ``name`` (and
-        # get-existing returns above). Only the mint path is a genuine new
-        # user-initiated chat, so only it may count toward the survey's session
-        # window -- otherwise every restart re-counts each restored user slot.
-        minted_new = not name
-        if not name:
-            self._slot_counter += 1
-            ts = int(time.time())
-            name = _mint_slot_key("chat", self._slot_counter, ts)
+        assert creation is not None
+        name = creation.key
+        requested_name = creation.requested_name
+        minted_new = creation.minted_new
         slot = _ChatSlot(
             name,
             agent=agent,
@@ -6102,12 +5260,18 @@ class DashboardState:
         # SlotOrigin.USER), so a caller that forgets to declare loses
         # visibility instead of leaking — the direction this has to fail in.
         slot._origin = origin or (SlotOrigin.APP if app else "")
-        if minted_new and slot._origin == SlotOrigin.USER:
+        if minted_new and count_user_session and slot._origin == SlotOrigin.USER:
             # Count only genuine, newly-minted user chats toward the survey's
             # "new user" window (session_pulse_counter). `minted_new` excludes
             # restore/rehydrate (which passes the persisted key as name) and
-            # get-existing, so a restart never re-counts already-seen sessions;
-            # only the request layer ever supplies origin=USER. Best-effort:
+            # get-existing, so a restart never re-counts already-seen sessions.
+            # `count_user_session` carries the human-started signal: only the
+            # request-layer paths a person actually drives (chat-send
+            # auto-create, new-chat tab, fork) opt in, so agent-minted USER
+            # slots (the session-control create verb) do not satisfy the
+            # survey gate on their own (#6139). The
+            # origin conjunct stays as the invariant floor: a caller can never
+            # count a non-USER slot, flag or not. Best-effort:
             # the helper swallows its own I/O errors and never raises into
             # slot creation.
             #
@@ -6193,7 +5357,7 @@ class DashboardState:
                         self._slack_to_slot[_ts] = name
         except Exception:
             pass
-        self._slots[name] = slot
+        _registry_for(self).put_slot(self, name, slot)
         # Publish the updated key set to SessionManager and the surface
         # registry NOW, not just on the HTTP slot endpoints. Slots born here
         # programmatically (auto-research campaign workers, cron/workflow
@@ -6216,61 +5380,28 @@ class DashboardState:
         return slot
 
     def live_slot_count(self) -> int:
-        """Slots that occupy memory: published PLUS still under construction.
+        """Count published and allocated-but-unpublished slots."""
+        return _registry_for(self).live_slot_count(self)
 
-        The number every slot cap must test. A slot retracted for construction is
-        missing from ``_slots`` but is fully allocated, so a cap reading
-        ``len(self._slots)`` directly undercounts and lets concurrent creators
-        each slip past a cap that is already full.
-        """
-        return len(self._slots) + len(self._slots_under_construction)
+    def creator_slot_count(self, creator_key: str) -> int:
+        """Count live slots attributed to one non-empty creator key."""
+        return _registry_for(self).creator_slot_count(self, creator_key)
 
     def begin_slot_construction(self, key: str) -> None:
-        """Mark *key* as allocated-but-unpublished.
-
-        Pair with :meth:`end_slot_construction` in a ``finally`` -- a leaked key
-        inflates every slot cap for the lifetime of the process.
-        """
-        self._slots_under_construction.add(key)
+        """Mark a slot key as allocated but not yet published."""
+        _registry_for(self).begin_slot_construction(self, key)
 
     def end_slot_construction(self, key: str) -> None:
-        """Drop *key* from the under-construction set. Idempotent."""
-        self._slots_under_construction.discard(key)
+        """Release an allocated-but-unpublished slot marker."""
+        _registry_for(self).end_slot_construction(self, key)
 
     def reseed_slot_counter(self) -> None:
-        """Advance ``_slot_counter`` past the highest index among live slots.
-
-        ``__init__`` resets ``_slot_counter`` to 0 on every gateway boot, but
-        the startup restore paths (``restore_open_slots`` then
-        ``restore_recent_sessions``) rehydrate the user's tabs under their
-        original ``chat-<N>-<ts>`` keys without touching the counter. The first
-        new slot minted after a restart would then re-use a low index
-        (``chat-1-...``) that collides with an already-restored tab holding that
-        same index, scrambling the frontend's tab -> session binding so a
-        restored tab loads the wrong session.
-
-        Called once after the restore paths run in ``start_dashboard``. Parses
-        the ``<prefix>-<N>-<ts>`` slot keys and seeds the counter to the max
-        observed index so subsequent auto-minted slots always get fresh,
-        collision-proof indices. Monotonic: only ever advances the counter,
-        never lowers it, so it is safe to call regardless of restore order.
-        """
-        max_idx = self._slot_counter
-        for name in self._slots:
-            # Parse via the shared helper so this stays in lock-step with the
-            # key minter (_mint_slot_key). Custom keys return None and skip.
-            idx = _slot_index_from_key(name)
-            if idx is not None and idx > max_idx:
-                max_idx = idx
-        if max_idx != self._slot_counter:
-            # Symmetric with restore_recent_sessions' "Restored %d session(s)"
-            # log so a future recurrence of the collision is observable.
-            logger.info(
-                "Reseeded slot counter %d -> %d past highest restored slot index",
-                self._slot_counter,
-                max_idx,
-            )
-        self._slot_counter = max_idx
+        """Advance the mint counter past every parseable current slot key."""
+        _registry_for(self).reseed_slot_counter(
+            self,
+            slot_index_from_key=lambda name: _slot_index_from_key(name),
+            logger_provider=lambda: logger,
+        )
 
     def _broadcast_chat_message(self, slot_key: str, msg: dict) -> None:
         """Push a chat message to all SSE clients via the global stream."""
@@ -6339,7 +5470,7 @@ class DashboardState:
 
     # ── Folder persistence ──
 
-    _FOLDERS_FILE = "folders.json"
+    _FOLDERS_FILE = FOLDERS_FILE
     _TAGS_FILE = "tags.json"
     _TAG_BOARDS_FILE = "tag_boards.json"
 
@@ -6362,65 +5493,14 @@ class DashboardState:
     ]
 
     def load_folders(self) -> None:
-        """Load folder definitions from disk, dropping rows nothing can use.
-
-        ``folders.json`` is hand-editable, and a bare ``json.loads`` admits
-        whatever it holds: a non-list document, a non-dict entry, or a row with
-        no ``id``. Every consumer matches rows by id, and ``mutate_folders``
-        snapshots the store with ``dict(row)`` -- which raises on a non-dict and
-        surfaces as a 500, since no middleware maps handler exceptions. So ONE
-        bad row would take out every folder read and write until someone edited
-        the file, and hardening each consumer in turn only moves where it dies.
-
-        Filtered here instead, at the single point the rows enter memory. A row
-        with no usable id can never be the row a request addresses, so dropping
-        it is the correct answer and not merely the safe one; it is logged so a
-        silently shrinking sidebar is explainable. Same per-entry isolation the
-        cron loader applies for the same reason.
-
-        The id must be a non-empty STRING, not merely truthy. Ids are minted as
-        ``uuid.uuid4().hex[:12]``, so anything else is already corrupt -- and a
-        merely-truthy test lets a list or dict id through, which then reaches
-        ``counts.get(f["id"])`` in the archived-count join and raises
-        ``TypeError: unhashable type`` from inside the folder GET. Admitting a
-        row that cannot be used is the same failure as not filtering at all.
-        """
+        """Load usable folder definitions without replacing good state on failure."""
         path = config_dir() / self._FOLDERS_FILE
-        try:
-            if path.exists():
-                raw = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(raw, list):
-                    logger.warning(
-                        "folders.json is a %s, not a list — ignoring it",
-                        type(raw).__name__,
-                    )
-                    return
-                kept = [
-                    f
-                    for f in raw
-                    if isinstance(f, dict) and isinstance(f.get("id"), str) and f["id"]
-                ]
-                if len(kept) != len(raw):
-                    logger.warning(
-                        "dropped %d unusable folder row(s) from folders.json "
-                        "(not a dict, or no id)",
-                        len(raw) - len(kept),
-                    )
-                self._folders = kept
-        except Exception:
-            logger.warning("Failed to load folders", exc_info=True)
+        self._folders = _FOLDER_REPOSITORY.load(path, self._folders)
 
     def save_folders(self) -> None:
-        """Persist folder definitions to disk (atomic write).
-
-        Synchronous and therefore ON the event loop when called from a handler.
-        Prefer :meth:`mutate_folders` for anything reachable from a request or a
-        background pass — it serializes the read-modify-write and moves the
-        ``fsync`` off the loop. This form remains for the boot path and for
-        callers that hold no loop.
-        """
+        """Persist folder definitions for synchronous boot-time callers."""
         path = config_dir() / self._FOLDERS_FILE
-        self._atomic_write_json(path, self._folders)
+        _FOLDER_REPOSITORY.save(path, self._folders, self._atomic_write_json)
 
     _CRON_FOLDERS_FILE = "cron_folders.json"
 
@@ -6444,23 +5524,21 @@ class DashboardState:
                         type(loaded).__name__,
                     )
                     return
-                valid = [
-                    f
-                    for f in loaded
-                    if isinstance(f, dict)
-                    and isinstance(f.get("id"), str)
-                    and f.get("id")
-                    and isinstance(f.get("name"), str)
-                    and f.get("name")
-                    and isinstance(f.get("order"), (int, float))
-                    and not isinstance(f.get("order"), bool)
-                ]
-                if len(valid) != len(loaded):
-                    logger.warning(
-                        "Dropped %d malformed entr(ies) while loading %s",
-                        len(loaded) - len(valid),
-                        self._CRON_FOLDERS_FILE,
+
+                def _is_valid(f: Any) -> bool:
+                    return (
+                        isinstance(f, dict)
+                        and isinstance(f.get("id"), str)
+                        and bool(f.get("id"))
+                        and isinstance(f.get("name"), str)
+                        and bool(f.get("name"))
+                        and isinstance(f.get("order"), (int, float))
+                        and not isinstance(f.get("order"), bool)
                     )
+
+                valid, unparsed = self._partition_preserving(
+                    loaded, _is_valid, "entr(ies)", self._CRON_FOLDERS_FILE
+                )
                 self._cron_folders = valid
         except Exception:
             logger.warning("Failed to load cron folders", exc_info=True)
@@ -6477,9 +5555,21 @@ class DashboardState:
     def create_cron_folder(self, name: str, folder_id: str) -> dict:
         """Create a new cron folder and persist.
 
-        Returns the created folder dict. Raises on persistence failure
-        (callers should surface a 500); in-memory state is rolled back.
+        Returns the created folder dict. Raises ValueError if ``folder_id``
+        collides with an existing folder (``rename``/``delete`` act on the
+        first id match, so a duplicate would strand the shadowed folder as
+        un-renameable/un-deletable). Raises on persistence failure (callers
+        should surface a 500); in-memory state is rolled back.
+
+        MERGE-REVIEW: upstream persists BEFORE exposing the folder in
+        ``_cron_folders``, so a concurrent ``GET /api/cron-folders`` can never
+        read a folder a failed save then removes. This body still appends
+        first and rolls back on failure, which leaves that ghost window open.
+        The docstring describes the code as it is; adopting upstream's
+        ordering is a follow-up, not a merge resolution.
         """
+        if any(f["id"] == folder_id for f in self._cron_folders):
+            raise ValueError("cron folder id collision")
         order = max((f["order"] for f in self._cron_folders), default=-1) + 1
         folder = {"id": folder_id, "name": name, "order": order}
         self._cron_folders.append(folder)
@@ -6563,6 +5653,11 @@ class DashboardState:
         Legacy pins (pre-mid era) may lack the ``mid`` field — they are preserved
         for backward compatibility; new pins always carry ``mid``.
 
+        Individual malformed entries are dropped from the active list but kept
+        verbatim in ``_unparsed_chat_pin_entries`` so the next ``save_chat_pins``
+        round-trips them back to disk rather than silently erasing a user's
+        hand-edited-but-typo'd pin (mirrors the cron-folder contract, #5792).
+
         Error classification:
         - Missing file: normal (first run) → empty list.
         - Malformed JSON / invalid shape: tolerated for compatibility → empty list.
@@ -6573,12 +5668,16 @@ class DashboardState:
         try:
             if not path.exists():
                 self._chat_pins = []
+                self._unparsed_chat_pin_entries = []
                 return
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
             # Malformed content — treat as empty (data corruption).
             logger.warning("chat_pins.json has malformed content: %s", exc)
             self._chat_pins = []
+            # Whole-file parse failure: nothing was parsed, so there are no
+            # per-entry bytes to preserve. Do NOT clear a prior load's
+            # preserved entries against an unreadable read.
             return
         except OSError:
             # Transient I/O error — do NOT clobber valid in-memory state.
@@ -6590,28 +5689,44 @@ class DashboardState:
             self._chat_pins = []
             return
 
-        valid = [
-            pin
-            for pin in raw
-            if isinstance(pin, dict)
-            and all(isinstance(pin.get(key), str) and pin.get(key) for key in ("id", "slot_key"))
-            # Require at least one identity field: mid or message_ts
-            and (
-                (isinstance(pin.get("mid"), str) and pin.get("mid"))
-                or (isinstance(pin.get("message_ts"), str) and pin.get("message_ts"))
+        def _is_valid(pin: Any) -> bool:
+            return (
+                isinstance(pin, dict)
+                and all(
+                    isinstance(pin.get(key), str) and pin.get(key) for key in ("id", "slot_key")
+                )
+                # Require at least one identity field: mid or message_ts
+                and bool(
+                    (isinstance(pin.get("mid"), str) and pin.get("mid"))
+                    or (isinstance(pin.get("message_ts"), str) and pin.get("message_ts"))
+                )
+                and isinstance(pin.get("preview"), str)
+                and isinstance(pin.get("pinned_at"), str)
+                and bool(pin.get("pinned_at"))
             )
-            and isinstance(pin.get("preview"), str)
-            and isinstance(pin.get("pinned_at"), str)
-            and pin.get("pinned_at")
-        ]
-        if len(valid) != len(raw):
-            logger.warning("Dropped %d malformed chat pin record(s) on load", len(raw) - len(valid))
+
+        valid, unparsed = self._partition_preserving(
+            raw, _is_valid, "chat pin record(s)", self._CHAT_PINS_FILE
+        )
         self._chat_pins = valid
+        self._unparsed_chat_pin_entries = unparsed
 
     def save_chat_pins(self) -> None:
-        """Persist pinned chat messages with an atomic, owner-only file replacement."""
+        """Persist pinned chat messages with an atomic, owner-only file replacement.
+
+        Writes the active pins plus any malformed entries preserved at load
+        time (``_unparsed_chat_pin_entries``), so a save triggered by an
+        unrelated pin operation cannot erase bytes a hand-edit left in a shape
+        this loader could not validate.
+        """
         path = config_dir() / self._CHAT_PINS_FILE
-        atomic_write(path, json.dumps(self._chat_pins), fsync=True, mode=0o600)
+        unparsed = getattr(self, "_unparsed_chat_pin_entries", [])
+        atomic_write(
+            path,
+            json.dumps([*self._chat_pins, *unparsed]),
+            fsync=True,
+            mode=0o600,
+        )
 
     async def remove_chat_pins_for_slots(self, slot_keys: set[str]) -> int:
         """Remove pins when their persisted history sessions are permanently deleted."""
@@ -6632,120 +5747,56 @@ class DashboardState:
                 raise
             return removed
 
-    async def mutate_folders(self, mutate: Callable[[list[dict[str, Any]]], tuple[bool, _T]]) -> _T:
-        """Serialize one read-modify-write of the folder store; persist off-loop.
+    def folders_generation(self) -> int:
+        """Monotonic counter identifying the current folder-tree snapshot.
 
-        *mutate* receives the live folder list and returns
-        ``(changed, value)``: ``changed`` decides whether the store is written,
-        ``value`` is handed back to the caller. It must be **synchronous** — it
-        runs while the store lock is held, and that is what makes the whole
-        find-then-modify sequence atomic against another coroutine doing the
-        same thing. Do not call ``mutate_folders`` from inside *mutate*.
+        Rides the ``slots`` WS frame so an already-open tab can tell that the
+        folder store actually CHANGED and invalidate its cached
+        ``['chat-folders']`` query. Without it a folder created by anything other
+        than this tab's own mutation — an agent, a second tab, another device —
+        stayed invisible until a reload: the query carries the app-wide
+        ``staleTime: Infinity``, so nothing expires it, and the tree the frame
+        already carries cannot be written into the cache directly (that would
+        clobber an in-flight optimistic edit and, lacking ``history_count``, mark
+        the query fresh so the real GET never runs). A generation is the small
+        signal that lets the client re-GET instead of guess.
 
-        Why both halves matter, from two defects this replaced:
-
-        * **Serialized.** Every writer used to be a bare ``save_folders()``, so
-          the store was race-free only because no writer yielded mid-update —
-          the event loop was the lock by accident. The moment one writer
-          awaited, two of them could each read a stale list and the later write
-          would drop the other's folder. Holding one lock across
-          modify-and-persist removes that coupling.
-        * **Off the loop.** The write is a tempfile + ``os.fsync`` +
-          ``os.replace``; on slow or network storage that stalls chat and
-          heartbeat processing for as long as the flush takes. Only the IO
-          crosses the thread boundary.
-
-        The snapshot handed to the worker is taken here, under the lock, rather
-        than letting the thread read ``self._folders``: the list is mutated on
-        the loop, and serializing it from another thread could observe a
-        half-applied mutation.
-
-        If the write raises, the in-memory list is restored to its pre-callback
-        state before the exception propagates, so memory never silently diverges
-        from disk on a failed persist. The write is also *confirmed* before the
-        lock is released (see :meth:`_write_folders_confirmed`), so a mutation
-        that did not land is undone while the store is still held — no reader,
-        locked or not, can observe a folder that is about to be rolled back.
+        Read through ``getattr`` because this is reachable from the slots-push
+        hot path, which also runs on a ``__new__``-built state that never ran
+        ``__init__`` (several endpoint suites build their fixture that way).
         """
-        async with self._folders_lock:
-            before = [dict(f) for f in self._folders]
-            changed, value = mutate(self._folders)
-            if not changed:
-                return value
-            path = config_dir() / self._FOLDERS_FILE
-            snapshot = [dict(f) for f in self._folders]
-            try:
-                await asyncio.to_thread(self._write_folders_confirmed, path, snapshot)
-            except Exception:
-                self._folders[:] = before
-                raise
-            return value
+        return int(getattr(self, "_folders_generation", 0) or 0)
+
+    async def mutate_folders(self, mutate: Callable[[list[dict[str, Any]]], tuple[bool, _T]]) -> _T:
+        """Serialize a folder mutation and confirm its off-loop persistence."""
+
+        def _mark_committed() -> None:
+            # This runs under the repository lock and only after the write is
+            # confirmed.  A failed/no-op transaction must not make clients
+            # re-fetch a tree that never changed, and concurrent commits must
+            # not collapse two monotonic generation bumps into one.
+            self._folders_generation = self.folders_generation() + 1
+
+        return await _FOLDER_REPOSITORY.mutate(
+            lambda: self._folders,
+            self._folders_lock,
+            mutate,
+            lambda: config_dir() / self._FOLDERS_FILE,
+            self._write_folders_confirmed,
+            _mark_committed,
+        )
 
     async def read_folders(self, read: Callable[[list[dict[str, Any]]], _T]) -> _T:
-        """Run *read* against the folder list under the store lock.
-
-        The read-only counterpart to :meth:`mutate_folders`. Callers that only
-        inspect the store still need the lock: ``mutate_folders`` applies its
-        callback's mutation to the live list and only then persists it off-loop,
-        so an unlocked reader can observe a folder mid-transaction — including
-        one whose write is about to fail and be rolled back. Taking the lock
-        means a reader sees only committed state.
-
-        *read* must not mutate the list and must not call ``mutate_folders``
-        (re-entering the lock would deadlock).
-        """
-        async with self._folders_lock:
-            return read(self._folders)
+        """Run a synchronous reader against committed folder state."""
+        return await _FOLDER_REPOSITORY.read(lambda: self._folders, self._folders_lock, read)
 
     def _write_folders_confirmed(self, path: Path, snapshot: list[dict[str, Any]]) -> None:
-        """Persist the folder list and prove it landed. Raises if it did not.
-
-        Runs in a worker thread, called with the store lock held.
-        :meth:`_atomic_write_json` LOGS and swallows every error, so a normal
-        return from it is not evidence of a write — a read-only or full disk
-        looks exactly like success. Reading the store back is evidence, and
-        doing it here rather than in the caller is what keeps the check inside
-        the lock: :meth:`mutate_folders` restores the in-memory list when this
-        raises, so an unwritten folder is never visible outside the transaction.
-        """
-        self._atomic_write_json(path, snapshot)
-        try:
-            on_disk = json.loads(path.read_bytes())
-        except Exception as exc:
-            raise OSError(f"folder store unreadable after write: {path.name}") from exc
-        # The WHOLE value, not just the id set: a rename, reparent, collapse or
-        # icon change leaves the ids untouched, so an id-only comparison would
-        # accept a silently-failed update and let the stale values come back on
-        # the next restart. Folder records are flat JSON scalars, so the snapshot
-        # round-trips exactly and equality is a faithful test.
-        if on_disk != snapshot:
-            raise OSError(f"folder store did not persist as intended: {path.name}")
+        """Persist the complete folder value and prove it landed."""
+        _FOLDER_REPOSITORY.write_confirmed(path, snapshot, self._atomic_write_json)
 
     def folder_breadcrumb(self, folder_id: str, sep: str = " › ") -> str:
-        """Render a folder's ancestry root→leaf as a breadcrumb string.
-
-        Walks the ``parent_id`` chain up to the root, then joins names with
-        *sep*. Cycle-safe (a visited set bounds the walk) and tolerant of
-        dangling ``parent_id`` references. Returns "" for an empty or unknown
-        folder id.
-        """
-        if not folder_id:
-            return ""
-        # load_folders() does no id-filtering (unlike load_tags), so a legacy or
-        # corrupt folders.json may contain dicts lacking an "id" key. Skip those
-        # rather than letting a hard index raise KeyError mid-walk — the docstring
-        # promises tolerance of dangling references and "" for an unknown id.
-        by_id = {f["id"]: f for f in self._folders if isinstance(f, dict) and f.get("id")}
-        names: list[str] = []
-        seen: set[str] = set()
-        fid = folder_id
-        while fid and fid in by_id and fid not in seen:
-            seen.add(fid)
-            folder = by_id[fid]
-            names.append(str(folder.get("name", "")))
-            fid = str(folder.get("parent_id") or "")
-        names.reverse()
-        return sep.join(n for n in names if n)
+        """Render a cycle-safe root-to-leaf folder breadcrumb."""
+        return _FOLDER_REPOSITORY.breadcrumb(self._folders, folder_id, sep)
 
     def load_tags(self) -> None:
         """Load tag vocabulary and sidebar columns from disk; seed defaults if missing.
@@ -6762,7 +5813,17 @@ class DashboardState:
             if file_existed:
                 raw = json.loads(tags_path.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
-                    self._tags = [t for t in raw if isinstance(t, dict) and t.get("id")]
+                    # Keep rows the active list dropped verbatim so the seed/
+                    # back-fill save below (and every later save) round-trips
+                    # them back instead of erasing a hand-edited-but-typo'd row
+                    # at boot with no user action (#5792).
+                    self._tags, unparsed = self._partition_preserving(
+                        raw,
+                        lambda t: isinstance(t, dict) and bool(t.get("id")),
+                        "tag entr(ies)",
+                        self._TAGS_FILE,
+                    )
+                    self._unparsed_tag_entries = unparsed
                 else:
                     # Valid JSON but not a list (e.g. {}): the vocabulary
                     # state is UNKNOWN, same as a parse failure — do not let
@@ -6801,7 +5862,16 @@ class DashboardState:
             if columns_path.exists():
                 raw = json.loads(columns_path.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
-                    self._tag_boards = [c for c in raw if isinstance(c, dict) and c.get("id")]
+                    # Preserve dropped columns verbatim so a later save
+                    # round-trips them rather than erasing a hand-edited-but-
+                    # typo'd column (#5792).
+                    self._tag_boards, unparsed_cols = self._partition_preserving(
+                        raw,
+                        lambda c: isinstance(c, dict) and bool(c.get("id")),
+                        "sidebar column(s)",
+                        self._TAG_BOARDS_FILE,
+                    )
+                    self._unparsed_tag_board_entries = unparsed_cols
                     # Prune column tag_ids missing from the vocabulary: tag
                     # deletion commits the vocab write first (crash-atomic),
                     # so a crash mid-delete can leave dangling ids here. The
@@ -6820,8 +5890,15 @@ class DashboardState:
             logger.warning("Failed to load sidebar columns", exc_info=True)
 
     def save_tags(self) -> None:
-        """Persist tag vocabulary to disk (atomic write)."""
-        self._atomic_write_json(config_dir() / self._TAGS_FILE, self._tags)
+        """Persist tag vocabulary to disk (atomic write).
+
+        Appends any malformed entries preserved at load time
+        (``_unparsed_tag_entries``) so a save — including the seed/back-fill
+        save that runs during ``load_tags`` itself — cannot erase bytes a
+        hand-edit left in a shape the loader could not validate (#5792).
+        """
+        unparsed = getattr(self, "_unparsed_tag_entries", [])
+        self._atomic_write_json(config_dir() / self._TAGS_FILE, [*self._tags, *unparsed])
 
     def save_tags_snapshot(self, snapshot: list[dict]) -> None:
         """Persist a pre-captured tag snapshot to disk (strict -- raises on failure).
@@ -6832,14 +5909,27 @@ class DashboardState:
         location resolves through this module's ``config_dir`` exactly like
         ``save_tags`` -- keeping tests that patch it working unchanged.
 
+        Malformed entries preserved at load time (``_unparsed_tag_entries``)
+        are appended so this write path preserves them too (#5792).
+
         Raises on I/O failure so callers can roll back in-memory state and
         surface HTTP 5xx rather than silently losing data.
         """
-        self._atomic_write_json_strict(config_dir() / self._TAGS_FILE, snapshot)
+        unparsed = getattr(self, "_unparsed_tag_entries", [])
+        self._atomic_write_json_strict(config_dir() / self._TAGS_FILE, [*snapshot, *unparsed])
 
     def save_tag_boards(self) -> None:
-        """Persist sidebar column layout to disk (atomic write)."""
-        self._atomic_write_json(config_dir() / self._TAG_BOARDS_FILE, self._tag_boards)
+        """Persist sidebar column layout to disk (atomic write).
+
+        Appends any malformed columns preserved at load time
+        (``_unparsed_tag_board_entries``) so a save cannot erase bytes a
+        hand-edit left in a shape the loader could not validate (#5792).
+        """
+        unparsed = getattr(self, "_unparsed_tag_board_entries", [])
+        self._atomic_write_json(
+            config_dir() / self._TAG_BOARDS_FILE,
+            [*self._tag_boards, *unparsed],
+        )
 
     def save_tag_boards_snapshot(self, snapshot: list[dict]) -> None:
         """Persist a pre-captured boards snapshot to disk (strict -- raises on failure).
@@ -6850,10 +5940,51 @@ class DashboardState:
         resolves through this module's ``config_dir`` exactly like
         ``save_tag_boards`` -- keeping tests that patch it working unchanged.
 
+        Malformed columns preserved at load time
+        (``_unparsed_tag_board_entries``) are appended so this write path
+        preserves them too (#5792).
+
         Raises on I/O failure so callers can roll back in-memory state and
         surface HTTP 5xx rather than silently losing data.
         """
-        self._atomic_write_json_strict(config_dir() / self._TAG_BOARDS_FILE, snapshot)
+        unparsed = getattr(self, "_unparsed_tag_board_entries", [])
+        self._atomic_write_json_strict(config_dir() / self._TAG_BOARDS_FILE, [*snapshot, *unparsed])
+
+    @staticmethod
+    def _partition_preserving(
+        raw: list[Any],
+        predicate: Callable[[Any], bool],
+        noun: str,
+        source_file: str,
+    ) -> tuple[list[Any], list[Any]]:
+        """Split ``raw`` into ``(active, unparsed)`` by ``predicate``.
+
+        The shared "partition malformed rows at load, keep them verbatim so a
+        later save round-trips them back" mechanic behind ``load_cron_folders``,
+        ``load_chat_pins``, ``load_tags`` and the tag-board load (all #5792).
+        A row is active when ``predicate`` returns truthy; every other row is
+        collected into ``unparsed`` so the caller's save path can re-append it
+        (``[*active, *unparsed]``) at write time rather than silently erasing
+        bytes a hand-edit left in a shape the loader could not validate.
+
+        When any row is preserved, logs the shared preserving-N warning at
+        WARNING level. ``noun`` supplies the per-store wording (``"entr(ies)"``,
+        ``"chat pin record(s)"``, ``"tag entr(ies)"``, ``"sidebar column(s)"``)
+        and ``source_file`` names the file, so the emitted messages stay
+        identical to the hand-rolled copies this replaced.
+        """
+        active: list[Any] = []
+        unparsed: list[Any] = []
+        for row in raw:
+            (active if predicate(row) else unparsed).append(row)
+        if unparsed:
+            logger.warning(
+                "Preserving %d malformed %s while loading %s " "(kept verbatim, not active)",
+                len(unparsed),
+                noun,
+                source_file,
+            )
+        return active, unparsed
 
     @staticmethod
     def _atomic_write_json_strict(path: Path, data: Any) -> None:
@@ -6901,7 +6032,18 @@ class DashboardState:
 
         Issue links are excluded: the check-status path reaches ``gh pr view``
         and has no meaning for an issue.
+
+        Returns nothing while the chips are switched off. This is the point of
+        gating here rather than only in the payload: the periodic refresh this
+        feeds spawns a credentialed provider subprocess per round, and a user who
+        turned the chips off should stop paying for status nobody renders.
         """
+        from kiro_crew.dashboard.handlers.source_providers import (
+            session_card_source_links_enabled,
+        )
+
+        if not session_card_source_links_enabled():
+            return []
         urls: list[str] = []
         for s in self._slots.values():
             urls.extend(
@@ -6912,7 +6054,17 @@ class DashboardState:
         return urls
 
     def source_link_urls_for_slot(self, key: str) -> list[str]:
-        """Sidebar-visible PR/MR chip URLs for one slot (same cap and kind filter)."""
+        """Sidebar-visible PR/MR chip URLs for one slot (same cap and kind filter).
+
+        Empty while the chips are switched off, for the same reason
+        :meth:`source_link_urls` is: this feeds the turn-boundary status refresh.
+        """
+        from kiro_crew.dashboard.handlers.source_providers import (
+            session_card_source_links_enabled,
+        )
+
+        if not session_card_source_links_enabled():
+            return []
         slot = self._slots.get(key)
         if slot is None:
             return []
@@ -6940,10 +6092,20 @@ class DashboardState:
         review round is exactly when a PR's lifecycle moved, and nothing else in
         the system invalidates the status caches on that event: the chips would
         wait out the periodic rotation and the detail panel would not refetch at
-        all. Owner-gated (status is credential-backed, and with no owner window
-        open there is nobody to render it, so no provider subprocess is spawned)
-        and rate-floored inside ``request_check_refresh_now``.
+        all. Fires ONLY when an OWNER window is open: the read runs the
+        operator's credentials, so a non-owner window must not drive it (a
+        non-owner renders the owner-populated caches read-only). With no owner
+        window open there is nobody entitled to a credentialed read, so no
+        provider subprocess is spawned. Rate-floored inside
+        ``request_check_refresh_now``.
         """
+        # Both the status read and the visibility revalidation below run the
+        # operator's `gh`/`glab` credentials, so this turn-boundary refresh runs
+        # ONLY when an OWNER window is open. A non-owner dashboard window never
+        # drives it (GPT #6789): the owner's own connection keeps the caches warm
+        # and non-owner windows render the result read-only via the fail-closed
+        # is_repo_public gate. With no owner window open there is nobody entitled
+        # to drive a credentialed read, so this is a no-op.
         if not self._owner_ws_clients:
             return
         try:
@@ -6952,9 +6114,20 @@ class DashboardState:
                 return
             from kiro_crew.dashboard.handlers.source_providers import (
                 request_check_refresh_now,
+                schedule_visibility_refresh,
             )
 
             request_check_refresh_now(urls, self.push_slots_update)
+            # force=True: the status read above bypasses the TTL, so visibility
+            # MUST be revalidated in lockstep — otherwise fresh (now-private)
+            # status could be projected against a still-cached-public visibility
+            # entry, leaking private status to a non-owner (GPT #6789). Runs
+            # AFTER the status schedule: both are fire-and-forget schedulers, and
+            # ordering the status call first preserves the turn-boundary contract
+            # while the downstream render gate (`_project_source_links` ->
+            # is_repo_public) is what actually withholds status until visibility
+            # reconfirms.
+            schedule_visibility_refresh(urls, self.push_slots_update, force=True)
         except Exception:
             logger.debug("turn-boundary source status refresh failed", exc_info=True)
 
@@ -7150,10 +6323,16 @@ class DashboardState:
         return links, False, "", ""
 
     def serialize_slot(
-        self, slot: _ChatSlot, *, include_check_status: bool = False
+        self,
+        slot: _ChatSlot,
+        *,
+        include_check_status: bool = False,
+        dashboard_user: bool = False,
     ) -> dict[str, Any]:
         """Serialize one slot with state-backed channel-link metadata."""
-        payload = slot.to_dict(include_check_status=include_check_status)
+        payload = slot.to_dict(
+            include_check_status=include_check_status, dashboard_user=dashboard_user
+        )
         links, slack_linked, slack_channel, slack_thread_ts = self._slot_links(slot)
         payload.update(
             {
@@ -7165,17 +6344,26 @@ class DashboardState:
         )
         return payload
 
-    def serialize_slots(self, *, include_check_status: bool = False) -> list:
+    def serialize_slots(
+        self, *, include_check_status: bool = False, dashboard_user: bool = False
+    ) -> list:
         """Serialize slots, optionally including owner-only provider status.
 
         ``subagents_running`` remains available to every authenticated caller.
         Credential-backed ``ci`` and ``state`` fields are omitted unless an
-        authenticated owner boundary explicitly opts in.
+        authenticated owner boundary explicitly opts in — EXCEPT a link whose
+        repository is known public, which any authenticated dashboard user
+        (``dashboard_user=True``) may see because that lifecycle is already
+        world-visible. Private/unknown repos and app tokens stay owner-only.
         """
         out = []
         subs = getattr(self, "subagents", None)
         for s in self._slots.values():
-            d = self.serialize_slot(s, include_check_status=include_check_status)
+            d = self.serialize_slot(
+                s,
+                include_check_status=include_check_status,
+                dashboard_user=dashboard_user,
+            )
             d["subagents_running"] = bool(subs and subs.running_agents_for(f"dashboard:{s.key}"))
             out.append(d)
         return out
@@ -7326,7 +6514,22 @@ class DashboardState:
         )
 
         yolo_active = self.is_yolo_active()  # expire first if needed
+        # PUBLIC-repo chip status rides the general frame so any authenticated
+        # dashboard user (SSE and WS both run on dashboard-user tokens) sees the
+        # merged/closed/CI glyph for a repo whose lifecycle is already
+        # world-visible. Private/unknown repos fall through to owner-only inside
+        # serialize_slots, and app tokens are stripped of this status in
+        # ``_serialize_for_client`` -> ``filter_slots_for_app`` before delivery,
+        # so widening the general list here never leaks status to an app scope.
+        # SSE carries the BARE list (see below); the WS dashboard-user frame
+        # carries the enriched one. GPT #6789: the general ``_slots_list`` feeds
+        # BOTH the SSE queue (which has NO per-app filtering) and the WS frame,
+        # so enriching it here leaked public-repo status onto ``/api/stream`` for
+        # any app token allowed that route. Keep the broadcast list bare and put
+        # the public-repo enrichment only on the WS path, where
+        # ``_serialize_for_client`` re-filters app tokens.
         slots_data = self.serialize_slots()
+        slots_data_ws = self.serialize_slots(dashboard_user=True)
         mgr = getattr(self, "channel_manager", None)
         ch_trusted = bool(mgr and any(ch.trusted for ch in mgr._channels.values()))
         # Piggyback the allowlist generation so clients invalidate the cached
@@ -7347,7 +6550,13 @@ class DashboardState:
         self._broadcast(
             {
                 "_type": "slots",
+                # BARE list for SSE and the generic-envelope fields below.
                 "_slots_list": slots_data,
+                # Enriched (public-repo status) list for the WS dashboard-user
+                # frame ONLY. ``_broadcast`` builds the WS frame from this when
+                # present; SSE never reads it, so status cannot reach the
+                # unfiltered stream.
+                "_slots_list_ws": slots_data_ws,
                 "_yolo": yolo_active,
                 "slots": json.dumps(slots_data),
                 "channelTrusted": ch_trusted,
@@ -7361,27 +6570,34 @@ class DashboardState:
                 # constructed_state pins against. An absent/None folder store is an
                 # empty tree.
                 #
-                # Coerce to well-formed dict entries rather than `list(_folders)`:
-                # load_folders() does a bare json.loads with no shape check, so a
-                # corrupt folders.json can leave _folders as a non-list (crashing
-                # list() with TypeError on this hot path) or a list of non-dicts /
-                # dicts without an "id" (which the client's grouping keys on). Filter
-                # to dict entries carrying a string "id" so a corrupt store degrades
-                # to a smaller/empty tree instead of crashing the broadcast.
+                # Lightweight states can bypass load_folders(), so keep this hot
+                # broadcast path tolerant of malformed in-memory values.
                 "folders": _safe_folder_tree(getattr(self, "_folders", None)),
+                # Lets the client distinguish "the tree changed" from "a session
+                # blinked": this frame fires on routine slot activity, so the
+                # tree alone is not a change signal.
+                "foldersGeneration": self.folders_generation(),
             }
         )
+        # The owner frame is the owner's ONLY slots frame — `_send_ws_all` skips
+        # owner sockets for `slots` (see there for why), so this envelope has to
+        # carry every key the generic one does. It previously carried a subset,
+        # which is why the owner had to receive both: `folders` seeds the
+        # first-paint folder tree and `gitlabHostsGeneration` drives the
+        # dashboard-config invalidation, and neither was here. Both frames are now
+        # built by `_slots_ws_frame`, so a key can no longer reach one and not the
+        # other.
         owner_ws_clients = getattr(self, "_owner_ws_clients", None)
         if owner_ws_clients:
             owner_slots = self.serialize_slots(include_check_status=True)
             self._send_ws_owners(
-                json.dumps(
-                    {
-                        "type": "slots",
-                        "data": owner_slots,
-                        "yolo": yolo_active,
-                        "channelTrusted": ch_trusted,
-                    }
+                _slots_ws_frame(
+                    owner_slots,
+                    yolo=yolo_active,
+                    channel_trusted=ch_trusted,
+                    gitlab_hosts_gen=gitlab_hosts_generation(),
+                    folders=_safe_folder_tree(getattr(self, "_folders", None)),
+                    folders_gen=self.folders_generation(),
                 )
             )
 
@@ -7476,7 +6692,17 @@ class DashboardState:
             # branch so the chokepoint can filter correctly.
             ws_data: object
             if msg_type == "slots":
-                slots_list = note.get("_slots_list") or json.loads(note["slots"])
+                # SSE (above) consumed the BARE ``_slots_list``. The WS frame is
+                # built from the ENRICHED ``_slots_list_ws`` (public-repo status
+                # for dashboard users) when present — app tokens are re-filtered
+                # in ``_serialize_for_client`` so they never receive it, and SSE
+                # never reads this key. Falls back to the bare list for callers
+                # (targeted title pushes, tests) that send only ``_slots_list``.
+                slots_list = (
+                    note.get("_slots_list_ws")
+                    or note.get("_slots_list")
+                    or json.loads(note["slots"])
+                )
                 # ``data`` for slots carries the whole envelope so the
                 # chokepoint can per-app filter and re-serialize it.
                 ws_data = {
@@ -7484,24 +6710,16 @@ class DashboardState:
                     "yolo": note.get("_yolo", False),
                     "channelTrusted": note.get("channelTrusted", False),
                 }
-                ws_msg = json.dumps(
-                    {
-                        "type": "slots",
-                        "data": slots_list,
-                        "yolo": ws_data["yolo"],
-                        "channelTrusted": ws_data["channelTrusted"],
-                        # Forwarded explicitly: this envelope is rebuilt key-by-key,
-                        # so anything not named here is silently dropped. The client
-                        # invalidates its cached dashboard config when this changes.
-                        "gitlabHostsGeneration": note.get("gitlabHostsGeneration"),
-                        # Folder tree (no history_count) so the sidebar groups
-                        # sessions on first paint without waiting for the separate
-                        # GET /api/chat/folders. Only the dashboard-user frame
-                        # (default_msg) carries it; app-token frames are rebuilt in
-                        # the scope chokepoint and deliberately omit it (apps do not
-                        # render the chat folder tree).
-                        "folders": note.get("folders"),
-                    }
+                # Built by `_slots_ws_frame`, NOT inline: the owner frame in
+                # `_do_slots_broadcast` has to carry an identical key set, and it
+                # cannot if each site names its own keys. See that function.
+                ws_msg = _slots_ws_frame(
+                    slots_list,
+                    yolo=bool(ws_data["yolo"]),
+                    channel_trusted=bool(ws_data["channelTrusted"]),
+                    gitlab_hosts_gen=note.get("gitlabHostsGeneration"),
+                    folders=note.get("folders"),
+                    folders_gen=note.get("foldersGeneration"),
                 )
             elif msg_type == "slot_title":
                 ws_data = {"key": note["key"], "title": note["title"]}
@@ -7553,169 +6771,18 @@ class DashboardState:
             self._send_ws_all(msg_type, ws_data, ws_msg)
 
     def _spawn_ws_send(self, ws: web.WebSocketResponse, msg: str) -> None:
-        """Fire-and-forget a WS send while retaining a strong task reference.
-
-        ``asyncio.ensure_future(...)`` without keeping the returned task lets the
-        event loop hold only a weak reference, so the task can be garbage-collected
-        mid-send — silently dropping the websocket message (a lost dashboard update).
-        Track it in ``_background_tasks`` (the existing pattern in this module) and
-        discard on completion so the reference is held for the task's lifetime.
-
-        A fan-out can be reached from a worker thread: ``push_slots_update``'s
-        leading edge broadcasts inline on whatever thread called it, and several
-        subsystems notify the dashboard from sync callbacks. Off the loop there is
-        nothing to attach a coroutine to, so the send HOPS to the serving loop and
-        the coroutine is created there.
-
-        **Only a PEER failure escapes this method.** A synchronous raise from
-        ``send_str`` (``ConnectionResetError`` on a gone client) propagates, because
-        the fan-out uses it to reap that client. Everything else — no serving loop,
-        a loop mid-shutdown — is this process's own problem, is logged, and costs
-        the frame but never the registration. Conflating the two is what let a
-        thread-origin broadcast unregister every healthy socket: ``ensure_future``
-        raises off-loop, the fan-out read that as a dead peer, and the client kept
-        an open connection that would never receive another frame.
-        """
-        loop = self._running_loop()
-        if loop is None:
-            target = self.serving_loop
-            if target is not None and not target.is_closed():
-                try:
-                    target.call_soon_threadsafe(self._spawn_ws_send, ws, msg)
-                    return
-                except RuntimeError:
-                    # Raced a shutdown between the is_closed check and the call.
-                    logger.debug("WS send: serving loop is shutting down")
-            # Nowhere to run it. Still CALL send_str so a peer that refuses
-            # synchronously is reported to the caller, then close the coroutine
-            # rather than abandoning it — an un-awaited coroutine loses the frame
-            # just as silently and additionally warns at collection time.
-            coro = ws.send_str(msg)
-            close = getattr(coro, "close", None)
-            if callable(close):
-                close()
-            logger.debug("WS send dropped: no serving loop to run it on")
-            return
-        # Latch through the accessor, never by assigning the field: the read
-        # records this loop only when nothing bound one, so a loop bound at
-        # startup stays authoritative and bind_serving_loop remains the only
-        # writer that can override. The send below runs on the loop we are on.
-        self.serving_loop
-        task = asyncio.ensure_future(ws.send_str(msg))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._on_ws_send_done)
+        _websocket_for(self)._spawn_ws_send(ws, msg)
 
     def _on_ws_send_done(self, task: asyncio.Task) -> None:
-        """Discard the finished WS-send task and surface any failure.
-
-        A failed ``ws.send_str`` (e.g. ``ConnectionResetError`` when a client
-        disconnects mid-send) is otherwise swallowed silently — the task stores the
-        exception, nobody reads it, and it's GC'd with the task — leaving operators
-        blind to send failures under burst load. Log at DEBUG since peer disconnects
-        are routine and expected, not errors.
-        """
-        self._background_tasks.discard(task)
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.debug("WS send failed (client likely disconnected): %s", exc)
+        _websocket_for(self)._on_ws_send_done(task)
 
     def _ws_client_allowed(self, ws: web.WebSocketResponse, msg_type: str, data: object) -> bool:
-        """Return True if *ws* should receive an event with *msg_type* / *data*.
-
-        Deny-by-default (CWE-269): every non-dashboard-user connection is gated
-        through :func:`ws_event_scope.ws_event_allowed`. Dashboard-user tokens
-        are identified by the POSITIVE ``_is_dashboard_user`` flag set by
-        ``api_ws`` — never by the absence of ``_app``, which would fail OPEN on
-        any register path that forgot to set it.
-        """
-        if ws.get("_is_dashboard_user", False):
-            return True
-        ws_app: str = ws.get("_app", "")
-        snapshot: frozenset[str] = ws.get("_allowed_events", frozenset())
-        _data_dict: dict = data if isinstance(data, dict) else {}
-        try:
-            # circular import: ws_event_scope references SlotOrigin from this
-            # module at type-check time and reads ``state._slots`` at runtime,
-            # so a top-level import here would create a bootstrap cycle.
-            from kiro_crew.dashboard.ws_event_scope import (
-                _audit_deny,
-                effective_allowed_events,
-                ws_event_allowed,
-            )
-
-            # The connect-time snapshot can only SHRINK from here: a narrowed or
-            # deleted manifest has to stop granting scopes on a socket that is
-            # already open, and this is the one place every decision reads them.
-            allowed = effective_allowed_events(ws_app, snapshot)
-
-            return ws_event_allowed(
-                msg_type,
-                _data_dict,
-                app=ws_app,
-                allowed_events=allowed,
-                state=self,
-            )
-        except Exception:
-            # The scope check itself failed — fail closed AND audit, so probing
-            # for scope-check bugs leaves a trail.
-            try:
-                _audit_deny(ws_app or "<unknown>", msg_type, "scope_check_exception")
-            except Exception as inner_exc:
-                logger.debug(
-                    "state: audit for scope_check_exception failed for %s/%s: %s",
-                    ws_app,
-                    msg_type,
-                    inner_exc,
-                )
-            return False
+        return _websocket_for(self)._ws_client_allowed(ws, msg_type, data)
 
     def _serialize_for_client(
         self, ws: web.WebSocketResponse, msg_type: str, data: object, default_msg: str
     ) -> str:
-        """Return the wire message to send to *ws*.
-
-        Most events go to every client as ``default_msg`` verbatim. The
-        ``slots`` event carries the full slot list, so an app token that
-        declared only ``slots:own`` would otherwise see every slot's metadata
-        on each re-push (CWE-269). Re-filter the list per app here so the
-        manifest scope is enforced on broadcast re-pushes, not only at connect.
-        """
-        if ws.get("_is_dashboard_user", False):
-            return default_msg
-        if msg_type in ("subagent_batch_update", "subagent_batch_chunks"):
-            return self._serialize_subagent_batch(ws, msg_type, data, default_msg)
-        if msg_type != "slots":
-            return default_msg
-        if not isinstance(data, dict) or "slots" not in data:
-            # Not the expected envelope shape — nothing to filter here; the
-            # gate has already applied deny-by-default.
-            return default_msg
-        snapshot: frozenset[str] = ws.get("_allowed_events", frozenset())
-        ws_app: str = ws.get("_app", "")
-        try:
-            # circular import: see _ws_client_allowed above.
-            from kiro_crew.dashboard.ws_event_scope import (
-                effective_allowed_events,
-                filter_slots_for_app,
-                slots_envelope_extras,
-            )
-
-            # Same live-narrowing read as the gate: filtering the payload with a
-            # stale snapshot would hand back the slots a revoked scope covered.
-            allowed = effective_allowed_events(ws_app, snapshot)
-            filtered = filter_slots_for_app(data["slots"], ws_app, allowed, self)
-            # The ENVELOPE needs its own decision: the slot filter narrows
-            # ``data`` only, and this frame also carries global safety-posture
-            # booleans (``yolo`` / ``channelTrusted``) that no slot scope covers.
-            extras = slots_envelope_extras(allowed, yolo=bool(data.get("yolo", False)))
-        except Exception:
-            # Fail closed: send an empty list rather than the unfiltered payload,
-            # and drop the posture fields rather than defaulting them.
-            filtered = []
-            extras = {}
-        return json.dumps({"type": "slots", "data": filtered, **extras})
+        return _websocket_for(self)._serialize_for_client(ws, msg_type, data, default_msg)
 
     def _serialize_subagent_batch(
         self,
@@ -7724,449 +6791,67 @@ class DashboardState:
         data: object,
         default_msg: str,
     ) -> str:
-        """Filter a coalesced subagent batch frame per app token.
-
-        Above the coalescer threshold ONE frame carries MANY subagents' rows, so
-        it has no single ``slot`` the event-scope gate could judge it by. The
-        gate therefore admits it and the per-item filtering happens here —
-        mirroring the ``slots`` re-push split — so an app receives only the rows
-        for subagents it may see instead of every running agent's status and
-        output (CWE-269).
-        """
-        # circular import: see _ws_client_allowed above — ws_event_scope imports
-        # DashboardState for typing, so this stays function-local.
-        from kiro_crew.dashboard.ws_event_scope import (
-            _SUBAGENT_BATCH_ITEM_KEY,
-            filter_subagent_batch_for_app,
-        )
-
-        key = _SUBAGENT_BATCH_ITEM_KEY.get(msg_type, "")
-        if not key or not isinstance(data, dict) or not isinstance(data.get(key), list):
-            # Unexpected envelope shape — fail closed rather than forwarding it
-            # unfiltered, matching the slots branch.
-            return json.dumps({"type": msg_type, "data": {key or "items": []}})
-        snapshot: frozenset[str] = ws.get("_allowed_events", frozenset())
-        ws_app: str = ws.get("_app", "")
-        try:
-            # Live-narrowed like the gate and the slots branch: a revoked
-            # subagent scope must stop selecting rows on an open socket too.
-            from kiro_crew.dashboard.ws_event_scope import effective_allowed_events
-
-            allowed = effective_allowed_events(ws_app, snapshot)
-            items = filter_subagent_batch_for_app(
-                data[key], ws_app, allowed, self, msg_type=msg_type
-            )
-        except Exception:
-            self._log.warning("subagent batch filter failed; dropping items", exc_info=True)
-            items = []
-        return json.dumps({"type": msg_type, "data": {key: items}})
+        return _websocket_for(self)._serialize_subagent_batch(ws, msg_type, data, default_msg)
 
     def _send_ws_all(self, msg_type: str, data: object, msg: str) -> None:
-        """Send a typed message to all WS clients.
-
-        This is the single chokepoint for every WS fan-out that can reach an app
-        token (both :meth:`broadcast_ws` and :meth:`_broadcast`). Each
-        connection is checked against :meth:`_ws_client_allowed`; only
-        dashboard-user tokens bypass the scope gate. Payload-level per-app
-        filtering (currently just ``slots``) happens in
-        :meth:`_serialize_for_client`.
-        """
-        dead: list[web.WebSocketResponse] = []
-        for ws in list(self._ws_clients):
-            if ws.closed:
-                dead.append(ws)
-                continue
-            if not self._ws_client_allowed(ws, msg_type, data):
-                continue
-            try:
-                payload = self._serialize_for_client(ws, msg_type, data, msg)
-            except Exception:
-                # A payload-shaping bug is ours, not the peer's. Unregistering here
-                # would strip a healthy socket of every future broadcast while
-                # leaving it open, so the client renders a frozen snapshot with
-                # nothing surfaced anywhere.
-                logger.warning(
-                    "WS payload shaping failed for %s; keeping the client registered",
-                    msg_type,
-                    exc_info=True,
-                )
-                continue
-            try:
-                self._spawn_ws_send(ws, payload)
-            except Exception:
-                # send_str refused synchronously — this peer is gone. Scheduling
-                # problems never reach here; see _spawn_ws_send.
-                dead.append(ws)
-        for ws in dead:
-            self._remove_ws(ws)
+        _websocket_for(self)._send_ws_all(msg_type, data, msg)
 
     def _send_ws_owners(self, msg: str) -> None:
-        """Send a pre-serialized message only to owner-authenticated clients."""
-        dead: list[web.WebSocketResponse] = []
-        for ws in list(self._owner_ws_clients):
-            if ws.closed:
-                dead.append(ws)
-                continue
-            try:
-                self._spawn_ws_send(ws, msg)
-            except Exception:
-                # Synchronous refusal from the peer; see _send_ws_all.
-                dead.append(ws)
-        for ws in dead:
-            self._remove_ws(ws)
+        _websocket_for(self)._send_ws_owners(msg)
 
     def broadcast_ws(self, msg_type: str, data: object) -> None:
-        """Send a typed message to all WS clients (not SSE).
-
-        Per-app event scope filtering is applied inside :meth:`_send_ws_all`
-        (the single chokepoint for WS fan-out).
-        """
-        if not self._ws_clients:
-            return
-        msg = json.dumps({"type": msg_type, "data": data})
-        self._send_ws_all(msg_type, data, msg)
+        _websocket_for(self).broadcast_ws(msg_type, data)
 
     def broadcast_context_usage(self, slot_key: str, payload: dict) -> None:
-        """Broadcast one ``context_usage`` frame AND record it as the slot's snapshot.
-
-        The SINGLE writer for context-meter state. Every producer of a
-        ``context_usage`` frame routes through here so the broadcast and the
-        stored snapshot cannot drift: the meter is otherwise turn-scoped only,
-        and reopening a session whose ACP process has expired (idle timeout or a
-        gateway restart) leaves the bar at 0% until the next turn because
-        nothing on the open path carries usage.
-
-        ``payload`` is the frame as broadcast (``{slot, pct, used_tokens?,
-        window_tokens?, reset?}``). The snapshot mirrors it plus the slot's
-        model, which the read side compares to decide whether the reading still
-        describes the session (see ``_context_snapshot_fields``). ``pct`` is
-        the load-bearing field and is stored on its own when that is all the
-        frame carries: kiro-cli commonly reports a percentage with no
-        ``usage_update``, so requiring token counts here would leave the
-        majority of sessions with nothing to restore. A post-compaction frame
-        legitimately stores ``pct: 0`` — that IS the new truth, not an absence.
-
-        Storage is a small sidecar map, NOT the session's metadata line:
-        ``ConversationLog.update_metadata`` reads and rewrites the WHOLE
-        transcript to edit its first line, so paying that per turn would scale
-        a turn's I/O with transcript size (tens of MB on a long session) while
-        holding the cross-process lock. The sidecar is O(open slots).
-        """
-        self.broadcast_ws("context_usage", payload)
-        slot = self.get_slot(slot_key)
-        if slot is None:
-            return
-        # SSE-only consumers (API clients, soak harness) never open a
-        # WebSocket, so the broadcast above is invisible to them. Mirror the
-        # SAME payload into the slot's live stream queue as an ephemeral
-        # wire-only frame under the SAME ``context_usage`` name the WS
-        # transport uses. Done HERE, inside the single writer, so every
-        # producer (end-of-turn, compaction, cron injection, reset) feeds the
-        # SSE channel identically and it cannot drift from the WS channel.
-        try:
-            slot.push_wire_frame("context_usage", json.dumps(payload))
-        except (TypeError, ValueError):
-            pass  # non-serializable payload (e.g. a test mock) — skip the SSE mirror
-        # Ephemeral tabs (incognito/temporary) leave no memory behind by
-        # contract — same filter as _persist_open_slots.
-        if getattr(slot, "memory_mode", "persistent") != "persistent":
-            return
-        pct = payload.get("pct")
-        if not isinstance(pct, (int, float)) or isinstance(pct, bool):
-            return
-        snapshot: dict[str, Any] = {"pct": pct, "model": slot.model}
-        window = payload.get("window_tokens") or 0
-        if window:
-            snapshot["window_tokens"] = window
-            snapshot["used_tokens"] = payload.get("used_tokens", 0)
-        with self._context_snapshots_lock:
-            if self._context_snapshots.get(slot_key) == snapshot:
-                return  # unchanged — nothing for the next flush to write
-            self._context_snapshots[slot_key] = snapshot
-            self._context_snapshots_dirty = True
+        _persistence_for(self).broadcast_context_usage(self, slot_key, payload)
 
     def ensure_context_snapshots_loaded(self) -> None:
-        """Merge the on-disk snapshot file into the in-memory map. BLOCKING.
-
-        Only readings taken by an EARLIER process need the file; anything this
-        process recorded is already in memory. So the merge never overwrites a
-        live entry — disk fills gaps, memory wins ties.
-
-        The loaded flag flips only AFTER the merge is in the map, under the
-        lock, so a concurrent flush can never observe ``loaded`` while the
-        disk entries are still in flight — that ordering is what stops the
-        flush from writing a memory-only view over readings it has not merged
-        yet. Two concurrent loaders may both read the file; the second merge
-        is a no-op because ties keep the in-memory value.
-
-        Blocking by design and therefore never called from the event loop: the
-        async slot-detail handler reaches it through ``asyncio.to_thread`` and
-        the flush paths reach it from their executors. A missing or corrupt
-        file leaves the map as-is; a lost snapshot only degrades the reopen case
-        back to an empty bar.
-        """
-        with self._context_snapshots_lock:
-            if self._context_snapshots_loaded:
-                return
-        try:
-            raw = json.loads((config_dir() / "context_snapshots.json").read_text())
-        except FileNotFoundError:
-            raw = {}
-        except Exception:
-            logger.debug("context_snapshots.json unreadable; starting empty", exc_info=True)
-            raw = {}
-        if not isinstance(raw, dict):
-            raw = {}
-        with self._context_snapshots_lock:
-            if self._context_snapshots_loaded:
-                return
-            for key, value in raw.items():
-                if isinstance(key, str) and isinstance(value, dict):
-                    self._context_snapshots.setdefault(key, value)
-            self._context_snapshots_loaded = True
+        _persistence_for(self).ensure_context_snapshots_loaded(self)
 
     def context_snapshot_for(self, slot_key: str) -> dict | None:
-        """Return a copy of the recorded reading for ``slot_key``, or ``None``.
-
-        The read seam for the slot-detail handler: hands out a copy under the
-        lock so the caller never holds a reference into the shared map.
-        """
-        with self._context_snapshots_lock:
-            snapshot = self._context_snapshots.get(slot_key)
-            return dict(snapshot) if isinstance(snapshot, dict) else None
+        return _persistence_for(self).context_snapshot_for(self, slot_key)
 
     def _persist_context_snapshots(self) -> None:
-        """Write the snapshot map to ``<config_dir>/context_snapshots.json``. BLOCKING.
-
-        Called from ``_flush_dirty_slots`` (the flush loop's executor pass) and
-        from the shutdown save in ``chat_persistence`` — the same off-loop
-        paths ``_persist_open_slots`` uses, and for the same reason: a home
-        directory on slow or network-backed storage can stall the write, and
-        one stalled write on the event loop freezes every chat turn and the
-        liveness heartbeat.
-
-        The data lock is held for the in-memory work only — the dirty check,
-        the disk merge, the prune, and serialization — never across the file
-        write, so a stalled disk cannot block the event loop's writers. The
-        flush lock then serializes whole flushes against each other: without
-        it, the periodic and shutdown flushes can overlap and the slower one
-        lands an OLDER serialization last, rolling the file back with the
-        dirty flag already cleared. ANY
-        failure re-arms the dirty flag and is swallowed: the flush loop treats
-        a raising callee as fatal, and losing every future flush over one
-        failed write would be a far worse trade than retrying in 5s. The prune
-        reads ``self._slots`` from a worker thread the way
-        ``_flush_dirty_slots`` and ``_persist_open_slots`` already do; if the
-        loop resizes it mid-iteration the raise lands in the same retry path.
-
-        Entries for slots that no longer exist are dropped on the way out, so a
-        deleted session cannot leave its usage behind and the file stays bounded
-        by the number of open slots.
-
-        NO-OP while ``restoring_open_slots`` is set — the same guard
-        ``_persist_open_slots`` carries, for the same reason: the startup
-        restore yields to the event loop between tabs, so mid-restore
-        ``self._slots`` holds only the tabs restored so far, and the prune
-        would read that partial set as "deleted sessions" and permanently drop
-        the readings of every tab still waiting to be restored. Skipping is
-        always safe: the dirty flag stays set, so the first flush after the
-        restore completes writes everything.
-        """
-        if self.restoring_open_slots:
-            logger.debug("context snapshot flush skipped: restore in progress")
-            return
-        with self._context_snapshots_lock:
-            if not self._context_snapshots_dirty:
-                return
-        self.ensure_context_snapshots_loaded()
-        # _context_snapshots_flush_lock makes the serialize→write pair atomic
-        # against the OTHER flush path, so a slower flush cannot land an older
-        # serialization after a newer one and roll the file back.
-        with self._context_snapshots_flush_lock:
-            try:
-                with self._context_snapshots_lock:
-                    self._context_snapshots_dirty = False
-                    live_keys = set(self._slots)
-                    for key in [k for k in self._context_snapshots if k not in live_keys]:
-                        del self._context_snapshots[key]
-                    payload = json.dumps(self._context_snapshots)
-                atomic_write(config_dir() / "context_snapshots.json", payload, mode=0o600)
-            except Exception:
-                logger.debug("Failed to persist context_snapshots.json", exc_info=True)
-                with self._context_snapshots_lock:
-                    self._context_snapshots_dirty = True
+        _persistence_for(self)._persist_context_snapshots(self)
 
     async def deliver_ws_owners(self, msg_type: str, data: object) -> int:
-        """Send a typed message ONLY to owner clients; return how many sends COMPLETED.
-
-        Use this instead of :meth:`broadcast_ws` for payloads scoped to the
-        dashboard user rather than to every subscriber — an app credential can
-        open ``/api/ws`` and lands in ``_ws_clients``, so an all-clients broadcast
-        of user-scoped content crosses the App Kit boundary.
-
-        The return value is the count of sends that actually completed, for
-        callers whose response reports delivery. A socket count is not a delivery count: the
-        fire-and-forget path returns before any ``send_str`` runs, so a client
-        that disconnects between the count and the send yields a failed send that
-        was already reported as success. For an ephemeral, broadcast-only payload
-        (nothing is stored server-side to re-deliver) that false success is the
-        whole failure mode — the caller is told the user saw a card that was
-        dropped on the floor.
-
-        Sends run concurrently and failures are absorbed per socket: one dead
-        peer must not hide a successful delivery to another window. Sockets that
-        are already ``closed``, and those whose send raised, are removed here —
-        the same cleanup the non-awaiting path performs.
-        """
-        targets = [ws for ws in list(self._owner_ws_clients) if not ws.closed]
-        if not targets:
-            return 0
-        msg = json.dumps({"type": msg_type, "data": data})
-        results = await asyncio.gather(
-            *(ws.send_str(msg) for ws in targets), return_exceptions=True
-        )
-        delivered = 0
-        for ws, result in zip(targets, results):
-            if isinstance(result, BaseException):
-                logger.debug("Owner WS send failed (client likely disconnected): %s", result)
-                self._remove_ws(ws)
-            else:
-                delivered += 1
-        for ws in list(self._owner_ws_clients):
-            if ws.closed:
-                self._remove_ws(ws)
-        return delivered
+        return await _websocket_for(self).deliver_ws_owners(msg_type, data)
 
     def broadcast_ws_owners(self, msg_type: str, data: object) -> None:
-        """Send a typed message to OWNER-authorized WS clients only.
-
-        For payloads that carry capability material (e.g. the MCP Apps
-        ``mcp_app_render`` frame, which delivers the app's ``callback_secret``)
-        — a non-owner or guest socket must never receive them.
-        """
-        if not getattr(self, "_owner_ws_clients", None):
-            return
-        msg = json.dumps({"type": msg_type, "data": data})
-        self._send_ws_owners(msg)
+        _websocket_for(self).broadcast_ws_owners(msg_type, data)
 
     def ws_client_count(self) -> int:
-        """Number of connected dashboard WS clients (live subscribers)."""
-        return len(self._ws_clients)
+        return _websocket_for(self).ws_client_count()
 
     def broadcast_browser_event(self, event_type: str, data: dict) -> None:
-        """Broadcast a browser activity event to all connected WS clients.
-
-        Redacts string values to prevent credential leakage.
-        """
-        safe_data: dict[str, Any] = {}
-        for k, v in data.items():
-            if isinstance(v, str):
-                v, _ = redact_credentials(v)
-                v, _ = redact_exfiltration_urls(v)
-            safe_data[k] = v
-        payload: dict[str, Any] = {"type": "browser_event", "event": event_type, "ts": time.time()}
-        for k, v in safe_data.items():
-            if k not in ("type", "event", "ts"):
-                payload[k] = v
-        self.broadcast_ws("browser_event", payload)
+        _websocket_for(self).broadcast_browser_event(event_type, data)
 
     def register_ws(self, ws: web.WebSocketResponse, *, owner: bool = False) -> None:
-        """Register a WebSocket client and its owner authorization state.
-
-        Latches the serving loop here rather than on the first send. Registration
-        runs on the aiohttp handler's loop, so this is the earliest point that
-        loop is known; latching on first send instead left a window where the
-        FIRST frame after a connect, if it originated off-loop, had no loop to
-        run on and was dropped -- a live notification lost until the client
-        reconnected.
-        """
-        self._ws_clients.append(ws)
-        if owner:
-            self._owner_ws_clients.add(ws)
-        # Same one-sink rule as _spawn_ws_send: reading the accessor latches
-        # this loop when nothing bound one and leaves a startup bind alone.
-        self.serving_loop
+        _websocket_for(self).register_ws(ws, owner=owner)
 
     def unregister_ws(self, ws: web.WebSocketResponse) -> None:
-        """Remove a WebSocket client on disconnect."""
-        self._remove_ws(ws)
+        _websocket_for(self).unregister_ws(ws)
 
     def _remove_ws(self, ws: web.WebSocketResponse) -> None:
-        """Remove a WS client from all subscriber lists."""
-        try:
-            self._ws_clients.remove(ws)
-        except ValueError:
-            pass
-        self._owner_ws_clients.discard(ws)
-        self._ws_log_subscribers.discard(ws)
-        self._ws_subagent_subscribers.discard(ws)
+        _websocket_for(self)._remove_ws(ws)
 
     def subscribe_logs(self, ws: web.WebSocketResponse) -> None:
-        """Subscribe a WS client to log events."""
-        self._ws_log_subscribers.add(ws)
+        _websocket_for(self).subscribe_logs(ws)
 
     def unsubscribe_logs(self, ws: web.WebSocketResponse) -> None:
-        """Unsubscribe a WS client from log events."""
-        self._ws_log_subscribers.discard(ws)
+        _websocket_for(self).unsubscribe_logs(ws)
 
     def subscribe_subagents(self, ws: web.WebSocketResponse) -> None:
-        self._ws_subagent_subscribers.add(ws)
+        _websocket_for(self).subscribe_subagents(ws)
 
     def unsubscribe_subagents(self, ws: web.WebSocketResponse) -> None:
-        self._ws_subagent_subscribers.discard(ws)
+        _websocket_for(self).unsubscribe_subagents(ws)
 
     def broadcast_ws_subagent_subscribers(self, msg_type: str, data: object) -> None:
-        """Send to subagent-subscribed clients only (for heavy chunk data).
-
-        A second fan-out path parallel to :meth:`broadcast_ws`, used for
-        high-volume ``subagent_chunk`` traffic. It applies the SAME per-app
-        scope gate via :meth:`_ws_client_allowed`, so an app token cannot
-        bypass filtering just by sending ``{"type": "subscribe_subagents"}``.
-        """
-        if not self._ws_subagent_subscribers:
-            return
-        msg = json.dumps({"type": msg_type, "data": data})
-        dead: list[web.WebSocketResponse] = []
-        for ws in list(self._ws_subagent_subscribers):
-            if ws.closed:
-                dead.append(ws)
-                continue
-            if not self._ws_client_allowed(ws, msg_type, data):
-                continue
-            try:
-                payload = self._serialize_for_client(ws, msg_type, data, msg)
-            except Exception:
-                # Same split as _send_ws_all: a payload-shaping fault is ours and
-                # must not unregister a healthy subscriber (_remove_ws strips
-                # _ws_clients too, so an eviction here freezes that client's whole
-                # dashboard, not just its subagent stream).
-                logger.warning(
-                    "WS subagent payload shaping failed for %s; keeping the client registered",
-                    msg_type,
-                    exc_info=True,
-                )
-                continue
-            try:
-                self._spawn_ws_send(ws, payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self._remove_ws(ws)
+        _websocket_for(self).broadcast_ws_subagent_subscribers(msg_type, data)
 
     async def close_all_ws(self) -> None:
-        """Close all WebSocket connections (called on shutdown)."""
-        if self._flush_task:
-            self._flush_task.cancel()
-            self._flush_task = None
-        for ws in list(self._ws_clients):
-            try:
-                await ws.close()
-            except Exception:
-                pass
-        self._ws_clients.clear()
-        self._owner_ws_clients.clear()
-        self._ws_log_subscribers.clear()
-        self._ws_subagent_subscribers.clear()
+        await _websocket_for(self).close_all_ws()
 
 
 # ── Notification persistence ──
@@ -8414,3 +7099,16 @@ def _cached_check_status(url: str) -> dict | None:
     from kiro_crew.dashboard.handlers.source_providers import get_cached_check_status
 
     return get_cached_check_status(url)
+
+
+def _repo_is_public(url: str) -> bool | None:
+    """Lazy wrapper for the repo-visibility reader (public/private/unknown).
+
+    Function-local import (top-level-imports exception): ``source_providers``
+    imports chat-state helpers from this module, so a module-scope import here
+    would create a bootstrap import cycle. Same rationale as
+    ``_cached_check_status`` directly above.
+    """
+    from kiro_crew.dashboard.handlers.source_providers import is_repo_public
+
+    return is_repo_public(url)

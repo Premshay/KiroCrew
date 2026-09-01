@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from kiro_crew import model_registry
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.cron import get_local_tz
@@ -1053,7 +1054,24 @@ def _load_steering_resources() -> str:
         cfg_path = kiro_agents_dir() / "kirocrew.json"
         if not cfg_path.exists():
             return ""
-        cfg = json.loads(safe_read_file(str(cfg_path)))
+        # The agents dir is user-writable and shared with other tools, so the
+        # spec goes through the hardened agent-spec reader. ``safe_read_file``
+        # screened the resolved target but read it with an unbounded
+        # ``fh.read()`` -- the size cap guards ``safe_read_file_bytes``, the
+        # other helper -- and emitted no SEL event, so an oversized spec was
+        # still read whole here and a refusal was never audited. Every outcome
+        # the blanket ``except`` below used to absorb (PermissionError on a
+        # sensitive target, AttributeError on non-object JSON) now arrives as
+        # ``None`` and returns the same empty string, without the read.
+        from kiro_crew.agent_discovery import _read_agent_spec
+
+        cfg = _read_agent_spec(
+            cfg_path,
+            operation="steering_resources",
+            source="unknown",
+        )
+        if cfg is None:
+            return ""
         resources = cfg.get("resources", [])
         parts: list[str] = []
         home_resolved = str(Path.home().resolve()) + os.sep
@@ -1137,6 +1155,17 @@ _CRITICAL_RULES_TAIL = (
     '"Yes, delete it"). Never phrase a label in your own voice or as your own '
     'next action ("I\'ll merge it", "Let me show the diff", "I can rebase '
     'first"), and never phrase it as a question back to the user.\n'
+    "Every option must be SELF-CONTAINED: each rendered chip carries its own "
+    "send control, so the user can send any single option alone, and ONLY that "
+    "option's text is sent -- none of its siblings come with it. Never write "
+    'an option that only makes sense combined with another one ("Build the '
+    'widget" | "Include the stop button too" -- sent alone, the second names '
+    "no action). Fold the shared base action into each label instead "
+    '("Build the widget with the stop button included").\n'
+    "Keep each option label SHORT -- aim for at most 8 words. The chip row "
+    "renders each label on a single line, so a long label displays cut off; "
+    "put supporting detail in the message body before the [OPTIONS:] line and "
+    "keep the label itself to the bare instruction.\n"
     "[END CRITICAL RULES]\n\n"
 )
 # The dashboard variant is the module's canonical block: tests and the
@@ -1791,7 +1820,11 @@ class ContextBuilder:
             self._bot_name = bot_name
         else:
             cfg = KiroCrewConfig.load()
-            self._bot_name = "KiroCrew" if cfg.agent.provider == "claude_code" else "Kiro"
+            provider = cfg.agent.provider
+            # The joined spelling is the {bot_name} value the prompt
+            # substitutes, not prose about the product: respelling it would
+            # change what the model is told to answer to.
+            self._bot_name = "KiroCrew" if is_claude_code(provider) else "Kiro"  # brand-ok
         # Register default memory in the workspace cache
         _memory_stores["default"] = self.memory
 
@@ -1852,17 +1885,20 @@ class ContextBuilder:
                 'or any content that fails the test: "would the reader be '
                 'stuck without this line?"\n'
                 "- Code blocks and commands are the answer — never cut them.\n"
-                "- Never compress for brevity: security warnings, "
-                "irreversible-action confirmations, and ordered multi-step "
-                "instructions where a dropped step causes a mistake. Those "
-                "stay complete, and code, commands, paths, identifiers and "
-                "error strings stay verbatim.\n"
+                "- Stakes change what you must not omit, never the length: "
+                "security warnings and irreversible-action confirmations "
+                "always appear, each as one line naming the call, the risk, "
+                "and whether it can be undone; the mechanism and the failure "
+                "modes are not required. Ordered multi-step instructions "
+                "where a dropped step causes a mistake stay complete, and "
+                "code, commands, paths, identifiers and error strings stay "
+                "verbatim.\n"
                 "- When the user ASKS for something long (design doc, tutorial, "
                 "full implementation), ignore these constraints and deliver "
                 "what was asked.\n"
                 "- Required output formats are sacred and never cut: "
                 "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
-                "URLs, security warnings, and any format the rendering surface "
+                "URLs, and any format the rendering surface "
                 "needs. These go in their required position regardless of "
                 "brevity.\n"
                 "- Preserve the user's language."
@@ -1890,9 +1926,13 @@ class ContextBuilder:
                 "verbatim and complete. Brevity is for prose, never correctness.\n"
                 "- Preserve the user's language; compress the style, not the "
                 "content.\n\n"
-                "Ignore concise mode and keep full detail for: security warnings, "
-                "irreversible-action confirmations, and multi-step instructions "
-                "where order or omissions could cause a mistake."
+                "Stakes change what concise mode must not omit, never how "
+                "long it may run: security warnings and irreversible-action "
+                "confirmations always appear, each as one line naming the "
+                "call, the risk, and whether it can be undone; the mechanism "
+                "and the failure modes are not required. Likewise, multi-step "
+                "instructions where order or omissions could cause a mistake "
+                "stay complete."
             )
         elif verbosity == "answer_only":
             verbosity_block = (
@@ -1910,8 +1950,13 @@ class ContextBuilder:
                 "are about to do, what you just did, rationale, alternatives "
                 "you rejected, caveats, trade-offs, unprompted next steps, and "
                 "closing offers to help.\n"
-                "- A change, a command, or a value IS the answer. Show it and "
-                "stop; do not narrate it.\n"
+                "- Whatever the user needs in order to know or to act IS the "
+                "answer — a change, a command, a value, a verdict. Lead with "
+                "it and stop; do not narrate it. The work that produced it — "
+                "the evidence, the search, the options you weighed — is "
+                "explanation, so it is opt-in like the rest. Naming your "
+                "findings is not naming the answer: if the user has to derive "
+                "it from what you found, you have not answered.\n"
                 "- One exception to stopping: when that command or change "
                 "destroys, overwrites or rewrites something, the undo path "
                 "rides along with it in the same reply — how to get it back, "
@@ -1927,7 +1972,23 @@ class ContextBuilder:
                 "Take a position instead of listing options.\n"
                 "- Code, commands, paths, identifiers, error strings and file "
                 "contents stay verbatim and complete — this mode cuts prose, "
-                "never payload.\n"
+                "never payload. Payload is what the user asked for or has to "
+                "act on. Material you quote to prove a point is evidence, not "
+                "payload, and evidence is opt-in: leave it out and offer it.\n"
+                "- One sentence per thing you are telling them. The verdict is "
+                "a sentence; each recommendation is a sentence; each item in a "
+                "list is a sentence. This bounds each item, not the reply, so "
+                "a procedure that genuinely needs seven steps gets seven "
+                "one-sentence steps — but a reply that has grown sections, "
+                "numbered findings or bullets with sub-bullets is a report, "
+                "and the answer is buried inside it.\n"
+                "- Verify against the real thing, then answer without showing "
+                "the work. Reading the code, the log or the document is what "
+                "keeps you from being wrong; a file path, a line number, a "
+                "quoted function or a count of the steps you took only shows "
+                "that you read it. Say what the thing does, not where you "
+                "found it, and hand the reference over when the user asks to "
+                "check it.\n"
                 "- The moment the user asks why, asks you to explain, or asks "
                 "for a doc, review, walkthrough or deep dive, this mode is off "
                 "for that reply: give the full detail they asked for.\n\n"
@@ -2067,7 +2128,7 @@ class ContextBuilder:
         deployment's effective window), leaving that path byte-for-byte
         unchanged.
 
-        All providers — including ``provider_type="claude_code"`` — receive the
+        All providers — including Claude Code — receive the
         same injected context (critical rules, thread history, memory, skills,
         lessons); steering files are the one exception (see below). This keeps
         Claude Code at parity with kiro so dashboard/Slack UI contracts (diff
@@ -2076,7 +2137,7 @@ class ContextBuilder:
 
         *provider_type* is consumed again for the steering gate only: the
         steering block below is injected solely on the CC backend
-        (``provider_type == "claude_code"``). kiro-cli loads an agent's
+        (``is_claude_code(provider_type)``). kiro-cli loads an agent's
         ``resources`` natively when spawned with ``--agent`` (acp/client.py
         ``_spawn``), so re-injecting steering on the ACP/kiro backend would
         duplicate what kiro already loaded; the CC backend (claude-agent-acp)
@@ -2100,7 +2161,7 @@ class ContextBuilder:
         and hooks are injected for all agents.
         """
         is_custom = agent and agent != "kirocrew"
-        is_cc = provider_type == "claude_code"
+        is_cc = is_claude_code(provider_type)
         caps = _resolve_caps(model_window)
         parts: list[str] = []
 
@@ -2616,7 +2677,7 @@ class ContextBuilder:
         # Set together with the user's text part when user_text_range is given.
         _user_bounds: tuple[int, int] | None = None
         _user_part_index: int | None = None
-        is_cc = provider_type == "claude_code"
+        is_cc = is_claude_code(provider_type)
 
         # ``is_new_session`` means this gateway constructed a provider client,
         # not necessarily that the provider constructed a conversation.  On a
@@ -3145,7 +3206,9 @@ class ContextBuilder:
                 "as the very last line — exactly once, nothing after it. "
                 "Users can select multiple options before submitting. Label each choice "
                 'in the user\'s voice as an instruction to you — "Merge it now", not '
-                '"I\'ll merge it".)'
+                '"I\'ll merge it". Make each choice self-contained — any single one can '
+                "be sent alone, so never write a choice that merely modifies a sibling "
+                '("Include the stop button too"); fold the base action into it.)'
             )
             # Situational nudges for tools that may otherwise never surface with
             # MCP Tool Search. Gated on having a dashboard tab open, because
@@ -3155,17 +3218,19 @@ class ContextBuilder:
             # wants none of the Crew's dashboard-tool nudges (it drives its own
             # UI through its MCP tools), so honor that here too, not just for
             # _CRITICAL_RULES.
-            # ask_question is a MID-turn blocking decision; [OPTIONS:] remains
-            # the cheaper END-turn choice mechanism on every interactive surface.
+            # ask_question posts a NON-BLOCKING card and the agent ends its turn:
+            # what blocks is the DECISION, not the tool call. [OPTIONS:] remains
+            # the cheaper choice mechanism on every interactive surface.
             if has_dashboard_surface(session_key or "") and _agent_includes_crew_context(agent):
                 parts.append(
-                    "\n\n(If you need the user's answer to a blocking question BEFORE "
-                    "you can continue the current turn, use the ask_question tool — it "
-                    "pauses and returns the answer as the tool result. Use it SPARINGLY: "
-                    "only when you genuinely cannot proceed without the answer. When you "
-                    "are ENDING your turn, use the final [OPTIONS:] line instead. Never "
-                    "interrupt the user for a non-blocking choice, and never ask what you "
-                    "can reasonably decide or discover yourself.)"
+                    "\n\n(If a decision is genuinely needed before the work can "
+                    "continue, use the ask_question tool to put it to the user as a card, "
+                    "then END YOUR TURN: the tool does not block, and the answer arrives "
+                    "as the user's next message rather than as the tool's result. Use it "
+                    "SPARINGLY: only when you cannot proceed without the answer. When you "
+                    "are ending your turn anyway, use the final [OPTIONS:] line instead. "
+                    "Never interrupt the user for a non-blocking choice, and never ask "
+                    "what you can reasonably decide or discover yourself.)"
                 )
                 # A follow-up card is distinct from both: it offers concrete NEXT
                 # tasks after work is done, optionally handing one to a worktree.

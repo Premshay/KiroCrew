@@ -8,6 +8,7 @@ import { createSlot } from '../store/chatSlice'
 import { api, type WebhookTokenEntry } from '../api/client'
 import { useProvider } from '../providers'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { FOLDER_COLOR_PALETTE } from '../components/folderColorCatalog'
 import { Btn, SendBtn, Input, Badge, SearchInput, PageHeader, EmptyState } from '../components/ui'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import {
@@ -27,6 +28,7 @@ import { wakesCrew, crewWakeQueryKey, crewWebhooksQueryKey, webhookBoundToCrew, 
 import type { CronJob } from '../types'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import { SourceBadge } from '../components/SourceBadge'
+import { errMessage } from '../utils/thunkError'
 
 import { i18nT } from '../i18n/t'
 import ErrorNotice from '../components/ErrorNotice'
@@ -43,6 +45,7 @@ interface CreatePayload {
   workspace: string
   memory_store: string
   triggers: string
+  session_color: string
 }
 
 /** Editable fields sent when updating an existing agent binding. */
@@ -54,6 +57,8 @@ interface AgentUpdatePayload {
   triggers: string
   /** '' = inherit (the kiro template's pin, then the global fallback). */
   model: string
+  /** Default session color (#rrggbb hex) for new sessions. '' = no default. */
+  session_color: string
 }
 
 /** The stored spelling for "no per-agent pin, inherit the next tier down". The
@@ -149,7 +154,6 @@ function WorkspaceForm({
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-1">
               {/* Native input associated via htmlFor+id; label-has-for's nesting requirement is a false positive. */}
-              {/* eslint-disable-next-line jsx-a11y/label-has-for */}
               <label htmlFor="ws-name" className="text-[11px] text-muted uppercase tracking-wider font-medium">{i18nT('pages.kiroCrewAgentsPage.name')}</label>
               <InfoTip text={i18nT('pages.kiroCrewAgentsPage.a_unique_identifier_for_this_workspace_agents_re')} />
             </div>
@@ -158,7 +162,6 @@ function WorkspaceForm({
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-1">
               {/* Native input associated via htmlFor+id; label-has-for's nesting requirement is a false positive. */}
-              {/* eslint-disable-next-line jsx-a11y/label-has-for */}
               <label htmlFor="ws-dir" className="text-[11px] text-muted uppercase tracking-wider font-medium">{i18nT('pages.kiroCrewAgentsPage.directory')}</label>
               <InfoTip text={i18nT('pages.kiroCrewAgentsPage.subdirectory_inside_kiro_crew_where_this_workspa')} />
             </div>
@@ -367,6 +370,107 @@ export function TriggersField({ value, onChange }: { value: string; onChange: (v
   )
 }
 
+/** Session color picker for agent configuration. Sets the default session
+ *  tint color for new sessions created with this agent. */
+export function SessionColorField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const HEX_RE = /^#[0-9a-f]{6}$/i
+  const [draft, setDraft] = useState(value || '')
+  // Re-sync the draft when the committed value changes from outside (e.g. the
+  // swatch, Clear, or opening the editor on a different crew).
+  useEffect(() => { setDraft(value || '') }, [value])
+  const commit = (raw: string) => {
+    const v = raw.trim().toLowerCase()
+    if (v === '') { onChange(''); setDraft('') }
+    else if (HEX_RE.test(v)) { onChange(v); setDraft(v) }
+    else { setDraft(value || '') } // invalid on blur → revert to committed
+  }
+  return (
+    <Field label={i18nT('pages.kiroCrewAgentsPage.session_color')} hint={i18nT('pages.kiroCrewAgentsPage.session_color_hint')}>
+      {/* Quick picks first, exact entry below — the order the session
+       *  right-click menu uses, so the two surfaces read the same way.
+       *
+       *  These are FOLDER_COLOR_PALETTE, the repo's existing fixed-hex identity
+       *  catalog, NOT the sidebar's generated palette. The sidebar's swatches
+       *  are a `color_index` into a palette derived from the theme accent, so
+       *  they re-derive when the theme changes; a crew's `session_color` is a
+       *  stored hex, so a swatch here has to commit exactly the literal it
+       *  shows and must not drift. That is the same job the folder catalog
+       *  already does, and reusing it keeps one visual language across folders,
+       *  tags and crews — as that file's own comment argues — instead of a
+       *  second preset list that would silently diverge from it. Read-only:
+       *  the catalog's KEEP IN SYNC contract with chat_folders.py governs
+       *  changes to its entries, and consuming it adds no such coupling.
+       *
+       *  The active ring is matched by hex, so a custom colour outside the
+       *  catalog correctly rings nothing.
+       *
+       *  No "no color" cell here: Clear already owns that, and two controls for
+       *  one action is worse than one. */}
+      <div className="mb-2 flex flex-wrap items-center gap-1.5">
+        {FOLDER_COLOR_PALETTE.map(({ value: c, label }) => {
+          const active = HEX_RE.test(value) && value.toLowerCase() === c
+          return (
+            <Btn
+              type="button"
+              key={c}
+              aria-label={label()}
+              aria-pressed={active}
+              title={label()}
+              // Btn, not a raw <button>, so the swatches inherit the standard
+              // press and disabled treatment. `p-0` and the sizing below win
+              // over Btn's own padding/radius/border because Btn twMerges
+              // `className` last; the inline background beats its
+              // `bg-transparent` (and its hover background) on specificity, so
+              // the dot keeps its colour in every state.
+              //
+              // `border-text-strong`, not `border-accent`: the accent is itself a
+              // purple in most themes, so an accent ring on the indigo and violet
+              // entries reads as no ring at all. The near-white ring is what
+              // SessionColorSwatches uses, and it separates from every hue here.
+              className={`h-5 w-5 p-0 cursor-pointer rounded-full border-2 transition-transform hover:scale-110 ${active ? 'border-text-strong scale-110' : 'border-border'}`}
+              style={{ background: c }}
+              onClick={() => onChange(c)}
+            />
+          )
+        })}
+      </div>
+      <div className="flex items-center gap-2">
+        <Input
+          type="color"
+          value={value || '#6366f1'}
+          onChange={e => onChange(e.target.value.toLowerCase())}
+          className="h-8 w-8 flex-none cursor-pointer p-0.5"
+          aria-label={i18nT('pages.kiroCrewAgentsPage.session_color')}
+        />
+        <Input
+          placeholder="#rrggbb"
+          value={draft}
+          onChange={e => {
+            const v = e.target.value.trim().toLowerCase()
+            setDraft(v)
+            // Live-commit only when the draft is a complete hex or cleared;
+            // partial values stay local so typing is never swallowed.
+            if (v === '' || HEX_RE.test(v)) onChange(v)
+          }}
+          onBlur={e => commit(e.target.value)}
+          className="flex-1 font-mono text-[13px]"
+          aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_hex')}
+        />
+        {value && (
+          <Btn
+            type="button"
+            onClick={() => onChange('')}
+            className="text-[11px]"
+            aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_clear')}
+          >
+            {i18nT('pages.kiroCrewAgentsPage.session_color_clear')}
+          </Btn>
+        )}
+      </div>
+    </Field>
+  )
+}
+
 /** The create form's binding block. */
 function BindingFields({
   templateLabel, kiroAgentOptions, kiroAgent, setKiroAgent,
@@ -412,6 +516,7 @@ function CrewCard({ agent, isDefault, shared, onOpen }: {
       className={`group flex flex-col gap-3 rounded-lg border bg-card p-3.5 transition-all
                   hover:border-border-strong hover:shadow-md focus-ring
                   ${isDefault ? 'border-accent-subtle' : 'border-border'}`}
+      style={agent.session_color ? { borderLeftColor: agent.session_color, borderLeftWidth: '3px' } : undefined}
     >
       <div className="flex items-center gap-3">
         <CrewAvatar seed={agent.name} size={38} />
@@ -603,6 +708,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const [workspace, setWorkspace] = useState('default')
   const [memoryStore, setMemoryStore] = useState('default')
   const [triggers, setTriggers] = useState('')
+  const [sessionColor, setSessionColor] = useState('')
   const [editModel, setEditModel] = useState(INHERIT_MODEL)
   const [confirmDelete, setConfirmDelete] = useState(false)
   /** The armed confirm row, scrolled into view when it appears: the danger zone
@@ -639,6 +745,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     setConfirmDelete(false)
     setName(''); setKiroAgent(''); setWorkspace('default'); setMemoryStore('default')
     setTriggers('')
+    setSessionColor('')
     setSheet({ mode: 'create' })
   }, [])
 
@@ -648,6 +755,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     setConfirmDelete(false)
     setKiroAgent(a.kiro_agent); setWorkspace(a.workspace); setMemoryStore(a.memory_store)
     setTriggers(a.triggers || '')
+    setSessionColor(a.session_color || '')
     setEditModel(a.model || INHERIT_MODEL)
     setSheet({ mode: 'edit', name: a.name })
   }, [defaultAgent])
@@ -716,7 +824,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     // 'kirocrew' default: that default is what silently turns a new crew into an
     // alias for the DEFAULT agent (#1684).
     if (!kiroAgent) { setError(i18nT('pages.kiroCrewAgentsPage.agent_template_is_required')); return }
-    createMut.mutate({ name: n, kiro_agent: kiroAgent, workspace, memory_store: memoryStore, triggers, epoch: sheetEpoch.current })
+    createMut.mutate({ name: n, kiro_agent: kiroAgent, workspace, memory_store: memoryStore, triggers, session_color: sessionColor, epoch: sheetEpoch.current })
   }
 
   const saveEdit = () => {
@@ -733,6 +841,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
         // INHERIT_MODEL is normalized to '' server-side; send it verbatim so
         // clearing a pin is a real write rather than a skipped field.
         model: editModel,
+        session_color: sessionColor,
       },
     })
   }
@@ -748,8 +857,10 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     } catch (e) {
       // `unwrap()` rethrows Redux Toolkit's SERIALIZED error, which is a plain
       // object carrying `message` rather than a real Error — an `instanceof`
-      // check alone renders it as "[object Object]".
-      const msg = e instanceof Error ? e.message : (e as { message?: string })?.message
+      // check alone renders it as "[object Object]". `errMessage` owns that
+      // extraction for every thunk-boundary reader, so this site cannot drift
+      // from the classifier in `utils/thunkError` that depends on the same fact.
+      const msg = errMessage(e)
       settleFor(epoch, msg || i18nT('pages.kiroCrewAgentsPage.failed_to_update_agent'))
       return
     }
@@ -889,8 +1000,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     }
     if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add('model')
     if (triggers !== (editingAgent.triggers || '')) out.add('routing')
+    if (sessionColor !== (editingAgent.session_color || '')) out.add('routing')
     return out
-  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, triggers])
+  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, triggers, sessionColor])
 
   const sections = useCrewEditorSections({
     templateLabel: provider.labels.agentTemplateField,
@@ -1120,6 +1232,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 <section className="flex flex-col gap-3">
                   <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">{i18nT('pages.kiroCrewAgentsPage.routing')}</h3>
                   <TriggersField value={triggers} onChange={setTriggers} />
+                  <SessionColorField value={sessionColor} onChange={setSessionColor} />
                 </section>
                 <section className="flex flex-col gap-3">
                   <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">{i18nT('pages.kiroCrewAgentsPage.runtime_binding')}</h3>
@@ -1226,7 +1339,12 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
                   {pane === 'webhook' && <CrewWebhookSection crew={editing} />}
 
-                  {pane === 'routing' && <TriggersField value={triggers} onChange={setTriggers} />}
+                  {pane === 'routing' && (
+                    <>
+                      <TriggersField value={triggers} onChange={setTriggers} />
+                      <SessionColorField value={sessionColor} onChange={setSessionColor} />
+                    </>
+                  )}
 
                   {pane === 'danger' && (
                     <div className="flex flex-col gap-3 rounded-md border border-danger-subtle bg-danger-subtle p-3">

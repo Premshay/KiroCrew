@@ -203,11 +203,11 @@ def make_dir_link(link: pathlib.Path, target: pathlib.Path) -> None:
 
 @pytest.fixture(autouse=True)
 def _windows_restrict_to_owner_stub(request, monkeypatch):
-    """On Windows, no-op the icacls secret lockdown for hermetic tests.
+    """On Windows, no-op the secret lockdown for hermetic tests.
 
-    Many tests stub ``subprocess.run`` (or strip PATH) for hermeticity;
-    ``restrict_to_owner``'s whoami/icacls spawns then fail and its
-    DELIBERATE fail-loud OSError cascades into hundreds of unrelated
+    Many tests stub ``subprocess.run`` (or strip PATH) for hermeticity, or
+    monkeypatch the SID resolver; ``restrict_to_owner``'s DELIBERATE fail-loud
+    OSError then cascades into hundreds of unrelated
     tests. The real Windows implementation keeps direct coverage in
     test_platform_compat / test_spawn_audit (exempted here) and the
     POSIX chmod path keeps full coverage on the Linux matrix. Product
@@ -218,10 +218,23 @@ def _windows_restrict_to_owner_stub(request, monkeypatch):
     ``restrict_dir_to_owner`` is stubbed alongside it and must stay that
     way: it is the directory twin that ``make_owner_only_dir`` routes
     through, so stubbing only the file helper would leave every test that
-    creates an owner-only directory spawning a real icacls.
+    creates an owner-only directory writing a real DACL.
+
+    Note the lockdown no longer spawns anything -- it applies the DACL through
+    ``advapi32`` in-process -- so the subprocess-stub collision this fixture was
+    built for is mostly gone. The stub is kept because a hermetic test that
+    patches the SID resolver or the writer seam can still trip the fail-loud
+    OSError, and narrowing it is a change to hundreds of tests' blast radius
+    rather than part of the DACL swap.
     """
     if not platform_compat.IS_WINDOWS or request.module.__name__ in (
         "test_platform_compat",
+        # Exempted for the same reason as test_platform_compat: these modules own
+        # the direct Windows-branch coverage for the owner-only lockdown, so a
+        # stub would make their assertions vacuous. They were passing on Linux
+        # (where the fixture is inert) and silently asserting nothing on Windows.
+        "test_platform_compat_coverage",
+        "test_config_rmw_preserves_settings",
         "test_spawn_audit",
     ):
         yield
@@ -390,6 +403,22 @@ def pytest_internalerror(excrepr, excinfo) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _release_stt_engine():
+    """Never let a loaded speech model outlive the test that loaded it.
+
+    ``kiro_crew.stt.engine`` keeps ONE recogniser per process on purpose: the
+    whole point of the module is that an utterance does not pay for a model load.
+    Under xdist that same property makes it cross-test state, and the instance
+    carries the idle-eviction window the first caller passed, so a later test
+    reading a different setting would silently get the earlier one.
+    """
+    yield
+    from kiro_crew.stt import engine as stt_engine
+
+    stt_engine._engine = None
+
+
+@pytest.fixture(autouse=True)
 def _reset_safety_override_between_tests():
     """Reset the SafetyOverride singleton between tests to prevent state leaking."""
     _reset_safety_override()
@@ -494,7 +523,7 @@ def _disable_dev_fleet_background_tasks(monkeypatch):
     still be running when the test's client tears down, and cancelling it then
     is what leaked into unrelated tests and flaked ``Gateway Tests (macOS)``
     (issue #1832). A test that wants the real refresher overrides this itself
-    via ``monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: False)``.
+    via ``monkeypatch.setattr(worktree_ops, "_background_tasks_disabled", lambda: False)``.
     """
     monkeypatch.setenv("KIROCREW_DEVFLEET_NO_BACKGROUND", "1")
 
@@ -554,16 +583,25 @@ def _isolate_message_entry_cache():
 
     The byte counter is part of the same state, so resetting only the dict would
     leave the memory ceiling mis-accounted and evict a healthy cache.
+
+    The memoised config bounds are reset for the same reason: they are resolved
+    once per process from whatever KIROCREW_HOME the first caller saw, so a test
+    that resolved them under its own home would otherwise leak its bounds into
+    every later test's cache behaviour.
     """
     from kiro_crew.dashboard import chat_persistence as _cp
 
     _cp._entry_cache.clear()
     _cp._entry_cache_bytes = 0
+    _cp._entry_cache_bounds_cached = None
+    _cp._entry_cache_bounds_read_warned = False
     try:
         yield
     finally:
         _cp._entry_cache.clear()
         _cp._entry_cache_bytes = 0
+        _cp._entry_cache_bounds_cached = None
+        _cp._entry_cache_bounds_read_warned = False
 
 
 @pytest.fixture(autouse=True)

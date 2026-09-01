@@ -139,9 +139,13 @@ describe('MarkdownRenderer images', () => {
   it('releases the layout placeholder once the image has loaded', () => {
     const { container } = render(<MarkdownRenderer content={'![shot](/tmp/shot.png)'} />)
     const img = () => container.querySelector('img')!
-    expect(img().getAttribute('style')).toContain('min-height: 120px')
+    // Pre-load: a fixed pending box (not full-width, not the old min-height
+    // floor — an unloaded <img> has no intrinsic WIDTH either).
+    expect(img().getAttribute('style')).toContain('width: 420px')
+    expect(img().getAttribute('style')).toContain('height: 236px')
     fireEvent.load(img())
-    expect(img().getAttribute('style') || '').not.toContain('min-height')
+    expect(img().getAttribute('style') || '').not.toContain('420px')
+    expect(img().getAttribute('style') || '').not.toContain('236px')
   })
 
   it('opens the lightbox for the clicked image and reports its siblings', () => {
@@ -356,7 +360,9 @@ describe('MarkdownRenderer path chip with no file handler', () => {
     globalThis.fetch = vi.fn(() =>
       Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response),
     ) as unknown as typeof fetch
-    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue(undefined as never)
+    // Resolve the wire shape (the OS handled it, no copy path) so the shared
+    // `revealOrOpen` can read `r.copy` without tripping over `undefined`.
+    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({} as never)
     const { container } = render(<MarkdownRenderer content={'`/tmp/notes/plan.md`'} />)
     const chip = await waitFor(() => {
       const c = container.querySelector('code[data-path-kind="file"]') as HTMLElement | null
@@ -364,7 +370,9 @@ describe('MarkdownRenderer path chip with no file handler', () => {
       return c!
     })
     fireEvent.click(chip)
-    expect(reveal).toHaveBeenCalledWith('/tmp/notes/plan.md')
+    // The chip routes through the shared `revealOrOpen`, which calls the
+    // transport with the explicit 'reveal' action rather than a bare path.
+    expect(reveal).toHaveBeenCalledWith('/tmp/notes/plan.md', 'reveal')
   })
 })
 

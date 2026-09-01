@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import json
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,10 +38,19 @@ class TestVoiceConfig:
     async def test_get_config(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
-            global_enabled=True, provider="polly", default_voice="Joanna",
-            default_engine="neural", default_rate="100%", default_pitch="0%",
-            aws_profile="", region="us-east-1", piper_binary="", piper_model="",
-            piper_model_config="", piper_length_scale=1.0,
+            global_enabled=True,
+            auto_speak=False,
+            provider="polly",
+            default_voice="Joanna",
+            default_engine="neural",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="us-east-1",
+            piper_binary="",
+            piper_model="",
+            piper_model_config="",
+            piper_length_scale=1.0,
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -50,13 +61,51 @@ class TestVoiceConfig:
             assert data["voice"] == "Joanna"
             assert data["engine"] == "neural"
             assert data["enabled"] is True
+            # autoSpeak reflects the dedicated auto_speak field, not `enabled` —
+            # they're independent toggles in the Settings UI.
+            assert data["autoSpeak"] is False
+
+    @pytest.mark.asyncio
+    async def test_get_config_auto_speak_independent_of_enabled(self, tmp_path, monkeypatch):
+        # Regression test: `autoSpeak` used to alias `global_enabled`, so a user
+        # with voice enabled but auto-speak off would still get auto-spoken
+        # replies (and vice versa). The two must be reported independently.
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(
+            global_enabled=True,
+            auto_speak=False,
+            provider="piper",
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            piper_binary="",
+            piper_model="",
+            piper_model_config="",
+            piper_length_scale=1.0,
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.get("/api/voice/config")
+            data = await resp.json()
+            assert data["enabled"] is True
+            assert data["autoSpeak"] is False
 
     @pytest.mark.asyncio
     async def test_put_config_updates_voice(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
-            global_enabled=False, default_voice="Joanna", default_engine="neural",
-            default_rate="100%", default_pitch="0%", aws_profile="", region="us-east-1",
+            global_enabled=False,
+            auto_speak=False,
+            default_voice="Joanna",
+            default_engine="neural",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="us-east-1",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         # Write a config file so PUT can persist
@@ -71,13 +120,60 @@ class TestVoiceConfig:
             assert mock_vc.global_enabled is True
 
     @pytest.mark.asyncio
+    async def test_put_config_updates_auto_speak_independently_of_enabled(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression test: PUT {"autoSpeak": ...} used to flip `global_enabled`
+        # (the primary voice switch) instead of the dedicated `auto_speak` field —
+        # so unchecking "Auto-speak responses" in Settings silently disabled
+        # voice entirely, including the manual speak button.
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(
+            global_enabled=True,
+            auto_speak=True,
+            provider="piper",
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            piper_binary="",
+            piper_model="",
+            piper_model_config="",
+            piper_length_scale=1.0,
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({}))
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.config_path", lambda: cfg_path)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.put("/api/voice/config", json={"autoSpeak": False})
+            assert resp.status == 200
+            assert mock_vc.auto_speak is False
+            # Turning auto-speak off must NOT also disable voice globally.
+            assert mock_vc.global_enabled is True
+        persisted = json.loads(cfg_path.read_text(encoding="utf-8"))["voice_reply"]
+        assert persisted["auto_speak"] is False
+
+    @pytest.mark.asyncio
     async def test_get_config_exposes_provider_and_piper(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
-            global_enabled=True, provider="piper", default_voice="Ruth",
-            default_engine="generative", default_rate="100%", default_pitch="0%",
-            aws_profile="", region="", piper_binary="/usr/bin/piper",
-            piper_model="~/m.onnx", piper_model_config="", piper_length_scale=1.0,
+            global_enabled=True,
+            auto_speak=False,
+            provider="piper",
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            piper_binary="/usr/bin/piper",
+            piper_model="~/m.onnx",
+            piper_model_config="",
+            piper_length_scale=1.0,
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         state = _make_state(tmp_path)
@@ -94,10 +190,19 @@ class TestVoiceConfig:
     async def test_put_config_updates_provider_and_piper(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
-            global_enabled=False, provider="polly", default_voice="Joanna",
-            default_engine="neural", default_rate="100%", default_pitch="0%",
-            aws_profile="", region="", piper_binary="", piper_model="",
-            piper_model_config="", piper_length_scale=1.0,
+            global_enabled=False,
+            auto_speak=False,
+            provider="polly",
+            default_voice="Joanna",
+            default_engine="neural",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            piper_binary="",
+            piper_model="",
+            piper_model_config="",
+            piper_length_scale=1.0,
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -105,10 +210,14 @@ class TestVoiceConfig:
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice.config_path", lambda: cfg_path)
         state = _make_state(tmp_path)
         async with TestClient(TestServer(_make_voice_app(state))) as client:
-            resp = await client.put("/api/voice/config", json={
-                "provider": "piper", "piper_model": " ~/voices/en.onnx ",
-                "piper_length_scale": 1.5,
-            })
+            resp = await client.put(
+                "/api/voice/config",
+                json={
+                    "provider": "piper",
+                    "piper_model": " ~/voices/en.onnx ",
+                    "piper_length_scale": 1.5,
+                },
+            )
             assert resp.status == 200
             assert mock_vc.provider == "piper"
             assert mock_vc.piper_model == "~/voices/en.onnx"  # stripped
@@ -143,10 +252,19 @@ class TestVoiceConfig:
     async def test_put_config_rejects_invalid_provider(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
-            global_enabled=False, provider="piper", default_voice="Ruth",
-            default_engine="generative", default_rate="100%", default_pitch="0%",
-            aws_profile="", region="", piper_binary="", piper_model="",
-            piper_model_config="", piper_length_scale=1.0,
+            global_enabled=False,
+            auto_speak=False,
+            provider="piper",
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            piper_binary="",
+            piper_model="",
+            piper_model_config="",
+            piper_length_scale=1.0,
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -166,10 +284,19 @@ class TestVoiceConfig:
         # The provider check above was already guarded; engine was missed.
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
-            global_enabled=False, provider="piper", default_voice="Ruth",
-            default_engine="generative", default_rate="100%", default_pitch="0%",
-            aws_profile="", region="", piper_binary="", piper_model="",
-            piper_model_config="", piper_length_scale=1.0,
+            global_enabled=False,
+            auto_speak=False,
+            provider="piper",
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            piper_binary="",
+            piper_model="",
+            piper_model_config="",
+            piper_length_scale=1.0,
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -187,10 +314,19 @@ class TestVoiceConfig:
     async def test_put_config_ignores_invalid_length_scale(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
-            global_enabled=False, provider="piper", default_voice="Ruth",
-            default_engine="generative", default_rate="100%", default_pitch="0%",
-            aws_profile="", region="", piper_binary="", piper_model="",
-            piper_model_config="", piper_length_scale=1.0,
+            global_enabled=False,
+            auto_speak=False,
+            provider="piper",
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            piper_binary="",
+            piper_model="",
+            piper_model_config="",
+            piper_length_scale=1.0,
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -214,10 +350,19 @@ class TestVoiceConfig:
         # unhashable JSON value (list/dict); the isinstance(str) guard prevents it.
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
-            global_enabled=False, provider="piper", default_voice="Ruth",
-            default_engine="generative", default_rate="100%", default_pitch="0%",
-            aws_profile="", region="", piper_binary="", piper_model="",
-            piper_model_config="", piper_length_scale=1.0,
+            global_enabled=False,
+            auto_speak=False,
+            provider="piper",
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            piper_binary="",
+            piper_model="",
+            piper_model_config="",
+            piper_length_scale=1.0,
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
@@ -231,30 +376,44 @@ class TestVoiceConfig:
 
     @pytest.mark.asyncio
     async def test_put_config_preserves_unmanaged_voice_reply_keys(self, tmp_path, monkeypatch):
-        # The PUT persists a fixed key set but the loader also reads auto_speak /
+        # The PUT persists a fixed key set but the loader also reads
         # auto_reply_to_voice from voice_reply — a wholesale rewrite would drop
-        # them. Merge must preserve keys this handler doesn't manage.
+        # it. Merge must preserve keys this handler doesn't manage.
+        # (auto_speak IS managed by this handler — see
+        # test_put_config_updates_auto_speak_independently_of_enabled — so it's
+        # written from the live `_vc.auto_speak`, not merely carried over.)
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         mock_vc = MagicMock(
-            global_enabled=True, provider="polly", default_voice="Joanna",
-            default_engine="neural", default_rate="100%", default_pitch="0%",
-            aws_profile="", region="", piper_binary="", piper_model="",
-            piper_model_config="", piper_length_scale=1.0,
+            global_enabled=True,
+            auto_speak=True,
+            provider="polly",
+            default_voice="Joanna",
+            default_engine="neural",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            piper_binary="",
+            piper_model="",
+            piper_model_config="",
+            piper_length_scale=1.0,
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
         cfg_path = tmp_path / "config.json"
-        cfg_path.write_text(json.dumps({
-            "voice_reply": {"enabled": True, "auto_reply_to_voice": False, "auto_speak": True}
-        }))
+        cfg_path.write_text(
+            json.dumps(
+                {"voice_reply": {"enabled": True, "auto_reply_to_voice": False, "auto_speak": True}}
+            )
+        )
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice.config_path", lambda: cfg_path)
         state = _make_state(tmp_path)
         async with TestClient(TestServer(_make_voice_app(state))) as client:
             resp = await client.put("/api/voice/config", json={"voice": "Matthew"})
             assert resp.status == 200
         persisted = json.loads(cfg_path.read_text(encoding="utf-8"))["voice_reply"]
-        assert persisted["voice_id"] == "Matthew"       # updated
+        assert persisted["voice_id"] == "Matthew"  # updated
         assert persisted["auto_reply_to_voice"] is False  # preserved (not dropped)
-        assert persisted["auto_speak"] is True            # preserved
+        assert persisted["auto_speak"] is True  # written from _vc.auto_speak
 
     @pytest.mark.asyncio
     async def test_synthesize_routes_piper_through_nonstreaming(self, tmp_path, monkeypatch):
@@ -344,6 +503,127 @@ class TestVoiceSynthesize:
             assert data["ok"] is True
             assert data["chunks"] == 1
         state.broadcast_ws.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_the_piper_clip_is_read_off_the_event_loop(self, tmp_path, monkeypatch):
+        """AUTOSDE `no-blocking-call-on-event-loop`, Piper path.
+
+        Piper returns an UNCOMPRESSED wav whose size scales with the length of
+        the reply, and this handler reads it whole before base64-ing it. The
+        gateway runs every session on one loop, so a synchronous read here
+        stalls every other chat turn — and the liveness heartbeat — for as long
+        as the transfer takes.
+
+        The probe is the read itself: `open` is wrapped for this one path and
+        records the thread it was called on. Comparing that against the thread
+        running this coroutine is exact — no sleeping, no timing threshold.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(
+            provider="piper", default_voice="Ruth", default_engine="generative",
+            default_rate="100%", default_pitch="0%", aws_profile="", region="",
+            piper_binary="", piper_model="~/m.onnx", piper_model_config="",
+            piper_length_scale=1.0,
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+
+        wav = tmp_path / "out.wav"
+        wav.write_bytes(b"RIFF....WAVEfake-audio-bytes")
+
+        async def _fake_synth(text, **kw):
+            return str(wav)
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.synthesize_speech", _fake_synth)
+
+        loop_thread = threading.get_ident()
+        read_threads: list[int] = []
+        real_open = builtins.open
+
+        def _watch_open(file, *args, **kwargs):
+            # Delegate everything; only the clip's own read is recorded, so
+            # nothing else in the request path is disturbed.
+            if str(file) == str(wav):
+                read_threads.append(threading.get_ident())
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", _watch_open)
+
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.post("/api/voice/synthesize", json={"text": "hello", "slot": "s1"})
+            assert resp.status == 200
+
+        assert read_threads, "the clip was never read — the probe did not fire"
+        assert loop_thread not in read_threads, (
+            "the synthesized clip was read on the gateway event loop "
+            f"(thread {loop_thread}); every other session blocks for the "
+            "length of that read"
+        )
+        # Positive control in the same test: the audio still reaches the client,
+        # so the assertion above is about WHERE the read happened, not about a
+        # read that silently stopped happening.
+        payloads = [c.args[1] for c in state.broadcast_ws.call_args_list]
+        assert any(p.get("audio") for p in payloads)
+
+    @pytest.mark.asyncio
+    async def test_the_polly_chunks_are_written_and_read_off_the_event_loop(
+        self, tmp_path, monkeypatch
+    ):
+        """Same rule, streaming path — and it is the worse of the two.
+
+        The chunk spill runs once per SENTENCE inside the streaming loop, so a
+        long reply blocks the loop repeatedly, and the stitched mp3 is then read
+        whole on top of that.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(
+            provider="polly", default_voice="Joanna", default_engine="neural",
+            default_rate="100%", default_pitch="0%", aws_profile="", region="us-east-1",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+
+        async def _mock_stream(*a, **kw):
+            yield 0, "Hello", b"\x00\x01\x02"
+            yield 1, "Again", b"\x03\x04\x05"
+
+        final = tmp_path / "final.mp3"
+        final.write_bytes(b"ID3stitched-audio")
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.streaming_voice_reply", _mock_stream)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.stitch_mp3s", AsyncMock(return_value=str(final))
+        )
+
+        loop_thread = threading.get_ident()
+        audio_io_threads: list[int] = []
+        real_open = builtins.open
+
+        def _watch_open(file, *args, **kwargs):
+            # Both the per-sentence chunk spill and the stitched read are `.mp3`;
+            # the chunk path is chosen by mkstemp, so match on the suffix rather
+            # than on a path the test cannot know in advance.
+            if str(file).endswith(".mp3"):
+                audio_io_threads.append(threading.get_ident())
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", _watch_open)
+
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.post("/api/voice/synthesize", json={"text": "Hello. Again.", "slot": "s1"})
+            assert resp.status == 200
+            assert (await resp.json())["chunks"] == 2
+
+        # Two chunk writes plus the stitched read: the probe must have seen all
+        # three, otherwise "not on the loop" would be vacuously true.
+        assert len(audio_io_threads) == 3, (
+            f"expected 2 chunk writes + 1 stitched read, saw {len(audio_io_threads)}"
+        )
+        assert loop_thread not in audio_io_threads, (
+            "synthesized audio was written or read on the gateway event loop "
+            f"(thread {loop_thread})"
+        )
 
     @pytest.mark.asyncio
     async def test_synthesize_exception_returns_500_and_broadcasts_error(self, tmp_path, monkeypatch):

@@ -1068,11 +1068,16 @@ describe('sendChat theme consent', () => {
 /* ─────────────── 3. the non-trivial method implementations ─────────────── */
 
 describe('revealPath', () => {
-  it('copies the path when the host is headless and cannot reveal it', async () => {
+  // The transport is side-effect-free: it posts the action and returns the wire
+  // shape. When the host is headless it hands back a `copy` path for the caller
+  // (`revealOrOpen`) to write — `api.revealPath` itself never touches the
+  // clipboard, so the degrade lives in exactly one place.
+  it('returns the copy path when the host is headless and cannot reveal it', async () => {
     fetchMock.mockResolvedValue(okJson({ copy: '/home/u/report.zip' }))
-    await api.revealPath('/home/u/report.zip')
+    const r = await api.revealPath('/home/u/report.zip')
     expect(call().body).toEqual({ path: '/home/u/report.zip', action: 'reveal' })
-    expect(vi.mocked(copyToClipboard)).toHaveBeenCalledWith('/home/u/report.zip')
+    expect(r).toMatchObject({ copy: '/home/u/report.zip' })
+    expect(vi.mocked(copyToClipboard)).not.toHaveBeenCalled()
   })
 
   it('does not touch the clipboard when the OS handled it', async () => {
@@ -1360,7 +1365,9 @@ describe('publishToProvider', () => {
 describe('every api method issues one well-formed /api request', () => {
   // Exercised individually above with the fixtures they need (a Blob, a
   // ReadableStream, a File list, an object-URL download).
-  const HAND_TESTED = new Set(['sttTranscribe', 'uploadFiles', 'installFromRegistryStream', 'exportPlanYaml'])
+  // `skills` joins them because it wraps the fetch in a deadline, so it USES the
+  // signal argument rather than forwarding it; junk there is not a URL question.
+  const HAND_TESTED = new Set(['sttTranscribe', 'uploadFiles', 'installFromRegistryStream', 'exportPlanYaml', 'skills'])
 
   type AnyFn = (...args: unknown[]) => unknown
   const methods = Object.entries(api as unknown as Record<string, AnyFn>)

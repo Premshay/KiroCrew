@@ -25,12 +25,36 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from kiro_crew import platform_compat, security, webhooks
+
+# The xattr ACL-carry policy is shared with atomic_write.atomic_write: both
+# install a fresh inode and must reproduce the source's access controls or
+# refuse. atomic_write is a leaf module (imported here transitively already via
+# platform_compat), so importing these from there keeps one spelling of the
+# policy without a cycle.
+from kiro_crew.atomic_write import (
+    _XATTR_UNSUPPORTED_ERRNOS,
+    _is_access_control_xattr,
+    _should_carry_xattr,
+)
 from kiro_crew.config import paths as _config_paths
 from kiro_crew.platform import current_context, redact_via_context
 from kiro_crew.platform.governance import (
     CU_CLASS_OBSERVE,
     computer_use_action_classes,
     computer_use_action_from_title,
+)
+
+# The bounded, depth-aware target-path walk lives one layer below both this
+# module and governance (see the re-export note where the keystone consumers
+# are defined). Imported here so ``hooks.TARGET_PATH_KEYS`` / ``hooks.TargetPaths``
+# / ``hooks.target_paths`` (and the work caps) stay importable at their historic
+# names; hooks keeps its HARD-DENY reading of ``TargetPaths.truncated``.
+from kiro_crew.platform.tool_paths import (  # noqa: F401  (re-exported for callers)
+    _TARGET_PATH_MAX_NODES,
+    _TARGET_PATH_MAX_PATHS,
+    TARGET_PATH_KEYS,
+    TargetPaths,
+    target_paths,
 )
 from kiro_crew.security import (
     audit_bash_exfiltration,
@@ -39,6 +63,7 @@ from kiro_crew.security import (
     is_sensitive_write_path,
 )
 from kiro_crew.sel import sel
+from kiro_crew.session_directive import CORE_MCP_SERVER
 from kiro_crew.validation import _bounded_pattern_search
 
 logger = logging.getLogger(__name__)
@@ -381,6 +406,48 @@ class HooksConfig:
         }
 
 
+# ── Spawn auto-approve identity ──
+
+
+def event_is_spawn_run(event: object) -> bool:
+    """True when a permission event is genuinely the ``spawn_run`` MCP tool.
+
+    The ``auto_approve_subagent_spawn`` rung must key on canonical,
+    NON-model-authored identity: ``event.title`` is LLM-authored prose (for
+    shell tools ``select_tool_title`` even prefers the model's description),
+    so ANY event whose title is forged to ``spawn_run`` — a shell command, a
+    re-titled ``send_file``, anything — must never satisfy this rung.
+
+    Canonical identity only, deny-by-default: ``event.tool_name`` (from
+    ``_meta.kiro``, never model-authored) must be ``spawn_run``, carry the
+    ``mcp_identity_trusted`` provenance flag (non-emptiness alone is not
+    proof of provenance; a future inline population path must fail closed),
+    and be served by the crew's own MCP server (``CORE_MCP_SERVER``), so a
+    foreign server or a built-in that merely NAMES a tool ``spawn_run``
+    cannot ride the rung.
+
+    The title must ALSO read ``spawn_run``. Not as identity — the title is
+    forgeable and never sufficient — but because the channel PreToolUse gate
+    (``build_tool_gate``) keys deny rules on the title: a genuine spawn whose
+    display title was rephrased must fall to the approval ladder rather than
+    let this rung approve past a title-keyed deny that would otherwise have
+    fired. This exactly preserves the rung's pre-fix approval surface (title
+    ``spawn_run``), minus the forgeries.
+
+    There is deliberately NO title fallback: on a backend that does not emit
+    ``_meta.kiro`` (or on the correlated provenance-cache miss) the rung
+    simply does not fire and the request falls to the channel's normal
+    approval ladder (session trust / YOLO / interactive) — a downgrade,
+    never a hard block.
+    """
+    return (
+        (getattr(event, "title", "") or "") == "spawn_run"
+        and (getattr(event, "tool_name", "") or "") == "spawn_run"
+        and bool(getattr(event, "mcp_identity_trusted", False))
+        and (getattr(event, "mcp_server_name", "") or "") == CORE_MCP_SERVER
+    )
+
+
 # ── HookManager ──
 
 
@@ -596,7 +663,18 @@ class HookManager:
         # a write to ~/.ssh under that key was never gated and the human was asked
         # to approve a path the keystone should have refused outright.
         if raw_params:
-            for real_path in target_paths(raw_params):
+            real_paths = target_paths(raw_params)
+            if real_paths.truncated:
+                # The walk hit its work cap, so the list may be INCOMPLETE. A
+                # partial scan must not be trusted as a full one — deny, same
+                # deny-by-default shape as the unrecoverable shell command
+                # above. No legitimate tool call carries hundreds of target
+                # paths, so this refuses only attacker-shaped payloads.
+                return ToolHookResult.deny(
+                    "Blocked: tool arguments too large to verify for sensitive "
+                    "paths (deny-by-default)"
+                )
+            for real_path in real_paths:
                 if is_sensitive_path(real_path):
                     return ToolHookResult.deny(f"Blocked: access to sensitive path: {real_path}")
         # Config files are WRITE-protected (reads stay allowed): block the agent's
@@ -1462,36 +1540,18 @@ _RECURSIVE_SEARCH_OPERATIONS: frozenset[str] = frozenset(
 # number and needs no such treatment.
 _SEARCH_PATH_FIELD = "path"
 
-#: EVERY argument name a tool may carry its target file path under. Public because
-#: it is shared with the consent prompt in ``cli_chat``: a prompt that disclosed a
-#: path the gate did not inspect would let the two disagree about what the target
-#: is, and the surface asking a human would be reading the weaker field. One tuple
-#: is what makes that parity structural instead of a comment claiming it.
-#:
-#: The camel-case spelling is not hypothetical -- ``_SEARCH_DENY_ARG_KEYS`` has
-#: accepted it for the search plane all along, while the sensitive-path keystone
-#: below read only the two snake_case forms.
-TARGET_PATH_KEYS: tuple[str, ...] = ("path", "file_path", "filePath")
-
-
-def target_paths(raw_params: Mapping | None) -> list[str]:
-    """Every non-empty string path in *raw_params*, under any accepted spelling.
-
-    Returns ALL of them rather than the first match, and callers deny if ANY is
-    forbidden. That is deliberately different from "normalize the aliases onto one
-    key and reject conflicts": a conflict rule has to decide which spelling wins,
-    and picking wrong is how a sensitive path slips past. Checking every value
-    present cannot be gamed by adding a second, innocent-looking alias, and needs
-    no adjudication.
-    """
-    if not isinstance(raw_params, Mapping):
-        return []
-    found: list[str] = []
-    for key in TARGET_PATH_KEYS:
-        value = raw_params.get(key)
-        if isinstance(value, str) and value.strip() and value not in found:
-            found.append(value)
-    return found
+# The sensitive-path keystone's target extraction — ``TARGET_PATH_KEYS``, the
+# ``_TARGET_PATH_MAX_PATHS`` / ``_TARGET_PATH_MAX_NODES`` work caps, the
+# ``TargetPaths`` list-subclass carrying ``truncated``, and the bounded,
+# depth-aware ``target_paths`` walk — now live in
+# ``kiro_crew.platform.tool_paths`` (imported at module top) so the governance
+# intersection plane can share the SAME traversal. governance cannot import
+# hooks — hooks imports governance — so the walk moved DOWN a layer that both
+# import. The names are re-exported from ``hooks`` (see the top-level import)
+# unchanged so the keystone consumers below and any caller that imports them
+# from ``hooks`` keep working. hooks still applies HARD-DENY semantics to
+# ``truncated`` (deny an unverifiable scan); governance applies its own
+# permit-by-default policy to the same flag.
 
 
 # The SCOPE-bearing arguments of a file search as ``(canonical, accepted spellings)``,
@@ -1798,6 +1858,62 @@ def is_unc_shape(raw: str) -> bool:
     return len(raw) >= 2 and raw[0] in "\\/" and raw[1] in "\\/"
 
 
+_unc_agents_root_cache: tuple[tuple[object, ...], Path | None] | None = None
+
+
+def _unc_agents_root() -> Path | None:
+    """The kiro agents dir as a UNC-gate trusted root, memoized per configuration.
+
+    ``kiro_agents_dir()`` resolves ``KIRO_HOME`` (``Path.resolve()`` --
+    filesystem I/O, and on a UNC-shaped override an SMB touch), so consulting
+    it per gate check would put blocking I/O -- and exactly the network access
+    this gate promises not to make -- on every validation, including async
+    callers (review finding on #6728). Memoized on the RAW ``KIRO_HOME`` env
+    value plus the accessor and override-hook identities, so the resolution
+    runs once per configuration and a monkeypatched or hot-swapped accessor
+    invalidates naturally. Mirrors how ``data_home()`` keeps its own hot path
+    cheap.
+
+    A computation failure memoizes ``None`` (root absent, gate stays total):
+    deterministic-per-configuration beats self-healing here, because the
+    failure mode being avoided is a per-call resolve that can block on an SMB
+    timeout, and the degraded state -- UNC agent specs refused -- is exactly
+    the pre-#6721 status quo. Recovery is an env change or process restart.
+    Benign write race under threads: last-writer-wins on an idempotent value.
+    """
+    global _unc_agents_root_cache
+    key: tuple[object, ...] = (
+        os.environ.get("KIRO_HOME"),
+        _config_paths.kiro_agents_dir,
+        getattr(_config_paths, "_agents_dir_override", None),
+    )
+    cached = _unc_agents_root_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        # Same admission basis as data_home(): the gateway itself writes the
+        # managed agent specs here. The PROJECT-level agents dir is
+        # deliberately NOT admitted -- an arbitrary project directory is not
+        # gateway-written, so admitting it would widen the trust boundary.
+        root: Path | None = _config_paths.kiro_agents_dir()
+    except (ValueError, OSError, RuntimeError):
+        # A broken home resolution must not take the gate down with it: the
+        # two always-computable roots still apply and the function stays
+        # total (True/False, never a propagated error).
+        root = None
+    _unc_agents_root_cache = (key, root)
+    return root
+
+
+# Prime the memo at import time (review finding, #6728 round 3): without this
+# the FIRST gate check after process start -- or after a ``KIRO_HOME`` change --
+# still pays the resolving accessor on whatever thread asked, which on an async
+# validation path is the event loop. Import of this module happens at process
+# start, off the loop, so the one resolution per configuration lands there.
+# Best-effort: a failure here memoizes root-absent exactly as a lazy miss would.
+_unc_agents_root()
+
+
 def unc_probe_allowed(raw: str) -> bool:
     """Whether a UNC-shaped path may touch the filesystem on Windows.
 
@@ -1805,18 +1921,27 @@ def unc_probe_allowed(raw: str) -> bool:
     (``\\\\evil\\share\\x.png`` or ``//evil/share/x.png`` echoed in any message
     or query) makes Windows open an SMB connection to that host -- an outbound
     credential probe the attacker controls. Filesystem access is therefore
-    restricted to UNC paths under directories this gateway itself writes
-    attachments to: the data home (on a roaming profile the home directory is
-    itself a UNC share, the one legitimate source of UNC attachment paths) and
-    the temp directory (channel-side image staging). The comparison is purely
-    lexical (``normpath``/``normcase``), so this check never touches the
-    network itself.
+    restricted to UNC paths under directories this gateway itself writes to:
+    the data home (on a roaming profile the home directory is itself a UNC
+    share, the one legitimate source of UNC attachment paths), the temp
+    directory (channel-side image staging), and the kiro agents directory
+    (``apps.bridges._register_agents`` and ``agent.rebuild_agent_config``
+    write the managed specs there -- see ``kiro_agents_dir()``'s docstring;
+    on a roaming profile it sits on the same UNC share as the data home, and
+    without it every user-level agent spec read was silently refused, #6721).
+    The comparison is purely lexical (``normpath``/``normcase``) and the
+    agents root is memoized per configuration (see ``_unc_agents_root``), so
+    this check never touches the network itself.
     """
     try:
         cand = os.path.normcase(os.path.normpath(raw))
     except (ValueError, OSError):
         return False
-    for root in (_config_paths.data_home(), Path(tempfile.gettempdir())):
+    roots: tuple[Path, ...] = (_config_paths.data_home(), Path(tempfile.gettempdir()))
+    agents_root = _unc_agents_root()
+    if agents_root is not None:
+        roots += (agents_root,)
+    for root in roots:
         rootn = os.path.normcase(os.path.normpath(str(root)))
         if not is_unc_shape(rootn):
             continue
@@ -1860,7 +1985,11 @@ def safe_read_file(path: str) -> str:
     """
     resolved = os.path.realpath(os.path.expanduser(path))
     if is_sensitive_path(resolved):
-        raise PermissionError(f"Blocked: access to sensitive path: {resolved}")
+        # {resolved!r}, not {resolved}: the resolved target is caller/attacker
+        # influenced (a symlink target is chosen by whoever wrote the link) and
+        # this text reaches log records via ``exc_info`` — a raw newline in it
+        # would forge a second record.
+        raise PermissionError(f"Blocked: access to sensitive path: {resolved!r}")
     try:
         fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
@@ -1868,7 +1997,7 @@ def safe_read_file(path: str) -> str:
         # swap of the final component into a symlink — refuse it. Any other
         # OSError (ENOENT, EACCES) is a normal read error; re-raise as-is.
         if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", -1)):
-            raise PermissionError(f"Blocked: refusing to follow symlink at {resolved}") from exc
+            raise PermissionError(f"Blocked: refusing to follow symlink at {resolved!r}") from exc
         raise
     with os.fdopen(fd, "r", encoding="utf-8") as fh:
         return fh.read()
@@ -1939,7 +2068,7 @@ def safe_read_file_bytes_with_identity(
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
         if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", -1)):
-            raise PermissionError(f"Blocked: refusing to follow symlink at {path}") from exc
+            raise PermissionError(f"Blocked: refusing to follow symlink at {path!r}") from exc
         return None
     try:
         st = os.fstat(fd)
@@ -2047,8 +2176,9 @@ def safe_read_file_bytes_nolink(
     ``st_nlink > 1`` or a non-regular file type is rejected.
 
     When ``within_root`` is given, the OPENED descriptor's real path
-    (via ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS) must resolve
-    inside that root and must not be sensitive. ``O_NOFOLLOW`` only guards the
+    (via ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS, or
+    ``GetFinalPathNameByHandleW`` on Windows) must resolve inside that root and
+    must not be sensitive. ``O_NOFOLLOW`` only guards the
     FINAL path component — a nested directory swapped for a symlink between
     the tree walk and the open would silently escape the approved tree. The
     fd-path check is pinned to the inode actually opened, so no check-to-use
@@ -2109,28 +2239,6 @@ def safe_read_file_bytes_nolink(
                 os.close(fd)
             except OSError:
                 pass
-
-
-# errnos meaning "this filesystem has no extended attributes", as opposed to "the
-# lookup failed". Only the former is safe to treat as "nothing to carry".
-_XATTR_UNSUPPORTED_ERRNOS = frozenset(
-    e for e in (getattr(errno, n, None) for n in ("ENOTSUP", "EOPNOTSUPP", "ENOSYS"))
-    if e is not None
-)
-
-_ACCESS_CONTROL_XATTR_PREFIXES = (
-    "system.posix_acl_",  # POSIX ACLs: the actual permission set
-    "security.",          # SELinux/SMACK/capabilities labels
-)
-
-
-def _is_access_control_xattr(attr: str) -> bool:
-    """True when losing *attr* would leave the file less protected.
-
-    Only these justify refusing a write. `user.*` is application metadata: worth
-    carrying, not worth failing a save over on a filesystem that cannot store it.
-    """
-    return attr.startswith(_ACCESS_CONTROL_XATTR_PREFIXES)
 
 
 def safe_write_file_nolink(
@@ -2283,10 +2391,18 @@ def safe_write_file_nolink(
     # A filesystem that does not support xattrs at all is NOT an error: there is
     # nothing on the source to lose. Any OTHER failure means we cannot know what
     # we would be dropping, so it refuses.
+    #
+    # `_should_carry_xattr` narrows this to the attributes an inode-replacing
+    # write may reproduce, and it is applied HERE, at the read, so a
+    # privilege-bearing `security.capability` or an integrity signature over the
+    # OLD bytes (`security.ima`/`security.evm`) is never captured to be replayed
+    # onto content the caller supplied. See its allowlist in atomic_write.py.
     src_xattrs: list[tuple[str, bytes]] = []
     if all(hasattr(os, a) for a in ("listxattr", "getxattr", "setxattr")):
         try:
             for _attr in os.listxattr(fd):
+                if not _should_carry_xattr(_attr):
+                    continue
                 src_xattrs.append((_attr, os.getxattr(fd, _attr)))
         except OSError as exc:
             if exc.errno not in _XATTR_UNSUPPORTED_ERRNOS:
@@ -2390,7 +2506,9 @@ def safe_write_file_nolink(
             # a fresh inode starts with none, which silently drops POSIX ACLs
             # (stored as system.posix_acl_access) and any user.* metadata.
             #
-            # Split by what the attribute DOES, rather than one policy for all:
+            # Split by what the attribute DOES, rather than one policy for all.
+            # `src_xattrs` is already narrowed to the carriable allowlist at the
+            # read above, so the split below is only over POSIX ACLs and `user.*`:
             #
             #  * an ACCESS-CONTROL attribute that fails to copy is a security
             #    regression -- the rename would install an inode the owner has
@@ -2886,6 +3004,23 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     # ``status.reconcile_connected_since`` for why that boundary is
     # best-effort rather than fail-closed (stats only, no bytes returned).
     "connections_status.oauth_grant_presence": ".aws/sso/cache/<sha256(mcp_url)>.token.json",
+    # Class 2, same artifacts and same posture again: the premint endpoint
+    # (``dashboard.handlers.connections.api_connections_premint``) reaches the warm
+    # engine's candidate scan, which STATS the paired grant artifacts for every
+    # registry provider to decide which ones still need a URL minted.
+    #
+    # A separate id from the mint's and the status module's, so the trail names the
+    # surface that looked. ONE event per activation rather than one per candidate:
+    # the scan is a single pass whose N answers feed exactly one act decision (spawn
+    # the shared warm process, or do not), so per-candidate events would over-count
+    # one observation and, because this entry point marks its events critical, drain
+    # the queue N times for a single page mount. Audited only when the endpoint ACTS
+    # -- an empty candidate set returns early without spawning, persisting, or
+    # reporting any grant answer, so a page mounted against a fully-authorized
+    # gallery writes nothing. Best-effort rather than fail-closed for the same reason
+    # as the two entries above (stats only, no bytes returned); see
+    # ``api_connections_premint`` for why refusing would be the worse failure.
+    "connections_premint.oauth_grant_presence": ".aws/sso/cache/<sha256(mcp_url)>.token.json",
 }
 
 
@@ -3015,6 +3150,89 @@ def validate_hook_fields(
             re.compile(matcher)
         except re.error as exc:
             raise ValueError(f"invalid regex: {exc}") from None
+
+
+# Env keys a script-hook subprocess may inherit from the gateway. A script hook
+# runs an operator/agent-authored command through ``/bin/sh -c`` (POSIX) or
+# ``cmd /c`` (Windows), so it needs only what the shell and an ordinary command
+# require to run — an interpreter/tool on PATH, HOME, locale, TLS trust, and a
+# proxy — plus the two hook-metadata variables injected below. Inheriting the
+# whole gateway environment (``{**os.environ, ...}``) also handed every hook the
+# gateway's AWS keys, model/provider keys, OAuth tokens, and connection strings,
+# which a hostile or careless command could echo straight back through stdout,
+# stderr, or the audit trail. This is the same strict-allowlist boundary the
+# authenticated ``gh``/``glab`` spawns cross (``_PROVIDER_BASE_ENV_KEYS`` in
+# ``dashboard/handlers/source_providers.py``); a variable a hook genuinely needs
+# is added here by name, never by opening the gate to the whole environment. A
+# key absent from the host environment is simply not forwarded — the allowlist
+# is a filter, not a set of required keys — so a minimal container is unaffected.
+_HOOK_BASE_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        # A hook subprocess sees ONLY these ambient keys (plus the two
+        # KIROCREW_HOOK_* metadata vars). A hook that depended on an ambient var
+        # NOT listed here (e.g. VIRTUAL_ENV, PYTHONPATH, JAVA_HOME, AWS_PROFILE,
+        # nvm/pyenv vars) will fail after upgrade with a "works in my terminal,
+        # fails in the hook" symptom — the fix is to add that key here by name.
+        # This fail-closed direction is deliberate: the allowlist is the
+        # secret-egress boundary, so widening it is a per-key security decision.
+        # Shell / command resolution. PATH is what lets ``/bin/sh -c "python …"``
+        # find the interpreter; the Windows spellings mirror it there.
+        "PATH",
+        "PATHEXT",
+        "COMSPEC",
+        "SYSTEMROOT",
+        # Home / user profile — a hook command that reads or writes under ``~``.
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        # Data home — a hook that invokes the ``kirocrew`` CLI (or otherwise
+        # reads the instance's data dir) must resolve the gateway's overridden
+        # home, not the default ``~/.kiro/crew``. It is a path, not a credential,
+        # so preserving it does not widen the secret-egress boundary this env
+        # allowlist exists to close.
+        "KIROCREW_HOME",
+        # Temp dir — a hook that stages a scratch file.
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        # Locale — so a hook's output encoding matches the host.
+        "LANG",
+        "LC_ALL",
+        # TLS trust may be required by network clients. Proxy URLs are omitted:
+        # HTTP(S)_PROXY commonly embeds userinfo credentials, and script hooks
+        # are an untrusted execution boundary. NO_PROXY carries host patterns,
+        # not credentials, and is safe to preserve.
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "NO_PROXY",
+        "no_proxy",
+    }
+)
+
+
+def _hook_subprocess_env(hook: "ScriptHook", context: str) -> dict[str, str]:
+    """Build the environment a script-hook subprocess runs with.
+
+    A strict allowlist over ``os.environ`` (``_HOOK_BASE_ENV_KEYS``) plus the two
+    hook-metadata variables the hook contract exposes — never a copy of the whole
+    gateway environment, which would leak the gateway's credentials to every hook
+    command (see ``_HOOK_BASE_ENV_KEYS``). The metadata variables are set LAST so
+    a same-named ambient variable can never shadow them.
+
+    ``KIROCREW_HOOK_CONTEXT`` is capped for a Stop event only: the env var is
+    bounded by ARG_MAX (~32K on Windows), and a multi-KB Stop segment there can
+    fail subprocess creation. The full context still reaches the hook via the
+    stdin JSON payload (``Stop -> hook_event["assistant_text"]``) and drove
+    matcher evaluation, so the cap loses nothing the hook cannot recover.
+    """
+    env = {k: v for k, v in os.environ.items() if k in _HOOK_BASE_ENV_KEYS}
+    env["KIROCREW_HOOK_EVENT"] = hook.event
+    env["KIROCREW_HOOK_CONTEXT"] = context[:500] if hook.event == HOOK_EVENT_STOP else context
+    return env
 
 
 @dataclass
@@ -3320,18 +3538,17 @@ async def run_script_hook(
 
     try:
         # circular import: sandbox → registry → apps → hooks, so import at call time
-        from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
+        from kiro_crew.sandbox import (
+            create_subprocess_limited,
+            sandboxed_spawn_argv,
+            sandboxed_spawn_argv_async,
+        )
 
-        # The env var is bounded by ARG_MAX — a multi-KB Stop segment there can
-        # fail subprocess creation (~32K on Windows). Cap the ENV copy only; the
-        # full context still reaches the hook via the stdin JSON payload
-        # (Stop -> hook_event["assistant_text"]) and drove matcher evaluation.
-        env_context = context[:500] if hook.event == HOOK_EVENT_STOP else context
-        env = {
-            **os.environ,
-            "KIROCREW_HOOK_EVENT": hook.event,
-            "KIROCREW_HOOK_CONTEXT": env_context,
-        }
+        # A script hook inherits only the minimum env its shell + command need
+        # (``_HOOK_BASE_ENV_KEYS``) plus the two hook-metadata variables — NOT a
+        # copy of the whole gateway environment, which would expose the gateway's
+        # AWS/model/OAuth/connection-string credentials to every hook command.
+        env = _hook_subprocess_env(hook, context)
         # Shell per platform: POSIX /bin/sh -c, Windows cmd /c (no /bin/sh there).
         # The argv is what the sandbox/cgroup chokepoints below vet, on BOTH
         # platforms — only the eventual spawn form differs (see the Windows
@@ -3340,8 +3557,16 @@ async def run_script_hook(
             argv = ["cmd", "/c", hook.command]
         else:
             argv = ["/bin/sh", "-c", hook.command]
-        wrapped_argv, cleanup_path = wrap_argv(argv)
-        wrapped_argv = cgroup_scope_argv(wrapped_argv)  # cgroup DoS ceiling
+        # Route argv and the strict hook allowlist through the shared spawn
+        # funnel. Besides filesystem isolation and cgroup limits, this lets an
+        # outer systemd-run wrapper receive its user-bus locators while inserting
+        # an inner `env -u` shim that removes them before the hook command execs.
+        # Calling wrap_argv + cgroup_scope_argv directly would give the wrapper
+        # the child-safe allowlist and make it fail before a PreToolUse policy
+        # hook could run.
+        wrapped_argv, env, cleanup_path = await sandboxed_spawn_argv_async(
+            argv, env=env, _prepare=sandboxed_spawn_argv
+        )
         # Process-group isolation for clean tree-kill on timeout. Pass both flags
         # explicitly (NOT **dict unpack — breaks mypy's Popen overload resolution
         # on the build fleet): start_new_session=True is a no-op on Windows,
@@ -3400,15 +3625,19 @@ async def run_script_hook(
                     pass
         elapsed = int((time.monotonic() - start) * 1000)
         exit_code = proc.returncode or 0
+        # Decode with the upstream byte cap (#5442) so redaction never sees an
+        # unbounded string, THEN redact the full capped streams through the
+        # canonical companion-aware shim before any truncation or return
+        # (#5441). Both fields are returned by the test API, and stdout can also
+        # become model context for prompt/spawn hooks; redacting the capped text
+        # first prevents a credential that straddles a presentation boundary
+        # (e.g. the 500-char stderr cut for last_error, #4708) from leaking as
+        # an unredacted fragment.
         stdout_text = _decode_capped(stdout_b, stdout_trunc).strip()
         stderr_text = _decode_capped(stderr_b, stderr_trunc).strip()
-        # Redact the FULL (capped) stderr through the canonical companion-aware
-        # shim before truncating, so a credential straddling the 500-char
-        # boundary cannot leak as an unredacted fragment. The field surfaces on
-        # the dashboard and must not expose secrets (#4708). Memory is already
-        # bounded upstream by the byte cap (#5442), so redaction never sees an
-        # unbounded string.
-        stderr_safe = redact_via_context(stderr_text)[:500] if stderr_text else ""
+        stdout_safe = redact_via_context(stdout_text) if stdout_text else ""
+        stderr_safe_full = redact_via_context(stderr_text) if stderr_text else ""
+        stderr_safe = stderr_safe_full[:500]
         hook.last_run = time.time()
         if exit_code == 2:
             hook.last_status = "blocked"
@@ -3424,8 +3653,8 @@ async def run_script_hook(
             hook_id=hook.id,
             hook_name=hook.name,
             event=hook.event,
-            stdout=stdout_text,
-            stderr=stderr_text,
+            stdout=stdout_safe,
+            stderr=stderr_safe_full,
             exit_code=exit_code,
             duration_ms=elapsed,
         )
@@ -3465,15 +3694,16 @@ async def run_script_hook(
         )
     except Exception as exc:
         elapsed = int((time.monotonic() - start) * 1000)
+        safe_error = redact_via_context(str(exc))
         hook.last_run = time.time()
         hook.last_status = "error"
-        hook.last_error = str(exc)[:500]
+        hook.last_error = safe_error[:500]
         hook.run_count += 1
         return ScriptHookResult(
             hook_id=hook.id,
             hook_name=hook.name,
             event=hook.event,
-            error=str(exc),
+            error=safe_error,
             duration_ms=elapsed,
         )
 

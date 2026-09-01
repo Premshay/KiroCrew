@@ -5,6 +5,15 @@ import MarkdownRenderer, { Lightbox, dispatchLightbox, isPathCandidate, splitLin
 import { __resetPathKindCache } from '../hooks/usePathKind'
 import { api } from '../api/client'
 
+// The chip's reveal hint is now gated on branding.directLocal: a remote session
+// degrades shift+click to a clipboard copy, so revealHintFor only promises
+// Finder/Explorer/file-manager on a direct-local gateway. The platform-aware
+// hint assertions below therefore mount against a local session; the remote
+// (directLocal:false) copy wording is pinned in MarkdownRenderer.contextmenu.test.tsx.
+vi.mock('../hooks/useBranding', () => ({
+  useBranding: () => ({ botName: 'Test', avatar: '', directLocal: true }),
+}))
+
 type LightboxDetail = { images: { src: string; alt: string }[]; index: number }
 
 describe('MarkdownRenderer list indentation', () => {
@@ -199,6 +208,45 @@ describe('isPathCandidate — path chip pre-filter', () => {
   it('accepts a bare relative path when the last segment has an extension', () => {
     expect(isPathCandidate('src/main.py')).toBe(true)
     expect(isPathCandidate('website/src/components/MarkdownRenderer.tsx')).toBe(true)
+  })
+
+  it('accepts Unicode segments in rooted, home-relative and explicitly relative paths', () => {
+    // Filenames are not ASCII-only. Each shape class from the ASCII cases
+    // above must also classify when its segments carry CJK, accented or
+    // Cyrillic letters (issue #6483: \w rejected these before the stat probe).
+    expect(isPathCandidate('/a/b/产品文档-v1.0.md')).toBe(true) // CJK, rooted
+    expect(isPathCandidate('/home/user/notes/café-menü')).toBe(true) // accented, rooted, no extension
+    expect(isPathCandidate('~/документы/отчёт.txt')).toBe(true) // Cyrillic, home-relative
+    expect(isPathCandidate('~/文档/说明')).toBe(true) // CJK terminal segment, no extension
+    expect(isPathCandidate('./docs/仕様書.md')).toBe(true) // CJK, explicitly relative
+    expect(isPathCandidate('../архив/старый-отчёт')).toBe(true) // Cyrillic, parent-relative
+  })
+
+  it('accepts combining marks — NFD-decomposed and mark-requiring scripts', () => {
+    // macOS returns NFD-decomposed filenames (é as e + U+0301), and Indic
+    // scripts need combining marks even under NFC — both are \p{M}, not
+    // \p{L}. Written as escapes so the source encoding cannot renormalize.
+    expect(isPathCandidate('/home/user/notes/cafe\u0301-menu\u0308')).toBe(true)
+    expect(isPathCandidate('~/दस्तावेज़/रिपोर्ट.md')).toBe(true) // Devanagari (virama/matra/nukta)
+  })
+
+  it('accepts a bare relative path whose Unicode basename has an ASCII extension', () => {
+    // The extension positive-signal must not require the whole basename to be
+    // ASCII — only the trailing `.ext` is the signal.
+    expect(isPathCandidate('src/产品文档-v1.0.md')).toBe(true)
+    expect(isPathCandidate('docs/résumé.pdf')).toBe(true)
+  })
+
+  it('still rejects slash-separated Unicode prose with no positive path signal', () => {
+    // Same rule as ASCII `and/or`: a bare two-segment identifier without a
+    // root, explicit-relative prefix, or extension is not a candidate.
+    expect(isPathCandidate('要么这样/要么那样')).toBe(false)
+    expect(isPathCandidate('и/или')).toBe(false)
+    expect(isPathCandidate('entweder/oder')).toBe(false)
+    // Shape-level pin: fullwidth colon U+FF1A is \p{Po}, outside the widened
+    // class, so this is rejected by PATH_SHAPE_RE itself — not by the
+    // extension gate — pinning that Unicode punctuation stays excluded.
+    expect(isPathCandidate('/文档：说明/文件.md')).toBe(false)
   })
 
   it('rejects git refs — the regression that made this gate necessary', () => {
@@ -575,7 +623,7 @@ describe('MarkdownRenderer path chips — activation routing', () => {
 
   it('falls back to reveal-in-OS for a directory when no folder handler is wired', async () => {
     stubKind('dir', false)
-    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue(undefined as never)
+    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({ ok: true } as never)
     const { container } = render(<MarkdownRenderer content={'`/Users/me/ws`'} onFileOpen={vi.fn()} />)
     const chip = await waitFor(() => {
       const c = container.querySelector('code[data-path-kind="dir"]')
@@ -583,13 +631,15 @@ describe('MarkdownRenderer path chips — activation routing', () => {
       return c!
     })
     fireEvent.click(chip)
-    expect(reveal).toHaveBeenCalledWith('/Users/me/ws')
+    // Now routed through the shared `revealOrOpen` helper, which passes the
+    // explicit 'reveal' action to the transport call.
+    expect(reveal).toHaveBeenCalledWith('/Users/me/ws', 'reveal')
   })
 
   it('shift-click reveals instead of opening', async () => {
     stubKind('file', true)
     const onFileOpen = vi.fn()
-    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue(undefined as never)
+    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({ ok: true } as never)
     const { container } = render(
       <MarkdownRenderer content={'`/home/user/a.md`'} onFileOpen={onFileOpen} />,
     )
@@ -599,7 +649,7 @@ describe('MarkdownRenderer path chips — activation routing', () => {
       return c!
     })
     fireEvent.click(chip, { shiftKey: true })
-    expect(reveal).toHaveBeenCalledWith('/home/user/a.md')
+    expect(reveal).toHaveBeenCalledWith('/home/user/a.md', 'reveal')
     expect(onFileOpen).not.toHaveBeenCalled()
   })
 
@@ -865,14 +915,15 @@ describe('MarkdownRenderer path chips — file:line references', () => {
 
   it('shift-click still reveals the file itself, without the line', async () => {
     stubPaths(['/Users/me/src/_dispatch.py'])
-    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue(undefined as never)
+    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({ ok: true } as never)
     const onFileOpen = vi.fn()
     const { container } = render(
       <MarkdownRenderer content={'`/Users/me/src/_dispatch.py:447`'} onFileOpen={onFileOpen} />,
     )
     fireEvent.click(await chipOf(container), { shiftKey: true })
-    // Finder/Explorer selects a file; it has no notion of a line.
-    expect(reveal).toHaveBeenCalledWith('/Users/me/src/_dispatch.py')
+    // Finder/Explorer selects a file; it has no notion of a line. Routed through
+    // the shared helper, which passes the explicit 'reveal' action.
+    expect(reveal).toHaveBeenCalledWith('/Users/me/src/_dispatch.py', 'reveal')
     expect(onFileOpen).not.toHaveBeenCalled()
   })
 
@@ -904,7 +955,7 @@ describe('MarkdownRenderer path chips — forgery resistance', () => {
       Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response),
     ) as unknown as typeof fetch
     const onFileOpen = vi.fn()
-    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue(undefined as never)
+    const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({ ok: true } as never)
     const { container } = render(
       <MarkdownRenderer
         content={'<code data-path-kind="file" data-path="/etc/hosts">totally harmless</code>'}

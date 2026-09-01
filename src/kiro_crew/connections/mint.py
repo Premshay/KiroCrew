@@ -59,6 +59,7 @@ from uuid import uuid4
 # binding.
 from kiro_crew import agent as _agent
 from kiro_crew.acp.client import AcpClient
+from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.agent_files import AGENT_FILENAME, OWNED_KIRO_AGENT_FILES
 from kiro_crew.config.loader import data_home
 from kiro_crew.loop_lock import LoopBoundLock
@@ -104,6 +105,14 @@ class MintState(TypedDict, total=False):
     agent: str  # ephemeral spec name
     spec_path: str  # the exact file this flow wrote, and the only one it deletes
     pid: int  # sweep-protected for as long as the process is held
+    # Set only by the warm table (:mod:`kiro_crew.connections.warm`). A shared row
+    # owns no ``client``: its URL was minted on a process it shares with every
+    # other card, so redeemability is judged by generation AND activation liveness
+    # instead. Declared here because the table itself is shared, and a row type
+    # that cannot describe half its rows pushes every read through a cast.
+    shared: bool
+    generation: int  # the shared process that holds this row's PKCE verifier
+    activation: int  # the session that owns this row's loopback listener
 
 
 _mints: dict[str, MintState] = {}
@@ -351,11 +360,30 @@ def _write_mint_agent_spec(slug: str) -> tuple[str, str]:
     this provider's challenge, all of it on the path the card waits on.
 
     Falls back to the main agent name when ``slug`` has no entry in the main spec
-    yet, so a mint never ends up with FEWER servers than it needs.
+    yet, so a mint never ends up with FEWER servers than it needs. A main spec
+    that exists but is REFUSED by the hardened reader raises ``OSError`` instead:
+    the fallback would hand the refused file to the spawned child to reload.
     """
     agents_dir = _agent.kiro_agents_dir_path()
     alias = mcp_server_alias(slug)
-    entry = (_agent._load_json(agents_dir / AGENT_FILENAME).get("mcpServers") or {}).get(alias)
+    # Hardened reader (#6736). A REFUSED main spec (oversize, sensitive symlink,
+    # non-object) must NOT reach the main-agent fallback: that fallback spawns
+    # ``kiro-cli --agent kirocrew``, and the child would reload the very file the
+    # gateway just refused to read -- uncapped and unguarded. Raising instead
+    # lands in the mint flow's failure path (retryable ``failed`` row, holdings
+    # disposed, no child spawned). The fallback below stays reserved for what it
+    # always meant: the file or the alias entry being genuinely absent.
+    spec = _read_agent_spec(
+        agents_dir / AGENT_FILENAME,
+        operation="connections_mint",
+        source="dashboard",
+    )
+    if spec is None:
+        if (agents_dir / AGENT_FILENAME).exists():
+            logger.warning("Main agent spec unusable; refusing to mint for %r", alias)
+            raise OSError("main agent spec unusable")
+        spec = {}
+    entry = (spec.get("mcpServers") or {}).get(alias)
     if not isinstance(entry, dict):
         logger.debug("No %r entry in the main agent spec; minting with %r", alias, _MAIN_AGENT_NAME)
         return _MAIN_AGENT_NAME, ""
@@ -494,8 +522,8 @@ def _log_mint_outcome(slug: str, outcome: str, detail: str) -> None:
 
     Blocking on FIRST use: the append itself is queued to SEL's writer thread, but
     the first ``sel()`` of a process constructs the log -- trust-dir creation, key
-    validation, a backward scan of the existing log, and on Windows an ``icacls``
-    subprocess. Async callers go through ``asyncio.to_thread``.
+    validation, a backward scan of the existing log, and on Windows the owner-only
+    DACL on the key file. Async callers go through ``asyncio.to_thread``.
     """
     sel().log_api_access(
         caller="dashboard",
@@ -800,7 +828,17 @@ def _agent_spec_entry_missing(slug: str) -> bool:
     through ``asyncio.to_thread``.
     """
     agents_dir = _agent.kiro_agents_dir_path()
-    servers = _agent._load_json(agents_dir / AGENT_FILENAME).get("mcpServers") or {}
+    # Hardened reader (#6736): a refused main spec reads as absent, so the entry
+    # counts as missing -- the same degrade-as-absent direction as before.
+    spec = (
+        _read_agent_spec(
+            agents_dir / AGENT_FILENAME,
+            operation="connections_mint",
+            source="dashboard",
+        )
+        or {}
+    )
+    servers = spec.get("mcpServers") or {}
     return mcp_server_alias(slug) not in servers
 
 

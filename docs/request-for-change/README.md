@@ -18,10 +18,16 @@ were added
 not been re-audited since 2026-08-03. The durable-run-coordinator row was added
 2026-08-22 and the orchestrator-chat-sessions row was re-audited at
 `c4f253891`; the `rfc-token-efficient-monitors` row was added 2026-08-22 and
-verified against `6d3e30bbbd`.
+verified against `6d3e30bbbd`. The `rfc-global-workflow-library` row was added
+2026-08-25 and audited against `749468d42`; its implementation exists only in
+the active detached worktree. The `rfc-agentcore-identity-gateway` row
+was added 2026-08-27. The `rfc-crew-agent-sdk-boundary` row was added 2026-08-28 and verified against `dc88f142b`. The `rfc-transcript-section-markers` row was added 2026-08-30 and verified against `202770d13`.
 
 | Document | Status | What is actually on main |
 |---|---|---|
+| [rfc-transcript-section-markers.md](rfc-transcript-section-markers.md) | `draft` | Nothing. No `section_marker` role exists; every collapse affordance is intra-turn (`CollapsibleToolGroup`, `TurnBlock`, `ToolCallLine`) and nothing collapses rows above a point |
+| [rfc-crew-agent-sdk-boundary.md](rfc-crew-agent-sdk-boundary.md) | `draft` | Nothing. Audited at `dc88f142b`: `providers/base.py:30` still aliases `AcpEvent` as the "provider-agnostic" event type, 68 direct `kiro_crew.acp` import edges remain across 42 files outside `acp/` and `providers/`, and `acp/worker_pool.py:49` still imports back from `session_pid.py` behind a cycle guard. No `agent_sdk` package and no import ratchet exist |
+| [rfc-global-workflow-library.md](rfc-global-workflow-library.md) | `in-progress` | Nothing. The active detached worktree adds the global definition library, local adaptation and lineage, exact `/workflow <name>` invocation, MCP/HTTP contracts, and the Agent Capabilities management surface |
 | [rfc-durable-run-coordinator.md](rfc-durable-run-coordinator.md) | `draft` | Nothing. Design and seven-PR additive migration stack only; the existing in-memory manager and run folders remain authoritative |
 | [rfc-issue-radar-crews.md](rfc-issue-radar-crews.md) | `draft` | Nothing. Design of record only; `crew_brief.md` and `crew_ledger_spec.md` sit beside the Issue Radar backend as companion specs, also unimplemented |
 | [rfc-orchestrator-chat-sessions.md](rfc-orchestrator-chat-sessions.md) | `partial` | Crew Mode shipped in [#1295](https://github.com/kirodotdev/KiroCrew/pull/1295) and has since received store and routing fixes. The implementation deliberately diverges from the RFC in at least three places: no snapshot-generation CAS, no `release` decision action, and immediate per-result delivery instead of burst coalescing |
@@ -50,6 +56,7 @@ verified against `6d3e30bbbd`.
 | [rfc-amend-tenets-everything-is-an-app.md](rfc-amend-tenets-everything-is-an-app.md) | `draft` | Nothing. `TENETS.md` still carries seven tenets on main. `git log --follow` on it shows two commits and no prior amendment, and `grep -i tenet` returns zero hits in `GOVERNANCE.md` |
 | [rfc-crew-projects.md](rfc-crew-projects.md) | `draft` | Nothing. Verified at `5cd92ff99`: no project manifest format exists, `slot.project` is a bare directory path, and `grep -ril "confluence\|servicenow" src/kiro_crew` returns zero hits |
 | [rfc-tool-derived-diff-cards.md](rfc-tool-derived-diff-cards.md) | `in-progress` | Ships with [#5012](https://github.com/kirodotdev/KiroCrew/pull/5012): dashboard diff-card/summary promotion + runtime-selected prompt rule. The messaging `OutputEvent` extension (§3.3) is unstarted |
+| [rfc-agentcore-identity-gateway.md](rfc-agentcore-identity-gateway.md) | `in-progress` | First stack PR lands the `agent_identity` CPP slot, `DefaultAgentIdentityProvider` no-op, `capabilities.agentcore` catalog row, and AWS-free policy validators. No AWS extra, no Gateway inject, no login attach, no Settings UI |
 
 Nothing in this directory is `implemented` or `superseded` today.
 

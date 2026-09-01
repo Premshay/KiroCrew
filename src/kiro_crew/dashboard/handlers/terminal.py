@@ -35,12 +35,10 @@ from kiro_crew.security import (
 if platform_compat.IS_POSIX:
     import fcntl
     import pty as _pty
-    import signal
     import termios
 else:  # pragma: no cover — Windows fallback
     fcntl = None  # type: ignore[assignment]
     _pty = None  # type: ignore[assignment]
-    signal = None  # type: ignore[assignment]
     termios = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
@@ -52,6 +50,10 @@ logger = logging.getLogger(__name__)
 # its own terminals (frontend MAX_TERMINALS_PER_CHAT); this is the server-side
 # backstop. Override via config.json dashboard.terminal.max_sessions.
 _MAX_SESSIONS = 12
+# Bound on a ``{session_id}`` URL path param, applied by BOTH routes that read
+# one. Named rather than repeated because the two call sites drifted while the
+# bound was a bare literal: WS-open enforced it and DELETE did not.
+_MAX_SESSION_ID_LEN = 64
 _ORPHAN_TIMEOUT_S = 900  # 15 min with no WS → reap PTY (grace window for reload/network drops; in-app nav keeps the WS alive)
 _SCROLLBACK_MAX = 50 * 1024  # 50KB ring buffer per session for reconnect replay
 
@@ -60,6 +62,43 @@ def _sel():
     import kiro_crew.dashboard.handlers as _pkg  # circular import: __init__ imports terminal
 
     return _pkg.sel()
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``, tolerating short writes.
+
+    ``os.write`` on a blocking PTY controller fd may accept fewer bytes than requested
+    when the tty input buffer is full: it blocks until *some* space frees, writes
+    what fits, and returns a short count. A single ``os.write`` that discards its
+    return therefore silently truncates a large paste under a backpressured
+    reader. Loop over a ``memoryview`` so partial writes advance without
+    reslicing, until the buffer is fully consumed.
+
+    The loop writes through a private ``os.dup`` of ``fd``, taken before the
+    first write. A concurrent ``_kill_session`` closes the session's descriptor
+    without waiting for in-flight writes, and the kernel may hand that NUMBER
+    to an unrelated ``open()`` — a loop still holding the raw number would then
+    write the paste's remaining bytes into whatever reused it. The dup pins the
+    PTY's file description for the loop's lifetime, so the original can close
+    and be reused freely; once the shell side is gone, writes to the dup raise
+    (``EIO``) instead of landing elsewhere. The race window shrinks back to the
+    single ``dup`` call, no wider than the single-``os.write`` shape this
+    replaced. Teardown still never waits on writers — semantics unchanged.
+
+    Runs inside a single executor call so a multi-KB write does not bounce
+    per-chunk through the event loop. ``OSError`` (a closed fd at the ``dup``,
+    or the PTY torn down mid-loop) propagates to the caller unchanged.
+    """
+    if not data:
+        return
+    dup_fd = os.dup(fd)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(dup_fd, view)
+            view = view[written:]
+    finally:
+        os.close(dup_fd)
 
 
 class _ConptyBackend(Protocol):
@@ -132,6 +171,14 @@ class _TerminalSession:
     # Serializes concurrent WS writes (reader loop + title poller + pong);
     # aiohttp's WebSocket writer is not safe for concurrent sends.
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Serializes WebSocket→PTY writes across handlers. A reconnect attaches a
+    # new WS handler by assignment (``existing.ws = ws``) without waiting for
+    # the previous handler's write loop to exit, so two handlers can hold
+    # in-flight writes for the same PTY at once. Each frame's bytes must land
+    # contiguously — ``_write_all`` may need several ``os.write`` calls when
+    # the tty input buffer backpressures — so the whole frame is written under
+    # this lock.
+    write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def _get_registry(request: web.Request) -> dict[str, _TerminalSession | None]:
@@ -558,7 +605,7 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         return web.Response(status=403, text="Terminal panel disabled")
 
     session_id = request.match_info.get("session_id", "")
-    if not session_id or len(session_id) > 64:
+    if not session_id or len(session_id) > _MAX_SESSION_ID_LEN:
         _sel().log_api_access(
             caller=caller,
             operation="terminal.ws.open",
@@ -893,17 +940,29 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         async for msg in ws:
             if msg.type == web.WSMsgType.BINARY:
                 try:
-                    if sess.winpty is not None:
-                        await asyncio.get_running_loop().run_in_executor(
-                            None, sess.winpty.write, msg.data,
-                        )
-                    else:
-                        await asyncio.get_running_loop().run_in_executor(
-                            None,
-                            os.write,
-                            sess.master_fd,  # wokeignore:rule=master
-                            msg.data,
-                        )
+                    # A reconnect can leave the previous handler's write loop
+                    # draining its socket while this one starts; the lock keeps
+                    # each frame's bytes contiguous on the PTY even when
+                    # _write_all needs several os.write calls to land them.
+                    async with sess.write_lock:
+                        if sess.winpty is not None:
+                            # ConPTY's write buffers the full payload and returns
+                            # len(data) unconditionally (see conpty.WindowsPty.write),
+                            # so there is no short-write count to loop over here.
+                            await asyncio.get_running_loop().run_in_executor(
+                                None, sess.winpty.write, msg.data,
+                            )
+                        else:
+                            # Read the fd once before the offload: a concurrent kill
+                            # sets the fd to -1 before close, so os.write then
+                            # raises OSError and the loop below breaks — matching the
+                            # single-write behavior this replaces.
+                            await asyncio.get_running_loop().run_in_executor(
+                                None,
+                                _write_all,
+                                sess.master_fd,  # wokeignore:rule=master
+                                msg.data,
+                            )
                 except OSError:
                     break
                 # A submitted line may be a `cd`. Drop the completion route's
@@ -1001,7 +1060,7 @@ async def api_terminal_create(request: web.Request) -> web.Response:
             resources=f"max_sessions={max_sessions}",
         )
         return web.json_response(
-            {"error": f"Max {max_sessions} sessions"},
+            {"error": f"Max {max_sessions} sessions", "code": "terminal_max_sessions"},
             status=429,
         )
 
@@ -1072,9 +1131,15 @@ async def api_terminal_redact(request: web.Request) -> web.Response:
         if not isinstance(text, str):
             raise TypeError
     except Exception:
-        return web.json_response({"error": "expected JSON body {text: string}"}, status=400)
+        return web.json_response(
+            {"error": "expected JSON body {text: string}", "code": "terminal_invalid_body"},
+            status=400,
+        )
     if len(text.encode("utf-8", errors="replace")) > _REDACT_MAX_BYTES:
-        return web.json_response({"error": "selection too large"}, status=413)
+        return web.json_response(
+            {"error": "selection too large", "code": "terminal_selection_too_large"},
+            status=413,
+        )
     # This is the ONLY credential scan on the path from PTY output to a model,
     # so it runs unconditionally and there is no configuration that skips it.
     # A contiguous selection is also the only input the redactors can be
@@ -1093,7 +1158,10 @@ async def api_terminal_redact(request: web.Request) -> web.Response:
     except Exception:
         # Fail closed: the caller gets no text to insert.
         logger.exception("terminal: selection redaction failed")
-        return web.json_response({"error": "redaction failed"}, status=500)
+        return web.json_response(
+            {"error": "redaction failed", "code": "terminal_redaction_failed"},
+            status=500,
+        )
     return web.json_response({"text": redacted})
 
 
@@ -1446,19 +1514,27 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
     except Exception:
         _log_complete(caller, "denied", "invalid_body")
         return web.json_response(
-            {"error": "expected JSON body "
-                      "{session_id: string, token?: string, folders_only?: boolean, "
-                      "argv?: string[]}"},
+            {
+                "error": "expected JSON body "
+                         "{session_id: string, token?: string, folders_only?: boolean, "
+                         "argv?: string[]}",
+                "code": "terminal_invalid_body",
+            },
             status=400,
         )
     if len(token) > _COMPLETE_TOKEN_MAX:
         _log_complete(caller, "denied", "token_too_long")
-        return web.json_response({"error": "token too long"}, status=413)
+        return web.json_response(
+            {"error": "token too long", "code": "terminal_token_too_long"}, status=413
+        )
 
     sess = _get_registry(request).get(session_id)
     if sess is None:
         _log_complete(caller, "denied", "unknown_session")
-        return web.json_response({"error": "Unknown terminal session"}, status=404)
+        return web.json_response(
+            {"error": "Unknown terminal session", "code": "terminal_unknown_session"},
+            status=404,
+        )
 
     cwd = await _session_cwd_cached(sess)
     dir_part, prefix = _split_path_token(token)
@@ -1595,6 +1671,21 @@ async def api_terminal_delete(request: web.Request) -> web.Response:
         return web.Response(status=403, text="Terminal panel disabled")
 
     session_id = request.match_info.get("session_id", "")
+    # Same bound ``api_terminal_ws`` applies when a session is created, so an id
+    # outside it provably keys nothing in this registry. Rejecting it here means
+    # a malformed request is told so, rather than being answered "no such
+    # session" after the lookup. Plaintext 400 to match this handler's other
+    # responses (401/403/404 above and below are all plaintext).
+    if not session_id or len(session_id) > _MAX_SESSION_ID_LEN:
+        _sel().log_api_access(
+            caller=caller,
+            operation="terminal.session.delete",
+            outcome="denied",
+            source="dashboard",
+            resources=f"invalid_session_id={session_id!r}",
+        )
+        return web.Response(status=400, text="Invalid session_id")
+
     registry = _get_registry(request)
     sess = registry.pop(session_id, None)  # type: ignore[arg-type]
     if not sess:

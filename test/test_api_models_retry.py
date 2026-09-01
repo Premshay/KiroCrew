@@ -245,6 +245,10 @@ def test_successful_list_launches_resolved_binary_in_place(tmp_path, monkeypatch
     payload = json.dumps({"models": [{"model_name": "claude-opus-4.8"}]}).encode()
     resolved = "/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli"
     spawn = AsyncMock(return_value=_FakeProc(payload))
+    env_file = tmp_path / ".env"
+    env_file.write_text("KIRO_API_KEY=model-list-key\n", encoding="utf-8")
+    monkeypatch.delenv("KIRO_API_KEY", raising=False)
+    monkeypatch.setattr("kiro_crew.config.loader.env_path", lambda: env_file)
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "FAKE-secret")
     monkeypatch.setenv("PYTHONPATH", "/gateway/pythonpath")
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-FAKE")
@@ -272,6 +276,7 @@ def test_successful_list_launches_resolved_binary_in_place(tmp_path, monkeypatch
     assert "AWS_SECRET_ACCESS_KEY" not in env
     assert "PYTHONPATH" not in env
     assert "SLACK_BOT_TOKEN" not in env
+    assert env["KIRO_API_KEY"] == "model-list-key"
     assert env["AWS_ACCESS_KEY_ID"] == "FAKE-akid"
     assert env["KIROCREW_UNRELATED_KEEPME"] == "keep-this-value"
 
@@ -316,8 +321,6 @@ def test_structured_context_window_seeds_central_authority(tmp_path):
         "kiro_crew.sandbox.resource_limit_preexec", lambda: None
     ), patch.object(
         agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)
-    ), patch.object(
-        agents.asyncio, "wait_for", return_value=(payload, b"")
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 200
@@ -361,8 +364,6 @@ def test_list_models_spawns_at_the_configured_sandbox_tier(tmp_path):
         "kiro_crew.sandbox.resource_limit_preexec", lambda: None
     ), patch.object(
         agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)
-    ), patch.object(
-        agents.asyncio, "wait_for", return_value=(payload, b"")
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
 

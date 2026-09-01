@@ -263,7 +263,7 @@ show the real product UI; the detail page renders both when both are declared.
 |-------|------|---------|-------------|
 | `backend.entryPoint` | string | | Script to run (relative to app root), or a dotted Python module path launched via `python -m` (used by built-in apps like `file-explorer`, e.g. `kiro_crew.apps.builtins.file_explorer.server`) |
 | `backend.port` | string | `"auto"` | Port number or `"auto"` for auto-assignment |
-| `backend.healthCheck` | string | `"/health"` | Health check endpoint path |
+| `backend.healthCheck` | string | `"/health"` | Absolute health-check path beginning with `/`; unsafe or ambiguous paths are refused. Polled until it answers at startup, then re-polled for the life of the backend — keep the handler cheap and dependency-free. A backend that stops answering it is dropped from the reverse proxy and its MCP servers are deregistered until it answers again. |
 | `backend.routes` | string | | Base route path for the backend |
 | `backend.type` | string | `""` | Backend runtime: `"python"`, `"asgi"`, `"node"`, `"exec"` (execute the entry point file as-is), or `""` (auto-detect from `entryPoint` — a `.sh` file or an extensionless executable with a non-Python shebang is treated as a shell launcher) |
 
@@ -304,6 +304,24 @@ root (validated against `HooksConfig._HOOK_PATH_RE`).
 `hooks.routes` handlers are wired up when the app is enabled (via
 `on_app_enable`, also re-run at gateway startup via `on_gateway_startup`), so
 they go live without waiting for a Gateway restart.
+
+**Importing your own modules.** Hook entry files are loaded from their file path
+into a synthetic package named after the app, never via `sys.path`, so use a
+**relative** import to reach a sibling module:
+
+```python
+# backend/routes.py
+from . import config          # backend/config.py
+from .render import to_html   # backend/render.py
+```
+
+A relative import resolves inside the app's own directory tree and cannot walk
+above the app root (`from ... import x` is refused). It is not a sandbox: app
+Python already runs in the Gateway process with full filesystem access, so a
+symlinked sibling resolves wherever it points. Do not use a bare
+`import config`: `sys.modules["config"]` is process-global, so two apps each
+shipping a `config.py` would end up sharing one module. `from kiro_crew...`
+absolute imports are for built-in apps only.
 
 ## Permissions
 
@@ -531,6 +549,11 @@ the user to run locally instead of executing it on the server.
 - `name` must match `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` (kebab-case)
 - `name` must not be `system` (it would shadow the `system.*` notification-channel
   namespace)
+- `name` must not be `library` (the dashboard serves `/apps/library` as a static
+  page — the installed-app management surface — and it registers ahead of the
+  `/apps/:name` route, so an app by that name would have an unreachable page).
+  Refused at every install door, including registry installs before any
+  clone/build work, with the machine-readable error code `reserved_app_name`.
 - `name` must not be a Windows reserved device stem — `con`, `prn`, `aux`, `nul`,
   `com1`–`com9`, `lpt1`–`lpt9` — because the app name becomes a directory and
   Windows resolves those inside every directory. Names that merely resemble one

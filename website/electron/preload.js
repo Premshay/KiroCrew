@@ -66,7 +66,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getAppMenuItems: (id) => ipcRenderer.invoke("app-menu:items", id),
   executeAppMenuItem: (id, index) => ipcRenderer.send("app-menu:execute", id, index),
   // App-menu navigation: main.js sends an in-app path ("/settings",
-  // "/settings?tab=about") when the user picks Settings…/About from the
+  // "/settings/about") when the user picks Settings…/About from the
   // native application menu; the SPA routes to it (see App.tsx).
   onNavigate: (cb) => {
     const handler = (_e, path) => cb(path);
@@ -89,21 +89,41 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Privacy-pane dialog only if macOS is actually the one saying no. Without
   // this the toast is a dead end: macOS never re-prompts after a denial.
   reportMicDenied: () => ipcRenderer.send("mic:denied"),
-  // Pierre highlight-churn accounting (see src/lib/pierrePerf.ts). Fields are
-  // coerced here because preload is the trust boundary: the main process writes
-  // them into a log line, so a renderer bug must not be able to put an object or
-  // a huge string there. Fire-and-forget — the renderer never waits on a
-  // diagnostic, and the main process drops it entirely unless KIROCREW_DEBUG.
-  reportPierrePerf: (w) =>
-    ipcRenderer.send("pierre-perf", {
-      calls: Number(w && w.calls) || 0,
-      chars: Number(w && w.chars) || 0,
-      keys: Number(w && w.keys) || 0,
-      maxKeysForOneSurface: Number(w && w.maxKeysForOneSurface) || 0,
-      repeatKeyCalls: Number(w && w.repeatKeyCalls) || 0,
-      maxLen: Number(w && w.maxLen) || 0,
-      heapMB: Number(w && w.heapMB) || -1,
+  // Renderer memory trajectory (see src/lib/memoryWatch.ts). Fields are coerced
+  // here because preload is the trust boundary: the main process writes them into
+  // a log line, so a renderer bug must not be able to put an object or an
+  // unbounded string there. Fire-and-forget — the renderer never waits on a
+  // diagnostic.
+  //
+  // A null metric is forwarded as null, NOT as 0 or -1. "this channel does not
+  // exist in this realm" and "this channel read zero" lead to opposite
+  // conclusions, and the instrument this replaces collapsed a genuine 0 into a
+  // sentinel with `Number(x) || -1`.
+  reportMemorySample: (s) =>
+    ipcRenderer.send("memory-sample", {
+      realm: String((s && s.realm) || "?").slice(0, 60),
+      usedHeapKB: Number.isFinite(s && s.usedHeapKB) ? s.usedHeapKB : null,
+      limitHeapKB: Number.isFinite(s && s.limitHeapKB) ? s.limitHeapKB : null,
+      externalKB: Number.isFinite(s && s.externalKB) ? s.externalKB : null,
     }),
+  // The object-heap half of the external-memory subtraction. The main world has
+  // no `process` under contextIsolation, but the preload shares the renderer's
+  // v8::Isolate, so `usedHeapSize` here describes the same heap that
+  // `performance.memory` reports in the page — which is what makes
+  // `usedJSHeapSize - usedHeapSize` a valid read of V8 external memory rather
+  // than a comparison of two different heaps. Returns null when Electron does not
+  // expose the API, so the caller reports the channel as unavailable instead of
+  // inventing a figure.
+  heapStatisticsKB: () => {
+    try {
+      if (typeof process.getHeapStatistics !== "function") return null;
+      const stats = process.getHeapStatistics();
+      const used = stats && stats.usedHeapSize;
+      return { usedHeapKB: Number.isFinite(used) ? used : null };
+    } catch {
+      return null;
+    }
+  },
   // The system-wide summon hotkey as ACTUALLY bound by main.js (registration
   // can degrade to the default or to nothing when a key is taken), so the
   // shortcuts UI advertises what really works. Resolves
@@ -119,6 +139,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
 contextBridge.exposeInMainWorld("localGatewayAPI", {
   get: () => ipcRenderer.invoke("local-gateway:get"),
   set: (enabled) => ipcRenderer.invoke("local-gateway:set", !!enabled),
+});
+
+// Read-only WSL2 host-runtime readout for the Host runtime card on System >
+// Services (HostRuntimeCard). Detection only — no config writes, no
+// persistence. The main-process handler rejects every sender whose gateway is
+// not genuinely local, so a connection window pointed at a remote gateway
+// gets a rejection here rather than the host's distro inventory. Absent in
+// plain browsers — the card treats a missing bridge as "not an Electron
+// shell" and renders nothing.
+contextBridge.exposeInMainWorld("wslAPI", {
+  detect: () => ipcRenderer.invoke("wsl:detect"),
 });
 
 // Native zoom bridge for the Settings > Display "Zoom Level" stepper.

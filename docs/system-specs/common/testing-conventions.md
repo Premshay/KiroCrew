@@ -140,9 +140,10 @@ one scope down:
   multithreaded, which the kernel answers with an EINVAL the probe used to cache as
   "this host has no sandbox backend".
 * `_restore_log_record_factory` puts `logging`'s record factory back. There is one such
-  slot per process, and `log_redaction`'s wrapper deliberately clears `args` and
-  `exc_info` on every record it creates, so leaving it installed reds whatever unrelated
-  test later asserts on either field. `cli._setup_cli_logging` installs it for a
+  slot per process, and `log_redaction`'s wrapper ALWAYS renders and clears
+  `exc_info` (frame locals are unscannable), and clears `args` on any record that
+  is not a clean tuple of exact scalars, so leaving it installed reds whatever
+  unrelated test later asserts on either field. `cli._setup_cli_logging` installs it for a
   long-lived command, so grepping `cli.main()` finds only some of the tests that reach
   it — most call that helper directly, and they are in `test_cli_logging.py`, whose own
   `_pristine_logging` fixture restores handlers and levels but not the factory, which is
@@ -290,6 +291,15 @@ which testpath asked for the workers.
   no individual test (`_isolate_sel_default_dir`, in the rootdir conftest). When you
   add a subsystem with a background worker, ask which directory its thread captured
   and whether anything deletes that directory underneath it.
+
+  One shared directory also means one shared **chain lock**, and that is the wrong
+  tier for a test whose assertion depends on a fail-closed critical SEL write
+  *winning* that lock — on the event-loop thread the acquire is a single non-blocking
+  attempt, so any sibling's writer holding the lock at the wrong moment refuses the
+  audit and fails the test with no code defect anywhere (issue #7029, the issue-radar
+  trust flake). Such tests request `sel_private_root` (rootdir conftest): it rebinds
+  the singleton to a per-test, per-xdist-worker directory built `sync=True` — no
+  background writer at all — so no concurrent writer exists to contend with.
 
 - **When you stub a lifecycle method, SPY and delegate — never replace.** A stub that
   only records the call leaves whatever that method was supposed to stop still running.

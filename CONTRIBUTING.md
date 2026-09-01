@@ -55,11 +55,13 @@ cd website
 npm install
 npm run build
 cp -r dist ../src/kiro_crew/static/dist
+cd electron && npm ci && cd ..       # desktop sub-package deps (npm test needs them)
 cd ..
 
-# 3. Editable backend install (with optional voice extras)
+# 3. Editable backend install (with dev/test tooling)
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[voice]"
+pip install -e ".[dev]"
+# Optional voice extras (local speech-to-text): pip install -e ".[dev,voice]"
 
 # 4. Configure and verify
 kirocrew setup               # data dir, agent backend (channels connect later)
@@ -103,7 +105,8 @@ truth (with `.github/workflows/ci.yml` canonical for the gate list).
 ### Backend
 
 ```bash
-pip install -e ".[voice]"    # installs deps + console scripts
+pip install -e ".[dev]"      # installs deps + console scripts + test tooling
+# Optional voice extras (local speech-to-text): pip install -e ".[dev,voice]"
 pytest                       # run the test suite
 ```
 
@@ -116,6 +119,7 @@ The React SPA lives in `website/`. Production builds are bundled into
 cd website
 npm install
 npm run build                # tsc + vite build → website/dist
+cd electron && npm ci && cd ..       # desktop sub-package deps (npm test needs them)
 ```
 
 After building, copy `website/dist` into `src/kiro_crew/static/dist/` so the
@@ -530,6 +534,37 @@ you to fix — flag it to a maintainer.
 Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
 
 Rules: imperative mood, lowercase summary, no trailing period, wrap body at 72 chars.
+
+## Recognizing Contributions
+
+There is one contributor list, the Contributors block in [README.md](README.md).
+Deliberately one: a second table for "other" contributions would rank one kind of
+help above another, and split recognition across two places nobody reads twice.
+
+Two things are credited automatically by a daily job: authoring a merged pull
+request, and reporting an issue that a merged pull request closed. You do not need
+to ask for either.
+
+The second rule is deliberately about outcome, not volume. Credit follows a report
+that changed the product, which is why the job reads each merged PR's closing
+references rather than listing every issue — that keeps duplicates, invalid
+reports, and issues opened to farm a credit out of the list. It undercounts on
+purpose: if a pull request fixed your report without writing a closing keyword,
+the link does not exist and the job cannot see it. Ask, and it gets added by hand.
+
+Everything else is credited in the same block on request: a code review, a
+translation, an idea, a design, a private security report. Open an issue naming
+the person (yourself is fine), and a maintainer records it:
+
+```sh
+python3 scripts/update_contributors.py --login <github-login> --name "Display Name"
+```
+
+The daily job re-derives the full contributor set and rebuilds its branch
+from scratch, but it never rewrites or drops an existing line, so a
+manually-added entry survives every later run. A login listed in
+`.github/contributors-optout.txt` is never added by the job, which is how a
+removal request stays honored.
 
 ## Questions?
 

@@ -251,9 +251,18 @@ describe('messageRenderers — the assistant footer rule', () => {
 })
 
 describe('messageRenderers — cards, pills and banners', () => {
-  it('draws a stop event as a full-width row', () => {
-    renderRow(msg({ role: 'system', content: 'zzq-stopped', kind: 'stop_event' }))
-    expect(screen.getByTestId('row')).toHaveTextContent('zzq-stopped')
+  it('draws a stop event on the shared StopEventCard, reading its state off meta', () => {
+    // A stop row's `content` is the card's own JSON envelope, never prose, so the
+    // entry hands the whole message to the card and lets it read `meta.state`.
+    // Recipe parity with the dashboard is pinned in AppSdkStopEventCardParity.
+    const data = { kind: 'stop_event', id: 'stop-zzq', state: 'stopped', outcome: null }
+    const json = JSON.stringify(data)
+    const m = msg({ role: 'system', content: json, cls: json, meta: data })
+    const { entry } = renderRow(m)
+    expect(entry?.id).toBe('stop_event')
+    const card = screen.getByTestId('stop-event-card')
+    expect(screen.getByTestId('row')).toContainElement(card)
+    expect(card.getAttribute('data-state')).toBe('stopped')
   })
 
   it('draws error and notice rows', () => {
@@ -277,6 +286,45 @@ describe('messageRenderers — cards, pills and banners', () => {
   it('leaves an unlabelled injection verbatim', () => {
     renderRow(msg({ role: 'inject', content: '[Cron notification from "x"]\nzzq-raw' }))
     expect(screen.getByTestId('md').textContent).toContain('[Cron notification from "x"]')
+  })
+
+  // A note's [OPTIONS:] marker is consumed into the pill row, so the bubble must not
+  // ALSO print it -- the user would see the same choices twice.
+  it('strips the OPTIONS marker from the text a note bubble renders', () => {
+    renderRow(msg({
+      role: 'inject',
+      cls: 'reconcile-note',
+      content: 'zzq-note-prose [OPTIONS: Fix | Skip]',
+    }))
+    const rendered = screen.getByTestId('md').textContent ?? ''
+    expect(rendered).not.toContain('[OPTIONS:')
+    expect(rendered).toContain('zzq-note-prose')
+  })
+
+  it('keeps the marker verbatim on an inject row that is NOT a note', () => {
+    renderRow(msg({ role: 'inject', content: 'zzq-cron-prose [OPTIONS: Fix | Skip]' }))
+    const rendered = screen.getByTestId('md').textContent ?? ''
+    expect(rendered).toContain('[OPTIONS: Fix | Skip]')
+  })
+
+  // A rehydrated note has no `cls` -- history persists it only for role="system" --
+  // so provenance in `meta` is what keeps the strip alive across a restart.
+  it('strips the marker from a note rehydrated from history without its class', () => {
+    renderRow(msg({
+      role: 'inject',
+      cls: '',
+      content: 'zzq-reloaded-prose [OPTIONS: Fix | Skip]',
+      meta: { noteSession: 'chat-1844-1787619403' },
+    }))
+    const rendered = screen.getByTestId('md').textContent ?? ''
+    expect(rendered).not.toContain('[OPTIONS:')
+    expect(rendered).toContain('zzq-reloaded-prose')
+  })
+
+  it('keeps the marker on a classless inject row carrying no note provenance', () => {
+    renderRow(msg({ role: 'inject', cls: '', content: 'zzq-bare-prose [OPTIONS: Fix | Skip]' }))
+    const rendered = screen.getByTestId('md').textContent ?? ''
+    expect(rendered).toContain('[OPTIONS: Fix | Skip]')
   })
 
   it('drops an OAuth banner a Connections card already owns', () => {
@@ -375,6 +423,16 @@ describe('ToolCallPill', () => {
     />)
     expect((screen.getByRole('button') as HTMLElement).className).toContain('text-danger')
     rejected.unmount()
+
+    // The backend persists the raw token, so a reject-once arrives here as
+    // `rejected_once`. An equality match on 'rejected' would tone the most
+    // deliberate denial a human can make as if nothing had been decided.
+    const rejectedOnce = render(<ToolCallPill
+      message={msg({ role: 'tool', content: '🔧 zzq', meta: { resolved: 'rejected_once' } })}
+      running
+    />)
+    expect((screen.getByRole('button') as HTMLElement).className).toContain('text-danger')
+    rejectedOnce.unmount()
 
     const done = render(<ToolCallPill
       message={msg({ role: 'tool_result', content: 'zzq' })} running

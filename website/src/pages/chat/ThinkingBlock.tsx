@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { ChevronRight, Sparkles } from 'lucide-react'
 import { useRowDisclosure } from './rowDisclosure'
@@ -18,6 +18,16 @@ const LIVE_TAIL_CHARS = 240
  *  there a late hand-off shows a redundant indicator, here a short window makes
  *  the line appear and vanish across the gap between two reasoning bursts. */
 const PREVIEW_IDLE_MS = 1200
+
+/** Slack, in px, for "is the expanded trace at its end". An exact test never
+ *  re-arms following: sub-pixel offsets leave scrollTop a hair short, stranding
+ *  a reader who scrolled back down. Same value as ActivityViewer's log pane. */
+const TAIL_SLACK_PX = 20
+
+/** Within a line's slack of the bottom -- the one test both the scroll listener
+ *  and the pin effect latch on, so they cannot drift apart. */
+const isAtEnd = (el: HTMLElement) =>
+  el.scrollTop + el.clientHeight >= el.scrollHeight - TAIL_SLACK_PX
 
 /** The tail of the trace as a single line: whatever the model just wrote, with
  *  newlines collapsed so a multi-line thought still reads as one line. */
@@ -49,6 +59,9 @@ function ThinkingBlock({ content, disclosureKey }: { content: string; disclosure
   const [clipped, setClipped] = useState(false)
   const lastContent = useRef<string | null>(null)
   const ticker = useRef<HTMLSpanElement | null>(null)
+  const bodyRef = useRef<HTMLDivElement | null>(null)
+  // A ref, not state: it changes on every scroll event and must not repaint.
+  const autoScroll = useRef(true)
 
   // Liveness is derived from the content GROWING rather than from the slot's
   // running flag: one turn keeps a single reasoning block, so a burst that
@@ -84,6 +97,33 @@ function ThinkingBlock({ content, disclosureKey }: { content: string; disclosure
     setClipped(c => (c === overflowing ? c : overflowing))
   }, [tail])
 
+  // Reasoning is APPENDED, so the newest text sits at the bottom and an
+  // unmanaged container shows the oldest. Follow the tail WHILE LIVE, yield as
+  // soon as the reader scrolls up, re-arm when they return -- the same contract
+  // as the subagent output pane in ActivityViewer.
+  // useEffect is safe despite writing scroll position: the panel mounts inside an
+  // AnimatePresence animating height in from 0, so there is no painted frame for
+  // a scrollTop-0 flash to land on.
+  useEffect(() => {
+    if (!expanded || !streaming) return
+    const el = bodyRef.current
+    if (el && autoScroll.current) el.scrollTop = el.scrollHeight
+  }, [expanded, content, streaming])
+
+  // Latch on where the reader IS -- deliberately NOT on `content`: an append
+  // commits a taller box before liveness flips, so re-deriving would stop follow.
+  useEffect(() => {
+    if (!expanded) { autoScroll.current = true; return }
+    const el = bodyRef.current
+    if (el && !streaming) autoScroll.current = isAtEnd(el)
+  }, [expanded, streaming])
+
+  const onBodyScroll = useCallback(() => {
+    const el = bodyRef.current
+    if (!el) return
+    autoScroll.current = isAtEnd(el)
+  }, [])
+
   if (!content) return null
 
   const fade = 'linear-gradient(to right, transparent 0, #000 36px)'
@@ -111,20 +151,21 @@ function ThinkingBlock({ content, disclosureKey }: { content: string; disclosure
         {/* Same deterministic centering as the tool pill's status icon: the
             label spans pin leading-5 (20px), so the 12px icon centers on the
             first line at (20 − 12) / 2 = 4px. While reasoning is live the icon
-            gently pulses, reinforcing the label's streaming shimmer so a folded
-            row still reads as "in progress" even when the one-line tail is
-            empty between two bursts. */}
+            gently pulses — the row's ONLY "in progress" motion, so a folded
+            row still reads as live even when the one-line tail is empty
+            between two bursts. */}
         <Sparkles size={12} className={`shrink-0 text-accent${streaming ? ' animate-pulse' : ''}`} style={{ marginTop: '4px' }} />
         {/* The label is tense-aware: several locales render `thinking` as an
             explicitly in-progress form ("思考中", "考え中"), which reads wrong
             once the burst has settled. It rides the same growth-derived
             liveness as the preview line, so the row's whole header flips to
             the finished form the moment the preview disappears — and a block
-            restored from history starts on the finished form. While live it
-            also carries `.streaming-glow` — the same accent shimmer-sweep the
-            streaming assistant answer uses — so a folded turn's single row
-            actively signals the model is still thinking. */}
-        <span className={`shrink-0 leading-5${streaming ? ' streaming-glow' : ''}`}>{streaming ? i18nT('pages.chat.thinkingBlock.thinking') : i18nT('pages.chat.thinkingBlock.thought_process')}</span>
+            restored from history starts on the finished form. The label itself
+            stays static: `.streaming-glow` is sized for a full streaming
+            sentence, and on a 3-glyph CJK label its background chip + sweep
+            read as a smeared highlight, so liveness is carried by the pulsing
+            icon and the live preview tail instead. */}
+        <span className="shrink-0 leading-5">{streaming ? i18nT('pages.chat.thinkingBlock.thinking') : i18nT('pages.chat.thinkingBlock.thought_process')}</span>
         <ChevronRight
           size={13}
           className="shrink-0 transition-transform duration-200"
@@ -169,7 +210,7 @@ function ThinkingBlock({ content, disclosureKey }: { content: string; disclosure
                 opacity modifier: the theme colours are raw var() references,
                 so Tailwind opacity variants silently generate nothing. */}
             <div className={`${ROW_RAIL_CLASS} border-l-[color-mix(in_srgb,var(--accent)_70%,transparent)]`}>
-              <div className="max-h-[360px] overflow-auto">
+              <div ref={bodyRef} onScroll={onBodyScroll} data-testid="thinking-body" className="max-h-[360px] overflow-auto">
                 {/* The RAIL spans the row so its edge aligns with the tool
                     payload box, but the prose inside is capped at a readable
                     measure — reasoning is sentences, not code, and ~140-char

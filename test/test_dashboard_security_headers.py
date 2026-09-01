@@ -123,6 +123,22 @@ class TestApplySecurityHeaders:
         assert "http://*.localhost:*" not in csp
         assert "frame-ancestors 'self'" in csp
 
+    def test_csp_script_src_admits_wasm_but_not_eval(self) -> None:
+        """The Pierre highlight workers tokenize with the shiki-wasm engine
+        (website/src/pierre/config.ts, PIERRE_REGEX_ENGINE), and a same-origin
+        worker takes its CSP from its own script response — this header.
+        WebAssembly.instantiate needs 'wasm-unsafe-eval' in script-src or the
+        tokenizer worker dies on first highlight and every diff surface
+        unmounts. The expression admits ONLY WASM compilation: JS eval stays
+        banned, which the second assertion pins so a future edit cannot
+        silently widen this into 'unsafe-eval'."""
+        resp = _make_response()
+        _apply_security_headers(resp, _make_app(with_instances=False))
+        csp = resp.headers["Content-Security-Policy"]
+        script_src = next(d for d in csp.split(";") if d.strip().startswith("script-src"))
+        assert "'wasm-unsafe-eval'" in script_src
+        assert "'unsafe-eval'" not in script_src.replace("'wasm-unsafe-eval'", "")
+
     def test_csp_connect_src_allows_loopback_liveness_probe(self) -> None:
         """WebPreviewPanel polls the framed dev server with a no-cors ``fetch``
         because a cross-origin iframe cannot report that its server died. When
@@ -350,6 +366,37 @@ class TestApplySecurityHeaders:
         assert "frame-ancestors 'self'" in csp
         assert "localhost:3000" not in csp
         assert resp.headers["X-Frame-Options"] == "SAMEORIGIN"
+
+    def test_shell_csp_ancestors_go_through_the_same_validator(self, monkeypatch) -> None:
+        """The dashboard shell's ``frame-ancestors`` is built by
+        ``origin.frame_ancestors_value``, the same joiner the sandboxed-document
+        responses use — not a local ``" ".join``.
+
+        This is the third ancestor-emitting site. While it hand-joined, it was the
+        one source nothing validated, so the helper's guarantee that no future
+        ancestor can reintroduce an inexpressible entry did not actually hold for
+        the shell. That class of bug is not hypothetical: a bracketed IPv6 literal
+        WAS being emitted, and engines refuse the whole source expression when they
+        see one, dropping every ancestor with it.
+
+        Asserted by behaviour rather than by reading the source: an inexpressible
+        ancestor must not reach the header even when ``_extra_frame_ancestors``
+        offers one.
+        """
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.server._extra_frame_ancestors",
+            lambda request, app: ["http://[::1]:5476", "http://localhost:5476"],
+        )
+        request = make_mocked_request("GET", "/")
+        resp = _make_response()
+        _apply_security_headers(resp, _make_app(with_instances=True), request=request)
+        csp = resp.headers["Content-Security-Policy"]
+        frame_anc = next(d for d in csp.split(";") if d.strip().startswith("frame-ancestors"))
+        assert "[::1]" not in frame_anc
+        # The expressible sibling still gets through, so this is a filter and not
+        # a blanket refusal.
+        assert "http://localhost:5476" in frame_anc
+        assert "'self'" in frame_anc
 
     def test_frame_ancestors_ignores_forged_unsigned_cookie(self) -> None:
         """A forged/unsigned ``mc_token_<port>`` cookie must NOT get its parent

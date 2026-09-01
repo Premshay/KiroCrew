@@ -32,7 +32,16 @@ from collections import deque
 from contextlib import aclosing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence, TypeVar
+from typing import (
+    Any,
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Mapping,
+    Sequence,
+    TypeVar,
+)
 
 from kiro_crew import agent_scratch, model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
@@ -40,8 +49,11 @@ from kiro_crew.acp._dispatch import (
     derive_edit_diff,
     extract_tool_purpose,
     make_unified_diff,
+    parse_prompt_token_usage,
     parse_session_modes,
+    parse_usage_cost,
     parse_usage_update,
+    redact_text,
     trusted_mcp_identity,
 )
 from kiro_crew.acp.liveness import (
@@ -101,6 +113,7 @@ from kiro_crew.acp.types import (
     OPTION_ALLOW_ONCE,
     OUTCOME_CANCELLED,
     OUTCOME_SELECTED,
+    STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_END_TURN,
     UPDATE_AGENT_MESSAGE_CHUNK,
     UPDATE_AGENT_THOUGHT_CHUNK,
@@ -113,33 +126,44 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     JsonRpcRequest,
     ProviderChildActivity,
-    TurnUsage,
 )
 from kiro_crew.agent import ensure_agent_materialized, session_capability_servers
+from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import (
     COMPACT_WAIT_TIMEOUT_SECS,
     KIROCREW_SPAWNED_ENV,
     KIROCREW_SPAWNED_VALUE,
 )
-from kiro_crew.env import augmented_path, mise_data_dir, resolve_krb5_ccname
+from kiro_crew.env import (
+    augmented_path,
+    describe_search_path,
+    mise_data_dir,
+    resolve_krb5_ccname,
+)
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import (
     HOOK_EVENT_POST_TOOL_USE,
     fire_tool_hooks,
     get_global_hook_store,
 )
-from kiro_crew.kiro_cli import resolve_kiro_cli
+from kiro_crew.kiro_cli import known_kiro_cli_dirs, resolve_kiro_cli
 from kiro_crew.mcp_gateway.claim import schedule_claim
 from kiro_crew.mcp_gateway.session_servers import pooled_session_servers
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
+    BoundWorkspaceMismatch,
     apply_windows_resource_ceiling,
+    assert_voice_runtime_outside_agent_workspace,
+    bind_voice_safe_agent_workspace_async,
     cgroup_scope_argv,
     create_subprocess_limited,
+    release_bound_agent_workspace,
+    resolve_bound_session_workspace,
     scrub_agent_subprocess_env,
     wrap_argv,
+    wrap_argv_async,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -333,16 +357,27 @@ def _normalize_exe_casing(path: str | None) -> str | None:
         return path
 
 
-def _resolve_kiro_bin() -> str | None:
+def _resolve_kiro_bin(
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> str | None:
     """Resolve the user's installed Kiro CLI, to be launched in place.
 
     Returns the installed binary's own path. KiroCrew never copies the CLI and
     executes the copy: Kiro CLI 2.15+ dispatches subcommands by exec'ing a
     sibling executable resolved relative to its own path, which a copy into a
     private directory destroys.
+
+    *environ* and *home* exist so a caller that also needs to REPORT the search
+    can pin both to one reading of the environment. ``known_kiro_cli_dirs`` is a
+    pure function of ``(platform, home, environ)``, so passing the same mapping
+    here and to the diagnostic guarantees the directories named in a "not found"
+    message are the directories that were actually searched. Both default to the
+    live values, so every other caller is unchanged.
     """
 
-    executable = resolve_kiro_cli()
+    executable = resolve_kiro_cli(environ=environ, home=home)
     if not executable:
         return executable
     # Deferred to keep the low-level resolver import graph acyclic:
@@ -363,7 +398,11 @@ def _resolve_kiro_bin() -> str | None:
     return snapshot.launch_path
 
 
-async def _resolve_kiro_bin_for_spawn() -> str | None:
+async def _resolve_kiro_bin_for_spawn(
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> str | None:
     """Resolve the Kiro CLI path off the event loop.
 
     Plain ``to_thread`` — deliberately NOT shielded. The shield existed only to
@@ -378,7 +417,56 @@ async def _resolve_kiro_bin_for_spawn() -> str | None:
     ASYNCIO UNHANDLED record to crash.log for an ordinary tab close.
     """
 
-    return await asyncio.to_thread(_resolve_kiro_bin)
+    return await asyncio.to_thread(_resolve_kiro_bin, environ=environ, home=home)
+
+
+def kiro_cli_not_found_message(
+    *,
+    environ: Mapping[str, str],
+    home: Path,
+) -> str:
+    """The one message for "the Kiro CLI is not where we looked".
+
+    Every spawn path that resolves the CLI has to answer the same two-way
+    question a bare name cannot: is the binary not installed, or is its install
+    directory outside the search? :func:`env.describe_search_path` exists for
+    that, and this function is where the ACP paths get it, so the client and the
+    runtime cannot drift into reporting the same failure differently (the same
+    single-source rule ``_resolve_kiro_bin_for_spawn`` and
+    ``_drain_oversize_line`` are already shared under).
+
+    Two properties are deliberate:
+
+    * The directories are computed from the *caller's* ``environ`` and ``home``,
+      not a fresh read. ``known_kiro_cli_dirs`` is a pure function of
+      ``(platform, home, environ)``, so a caller that passes the same mapping it
+      resolved against gets a message naming the directories actually searched —
+      the guarantee #5048 established for the Claude adapter.
+    * The message never says "in PATH". Resolution also walks
+      ``%LOCALAPPDATA%\\Kiro-Cli``, ``%ProgramFiles%\\Kiro-Cli`` and the
+      ``KIROCREW_KIRO_BIN`` override, so "not found in PATH" sent a reader whose
+      install was simply uncovered off to check the one thing that was not the
+      question. In #6497 it sent them further: ``where kiro-cli`` found nothing,
+      the app bundle did contain a ``kirocrew.exe`` — Kiro Crew's OWN console
+      script — and the conclusion drawn was that the agent CLI had been renamed
+      and this lookup left stale. Naming the searched directories and the
+      override makes both wrong turns unavailable.
+
+    Off the event loop when called from async code: expanding the inherited PATH
+    touches the filesystem.
+    """
+    # Local import: ``kiro_prerequisite`` pulls in the sandbox plane that this
+    # module also feeds, and the sibling ``snapshot_trusted_acp_executable``
+    # import above is deferred for the same acyclicity reason.
+    from kiro_crew.kiro_prerequisite import OFFICIAL_INSTALL_DOCS_URL
+
+    searched_dirs = known_kiro_cli_dirs(sys.platform, home, environ)
+    return (
+        f"{KIRO_CLI_BIN} not found "
+        f"({describe_search_path(os.pathsep.join(searched_dirs))}). "
+        f"Kiro CLI is a separate prerequisite Kiro Crew does not bundle: install it "
+        f"from {OFFICIAL_INSTALL_DOCS_URL}, or point KIROCREW_KIRO_BIN at the binary."
+    )
 
 
 def _mise_which(tool: str) -> str | None:
@@ -445,7 +533,9 @@ def _resolve_node_for_script(script_path: str) -> str | None:
 
 
 _UNRESOLVED: object = object()  # sentinel for "not yet resolved"
-_claude_acp_argv_cache: list[str] | None | object = _UNRESOLVED
+# Cache the PATH with the resolution result. A failed resolve is cached too, so
+# recomputing PATH at the error site could report directories that were never searched.
+_claude_acp_argv_cache: tuple[list[str] | None, str] | object = _UNRESOLVED
 
 
 def _vendored_claude_acp_roots(pkg_dir: Path | None = None) -> list[Path]:
@@ -496,11 +586,13 @@ def _resolve_vendored_claude_acp(pkg_dir: Path | None = None) -> str | None:
     return None
 
 
-def _resolve_claude_acp_bin() -> list[str] | None:
-    """Find the claude-agent-acp Node entry script and return argv.
+def _resolve_claude_acp_bin() -> tuple[list[str] | None, str]:
+    """Find the claude-agent-acp Node entry script and its searched PATH.
 
-    Returns a list suitable for subprocess argv (e.g. ``["node", "script.js"]``
-    or ``["/path/to/binary"]``).  Explicitly resolves the node binary to
+    The first item is argv suitable for subprocess use (e.g.
+    ``["node", "script.js"]`` or ``["/path/to/binary"]``), or ``None`` when
+    nothing was found. The second is the PATH searched at step 5. Explicitly
+    resolves the node binary to
     avoid relying on ``#!/usr/bin/env node`` shebang resolution which fails
     in non-interactive daemon contexts (mise shims require cwd with
     .mise.toml or a working global config).
@@ -553,7 +645,7 @@ def _resolve_claude_acp_bin() -> list[str] | None:
         resolved = str(Path(script).resolve())
         node = _resolve_node_for_script(resolved)
         if node:
-            return [node, resolved]
+            return [node, resolved], search_path
         # Directly runnable (a real executable on POSIX; a .exe/.cmd/etc. on
         # Windows)? Run it as-is. A bare .js is NOT directly runnable on Windows
         # (is_executable_file excludes it), so it correctly falls through to be
@@ -561,12 +653,12 @@ def _resolve_claude_acp_bin() -> list[str] | None:
         # Casing-normalize (Windows): a `which`-resolved .EXE must reach a
         # launcher-style shim with its true on-disk name (see _normalize_exe_casing).
         if platform_compat.is_executable_file(script):
-            return [_normalize_exe_casing(script) or script]
+            return [_normalize_exe_casing(script) or script], search_path
         node_on_path = shutil.which("node", path=search_path)
         if node_on_path:
-            return [node_on_path, resolved]
+            return [node_on_path, resolved], search_path
 
-    return None
+    return None, search_path
 
 
 def _resolve_claude_code_executable() -> str | None:
@@ -943,6 +1035,18 @@ _STALE_TURN_TIMEOUT = 90.0
 # keep resetting the timer via tool_call_update progress frames and tool
 # results, so this only trips on a genuine stall.
 _TOOL_STALL_TIMEOUT = 600.0
+# After a compaction `failed` status, kiro-cli can leave the turn it was
+# compacting for unanswered: no session/prompt response and no end_turn ever
+# arrive, so the read loop drains in silence to the caller's full prompt
+# ceiling (hours) and the slot is never released — the user waits it out or
+# presses Stop (issue #3583). Once a failure has been seen, treat this much
+# BACKEND SILENCE as a dead turn and end it with
+# STOP_REASON_COMPACTION_FAILED. Any stdout frame resets the clock, so a
+# backend that recovers and keeps streaming is unaffected and stays governed
+# by _STALE_TURN_TIMEOUT / _TOOL_STALL_TIMEOUT. Deliberately does NOT fold in
+# _last_activity (stderr/keepalive): a wedged post-compaction turn that keeps
+# writing stderr must still be reaped.
+_COMPACTION_FAILED_TURN_BUDGET = 60.0
 _CANCEL_GRACE_SECS = 10.0  # grace window for cooperative cancel ack
 # Claude Code can start these SDK-originated cycles while the ACP host is idle.
 # They are not responses to a dashboard prompt and must never be consumed by the
@@ -993,6 +1097,42 @@ def _is_shell_kind(kind: str | None) -> bool:
     return kind == _ACP_SHELL_KIND
 
 
+# Cap for the failure detail carried into the compaction notice: it is
+# backend-echoed text on a chat row, not a log line.
+_COMPACTION_DETAIL_MAX_CHARS = 200
+
+
+def compaction_failure_detail(params: dict) -> str:
+    """Best-effort reason text from a ``failed`` compaction notification.
+
+    kiro-cli carries no dedicated error field today: ``summary`` is
+    populated on success but typically empty on failure, which collapsed the
+    user-facing notice to "unknown error" with nothing to report or grep
+    (issue #3583). Prefer any named reason the payload does carry, else fall
+    back to the raw shape so the notice says something concrete. Redacted
+    here (not at each call site) because this reaches the dashboard.
+    """
+    status = params.get("status")
+    status = status if isinstance(status, dict) else {}
+    detail = ""
+    for source in (status, params):
+        for key in ("error", "reason", "message", "detail"):
+            value = source.get(key)
+            if isinstance(value, dict):
+                value = value.get("message") or value.get("error")
+            if isinstance(value, str) and value.strip():
+                detail = value.strip()
+                break
+        if detail:
+            break
+    if not detail:
+        # No named reason anywhere — the raw params ARE the only evidence.
+        detail = f"no reason reported by the agent (raw: {params})"
+    # redact_text is the single-source scrub (exfil URLs + credentials) every
+    # other LLM-influenced surface uses, including the sibling KAS summary.
+    return redact_text(detail)[:_COMPACTION_DETAIL_MAX_CHARS]
+
+
 class AcpError(Exception):
     """Base ACP error.
 
@@ -1020,9 +1160,9 @@ class AcpError(Exception):
 class AcpTimeoutError(AcpError):
     """Prompt timed out."""
 
-    def __init__(self, partial_output: str = ""):
+    def __init__(self, partial_output: str = "", *, message: str = "ACP prompt timed out"):
         self.partial_output = partial_output
-        super().__init__("ACP prompt timed out")
+        super().__init__(message)
 
 
 class AcpPermissionNeeded(AcpError):  # noqa: N818
@@ -1119,10 +1259,13 @@ class AcpConversationPayloadExceeded(AcpContextWindowExceeded):  # noqa: N818
     """
 
 
-# kiro-cli emits a "not logged in" banner on stderr when the user's session
-# has expired. Detected during spawn/prompt so we can raise AcpAuthRequired
-# (non-retryable) instead of churning through the retry ladder.
-_NOT_LOGGED_IN_RE = re.compile(r"not\s+logged\s+in", re.IGNORECASE)
+# Auth failure on stderr is detected during spawn/prompt so we can raise
+# AcpAuthRequired (non-retryable) instead of churning through the retry ladder.
+# The detector is `is_auth_failure_output` below; there is deliberately no
+# separate "not logged in" pattern here, because having one was the defect —
+# `_RE_SESSION_EXPIRED` already carries that wording alongside the rest of the
+# auth vocabulary, and a second narrower copy is what let the spawn path miss
+# every expiry that does not use the banner's exact words.
 _NOT_LOGGED_IN_MESSAGE = (
     "kiro-cli is not logged in. Run `kiro-cli login` in your terminal, " "then start a new chat."
 )
@@ -1239,6 +1382,34 @@ def _is_session_expired(haystack: str) -> bool:
         or _RE_SESSION_EXPIRED.search(haystack)
         or _RE_INVALID_BEARER.search(haystack)
     )
+
+
+def is_auth_failure_output(haystack: str) -> bool:
+    """True when free-form kiro-cli output reports an auth failure.
+
+    Companion to :func:`_is_session_expired` for output that is NOT a JSON-RPC
+    error frame — i.e. whatever the CLI writes to stderr while starting up. It is
+    the union of the two terminal auth families this module already recognises:
+    ``_is_session_expired`` (401/403, expiry wording, rejected bearer token) and
+    ``_RE_AUTH`` (the named service exceptions, which ``_is_session_expired``
+    deliberately leaves to ``_RE_AUTH``). Both are terminal for the same reason —
+    no retry refreshes a login — so for the single question "is this stderr an
+    auth problem" they belong together.
+
+    This exists because the two auth vocabularies had drifted apart by call path,
+    not by intent. Everything above was reachable only from the error-frame path;
+    the spawn / ``session/new`` path had its own detector matching the single
+    literal banner ``not logged in``. Real expiry output does not use that
+    wording — an expired bearer token produces ``AccessDeniedException: "Invalid
+    token"`` and ``the bearer token included in the request is invalid`` — so the
+    spawn path discarded an auth signal this module could already read, and the
+    operator got a 90-second timeout instead of a sign-in prompt.
+
+    Keeping one detector rather than widening the banner regex is the same
+    anti-drift argument the module makes for its other shared patterns: a second
+    vocabulary is what created the gap.
+    """
+    return bool(_RE_AUTH.search(haystack)) or _is_session_expired(haystack)
 
 
 # Account/plan capacity is EXHAUSTED — terminal. Distinct from a throttle: a
@@ -2288,6 +2459,8 @@ class AcpClient:
         )
         self._mcp_gateway_socket = str(mcp_gateway_socket) if mcp_gateway_socket else None
         self._sandbox_cleanup: str | None = None
+        self._bound_workspace_fd: int | None = None
+        self._spawn_work_dir = str(self._work_dir)
         self._process: asyncio.subprocess.Process | None = None
         self._pid: int | None = None
         self._start_time: int | None = None  # process start time for PID recycling detection
@@ -2468,6 +2641,13 @@ class AcpClient:
         # single progress frame.  Gates the _TOOL_STALL_TIMEOUT watchdog so a
         # dispatched-but-never-resolved tool can't hang the whole turn.
         self._tool_dispatched: bool = False
+        # Armed by _handle_compaction_status on a `failed` status and cleared at
+        # turn start: gates the _COMPACTION_FAILED_TURN_BUDGET check in
+        # _prompt_loop. _compaction_failed_turn records that the check fired, so
+        # _dispatch_events ends the turn with the compaction stop reason instead
+        # of the generic timeout error.
+        self._compaction_failed_at: float | None = None
+        self._compaction_failed_turn: bool = False
         # Liveness oracle for the stale-turn gate: before ending a silent turn
         # at _STALE_TURN_TIMEOUT, consult /proc evidence so a backend that is
         # provably working (CPU/IO movement in the subprocess subtree) is not
@@ -2511,8 +2691,8 @@ class AcpClient:
     def _is_kiro(self) -> bool:
         """True when this client drives kiro-cli (the AcpClient default).
 
-        AcpClient serves exactly two backends — kiro-cli and the dormant claude
-        seam — so this is the positive spelling of the sites that used to read
+        AcpClient serves exactly two backends — kiro-cli and claude-agent-acp —
+        so this is the positive spelling of the sites that used to read
         ``not self._is_claude`` (harness-parity H5). KAS runs on AcpRuntime, not
         AcpClient, so it never reaches this property.
         """
@@ -2537,13 +2717,14 @@ class AcpClient:
     def _claude_session_mcp_servers(self) -> list:
         """MCP server array passed to a claude ``session/new`` / ``session/load``.
 
-        Overridable seam for the dormant ``_is_claude`` backend. The Default is
-        ``[]`` so the public core (kiro-cli only, which gets its servers via
-        ``--agent``) is byte-identical. An internal companion that re-registers
-        a Claude backend over the ``ACP_BACKEND_CLAUDE`` seam overrides this to
-        inject the kirocrew-core/cron + user MCP servers — the claude adapter
-        does not read ``kirocrew.mcp.json`` on its own, so without this a claude
-        session would have zero MCP tools.
+        Overridable seam. The Default is ``[]``, which is byte-identical for kiro-cli
+        (it gets its servers via ``--agent``) but is a REAL GAP for claude: the
+        claude-agent-acp adapter does not read ``kirocrew.mcp.json`` on its own, so a
+        claude session started on a build that does not override this has zero MCP
+        tools. The harness itself works — prompts, streaming, permissions — but Crew's
+        own tools are absent. An edition overrides this to inject the
+        kirocrew-core/cron + user MCP servers; closing it for the public build means
+        translating ``kirocrew.mcp.json`` into this array here.
         """
         return []
 
@@ -2738,6 +2919,12 @@ class AcpClient:
         claude-agent-acp) instead of a hardcoded guess. Best-effort and never
         raises — a backend that omits ``models`` simply leaves the list empty.
 
+        The shape walk is delegated to
+        :func:`kiro_crew.acp.session_handle.parse_advertised_models` so this
+        snapshot stays directly comparable with the pooled-runtime probe
+        (#6382). This path keeps its dict-only ``models`` gate and its
+        non-empty assignment guard — both are call-site policy, not parsing.
+
         Also records ``currentModelId`` for ``_track_metadata``'s context
         window lookup.
         """
@@ -2747,23 +2934,18 @@ class AcpClient:
         current_model_id = models.get("currentModelId")
         if isinstance(current_model_id, str) and current_model_id:
             self._resolved_model_id = current_model_id
-        advertised = models.get("availableModels")
-        if not isinstance(advertised, list):
-            return
-        captured: list[dict[str, str]] = []
-        for m in advertised:
-            if not isinstance(m, dict):
-                continue
-            model_id = m.get("modelId") or m.get("value") or ""
-            if not model_id:
-                continue
-            captured.append(
-                {
-                    "modelId": str(model_id),
-                    "name": str(m.get("name") or model_id),
-                    "description": str(m.get("description") or ""),
-                }
-            )
+        # Imported lazily: acp.session_handle imports this module at module
+        # level, so a top-level import here would be a cycle.
+        from kiro_crew.acp.session_handle import parse_advertised_models
+
+        # Parse the gated sub-payload, not the whole response: the parser's
+        # dict-or-list fallback would otherwise let an EMPTY (falsy) models
+        # object fall through to a top-level ``availableModels`` key, sourcing
+        # the list from a payload the dict gate above never saw.
+        # NOTE: the pre-consolidation code returned early on a malformed
+        # ``availableModels``; nothing may be appended after this block
+        # without re-adding that malformed-payload guard.
+        captured = parse_advertised_models({"models": models})
         if captured:
             self._available_models = captured
 
@@ -3114,6 +3296,50 @@ class AcpClient:
                 pass
             self._sandbox_cleanup = None
 
+    async def _discard_bound_workspace(self) -> None:
+        """Close the parent copy of a macOS workspace identity off-loop."""
+        descriptor = getattr(self, "_bound_workspace_fd", None)
+        self._bound_workspace_fd = None
+        work_dir = getattr(self, "_work_dir", None)
+        if work_dir is not None:
+            self._spawn_work_dir = str(work_dir)
+        if descriptor is not None:
+            await release_bound_agent_workspace(descriptor)
+
+    async def _session_work_dir(self) -> str:
+        """Return the ACP cwd backed by the process's bound directory identity.
+
+        Unbound -- every platform but macOS, where nothing binds -- this is the
+        spawn's own pathname and there is nothing to re-check.
+
+        Bound, the descriptor is re-verified and the peer receives the DESCRIPTOR's
+        own name. The rule itself is ``sandbox.resolve_bound_session_workspace``,
+        shared with ``AcpRuntime._session_work_dir`` so the two halves of this
+        boundary cannot drift; only the error type is this front end's. Fails the
+        session rather than falling back to the bind-time spelling; see the runtime's
+        method for the residual limit a string cannot close.
+        """
+        if self._bound_workspace_fd is None:
+            return self._spawn_work_dir
+        try:
+            return await resolve_bound_session_workspace(
+                self._bound_workspace_fd, self._spawn_work_dir
+            )
+        except BoundWorkspaceMismatch as exc:
+            raise AcpError(
+                "A delegated macOS Kiro process is bound to one exact workspace; "
+                "respawn it bound to the requested workspace"
+            ) from exc
+        except OSError as exc:
+            raise AcpError("Cannot verify the macOS session workspace binding") from exc
+
+    async def _cleanup_failed_live_spawn(self) -> None:
+        """Kill a failed live child and always release its workspace binding."""
+        try:
+            await self._kill_process(force=True)
+        finally:
+            await self._discard_bound_workspace()
+
     async def _to_thread_guarding_sandbox(
         self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any
     ) -> _T:
@@ -3134,15 +3360,21 @@ class AcpClient:
     async def _spawn(self) -> None:
         """Start the ACP backend subprocess with stdio pipes.
 
-        KiroCrew's public core only ever drives the kiro-cli backend. The
-        claude-agent-acp branch below is the dormant protocol seam (see
-        ``ACP_BACKEND_CLAUDE``): the public provider factory never selects it,
-        so it is unreachable here, but an internal companion that re-registers
-        a Claude backend reuses this same client over the seam.
+        Two backends reach here, and the claude-agent-acp branch below is now a
+        live path on a public build: ``ACP_BACKEND_CLAUDE`` is in
+        ``BASELINE_SELECTABLE_BACKENDS``, so an operator who has the adapter can
+        select it and this branch spawns it.
         """
         # Off-loop: mkdir is a blocking syscall and the parent dirs may live on
         # slow storage; the loop must never wait on the kernel here.
         await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
+
+        # Kiro's internal macOS sandbox replaces (rather than nests inside)
+        # Kiro Crew's Seatbelt profile. Refuse a delegated agent workspace that
+        # can reach the protected named decoder snapshots; otherwise a same-UID
+        # agent could replace verified bytes before the decoder spawn opens them.
+        if self.backend in ACP_BACKENDS_INTERNAL_SANDBOX:
+            await asyncio.to_thread(assert_voice_runtime_outside_agent_workspace, self._work_dir)
 
         if self._is_claude:
             # Dormant seam — see method docstring. Binary resolution only; the
@@ -3166,22 +3398,48 @@ class AcpClient:
             global _claude_acp_argv_cache  # noqa: PLW0603
             if _claude_acp_argv_cache is _UNRESOLVED:
                 _claude_acp_argv_cache = await asyncio.to_thread(_resolve_claude_acp_bin)
-            claude_argv = _claude_acp_argv_cache
+            cached_claude_resolution = _claude_acp_argv_cache
+            claude_argv, acp_search_path = (
+                cached_claude_resolution
+                if isinstance(cached_claude_resolution, tuple)
+                else (None, "")
+            )
             if not isinstance(claude_argv, list) or not claude_argv:
                 raise AcpError(
-                    f"{CLAUDE_ACP_BIN} not found. Install it with "
+                    f"{CLAUDE_ACP_BIN} not found "
+                    f"({describe_search_path(acp_search_path)}). Install it with "
                     f"'npm i -g {CLAUDE_ACP_NPM_PKG}' (or add it as a project "
-                    f"dependency), or set CLAUDE_AGENT_ACP_BIN to its entry "
-                    f"script."
+                    f"dependency), or set CLAUDE_AGENT_ACP_BIN to its entry script."
                 )
             argv: list[str] = claude_argv
         else:
+            # Pin ONE reading of the environment for both the search and the
+            # message that reports it. The previous code resolved against the live
+            # ``os.environ`` and then, on failure, recomputed the directory set
+            # from a FRESH read -- so a PATH change landing in that window (a
+            # concurrent installer, a self-update, anything editing the gateway's
+            # environment) produced a "not found" message naming directories that
+            # were never searched, while omitting ones that were. #5048 already
+            # solved this for the Claude adapter by caching the search path WITH
+            # the resolution result; this is the same guarantee for the Kiro
+            # sibling, which it left recomputing.
+            spawn_environ = dict(os.environ)
+            spawn_home = Path.home()
             try:
-                kiro_bin = await _resolve_kiro_bin_for_spawn()
+                kiro_bin = await _resolve_kiro_bin_for_spawn(environ=spawn_environ, home=spawn_home)
             except _KiroExecutableTrustError as exc:
                 raise AcpError(str(exc)) from exc
             if not kiro_bin:
-                raise AcpError(f"{KIRO_CLI_BIN} not found in PATH")
+                # Pure function of the arguments, so this reproduces exactly the
+                # set the resolution above walked. Still off-loop: it expands the
+                # inherited PATH.
+                raise AcpError(
+                    await asyncio.to_thread(
+                        kiro_cli_not_found_message,
+                        environ=spawn_environ,
+                        home=spawn_home,
+                    )
+                )
             # Self-heal (B): ensure the managed default agent file exists before
             # this --agent spawn, so kiro-cli registers the mode and step 4's
             # set_mode succeeds instead of faulting "Mode not found". Best-effort,
@@ -3200,11 +3458,12 @@ class AcpClient:
         # Crew's seatbelt on macOS and grants Windows's Kiro-only delegation in
         # favour of the harness's own internal sandbox, so a harness without one
         # must never be granted it by the absence of another harness.
-        argv, self._sandbox_cleanup = wrap_argv(
+        argv, self._sandbox_cleanup = await wrap_argv_async(
             argv,
             mode=self._sandbox_mode,
             strip_python_env=True,
             is_kiro_cli=self.backend in ACP_BACKENDS_INTERNAL_SANDBOX,
+            _prepare=wrap_argv,
         )
         # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
@@ -3271,6 +3530,14 @@ class AcpClient:
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
         env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
+        # Own browser session per agent process: the CLI resolves a nameless
+        # command to one shared ``default`` browser, so without this two agents
+        # navigate and close each other's pages (see browser_session_env).
+        browser_env = browser_session_env(env)
+        env.update(browser_env)
+        if browser_env:
+            lifecycle_env = {**os.environ, **browser_env}
+            env.update(await self._to_thread_guarding_sandbox(browser_socket_env, lifecycle_env))
         # Per-process scratch containment (#5063) -- see acp/runtime.py's
         # twin block. Allocated off-loop, fail-open; owner recorded after
         # spawn; reclamation is liveness-keyed, never age-keyed.
@@ -3307,22 +3574,37 @@ class AcpClient:
         # stops an inherited Ctrl-C propagating into the gateway. The flag comes
         # from platform_compat (getattr) so referencing it doesn't fail mypy's
         # [attr-defined] check on Linux where subprocess.* lacks it.
-        self._process = await create_subprocess_limited(
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(self._work_dir),
-            limit=_STDOUT_BUFFER_LIMIT,
-            env=env,
-            start_new_session=platform_compat.IS_POSIX,
-            creationflags=(
-                platform_compat.CREATE_NEW_PROCESS_GROUP
-                | platform_compat._SUBPROCESS_NO_WINDOW
-                | platform_compat.CREATE_SUSPENDED
-            ),
-            profile=RLIMIT_PROFILE_SESSION_HOST,
-        )
+        await self._discard_bound_workspace()
+        if self.backend in ACP_BACKENDS_INTERNAL_SANDBOX:
+            self._spawn_work_dir, self._bound_workspace_fd = (
+                await bind_voice_safe_agent_workspace_async(self._work_dir)
+            )
+        try:
+            self._process = await create_subprocess_limited(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self._spawn_work_dir,
+                limit=_STDOUT_BUFFER_LIMIT,
+                env=env,
+                start_new_session=platform_compat.IS_POSIX,
+                creationflags=(
+                    platform_compat.CREATE_NEW_PROCESS_GROUP
+                    | platform_compat._SUBPROCESS_NO_WINDOW
+                    | platform_compat.CREATE_SUSPENDED
+                ),
+                # None off macOS, where nothing binds. When set, the child enters
+                # the workspace through this verified descriptor instead of
+                # resolving ``cwd``'s pathname, which a same-UID symlink retarget
+                # could aim elsewhere in between.
+                chdir_fd=self._bound_workspace_fd,
+                profile=RLIMIT_PROFILE_SESSION_HOST,
+            )
+        except BaseException:
+            await self._discard_bound_workspace()
+            self._discard_sandbox_cleanup()
+            raise
         self._pid = self._process.pid
         _spawn_label = (
             "claude-agent-acp" if self._is_claude else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
@@ -3412,7 +3694,7 @@ class AcpClient:
                 exc_info=True,
             )
             try:
-                await self._kill_process(force=True)
+                await self._cleanup_failed_live_spawn()
             except Exception:
                 logger.warning(
                     "Cleanup kill after a failed spawn did not complete for PID %s",
@@ -3643,6 +3925,13 @@ class AcpClient:
         # replacement process, so release it with the oracle it sampled into.
         self._retire_liveness_state()
         self._session_id = None
+        # The adapter's cumulative cost counter is in-process: a replacement
+        # process restarts it at zero, so the delta baseline must restart with
+        # it or spend up to the old total is silently dropped — the monotonic
+        # guard only catches a counter that has NOT yet caught back up to the
+        # stale baseline. The current turn's already-billed delta is kept;
+        # carry_over() zeroes it at the next turn boundary.
+        self.last_prompt_stats.cost_session_usd = 0.0
         self._buffer.clear()
         self._stderr_lines.clear()
         if self._stderr_task and not self._stderr_task.done():
@@ -3722,14 +4011,14 @@ class AcpClient:
         rather than loop. Returns the session/new response dict (possibly still
         without a sessionId, which the caller treats as a hard failure).
 
-        The claude-backed substitution retry path is the dormant ``_is_claude``
-        seam (kiro-cli never emits this advisory); the public core drives only
-        kiro-cli, so ``mcpServers`` stays ``[]`` and the settings re-seed is
-        best-effort via ``getattr`` — the deleted cc_agent glue is re-added by
-        the internal companion, not the public core.
+        The substitution retry is a claude-only path (kiro-cli never emits this
+        advisory). On a build that does not override ``_claude_session_mcp_servers``,
+        ``mcpServers`` stays ``[]`` and the settings re-seed is best-effort via
+        ``getattr``: the re-seed helper is an edition override, so the base client
+        must tolerate its absence rather than assume it.
         """
         new_params: dict = {
-            "cwd": str(self._work_dir),
+            "cwd": await self._session_work_dir(),
             # kiro-cli loads servers from --agent; claude-agent-acp must be
             # told here -- it does not read kirocrew.mcp.json on its own. The
             # Default hook returns [] (kiro-cli path unchanged); an internal
@@ -3749,7 +4038,12 @@ class AcpClient:
 
         self._last_substitution_model = None
         session_id = await self._send_request(METHOD_SESSION_NEW, new_params)
-        session_resp = await self._wait_for_response(session_id, timeout=_INIT_TIMEOUT)
+        session_resp = await self._wait_for_response(
+            session_id,
+            timeout=_INIT_TIMEOUT,
+            method=METHOD_SESSION_NEW,
+            expected_mcp=new_params.get("mcpServers"),
+        )
 
         # Happy path: a real session came back.
         if session_resp.get("sessionId"):
@@ -3774,9 +4068,8 @@ class AcpClient:
             self._model = substitute
             # Re-seed settings.local.json so the fresh SettingsManager the adapter
             # builds for the retry resolves the substitute model (it merges
-            # settings sources each session/new). The re-seed helper lives in the
-            # internal companion's cc_agent glue; guard so the public core (which
-            # never reaches this dormant _is_claude branch) does not AttributeError.
+            # settings sources each session/new). The re-seed helper is an edition
+            # override, so guard for its absence rather than assume it exists.
             _reseed = getattr(self, "_write_claude_local_settings", None)
             if callable(_reseed):
                 try:
@@ -3791,7 +4084,12 @@ class AcpClient:
                     logger.warning("re-seed of settings.local.json failed", exc_info=True)
             self._last_substitution_model = None
             retry_id = await self._send_request(METHOD_SESSION_NEW, new_params)
-            session_resp = await self._wait_for_response(retry_id, timeout=_INIT_TIMEOUT)
+            session_resp = await self._wait_for_response(
+                retry_id,
+                timeout=_INIT_TIMEOUT,
+                method=METHOD_SESSION_NEW,
+                expected_mcp=new_params.get("mcpServers"),
+            )
 
         return session_resp
 
@@ -3860,7 +4158,7 @@ class AcpClient:
                 try:
                     load_params: dict = {
                         "sessionId": resume_sid,
-                        "cwd": str(self._work_dir),
+                        "cwd": await self._session_work_dir(),
                         # kiro-cli gets its servers via --agent; the claude
                         # backend must receive them here (it does not read
                         # kirocrew.mcp.json itself). Default [] leaves kiro-cli
@@ -3878,7 +4176,12 @@ class AcpClient:
                     else:
                         load_params["_meta"] = {"_kiro.dev/session_file": session_file}
                     load_id = await self._send_request(METHOD_SESSION_LOAD, load_params)
-                    load_resp = await self._wait_for_response(load_id, timeout=_INIT_TIMEOUT)
+                    load_resp = await self._wait_for_response(
+                        load_id,
+                        timeout=_INIT_TIMEOUT,
+                        method=METHOD_SESSION_LOAD,
+                        expected_mcp=load_params.get("mcpServers"),
+                    )
                     if "modes" in load_resp:
                         self._session_id = resume_sid
                         self._resumed = True
@@ -4011,6 +4314,7 @@ class AcpClient:
             for attempt in range(2):
                 try:
                     if self._process and self._process.returncode is not None:
+                        await self._discard_bound_workspace()
                         self._reset_state()
 
                     if not self._process:
@@ -4030,7 +4334,7 @@ class AcpClient:
                 except (AcpTimeoutError, AcpError, OSError) as exc:
                     if attempt == 0:
                         logger.warning("ACP init failed (%s), retrying with fresh process...", exc)
-                        await self._kill_process(force=True)
+                        await self._cleanup_failed_live_spawn()
                         self._reset_state()
                         # The agent CLI is one binary shared by every process on
                         # the host, and its self-updater replaces it in place, so
@@ -4047,7 +4351,7 @@ class AcpClient:
                         _startup_outcome = (
                             "auth_required" if isinstance(exc, AcpAuthRequired) else "error"
                         )
-                        await self._kill_process(force=True)
+                        await self._cleanup_failed_live_spawn()
                         self._reset_state()
                         raise
         finally:
@@ -4090,6 +4394,7 @@ class AcpClient:
         try:
             await self._kill_process(force=True)
         finally:
+            await self._discard_bound_workspace()
             self._reset_state()  # untracks all PIDs (root + children)
 
     # ── JSON-RPC Transport ──
@@ -4471,7 +4776,14 @@ class AcpClient:
             params=data.get("params"),
         )
 
-    async def _wait_for_response(self, req_id: int, timeout: float = 50.0) -> dict:
+    async def _wait_for_response(
+        self,
+        req_id: int,
+        timeout: float = 50.0,
+        *,
+        method: str = "",
+        expected_mcp: object = None,
+    ) -> dict:
         """Block until a JSON-RPC response matching *req_id* arrives.
 
         Explicitly classifies JSON-RPC 2.0 messages with the same method-aware
@@ -4516,13 +4828,21 @@ class AcpClient:
         self._claude_dispatch_depth += 1
         try:
             return await self._wait_for_response_inner(
-                req_id, deadline, hard_deadline, timeout
+                req_id, deadline, hard_deadline, timeout,
+                method=method, expected_mcp=expected_mcp,
             )
         finally:
             self._claude_dispatch_depth = max(0, self._claude_dispatch_depth - 1)
 
     async def _wait_for_response_inner(
-        self, req_id: int, deadline: float, hard_deadline: float, timeout: float
+        self,
+        req_id: int,
+        deadline: float,
+        hard_deadline: float,
+        timeout: float,
+        *,
+        method: str = "",
+        expected_mcp: object = None,
     ) -> dict:
         """The read loop of :meth:`_wait_for_response`, split so the dispatch
         claim above is released on every exit path including a raise."""
@@ -4605,7 +4925,64 @@ class AcpClient:
             deferred.append(msg)
 
         _reinject()
-        raise AcpTimeoutError()
+        label = method or f"request {req_id}"
+        message = f"ACP {label} timed out after {timeout:.0f}s"
+        if method in {METHOD_SESSION_NEW, METHOD_SESSION_LOAD}:
+            progress = self._mcp_timeout_progress(expected_mcp)
+            if progress:
+                message += f" ({progress})"
+        raise AcpTimeoutError(message=message)
+
+    def _mcp_timeout_progress(self, expected: object) -> str:
+        """Summarize the MCP notifications buffered during a stalled session start."""
+
+        def clean(value: object, cap: int = 64) -> str:
+            text, _ = redact_exfiltration_urls(str(value or ""))
+            text, _ = redact_credentials(text)
+            return "".join(ch for ch in " ".join(text.split()) if ch.isprintable())[:cap]
+
+        roster = [
+            clean(item.get("name"))
+            for item in (expected if isinstance(expected, list) else [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+        ready: set[str] = set()
+        failed: dict[str, str] = {}
+        auth: set[str] = set()
+        for msg in self._mcp_notifications:
+            params = msg.params if isinstance(msg.params, dict) else {}
+            name = clean(params.get("serverName") or params.get("name"))
+            if not name:
+                continue
+            if msg.is_method(METHOD_MCP_SERVER_INITIALIZED):
+                ready.add(name)
+            elif msg.is_method(METHOD_MCP_SERVER_INIT_FAILURE):
+                failed[name] = clean(params.get("error"), 120)
+            elif msg.is_method(METHOD_MCP_OAUTH_REQUEST):
+                auth.add(name)
+
+        def names(values: list[str]) -> str:
+            head = values[:8]
+            suffix = f" (+{len(values) - 8} more)" if len(values) > 8 else ""
+            return ", ".join(head) + suffix
+
+        reported = ready | set(failed)
+        parts = (
+            [f"{len(reported & set(roster))}/{len(roster)} MCP server(s) reported"]
+            if roster
+            else []
+        )
+        missing = [name for name in roster if name not in reported]
+        if missing:
+            parts.append(f"no report from {names(missing)}")
+        if failed:
+            parts.append(
+                "failed: "
+                + names([f"{name} ({error})" if error else name for name, error in failed.items()])
+            )
+        if auth:
+            parts.append(f"awaiting authorization: {names(sorted(auth))}")
+        return "; ".join(parts)
 
     async def _drain_notifications(
         self,
@@ -4840,14 +5217,62 @@ class AcpClient:
             # clear the active turn's tracked consult and so allow a second walk
             # while the first is still pending.
             self._retire_liveness_state()
+            self._compaction_failed_at = None
+            self._compaction_failed_turn = False
             deadline = time.monotonic() + timeout
             consecutive_empty = 0
             last_data_ts = time.monotonic()
+            # Consumer park accounting (mirrors AcpSessionHandle._dispatch_events):
+            # the interval between this generator's yield and its resume is
+            # CONSUMER time — a human approval prompt parks the whole generator
+            # chain at that yield — so the post-compaction-failure idle clock
+            # below must subtract it or a long approval wait reads as backend
+            # silence and the budget reaps a live turn. `parked_at_data`
+            # snapshots the accumulator when `last_data_ts` is taken, so only
+            # park time accrued SINCE the last frame is excluded.
+            parked_total = 0.0
+            parked_at_data = 0.0
 
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
+
+                # Post-compaction-failure budget: a `failed` status arrived and the
+                # backend has since gone silent past the budget, so no prompt
+                # response or end_turn is coming. Stop reading so _dispatch_events
+                # ends the turn explicitly and the runner releases the slot,
+                # instead of draining to `deadline` (hours).
+                #
+                # SUSPENDED while a tool is in flight: kiro-cli can recover from a
+                # failed compaction and dispatch a tool, and a legitimately silent
+                # long tool (a build, a spawned subagent) would then be reaped at
+                # 60s — killing valid work that the tool-stall watchdog already
+                # governs on its own, much longer, liveness-gated budget. A tool
+                # dispatch is positive evidence the turn is alive, so this budget
+                # hands off to _TOOL_STALL_TIMEOUT and re-arms when the tool
+                # resolves (_tool_dispatched cleared in _dispatch_events).
+                #
+                # Clock asymmetry with AcpSessionHandle's twin is INTENTIONAL: this
+                # path owns a dedicated process, so every frame is its own and the
+                # park accounting below is what it needs; the shared-runtime twin
+                # instead needs session-attributable frames (a co-tenant's fanout
+                # must not defer the reap). Keep both when touching either.
+                if self._compaction_failed_at is not None and not self._tool_dispatched:
+                    _compact_idle = max(
+                        0.0,
+                        (time.monotonic() - max(self._compaction_failed_at, last_data_ts))
+                        - max(0.0, parked_total - parked_at_data),
+                    )
+                    if _compact_idle > _COMPACTION_FAILED_TURN_BUDGET:
+                        logger.warning(
+                            "Compaction failed for req %d and no prompt response "
+                            "arrived for %.0fs — ending the turn.",
+                            req_id,
+                            _compact_idle,
+                        )
+                        self._compaction_failed_turn = True
+                        return
 
                 msg = await self._read_message(timeout=min(remaining, _READ_TIMEOUT))
                 if msg is None:
@@ -4949,6 +5374,7 @@ class AcpClient:
 
                 consecutive_empty = 0
                 last_data_ts = time.monotonic()
+                parked_at_data = parked_total
                 # NB: do NOT clear _tool_dispatched here.  The last_data_ts reset
                 # above already prevents false positives for tools that stream
                 # progress frames (each frame restarts the _TOOL_STALL_TIMEOUT
@@ -4961,7 +5387,16 @@ class AcpClient:
                 self.last_prompt_stats.event_count += 1
 
                 action = self._process_message(msg, req_id)
-                yield action, msg
+                # Single yield chokepoint: everything downstream (dispatch,
+                # chat runner, a human answering an approval card) runs while
+                # this generator is suspended here, so the whole gap is
+                # consumer time. `finally` so an abandoned generator's
+                # GeneratorExit still closes the park.
+                _parked_since = time.monotonic()
+                try:
+                    yield action, msg
+                finally:
+                    parked_total += max(0.0, time.monotonic() - _parked_since)
         finally:
             # Release the inbox claim before the lock, so a frame arriving in
             # the gap is routed as between-turn work rather than queued for a
@@ -5058,6 +5493,7 @@ class AcpClient:
                     result = msg.result or {}
                     if isinstance(result, dict):
                         reason = result.get("stopReason", "") or ""
+                    self._track_prompt_usage(result)
                     self._last_stop_reason = reason
                     self._turn_done.set()
                     return
@@ -5152,6 +5588,7 @@ class AcpClient:
                 reason = ""
                 if isinstance(result, dict):
                     reason = result.get("stopReason", "") or ""
+                self._track_prompt_usage(result)
                 if extract_agent_from_result and isinstance(result, dict):
                     # commands/execute returns output in result fields,
                     # not via session/update chunks — yield as text.
@@ -5177,7 +5614,7 @@ class AcpClient:
                 yield AcpEvent(
                     kind=EVENT_COMPLETE,
                     stop_reason=reason,
-                    usage=TurnUsage(credits=self.last_prompt_stats.credits),
+                    usage=self.last_prompt_stats.to_turn_usage(),
                 )
                 return
             if action == "error":
@@ -5226,7 +5663,7 @@ class AcpClient:
                             yield tr_event
                         yield AcpEvent(
                             kind=EVENT_COMPLETE,
-                            usage=TurnUsage(credits=self.last_prompt_stats.credits),
+                            usage=self.last_prompt_stats.to_turn_usage(),
                         )
                         return
                 tool_event = self._scrub_provider_child_tool_event(
@@ -5300,6 +5737,11 @@ class AcpClient:
                 status = params.get("status", {})
                 status_type = status.get("type", "") if isinstance(status, dict) else str(status)
                 summary = params.get("summary", "")
+                if status_type == "failed":
+                    # The notice reads AcpEvent.title, and `summary` is empty on
+                    # failure — carry the notification's own reason so the row
+                    # stops collapsing to "unknown error".
+                    summary = compaction_failure_detail(params)
                 yield AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)
             elif action == "clear":
                 yield AcpEvent(kind=EVENT_CLEAR_STATUS)
@@ -5427,6 +5869,21 @@ class AcpClient:
         if not got_complete:
             self._last_stop_reason = ""
             self._turn_done.set()
+            if self._compaction_failed_turn:
+                # Compaction failed and the turn was abandoned by the backend.
+                # Terminate explicitly — checked BEFORE the stale-turn branch so
+                # a turn that had streamed text does not report a normal
+                # end_turn, and before AcpTimeoutError so callers get the real
+                # cause. The user-facing notice is already appended by the
+                # compaction-status path; this only ends the turn.
+                self._compaction_failed_turn = False
+                self._last_stop_reason = STOP_REASON_COMPACTION_FAILED
+                yield AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason=STOP_REASON_COMPACTION_FAILED,
+                    usage=self.last_prompt_stats.to_turn_usage(),
+                )
+                return
             # If text was streamed, this is a stale turn (kiro-cli finished
             # but never sent `result`).  Yield a synthetic complete so callers
             # finalize normally instead of showing a timeout error.
@@ -5438,7 +5895,7 @@ class AcpClient:
                 yield AcpEvent(
                     kind=EVENT_COMPLETE,
                     stop_reason=STOP_REASON_END_TURN,
-                    usage=TurnUsage(credits=self.last_prompt_stats.credits),
+                    usage=self.last_prompt_stats.to_turn_usage(),
                 )
                 return
             raise AcpTimeoutError()
@@ -5759,6 +6216,7 @@ class AcpClient:
                 result = msg.result or {}
                 if isinstance(result, dict):
                     reason = result.get("stopReason", "") or ""
+                self._track_prompt_usage(result)
                 self._last_stop_reason = reason
                 self._turn_done.set()
                 return "".join(output)
@@ -6006,12 +6464,31 @@ class AcpClient:
                 self.last_prompt_stats.note_pct_reported()
             else:
                 logger.debug("usage_update missing used/size: %s", update)
+            # Session-cumulative billing cost (claude seam); kiro never sends
+            # the key so this is None on the kiro path. Delta'd per turn on
+            # the stats object (monotonic guard lives there).
+            cost = parse_usage_cost(update)
+            if cost is not None:
+                self.last_prompt_stats.apply_cost_cumulative(cost)
         elif kind == UPDATE_CONFIG_OPTION:
             self._handle_config_option_update(msg)
         elif kind == UPDATE_AVAILABLE_COMMANDS:
             self._handle_available_commands_update(msg)
         elif self._is_claude and kind and kind not in KNOWN_SESSION_UPDATES:
             logger.debug("Unhandled session update type: %s", kind)
+
+    def _track_prompt_usage(self, result: Any) -> None:
+        """Fold a PromptResponse's turn-scoped token counts into the stats.
+
+        The claude-agent-acp adapter reports per-turn token counts on the
+        prompt response; kiro-cli's response carries only ``stopReason``, so
+        ``parse_prompt_token_usage`` returns None there and the stats are
+        untouched (harness parity). Validation lives at that shared
+        chokepoint, mirroring ``_track_usage_update``.
+        """
+        tokens = parse_prompt_token_usage(result)
+        if tokens is not None:
+            self.last_prompt_stats.apply_prompt_token_usage(*tokens)
 
     async def _maybe_audit_tool_call(self, tool_event: "AcpEvent") -> None:
         """Emit a per-tool-call SEL audit for clients with no external audit loop.
@@ -6411,6 +6888,10 @@ class AcpClient:
                 tool_call_id=tool_call_id,
                 raw_tool_params=raw_input if isinstance(raw_input, dict) else None,
                 is_shell=is_shell,
+                # Identity and its provenance flag both come from
+                # ``trusted_mcp_identity`` above: it is the one place that knows
+                # WHICH source supplied the pair, so re-deriving trust from
+                # non-emptiness here could disagree with it.
                 tool_name=_tool_name,
                 mcp_server_name=_mcp_server_name,
                 mcp_identity_trusted=_mcp_identity_trusted,
@@ -6769,7 +7250,12 @@ class AcpClient:
         s_type = status.get("type", "") if isinstance(status, dict) else str(status)
         if s_type == "failed":
             logger.warning("Compaction failed — raw notification params: %s", params)
+            # Arm the bounded post-failure wait (see
+            # _COMPACTION_FAILED_TURN_BUDGET): kiro-cli may never answer the
+            # prompt this compaction was for.
+            self._compaction_failed_at = time.monotonic()
         elif s_type == "completed":
+            self._compaction_failed_at = None
             self.last_prompt_stats.reset_after_compaction()
 
     async def wait_for_compaction(self, timeout: float = COMPACT_WAIT_TIMEOUT_SECS) -> dict:

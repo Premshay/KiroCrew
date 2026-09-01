@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -50,7 +51,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import hooks, platform_compat
+from kiro_crew import hooks, identity_stores, platform_compat
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent_files import AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
@@ -64,6 +65,7 @@ from kiro_crew.sandbox import (
     SandboxUnavailableError,
     resource_limit_supervisor_argv,
     sandboxed_spawn_argv,
+    shielded_prepare_off_loop,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -193,7 +195,7 @@ _AUTH_STORE_READ_ERROR = "Kiro identity file could not be read safely"
 # "no such table: history" on first use. Copying every table's DDL (and indexes)
 # while withholding non-identity ROWS keeps the CLI's queries valid and still
 # hands the sandboxed process no transcript content.
-_AUTH_SQLITE_DB = "data.sqlite3"
+_AUTH_SQLITE_DB = identity_stores.AUTH_SQLITE_DB
 _AUTH_IDENTITY_TABLES = ("auth_kv", "migrations")
 # `state` is a mixed key/value table: a few rows describe WHICH identity is signed
 # in (Identity Center region + start URL, CodeWhisperer profile) and the rest is
@@ -448,6 +450,17 @@ class _AuthStoreMapping:
     source: Path
     staged_relative: Path
     filenames: tuple[str, ...]
+    # Mappings sharing a group are ALTERNATE locations of ONE store, only one of
+    # which a given host uses. Staging must abort when a matched store cannot be
+    # read, because a staged home with no identity looks signed-out -- but that
+    # rule is right per LOCATION and wrong across alternates, where a stale
+    # leftover in the root this host abandoned would abort staging from the root
+    # it actually uses. Within a group the abort is therefore deferred: it fires
+    # only when NO alternate yielded an identity. ``None`` means "not an
+    # alternate of anything" and keeps the strict per-location rule -- the AWS
+    # SSO cache is a single location holding several token files, and losing any
+    # one of those must still abort.
+    group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -790,64 +803,6 @@ def _atomic_write_secret_bytes(path: Path, content: bytes) -> None:
     atomic_write(path, content, fsync=True, restrict_to_owner=True)
 
 
-def _store_write_time(db: Path) -> float:
-    """Newest write across a store's main file and its WAL sidecar.
-
-    The store runs in SQLite WAL mode: a commit lands in the ``-wal`` sidecar
-    and the main file's mtime does not advance until a checkpoint, so the main
-    file alone under-reports recency on exactly the side being written. The
-    ``-shm`` index file is not consulted -- it is mapped shared memory, not a
-    write record. Raises ``OSError`` if the main file vanished; a missing
-    sidecar is normal (checkpointed or non-WAL store).
-    """
-
-    newest = db.stat().st_mtime
-    wal = db.with_name(db.name + "-wal")
-    try:
-        newest = max(newest, wal.stat().st_mtime)
-    except OSError:
-        pass
-    return newest
-
-
-def _win32_identity_store_path(home: Path) -> Path:
-    """Pick between the Local anchor and the legacy Roaming store on Windows.
-
-    Current kiro-cli writes ``AppData/Local/kiro-cli``; older layouts used
-    ``AppData/Roaming/kiro-cli``. When only one store exists it is the store.
-    When BOTH exist, the most recently written one wins: an upgraded host
-    carries a stale Roaming leftover next to its live Local store (upgrades do
-    not clean up the old directory), while a downgraded host writes Roaming
-    next to a stale Local leftover -- and preferring either fixed side reads
-    the leftover on the other shape, yielding a confident fingerprint of an
-    account nobody is signed into. Reporting both-present as absent instead
-    would silently disable identity tracking on every upgraded host, the
-    common shape. The mtime signal is as trustworthy as the stores
-    themselves: both paths sit inside the ``_SENSITIVE_HOME_DIRS`` fence, so
-    anything that could move their timestamps could already author the rows
-    outright -- no new forgeable surface. Equal timestamps prefer Local, the
-    current layout.
-    """
-
-    local = home / "AppData" / "Local" / "kiro-cli" / _AUTH_SQLITE_DB
-    roaming = home / "AppData" / "Roaming" / "kiro-cli" / _AUTH_SQLITE_DB
-    if not roaming.exists():
-        return local
-    if not local.exists():
-        return roaming
-    try:
-        # Recency is per STORE, not per file: in WAL mode a commit advances
-        # the -wal sidecar while the main file's mtime stays frozen until a
-        # checkpoint, so each side reports the newest of the pair.
-        if _store_write_time(roaming) > _store_write_time(local):
-            return roaming
-    except OSError:
-        # A store vanished between the existence probe and the stat; the
-        # Local anchor is the current layout and the safe default.
-        pass
-    return local
-
-
 def kiro_identity_store_path(
     platform_name: str,
     home: Path,
@@ -875,8 +830,9 @@ def kiro_identity_store_path(
     directory (``AppData/Local/kiro-cli``); older layouts used the roaming one
     (``AppData/Roaming/kiro-cli``). When only one store exists it is chosen;
     when both exist the most recently written one wins, so a leftover from
-    the other layout never masks the live store's account (see
-    :func:`_win32_identity_store_path`). Both anchors sit inside the
+    the other layout never masks the live store's account (the WAL-aware
+    mtime tie-break lives in :func:`identity_stores.selected_store`). Both
+    anchors sit inside the
     ``_SENSITIVE_HOME_DIRS`` fence, so neither choice widens what an agent
     can forge. This branch stats the filesystem, so callers on the event loop
     should resolve the path inside the same worker thread as the read itself.
@@ -888,11 +844,7 @@ def kiro_identity_store_path(
     that genuinely requires it does not change every call site.
     """
 
-    if platform_name == "darwin":
-        return home / "Library" / "Application Support" / "kiro-cli" / _AUTH_SQLITE_DB
-    if platform_name == "win32":
-        return _win32_identity_store_path(home)
-    return home / ".local" / "share" / "kiro-cli" / _AUTH_SQLITE_DB
+    return identity_stores.selected_store(platform_name, home)
 
 
 def identity_store_is_relocated(
@@ -930,24 +882,33 @@ def identity_store_is_relocated(
     :meth:`KiroPrerequisiteService.current_identity_fingerprint` makes it
     diagnosable. A variable set to exactly the default location is not a
     relocation.
+
+    The (variable, default root) pairs are PROJECTED from
+    :data:`identity_stores.IDENTITY_STORE_ROOTS` -- each kiro-cli row's
+    ``env_var`` against the parent of its home-relative directory -- so this
+    check learns about a new or relocated store row the same way the fence,
+    staging, and state-db discovery do. macOS falls out naturally: its rows
+    carry no ``env_var`` (no standard variable relocates
+    ``~/Library/Application Support``), so no pair is checked there.
     """
 
-    if platform_name == "win32":
-        for variable, default in (
-            ("LOCALAPPDATA", home / "AppData" / "Local"),
-            ("APPDATA", home / "AppData" / "Roaming"),
+    plat = (
+        identity_stores.Platform(platform_name)
+        if platform_name in ("darwin", "win32")
+        else identity_stores.Platform.POSIX
+    )
+    for root in identity_stores.IDENTITY_STORE_ROOTS:
+        if (
+            root.platform is not plat
+            or root.product is not identity_stores.Product.KIRO_CLI
+            or root.env_var is None
         ):
-            configured = environ.get(variable, "").strip()
-            if configured and Path(configured) != default:
-                return True
-        return False
-    if platform_name == "darwin":
-        # No standard variable relocates ~/Library/Application Support.
-        return False
-    configured = environ.get("XDG_DATA_HOME", "").strip()
-    if not configured:
-        return False
-    return Path(configured) != home / ".local" / "share"
+            continue
+        default = home.joinpath(*root.home_relative_dir.split("/")).parent
+        configured = environ.get(root.env_var, "").strip()
+        if configured and Path(configured) != default:
+            return True
+    return False
 
 
 def identity_fingerprint(path: Path) -> str:
@@ -1084,7 +1045,17 @@ def _auth_store_mappings(
     home: Path,
     environ: MutableMapping[str, str],
 ) -> tuple[_AuthStoreMapping, ...]:
-    """Return only Kiro identity stores, never the surrounding credential dirs."""
+    """Return only Kiro identity stores, never the surrounding credential dirs.
+
+    Built over the canonical :func:`identity_stores.store_mappings` projection so
+    the source directories, the env-var source-side honouring
+    (``LOCALAPPDATA`` / ``APPDATA`` / ``XDG_DATA_HOME``), the fixed staged side,
+    and the Local-before-Roaming ordering all come from the single table. This
+    wrapper keeps staging's own concerns: the ``.aws/sso/cache`` token mapping
+    (not an identity store, so not in the table), the ``_AuthStoreMapping`` shape
+    with ``filenames=_AUTH_SQLITE_FILES``, and the ``win32:{app}`` group that
+    defers the abort across a product's two alternate AppData roots.
+    """
 
     mappings = [
         _AuthStoreMapping(
@@ -1093,36 +1064,25 @@ def _auth_store_mappings(
             filenames=("kiro-auth-token*.json",),
         )
     ]
-    app_names = ("kiro-cli", "amazon-q")
-    if platform_name == "darwin":
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=home / "Library" / "Application Support" / app_name,
-                    staged_relative=Path("Library") / "Application Support" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
+    for row in identity_stores.store_mappings(platform_name, home, environ):
+        # Both AppData roots of one Windows product are alternates: only one is
+        # this host's live store, so a stale leftover in the unused root must
+        # not abort staging from the used one. A shared group defers the abort
+        # across them; distinct ``staged_relative`` values (from the table) keep
+        # them from overwriting each other. macOS/Linux have a single location
+        # per product, so no group. (The env-var source-side honouring and the
+        # fixed staged side are already applied by ``store_mappings``.)
+        group = (
+            f"win32:{row.product.value}" if platform_name == "win32" else None
+        )
+        mappings.append(
+            _AuthStoreMapping(
+                source=row.source,
+                staged_relative=row.staged_relative,
+                filenames=_AUTH_SQLITE_FILES,
+                group=group,
             )
-    elif platform_name == "win32":
-        local_app_data = Path(environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=local_app_data / app_name,
-                    staged_relative=Path("AppData") / "Local" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
-            )
-    else:
-        data_home = Path(environ.get("XDG_DATA_HOME") or home / ".local" / "share")
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=data_home / app_name,
-                    staged_relative=Path(".local") / "share" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
-            )
+        )
     return tuple(mappings)
 
 
@@ -1176,7 +1136,13 @@ def _prepare_auth_workspace(
             platform_compat.chmod_safe(str(root), 0o700)
         else:
             platform_compat.restrict_dir_to_owner(str(root))
+        # Deferred aborts, keyed by group: a group records its failure and is
+        # judged only after every alternate has been attempted.
+        group_staged: dict[str, bool] = {}
+        group_failed: dict[str, str] = {}
         for mapping in _auth_store_mappings(platform_name, home, environ):
+            if mapping.group is not None:
+                group_staged.setdefault(mapping.group, False)
             for pattern in mapping.filenames:
                 for source in mapping.source.glob(pattern):
                     staged_path = root / mapping.staged_relative / source.name
@@ -1184,14 +1150,34 @@ def _prepare_auth_workspace(
                     # every other identity file is a small JSON token copied
                     # under the bounded byte rules. Both abort staging on
                     # failure — never omit a matched store as though absent.
+                    # For a mapping in a GROUP the abort is deferred to the
+                    # group verdict below, because the alternates of one store
+                    # are not each independently required.
                     if source.name == _AUTH_SQLITE_DB:
                         if not _project_identity_database(source, staged_path):
-                            raise OSError(_AUTH_STORE_READ_ERROR)
+                            if mapping.group is None:
+                                raise OSError(_AUTH_STORE_READ_ERROR)
+                            group_failed[mapping.group] = _AUTH_STORE_READ_ERROR
+                            continue
+                        if mapping.group is not None:
+                            group_staged[mapping.group] = True
                         continue
                     content = _read_bounded_regular_file(source)
                     if content is None:
-                        raise OSError(_AUTH_STORE_READ_ERROR)
+                        if mapping.group is None:
+                            raise OSError(_AUTH_STORE_READ_ERROR)
+                        group_failed[mapping.group] = _AUTH_STORE_READ_ERROR
+                        continue
                     _atomic_write_secret_bytes(staged_path, content)
+                    if mapping.group is not None:
+                        group_staged[mapping.group] = True
+
+        # A group that had a readable store in ANY of its alternates is staged.
+        # A group whose every matched store failed is the signed-out-looking
+        # case the strict rule exists for, so it still aborts.
+        for group, message in group_failed.items():
+            if not group_staged.get(group, False):
+                raise OSError(message)
 
         env = dict(base_env)
         env.update(
@@ -1487,12 +1473,14 @@ async def _prepare_sandboxed_spawn(
 ) -> tuple[list[str], dict[str, str], str | None]:
     """Prepare filesystem-heavy sandbox state on a worker thread.
 
-    Cancellation waits for preparation to settle so a launcher/profile created
-    by the worker is still removed instead of becoming an untracked temp file.
+    Delegates to the shared :func:`shielded_prepare_off_loop`, which owns the
+    shield-and-recover pattern (including the repeat-cancellation semantics of
+    #5841) for every async caller of the chokepoint.  The chokepoint call itself
+    stays in this module so the ``mode``/``strip_python_env`` policy — and this
+    module's own seam over ``sandboxed_spawn_argv`` — remain local.
     """
-
-    task = asyncio.create_task(
-        asyncio.to_thread(
+    return await shielded_prepare_off_loop(
+        functools.partial(
             sandboxed_spawn_argv,
             argv,
             mode=mode,
@@ -1502,38 +1490,6 @@ async def _prepare_sandboxed_spawn(
             extra_visible_dirs=extra_visible_dirs,
         )
     )
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # A repeat cancellation landing on a bare recovery ``await`` is a
-        # ``BaseException``: it would escape a ``suppress(Exception)`` guard
-        # before the unlink runs, leaking the materialized launcher (#5841).
-        # The settle-then-unlink therefore runs as its own task, shielded
-        # from cancellations aimed at this caller; each absorbed repeat is
-        # ``uncancel()``-ed so an enclosing ``asyncio.timeout`` still reports
-        # ``TimeoutError``, and the ORIGINAL cancellation is re-raised once
-        # the launcher is gone.
-        async def _settle_then_unlink() -> None:
-            cleanup_path: str | None = None
-            with contextlib.suppress(Exception, asyncio.CancelledError):
-                _, _, cleanup_path = await task
-            await _unlink_off_loop(cleanup_path)
-
-        current = asyncio.current_task()
-        recovery = asyncio.create_task(_settle_then_unlink())
-        while not recovery.done():
-            try:
-                await asyncio.shield(recovery)
-            except asyncio.CancelledError:
-                uncancel = getattr(current, "uncancel", None)  # 3.11+
-                if uncancel is not None:
-                    uncancel()
-            except Exception:
-                logger.warning(
-                    "sandbox launcher cleanup failed after cancellation",
-                    exc_info=True,
-                )
-        raise
 
 
 async def _run_process(

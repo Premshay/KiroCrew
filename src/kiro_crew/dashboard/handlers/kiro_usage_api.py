@@ -92,6 +92,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from kiro_crew import hooks
+from kiro_crew.identity_stores import Trust, sqlite_dbs
 
 logger = logging.getLogger(__name__)
 
@@ -164,21 +165,21 @@ _JSON_TOKEN_READ_IDS = (
 # ``~/Library/Application Support`` on macOS, both matching the entries
 # above). ``AppData/Roaming`` is retained for layouts that used the roaming
 # location; a path that does not exist on the running host is inert.
-_CLI_SQLITE_DBS = (
-    Path.home() / ".local" / "share" / "kiro-cli" / "data.sqlite3",
-    Path.home() / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3",
-    Path.home() / "AppData" / "Local" / "kiro-cli" / "data.sqlite3",
-    Path.home() / "AppData" / "Roaming" / "kiro-cli" / "data.sqlite3",
-)
+_CLI_SQLITE_DBS = sqlite_dbs(Trust.TRUSTED)
 
 # Auth stores belonging to OTHER products (amazon-q). Readable, and often the same
 # account, but NOT kiro-cli's own credential — so a token from here can only be
 # used when a matching profile ARN proves the account independently. It can never
 # satisfy the source-anchored path.
-_OTHER_SQLITE_DBS = (
-    Path.home() / ".local" / "share" / "amazon-q" / "data.sqlite3",
-    Path.home() / "Library" / "Application Support" / "amazon-q" / "data.sqlite3",
-)
+#
+# The Windows entries mirror the kiro-cli tuple above rather than stopping at the
+# POSIX layouts: the fence (``_SENSITIVE_HOME_DIRS``) and sign-in staging both
+# already name ``AppData/{Local,Roaming}/amazon-q``, so omitting them here made
+# an amazon-q token unreadable for usage on exactly the platform where it is
+# fenced -- a store every writer treats as a secret and this reader treats as
+# absent. Untrusted either way (``from_cli_store=False``), so this widens what
+# can be READ for credit reporting, never what is believed.
+_OTHER_SQLITE_DBS = sqlite_dbs(Trust.OTHER)
 _SQLITE_TOKEN_KEYS = ("kirocli:odic:token", "codewhisperer:odic:token", "kirocli:social:token", "kirocli:external-idp:token")
 
 # SEL audit label for the SQLite live-token read. Not an allowlist entry (that

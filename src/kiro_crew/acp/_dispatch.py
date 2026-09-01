@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from kiro_crew import mcp_apps_render
 from kiro_crew.acp.types import (
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -787,6 +788,33 @@ def build_permission_event(
         if isinstance(_inline, dict):
             _resolved_raw_params = _inline
 
+    # Trusted MCP server + tool identity recovered from the preceding tool_call
+    # (the permission payload carries no _meta). .get() (not .pop()) mirrors the
+    # is_shell cache: a later tool_call_update for the same id re-reads it; the
+    # per-turn dispatch .clear() handles cleanup. Empty on a miss (fail-closed
+    # for the app-own-server auto-approve). The tool name lets the app-own-server
+    # auto-approve govern the canonical mcp__<server>__<tool> on the permission
+    # path.
+    _cached_server = (
+        mcp_server_name_cache.get(_ck)
+        if (mcp_server_name_cache is not None and tool_call_id)
+        else None
+    )
+    _cached_tool = (
+        tool_name_cache.get(_ck) if (tool_name_cache is not None and tool_call_id) else None
+    )
+    _mcp_server_name = _cached_server or ""
+    _tool_name = _cached_tool or ""
+    # Explicit identity-provenance flag (mirrors _raw_params_trusted): True iff
+    # BOTH cache reads above actually HIT — a written entry may legitimately be
+    # "" for a non-MCP tool, so the hit is distinguished from a miss by the
+    # None default, never by the value. Deliberately derived from the reads
+    # themselves, not from cache availability or non-emptiness: a future
+    # inline fallback populating the identity fields from the permission
+    # payload would leave this False and fail closed in
+    # AcpEvent.child_mcp_identity_trusted.
+    _mcp_identity_trusted = _cached_server is not None and _cached_tool is not None
+
     event = AcpEvent(
         kind=EVENT_PERMISSION_REQUEST,
         request_id=request_id,
@@ -800,23 +828,9 @@ def build_permission_event(
         tool_call_id=tool_call_id,
         raw_tool_params=_resolved_raw_params,
         is_shell=is_shell,
-        # Trusted MCP server identity recovered from the preceding tool_call
-        # (the permission payload carries no _meta). .get() (not .pop()) mirrors
-        # the is_shell cache: a later tool_call_update for the same id re-reads
-        # it; the per-turn dispatch .clear() handles cleanup. Empty on a miss
-        # (fail-closed for the app-own-server auto-approve).
-        mcp_server_name=(
-            mcp_server_name_cache.get(_ck, "")
-            if (mcp_server_name_cache is not None and tool_call_id)
-            else ""
-        ),
-        # Trusted tool identity recovered from the preceding tool_call, mirroring
-        # mcp_server_name above. Lets the app-own-server auto-approve govern the
-        # canonical mcp__<server>__<tool> on the permission path (no _meta here).
-        # Empty on a miss (fail-closed: no trusted tool name → no auto-approve).
-        tool_name=(
-            tool_name_cache.get(_ck, "") if (tool_name_cache is not None and tool_call_id) else ""
-        ),
+        mcp_server_name=_mcp_server_name,
+        tool_name=_tool_name,
+        mcp_identity_trusted=_mcp_identity_trusted,
     )
     return event, recorded
 
@@ -937,6 +951,10 @@ def _build_tool_call_event(
         # Trusted identity from adapter-owned metadata, never the display title.
         tool_name=_tool_name,
         mcp_server_name=_mcp_server_name,
+        # The flag travels with the pair from ``trusted_mcp_identity`` rather
+        # than being re-derived from non-emptiness here: that function is the
+        # one place that knows WHICH source supplied the identity, and a second
+        # rule at the call site could disagree with it.
         mcp_identity_trusted=_mcp_identity_trusted,
         diff_old_text=_diff_old_text,
         diff_path=_diff_path,
@@ -1021,7 +1039,19 @@ def _build_tool_result_event(update: dict[str, Any]) -> AcpEvent | None:
                                 output_parts.append(json.dumps(j, default=str)[:4000])
     if not output_parts:
         return None
-    final_output = _redact("\n".join(output_parts)[:8000])
+    joined = "\n".join(output_parts)
+    final_output = _redact(joined[:8000])
+    # An MCP App render marker lives at offset 0 of its own text part, but the
+    # 8000-char join cut is applied to the CONCATENATION of all parts: when the
+    # marker part is preceded by other (up to 4000-char) parts, its offset in
+    # the joined string can exceed 8000 and the slice drops it, so
+    # ``mcp_apps_render.find_marker`` never sees it and the app never mounts.
+    # If the pre-slice text carried a marker that the slice removed, re-inject
+    # it at offset 0 so it stays under any cut and remains detectable. The
+    # marker is a fixed control token, not sensitive, so it needs no redaction.
+    marker_match = mcp_apps_render.MARKER_RE.search(joined)
+    if marker_match and mcp_apps_render.find_marker(final_output) is None:
+        final_output = f"{marker_match.group(0)} {final_output}"
     return AcpEvent(
         kind=EVENT_TOOL_RESULT,
         tool_call_id=tool_use_id,
@@ -1439,6 +1469,73 @@ def parse_usage_update(update: dict[str, Any]) -> tuple[int | float | None, int 
     return _token_count(used), _token_count(size)
 
 
+def parse_usage_cost(update: dict[str, Any]) -> float | None:
+    """Parse a ``usage_update``'s session-cumulative cost into a validated float.
+
+    The claude-agent-acp adapter reports billing as ``cost: {amount, currency}``
+    on ``usage_update`` (session-cumulative). kiro-cli never sends the key, so
+    the kiro path always reads None here. Same defensive posture as
+    ``parse_usage_update`` (the other consumer of this frame): the value comes
+    straight from the agent process, so a malformed shape (non-dict cost,
+    str/list/bool amount, NaN/Infinity, negative) must degrade to "absent",
+    never raise inside the prompt-turn dispatch path. Both consumers store
+    the result in USD-denominated fields, so a present ``currency`` other
+    than exact ``"USD"`` (ISO 4217 uppercase; an absent currency is accepted
+    for adapters that omit it) also degrades the whole cost to absent rather
+    than mislabeling a non-USD amount as USD. Flat-primary with a nested
+    ``update.usage.cost`` fallback, mirroring ``parse_usage_update``.
+    """
+    if not isinstance(update, dict):
+        return None
+    cost = update.get("cost")
+    if cost is None:
+        nested = update.get("usage")
+        if isinstance(nested, dict):
+            cost = nested.get("cost")
+    if not isinstance(cost, dict):
+        return None
+    currency = cost.get("currency")
+    if currency is not None and currency != "USD":
+        logger.debug("acp usage cost: non-USD currency %s, dropping cost", repr(currency)[:40])
+        return None
+    amount = _token_count(cost.get("amount"))
+    if amount is None or amount < 0:
+        return None
+    return float(amount)
+
+
+def parse_prompt_token_usage(result: Any) -> tuple[int, int, int, int] | None:
+    """Parse a PromptResponse's turn-scoped token counts.
+
+    The claude-agent-acp adapter reports per-turn token counts on the prompt
+    RESPONSE (``inputTokens`` / ``outputTokens`` / ``cachedReadTokens`` /
+    ``cachedWriteTokens``); kiro-cli's response carries only ``stopReason``.
+    Returns ``(input, output, cache_read, cache_write)`` with each field
+    validated via ``_token_count`` (bool excluded, finite) plus non-negative,
+    coerced to int; an absent or malformed field reads 0. Returns None when
+    NONE of the four keys is present, so the kiro path never touches the
+    per-turn stats (harness parity: byte-identical behavior for a backend
+    that sends no token counts). Flat-primary with a nested ``result.usage``
+    fallback, mirroring ``parse_usage_update``'s dual-shape read.
+    """
+    if not isinstance(result, dict):
+        return None
+    nested = result.get("usage")
+    nested = nested if isinstance(nested, dict) else {}
+    keys = ("inputTokens", "outputTokens", "cachedReadTokens", "cachedWriteTokens")
+    if not any(k in result or k in nested for k in keys):
+        return None
+
+    def _count(key: str) -> int:
+        value = result.get(key, nested.get(key))
+        n = _token_count(value)
+        if n is None or n < 0:
+            return 0
+        return int(n)
+
+    return _count(keys[0]), _count(keys[1]), _count(keys[2]), _count(keys[3])
+
+
 # Re-export the method names so callers can use a single import site for the
 # kiro handshake (mode/model) requests alongside the param builders.
 __all__ = [
@@ -1450,6 +1547,8 @@ __all__ = [
     "build_permission_event",
     "parse_session_update",
     "parse_usage_update",
+    "parse_usage_cost",
+    "parse_prompt_token_usage",
     "parse_text_chunk",
     "make_unified_diff",
     "select_tool_title",

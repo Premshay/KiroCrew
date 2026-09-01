@@ -47,6 +47,7 @@ from kiro_crew.discord.renderer import (
     DiscordApprovalDecider,
     DiscordRenderer,
     build_model_components,
+    session_provenance_tag,
 )
 from kiro_crew.discord.session_resume import (
     DiscordSessionResume,
@@ -59,7 +60,11 @@ from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
 from kiro_crew.messaging.attachments import IngestLimits
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
 from kiro_crew.messaging.commands import stop_running_turn
-from kiro_crew.messaging.dispatch import build_directive_consumer, delivery_is_muted
+from kiro_crew.messaging.dispatch import (
+    build_auto_approve,
+    build_directive_consumer,
+    delivery_is_muted,
+)
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -73,9 +78,11 @@ from kiro_crew.messaging.link import (
 from kiro_crew.messaging.renderer import Renderer, SilentRenderer
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.messaging.upload_gate import live_dashboard_slot, uploads_restricted
+from kiro_crew.monitoring.completion import MonitorCompletionHook
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 from kiro_crew.stats import Stats
 
@@ -123,6 +130,36 @@ _MAX_COLLAPSED_ATTACHMENTS = IngestLimits().max_attachments
 #: Everything else targets a session or is a plain turn and must be refused until
 #: the user has been told — including a bare message, whose ``cmd`` is ``None``.
 _DETACH_EXEMPT_COMMANDS = frozenset({"new", "unlink", "sessions", "help", "status"})
+
+#: Refusal for an option press whose provenance tag does not name the
+#: conversation's CURRENT target session (rebound, `!new`, or idle-rotated).
+#: One constant, two gate sites (pre-busy and post-rotation), so the wording
+#: cannot drift between them.
+_STALE_OPTIONS_REFUSAL = (
+    "🔘 These buttons belong to a conversation this chat has since moved away "
+    "from, so your choice was NOT applied. Type it as a message instead, or "
+    "run `!sessions` to reattach the session that asked."
+)
+
+#: Refusal for a pre-provenance button (bare ``opt:<i>``): Discord replays old
+#: components indefinitely, so an untagged press can never prove which session
+#: it belongs to — fail closed rather than route it by current binding.
+_UNTAGGED_OPTIONS_REFUSAL = (
+    "🔘 These buttons predate a session-safety update, so which conversation "
+    "they belong to can no longer be verified and your choice was NOT applied. "
+    "Type it as a message instead."
+)
+
+#: Refusal for a valid press whose target session is mid-turn. A press must
+#: never be queued or steered: the busy queue stores bare text and the drain
+#: replays it WITHOUT the provenance tag, so a `!new` or idle rotation between
+#: enqueue and drain would execute the model-authored choice in a conversation
+#: the tag never named. Refusing is the only shape that keeps the provenance
+#: guarantee end to end.
+_BUSY_OPTIONS_REFUSAL = (
+    "🔘 That conversation is busy with another turn, so your choice was NOT "
+    "applied. Type it as a message once the turn finishes."
+)
 
 # How long a !model picker stays pressable, and how many pickers are retained.
 # Both bound unbounded growth (one entry per press-less !model), they are not UX
@@ -225,8 +262,41 @@ class DiscordDispatcher:
         *,
         drain: bool = True,
         interpret_commands: bool = True,
+        origin_tag: str = "",
+        monitor_completion: MonitorCompletionHook | None = None,
     ) -> None:
-        """Drive one authorized inbound message through TurnDriver end-to-end."""
+        """Drive one authorized inbound message through TurnDriver end-to-end.
+
+        ``interpret_commands`` says whether *text* may execute as a command
+        (model-authored text never may). Resume routing is consulted when
+        ``interpret_commands`` is true OR the turn carries an ``origin_tag`` —
+        the tag implies routing, because validating it requires resolving the
+        binding to compare keys. The callers that dispatch with commands off
+        and no tag DEPEND on the skip: a queue drain replays messages that were
+        accepted for the native session while it was busy (a resumed session's
+        busy turn refuses instead of queueing, so a drained item's affinity is
+        native by construction), and an AutoNudge fire targets the native key
+        its loop resolved and rotation-checked — routing either into a binding
+        created later would run them in a session that never queued or armed
+        them. An ``[OPTIONS:]`` press dispatches with commands off but a
+        non-empty tag: the buttons were rendered on the bound session's own
+        reply, so the choice belongs to that session even though its label must
+        not execute as a command.
+
+        ``origin_tag`` is the provenance stamp a pressed option button carried
+        (see :func:`~kiro_crew.discord.renderer.session_provenance_tag`). When
+        non-empty, the turn runs ONLY if the session it resolves to is the one
+        that posted the buttons — checked before the busy path (so a stale press
+        cannot be queued and replayed tag-less) and AGAIN after idle/daily
+        rotation (so it cannot run under a generation the tag never named).
+        Discord replays old components indefinitely, so without this check a
+        button minted by one session would inject its model-authored choice into
+        whatever session the conversation was later rebound to (`!unlink` +
+        `!sessions`), or into a post-`!new` conversation that never asked the
+        question. An option press ALWAYS supplies a tag: untagged
+        (pre-provenance) presses are refused at the interaction boundary in
+        :meth:`on_interaction`, never dispatched here.
+        """
         assert self.client is not None, "DiscordDispatcher.client must be set"
         channel_id = msg.conversation_id
         self._routing_checks[channel_id] = self._routing_checks.get(channel_id, 0) + 1
@@ -269,7 +339,8 @@ class DiscordDispatcher:
         # destroyed they would compact or cancel the NATIVE DM session while the user
         # believes they drive the resumed one; deciding here makes that structural.
         route = RoutingDecision()
-        if interpret_commands and cmd not in _DETACH_EXEMPT_COMMANDS:
+        wants_routing = interpret_commands or bool(origin_tag)
+        if wants_routing and cmd not in _DETACH_EXEMPT_COMMANDS:
             async with self._routing_turn(channel_id) as queued:
                 route = await self._session_resume.route(channel_id)
                 if route.refusal is not None:
@@ -373,7 +444,28 @@ class DiscordDispatcher:
         # second resolver call let an unlink landing mid-decision route silently.
         resumed_key = route.resumed_key
         session_key = resumed_key or self._session_key(user_id, thread_id)
+        if origin_tag and session_provenance_tag(session_key) != origin_tag:
+            # The pressed button was minted by a session this conversation no
+            # longer targets (rebound via `!unlink`+`!sessions`, or rotated via
+            # `!new`). Running it would inject that session's model-authored
+            # choice into an unrelated transcript. The gate sits BEFORE the busy
+            # check so a stale press can neither run nor be QUEUED — `_handle_busy`
+            # enqueues raw text, and the drain replays it without the tag, so a
+            # queued stale press would execute unchecked later.
+            await self.client.send_message(channel_id, _STALE_OPTIONS_REFUSAL)
+            return
         if self.sessions.is_busy(session_key):
+            if origin_tag:
+                # A tagged press must never enter the busy path: `_handle_busy`
+                # enqueues BARE TEXT and the drain replays it without the tag,
+                # so a `!new` or idle rotation between enqueue and drain would
+                # execute the choice in a conversation the tag never named —
+                # and steer mode would inject it mid-turn with no check at all.
+                # Refuse instead; the user can re-press or type once the turn
+                # ends. This also covers the resumed-busy case below, with a
+                # press-specific remedy instead of the typed-message one.
+                await self.client.send_message(channel_id, _BUSY_OPTIONS_REFUSAL)
+                return
             if resumed_key is not None:
                 # Do NOT queue or steer into a resumed session's running turn.
                 # ``_drain_queue`` is only ever called from the tail of a
@@ -398,6 +490,16 @@ class DiscordDispatcher:
             daily_reset_hour=self.cfg.messaging.daily_reset_hour,
         )
         session_key = resumed_key or self._session_key(user_id, thread_id)
+        if origin_tag and session_provenance_tag(session_key) != origin_tag:
+            # REVALIDATE against the FINAL key: ``maybe_rotate`` above can bump
+            # the native generation between the pre-busy gate and here, and the
+            # turn must not run under a key the tag never named — the same
+            # invariant `!new` enforces, applied to the idle/daily reset. The
+            # pre-busy gate is kept too: it is what stops a stale press from
+            # being enqueued or probing busy state, which this later check
+            # cannot do.
+            await self.client.send_message(channel_id, _STALE_OPTIONS_REFUSAL)
+            return
         chan_id = f"discord:{channel_id}" if thread_id else f"discord:{user_id}"
         agent = self._resolve_agent()
         if resumed_key is not None:
@@ -598,12 +700,10 @@ class DiscordDispatcher:
                 out_renderer,
                 approval_mode=self.approval_mode,
                 decider=decider,
-                auto_approve_tool=lambda title: bool(
-                    self.ctx_builder
-                    and self.ctx_builder.hooks
-                    and self.ctx_builder.hooks.auto_approve_subagent_spawn
-                    and title == "spawn_run"
-                ),
+                # Preserve the auto_approve_subagent_spawn hook for spawn_run.
+                # The shared builder keys on canonical event identity
+                # (tool_name/is_shell), never the model-authored title.
+                auto_approve_tool=build_auto_approve(self.ctx_builder),
                 # The operator's process-wide grant, read per permission request --
                 # the same predicate every other shipped channel passes. Without it
                 # Discord is the one surface where arming YOLO from the dashboard is
@@ -619,6 +719,10 @@ class DiscordDispatcher:
                 directive_consumer=build_directive_consumer(
                     session_key=session_key, sessions=self.sessions, dispatcher=self
                 ),
+                audit_session_key=session_key,
+                audit_agent=agent or "kirocrew",
+                closing_gate=lambda: self.sessions.begin_turn(session_key),
+                monitor_completion=monitor_completion,
             )
             accumulated = await driver.run(full_message)
 
@@ -689,6 +793,16 @@ class DiscordDispatcher:
                 )
             except Exception:
                 logger.debug("Discord: success audit failed", exc_info=True)
+        except SessionClosingError:
+            # Shutdown began between the claim and the dispatch, so no turn ever
+            # opened. Caught ahead of the generic handler so a restart is not
+            # charged to the circuit breaker via `record_failure`, which is not
+            # true of a session that never misbehaved. The `finally` still
+            # finalizes the renderer and releases the lease.
+            logger.info(
+                "Discord: aborting dispatch for %s — gateway is shutting down",
+                session_key,
+            )
         except Exception:
             logger.exception("Discord transport_dispatch: error handling message")
             if _acquired:
@@ -877,12 +991,6 @@ class DiscordDispatcher:
         await self._queue.flip_answering_locked(
             session_key, self._receipt_surface(channel_id), answered, deferred
         )
-
-    async def _receipt_finish_cancelled_locked(self, session_key: str, channel_id: str) -> None:
-        """Finalize the receipt to a "🛑 Cancelled" record, if present. Caller
-        MUST hold ``self._queue.lock``."""
-        assert self.client is not None
-        await self._queue.finish_cancelled_locked(session_key, self._receipt_surface(channel_id))
 
     def _receipt_surface(self, channel_id: str) -> ReceiptSurface:
         """A receipt surface with this channel's address already bound."""
@@ -1102,12 +1210,21 @@ class DiscordDispatcher:
             await self.client.edit_message(itx.channel_id, itx.message_id, outcome, components=[])
             return
 
-        # [OPTIONS:] choice: "opt:<i>" — label recovered from the button text.
+        # [OPTIONS:] choice: "opt:<i>:<origin-tag>" — label recovered from the
+        # button text. A bare "opt:<i>" is a pre-provenance button; Discord
+        # replays old components indefinitely, so its originating session can
+        # never be verified — refuse it here, fail closed, before any echo
+        # suggests the choice was sent.
         if data.startswith("opt:"):
+            parts = data.split(":", 2)
+            origin_tag = parts[2] if len(parts) == 3 else ""
             choice_text = itx.label
             # Retire the buttons but KEEP the original answer text intact —
             # a components-only PATCH leaves the content unchanged.
             await self.client.edit_message_components(itx.channel_id, itx.message_id, [])
+            if not origin_tag:
+                await self.client.send_message(itx.channel_id, _UNTAGGED_OPTIONS_REFUSAL)
+                return
             if not choice_text:
                 await self.client.send_message(
                     itx.channel_id,
@@ -1132,7 +1249,20 @@ class DiscordDispatcher:
             # user was waiting on. Same rule and same reason as the queue drain, which
             # replays with commands off so a queued `!new` reaches the model as
             # literal text instead of executing.
-            await self.handle_message(synthetic, interpret_commands=False)
+            # UNLIKE the drain, the press still resolves the resumed binding: the
+            # buttons sit on the bound session's own reply, so the choice is that
+            # session's turn content — its non-empty `origin_tag` is what routes
+            # it (see ``handle_message``). Without routing the press ran in the
+            # NATIVE DM session — the click answered a question nobody asked
+            # there, while the bound session kept waiting (and if the binding died
+            # in between, routing now surfaces the Detached refusal instead of a
+            # silent native turn). The tag also closes the remaining window: the
+            # resolved target must BE the session that posted these buttons.
+            await self.handle_message(
+                synthetic,
+                interpret_commands=False,
+                origin_tag=origin_tag,
+            )
 
     # ── Public injection surface ────────────────────────────────────────────
     # Contract for out-of-band callers (AutoNudge fire path, the REST create

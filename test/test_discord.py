@@ -50,6 +50,7 @@ from kiro_crew.discord.renderer import (
     _extract_options,
     _strip_steering,
     build_option_components,
+    session_provenance_tag,
 )
 from kiro_crew.discord.transport import (
     DISCORD_CAPABILITIES,
@@ -70,6 +71,7 @@ from kiro_crew.messaging.queue_receipt import receipt_text as _receipt_text
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session import _opt_out_key
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -98,6 +100,24 @@ class MultipartFake:
         return await self.send_message(  # type: ignore[attr-defined]
             channel_id, text, components=components, reply_to_message_id=reply_to_message_id
         )
+
+    async def send_document(
+        self,
+        channel_id: str,
+        document: Any,
+        *,
+        caption: Any = None,
+        reply_to_message_id: Any = None,
+    ) -> str | None:
+        """Record the destination alongside the file: the document verb routes a
+        thread to its own channel id, which is the part a caller can get wrong."""
+        getattr(self, "uploads", []).append(("document", [document]))
+        getattr(self, "documents", []).append((channel_id, document, caption))
+        if getattr(self, "raise_uploads", False):
+            raise RuntimeError("document send exploded")
+        if getattr(self, "fail_uploads", False):
+            return None
+        return await self.send_message(channel_id, caption or "")  # type: ignore[attr-defined]
 
     async def edit_message_with_files(
         self,
@@ -135,6 +155,8 @@ class FakeClient(MultipartFake):
         self.attachment_bodies: dict[str, bytes] = {}
         self.attachment_downloads: list[str] = []
         self.uploads: list[tuple[str, list[Any]]] = []
+        #: (channel_id, document, caption) per name-preserving document send.
+        self.documents: list[tuple[str, Any, Any]] = []
         self.edit_ok = True
         #: When set, every send returns None, which is what the real client does
         #: for a revoked token or a dead network.
@@ -312,6 +334,10 @@ class FakeSessions:
         self.last_model: Any = None
         self.last_provider: Any = None
         self.raise_on_get = raise_on_get
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self._busy = False
         self._has = True
         self.queued: list = []
@@ -347,6 +373,12 @@ class FakeSessions:
         # rather than merely handing on something.
         self.last_provider = FakeProvider()
         return self.last_provider, True, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key: str, channel: str) -> None:
         return None
@@ -1022,6 +1054,17 @@ class TestOptionComponents:
         total = sum(len(r["components"]) for r in comps)
         assert total == 25
 
+    def test_origin_tag_suffixes_every_custom_id(self) -> None:
+        """The provenance tag rides the custom_id; bare ids are the legacy shape.
+
+        ``opt:<i>:<tag>`` is what the press-side gate parses back out, so the
+        two halves meet exactly here.
+        """
+        comps = build_option_components(["a", "b"], "deadbeefcafe")
+        assert comps is not None
+        ids = [b["custom_id"] for row in comps for b in row["components"]]
+        assert ids == ["opt:0:deadbeefcafe", "opt:1:deadbeefcafe"]
+
 
 class TestExtractOptions:
     def test_no_options(self) -> None:
@@ -1656,6 +1699,16 @@ class TestRenderer:
         labels = [b["label"] for row in comps for b in row["components"]]
         assert labels == ["A", "B"]
         assert "[OPTIONS" not in cli.final_text()
+        # The sealed row is PROVENANCE-STAMPED with this renderer's session key —
+        # the producer half of the stale-press fix. Without this pin, reverting
+        # the call sites to untagged build_option_components(opts) keeps the
+        # whole suite green while every new button falls back to the legacy
+        # current-binding path, silently reopening cross-session injection.
+        ids = [b["custom_id"] for row in comps for b in row["components"]]
+        assert ids == [
+            f"opt:0:{session_provenance_tag('sk')}",
+            f"opt:1:{session_provenance_tag('sk')}",
+        ]
 
     @pytest.mark.asyncio
     async def test_long_options_before_streamed_steer_ack_become_buttons(self) -> None:
@@ -2158,6 +2211,42 @@ class TestDispatcher:
         await d.handle_message(self._msg("hello world"))
         assert "Answer: hello world" in (cli.final_text() or "")
         assert sess.successes and sess.released
+        # Pins that the pre-dispatch closing gate is consulted on the normal
+        # path, so it cannot be dropped or renamed into a no-op unnoticed.
+        assert sess.begin_turns == 1
+
+    @pytest.mark.asyncio
+    async def test_a_shutdown_between_the_claim_and_the_dispatch_never_opens_the_turn(
+        self,
+    ) -> None:
+        """The lease-dispatch race gate.
+
+        ``get_or_create`` guards the CLAIM, but the turn only opens at
+        ``driver.run``, and the context build between them is wide enough for a
+        gateway restart to land in. Opening a turn then registers it behind the
+        drain snapshot ``close_all`` has already taken, so it is killed
+        mid-flight holding its native lock and reaches the user as an empty
+        response instead of this channel's notice.
+        """
+        d, cli, sess = _dispatcher({"u1"})
+        # get_or_create deliberately ignores `closing`, so the CLAIM still
+        # succeeds here. That is the race being pinned: a refused claim was
+        # always handled, an accepted claim whose DISPATCH loses was not.
+        sess.closing = True
+
+        await d.handle_message(self._msg("hello world"))
+
+        assert "Answer: hello world" not in (
+            cli.final_text() or ""
+        ), "the turn must not open behind close_all's drain snapshot"
+        assert sess.begin_turns == 1
+        # A restart is neither a success nor a session fault: charging it to the
+        # circuit breaker would count toward resetting a session that never
+        # misbehaved.
+        assert not sess.successes
+        assert not sess.failures
+        # Refused is not leaked -- the session-keyed semaphore still comes back.
+        assert sess.released
 
     @pytest.mark.asyncio
     async def test_cold_start_failure_releases_nothing_but_closes_renderer(
@@ -3006,7 +3095,8 @@ class TestInteractions:
     @pytest.mark.asyncio
     async def test_option_choice_reinjects_as_turn(self) -> None:
         d, cli, sess = _dispatcher({"u1"})
-        await d.on_interaction(self._itx("opt:0", label="Choice A"))
+        tag = session_provenance_tag(d.current_session_key("u1"))
+        await d.on_interaction(self._itx(f"opt:0:{tag}", label="Choice A"))
         # Buttons retired without clobbering the answer text.
         assert cli.component_edits == [("m1", [])]
         # Choice echoed as a quote, then answered as a fresh turn.
@@ -3016,9 +3106,19 @@ class TestInteractions:
         )
 
     @pytest.mark.asyncio
+    async def test_untagged_option_press_fails_closed(self) -> None:
+        """A pre-provenance button press is refused — its origin is unprovable."""
+        d, cli, sess = _dispatcher({"u1"})
+        await d.on_interaction(self._itx("opt:0", label="Choice A"))
+        assert cli.component_edits == [("m1", [])]
+        assert any("predate" in t for t, _ in cli.sent)
+        assert sess.successes == []
+
+    @pytest.mark.asyncio
     async def test_option_without_label_asks_to_type(self) -> None:
         d, cli, _ = _dispatcher({"u1"})
-        await d.on_interaction(self._itx("opt:0", label=""))
+        tag = session_provenance_tag(d.current_session_key("u1"))
+        await d.on_interaction(self._itx(f"opt:0:{tag}", label=""))
         assert any("type it instead" in t for t, _ in cli.sent)
 
 
@@ -3499,7 +3599,7 @@ class TestOptionChoiceIsNeverACommand:
                 channel_id="c1",
                 user_id="u1",
                 message_id="m1",
-                custom_id="opt:0",
+                custom_id=f"opt:0:{session_provenance_tag(before)}",
                 label="!new",
             )
         )

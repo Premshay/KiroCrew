@@ -162,6 +162,21 @@ The dashboard does **not** flow through `TurnDriver`; it remains unchanged as th
 | `EVENT_COMPACTION_STATUS` | `COMPACTION` |
 | `EVENT_COMPLETE` | `DONE` |
 
+An optional structured-monitor completion hook is orthogonal to rendering. It
+is invoked exactly from the `EVENT_COMPLETE` branch when its reason is safe
+completion evidence, before buffered output, steering, redaction, or `DONE` is
+flushed to the renderer, with the event's `TurnUsage` and a disposition derived
+from its stop reason. ACP's stale-stream compatibility completion reuses
+`end_turn`, so that reason remains uncharged until the event carries provenance
+that distinguishes it from a provider result. Completion accounting therefore
+survives failure or cancellation during renderer finalization. A normal handler
+return, command intercept, stream exception, or ACP-synthesized terminal does not
+manufacture completion evidence. Callback failure is logged and cannot
+change the channel turn's output or error behavior. The hook is absent from ordinary inbound turns
+and legacy AutoNudge turns. Slack reports a raw completion before its cancellable,
+best-effort analytics usage-row write, so cancellation after `EVENT_COMPLETE` cannot
+leave an accepted monitor wake in flight.
+
 ### Approval ladder
 
 Four modes (constants, mirroring the native Slack + dashboard ladder):
@@ -175,8 +190,28 @@ Four modes (constants, mirroring the native Slack + dashboard ladder):
 
 Two injected predicates take precedence over the ladder (both checked per permission request, and both auto-approve immediately — no buttons, no decider wait):
 
-- `auto_approve_tool: (tool_title) -> bool` — hook-driven auto-approve (e.g. `spawn_run` via the context builder's `auto_approve_subagent_spawn` hook). Reason logged as `hook_auto_approve`.
+- `auto_approve_tool: (permission_event) -> bool` — hook-driven auto-approve (e.g. `spawn_run` via the context builder's `auto_approve_subagent_spawn` hook). The predicate receives the whole PERMISSION EVENT — never just the title, which is model-authored — and keys on canonical identity only (`hooks.event_is_spawn_run`: `tool_name` == `spawn_run` with the `mcp_identity_trusted` provenance flag, served by `CORE_MCP_SERVER`; no title fallback — an event without canonical identity falls to the ladder below). Reason logged as `hook_auto_approve`.
 - `auto_approve_session: () -> bool` — honors the auto-approve grant without the driver importing any channel module. Reason logged as `session_trust`. **Every shipped channel passes it**, and for a decider-less one it is the ONLY rung. Webex, WeCom, iLink (weixin), iMessage, Discord and Teams pass the same `() -> safety_override().is_active()`, the ONE process-global grant the dashboard toggle drives. Telegram passes `safety_override().is_active() or is_session_trusted(session_key)`, because it offers a Trust button and so needs the per-session grant as well; the grant it reads is the SHARED `messaging/session_trust` one, which is the distinction that matters here. Slack is the outlier, passing a narrower channel-local `is_slack_session_trusted`. **A new channel should follow the seven, not Slack.** A channel-local trusted set is a SECOND grant: its own lifetime, its own audit trail, and its own way to disagree with the dashboard about whether auto-approve is on — and "is YOLO on?" has to have one answer. Omitting the keyword entirely is not a neutral default either: it makes arming YOLO from the dashboard INERT on that channel, so an unattended run still stops on every tool prompt with nobody there to answer, which is how Discord shipped until it was enrolled.
+
+**A `tool_gate` `"auto_approve"` verdict for a shell command is name-grant
+verified before it is honoured.** The gate's hook grants by program NAME
+(`auto_approve_tools` globs, the read-only allowlist), and the shell resolves
+that name again through a `PATH` that can lead with agent-writable directories.
+The driver therefore awaits `name_grant.refusal_for_event(event)` at the honour
+point — the one place shared by every channel's gate, chosen because each
+channel's `_tool_gate` is synchronous and loop-bound while the check does
+filesystem work — and on a refusal DOWNGRADES to the ladder below (never a hard
+block), logging `outcome=auto_approve_declined` with `reason=name_grant`, the
+refusal code, and `tier=hook_auto_approve`. On Windows the check cannot model
+the shell's lookup at all, so it declines every name-based shell grant there —
+a channel turn without a decider then falls to deny-by-default for shell tools
+its `auto_approve_tools` used to grant. Non-shell verdicts and the two
+full-trust predicates above are not name-based grants and are unchanged. The
+`APPROVAL_TRUST_READS` rung is also unchanged and deliberately out of this
+check's scope: it keys on `event.tool_kind`, never on a program name — a
+kind-based grant with its own (weaker) trust model, unlike the dashboard's
+trust-reads tier, which classifies the command by program name via
+`is_read_only_bash` and is therefore name-grant verified there.
 
 **Teams has a decider AND the shared predicate, and that combination is the
 pattern.** It renders Adaptive Card approvals, so it passes a real `decider`; it
@@ -1426,7 +1461,7 @@ The extraction is gated by a **golden-transcript** harness (`test/test_slack_gol
 
 ## Slack settings API
 
-Three dashboard-only endpoints back the `/settings?tab=channels&channel=slack` panel (legacy `?tab=slack` links redirect there). They are
+Three dashboard-only endpoints back the `/settings/channels/slack` panel (legacy `?tab=channels&channel=slack` and `?tab=slack` links redirect there). They are
 registered in the dashboard route block (NOT `_register_mcp_routes`, which is
 also mounted on the token-less API-only server) so they always sit behind
 dashboard token auth.
@@ -1518,12 +1553,28 @@ under the 2000-char cap, splitting ordinary text with the shared
 and holding local-image markup for secure multipart extraction at the semantic
 steer/final seal. It rotates messages at the shared driver's structured steer
 boundaries with quote chips, renders trailing `[OPTIONS:]` as button action rows
-(`opt:<i>`, label recovered from the component at interaction time), and posts
+(`opt:<i>:<tag>`, label recovered from the component at interaction time; `<tag>`
+is `session_provenance_tag()` — a 12-hex SHA-256 digest of the session key the
+buttons were rendered for), and posts
 Approve/Deny buttons for interactive tool approvals. Approval `custom_id`s carry a
 per-prompt random nonce (`a:<request_id>:<nonce>:<1|0>`) validated at
 resolution: ACP request IDs are reusable across provider/gateway restarts, so a
 stale button without the matching nonce fails closed. The decision window
 denies by default on timeout and retires the nonce with it.
+
+**Option-press provenance.** Discord replays old components indefinitely, so an
+option press dispatches only when the session the conversation currently
+resolves to (via the resume binding, else the native DM session) is the one the
+tag names — a press carries a non-empty tag, and the tag implies resume routing
+even though the label never executes as a command (button labels are
+model-authored turn content, same rule as the queue drain). The tag is checked
+before the busy path — a press against a busy target is refused, never
+queued/steered, because the drain replays items tag-less — and re-checked after
+idle/daily rotation so it cannot run under a generation the tag never named. A
+mismatch (the chat was rebound or `!new`'d since the buttons were posted) and an
+untagged pre-provenance button both fail closed with a refusal naming the
+remedy; queue drains and AutoNudge fires dispatch untagged with commands off and
+keep their native-session affinity.
 
 Every turn closes with a **one-line footer** as Discord subtext (`-#`) on the
 final segment, rendered by the shared `format_turn_status` (see "Turn-status
@@ -1635,7 +1686,7 @@ TTL-bounded picker registry resolves the index against the exact list it posted
 and refuses an expired, evicted or already-consumed one rather than applying a
 model from a stale advertisement.
 
-### Resume-binding expectations (`discord/resume_expectation.py`)
+### Resume-binding expectations (`messaging/resume_expectation.py`)
 
 An inbound resume binding lives on the bound session's `session_map.json` row. A recycle, restart prune, or dashboard unlink can destroy that row and the only evidence the channel was attached, so the resolver silently falls back to its DM session; the expectation record makes that loss reportable.
 
@@ -1843,7 +1894,7 @@ failure costs one replay window rather than the channel.
 
 ## Telegram settings API
 
-Two dashboard-only endpoints back the `/settings?tab=channels&channel=telegram` panel (legacy `?tab=telegram` links redirect there). Like the
+Two dashboard-only endpoints back the `/settings/channels/telegram` panel (legacy `?tab=channels&channel=telegram` and `?tab=telegram` links redirect there). Like the
 Slack settings API they are registered in the dashboard route block (NOT
 `_register_mcp_routes`) so they always sit behind dashboard token auth.
 

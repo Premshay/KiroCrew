@@ -183,6 +183,100 @@ class TestSlotsBroadcastCarriesFolders:
         frame = json.loads(ws.send_str.call_args[0][0])
         assert frame["folders"] == []
 
+    def test_frame_carries_the_folder_generation(self, state: DashboardState) -> None:
+        # The tree alone is not a change signal — this frame fires on routine
+        # session activity — so the client needs the generation to tell "the
+        # store changed" from "a session blinked".
+        state.serialize_slots = MagicMock(return_value=[])  # type: ignore[method-assign]
+        state._folders_generation = 3
+        ws = self._DashboardWS()
+        state.register_ws(ws)  # type: ignore[arg-type]
+
+        state._do_slots_broadcast()
+
+        frame = json.loads(ws.send_str.call_args[0][0])
+        assert frame["foldersGeneration"] == 3
+
+    def test_slot_activity_alone_does_not_advance_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        # THE guardrail. The client refetches whenever this number moves, so a
+        # generation that crept up on ordinary slot churn would refetch the
+        # session-scanning GET /api/chat/folders on every session event and land
+        # that refetch over any in-flight optimistic folder edit.
+        state.serialize_slots = MagicMock(return_value=[{"key": "chat-1"}])  # type: ignore[method-assign]
+        state._folders = [{"id": "f1", "name": "Work", "order": 0}]
+        ws = self._DashboardWS()
+        state.register_ws(ws)  # type: ignore[arg-type]
+
+        state._do_slots_broadcast()
+        state.serialize_slots = MagicMock(  # type: ignore[method-assign]
+            return_value=[{"key": "chat-1", "title": "renamed"}, {"key": "chat-2"}]
+        )
+        state._do_slots_broadcast()
+
+        generations = [
+            json.loads(call[0][0])["foldersGeneration"] for call in ws.send_str.call_args_list
+        ]
+        assert len(generations) == 2
+        assert generations[0] == generations[1]
+
+    @pytest.mark.asyncio
+    async def test_folder_mutation_advances_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        # Bumped in the mutate_folders funnel rather than at each call site, so a
+        # new folder-writing endpoint cannot forget to do it.
+        before = state.folders_generation()
+
+        await state.mutate_folders(
+            lambda folders: (True, folders.append({"id": "f9", "name": "New", "order": 0}))
+        )
+
+        state.serialize_slots = MagicMock(return_value=[])  # type: ignore[method-assign]
+        ws = self._DashboardWS()
+        state.register_ws(ws)  # type: ignore[arg-type]
+        state._do_slots_broadcast()
+
+        frame = json.loads(ws.send_str.call_args[0][0])
+        assert frame["foldersGeneration"] == before + 1
+        assert frame["folders"] == [{"id": "f9", "name": "New", "order": 0}]
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_folder_transaction_does_not_advance_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        # `changed=False` returns before the write; nothing changed, so no client
+        # should be told to refetch.
+        before = state.folders_generation()
+
+        await state.mutate_folders(lambda folders: (False, None))
+
+        assert state.folders_generation() == before
+
+    @pytest.mark.asyncio
+    async def test_a_failed_folder_transaction_does_not_advance_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        before = state.folders_generation()
+        state._folders = [{"id": "f1", "name": "Existing", "order": 0}]
+
+        def fail_write(*_args: object) -> None:
+            raise OSError("disk full")
+
+        state._write_folders_confirmed = fail_write  # type: ignore[method-assign]
+
+        with pytest.raises(OSError, match="disk full"):
+            await state.mutate_folders(
+                lambda folders: (
+                    True,
+                    folders.append({"id": "f2", "name": "Rolled back", "order": 1}),
+                )
+            )
+
+        assert state.folders_generation() == before
+        assert state._folders == [{"id": "f1", "name": "Existing", "order": 0}]
+
 
 class TestOwnerScopedBroadcast:
     """Owner-only typed broadcast + its delivery count (PR #461)."""
@@ -260,6 +354,293 @@ class TestSlotModel:
     def test_model_defaults_empty(self, state: DashboardState) -> None:
         slot = state.get_or_create_slot("test-2")
         assert slot.model == ""
+
+
+class TestSlotEffectiveAgent:
+    """`to_dict()["effective_agent"]` — the non-destructive divergence report.
+
+    The contract is asymmetric on purpose. ``agent`` is the user's INTENT and is
+    stored verbatim; ``effective_agent`` is a claim that something else answers,
+    and is emitted ONLY when that is known to be true. Every "we cannot tell yet"
+    case therefore has to come back empty: a false "your agent was substituted"
+    marker sends the user chasing a substitution that never happened, which is
+    strictly worse than a boot window with no marker at all.
+
+    The other pinned property is that resolution touches NO filesystem. It runs
+    inside every slots frame on the event loop, so a scan here would be a
+    recurring gateway stall — the tests below make the scanning entry points
+    explode and still expect an answer.
+    """
+
+    @staticmethod
+    def _pin(monkeypatch, *, aliases, default_alias, materialized, ready=True):
+        """Pin both in-memory snapshots, isolating from the host's real config.
+
+        Without this the resolver reads whatever ``~/.kiro/agents`` and the last
+        ``load()`` left behind, so a developer host with a real agent called
+        "researcher" would answer differently from CI.
+        """
+        import kiro_crew.config.loader as loader
+
+        monkeypatch.setattr(
+            loader,
+            "_CONFIG_AGENT_ALIAS_SNAPSHOT",
+            (frozenset(aliases), default_alias, ready),
+        )
+        monkeypatch.setattr(loader, "_MATERIALIZED_AGENTS", frozenset(materialized))
+        monkeypatch.setattr(loader, "_MATERIALIZED_AGENTS_READY", ready)
+
+    def test_honored_alias_reports_nothing(self, monkeypatch) -> None:
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew", "researcher"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        slot = _ChatSlot("s1", agent="researcher")
+        d = slot.to_dict()
+        assert d["effective_agent"] == ""
+        # The request is never rewritten by the report.
+        assert d["agent"] == "researcher"
+
+    def test_materialized_kiro_agent_reports_nothing(self, monkeypatch) -> None:
+        """An app agent lives in ~/.kiro/agents, never in config.agents."""
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized={"mochi"},
+        )
+        slot = _ChatSlot("s1", agent="mochi")
+        assert slot.to_dict()["effective_agent"] == ""
+
+    def test_unresolvable_agent_names_the_fallback(self, monkeypatch) -> None:
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized={"mochi"},
+        )
+        slot = _ChatSlot("s1", agent="deleted-app")
+        d = slot.to_dict()
+        assert d["effective_agent"] == "kirocrew"
+        # Still verbatim: the marker describes, it does not normalize.
+        assert d["agent"] == "deleted-app"
+
+    def test_blank_agent_reports_nothing(self, monkeypatch) -> None:
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        assert _ChatSlot("s1").to_dict()["effective_agent"] == ""
+
+    def test_cold_materialized_snapshot_reports_nothing(self, monkeypatch) -> None:
+        """The boot window. A cold snapshot cannot see app agents that DO exist."""
+        import kiro_crew.config.loader as loader
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        monkeypatch.setattr(loader, "_MATERIALIZED_AGENTS_READY", False)
+        slot = _ChatSlot("s1", agent="mochi")
+        assert slot.to_dict()["effective_agent"] == ""
+
+    def test_cold_alias_snapshot_reports_nothing(self, monkeypatch) -> None:
+        """No load() has published yet, so there is no fallback name to name."""
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases=set(),
+            default_alias="",
+            materialized=set(),
+            ready=False,
+        )
+        slot = _ChatSlot("s1", agent="mochi")
+        assert slot.to_dict()["effective_agent"] == ""
+
+    def test_agent_equal_to_the_fallback_reports_nothing(self, monkeypatch) -> None:
+        """Nothing diverged: the name requested IS the one answering."""
+        import kiro_crew.config.loader as loader
+
+        self._pin(
+            monkeypatch,
+            aliases=set(),
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        assert loader.resolve_effective_agent("kirocrew") == ""
+
+    def test_project_declared_agent_reports_nothing(self, monkeypatch) -> None:
+        """A project's own .kiro scope resolves the name; that is not divergence."""
+        import kiro_crew.agent_discovery as discovery
+        import kiro_crew.config.loader as loader
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        monkeypatch.setattr(
+            discovery,
+            "cached_project_agent_names",
+            lambda _d: frozenset({"repo-agent"}),
+        )
+        slot = _ChatSlot("s1", agent="repo-agent")
+        slot.project = "/some/checkout"
+        assert slot.to_dict()["effective_agent"] == ""
+        # Same pinning, a name the warm cache does NOT declare: now it diverges.
+        other = _ChatSlot("s2", agent="gone")
+        other.project = "/some/checkout"
+        assert other.to_dict()["effective_agent"] == "kirocrew"
+        assert loader is not None
+
+    def test_cold_project_cache_reports_nothing(self, monkeypatch) -> None:
+        """An uncached project is not evidence of absence."""
+        import kiro_crew.agent_discovery as discovery
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        monkeypatch.setattr(discovery, "cached_project_agent_names", lambda _d: None)
+        slot = _ChatSlot("s1", agent="repo-agent")
+        slot.project = "/some/checkout"
+        assert slot.to_dict()["effective_agent"] == ""
+
+    def test_resolution_never_touches_the_filesystem(self, monkeypatch) -> None:
+        """The loop-safety property, as a gate rather than a comment.
+
+        Both scanning entry points are made to explode. `to_dict` runs on the
+        event loop for every slots frame, so reaching either one would be a
+        per-frame stall — the kind the loop-stall watchdog blames on chat.
+        """
+        import kiro_crew.agent_discovery as discovery
+        import kiro_crew.config.loader as loader
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+
+        def _boom(*_a, **_k):  # pragma: no cover - must never run
+            raise AssertionError("effective-agent resolution scanned the filesystem")
+
+        monkeypatch.setattr(loader, "refresh_materialized_agents", _boom)
+        monkeypatch.setattr(loader, "_scan_materialized_agents", _boom)
+        monkeypatch.setattr(discovery, "project_agent_names", _boom)
+        monkeypatch.setattr(discovery, "cached_project_agent_names", lambda _d: frozenset())
+
+        slot = _ChatSlot("s1", agent="deleted-app")
+        slot.project = "/some/checkout"
+        assert slot.to_dict()["effective_agent"] == "kirocrew"
+
+    def test_project_lookup_failure_reports_nothing(self, monkeypatch) -> None:
+        """A broken cache read is "no evidence", never an exception into a frame."""
+        import kiro_crew.agent_discovery as discovery
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+
+        def _raise(_d):
+            raise RuntimeError("cache exploded")
+
+        monkeypatch.setattr(discovery, "cached_project_agent_names", _raise)
+        slot = _ChatSlot("s1", agent="deleted-app")
+        slot.project = "/some/checkout"
+        assert slot.to_dict()["effective_agent"] == ""
+
+    def test_load_publishes_the_alias_snapshot(self, monkeypatch) -> None:
+        """`load()` is the publisher, so the resolver never reads config.json."""
+        import kiro_crew.config.loader as loader
+
+        monkeypatch.setattr(
+            loader, "_CONFIG_AGENT_ALIAS_SNAPSHOT", (frozenset(), "", False)
+        )
+
+        cfg = loader.KiroCrewConfig.load()
+        aliases, default_alias, ready = loader.agent_alias_snapshot()
+        assert ready is True
+        assert aliases == frozenset(cfg.agents)
+        assert default_alias in cfg.agents
+
+    def test_publish_overwrites_a_richer_previous_snapshot(self, monkeypatch) -> None:
+        """The degraded-defaults path must SHRINK the snapshot, not union into it.
+
+        Leaving a stale alias published would have the resolver honor a name that
+        no longer loads, which is the false-negative twin of a false marker.
+        """
+        import dataclasses
+
+        import kiro_crew.config.loader as loader
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew", "researcher"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        cfg = loader.KiroCrewConfig()
+        cfg = dataclasses.replace(
+            cfg,
+            agents={"default": loader.KiroCrewAgentConfig(kiro_agent="kirocrew")},
+            default_agent="default",
+        )
+        loader.publish_agent_alias_snapshot(cfg)
+        aliases, default_alias, _ = loader.agent_alias_snapshot()
+        assert aliases == frozenset({"default"})
+        assert default_alias == "default"
+        assert loader.resolve_effective_agent("researcher") == "default"
+
+    def test_snapshot_is_published_as_one_immutable_triple(self, monkeypatch) -> None:
+        """Why the read path needs no lock, as a gate rather than a comment.
+
+        A reader loads ONE name, so it sees either the whole old triple or the
+        whole new one. Split across three globals it could pair a fresh alias set
+        with a stale fallback name, and the fix for that would be a mutex acquired
+        once per slot per frame on the event loop.
+        """
+        import kiro_crew.config.loader as loader
+
+        monkeypatch.setattr(
+            loader, "_CONFIG_AGENT_ALIAS_SNAPSHOT", (frozenset(), "", False)
+        )
+        before = loader.agent_alias_snapshot()
+        loader.publish_agent_alias_snapshot(loader.KiroCrewConfig.load())
+        after = loader.agent_alias_snapshot()
+
+        assert isinstance(after, tuple) and len(after) == 3
+        assert isinstance(after[0], frozenset)
+        # Swapped wholesale, so the value a reader already holds is unchanged.
+        assert before == (frozenset(), "", False)
+        assert after is not before
 
 
 class TestChatSlotStopState:
@@ -503,14 +884,19 @@ def test_folder_breadcrumb_cycle_safe(state):
 
 
 class TestOwnerSourceStatusTransport:
-    def test_slot_updates_keep_status_out_of_sse_and_generic_websockets(
+    def test_public_repo_status_rides_general_frame_owner_gets_full(
         self, state: DashboardState, monkeypatch
     ) -> None:
         source_url = "https://github.com/acme/repo/pull/12"
 
-        def serialize_slots(*, include_check_status: bool = False) -> list[dict]:
+        def serialize_slots(
+            *, include_check_status: bool = False, dashboard_user: bool = False
+        ) -> list[dict]:
             link = {"url": source_url, "provider": "github", "number": 12}
-            if include_check_status:
+            # Owner (include_check_status) sees status for any repo. A
+            # dashboard-user sees it for a KNOWN-public repo; this fixture treats
+            # dashboard_user=True as "public repo, show status".
+            if include_check_status or dashboard_user:
                 link.update({"ci": "passed", "state": "OPEN"})
             return [{"key": "chat-1", "source_links": [link]}]
 
@@ -522,27 +908,117 @@ class TestOwnerSourceStatusTransport:
             "_spawn_ws_send",
             lambda client, message: sent.append((client, json.loads(message))),
         )
-        generic_ws = MagicMock(closed=False)
-        owner_ws = MagicMock(closed=False)
-        state.register_ws(generic_ws)
+
+        class _FakeWs:
+            def __init__(self, *, dashboard_user: bool) -> None:
+                self.closed = False
+                self._flags = {"_is_dashboard_user": dashboard_user}
+
+            def get(self, key, default=None):
+                return self._flags.get(key, default)
+
+        dash_ws = _FakeWs(dashboard_user=True)
+        owner_ws = _FakeWs(dashboard_user=True)
+        state.register_ws(dash_ws)
         state.register_ws(owner_ws, owner=True)
         sse_queue = state.register_sse()
 
         state.push_slots_update()
 
+        # SSE carries the BARE list: the SSE queue has NO per-app filtering, so
+        # status must never ride it (GPT #6789 — an app token on /api/stream
+        # would otherwise receive credential-backed chip status). The enriched
+        # list is carried separately in `_slots_list_ws` for the WS path only.
         sse_note = sse_queue.get_nowait()
         assert "ci" not in str(sse_note["_slots_list"])
         assert "state" not in sse_note["_slots_list"][0]["source_links"][0]
+        # The enriched WS-only list DOES carry status (delivered to WS
+        # dashboard-user sockets, re-filtered for app tokens in
+        # `_serialize_for_client`).
+        assert sse_note["_slots_list_ws"][0]["source_links"][0]["ci"] == "passed"
+        assert sse_note["_slots_list_ws"][0]["source_links"][0]["state"] == "OPEN"
 
-        generic_messages = [message for client, message in sent if client is generic_ws]
+        dash_messages = [message for client, message in sent if client is dash_ws]
         owner_messages = [message for client, message in sent if client is owner_ws]
-        assert len(generic_messages) == 1
-        assert "ci" not in str(generic_messages[0]["data"])
-        assert "state" not in generic_messages[0]["data"][0]["source_links"][0]
-        assert len(owner_messages) == 2
-        assert "ci" not in str(owner_messages[0]["data"])
-        assert owner_messages[1]["data"][0]["source_links"][0]["ci"] == "passed"
-        assert owner_messages[1]["data"][0]["source_links"][0]["state"] == "OPEN"
+        # Dashboard user (non-owner): the single general frame carries public-repo
+        # status. `_send_ws_all` delivers exactly one `slots` frame to it.
+        assert len(dash_messages) == 1
+        assert dash_messages[0]["data"][0]["source_links"][0]["ci"] == "passed"
+        assert dash_messages[0]["data"][0]["source_links"][0]["state"] == "OPEN"
+        # Owner: EXACTLY ONE frame (the enriched owner frame). `_send_ws_all`
+        # skips owner sockets for `slots` (PR #6795), so the generic frame no
+        # longer backstops an owner; the owner frame is its only one and carries
+        # full status.
+        assert len(owner_messages) == 1
+        assert owner_messages[0]["data"][0]["source_links"][0]["ci"] == "passed"
+        assert owner_messages[0]["data"][0]["source_links"][0]["state"] == "OPEN"
+        # Both frames come from `_slots_ws_frame`, so they must carry the SAME
+        # envelope keys — asserted as set equality so a key added to one site and
+        # not the other fails here instead of silently depriving an owner window.
+        assert set(owner_messages[0]) == set(dash_messages[0])
+        assert owner_messages[0]["folders"] == dash_messages[0]["folders"]
+        assert (
+            owner_messages[0]["gitlabHostsGeneration"]
+            == dash_messages[0]["gitlabHostsGeneration"]
+        )
+
+    def test_owner_sockets_still_receive_non_slot_broadcasts(
+        self, state: DashboardState, monkeypatch
+    ) -> None:
+        """The `slots` exclusion must not silence an owner socket generally.
+
+        The generic fan-out skips owner sockets for `slots` alone, because that is
+        the one message type they receive twice. Every other type has no
+        owner-specific frame to fall back on, so a skip that keyed on the socket
+        rather than on the message type would drop it entirely — an owner window
+        that stops seeing refreshes, with nothing raised anywhere. This is the
+        control for that: it fails if the exclusion is ever widened.
+        """
+        sent: list[tuple[object, dict]] = []
+        monkeypatch.setattr(
+            state,
+            "_spawn_ws_send",
+            lambda client, message: sent.append((client, json.loads(message))),
+        )
+        owner_ws = MagicMock(closed=False)
+        state.register_ws(owner_ws, owner=True)
+
+        state._broadcast({"_type": "refresh", "kinds": "crons,agents"})
+
+        owner_messages = [message for client, message in sent if client is owner_ws]
+        assert len(owner_messages) == 1
+        assert owner_messages[0]["type"] == "refresh"
+        assert owner_messages[0]["data"]["kinds"] == ["crons", "agents"]
+
+    def test_app_token_frame_is_stripped_of_chip_status(self) -> None:
+        # The per-app filter must remove credential-backed chip status even when
+        # the general list carries it (widened for dashboard users). Slot
+        # metadata stays; ci/state/mergeable go.
+        from kiro_crew.dashboard.ws_event_scope import _strip_source_link_status
+
+        slot = {
+            "key": "chat-1",
+            "source_links": [
+                {
+                    "url": "https://github.com/acme/repo/pull/12",
+                    "provider": "github",
+                    "number": 12,
+                    "ci": "passed",
+                    "state": "merged",
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                }
+            ],
+        }
+        cleaned = _strip_source_link_status(slot)
+        link = cleaned["source_links"][0]
+        assert link["url"].endswith("/pull/12")
+        assert link["number"] == 12
+        for k in ("ci", "state", "mergeable", "mergeStateStatus"):
+            assert k not in link
+        # A slot with no status is returned unchanged (identity, no copy).
+        bare = {"key": "c", "source_links": [{"url": "u", "number": 1}]}
+        assert _strip_source_link_status(bare) is bare
 
     @pytest.mark.parametrize(
         ("claims", "owner_request"),
@@ -574,8 +1050,12 @@ class TestOwnerSourceStatusTransport:
 
         source_url = "https://github.com/acme/repo/pull/12"
 
-        def serialize_slots(*, include_check_status: bool = False) -> list[dict]:
+        def serialize_slots(
+            *, include_check_status: bool = False, dashboard_user: bool = False
+        ) -> list[dict]:
             link = {"url": source_url, "provider": "github", "number": 12}
+            # This connect test seeds no repo visibility, so a dashboard user
+            # fails closed to a bare chip (only the owner opt-in carries status).
             if include_check_status:
                 link.update({"ci": "passed", "state": "OPEN"})
             return [{"key": "chat-1", "source_links": [link]}]
@@ -629,9 +1109,11 @@ class TestOwnerSourceStatusTransport:
 
         fake_ws = FakeWebSocket()
         refresh = MagicMock()
+        vis_refresh = MagicMock()
         monkeypatch.setattr(dashboard_ws, "_check_ws_origin", lambda request: None)
         monkeypatch.setattr(dashboard_ws.web, "WebSocketResponse", lambda **kwargs: fake_ws)
         monkeypatch.setattr(source_providers, "schedule_check_refresh", refresh)
+        monkeypatch.setattr(source_providers, "schedule_visibility_refresh", vis_refresh)
 
         result = await dashboard_ws.api_ws(Request())  # type: ignore[arg-type]
         await asyncio.sleep(0)
@@ -643,23 +1125,124 @@ class TestOwnerSourceStatusTransport:
         if owner_request:
             assert initial_slots[0]["source_links"][0]["ci"] == "passed"
             refresh.assert_called_once_with([source_url], state.push_slots_update)
+            vis_refresh.assert_called_once_with([source_url], state.push_slots_update)
         elif claims.get("app"):
             # App token: the per-app WS scope gate filters the initial push, so
             # an app that declared no slots:* scope sees no slots at all — a
-            # stronger guarantee than merely withholding check status.
+            # stronger guarantee than merely withholding check status. No
+            # provider work is scheduled for it.
             assert initial_slots == []
             refresh.assert_not_called()
+            vis_refresh.assert_not_called()
             # Folders never ride an app-token frame (apps don't render the tree).
             assert "folders" not in initial_frame
         else:
+            # Non-owner dashboard user: connect frame carries NO status (this
+            # test seeds no visibility, so the public gate fails closed), and the
+            # connection MUST drive NEITHER refresh — both the status read and
+            # the visibility probe run the operator's credentials, so only the
+            # owner's connection may trigger them (GPT round-13). A non-owner
+            # renders the owner-populated caches read-only; it spawns no provider
+            # work of its own.
             assert "ci" not in str(initial_slots)
             assert "state" not in initial_slots[0]["source_links"][0]
             refresh.assert_not_called()
+            vis_refresh.assert_not_called()
             # The connect-time frame is what populates the sidebar on a cold
             # load, so a dashboard user MUST receive the folder tree here — this
             # is the frame that fixes the #4127 flicker.
             assert initial_frame["folders"] == [{"id": "f1", "name": "Work", "order": 0}]
         state.unregister_ws.assert_called_once_with(fake_ws)
+
+    @pytest.mark.asyncio
+    async def test_non_owner_status_refresh_only_for_confirmed_public(
+        self, monkeypatch
+    ) -> None:
+        """A non-owner dashboard connection drives NEITHER a status refresh NOR
+        a visibility probe, even when a confirmed-public repo is present — both
+        run the operator's credentials, so only the owner's connection may
+        trigger them (GPT round-13). The non-owner renders the owner-populated
+        caches read-only."""
+        from kiro_crew.dashboard import ws as dashboard_ws
+        from kiro_crew.dashboard import ws_event_scope
+        from kiro_crew.dashboard.handlers import source_providers
+
+        monkeypatch.setattr(ws_event_scope, "is_app_enabled", lambda _name: True)
+        monkeypatch.setattr(ws_event_scope, "get_app_manifest", lambda _name: None)
+        monkeypatch.setattr(ws_event_scope, "_declared_cache", {})
+
+        public_url = "https://github.com/acme/public/pull/1"
+        private_url = "https://github.com/acme/private/pull/2"
+
+        def serialize_slots(
+            *, include_check_status: bool = False, dashboard_user: bool = False
+        ) -> list[dict]:
+            return [
+                {
+                    "key": "chat-1",
+                    "source_links": [
+                        {"url": public_url, "provider": "github", "number": 1},
+                        {"url": private_url, "provider": "github", "number": 2},
+                    ],
+                }
+            ]
+
+        state = MagicMock()
+        state.owner_id = "U_OWNER"
+        state.serialize_slots.side_effect = serialize_slots
+        state._yolo = False
+        state._folders = []
+
+        class Request(dict):
+            def __init__(self) -> None:
+                super().__init__({"user": "U_OTHER", "app": ""})
+                self.setdefault("is_dashboard_user", True)
+                self.app = {"state": state}
+
+        class FakeWebSocket:
+            def __init__(self) -> None:
+                self.closed = True
+                self.sent: list[dict] = []
+                self._flags: dict = {"_is_dashboard_user": True}
+
+            def __setitem__(self, key: str, value) -> None:
+                self._flags[key] = value
+
+            def __getitem__(self, key: str):
+                return self._flags[key]
+
+            def get(self, key: str, default=None):
+                return self._flags.get(key, default)
+
+            async def prepare(self, request) -> None:
+                return None
+
+            async def send_json(self, payload: dict) -> None:
+                self.sent.append(payload)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        fake_ws = FakeWebSocket()
+        refresh = MagicMock()
+        vis_refresh = MagicMock()
+        monkeypatch.setattr(dashboard_ws, "_check_ws_origin", lambda request: None)
+        monkeypatch.setattr(dashboard_ws.web, "WebSocketResponse", lambda **kwargs: fake_ws)
+        monkeypatch.setattr(source_providers, "schedule_check_refresh", refresh)
+        monkeypatch.setattr(source_providers, "schedule_visibility_refresh", vis_refresh)
+
+        result = await dashboard_ws.api_ws(Request())  # type: ignore[arg-type]
+        await asyncio.sleep(0)
+
+        assert result is fake_ws
+        # Owner-only model: a non-owner triggers NO provider work at all — not a
+        # status refresh and not a visibility probe — regardless of whether a
+        # repo would read public. The owner's connection populates the caches.
+        vis_refresh.assert_not_called()
+        refresh.assert_not_called()
 
 
 class TestPeriodicCheckStatusRefresh:
@@ -958,8 +1541,12 @@ class TestPeriodicCheckStatusRefresh:
         assert order[:2] == ["ensure", "serialize"]
 
     @pytest.mark.asyncio
-    async def test_non_owner_ws_never_starts_refresh_loop(self, monkeypatch) -> None:
+    async def test_app_token_ws_never_starts_refresh_loop(self, monkeypatch) -> None:
+        """An app token renders no chip status (public or private), so it must
+        not spawn the periodic provider driver. Only owner or dashboard-user
+        connections do."""
         from kiro_crew.dashboard import ws as dashboard_ws
+        from kiro_crew.dashboard import ws_event_scope
         from kiro_crew.dashboard.handlers import source_providers
 
         state = MagicMock()
@@ -969,9 +1556,8 @@ class TestPeriodicCheckStatusRefresh:
 
         class Request(dict):
             def __init__(self) -> None:
-                super().__init__({"user": "U_OTHER", "app": ""})
-                # Mirror the auth middleware: it sets this POSITIVE flag so the
-                # WS layer never infers trust from a falsy app claim.
+                # An app token: non-empty app claim, NOT a dashboard user.
+                super().__init__({"user": "U_OWNER", "app": "source-app"})
                 self.setdefault("is_dashboard_user", not self.get("app"))
                 self.app = {"state": state}
 
@@ -981,8 +1567,74 @@ class TestPeriodicCheckStatusRefresh:
             def __init__(self) -> None:
                 self.closed = False
                 self.sent: list[dict] = []
-                # api_ws stores scope state on the socket via item assignment;
-                # flag as a dashboard user so the WS scope gate passes through.
+                self._flags: dict = {"_is_dashboard_user": False}
+
+            def __setitem__(self, key: str, value) -> None:
+                self._flags[key] = value
+
+            def __getitem__(self, key: str):
+                return self._flags[key]
+
+            def get(self, key: str, default=None):
+                return self._flags.get(key, default)
+
+            async def prepare(self, request) -> None:
+                return None
+
+            async def send_json(self, payload: dict) -> None:
+                self.sent.append(payload)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(0.05)
+                raise StopAsyncIteration
+
+        fake_ws = FakeWebSocket()
+        monkeypatch.setattr(ws_event_scope, "is_app_enabled", lambda _name: True)
+        monkeypatch.setattr(ws_event_scope, "get_app_manifest", lambda _name: None)
+        monkeypatch.setattr(ws_event_scope, "_declared_cache", {})
+        monkeypatch.setattr(dashboard_ws, "_check_ws_origin", lambda request: None)
+        monkeypatch.setattr(dashboard_ws.web, "WebSocketResponse", lambda **kwargs: fake_ws)
+        monkeypatch.setattr(source_providers, "CHECK_STATUS_TTL_SECS", 0.01)
+        monkeypatch.setattr(source_providers, "schedule_check_refresh", refresh)
+        monkeypatch.setattr(source_providers, "schedule_visibility_refresh", MagicMock())
+
+        await asyncio.wait_for(dashboard_ws.api_ws(Request()), timeout=5)  # type: ignore[arg-type]
+
+        refresh.assert_not_called()
+        state.source_link_urls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_owner_dashboard_user_does_not_start_refresh_loop(self, monkeypatch) -> None:
+        """A signed-in dashboard user who is NOT the owner renders PUBLIC-repo
+        chip status READ-ONLY from the owner-populated caches, so it must NOT
+        start the periodic driver — both the status and visibility refreshes run
+        the operator's credentials and are owner-only (GPT round-13)."""
+        from kiro_crew.dashboard import ws as dashboard_ws
+        from kiro_crew.dashboard.handlers import source_providers
+
+        state = MagicMock()
+        state.owner_id = "U_OWNER"
+        state.serialize_slots.return_value = []
+        state._yolo = False
+        # A real list so the loop's modulo has a real length (no MagicMock len).
+        state.source_link_urls.return_value = ["https://github.com/acme/repo/pull/1"]
+
+        class Request(dict):
+            def __init__(self) -> None:
+                super().__init__({"user": "U_OTHER", "app": ""})
+                self.setdefault("is_dashboard_user", not self.get("app"))
+                self.app = {"state": state}
+
+        check_refresh = MagicMock()
+        vis_refresh = MagicMock()
+
+        class FakeWebSocket:
+            def __init__(self) -> None:
+                self.closed = False
+                self.sent: list[dict] = []
                 self._flags: dict = {"_is_dashboard_user": True}
 
             def __setitem__(self, key: str, value) -> None:
@@ -1004,7 +1656,6 @@ class TestPeriodicCheckStatusRefresh:
                 return self
 
             async def __anext__(self):
-                # Stay open long enough for several 0.01s TTL ticks to elapse.
                 await asyncio.sleep(0.05)
                 raise StopAsyncIteration
 
@@ -1012,12 +1663,14 @@ class TestPeriodicCheckStatusRefresh:
         monkeypatch.setattr(dashboard_ws, "_check_ws_origin", lambda request: None)
         monkeypatch.setattr(dashboard_ws.web, "WebSocketResponse", lambda **kwargs: fake_ws)
         monkeypatch.setattr(source_providers, "CHECK_STATUS_TTL_SECS", 0.01)
-        monkeypatch.setattr(source_providers, "schedule_check_refresh", refresh)
+        monkeypatch.setattr(source_providers, "schedule_check_refresh", check_refresh)
+        monkeypatch.setattr(source_providers, "schedule_visibility_refresh", vis_refresh)
 
         await asyncio.wait_for(dashboard_ws.api_ws(Request()), timeout=5)  # type: ignore[arg-type]
-
-        refresh.assert_not_called()
-        state.source_link_urls.assert_not_called()
+        # Non-owner: the driver never starts, so neither refresh is ever called
+        # and source_link_urls is never polled by a refresh round.
+        assert not check_refresh.called
+        assert not vis_refresh.called
 
     @pytest.mark.asyncio
     async def test_refresh_loop_rotates_offset_across_rounds(self, monkeypatch) -> None:
@@ -1234,6 +1887,47 @@ class TestTurnBoundarySourceStatus:
         state.refresh_slot_source_status("chat-a")
 
         refresh.assert_not_called()
+
+    def test_turn_boundary_non_owner_drives_no_refresh(
+        self, state: DashboardState, monkeypatch
+    ) -> None:
+        """GPT #6789 round-13: at a turn boundary with ONLY a non-owner
+        dashboard-user window open (no owner window), NEITHER the credentialed
+        status read NOR the visibility probe fires — both run the operator's
+        credentials and are owner-only. A non-owner audience triggers nothing."""
+        from kiro_crew.dashboard import state as state_mod  # noqa: F401
+        from kiro_crew.dashboard.handlers import source_providers
+
+        slot = state.get_or_create_slot("chat-a")
+        slot.append(
+            "assistant",
+            "pub https://github.com/acme/pub/pull/1 priv https://github.com/acme/priv/pull/2",
+            broadcast=False,
+        )
+        # No owner window; one non-owner dashboard-user window.
+        state._owner_ws_clients.clear()
+        _du_ws = MagicMock(closed=False)
+        _du_ws.get.side_effect = lambda k, d=None: True if k == "_is_dashboard_user" else d
+        state._ws_clients = [_du_ws]
+        status_calls: list[tuple] = []
+        vis_calls: list[tuple] = []
+        monkeypatch.setattr(
+            source_providers,
+            "request_check_refresh_now",
+            lambda urls, on_update=None: status_calls.append((list(urls), on_update)),
+        )
+        monkeypatch.setattr(
+            source_providers,
+            "schedule_visibility_refresh",
+            lambda urls, on_update=None, *, force=False: vis_calls.append((list(urls), force)),
+        )
+
+        state.refresh_slot_source_status("chat-a")
+
+        # No owner window → the turn-boundary refresh is a no-op: neither the
+        # status read nor the visibility probe runs.
+        assert status_calls == []
+        assert vis_calls == []
 
     def test_turn_boundary_swallows_refresh_failures(
         self, state: DashboardState, monkeypatch

@@ -287,10 +287,17 @@ jobs:
       # the same step in claude-review.yml -- keep the two lanes in sync.
       - name: Opus 4.8 discovery
         id: discover
-        uses: anthropics/claude-code-action@459ad358ae43fea66bfefd0a1f8d840b4b9791fb # v1
+        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # workflow_run runs as the fork contributor, who lacks repo write;
+          # claude-code-action >=1.0.194 rejects that actor before the model
+          # call unless it is allow-listed here. The review is read-only
+          # (Read,Grep,Glob) and posts only a check-run/comment, and setting
+          # this input auto-enables the action's subprocess secret-scrub +
+          # bubblewrap isolation. See issue #6116.
+          allowed_non_write_users: "*"
           # No Bash: the diff is pre-fetched by the job itself with `git diff`
           # against the trusted base tree (NOT the compare API, which truncates
           # very large diffs -- see the fetch step above), so the reviewer needs
@@ -365,10 +372,14 @@ jobs:
       # unchanged.
       - name: Opus 4.8 validation
         id: review
-        uses: anthropics/claude-code-action@459ad358ae43fea66bfefd0a1f8d840b4b9791fb # v1
+        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # See the discovery step above: allow-list the fork actor so
+          # claude-code-action >=1.0.194 does not abort before the model call
+          # (issue #6116).
+          allowed_non_write_users: "*"
           claude_args: |
             --model us.anthropic.claude-opus-4-8
             --max-turns 120

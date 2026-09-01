@@ -347,10 +347,25 @@ class GitHubPRRecipe:
         try:
             if base:
                 # The full range this push would publish, against the base the PR targets.
-                proc = self._git("diff", f"{base}...HEAD", timeout=_PUSH_TIMEOUT_S)
+                proc = self._git(
+                    "-c",
+                    "diff.external=",
+                    "diff",
+                    "--no-ext-diff",
+                    f"{base}...HEAD",
+                    timeout=_PUSH_TIMEOUT_S,
+                )
             else:
                 # `--format=` prints the commit's PATCH and nothing else.
-                proc = self._git("show", "--format=", "HEAD", timeout=_PUSH_TIMEOUT_S)
+                proc = self._git(
+                    "-c",
+                    "diff.external=",
+                    "show",
+                    "--no-ext-diff",
+                    "--format=",
+                    "HEAD",
+                    timeout=_PUSH_TIMEOUT_S,
+                )
         except (OSError, subprocess.SubprocessError):
             logger.warning("could not read the pushable diff — refusing the push", exc_info=True)
             return False, "could not read the pushable diff"
@@ -370,6 +385,10 @@ class GitHubPRRecipe:
 
     def _push_fix_branch(self, *, branch: str) -> tuple[bool, str]:
         """Push HEAD to ``branch`` on the fetch url. Returns (ok, note)."""
+        from ...backend.clone_setup import _repository_is_isolated
+
+        if not _repository_is_isolated(self.clone_path):
+            return False, "repository isolation changed after review"
         url = self._resolve_fetch_url()
         if not url:
             return False, "no pushable origin fetch url (clone fully push-disabled)"
@@ -421,7 +440,7 @@ class GitHubPRRecipe:
         the morning-collection workflow keeps working offline.
         """
         self.pr_queue_dir.mkdir(parents=True, exist_ok=True)
-        (self.pr_queue_dir / f"{fingerprint}.diff").write_text(diff or "")
+        (self.pr_queue_dir / f"{fingerprint}.diff").write_text(diff or "", encoding="utf-8")
         body_path = self.pr_queue_dir / f"{fingerprint}.pr.md"
         # The title and body are agent-authored PROSE, so unlike the diff they can be
         # redacted without breaking anything the gate proved — a rewritten sentence is
@@ -436,14 +455,16 @@ class GitHubPRRecipe:
             summary = _redact_prose(summary)
             description = _strip_leading_h1(_redact_prose(description))
         except ProseRedactionUnavailable as exc:
-            body_path.write_text(f"# {summary}\n\n{_strip_leading_h1(description)}\n")
+            body_path.write_text(
+                f"# {summary}\n\n{_strip_leading_h1(description)}\n", encoding="utf-8"
+            )
             logger.warning(
                 "PR draft degraded to queue for %s: %s — prose was not published",
                 fingerprint,
                 exc,
             )
             return f"QUEUED:{fingerprint}"
-        body_path.write_text(f"# {summary}\n\n{description}\n")
+        body_path.write_text(f"# {summary}\n\n{description}\n", encoding="utf-8")
 
         if shutil.which("gh") is None:
             logger.info("gh CLI not on PATH — PR queued at %s", body_path)

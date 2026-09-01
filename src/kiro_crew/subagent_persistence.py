@@ -8,16 +8,20 @@ Each subagent gets a folder at ``~/.kiro/crew/subagents/{id}/`` containing:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
+import weakref
 from pathlib import Path
 
 from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
+from kiro_crew.jsonl_util import rotate_jsonl_at
 from kiro_crew.providers.cleanup import _is_safe_path
 
 logger = logging.getLogger(__name__)
@@ -140,6 +144,112 @@ def read_state(agent_id: str) -> dict | None:
         return None
 
 
+# ── per-agent write serialization ────────────────────────────────────
+
+#: ``update_state`` is a read / merge / rewrite, and its two halves are split by
+#: a blocking ``_atomic_write`` (fsync + rename). Two writers on one ``agent_id``
+#: therefore interleave: the second one's read predates the first one's write, so
+#: its rewrite restores a stale WHOLE-FILE snapshot and silently rolls back every
+#: field the first writer had just landed. Losing the other writer's fields is
+#: the visible half; rolling back fields NEITHER writer touched is the damaging
+#: half.
+#:
+#: The overlap is structural, not hypothetical. A run writes state from the event
+#: loop (PID, session id, provider, retention ``keep``) AND from the thread pool
+#: (model provenance, CC-path model refinement, per-turn diagnostics -- each via
+#: ``asyncio.to_thread``), so two pool writers overlap during a run and a
+#: loop-side write executes while the run's coroutine is suspended inside a
+#: pool-side one (#6298). Cancellation widens it: cancelling a ``to_thread``
+#: await DETACHES the worker rather than stopping it, so it finishes carrying a
+#: read that is already stale (#6308).
+#:
+#: SCOPE -- OFF-LOOP WRITERS ONLY. Serializing every writer would mean a
+#: loop-side caller waiting on a pool thread's fsync, i.e. a new blocking call
+#: on the event loop, which this repo's ``no-blocking-call-on-event-loop`` anchor
+#: forbids and which a bounded wait only shrinks rather than removes. So the lock
+#: is taken only by callers that are NOT on the loop, where blocking is legal;
+#: on-loop callers keep exactly their pre-existing behaviour (an unserialized
+#: rewrite). That closes pool-vs-pool interleaving completely and leaves the
+#: loop-side half untouched -- see :func:`update_state` for what remains open and
+#: the issue tracking the loop-side offload (#6288's class).
+#:
+#: The acquire is UNBOUNDED, and can be, precisely because no on-loop caller ever
+#: waits on it: the only threads that block here are pool workers whose own write
+#: (read + fsync + rename) already exposes them to a wedged FS, so waiting on the
+#: lock adds no parking risk the write itself did not already carry. No holder is
+#: ever an on-loop caller.
+#:
+#: In-process only, mirroring the per-key ``threading.Lock`` registry this repo
+#: already uses to serialize file read-modify-write (``learn._lock_for``,
+#: ``artifacts._lock_for_root``, ``history.ConversationLog._file_locks``). A
+#: filesystem lock is the tool for cross-process contention and there is none
+#: here: every ``update_state`` caller lives in the gateway process that owns the
+#: run. Keyed by agent id so unrelated runs never queue behind one agent's fsync,
+#: SELF-CLEANING, with no explicit eviction anywhere. The values are held
+#: WEAKLY and every caller keeps a strong reference for the length of its
+#: critical section, so an entry lives exactly as long as some writer is using
+#: it and then disappears on its own. That is a correctness property, not a
+#: tidiness one: removing an entry explicitly while another writer still holds
+#: or is queued on it SPLITS the lock's identity -- the next caller mints a
+#: fresh lock and enters ``state.json`` alongside the writer still inside it,
+#: which is the very loss this lock exists to prevent. Any hook that evicts
+#: without holding the lock (a folder delete, the tombstone pruner) can do
+#: exactly that, and the pruner's case is not even hypothetical: ``_atomic_write``
+#: re-creates the parent directory, so a writer already inside its critical
+#: section resurrects the folder the pruner just removed. Weak values make that
+#: unrepresentable -- an entry cannot be dropped while anyone can still reach
+#: it -- and agent ids are per-run uuids, so nothing accumulates either.
+_STATE_LOCKS: "weakref.WeakValueDictionary[str, _AgentLock]" = weakref.WeakValueDictionary()
+_STATE_LOCKS_GUARD = threading.Lock()
+
+
+class _AgentLock:
+    """A ``threading.Lock`` that can be weakly referenced.
+
+    ``threading.Lock`` itself cannot, so the registry stores this one-field
+    wrapper instead. Callers must retain the WRAPPER (not just ``.lock``) for
+    the whole critical section: it is the strong reference that keeps the
+    registry entry alive, and therefore keeps every concurrent writer on the
+    same lock.
+    """
+
+    __slots__ = ("lock", "__weakref__")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+
+
+def _on_event_loop() -> bool:
+    """True when the calling thread is running an asyncio event loop.
+
+    The seam that keeps the lock off the loop. A thread ``asyncio.to_thread`` /
+    ``run_in_executor`` dispatched to has no running loop, so pool writers
+    serialize; a synchronous call made from a coroutine does, so it does not
+    wait. Chosen over an explicit caller flag because ``update_state`` takes
+    ``**fields``: any keyword flag would be indistinguishable from a state field
+    a caller means to persist.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _lock_for_agent(agent_id: str) -> "_AgentLock":
+    """Return the process-wide ``state.json`` lock holder for *agent_id*.
+
+    The caller MUST keep the returned object alive for its whole critical
+    section -- see :data:`_STATE_LOCKS`.
+    """
+    with _STATE_LOCKS_GUARD:
+        holder = _STATE_LOCKS.get(agent_id)
+        if holder is None:
+            holder = _AgentLock()
+            _STATE_LOCKS[agent_id] = holder
+        return holder
+
+
 def update_state(agent_id: str, **fields: object) -> bool:
     """Merge *fields* into state.json (atomic rewrite).
 
@@ -149,16 +259,44 @@ def update_state(agent_id: str, **fields: object) -> bool:
     the reaper deleted -- but callers with a durability contract (the pre-spawn
     provenance write, #5394) need to see the skip to retry rather than mistake
     a silent no-op for success.
+
+    The read / merge / rewrite is serialized per agent for OFF-LOOP callers (see
+    :data:`_STATE_LOCKS`), so two pool writers can no longer rewrite a snapshot
+    that predates the other's write.
+
+    KNOWN LIMITATION: an ON-LOOP caller does not take the lock, because waiting
+    on a pool thread's fsync from the event loop is exactly the blocking call the
+    repo's anchor forbids. What closes the interleave for those callers instead
+    is that every off-loop writer inside a RUN is drained on cancellation
+    (``_write_state_off_loop``, #6298 / #6308): a pool writer cannot outlive the
+    run it belongs to, and the on-loop retention (``keep``) writes are reached
+    only through a ``_conversation_busy`` gate that refuses while a run is in
+    flight. The drain is bounded, so on a wedged FS a worker IS abandoned -- but
+    that same gate then holds the conversation until the abandoned worker
+    settles, so the two on-loop ``keep`` writes are deferred past it rather than
+    silently undone. Separately, on-loop callers still pay this function's fsync
+    ON the loop; moving them off-loop is tracked as #7302.
     """
     p = _agent_dir(agent_id) / "state.json"
+    # Off-loop callers serialize; on-loop callers keep pre-existing behaviour.
+    # ``holder`` stays referenced for the whole critical section -- that strong
+    # reference is what keeps every concurrent writer on one lock (see
+    # :data:`_STATE_LOCKS`), so it must not be narrowed to ``holder.lock``.
+    holder = None if _on_event_loop() else _lock_for_agent(agent_id)
+    if holder is not None:
+        holder.lock.acquire()
     try:
-        state = json.loads(p.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        logger.debug("update_state: cannot read state for %s, skipping", agent_id)
-        return False
-    state.update(fields)
-    state["updated_at"] = time.time()
-    _atomic_write(p, state)
+        try:
+            state = json.loads(p.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            logger.debug("update_state: cannot read state for %s, skipping", agent_id)
+            return False
+        state.update(fields)
+        state["updated_at"] = time.time()
+        _atomic_write(p, state)
+    finally:
+        if holder is not None:
+            holder.lock.release()
     return True
 
 
@@ -254,19 +392,46 @@ def clear_tombstone(agent_id: str) -> bool:
 # ── slow-command record (stalled but STILL RUNNING) ──────────────────
 
 
+# Rotate ``slow_commands.jsonl`` once it exceeds this size, keeping ONE
+# previous generation (``.jsonl.1``) — the same 1 MiB cap / ~2 MiB total
+# shape as ``mcp_gateway.stub._FALLBACK_LOG_MAX_BYTES``. The log lives at
+# the subagents-dir root so it survives per-agent folder cleanup, which
+# also keeps it outside ``prune_stale_tombstones``'s sweep (that prune
+# skips non-directories) — this cap is its only bound.
+_SLOW_LOG_MAX_BYTES = 1024 * 1024
+
+
 def record_slow_command(agent_id: str, **fields: object) -> None:
     """Append a stalled subagent's slow command to ``slow_commands.jsonl``.
 
     Unlike :func:`write_tombstone`, this does NOT mark the agent dead — a
     stalled subagent is still running; the record is purely for later analysis
-    of which commands run slow. Append-only, at the subagents-dir root so it
-    survives per-agent folder cleanup. Best-effort: never raises to the caller.
+    of which commands run slow. At the subagents-dir root so it survives
+    per-agent folder cleanup; rotated at :data:`_SLOW_LOG_MAX_BYTES` keeping
+    one previous generation. Best-effort: never raises to the caller.
+
+    Bounded via rotate-by-rename (``os.replace``, O(1)) rather than a
+    read-and-rewrite trim: this is invoked synchronously from the async
+    stall detector (``subagent._maybe_flag_stall``), so whole-file work
+    here would stall the gateway event loop.
     """
     entry = {"id": agent_id, "flagged": time.time(), **fields}
     base = _subagents_dir()
     try:
         base.mkdir(parents=True, exist_ok=True)
-        with open(base / "slow_commands.jsonl", "a", encoding="utf-8") as fh:
+        log_path = base / "slow_commands.jsonl"
+        # Rotation (shared helper): O(1) rotate-by-rename at the cap, guarded
+        # by a non-blocking try-lock so two writers hitting the cap together
+        # cannot both rotate, and a loser never waits — no call can stall the
+        # gateway event loop. The helper is best-effort by contract: ANY of
+        # its failures — the lock file unopenable (fd exhaustion, read-only or
+        # ACL-restricted dir), a fresh-boot missing log, a Windows sharing
+        # violation rejecting the rename — degrades to appending without
+        # rotating. Fd/disk exhaustion is a leading cause of the very stalls
+        # this log diagnoses, so a rotation failure must never cost the
+        # record; only a failure of the append itself may.
+        rotate_jsonl_at(log_path, _SLOW_LOG_MAX_BYTES)
+        with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, default=str) + "\n")
     except OSError:
         logger.warning("record_slow_command failed for %s", agent_id, exc_info=True)

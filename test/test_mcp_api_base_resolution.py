@@ -45,6 +45,22 @@ def _bases(monkeypatch: pytest.MonkeyPatch, mcp: Any, sequence: list[str]) -> No
     monkeypatch.setattr(mcp, "_resolve_api_target", lambda: (next(it, last), ""))
 
 
+def _sock_for(port: int) -> str:
+    """The socket path the product derives for *port*, derived the same way.
+
+    Assertions about which gateway a transport reached compare against THIS,
+    never a port substring of the path. The path contains the data home, whose
+    isolation directory is named ``<counter>-kirocrew-home`` from a per-process
+    allocation counter — so a worker that has handed out 5,476 paths puts the
+    literal ``5476`` in every path it builds afterwards. A substring check then
+    reports whichever port the counter happens to equal: the negative form fails
+    a correct socket, and the positive form passes a wrong one.
+    """
+    from kiro_crew.dashboard.origin import dashboard_socket_path
+
+    return str(dashboard_socket_path(port))
+
+
 def _retry_resolution(monkeypatch: pytest.MonkeyPatch, mcp: Any, port: int, source: str) -> None:
     """Script what ``_resolve_api_port`` answers when the replay re-resolves."""
     monkeypatch.setattr(mcp, "_resolve_api_port", lambda: (port, source))
@@ -256,7 +272,16 @@ def test_http_error_on_replay_surfaces_the_backend_body(mcp: Any, monkeypatch) -
 
 
 class TestMcpComputerReplay:
-    """``mcp_computer._invoke`` — the same refused-once-replay rule."""
+    """``mcp_computer._invoke`` — the same refused-once-replay rule, now SHARED.
+
+    #4106 item 2: this shim used to restate the rule (invalidate, re-resolve,
+    check the source, compare the base) in its own words, and restating it is
+    how it silently missed item 1 — it hand-built a ``retry_base`` with no
+    socket half at all. It now consumes ``mcp_core._replay_target``, so the
+    cases below script the rule at ITS seam (``_resolve_api_port`` on
+    ``mcp_core``) and assert this shim's error wording is unchanged: a
+    de-duplication of the rule must not normalise the two callers' messages.
+    """
 
     @pytest.fixture
     def computer(self, mcp: Any, monkeypatch) -> Any:
@@ -264,10 +289,26 @@ class TestMcpComputerReplay:
         monkeypatch.setattr(module, "_internal_secret", lambda: "s")
         return module
 
+    @staticmethod
+    def _first_target(monkeypatch: pytest.MonkeyPatch, computer: Any, base: str) -> None:
+        """Script the pair this shim resolves for its FIRST attempt."""
+        monkeypatch.setattr(computer, "_resolve_api_target", lambda: (base, ""))
+
+    @staticmethod
+    def _unreachable(computer: Any, out: dict) -> bool:
+        """This shim's own refusal wording, which the shared rule must not touch.
+
+        Compared against the module's own constant rather than a copy of its
+        text: the assertion is "still ITS message", so a reworded constant
+        should keep passing while a message borrowed from ``mcp_core`` fails.
+        """
+        prefix = computer.ERR_GATEWAY_UNREACHABLE.split("{detail}")[0]
+        return str(out.get("error", "")).startswith(prefix)
+
     def test_refusal_rediscovers_and_replays(self, computer: Any, mcp: Any, monkeypatch) -> None:
         urls: list[str] = []
-        monkeypatch.setattr(computer, "_api_base", lambda: "http://127.0.0.1:5476")
-        monkeypatch.setattr(computer, "_resolve_api_port", lambda: (7788, "marker"))
+        self._first_target(monkeypatch, computer, "http://127.0.0.1:5476")
+        _retry_resolution(monkeypatch, mcp, 7788, "marker")
 
         def fake_open(req, timeout=None, unix_socket_path=None):
             urls.append(req.full_url)
@@ -280,10 +321,12 @@ class TestMcpComputerReplay:
         assert out == {"text": "done"}
         assert len(urls) == 2
 
-    def test_refusal_with_unchanged_base_is_reported(self, computer: Any, monkeypatch) -> None:
+    def test_refusal_with_unchanged_base_is_reported(
+        self, computer: Any, mcp: Any, monkeypatch
+    ) -> None:
         attempts: list[str] = []
-        monkeypatch.setattr(computer, "_api_base", lambda: "http://127.0.0.1:7788")
-        monkeypatch.setattr(computer, "_resolve_api_port", lambda: (7788, "marker"))
+        self._first_target(monkeypatch, computer, "http://127.0.0.1:7788")
+        _retry_resolution(monkeypatch, mcp, 7788, "marker")
 
         def fake_open(req, timeout=None, unix_socket_path=None):
             attempts.append(req.full_url)
@@ -291,17 +334,18 @@ class TestMcpComputerReplay:
 
         monkeypatch.setattr(computer, "loopback_urlopen", fake_open)
         out = computer._invoke("dashboard:chat-1", "computer_get_state", {})
-        assert "error" in out
+        assert self._unreachable(computer, out), out
         assert len(attempts) == 1
 
     def test_no_replay_when_rediscovery_falls_through_to_default(
-        self, computer: Any, monkeypatch
+        self, computer: Any, mcp: Any, monkeypatch
     ) -> None:
-        """Same no-evidence rule as mcp_core._send: an unverified default-port
-        listener must never receive the replayed secret-bearing request."""
+        """Same no-evidence rule as mcp_core._send — because it is now literally
+        the same code: an unverified default-port listener must never receive the
+        replayed secret-bearing request."""
         attempts: list[str] = []
-        monkeypatch.setattr(computer, "_api_base", lambda: "http://127.0.0.1:9999")
-        monkeypatch.setattr(computer, "_resolve_api_port", lambda: (5476, "default"))
+        self._first_target(monkeypatch, computer, "http://127.0.0.1:9999")
+        _retry_resolution(monkeypatch, mcp, 5476, "default")
 
         def fake_open(req, timeout=None, unix_socket_path=None):
             attempts.append(req.full_url)
@@ -309,18 +353,69 @@ class TestMcpComputerReplay:
 
         monkeypatch.setattr(computer, "loopback_urlopen", fake_open)
         out = computer._invoke("dashboard:chat-1", "computer_get_state", {})
-        assert "error" in out
+        assert self._unreachable(computer, out), out
         assert len(attempts) == 1  # nothing was sent to the unverified default port
 
+    def test_the_attempt_pairs_its_unix_socket_with_its_base(
+        self, computer: Any, mcp: Any, monkeypatch
+    ) -> None:
+        """The gap restating the rule hid: this shim dialled TCP only.
+
+        ``loopback_urlopen`` PREFERS the unix socket, and that socket is what
+        lets the gateway kernel-verify (``SO_PEERCRED`` + /proc ancestry) that
+        this process really owns the session key it declares. Passing no socket
+        path meant every computer-use call fell back to TCP and the
+        header-on-faith path — for the one tool family whose whole point is that
+        the gateway evaluates and audits it. Consuming the shared resolution
+        fixes it for free, so it is pinned here.
+        """
+        seen: list[str] = []
+        monkeypatch.setattr(mcp, "_API", "http://127.0.0.1:7788")
+        monkeypatch.setattr(mcp, "_API_UNIX_SOCKET", "/tmp/seeded-7788.sock")
+
+        def fake_open(req, timeout=None, unix_socket_path=None):
+            seen.append(str(unix_socket_path or ""))
+            return _Resp(b'{"text": "done"}')
+
+        monkeypatch.setattr(computer, "loopback_urlopen", fake_open)
+        assert computer._invoke("dashboard:chat-1", "computer_get_state", {}) == {"text": "done"}
+        assert seen == ["/tmp/seeded-7788.sock"], f"the attempt dialled TCP only: {seen}"
+
+    def test_the_replay_pairs_a_fresh_socket_with_the_re_resolved_base(
+        self, computer: Any, mcp: Any, monkeypatch
+    ) -> None:
+        """And the replay must be paired too, from ONE fresh resolution.
+
+        The hand-built ``retry_base`` carried no socket half, so even a shim that
+        paired its first attempt would have dropped to TCP exactly when the
+        gateway had just moved. The shared owner derives both halves from the
+        resolution whose source it checked.
+        """
+        seen: list[tuple[str, str]] = []
+        self._first_target(monkeypatch, computer, "http://127.0.0.1:5476")
+        _retry_resolution(monkeypatch, mcp, 7788, "marker")
+
+        def fake_open(req, timeout=None, unix_socket_path=None):
+            seen.append((req.full_url, str(unix_socket_path or "")))
+            if ":5476" in req.full_url:
+                raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+            return _Resp(b'{"text": "done"}')
+
+        monkeypatch.setattr(computer, "loopback_urlopen", fake_open)
+        assert computer._invoke("dashboard:chat-1", "computer_get_state", {}) == {"text": "done"}
+        (_, _), (url, sock) = seen
+        assert ":7788" in url
+        assert sock == _sock_for(7788), f"replay dialled {url} with socket {sock!r}"
+
     def test_http_error_on_replay_surfaces_the_backend_body(
-        self, computer: Any, monkeypatch
+        self, computer: Any, mcp: Any, monkeypatch
     ) -> None:
         """A 4xx from the reached moved gateway must decode like a first-attempt
         4xx, not collapse into a stale 'gateway unreachable: refused'."""
         import io
 
-        monkeypatch.setattr(computer, "_api_base", lambda: "http://127.0.0.1:5476")
-        monkeypatch.setattr(computer, "_resolve_api_port", lambda: (7788, "marker"))
+        self._first_target(monkeypatch, computer, "http://127.0.0.1:5476")
+        _retry_resolution(monkeypatch, mcp, 7788, "marker")
 
         def fake_open(req, timeout=None, unix_socket_path=None):
             if ":5476" in req.full_url:
@@ -377,9 +472,8 @@ class TestOneResolutionPerAttempt:
         assert mcp._send("/api/x", headers={}, method="GET") == {"ok": True}
         ((url, sock),) = seen
         assert ":7788" in url
-        assert (
-            "7788" in sock and "9999" not in sock
-        ), f"one attempt aimed TCP at {url} and the unix socket at {sock}"
+        expected = _sock_for(7788)
+        assert sock == expected, f"one attempt aimed TCP at {url} and the unix socket at {sock}"
 
     def test_a_stable_source_still_resolves_once_and_pins(self, mcp: Any, monkeypatch) -> None:
         """Control: the caching rule for stable sources must not change.
@@ -448,9 +542,8 @@ class TestOneResolutionPerAttempt:
         assert len(seen) == 2, "the refused attempt must still be replayed once"
         assert len(runs) == 2, f"two attempts ran the discovery chain {len(runs)} times: {runs}"
         (url1, sock1), (url2, sock2) = seen
-        assert ":5476" in url1 and "5476" in sock1, "first attempt must be self-consistent"
+        assert ":5476" in url1 and sock1 == _sock_for(5476), "first attempt must be self-consistent"
         assert ":7788" in url2, "the replay must dial the re-resolved port"
-        assert (
-            "7788" in sock2 and "9999" not in sock2
-        ), f"the replay aimed TCP at {url2} and the unix socket at {sock2}"
-        assert "5476" not in sock2, "the replay must not reuse the refused resolution"
+        replayed = _sock_for(7788)
+        assert sock2 == replayed, f"the replay aimed TCP at {url2} and the unix socket at {sock2}"
+        assert sock2 != _sock_for(5476), "the replay must not reuse the refused resolution"

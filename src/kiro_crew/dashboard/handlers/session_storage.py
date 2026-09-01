@@ -35,6 +35,7 @@ from kiro_crew.session_map import SessionMap
 from kiro_crew.session_storage import (
     BUCKET_DAYS,
     MIN_RECLAIM_AGE_DAYS,
+    BatchIdentity,
     SessionIndex,
     SessionStorageError,
     SessionUnit,
@@ -175,7 +176,11 @@ async def _json_body(request: web.Request) -> dict[str, Any] | None:
 
 def _report_payload() -> dict[str, Any]:
     index = _build_index()
-    report = measure(index)
+    # One trash pass serves both the totals inside measure() and the wire array
+    # below: list_trash reads every batch manifest per call, and two calls could
+    # bracket a concurrent stage/empty and ship totals that contradict the array.
+    batches = list_trash()
+    report = measure(index, batches=batches)
     return {
         "total_bytes": report.total_bytes,
         "total_sessions": report.total_sessions,
@@ -203,7 +208,7 @@ def _report_payload() -> dict[str, Any]:
                     "sessions": batch.sessions,
                     "bytes": batch.bytes,
                 }
-                for batch in list_trash()
+                for batch in batches
             ],
         },
     }
@@ -420,11 +425,20 @@ def _empty_job_payload(job: _EmptyJob) -> dict[str, Any]:
     }
 
 
-async def _run_empty_job(job: _EmptyJob, batch_ids: list[str], caller: str) -> None:
+async def _run_empty_job(
+    job: _EmptyJob,
+    batch_ids: list[str],
+    caller: str,
+    identities: dict[str, BatchIdentity] | None = None,
+) -> None:
     """Run one empty to completion, then audit it.
 
     ``batch_ids`` is always explicit - never ``None`` for "all" - so the set the
     worker destroys is the set the request resolved, under the storage mutation lock.
+
+    ``identities`` carries what each of those ids pointed AT when it was resolved, so
+    the delete can refuse a directory swapped into an approved name during this
+    handoff. An id alone would have the worker delete whatever now answers to it.
 
     Deliberately not tied to the request that started it: the delete is minutes of
     filesystem work, and a user who closes the tab or walks to another page must
@@ -439,6 +453,7 @@ async def _run_empty_job(job: _EmptyJob, batch_ids: list[str], caller: str) -> N
             batch_ids,
             lambda freed: setattr(job, "freed_bytes", freed),
             job.skipped.append,
+            identities,
         )
     except SessionStorageError as exc:
         # Scrubbed, not passed through. A refusal's text can quote the argument that
@@ -559,7 +574,7 @@ async def api_session_storage_empty(request: web.Request) -> web.Response:
     # and leave a job that never finishes, making every later attempt a 409 for the
     # life of the process.
     try:
-        targets, job.total_bytes = await asyncio.to_thread(staged_targets, requested)
+        targets, job.total_bytes, identities = await asyncio.to_thread(staged_targets, requested)
     except SessionStorageError as exc:
         # A named id that is not a batch. Answered as the 400 it always was rather
         # than as a job, because nothing was dispatched and the caller can fix the
@@ -569,20 +584,36 @@ async def api_session_storage_empty(request: web.Request) -> web.Response:
         return _refused(exc, "empty_refused")
     except Exception:
         logger.exception("could not read the staged batches for the trash")
-        if requested is None:
-            # Fail closed, and SAY so on the job. "Everything currently staged"
-            # cannot be resolved, and handing the worker `None` so it re-enumerates
-            # later is the data loss this snapshot exists to prevent. The job is
-            # answered already-settled rather than 500'd so the screen has one shape
-            # to read and the user learns why nothing moved.
-            job.error = "The staged batches could not be read, so nothing was deleted."
-            job.finished_at = time.time()
-            job.done = True
-            return web.json_response(_empty_job_payload(job), status=202)
-        # An explicit selection needs no snapshot: the caller already named it, and a
-        # missing total only costs the progress bar its denominator.
-        targets = list(batch_ids or [])
-    job.task = asyncio.create_task(_run_empty_job(job, targets, _read_session_key(request)))
+        # Fail closed, for an explicit selection as much as for "everything staged", and
+        # SAY so on the job. The snapshot is not a convenience that buys a progress
+        # denominator: it is what turns a list of NAMES into approval of the directories
+        # those names pointed at. Dispatching without it deletes whatever answers to the
+        # names by the time the worker runs, which is the case this whole path exists to
+        # prevent - and the failure that lands here is not always benign (a tree deep
+        # enough to exhaust descriptors reaches this handler as an exception, and it is
+        # reached by writing into the trash). Answered already-settled rather than 500'd so
+        # the screen has one shape to read and the user learns why nothing moved.
+        job.error = "The staged batches could not be read, so nothing was deleted."
+        job.finished_at = time.time()
+        job.done = True
+        # Audited HERE because this return is the only outcome this request will have.
+        # Every other path through this endpoint reaches the audit inside
+        # `_run_empty_job`, and before this PR an explicit selection reached it too --
+        # it dispatched on a failed snapshot rather than refusing. Failing closed is
+        # the right call, but it moved the request off the audited path, and an
+        # irreversible operation that leaves no record of having been ATTEMPTED is a
+        # worse hole than the one it closed.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="session_storage.empty",
+            outcome="refused",
+            source="dashboard",
+            resources="snapshot_unreadable",
+        )
+        return web.json_response(_empty_job_payload(job), status=202)
+    job.task = asyncio.create_task(
+        _run_empty_job(job, targets, _read_session_key(request), identities)
+    )
     return web.json_response(_empty_job_payload(job), status=202)
 
 
@@ -679,7 +710,10 @@ def _inventory_payload(state: DashboardState) -> dict[str, Any]:
     # The same pass answers both halves of the screen. Measuring separately would
     # re-enumerate a store that reaches half a million files, and would let the
     # totals describe a different instant than the rows printed beneath them.
-    report = measure(index, units=units)
+    # The trash gets the identical treatment: one list_trash() pass feeds both
+    # the totals and the batches array, for the same one-instant reason.
+    batches = list_trash()
+    report = measure(index, units=units, batches=batches)
 
     # Replay-only units — subagent runs — are what a long-lived install accumulates
     # by the hundred thousand, and this screen folds every one of them into a single
@@ -779,7 +813,7 @@ def _inventory_payload(state: DashboardState) -> dict[str, Any]:
                     "sessions": batch.sessions,
                     "bytes": batch.bytes,
                 }
-                for batch in list_trash()
+                for batch in batches
             ],
         },
     }
@@ -843,8 +877,18 @@ def _classify(uids: list[str], index: SessionIndex, now: float) -> tuple[list[st
     guarantee is NOT weakened: it still re-reads the session map inside the lock
     and still refuses anything live, so this pre-pass can only ever be more
     conservative than the authority, never less.
+
+    That property requires the enumeration below to be UNCACHED — in both
+    halves. The co-tenant contribution to ``active`` is served from a 30s cache
+    on ordinary read paths, and a pre-pass fed a stale co-tenant set would
+    classify a just-claimed session as eligible — the authority would still
+    refuse it, but as the all-or-nothing batch failure this function exists to
+    prevent. The STORE half fails the same way on its own: ``age_days`` reads
+    the scan's mtime, so a session appended to after a cached pass reads
+    stale-older here and ``too_fresh`` inside the move. A perf change that
+    re-caches either half re-opens the batch failure.
     """
-    by_uid = {u.uid: u for u in list_units(index)}
+    by_uid = {u.uid: u for u in list_units(index, cached=False)}
     eligible: list[str] = []
     refused: list[dict] = []
     for uid in uids:
@@ -925,8 +969,42 @@ async def api_session_inventory_trash(request: web.Request) -> web.Response:
             refresh=_build_index,
         )
     except SessionStorageError as exc:
+        # Audited before returning. A refusal from inside the move is the same
+        # security-relevant outcome as the pre-flight one above -- someone asked to
+        # remove specific conversations and was told no -- and it is the ONLY record
+        # for the case where every selected session was protected, which returns
+        # here rather than through the success path. Resources names the selection
+        # rather than a per-uid reason: which one tripped it is in the message, and
+        # the whole batch was refused either way.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="session_storage.trash",
+            outcome="denied",
+            source="dashboard",
+            resources=",".join(eligible)[:512],
+        )
         return _refused(exc, "trash_refused")
 
+    # A session resumed while the batch was being staged was left in place, and
+    # this endpoint's contract is that anything not taken is named. It joins the
+    # same list under the same code the pre-flight uses for a live session: the
+    # mechanism differs (caught by mtime during the move, not by the index before
+    # it) but the fact the reader needs is identical — it is in use, so it stayed.
+    revived_refusals = [{"uid": uid, "reason": "in_use"} for uid in batch.revived]
+    if revived_refusals:
+        # Audited for the same reason the pre-flight refusal above is, and it has
+        # to be its own event: that one is emitted before the move, so a session
+        # protected DURING the move would otherwise appear in the record only
+        # inside a "success", leaving the protection itself unlogged. Emitted
+        # before the success event so the trail reads in the same order as the
+        # pre-flight path.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="session_storage.trash",
+            outcome="denied",
+            source="dashboard",
+            resources=",".join(f"{r['uid']}:{r['reason']}" for r in revived_refusals)[:512],
+        )
     _sel().log_api_access(
         caller=_read_session_key(request),
         operation="session_storage.trash",
@@ -939,6 +1017,6 @@ async def api_session_inventory_trash(request: web.Request) -> web.Response:
             "sessions": batch.sessions,
             "bytes": batch.bytes,
             "batch_id": batch.batch_id,
-            "refused": refused,
+            "refused": refused + revived_refusals,
         }
     )

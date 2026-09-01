@@ -80,6 +80,36 @@ class TestCronFoldersList:
         assert len(body) == 1
         assert body[0]["name"] == "Ops"
 
+    @pytest.mark.asyncio
+    async def test_list_serializes_a_snapshot_not_the_live_dicts(self, tmp_path):
+        """The GET must hand the encoder a copy, so a concurrent rename that
+        mutates a folder dict's name in place cannot tear the read."""
+        state = _make_state(tmp_path)
+        live = {"id": "a1", "name": "Ops", "order": 0}
+        state._cron_folders = [live]
+        request = _request(state)
+
+        captured = {}
+
+        def _capture(payload, **kw):
+            captured["payload"] = payload
+            return MagicMock(status=200)
+
+        with patch("kiro_crew.dashboard.handlers.cron.web.json_response", side_effect=_capture):
+            await api_cron_folders(request)
+
+        payload = captured["payload"]
+        # The response list is a fresh object, not the live list...
+        assert payload is not state._cron_folders
+        # ...and each entry is a copy, not the live dict a rename mutates.
+        assert payload[0] is not live
+        assert payload[0] == {"id": "a1", "name": "Ops", "order": 0}
+        # Mutating the returned snapshot must not touch server state.
+        payload[0]["name"] = "Renamed"
+        payload.append({"id": "b2", "name": "Injected", "order": 1})
+        assert live["name"] == "Ops"
+        assert state._cron_folders == [live]
+
 
 class TestCronFoldersCreate:
     """POST /api/cron-folders creates a new folder."""
@@ -347,6 +377,36 @@ class TestCronFolderDeleteStateMethod:
         state.crons = MagicMock()
         result = state.delete_cron_folder("nonexistent")
         assert result is False
+
+
+class TestCronFolderCreateStateMethod:
+    """DashboardState.create_cron_folder guards against a duplicate folder id."""
+
+    def test_create_rejects_duplicate_id(self, tmp_path, monkeypatch):
+        """A colliding folder_id is refused: rename/delete act on the first id
+        match, so a duplicate would strand the shadowed folder as
+        un-renameable/un-deletable. The guard keeps ids unique."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path, raising=False)
+        state = DashboardState.__new__(DashboardState)
+        state._cron_folders = [{"id": "dup", "name": "Ops", "order": 0}]
+        state.save_cron_folders()
+
+        with pytest.raises(ValueError, match="collision"):
+            state.create_cron_folder("Second", "dup")
+        # No shadow folder appended; the store is untouched
+        assert len(state._cron_folders) == 1
+        assert json.loads((tmp_path / state._CRON_FOLDERS_FILE).read_text()) == [
+            {"id": "dup", "name": "Ops", "order": 0}
+        ]
+
+    def test_create_appends_unique_id(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path, raising=False)
+        state = DashboardState.__new__(DashboardState)
+        state._cron_folders = [{"id": "f1", "name": "Ops", "order": 0}]
+
+        folder = state.create_cron_folder("Keep", "f2")
+        assert folder == {"id": "f2", "name": "Keep", "order": 1}
+        assert [f["id"] for f in state._cron_folders] == ["f1", "f2"]
 
 
 class TestCronFoldersAsyncPersistence:

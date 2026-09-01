@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo } from 'react'
 import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Keyboard, Square, BookOpen, X, ClipboardList, CheckCircle, Check, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, Headset, Volume2 } from 'lucide-react'
 import CopyBranchButton from './CopyBranchButton'
+import RejectDropdown from './RejectDropdown'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import { useScrollEdges } from '../hooks/useScrollEdges'
 import VoiceStatusBar from './VoiceStatusBar'
@@ -175,8 +176,10 @@ function sameBlocks(a: PasteBlock[], b: PasteBlock[]): boolean {
   return b.every(x => ids.has(x.id))
 }
 
-function toApiDecision(d: string): 'approve' | 'reject' {
-  return (d === 'approved' || d === 'trust' || d === 'trust_reads') ? 'approve' : 'reject'
+function toApiDecision(d: string): 'approve' | 'reject' | 'reject_once' {
+  if (d === 'approved' || d === 'trust' || d === 'trust_reads') return 'approve'
+  if (d === 'rejected_once') return 'reject_once'
+  return 'reject'
 }
 
 /** Approval sources that run unattended, with no human bound to the chat the
@@ -393,6 +396,10 @@ interface ChatInputProps {
   voiceSampleRef?: { current: AudioSample }
   /** Latest partial hypothesis, rendered muted in the dictation panel. */
   voicePartial?: string
+  /** Byte progress of the one-time speech-model download the live session waits
+   *  on, or null. Both recording surfaces render it: a multi-hundred-megabyte
+   *  transfer with nothing on screen is indistinguishable from a hung mic. */
+  voiceDownload?: { done: number; total: number } | null
   /** Live composer caret, updated by ChatInput so ChatPage's dictation handler
    *  can splice the transcript in at the cursor instead of appending. */
   voiceCaretRef?: React.MutableRefObject<{ start: number; end: number } | null>
@@ -466,14 +473,21 @@ interface ChatInputProps {
   followUpOptions?: string[]
   /** Options the user has picked (visual highlight in FollowUpBar) */
   followUpPicked?: Set<string>
-  /** Select a follow-up option — handler toggles text in input (see ChatPage wiring) */
-  onFollowUpSelect?: (option: string, event: React.MouseEvent) => void
-  /** Double-click a follow-up option — send with option text directly (bypasses setInput race) */
-  onFollowUpSend?: (text?: string) => void
+  /** Select a follow-up option — handler toggles text in input (see ChatPage wiring).
+   *  Third arg is `followUpSourceKey` as it was when the chip was CLICKED (the
+   *  chip debounces, and the row can advance inside that window); `undefined`
+   *  when no `followUpSourceKey` is supplied. */
+  onFollowUpSelect?: (option: string, event: React.MouseEvent, sourceKeyAtClick?: string | null) => void
+  /** Immediate send (double-click / Send-now). Second arg is the click-time
+   *  row identity FollowUpBar already snapshots for onSelect. */
+  onFollowUpSend?: (text?: string, sourceKeyAtClick?: string | null) => void
   /** Quick Send enabled — clicking sends immediately */
   quickSend?: boolean
   /** Layout mode for the follow-up bar: 'multiline' (default) or 'scroll' (original single-line). */
   followUpLayout?: 'multiline' | 'scroll'
+  /** Identity of the transcript row the follow-up options were derived from.
+   *  Forwarded to FollowUpBar so a chip click carries the row it acted on. */
+  followUpSourceKey?: string | null
   /** Collapsed paste blocks backing `⌜🗒 Pasted …⌟` tokens in `value`. */
   pasteBlocks?: PasteBlock[]
   /** Replace the current list of paste blocks (add/remove). */
@@ -541,16 +555,15 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
   const hide = () => setTip(null)
   return (
     <>
-      {/* In flow under the thumbnail, not overlaid on it. The chip's width comes
-          from the image's aspect ratio, so an overlaid pill has no width to fit
-          into: a phone screenshot gives it a 48px chip, while the widest catalog
-          values need 105px (bn) and 104px (de). Overlaid, that ends as one of
-          two defects — an unbreakable Latin word spilling sideways onto the
-          neighbouring chip, or a per-character-breaking script stacking down and
-          covering the thumbnail. In flow, the chip is simply as wide as the
-          wider of image and pill, so each locale pays only its own width and the
-          thumbnail is never covered in any of them. `whitespace-nowrap` is what
-          makes the chip grow instead of the pill wrapping. */}
+      {/* In flow under the thumbnail, not overlaid on it. The tile is a fixed
+          64px square, while the widest catalog values need 105px (bn) and
+          104px (de). Overlaid, that ends as one of two defects — an unbreakable
+          Latin word spilling sideways onto the neighbouring chip, or a
+          per-character-breaking script stacking down and covering the
+          thumbnail. In flow, the chip is simply as wide as the wider of tile
+          and pill, so each locale pays only its own width and the thumbnail is
+          never covered in any of them. `whitespace-nowrap` is what makes the
+          chip grow instead of the pill wrapping. */}
       <button
         type="button"
         ref={ref}
@@ -602,10 +615,10 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
         return (
           <div key={path} className="group/preview shrink-0 flex flex-col items-start gap-0.5" title={path}>
             {/* The corner controls anchor to the IMAGE, not to the chip: the chip
-                is as wide as the wider of image and resize pill, so a locale
-                whose pill is wider than the thumbnail (de: 104px pill, 48px
-                image) would otherwise strand the remove button 52px out in the
-                empty space beside the thumbnail it removes. */}
+                is as wide as the wider of tile and resize pill, so a locale
+                whose pill is wider than the 64px tile (de: 104px pill) would
+                otherwise strand the remove button 40px out in the empty space
+                beside the thumbnail it removes. */}
             <div className="relative">
             <span className="absolute -top-1.5 -left-1.5 w-5 h-5 rounded-full bg-accent text-accent-fg text-[10px] font-bold flex items-center justify-center z-10">{i + 1}</span>
             <button
@@ -614,25 +627,23 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
               className="block cursor-pointer"
               onClick={(e) => { const img = e.currentTarget.querySelector('img'); if (img) dispatchLightbox(img) }}
             >
-              {/* min-w: the chip's height is fixed and its width follows the
-                  aspect ratio, so a 1170x2532 phone screenshot renders 31px
-                  wide — too narrow to tell one screenshot from another. This is
-                  a floor on recognisability, not part of the overlap fix: with
-                  the pill in flow the overlap is 0 at any width. bg-bg-hover
-                  backs the letterbox bands the floor creates, so the border
-                  reads as a tile rather than a partly-empty frame; it applies to
-                  every image chip, including transparent PNGs. No ceiling: a
-                  panorama makes a wide chip and scrolls its siblings out of view
-                  in this overflow-x-auto strip, but nobody has reported that. */}
-              {/* The listener measures intrinsic layout; the image is inside the
+              {/* Fixed 64×64 square tile: every image chip is the same size, so
+                  a phone screenshot (31px at intrinsic ratio) is as recognisable
+                  as a landscape shot, and the strip's row stays uniform.
+                  object-cover center-crops instead of letterboxing — the full
+                  image is one click away in the lightbox, so the tile only has
+                  to be identifiable, not complete. bg-bg-hover backs
+                  transparent PNGs so the border reads as a tile rather than a
+                  see-through frame. */}
+              {/* The listener refreshes the scroll cue; the image is inside the
                   actual preview button and is not itself interactive. */}
               {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
-              <img src={src} alt={path} className="h-16 min-w-12 rounded border border-border object-contain bg-bg-hover hover:opacity-80 transition-opacity"
+              <img src={src} alt={path} className="w-16 h-16 rounded border border-border object-cover bg-bg-hover hover:opacity-80 transition-opacity"
                 data-lightbox-image=""
-                // A thumbnail widens when its bytes arrive (h-16 + intrinsic
-                // ratio), which grows scrollWidth without resizing the
-                // scroller's own box — no ResizeObserver fires and no scroll
-                // lands, so only this load signal can refresh the cue.
+                // The tile's box is fixed, but chips mount before their bytes
+                // arrive and remove/add churns the strip's scrollWidth without
+                // resizing the scroller's own box — no ResizeObserver fires and
+                // no scroll lands, so this load signal still refreshes the cue.
                 onLoad={remeasure} />
             </button>
             {onRemove && (
@@ -751,6 +762,7 @@ function ChatInput({
   voiceStreaming = false,
   voiceSampleRef,
   voicePartial = '',
+  voiceDownload = null,
   voiceCaretRef,
   voicePendingCaretRef,
   onClearVoiceError,
@@ -796,6 +808,7 @@ function ChatInput({
   onFollowUpSend,
   quickSend,
   followUpLayout,
+  followUpSourceKey,
   pasteBlocks = [],
   onPasteBlocksChange,
   knowledgeChip,
@@ -1241,8 +1254,8 @@ function ChatInput({
     if (steerActive && onSteer) onSteer()
     else onSend()
   }, [disabled, voiceTranscribing, steerActive, onSteer, onSend])
-  const sendFollowUp = useCallback((text?: string) => {
-    if (!disabled) onFollowUpSend?.(text)
+  const sendFollowUp = useCallback((text?: string, sourceKeyAtClick?: string | null) => {
+    if (!disabled) onFollowUpSend?.(text, sourceKeyAtClick)
   }, [disabled, onFollowUpSend])
   const { botName } = useBranding()
   const isMobile = useIsMobile()
@@ -1321,8 +1334,10 @@ function ChatInput({
   // `$` trigger renders the picker instantly (the fetch is the only latency).
   // prefetchQuery is a no-op if the cache is already fresh (staleTime), so it's
   // cheap to call on every focus. The key and the session key must match
-  // SkillPickerMenu's exactly, or the prefetch warms a different entry and the
-  // menu still pays the fetch on open.
+  // SkillPickerMenu's exactly — including the trailing agent segment — or the
+  // prefetch warms a different entry and the menu still pays the fetch on open.
+  // The deadline binds HERE too, not only in the menu: react-query dedupes on that
+  // shared key, so the menu opening onto this fetch never runs its own queryFn.
   const queryClient = useQueryClient()
   const skillSlotKey = slotId ? `dashboard:${slotId}` : undefined
   const skillSlotKeyRef = useRef(skillSlotKey)
@@ -1331,11 +1346,11 @@ function ChatInput({
   skillProjectRef.current = project
   const prefetchSkills = useCallback(() => {
     queryClient.prefetchQuery({
-      queryKey: ['skills', skillSlotKey ?? null, project ?? null],
-      queryFn: () => api.skills(skillSlotKey),
+      queryKey: ['skills', skillSlotKey ?? null, project ?? null, agentName ?? null],
+      queryFn: ({ signal }) => api.skills(skillSlotKey, agentName, signal),
       staleTime: skillsCacheStaleTime(project),
     })
-  }, [queryClient, skillSlotKey, project])
+  }, [queryClient, skillSlotKey, project, agentName])
   // Shared caret-relative token insertion for the @/$ pickers: replace the
   // sigil-token ending at the caret with `token`, commit, and restore the caret
   // just after it. One copy keeps the two onSelect handlers duplication-free.
@@ -1687,7 +1702,30 @@ function ChatInput({
     el.readOnly = false
     el.focus()
     el.select()
-    document.execCommand('insertText', false, text)
+    // Same reconciliation handlePaste does, for the same reason: execCommand's
+    // boolean is not evidence. It is absent entirely on some engines, and iOS
+    // Safari reports success on a <textarea> while leaving the field untouched.
+    // Here the whole field was just select()ed, so an unverified failure leaves
+    // the ORIGINAL prompt on screen with the optimizer's result discarded and
+    // no error — indistinguishable from "the optimizer changed nothing".
+    let inserted = false
+    try {
+      inserted = typeof document.execCommand === 'function' && document.execCommand('insertText', false, text)
+    } catch { inserted = false }
+    // Reconcile through the controlled value either way, exactly as handlePaste
+    // does: after a real insert this is the same string the textarea's own
+    // onChange already pushed up (React bails), while an insert React never saw
+    // would be reverted to the stale `value` prop on the next render — the same
+    // silent vanish by a different route. Marked user-driven so the undo
+    // recorder treats it as an edit (a new boundary) rather than a
+    // parent-driven draft restore, which is what keeps this "undoable".
+    const nativeOk = inserted && el.value === text
+    valueFromUserRef.current = true
+    onChange(text)
+    if (nativeOk) return // the native insert placed the caret itself
+    requestAnimationFrame(() => {
+      if (el && document.activeElement === el) el.setSelectionRange(text.length, text.length)
+    })
   }, [onChange])
 
   const optimizeMutation = useMutation({
@@ -2212,6 +2250,7 @@ function ChatInput({
     // the browser so the paste is never a silent no-op.
     if (cleaned !== pasted && cleaned !== '') {
       e.preventDefault()
+      const next = before + cleaned + after
       // Insert through the native input path so the textarea's own onChange runs:
       // that fires the /, @, $ picker detection, marks the edit user-driven, and
       // keeps native undo. Fall back to a controlled-value splice where
@@ -2220,9 +2259,19 @@ function ChatInput({
       try {
         inserted = typeof document.execCommand === 'function' && document.execCommand('insertText', false, cleaned)
       } catch { inserted = false }
-      if (inserted) return
+      // That boolean is not evidence on its own. iOS Safari's native paste
+      // callout reports success on a <textarea> and can leave the field
+      // untouched, and this branch has ALREADY called preventDefault() — so
+      // trusting the return value drops the paste with no visible trace at all.
+      // Read the DOM back instead, and reconcile the controlled value either
+      // way: after a real insert this is the same string the textarea's own
+      // onChange already pushed up (React bails), while an insert React never
+      // saw would otherwise be reverted to the stale `value` prop on the next
+      // render — the same silent vanish by a different route.
+      const nativeOk = inserted && ta.value === next
       valueFromUserRef.current = true
-      onChange(before + cleaned + after)
+      onChange(next)
+      if (nativeOk) return // the native insert placed the caret itself
       requestAnimationFrame(() => {
         if (ta && document.activeElement === ta) {
           const pos = before.length + cleaned.length
@@ -2232,19 +2281,48 @@ function ChatInput({
     }
   }, [onUploadFiles, onPasteBlocksChange, pasteBlocks, value, onChange])
 
-  /** Two-step click on a collapsed-paste token:
-   *    1st click (detail=1) → select the token as a range (visual highlight)
-   *    2nd click (detail=2, i.e. a quick second click = native "double click"
-   *       semantics) → expand to the original full content in the textarea
-   *  Uses `event.detail` (the click count) which the browser computes with
-   *  its own double-click timing — fully cross-browser (Chrome, Electron,
-   *  Safari, Firefox all agree) and no ref/selection tracking required. */
+  /** Replace a collapsed-paste token with its full content in the textarea and
+   *  drop the backing block. The caret lands just past the inserted content. */
+  const expandTokenRange = useCallback((range: { start: number; end: number; block: PasteBlock }) => {
+    const expanded = value.slice(0, range.start) + range.block.content + value.slice(range.end)
+    onChange(expanded)
+    onPasteBlocksChange?.(pasteBlocks.filter(b => b.id !== range.block.id))
+    requestAnimationFrame(() => {
+      const ta = inputRef.current
+      if (ta) {
+        const pos = range.start + range.block.content.length
+        ta.setSelectionRange(pos, pos)
+        ta.focus()
+      }
+    })
+  }, [value, pasteBlocks, onPasteBlocksChange, onChange])
+
+  /** Click/tap on a collapsed-paste token expands it to the original full
+   *  content in the textarea.
+   *
+   *  Two gestures reach expansion, because a single gesture cannot serve both
+   *  pointer classes:
+   *   - Mouse: a two-step click — 1st click (detail=1) selects the token as a
+   *     range (visual highlight), a quick 2nd click (detail>=2, the browser's
+   *     own double-click) expands. `event.detail` is the click count the
+   *     browser computes with its double-click timing, so no ref/selection
+   *     tracking is needed and Chrome/Electron/Safari/Firefox all agree.
+   *   - Touch: a single tap expands. Two discrete taps never coalesce into a
+   *     `detail>=2` click the way mouse clicks do, so the double-click path is
+   *     unreachable under a finger; gating expansion on it left the token only
+   *     ever selectable on touch, never openable. A tap matches the sent-bubble
+   *     PastedChip, which is a real <button> that toggles on one tap. */
   const handleTextareaClick = useCallback((e: React.MouseEvent<HTMLTextAreaElement>) => {
     if (!onPasteBlocksChange || !pasteBlocks.length) return
     const ta = e.currentTarget
     const caret = ta.selectionStart ?? 0
     const range = tokenRangeAt(value, pasteBlocks, caret)
     if (!range) return
+
+    // Touch has no double-click to reach the expand branch below, so the first
+    // tap inside a token expands directly — the select-first step is a
+    // mouse-only refinement.
+    if (isTouchDevice()) { expandTokenRange(range); return }
 
     if (e.detail < 2) {
       // First click in a (potential) sequence — highlight the token as an
@@ -2259,17 +2337,8 @@ function ChatInput({
 
     // e.detail >= 2 — second (or more) click in a rapid sequence on the
     // same region — expand.
-    const expanded = value.slice(0, range.start) + range.block.content + value.slice(range.end)
-    onChange(expanded)
-    onPasteBlocksChange(pasteBlocks.filter(b => b.id !== range.block.id))
-    requestAnimationFrame(() => {
-      if (ta) {
-        const pos = range.start + range.block.content.length
-        ta.setSelectionRange(pos, pos)
-        ta.focus()
-      }
-    })
-  }, [value, pasteBlocks, onPasteBlocksChange, onChange])
+    expandTokenRange(range)
+  }, [value, pasteBlocks, onPasteBlocksChange, expandTokenRange])
 
   /** Snap selection endpoints that land inside a token range to the nearest edge.
    *  Covers drag-select that ends mid-token, touch/long-press handles on mobile,
@@ -2672,7 +2741,7 @@ function ChatInput({
 
       {/* Ghost follow-up bubbles floating above input */}
       {!showGhost && followUpOptions && followUpOptions.length > 0 && onFollowUpSelect && (
-          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} />
+          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} sourceKey={followUpSourceKey} />
       )}
 
       {/* Tip / folder-suggestion band — LAST above the composer so it always
@@ -2691,8 +2760,18 @@ function ChatInput({
           Absent under a finger, and its absence is the feature: the reset is a
           double-click, so on touch the gesture could only ever pin the height, never
           undo it. See `manualHeight` for why the persisted value is disregarded
-          there too. */}
-      {!showGhost && !isTouch && <div
+          there too.
+
+          Its 6px box is ALSO the only thing separating the strip above (the
+          options row, the tip band) from the composer box — so dropping the
+          handle on touch dropped that separation with it, and the options row sat
+          flush against the input. Touch therefore keeps the box and drops only
+          the affordance, which puts the composer at the same offset under both
+          pointer types instead of leaving the gap a side effect of a
+          pointer-only control. */}
+      {!showGhost && (isTouch
+        ? <div aria-hidden="true" data-testid="composer-top-gap" className="h-[6px] shrink-0" />
+        : <div
         aria-hidden="true"
         data-testid="composer-resize-handle"
         className="flex items-center justify-center h-[6px] cursor-row-resize group/drag"
@@ -2702,7 +2781,7 @@ function ChatInput({
         title={i18nT('components.chatInput.drag_to_resize_double_click_to_reset')}
       >
         <div className="w-12 h-[3px] rounded-full bg-border group-hover/drag:bg-accent group-active/drag:bg-accent-hover transition-all duration-200 opacity-0 group-hover/drag:opacity-100" />
-      </div>}
+      </div>)}
 
       {/* Sub-agent spawn-approval banner — a top-level signal that one or more
        *  sub-agents are queued awaiting the user's approval to run, with inline
@@ -2889,7 +2968,11 @@ function ChatInput({
                             onAction={(action, pattern) => { handleApprovalAction(action, pattern) }}
                         />
                       )}
-                      <button disabled={approvalSubmitting} className={`${approvalBtnClass} hover:!text-danger hover:!bg-[color-mix(in_srgb,var(--danger)_10%,transparent)]`} onClick={() => handleApprovalAction('rejected')}><Ban size={12} className="shrink-0" />{i18nT('components.chatInput.reject')}</button>
+                      <RejectDropdown
+                          disabled={approvalSubmitting}
+                          className={`${approvalBtnClass} hover:!text-danger hover:!bg-[color-mix(in_srgb,var(--danger)_10%,transparent)]`}
+                          onAction={(action) => { handleApprovalAction(action) }}
+                      />
                   </div>
               </div>
               {/* A1 discoverability hint: points at the footer mode picker so a
@@ -2969,6 +3052,7 @@ function ChatInput({
         sendOnEnter={sendOnEnter}
         slotKey={skillSlotKey}
         project={project}
+        agent={agentName}
         onSelect={({ leaf }) => {
           // Token left literal — backend appends the skill body; the user still
           // sees their $token marker. Caret-relative replace via shared helper.
@@ -3102,9 +3186,9 @@ function ChatInput({
              keyboard hint stays suppressed for exactly the drain the finger
              just committed — and stays SHOWN for a keyboard-binding capture,
              where Esc/Enter genuinely work. */
-          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} gestureDriven={voiceHoldMode || touchPtt.bar === 'settling'} />
+          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} gestureDriven={voiceHoldMode || touchPtt.bar === 'settling'} download={voiceDownload} />
         ) : (
-          <VoiceStatusBar recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} />
+          <VoiceStatusBar recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} download={voiceDownload} />
         )}
 
         {optimizing && <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl"><Sparkles size={14} className="inline mr-1 text-yellow-400" /> {i18nT('components.chatInput.optimizing_prompt')}</span>}
@@ -3205,7 +3289,6 @@ function ChatInput({
               <div className="relative shrink-0" ref={plusWrapRef}>
                 {directFilePicker ? (
                   /* Association is intentionally absent while uploads disable the control. */
-                  // eslint-disable-next-line jsx-a11y/label-has-for
                   <label
                     htmlFor={uploading ? undefined : fileInputId}
                     aria-disabled={uploading || undefined}

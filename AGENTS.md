@@ -43,6 +43,7 @@ in the **same commit** when you change what it documents.
 | MCP servers or tools (adding, changing, statelessness) | [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
 | artifacts, companion chat | [artifacts](docs/system-specs/modules/artifacts.md) |
+| `stt/`, `transcribe.py`, `voice_reply.py`, the mic, dictation, TTS | [stt-streaming](docs/system-specs/features/stt-streaming.md) + [voice-streaming](docs/system-specs/features/voice-streaming.md) |
 | cron, learn, dashboard handlers | [learn-cron-dashboard](docs/system-specs/modules/learn-cron-dashboard.md) |
 | Slack, Discord, any channel, messaging, approvals | [messaging](docs/system-specs/modules/messaging.md) + [slack-gateway](docs/system-specs/modules/slack-gateway.md) |
 | subagents, spawn, orphan recovery | [subagent](docs/system-specs/modules/subagent.md) |
@@ -79,10 +80,18 @@ This repo is the de-Amazoned public fork of an internal package. Never re-add:
   holds): `sso_status.py`, `browser/auth.py`, `dashboard/handlers/sso_login.py`,
   `tunnel/manager.py`, `aim_agents.py`.
 - **Other providers.** Kiro Crew is KiroACP-only: `agent.provider` is fixed to
-  `acp` and kiro-cli is REQUIRED. Keep the dormant `ACP_BACKEND_CLAUDE` /
-  `_is_claude` seam in `acp/client.py` so an internal companion can re-register
-  Claude Code; do NOT re-add the public registration glue. A harness added at
-  `agent.acp_backend` is a different question and is governed by
+  `acp` and kiro-cli is REQUIRED. `ACP_BACKEND_CLAUDE` is a **publicly selectable
+  harness**, not a dormant seam: `acp/client.py` owns its whole spawn path and the
+  adapter it needs is a public npm package, so it sits in
+  `BASELINE_SELECTABLE_BACKENDS` and any operator with the two binaries can choose it.
+  Two consequences to keep in mind rather than undo: a Claude session starts with **no
+  Crew MCP tools** (`_claude_session_mcp_servers` defaults to `[]`), and a tool
+  pre-approved in Claude's own settings — including a `.claude/settings.json` inside a
+  cloned project — never reaches Crew's approval path, so its deny rules and audit log
+  do not see that call. Both are disclosed on the Agent Backend panel and in
+  `docs/system-specs/features/claude-code-provider.md`; do not widen the harness's
+  reach further without closing them. A harness added at `agent.acp_backend` is
+  governed by
   [Harness parity](#harness-parity-kiro-is-first-class-the-rest-are-adapted) —
   adapted, never a second `agent.provider` value.
 - **OSS-flipped defaults:** always-on in-process embeddings, Piper TTS by default,
@@ -180,11 +189,15 @@ that harness pays for it.
   it makes `sandbox.wrap_argv` SKIP Kiro Crew's own seatbelt in favour of the
   harness's internal sandbox, so granting it to a harness without one leaves the
   agent process unconfined.
-- **Kiro is the floor.** `agent.acp_backend` defaults to `ACP_BACKEND_KIRO` and
-  it is in `ACP_BACKENDS_SELECTABLE` unconditionally; an unusable persisted value
-  degrades there with a logged reason (`_normalize_acp_backend`) instead of
-  raising. A harness is selected at `acp_backend` — `agent.provider` stays
-  `enum=["acp"]`.
+- **Kiro is the floor.** `agent.acp_backend` defaults to `ACP_BACKEND_KIRO` and it
+  is in `acp_backends.selectable_backends()` unconditionally (its baseline is
+  `BASELINE_SELECTABLE_BACKENDS`); an unusable persisted value degrades there with a
+  logged reason instead of raising. There is exactly one gate —
+  `resolve_selected_backend`, called from `_normalize_acp_backend` inside config
+  load — and it reads `selectable_backends()` per call, so registering a backend is
+  what makes a persisted value survive. The Kiro construction path gains no second
+  check (harness-parity H13). A harness is selected at `acp_backend` —
+  `agent.provider` stays `enum=["acp"]`.
 - **Registration is additive at the seam** — `platform/interfaces.py`'s
   `ProviderRegistry`, a v1 addition with no `CONTRACT_VERSION` bump. A new
   provider capability lands on the `LLMProvider` ABC with a safe default, never
