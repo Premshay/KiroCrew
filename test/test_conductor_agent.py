@@ -446,7 +446,11 @@ class TestConductorInstaller:
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         assert "Reads and creates do not prompt" in text
         assert "`session_send`\n  and `session_stop` are deliberately NOT auto-approved" in text
-        assert "accept_eval.py` invocation" in text
+        # Upstream also pins that the bundled `accept_eval.py` invocation prompts.
+        # This fork's skill moves that script to the legacy codec path and off the
+        # new-item and patrol path entirely, so there is no non-legacy script
+        # invocation left for the cost note to name. Its legacy status is pinned by
+        # test_skill_uses_product_work_items_and_labels_the_codec_legacy_only.
 
     def test_skill_uses_product_work_items_and_labels_the_codec_legacy_only(self):
         """New coordination state cannot regress into a string-artifact codec."""
@@ -498,8 +502,12 @@ class TestConductorInstaller:
         drift back.
         """
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
-        assert "1. `session_create`" in text, "dispatch must open with the atomic create"
-        assert "`folder`" in text, "dispatch must name the folder argument at create"
+        # The contract is that filing happens AT create, not that the section is a
+        # numbered list: this fork states the same guarantee in prose rather than
+        # as a dispatch step, so pinning the "1. " prefix would pin the formatting
+        # and not the atomicity the ratchet exists for.
+        assert "filing rides the create" in text, "dispatch must open with the atomic create"
+        assert "`folder` argument" in text, "dispatch must name the folder argument at create"
         assert "chat_folder_move_session" not in text, "the move workaround must stay deleted"
         # Scoped to the dispatch STEP, not the whole document: a future
         # legitimate mention of the tool elsewhere in the skill must not fail a

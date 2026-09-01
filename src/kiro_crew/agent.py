@@ -42,6 +42,7 @@ from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.agent_files import (
     AGENT_FILENAME,
 )
+from kiro_crew.agent_files import CONDUCTOR_AGENT_FILENAME as _CONDUCTOR_AGENT_FILENAME
 from kiro_crew.agent_files import CONSOLIDATE_AGENT_FILENAME as _CONSOLIDATE_AGENT_FILENAME
 from kiro_crew.agent_files import FAST_RECON_AGENT_FILENAME as _FAST_RECON_AGENT_FILENAME
 from kiro_crew.agent_files import HEARTBEAT_AGENT_FILENAME as _HEARTBEAT_AGENT_FILENAME
