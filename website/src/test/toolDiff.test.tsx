@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { fireEvent } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
 import ToolCallLine from '../pages/chat/ToolCallLine'
-import { presentToolDiff, isDiffToolMessage } from '../pages/chat/toolDiff'
+import { presentToolDiff, isDiffToolMessage, diffCardStartsFolded, DIFF_CARD_FOLD_LINES } from '../pages/chat/toolDiff'
 import type { RootState } from '../store'
 import type { ChatMessage } from '../types'
 
@@ -214,5 +214,90 @@ describe('ToolCallLine diff presentation', () => {
     // Unfold to leave the module registry clean for other tests.
     fireEvent.click(second.getByText('app.py'))
     expect(second.container.querySelector('.diff-block')).toBeTruthy()
+  })
+})
+
+describe('diffCardStartsFolded', () => {
+  it('keeps a short diff open and folds anything longer', () => {
+    // The threshold is about RENDERED height, so every line the card draws
+    // counts — hunk header and file headers included.
+    expect(diffCardStartsFolded(UNIFIED_DIFF)).toBe(false)
+    expect(diffCardStartsFolded(bigDiff(DIFF_CARD_FOLD_LINES + 5))).toBe(true)
+  })
+
+  it('folds one line past the threshold, not at it', () => {
+    const at = bigDiff(DIFF_CARD_FOLD_LINES - 3)   // 3 header lines
+    const over = bigDiff(DIFF_CARD_FOLD_LINES - 2)
+    expect(at.split('\n').length).toBe(DIFF_CARD_FOLD_LINES)
+    expect(diffCardStartsFolded(at)).toBe(false)
+    expect(diffCardStartsFolded(over)).toBe(true)
+  })
+})
+
+describe('ToolCallLine diff card default fold', () => {
+  function editRow(id: string): ChatMessage {
+    return { role: 'tool', content: '🔧 fs_write', cls: '', meta: { tool_call_id: id, purpose: 'Edit app.py' } }
+  }
+  function storeFor(id: string, input: string) {
+    return createTestStore({
+      chat: {
+        messages: [editRow(id)],
+        toolLog: [{ type: 'tool', text: 'fs_write', kind: 'edit', input, tool_call_id: id, output: 'ok', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+  }
+
+  it('starts a long diff folded to its chip', () => {
+    const { container, getByText } = renderWithProviders(
+      <ToolCallLine message={editRow('tc_long')} running={false} />,
+      { store: storeFor('tc_long', bigDiff(40)) },
+    )
+    expect(container.querySelector('.diff-block')).toBeNull()
+    expect(getByText('big.txt')).toBeTruthy()
+    expect(getByText('+40')).toBeTruthy()
+    // One click is the whole cost of reading it.
+    fireEvent.click(getByText('big.txt'))
+    expect(container.querySelector('.diff-block')).toBeTruthy()
+  })
+
+  it('leaves a short diff open — a three-line change reads fine in place', () => {
+    const { container } = renderWithProviders(
+      <ToolCallLine message={editRow('tc_short')} running={false} />,
+      { store: storeFor('tc_short', UNIFIED_DIFF) },
+    )
+    expect(container.querySelector('.diff-block')).toBeTruthy()
+  })
+
+  it('an opened long card stays open across remount — the reader outranks the default', () => {
+    // Without a recorded CHOICE (as opposed to a recorded fold) the size rule
+    // would re-fold every card the reader deliberately opened, each time the
+    // virtualizer recycled its row.
+    const msg = editRow('tc_choice')
+    const first = renderWithProviders(<ToolCallLine message={msg} running={false} />, { store: storeFor('tc_choice', bigDiff(40)) })
+    fireEvent.click(first.getByText('big.txt'))
+    expect(first.container.querySelector('.diff-block')).toBeTruthy()
+    first.unmount()
+    const second = renderWithProviders(<ToolCallLine message={msg} running={false} />, { store: storeFor('tc_choice', bigDiff(40)) })
+    expect(second.container.querySelector('.diff-block')).toBeTruthy()
+  })
+
+  it('folds a diff that arrives after the row has mounted', () => {
+    // An edit row mounts on tool_call and the diff lands on tool_call_update,
+    // so the initial state is computed before there is anything to measure.
+    const persisted = (input?: string): ChatMessage => ({
+      role: 'tool', content: '🔧 fs_write', cls: '',
+      meta: { tool_call_id: 'tc_late', kind: 'edit', ...(input ? { input } : {}) },
+    })
+    const store = createTestStore({
+      chat: { messages: [persisted()], toolLog: [], slotRunning: false } as unknown as ChatState,
+    })
+    const { container, rerender, getByText } = renderWithProviders(
+      <ToolCallLine message={persisted()} running={false} />, { store },
+    )
+    expect(container.querySelector('.diff-block')).toBeNull()
+    rerender(<ToolCallLine message={persisted(bigDiff(40))} running={false} />)
+    expect(container.querySelector('.diff-block')).toBeNull()
+    expect(getByText('big.txt')).toBeTruthy()
   })
 })

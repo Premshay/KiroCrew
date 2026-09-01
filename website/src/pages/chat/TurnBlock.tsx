@@ -45,9 +45,10 @@ const isMcpAppItem = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
 // renders a DiffBlock card or summary chip below the pill). It stays out of
 // BOTH folds — a file change is a result, not a working step: the same class
 // as the prose ```diff the final summary used to carry, which neither fold
-// ever hid. Density relief is per-card (ToolCallLine's fold chip) plus the
-// size caps in presentToolDiff, so an edit-heavy turn is N foldable cards,
-// not an immovable wall (see rfc-tool-derived-diff-cards.md).
+// ever hid. Density relief is per-card: a card longer than
+// DIFF_CARD_FOLD_LINES opens folded to its chip and the reader's own toggle
+// overrides that either way, so an edit-heavy turn is N one-line chips rather
+// than an immovable wall (see rfc-tool-derived-diff-cards.md).
 const isDiffCardItem = (it: TurnItem) =>
   it.kind === 'single' && isDiffToolMessage(it.msg)
 const isTool = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>

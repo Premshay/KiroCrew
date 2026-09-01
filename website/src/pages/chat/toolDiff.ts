@@ -35,6 +35,40 @@ import type { ChatMessage } from '../../types'
  */
 const DIFF_CARD_MAX_LINES = 400
 
+/**
+ * Line count above which a card renders FOLDED to its chip. The card's
+ * every-edit-gets-a-trace guarantee is about the change being visible in the
+ * transcript, not about the whole diff being open: a turn touching five files
+ * otherwise puts hundreds of rendered rows between the reader and the prose
+ * either side of it, and DIFF_CARD_MAX_LINES admits 400 of them per card. So
+ * a small change — the class the inline card was for — stays in place, and
+ * anything longer is one click away behind a chip that still names the file
+ * and its ±counts.
+ *
+ * Counted in lines rather than in ± stats because it is the card's height on
+ * screen that costs the reader scrolling: a 3-line change quoted with context
+ * draws ~16 rows.
+ */
+export const DIFF_CARD_FOLD_LINES = 20
+
+/** Newlines in `s` — a char scan, since both callers run per rendered row. */
+function countNewlines(s: string): number {
+  let n = 0
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) === 10) n++
+  }
+  return n
+}
+
+/**
+ * Does a promoted card open folded? The DEFAULT only — a reader's own fold or
+ * unfold on that card outranks it (see ToolCallLine's choice registry), so
+ * this never reverses a deliberate click.
+ */
+export function diffCardStartsFolded(code: string): boolean {
+  return countNewlines(code) + 1 > DIFF_CARD_FOLD_LINES
+}
+
 /** How an edit-tool row presents its diff in the transcript. */
 export type ToolDiffView =
   | { mode: 'card'; code: string }
@@ -73,11 +107,7 @@ export function presentToolDiff(
   // most of the change. Always the summary chip, flagged so the chip shows a
   // visible truncation note and the counts read as lower bounds.
   const truncated = TRUNCATION_RE.test(input)
-  let newlines = 0
-  for (let i = 0; i < input.length; i++) {
-    if (input.charCodeAt(i) === 10) newlines++
-  }
-  if (!truncated && newlines <= DIFF_CARD_MAX_LINES) return { mode: 'card', code: input }
+  if (!truncated && countNewlines(input) <= DIFF_CARD_MAX_LINES) return { mode: 'card', code: input }
   const { added, removed } = countDiffStats(input)
   return { mode: 'summary', path: extractFilePath(input)?.path ?? null, added, removed, truncated }
 }
