@@ -231,6 +231,15 @@ const finalizeTrailingStreaming = (msgs: ChatMessage[]) => {
   }
 }
 
+/** A persisted row emitted after an agent has already ended its foreground turn.
+ *
+ * It is an authoritative boundary: a late `_done` frame may have left the prior
+ * response as `streaming` in a client cache, but this work cannot belong to that
+ * response. Freeze it before appending so an idle assistant row cannot replace
+ * it during the normal streaming-finalization reconciliation. */
+const isBetweenTurnWork = (meta?: Record<string, unknown>): boolean =>
+  meta?.between_turn === true
+
 /** The three keys that can pollute `Object.prototype` when used to index a
  *  plain-object map (`obj[key] = ...`). Slot ids, subagent ids, run ids, and
  *  session keys all flow in from WebSocket action payloads; a crafted payload
@@ -1100,6 +1109,7 @@ function applyNonActiveFrame(
   // placed after the redelivery guard so a replayed frame cannot clear a
   // live card (see dropStaleStatelessQuestion).
   dropStaleStatelessQuestion(state, slot, role)
+  if (isBetweenTurnWork(effectiveMeta)) finalizeTrailingStreaming(msgs)
   if (role === 'tool') {
     run.state = 'tool_running'
     syncOriginRun(state, slot, 'tool_running')
@@ -4509,6 +4519,7 @@ const chatSlice = createSlice({
       // placed after the redelivery guard so a replayed frame cannot clear a
       // live card (see dropStaleStatelessQuestion).
       dropStaleStatelessQuestion(state, slot, role)
+      if (isBetweenTurnWork(effectiveMeta)) finalizeTrailingStreaming(state.messages)
       // Tool call — update state, insert before streaming message
       if (role === 'tool') {
         state.slotState = 'tool_running'

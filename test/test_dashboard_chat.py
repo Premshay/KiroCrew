@@ -5168,6 +5168,28 @@ class TestTitleGenerationSessionLeak:
         mock_client.destroy.assert_awaited_once()
 
 
+class TestClaudeIdleEvent:
+    @pytest.mark.asyncio
+    async def test_idle_text_has_a_durable_turn_boundary(self, tmp_path, monkeypatch):
+        """Idle output must not be grouped with the previous user reply."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.providers.base import EVENT_TEXT_CHUNK, LLMEvent
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(chat_runner, "save_slot_off_loop", AsyncMock())
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        slot = state.get_or_create_slot("s1")
+
+        await chat_runner._render_claude_idle_event(
+            state,
+            slot,
+            LLMEvent(kind=EVENT_TEXT_CHUNK, text="status update"),
+        )
+
+        assert slot.messages[-1]["meta"]["between_turn"] is True
+
+
 class TestFlushSegment:
     """Unit tests for _flush_segment helper function."""
 
@@ -5197,6 +5219,24 @@ class TestFlushSegment:
         assert assistant_msgs[0]["content"] == "Hello world"
         # chat_segment should be broadcast
         state.broadcast_ws.assert_called_once_with("chat_segment", {"slot": "s1"})
+
+    def test_flush_segment_preserves_supplied_message_meta(self, tmp_path, monkeypatch):
+        """Between-turn rows retain their durable transcript boundary marker."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+
+        from kiro_crew.dashboard.chat import _flush_segment
+
+        _flush_segment(
+            state,
+            slot,
+            "status update",
+            broadcast=False,
+            message_meta={"between_turn": True},
+        )
+
+        assert slot.messages[-1]["meta"]["between_turn"] is True
 
     def test_flush_segment_schedules_widget_registration(self, tmp_path, monkeypatch):
         """A segment containing an <mcwidget> auto-registers it as an artifact.

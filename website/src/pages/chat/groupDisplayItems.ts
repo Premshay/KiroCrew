@@ -125,6 +125,10 @@ const isForeignInjection = (msg: ChatMessage): boolean => {
   return typeof kind === 'string' && FOREIGN_INJECT_KINDS.has(kind)
 }
 
+/** A dashboard row emitted while no prompt is consuming the provider stream. */
+const isBetweenTurnWork = (item: TurnItem): boolean =>
+  item.kind === 'single' && item.msg.meta?.between_turn === true
+
 export interface GroupedTurns {
   turns: DisplayItem[]
   /** Index into `turns` of the turn object produced by the TRAILING flush, or
@@ -196,6 +200,11 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
   if (group.length) raw.push({ kind: 'group', msgs: group, startIdx: groupStart })
 
   // Phase 2: group into turns (user message → next user message).
+  // A pending synthesis makes the immediate per-completion assistant summary
+  // redundant. Keep that suppression separate from the durable between-turn
+  // boundary below: neither kind of work belongs to the preceding user turn.
+  let lastSubagentHadSynthesis = false
+  let inBetweenTurnWork = false
   const turns: DisplayItem[] = []
   let turnItems: TurnItem[] = []
   // First index in `turns` after the last USER/nudge prompt — the start of the
@@ -266,6 +275,18 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
       continue
     }
     if (item.kind === 'single' && isForeignInjection(item.msg)) regionHasForeign = true
+    // Between-turn provider output is a new lifecycle without a user-authored
+    // opener. Flush the completed foreground turn before it so the idle reply
+    // cannot become that turn's conclusion or be folded by a later synthesis.
+    const startsBetweenTurnWork = isBetweenTurnWork(item) && !inBetweenTurnWork
+    inBetweenTurnWork = isBetweenTurnWork(item)
+    if (startsBetweenTurnWork) {
+      if (turnItems.length > 0) { flushTurn(turnItems, true); turnItems = [] }
+      lastSubagentHadSynthesis = false
+      regionHasForeign = true
+      turnItems.push(item)
+      continue
+    }
     // A nudge opens a new turn exactly like a user message does — it IS the
     // turn's prompt. Without this it gets swallowed into the previous turn's
     // collapsed step group and the cycle chip disappears. A sub-agent
@@ -273,12 +294,24 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
     // input, so the agent's reply belongs BELOW the card, not beside it.
     if (item.kind === 'single' && isTurnOpener(item.msg)) {
       if (turnItems.length > 0) { flushTurn(turnItems, true); turnItems = [] }
+      lastSubagentHadSynthesis = item.msg.role === 'subagent' &&
+        !!(item.msg.meta as Record<string, unknown> | undefined)?.synthesisPending
       turns.push(item)
       // A user/nudge prompt begins a fresh interim region; a sub-agent
       // completion belongs to the one already open.
       if (item.msg.role !== 'subagent') { regionStart = turns.length; regionHasForeign = false }
       continue
     }
+    if (
+      lastSubagentHadSynthesis &&
+      item.kind === 'single' &&
+      (item.msg.role === 'assistant' || item.msg.role === 'streaming') &&
+      !isSubagentCompletionMessage(item.msg)
+    ) {
+      lastSubagentHadSynthesis = false
+      continue
+    }
+    lastSubagentHadSynthesis = false
     turnItems.push(item)
   }
   // Flush the trailing group as complete, and remember whether that flush

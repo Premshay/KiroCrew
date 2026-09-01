@@ -3420,6 +3420,7 @@ def _flush_segment(
     *,
     broadcast: bool = True,
     quiet_persist: bool = False,
+    message_meta: dict | None = None,
 ) -> None:
     """Finalize current text block as a segment and persist it.
 
@@ -3478,7 +3479,13 @@ def _flush_segment(
     # other tabs viewing the same slot receive the finalized text.
     # The active tab already has this content from streaming chunks;
     # the chat_segment event tells it to finalize streaming → assistant.
-    slot.append("assistant", redacted, "msg msg-a", broadcast=not quiet_persist)
+    slot.append(
+        "assistant",
+        redacted,
+        "msg msg-a",
+        broadcast=not quiet_persist,
+        meta=message_meta,
+    )
     last_msg: dict = slot.messages[-1]
     # If a regenerate is pending, attach the stashed variants to this fresh assistant message.
     if slot._pending_variants:
@@ -3549,7 +3556,12 @@ async def _render_claude_idle_event(
             payload = _tool_call_ws_payload(event)
             payload["slot"] = slot.key
             state.broadcast_ws("tool_call", payload)
-            slot.append("tool", f"🔧 {payload['tool']}", "msg msg-tool", meta=_tool_meta(event))
+            slot.append(
+                "tool",
+                f"🔧 {payload['tool']}",
+                "msg msg-tool",
+                meta={**(_tool_meta(event) or {}), "between_turn": True},
+            )
         elif event.kind == EVENT_TEXT_CHUNK:
             text = (event.text or "").strip()
             if not text:
@@ -3562,7 +3574,7 @@ async def _render_claude_idle_event(
             text, creds = redact_credentials(text)
             for warning in creds:
                 logger.warning("Credential redacted in idle Claude output: %s", warning)
-            _flush_segment(state, slot, text)
+            _flush_segment(state, slot, text, message_meta={"between_turn": True})
         else:
             return
         await save_slot_off_loop(state, slot, best_effort=False)
