@@ -161,7 +161,6 @@ _DROP_IDS_IN_LOG = 8
 # server→client request with this itself (see _answer_ownerless_request);
 # mirrors the private constant AcpClient keeps for its own dispatch sites.
 _JSONRPC_METHOD_NOT_FOUND = -32601
-_INIT_TIMEOUT = 30.0
 _REQUEST_TIMEOUT = 30.0
 # One gateway event loop owns many independent SessionManager and worker-pool
 # callers. Keep their expensive subprocess spawn + initialize handshakes behind
@@ -230,7 +229,7 @@ def _cold_start_counts() -> tuple[int, int]:
 # ABOVE the backend's 30s OAuth wait plus the initialization tail that follows
 # it (observed: remaining servers register within ~1s after the wait; a
 # 71-server agent with no pending OAuth completes in ~14s) — do NOT "tidy" it
-# back down to _REQUEST_TIMEOUT. See issue #2946.
+# back down to _REQUEST_TIMEOUT.
 # This is the built-in default AND floor; ``agent.session_start_timeout_secs``
 # raises it for agents whose MCP fleet legitimately needs longer (see
 # _resolve_session_start_timeout below).
@@ -431,9 +430,10 @@ def _get_rss_mb(pid: int) -> float | None:
 
     Linux: reads /proc/<pid>/status. macOS (no /proc): shells out to
     ``ps -o rss= -p <pid>`` (ps reports RSS in KiB on both platforms).
-    Returns None on any failure (missing /proc, permission error, process
-    gone, ps not found) so callers can treat "unknown" the same as "not over
-    threshold" rather than raising.
+    Windows: WorkingSetSize through the ``platform_compat`` shim, since no
+    ``ps`` is resolvable there. Returns None on any failure (missing /proc,
+    permission error, process gone, ps not found) so callers can treat
+    "unknown" the same as "not over threshold" rather than raising.
     """
     if sys.platform == "linux":
         try:
@@ -448,9 +448,14 @@ def _get_rss_mb(pid: int) -> float | None:
         return None
 
     if platform_compat.IS_WINDOWS:
-        # No `ps` on a normal Windows PATH — the POSIX fallback below returned
-        # None for every pid, so the watchdog's RSS-recycle ceiling never fired.
-        # Read WorkingSetSize via GetProcessMemoryInfo through the shim.
+        # Windows ships no `ps` in the fixed system directories the POSIX
+        # fallback below resolves through (trusted_system_bin ignores PATH on
+        # purpose), so that fallback can only ever answer None here. Read
+        # WorkingSetSize via GetProcessMemoryInfo through the shim instead.
+        # The watchdog's RSS-recycle ceiling does not depend on this branch —
+        # _get_rss_tree_mb serves Windows from proc_rss_tree_mb_for_pid and
+        # never calls this function — so this keeps a direct single-pid read
+        # honest for a direct caller.
         rss = platform_compat.proc_rss_bytes_for_pid(pid)
         return None if rss is None else rss / (1024.0 * 1024.0)
 
@@ -664,7 +669,7 @@ def _resolve_session_start_timeout() -> float:
     [SESSION_START_TIMEOUT_MIN, SESSION_START_TIMEOUT_MAX]; the ``max`` here
     is belt-and-braces so a degraded load can never shrink the budget below
     the built-in floor — a session-start budget under the backend's 30s OAuth
-    wait recreates the race issue #2946 fixed.
+    wait recreates the race that floor exists to prevent.
     """
     try:
         # circular import: config.loader -> dashboard -> session -> acp
@@ -1300,7 +1305,7 @@ class AcpRuntime:
                     browser_socket_env, lifecycle_env
                 )
             )
-        # Per-process scratch containment (#5063): the agent's temp AND its
+        # Per-process scratch containment: the agent's temp AND its
         # prompt-guided work products land in an owned directory instead of
         # the shared system temp dir. Allocated off-loop (mkdir + config read)
         # through the sandbox guard like the env resolution above, and
@@ -1461,8 +1466,8 @@ class AcpRuntime:
             # leaks for the rest of the host's uptime.
             #
             # ERROR, not debug: this log line is the only signal that will ever
-            # be emitted for that leak. #2985 made a failed PID-file REWRITE
-            # loud for the same reason; this is the append half.
+            # be emitted for that leak. A failed PID-file REWRITE is loud for
+            # the same reason; this is the append half.
             logger.error(
                 "AcpRuntime: PID tracking failed for %s — this runtime is now "
                 "invisible to every reaper and will leak until the host reboots",
@@ -2179,8 +2184,9 @@ class AcpRuntime:
                         #   IDENTICAL to the main agent's. Dropping a REQUEST
                         #   is never an option: it strands the backend's
                         #   response oneshot and wedges the child's whole tool
-                        #   batch until process teardown (2h incident,
-                        #   2026-08-15, 13 approvals hung invisibly).
+                        #   batch until process teardown, with every approval in
+                        #   that batch hanging invisibly for as long as that
+                        #   runtime lives.
                         #
                         # With several registered sessions the frame names no
                         # owner; a permission request then falls to the
@@ -2224,9 +2230,12 @@ class AcpRuntime:
                             await asyncio.sleep(0)
                         else:
                             # Hang-resilience series: a child permission
-                            # request delivered to the mode-parity pipeline —
-                            # each one is a request that, before #3786, was
-                            # silently dropped and wedged its crew for 2h.
+                            # request delivered to the mode-parity pipeline.
+                            # Counted so routed requests are observable next
+                            # to the dropped-frame counter — a permission
+                            # request that is neither routed nor answered
+                            # leaves its crew waiting on a prompt nobody can
+                            # see.
                             if msg.id is not None and msg.is_method(
                                 METHOD_REQUEST_PERMISSION
                             ):
@@ -3269,11 +3278,12 @@ class AcpRuntime:
         except asyncio.TimeoutError:
             self._pending_requests.pop(req_id, None)
             active_starts, queued_starts = _cold_start_counts()
-            process_state = (
-                "absent"
-                if self._process is None
-                else "running" if self._process.returncode is None else "exited"
-            )
+            if self._process is None:
+                process_state = "absent"
+            elif self._process.returncode is None:
+                process_state = "running"
+            else:
+                process_state = "exited"
             logger.warning(
                 "acp_startup_stage stage=%s outcome=timeout timeout_method=%s "
                 "timeout_budget_s=%g duration_ms=%.1f active_starts=%d "
