@@ -14,6 +14,9 @@ import type { DisplayItem } from '../pages/chat/types'
 const msg = (role: string, content = ''): ChatMessage =>
   ({ role, content, cls: '' } as ChatMessage)
 
+const betweenTurn = (role: string, content = ''): ChatMessage =>
+  ({ ...msg(role, content), meta: { between_turn: true } })
+
 /** A turn long enough to collapse: needs a working step and > 2 items. */
 const workingTurn = () => [msg('assistant', 'a'), msg('tool', 't'), msg('assistant', 'b')]
 
@@ -104,6 +107,21 @@ describe('groupDisplayItems', () => {
     // Two collapsed turns, one per prompt — the nudge must not be swallowed into
     // the previous turn's step group.
     expect(turns.filter(isTurn)).toHaveLength(2)
+  })
+
+  it('does not fold a finished reply into following between-turn work', () => {
+    const priorReply = 'The complete answer the user must still be able to read.'
+    const idleReply = 'A separate status update from work that continued after the answer.'
+    const { turns } = groupDisplayItems([
+      msg('user', 'first'), msg('tool', 'inspect'), msg('assistant', priorReply), msg('tool', 'finish'),
+      betweenTurn('tool', 'idle inspect'), betweenTurn('assistant', idleReply), betweenTurn('tool', 'idle finish'),
+      msg('user', 'second'),
+    ])
+
+    const blocks = turns.filter(isTurn)
+    expect(blocks).toHaveLength(2)
+    expect(blocks[0].items.some(item => item.kind === 'single' && item.msg.content === priorReply)).toBe(true)
+    expect(blocks[1].items.some(item => item.kind === 'single' && item.msg.content === idleReply)).toBe(true)
   })
 
   it('marks every NON-trailing turn complete regardless of running state', () => {

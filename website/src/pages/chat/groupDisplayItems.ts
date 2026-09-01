@@ -40,6 +40,10 @@ export const TURN_OPENER_ROLES = new Set(['user', 'nudge', 'subagent'])
 export const isTurnOpener = (msg: ChatMessage): boolean =>
   TURN_OPENER_ROLES.has(msg.role) || isPeerChannelTurnOpener(msg)
 
+/** A dashboard row emitted while no prompt is consuming the provider stream. */
+const isBetweenTurnWork = (item: TurnItem): boolean =>
+  item.kind === 'single' && item.msg.meta?.between_turn === true
+
 export interface GroupedTurns {
   turns: DisplayItem[]
   /** Index into `turns` of the turn object produced by the TRAILING flush, or
@@ -94,6 +98,7 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
   // is the authority on what stays visible; we suppress ONLY when the backend
   // explicitly marked the completion as having pending synthesis.
   let _lastSubagentHadSynthesis = false
+  let inBetweenTurnWork = false
   const turns: DisplayItem[] = []
   let turnItems: TurnItem[] = []
   const hasWorkingSteps = (items: TurnItem[]) =>
@@ -109,29 +114,41 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
     }
   }
   for (const item of raw) {
-    // A nudge opens a new turn exactly like a user message does — it IS the
-    // turn's prompt. Without this it gets swallowed into the previous turn's
-    // collapsed step group and the cycle chip disappears. A sub-agent
-    // completion is the same case: the gateway injects it as the next turn's
-    // input, so the agent's reply belongs BELOW the card, not beside it.
-    if (item.kind === 'single' && isTurnOpener(item.msg)) {
+    // Between-turn provider output is work from a new lifecycle, but does not
+    // have a user-authored prompt row to anchor it. Without this boundary, its
+    // final prose becomes the prior turn's "conclusion" and folds that prior
+    // answer behind the intermediate-work disclosure.
+    const startsBetweenTurnWork = isBetweenTurnWork(item) && !inBetweenTurnWork
+    inBetweenTurnWork = isBetweenTurnWork(item)
+    if (startsBetweenTurnWork) {
       if (turnItems.length > 0) { flushTurn(turnItems, true); turnItems = [] }
-      // Track whether this subagent completion has synthesis pending
-      _lastSubagentHadSynthesis = item.msg.role === 'subagent' &&
-        !!(item.msg.meta as Record<string, unknown> | undefined)?.synthesisPending
-      turns.push(item)
-    } else if (
-      _lastSubagentHadSynthesis &&
-      item.kind === 'single' &&
-      (item.msg.role === 'assistant' || item.msg.role === 'streaming') &&
-      !isSubagentCompletionMessage(item.msg)
-    ) {
-      // Per-completion response with synthesis pending: skip it from the
-      // transcript. The synthesis turn will restate the findings.
-      _lastSubagentHadSynthesis = false
-    } else {
       _lastSubagentHadSynthesis = false
       turnItems.push(item)
+    } else {
+      // A nudge opens a new turn exactly like a user message does — it IS the
+      // turn's prompt. Without this it gets swallowed into the previous turn's
+      // collapsed step group and the cycle chip disappears. A sub-agent
+      // completion is the same case: the gateway injects it as the next turn's
+      // input, so the agent's reply belongs BELOW the card, not beside it.
+      if (item.kind === 'single' && isTurnOpener(item.msg)) {
+        if (turnItems.length > 0) { flushTurn(turnItems, true); turnItems = [] }
+        // Track whether this subagent completion has synthesis pending
+        _lastSubagentHadSynthesis = item.msg.role === 'subagent' &&
+          !!(item.msg.meta as Record<string, unknown> | undefined)?.synthesisPending
+        turns.push(item)
+      } else if (
+        _lastSubagentHadSynthesis &&
+        item.kind === 'single' &&
+        (item.msg.role === 'assistant' || item.msg.role === 'streaming') &&
+        !isSubagentCompletionMessage(item.msg)
+      ) {
+        // Per-completion response with synthesis pending: skip it from the
+        // transcript. The synthesis turn will restate the findings.
+        _lastSubagentHadSynthesis = false
+      } else {
+        _lastSubagentHadSynthesis = false
+        turnItems.push(item)
+      }
     }
   }
   // Flush the trailing group as complete, and remember whether that flush
