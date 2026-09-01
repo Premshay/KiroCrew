@@ -21,7 +21,7 @@ import { isSafePath } from '../../utils/safePath'
 import { fileReadUrl } from '../../utils/fileReadUrl'
 import McpAppFrame from '../../components/McpAppFrame'
 import DiffBlock, { extractFilePath as extractDiffHeaderPath } from '../../components/DiffBlock'
-import { presentToolDiff } from './toolDiff'
+import { presentToolDiff, diffCardStartsFolded } from './toolDiff'
 import { FileDiff } from 'lucide-react'
 import { i18nT } from '../../i18n/t'
 import { fmtDateFields, fmtDuration as fmtDurationParts, fmtUnit } from '../../i18n/format'
@@ -42,9 +42,16 @@ import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 // don't re-fire.)
 const revealedToolIds = new Set<string>()
 
-// Diff cards the reader folded, by tool_call_id — survives virtualizer
-// unmounts for the page lifetime so folds persist across scrolling.
-const foldedDiffCards = new Set<string>()
+// The reader's OWN fold state per diff card, by tool_call_id — true folded,
+// false opened, absent means untouched. Held at module scope (same lifetime
+// pattern as revealedToolIds above) so a virtualizer unmount does not silently
+// reopen a card the reader closed.
+//
+// A map of choices rather than a set of folds, because the default is now the
+// size rule (diffCardStartsFolded) rather than "open". A set could only record
+// one of the two directions, so re-opening a long card would read as untouched
+// and the size rule would fold it again on the next recycle.
+const diffCardFoldChoice = new Map<string, boolean>()
 
 // ── Row slide (height easing) ──
 // The transcript is pinned to the bottom, and the virtualizer's pin is
@@ -519,22 +526,31 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     [denied, toolKind, input],
   )
   // Per-card density control: a promoted card can be folded back to its chip
-  // after reading (multi-edit turns stack several large cards otherwise, and
-  // the only other relief is the GLOBAL collapse-all preference). Folds are
-  // remembered at module scope by tool_call_id (same lifetime pattern as
-  // revealedToolIds above) so a virtualizer unmount does not silently reopen
-  // every card the reader closed.
-  const [cardFolded, setCardFolded] = useState(
-    () => !!(toolCallId && foldedDiffCards.has(toolCallId)),
-  )
+  // after reading, and a long one starts that way (multi-edit turns stack
+  // several large cards otherwise, and the only other relief is the GLOBAL
+  // collapse-all preference). The reader's own toggle is recorded and wins
+  // over the size default from then on.
+  const cardCode = diffView?.mode === 'card' ? diffView.code : null
+  const [cardFolded, setCardFolded] = useState(() => {
+    const choice = toolCallId ? diffCardFoldChoice.get(toolCallId) : undefined
+    if (choice !== undefined) return choice
+    return cardCode !== null && diffCardStartsFolded(cardCode)
+  })
+  // An edit row mounts on the tool_call event and its diff arrives on the
+  // update, so the state above is often decided before there is anything to
+  // measure. Re-apply the size rule when the code lands or grows — and only
+  // while the reader has expressed no choice, which is what keeps a card they
+  // opened from folding under them mid-turn.
+  useEffect(() => {
+    if (cardCode === null) return
+    if (toolCallId && diffCardFoldChoice.has(toolCallId)) return
+    setCardFolded(diffCardStartsFolded(cardCode))
+  }, [cardCode, toolCallId])
   const diffTogglePendingFocus = useRef(false)
   const toggleCardFolded = useCallback(() => {
     setCardFolded(prev => {
       const next = !prev
-      if (toolCallId) {
-        if (next) foldedDiffCards.add(toolCallId)
-        else foldedDiffCards.delete(toolCallId)
-      }
+      if (toolCallId) diffCardFoldChoice.set(toolCallId, next)
       return next
     })
     // The two halves of the toggle unmount each other, so the activated
