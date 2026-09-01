@@ -1089,7 +1089,7 @@ class AcpRuntime:
         # Claude leaves before the kiro-cli environment is read at all: it
         # resolves its own binary and shares none of the search below.
         if self._is_claude:
-            claude_argv = await asyncio.to_thread(_resolve_claude_acp_bin)
+            claude_argv, _searched_path = await asyncio.to_thread(_resolve_claude_acp_bin)
             if not claude_argv:
                 raise AcpRuntimeError(
                     f"{CLAUDE_ACP_BIN} not found. Install it with "

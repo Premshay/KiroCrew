@@ -45,6 +45,7 @@ from kiro_crew.acp.runtime import (
     _ColdStartAdmission,
 )
 from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KAS,
     EVENT_COMPLETE,
     EVENT_TEXT_CHUNK,
@@ -830,6 +831,30 @@ def test_runtime_uses_clients_augmented_kiro_bin_resolver():
     import kiro_crew.acp.runtime as runtime_mod
 
     assert runtime_mod._resolve_kiro_bin_for_spawn is client_mod._resolve_kiro_bin_for_spawn
+
+
+@pytest.mark.asyncio
+async def test_runtime_claude_resolver_uses_only_the_argv_component():
+    import kiro_crew.acp.runtime as runtime_mod
+
+    rt = AcpRuntime(work_dir="/tmp", acp_backend=ACP_BACKEND_CLAUDE)
+    expected_argv = ["claude-agent-acp", "--stdio"]
+    with patch.object(
+        runtime_mod,
+        "_resolve_claude_acp_bin",
+        return_value=(expected_argv, "/searched/path"),
+    ):
+        assert await rt._resolve_spawn_argv() == expected_argv
+
+
+@pytest.mark.asyncio
+async def test_runtime_claude_missing_adapter_raises_not_found_error():
+    import kiro_crew.acp.runtime as runtime_mod
+
+    rt = AcpRuntime(work_dir="/tmp", acp_backend=ACP_BACKEND_CLAUDE)
+    with patch.object(runtime_mod, "_resolve_claude_acp_bin", return_value=(None, "/searched/path")):
+        with pytest.raises(AcpRuntimeError, match="claude-agent-acp not found"):
+            await rt._resolve_spawn_argv()
 
 
 @pytest.mark.parametrize("backend", [None, ACP_BACKEND_KAS])
