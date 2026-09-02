@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import LearningRail from '../apps/code-review-sage/components/LearningRail'
 import LearningView from '../apps/code-review-sage/views/LearningView'
 import { SageProvider } from '../apps/code-review-sage/context'
-import { sageApi } from '../apps/code-review-sage/api'
+import { SageApiError, sageApi } from '../apps/code-review-sage/api'
 
 vi.mock('../apps/code-review-sage/api', () => ({
   SageApiError: class SageApiError extends Error {
@@ -186,6 +186,47 @@ describe('curated Sage consolidation', () => {
     expect(screen.getByText('Decisions')).toBeInTheDocument()
     expect(screen.getByText('Merge')).toBeInTheDocument()
     expect(screen.getByText(/1\/60 rules/)).toBeInTheDocument()
+  })
+
+  it('puts preview status before the long ruleset', async () => {
+    mockApi.consolidationPreviews.mockResolvedValue({
+      code: 'preview_list',
+      namespace: 'default',
+      previews: [
+        {
+          preview_id: 'preview-1',
+          namespace: 'default',
+          created_at: '2026-09-02T00:00:00Z',
+          selected_candidate_ids: ['c1'],
+          state: PREVIEW.state,
+        },
+      ],
+    })
+    mount()
+    await openNamespace()
+    const history = await screen.findByText('Consolidation previews')
+    const rule = screen.getByText('Existing rule')
+    expect(history.compareDocumentPosition(rule) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+  })
+
+  it('follows an already-running preview instead of leaving a retry error', async () => {
+    const user = userEvent.setup()
+    mockApi.requestConsolidationPreview.mockRejectedValue(
+      new SageApiError('busy', 'consolidation_in_progress'),
+    )
+    mockApi.learnings.mockResolvedValue({
+      namespace: 'default',
+      patterns: [pattern('Existing rule')],
+      candidate: [pattern('Staged one', 'c1'), pattern('Staged two', 'c2')],
+      consolidating: true,
+      consolidate_error: null,
+    })
+    mount()
+    await openNamespace()
+    await user.click(await screen.findByRole('checkbox', { name: /Select Staged one/i }))
+    await user.click(screen.getByRole('button', { name: /Create preview/i }))
+    expect(await screen.findByText('Preparing preview…')).toBeInTheDocument()
+    expect(screen.queryByText(/already being prepared/i)).toBeNull()
   })
 
   it('requires a second explicit confirmation before it applies a fresh preview', async () => {
