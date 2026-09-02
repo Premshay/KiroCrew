@@ -214,6 +214,12 @@ export const sageApi = {
   learnings: (namespace: string): Promise<LearningsResponse> =>
     getJSON(`/learnings?namespace=${encodeURIComponent(namespace)}`),
 
+  archiveLearningRule: (namespace: string, recordId: string): Promise<{ ok: boolean }> =>
+    sendJSON('/learnings/rules/archive', 'POST', { namespace, record_id: recordId }),
+
+  restoreLearningRule: (namespace: string, recordId: string): Promise<{ ok: boolean }> =>
+    sendJSON('/learnings/rules/restore', 'POST', { namespace, record_id: recordId }),
+
   /** Request a proposal for the explicit candidate snapshot. This never applies
    * changes; the preview's dedicated confirmation endpoint owns that write. */
   requestConsolidationPreview: (

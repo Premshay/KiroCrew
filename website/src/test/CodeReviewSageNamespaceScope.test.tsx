@@ -37,6 +37,7 @@ function response(overrides: Record<string, unknown> = {}) {
     models: [],
     efforts: [],
     namespaces: ['default', 'service-rules'],
+    pinned_repos: [{ owner: 'acme', repo: 'service' }],
     max_concurrent_max: 30,
     reviewer: null,
     ...overrides,
@@ -86,9 +87,8 @@ describe('Code Review Sage namespace scope', () => {
 
     await screen.findByTestId('sage-namespace-scope-default')
     expect(screen.queryByTestId('sage-unscoped-namespaces')).toBeNull()
-    // An existing repository binding round-trips into the field it was saved from.
-    expect(screen.getByLabelText('Repository for service-rules'))
-      .toHaveValue('github.com/acme/service')
+    expect(screen.getByRole('combobox', { name: 'Repository for service-rules' }))
+      .toHaveTextContent('github.com/acme/service')
   })
 
   it('writes an explicit global binding without touching the other namespaces', async () => {
@@ -114,31 +114,25 @@ describe('Code Review Sage namespace scope', () => {
     }))
   })
 
-  it('refuses an unusable repository instead of sending it to the backend', async () => {
+  it('offers only pinned repositories when scoping a namespace', async () => {
     settings.mockResolvedValue(response())
     mount()
     await screen.findByTestId('sage-namespace-scope-default')
 
     await chooseScope('service-rules', /one repository/i)
-    fireEvent.change(screen.getByLabelText('Repository for service-rules'), {
-      target: { value: 'not a repo' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
-
-    expect(await screen.findByText(/does not read as a repository/i)).toBeInTheDocument()
-    expect(putSettings).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('combobox', { name: 'Repository for service-rules' }))
+    expect(await screen.findByRole('option', { name: 'github.com/acme/service' })).toBeInTheDocument()
+    expect(screen.queryByRole('textbox', { name: 'Repository for service-rules' })).toBeNull()
   })
 
-  it('sends the canonical repository identity the backend stores', async () => {
+  it('sends the selected pinned repository identity the backend stores', async () => {
     settings.mockResolvedValue(response())
     mount()
     await screen.findByTestId('sage-namespace-scope-default')
 
     await chooseScope('service-rules', /one repository/i)
-    fireEvent.change(screen.getByLabelText('Repository for service-rules'), {
-      target: { value: 'https://github.com/Acme/Service/pull/7' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    fireEvent.click(screen.getByRole('combobox', { name: 'Repository for service-rules' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'github.com/acme/service' }))
 
     await waitFor(() => expect(putSettings).toHaveBeenCalledWith({
       namespace_bindings: {
@@ -150,6 +144,30 @@ describe('Code Review Sage namespace scope', () => {
         },
       },
     }))
+  })
+
+  it('shows an unavailable saved binding without widening it', async () => {
+    settings.mockResolvedValue(response({
+      settings: {
+        model: null,
+        effort: 'high',
+        active_namespaces: ['default'],
+        namespace_bindings: {
+          default: {
+            scope: 'repository',
+            repository: {
+              provider: 'github', host: 'github.com', owner: 'former', repository: 'repo',
+            },
+          },
+        },
+        max_concurrent: 3,
+      },
+    }))
+    mount()
+
+    const picker = await screen.findByRole('combobox', { name: 'Repository for default' })
+    expect(picker).toHaveTextContent('unavailable')
+    expect(putSettings).not.toHaveBeenCalled()
   })
 
   it('clears a binding back to the unscoped state', async () => {

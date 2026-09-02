@@ -13,24 +13,13 @@
 import { AlertTriangle } from 'lucide-react'
 import { useState } from 'react'
 
-import {
-  formatRepositorySource, parseRepositorySource, scopeChoiceOf,
-  type RepositoryParseError, type ScopeChoice,
-} from '../lib/namespaceBindings'
-import type { NamespaceBinding } from '../lib/types'
+import { formatRepositorySource, scopeChoiceOf, type ScopeChoice } from '../lib/namespaceBindings'
+import type { NamespaceBinding, PinnedRepo } from '../lib/types'
 
 import SimpleSelect from '../../../components/SimpleSelect'
-import { Btn, Input } from '../../../components/ui'
 import { i18nT } from '../../../i18n/t'
 
 const SCOPE_OPTIONS: ScopeChoice[] = ['global', 'repository']
-
-const PARSE_ERROR_KEY: Record<RepositoryParseError, string> = {
-  repository_required:
-    'apps.codeReviewSage.components.namespaceScopePanel.error_repository_required',
-  repository_invalid:
-    'apps.codeReviewSage.components.namespaceScopePanel.error_repository_invalid',
-}
 
 const SELECT_CLASS =
   'text-[12.5px] px-2 py-1 rounded-md bg-bg-elevated text-text border border-border '
@@ -40,23 +29,22 @@ export interface NamespaceScopePanelProps {
   namespaces: string[]
   activeNamespaces: string[]
   bindings: Record<string, NamespaceBinding>
+  pinnedRepos: PinnedRepo[]
   /** Receives the WHOLE map: the settings PUT replaces `namespace_bindings`. */
   onSave: (bindings: Record<string, NamespaceBinding>) => void
   saving: boolean
 }
 
 export default function NamespaceScopePanel({
-  namespaces, activeNamespaces, bindings, onSave, saving,
+  namespaces, activeNamespaces, bindings, pinnedRepos, onSave, saving,
 }: NamespaceScopePanelProps) {
   // Namespaces whose row is showing the repository field before anything is saved.
   // A row is also in repository mode once its binding IS one, so nothing here has
   // to be cleared after a save lands.
   const [editing, setEditing] = useState<Record<string, boolean>>({})
-  const [drafts, setDrafts] = useState<Record<string, string>>({})
-  const [errors, setErrors] = useState<Record<string, RepositoryParseError>>({})
-
   const active = new Set(activeNamespaces)
   const unscopedActive = namespaces.filter((name) => active.has(name) && !bindings[name])
+  const repositoryOptions = pinnedRepos.map((repo) => `github.com/${repo.owner}/${repo.repo}`)
 
   const write = (name: string, binding: NamespaceBinding | null) => {
     const next = { ...bindings }
@@ -66,7 +54,6 @@ export default function NamespaceScopePanel({
   }
 
   const chooseScope = (name: string, choice: string) => {
-    setErrors(({ [name]: _dropped, ...rest }) => rest)
     if (choice === 'repository') {
       setEditing((prev) => ({ ...prev, [name]: true }))
       return
@@ -75,14 +62,14 @@ export default function NamespaceScopePanel({
     write(name, choice === 'global' ? { scope: 'global' } : null)
   }
 
-  const saveRepository = (name: string, raw: string) => {
-    const parsed = parseRepositorySource(raw)
-    if (!parsed.ok) {
-      setErrors((prev) => ({ ...prev, [name]: parsed.error }))
-      return
-    }
-    setErrors(({ [name]: _cleared, ...rest }) => rest)
-    write(name, { scope: 'repository', repository: parsed.value })
+  const chooseRepository = (name: string, value: string) => {
+    const repo = pinnedRepos.find((item) => `github.com/${item.owner}/${item.repo}` === value)
+    if (!repo) return
+    setEditing(({ [name]: _closed, ...rest }) => rest)
+    write(name, {
+      scope: 'repository',
+      repository: { provider: 'github', host: 'github.com', owner: repo.owner, repository: repo.repo },
+    })
   }
 
   return (
@@ -111,10 +98,9 @@ export default function NamespaceScopePanel({
           const binding = bindings[name]
           const choice = scopeChoiceOf(binding)
           const repositoryMode = choice === 'repository' || !!editing[name]
-          const draft = drafts[name] ?? (binding?.scope === 'repository'
+          const repository = binding?.scope === 'repository'
             ? formatRepositorySource(binding.repository)
-            : '')
-          const error = errors[name]
+            : ''
           return (
             <div
               key={name}
@@ -136,27 +122,19 @@ export default function NamespaceScopePanel({
               </div>
 
               {repositoryMode && (
-                <div className="mt-2 flex items-center gap-2 flex-wrap">
-                  <Input
-                    value={draft}
+                <div className="mt-2 max-w-[420px]">
+                  <SimpleSelect
+                    options={repositoryOptions}
+                    value={repository}
                     aria-label={i18nT('apps.codeReviewSage.components.namespaceScopePanel.repository_for', { name })}
-                    placeholder={i18nT('apps.codeReviewSage.components.namespaceScopePanel.repository_placeholder')}
-                    onChange={(e) => setDrafts((prev) => ({ ...prev, [name]: e.target.value }))}
-                    className="flex-1 min-w-[220px] font-mono text-[12.5px]"
+                    onChange={(value) => chooseRepository(name, value)}
+                    triggerFallback={i18nT('components.postureDisclosure.unavailable')}
+                    disabled={saving || repositoryOptions.length === 0}
+                    className={SELECT_CLASS}
                   />
-                  <Btn
-                    type="button"
-                    disabled={saving}
-                    onClick={() => saveRepository(name, draft)}
-                  >
-                    {i18nT('apps.codeReviewSage.components.namespaceScopePanel.save')}
-                  </Btn>
                 </div>
               )}
 
-              {error && (
-                <p className="mt-1.5 text-[11.5px] text-danger">{i18nT(PARSE_ERROR_KEY[error])}</p>
-              )}
               {!repositoryMode && choice === '' && active.has(name) && (
                 <p className="mt-1.5 text-[11.5px] text-muted">{i18nT('apps.codeReviewSage.components.namespaceScopePanel.row_unscoped_note')}</p>
               )}

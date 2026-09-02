@@ -197,6 +197,9 @@ def _validate_learning_record(record: object) -> None:
     _validate_recurrence_evidence(recurrence.get("evidence"), recurrence.get("count"))
     if not isinstance(record.get("legacy"), bool):
         raise _record_error("record legacy must be a boolean")
+    archived_from = record.get("archived_from")
+    if archived_from is not None and archived_from not in {"active", "pinned"}:
+        raise _record_error("record archived_from must be active, pinned, or null")
 
 
 def validate_learning_records_document(document: object) -> None:
@@ -458,6 +461,11 @@ def transition_learning_record(
             now = _utc_now()
             updated = dict(record)
             updated["lifecycle"] = lifecycle
+            # Keep enough durable state for the explicit restore action to
+            # return this rule to its pre-archive lifecycle without deleting
+            # its origin or recurrence evidence.
+            if lifecycle == "archived" and current in {"active", "pinned"}:
+                updated["archived_from"] = current
             updated["timestamps"] = {
                 **record["timestamps"],
                 "updated_at": now,
@@ -472,6 +480,55 @@ def transition_learning_record(
     capacity = enforce_active_context_budgets(root=root, namespace=namespace, config=config)
     final = next(item for item in load_learning_records(root, namespace) if item["id"] == record_id)
     return {"ok": True, "record": final, "capacity": capacity}
+
+
+def archive_learning_record(
+    record_id: str,
+    *,
+    operator: str,
+    root: Path | None = None,
+    namespace: str | None = None,
+    config: dict | None = None,
+) -> dict:
+    """Archive one loaded rule without deleting its governed record."""
+    record = next(
+        (item for item in load_learning_records(root, namespace) if item["id"] == record_id),
+        None,
+    )
+    if record is None:
+        raise KeyError(f"learning record {record_id!r} does not exist")
+    if record["lifecycle"] not in {"active", "pinned"}:
+        raise ValueError("only active or pinned learning records can be archived")
+    return transition_learning_record(
+        record_id, "archived", operator=operator, root=root, namespace=namespace, config=config
+    )
+
+
+def restore_learning_record(
+    record_id: str,
+    *,
+    operator: str,
+    root: Path | None = None,
+    namespace: str | None = None,
+    config: dict | None = None,
+) -> dict:
+    """Restore an archived rule to the lifecycle it held before archiving."""
+    record = next(
+        (item for item in load_learning_records(root, namespace) if item["id"] == record_id),
+        None,
+    )
+    if record is None:
+        raise KeyError(f"learning record {record_id!r} does not exist")
+    if record["lifecycle"] != "archived":
+        raise ValueError("only archived learning records can be restored")
+    return transition_learning_record(
+        record_id,
+        record.get("archived_from") or "active",
+        operator=operator,
+        root=root,
+        namespace=namespace,
+        config=config,
+    )
 
 
 def _legacy_record_id(namespace: str, lifecycle: str, occurrence: int, pattern: dict) -> str:
@@ -569,6 +626,44 @@ def export_learning_records(root: Path | None = None, namespace: str | None = No
 def migrate_legacy_learning_records(root: Path | None = None, namespace: str | None = None) -> dict:
     """Explicitly migrate compatible markdown entries into the record sidecar."""
     return export_learning_records(root, namespace)
+
+
+def list_rule_entries(root: Path | None = None, namespace: str | None = None) -> list[dict]:
+    """List rule rows while keeping legacy markdown migration action-triggered."""
+    ns = namespace or DEFAULT_NAMESPACE
+    records_path = learning_records_file(root, ns)
+    records = load_learning_records(root, ns) if records_path.exists() else []
+    if records:
+        return [
+            {
+                "id": record["id"],
+                "record_id": record["id"],
+                "title": str(record["text"]).splitlines()[0],
+                "scope": record["scope"],
+                "impact": "medium",
+                "added_at": record["timestamps"].get("created_at") or "",
+                "guidance": record["rule"],
+                "lifecycle": record["lifecycle"],
+                "legacy": record["legacy"],
+            }
+            for record in records
+            if record["lifecycle"] != "candidate"
+        ]
+
+    occurrences: collections.Counter[str] = collections.Counter()
+    entries = []
+    for pattern in list_patterns(root=root, namespace=ns):
+        identity = _legacy_record_id(ns, "active", 0, pattern)
+        occurrences[identity] += 1
+        entries.append(
+            {
+                **pattern,
+                "record_id": _legacy_record_id(ns, "active", occurrences[identity], pattern),
+                "lifecycle": "active",
+                "legacy": True,
+            }
+        )
+    return entries
 
 
 def rollback_learning_records_export(

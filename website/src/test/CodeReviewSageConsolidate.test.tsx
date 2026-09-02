@@ -24,6 +24,8 @@ vi.mock('../apps/code-review-sage/api', () => ({
     consolidationPreviews: vi.fn(),
     consolidationPreview: vi.fn(),
     applyConsolidationPreview: vi.fn(),
+    archiveLearningRule: vi.fn(),
+    restoreLearningRule: vi.fn(),
     createNamespace: vi.fn(),
     deleteNamespace: vi.fn(),
     settings: vi.fn(),
@@ -134,12 +136,45 @@ beforeEach(() => {
     ok: true,
     code: 'preview_applied',
   })
+  mockApi.archiveLearningRule.mockResolvedValue({ ok: true })
+  mockApi.restoreLearningRule.mockResolvedValue({ ok: true })
   mockApi.runs.mockResolvedValue({ runs: [] })
   mockApi.pinnedRepos.mockResolvedValue({ repos: [] })
   mockApi.repoPrs.mockResolvedValue({ repo: '', prs: [], count: 0 })
 })
 
 describe('curated Sage consolidation', () => {
+  it('archives and restores an individual governed rule through explicit controls', async () => {
+    mockApi.learnings.mockResolvedValue({
+      namespace: 'default',
+      patterns: [{ ...pattern('Existing rule'), record_id: 'rule-1', lifecycle: 'active' }],
+      candidate: [],
+      consolidating: false,
+      consolidate_error: null,
+    })
+    const user = userEvent.setup()
+    mockApi.archiveLearningRule.mockImplementation(async () => {
+      mockApi.learnings.mockResolvedValue({
+        namespace: 'default',
+        patterns: [{ ...pattern('Existing rule'), record_id: 'rule-1', lifecycle: 'archived' }],
+        candidate: [],
+        consolidating: false,
+        consolidate_error: null,
+      })
+      return { ok: true }
+    })
+    mount()
+    await openNamespace()
+
+    await user.click(await screen.findByRole('button', { name: 'Archive' }))
+    await waitFor(() => expect(mockApi.archiveLearningRule).toHaveBeenCalledWith('default', 'rule-1'))
+
+    await screen.findByRole('button', { name: 'Restore' })
+    expect(screen.getByText('Archived')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Restore' }))
+    await waitFor(() => expect(mockApi.restoreLearningRule).toHaveBeenCalledWith('default', 'rule-1'))
+  })
+
   it('keeps every pending candidate retained until an operator selects it', async () => {
     mount()
     await openNamespace()
