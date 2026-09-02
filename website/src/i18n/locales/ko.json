@@ -667,6 +667,22 @@
           "show_all_count": "모두 표시 ({{count}})",
           "this_repo_only": "{{repo}}만"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "저장소로 읽히지 않습니다. owner/repo를 쓰거나 저장소 URL을 붙여 넣으세요.",
+          "error_repository_required": "저장소를 owner/repo 형식으로 입력하거나 URL을 붙여 넣으세요.",
+          "no_namespaces": "아직 네임스페이스가 없습니다.",
+          "option_global": "모든 저장소",
+          "option_repository": "저장소 하나",
+          "option_unscoped": "아직 지정 안 함",
+          "repository_for": "{{name}}의 저장소",
+          "repository_placeholder": "owner/repo 또는 저장소 URL",
+          "row_unscoped_note": "범위를 정하기 전까지는 모든 저장소에 적용됩니다.",
+          "rule_scope": "규칙 적용 범위",
+          "save": "저장",
+          "scope_for": "{{name}}의 규칙 적용 범위",
+          "scope_intro": "학습한 규칙은 네임스페이스 단위로 불러옵니다. 네임스페이스를 저장소 하나에 묶으면 그 규칙은 다른 저장소 리뷰에 적용되지 않습니다.",
+          "unscoped_warning": "이 활성 네임스페이스들은 아직 적용 범위가 없어서 규칙이 모든 저장소에 적용됩니다: {{names}}"
+        },
         "postCommentsButton": {
           "cancel": "취소",
           "confirm_post_other": "댓글 {{count}}개를 보류 중 리뷰 초안으로 작성할까요?",
@@ -810,6 +826,24 @@
           "continue_session": "후속 세션 이어가기",
           "run_live_notice": "이 리뷰는 아직 진행 중입니다. 끝나기 전에는 지적 사항이 바뀔 수 있어 질문할 내용이 아직 없습니다.",
           "loading": "받아오는 중…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "이 리뷰가 시작될 때 고정된 값이라 리뷰어가 실제로 불러온 내용입니다. 적용 범위는 설정에서 바꿀 수 있고 다음 리뷰부터 반영됩니다.",
+          "hide_rules": "규칙 숨기기",
+          "loaded": "불러옴",
+          "no_rules": "이 변경에 불러온 규칙이 없습니다.",
+          "no_source_identity": "저장소 식별 정보 없음",
+          "not_loaded": "불러오지 않음",
+          "reason_explicit_global_binding": "모든 저장소로 지정됨",
+          "reason_legacy_active_namespace": "활성, 범위는 아직 없음",
+          "reason_namespace_missing": "네임스페이스가 더 이상 없습니다",
+          "reason_repository_binding_match": "이 저장소로 지정됨",
+          "reason_repository_binding_mismatch": "다른 저장소로 지정됨",
+          "reason_source_identity_unavailable": "이 변경은 저장소를 지정하지 않습니다",
+          "reason_unknown": "이유가 보고되지 않음",
+          "rules_applied": "적용된 규칙",
+          "show_rules": "규칙 보기",
+          "source_is": "출처: {{source}}"
         },
         "runCard": {
           "cancel": "취소",

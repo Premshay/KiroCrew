@@ -678,6 +678,22 @@
           "show_all_count": "सभी दिखाओ ({{count}})",
           "this_repo_only": "सिर्फ़ {{repo}}"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "यह रेपो जैसा नहीं लगता। owner/repo इस्तेमाल करो, या रिपॉज़िटरी URL पेस्ट करो।",
+          "error_repository_required": "रेपो को owner/repo की तरह लिखो, या उसका URL पेस्ट करो।",
+          "no_namespaces": "अभी कोई namespace नहीं है।",
+          "option_global": "सारे रेपो",
+          "option_repository": "एक रेपो",
+          "option_unscoped": "अभी सीमित नहीं",
+          "repository_for": "{{name}} के लिए रेपो",
+          "repository_placeholder": "owner/repo या रिपॉज़िटरी URL",
+          "row_unscoped_note": "जब तक तुम दायरा तय नहीं करते, यह हर रेपो पर लगता है।",
+          "rule_scope": "नियमों का दायरा",
+          "save": "सेव करो",
+          "scope_for": "{{name}} के नियमों का दायरा",
+          "scope_intro": "सीखे हुए नियम हर namespace के हिसाब से लोड होते हैं। किसी namespace को एक रेपो तक सीमित कर दो और उसके नियम बाकी रेपो की समीक्षाओं पर लगना बंद हो जाएँगे।",
+          "unscoped_warning": "इन सक्रिय namespace का अभी कोई दायरा नहीं है, इसलिए इनके नियम हर रेपो पर लगते हैं: {{names}}"
+        },
         "postCommentsButton": {
           "cancel": "रद्द करो",
           "confirm_post_one": "{{count}} टिप्पणी pull request पर डालें?",
@@ -831,6 +847,24 @@
           "continue_session": "फ़ॉलो-अप सेशन जारी रखें",
           "run_live_notice": "यह समीक्षा अफी चल रही है। पूरी होने तक निष्कर्ष बदल सकते हैं, इसलिए अबी पूछने के लिए कुछ नहीं है।",
           "loading": "लोड हो रहा है…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "यह समीक्षा शुरू होते ही तय हो गया था, इसलिए समीक्षक ने असल में यही लोड किया था। दायरा सेटिंग में बदलो, वह अगली समीक्षा पर लगेगा।",
+          "hide_rules": "नियम छिपाओ",
+          "loaded": "लोड हुए",
+          "no_rules": "इस बदलाव के लिए कोई नियम लोड नहीं हुआ।",
+          "no_source_identity": "कोई रेपो पहचान नहीं",
+          "not_loaded": "लोड नहीं हुए",
+          "reason_explicit_global_binding": "सारे रेपो तक सीमित",
+          "reason_legacy_active_namespace": "सक्रिय, अभी सीमित नहीं",
+          "reason_namespace_missing": "Namespace अब मौजूद नहीं है",
+          "reason_repository_binding_match": "इसी रेपो तक सीमित",
+          "reason_repository_binding_mismatch": "किसी दूसरे रेपो तक सीमित",
+          "reason_source_identity_unavailable": "यह बदलाव किसी रेपो का नाम नहीं देता",
+          "reason_unknown": "वजह नहीं बताई गई",
+          "rules_applied": "लगे हुए नियम",
+          "show_rules": "नियम दिखाओ",
+          "source_is": "स्रोत: {{source}}"
         },
         "runCard": {
           "cancel": "रद्द करो",

@@ -94,6 +94,9 @@ export interface Run {
   posted_review_ids?: Record<string, string>
   posting?: boolean
   post_error?: string | null
+  /** The frozen rule resolution per change URL, written when the run was created.
+   *  Absent on runs recorded before namespaces could be scoped. */
+  rule_resolutions?: Record<string, RuleResolution>
   runtime?: {
     engine: string
     provider: string
@@ -276,12 +279,70 @@ export interface RepoPrsResponse {
   count: number
 }
 
+// --- Namespace scope + rule provenance ---------------------------------------
+
+/** The canonical repository a namespace can be bound to. `provider` is the only
+ *  closed set today ("github"); `host` carries GitHub Enterprise installs. */
+export interface RepositorySource {
+  provider: string
+  host: string
+  owner: string
+  repository: string
+}
+
+/** Where one namespace's learned rules apply. A namespace with NO binding is
+ *  neither of these: it is a legacy active namespace, still applied everywhere
+ *  for compatibility and reported as a migration warning. */
+export type NamespaceBinding =
+  | { scope: 'global' }
+  | { scope: 'repository'; repository: RepositorySource }
+
+/** Why a namespace was included in, or left out of, one review's ruleset. Widened
+ *  with `string` because the backend owns the vocabulary and an unknown reason
+ *  must render as unknown rather than crash the pane. */
+export type RuleInclusionReason =
+  | 'legacy_active_namespace'
+  | 'explicit_global_binding'
+  | 'repository_binding_match'
+  | 'repository_binding_mismatch'
+  | 'source_identity_unavailable'
+  | 'namespace_missing'
+
+export interface NamespaceResolution {
+  namespace: string
+  included: boolean
+  reason: RuleInclusionReason | string
+  binding?: NamespaceBinding
+}
+
+export interface EffectiveRule {
+  namespace: string
+  rule_id: string
+  pattern: LearnedPattern
+  reason: RuleInclusionReason | string
+  /** SAGE-1 learning-record ids backing this rule, when a sidecar was exported. */
+  sidecar_record_ids?: string[]
+}
+
+/** The namespace/rule set frozen for ONE change before its reviewer started. The
+ *  review already ran against exactly this, so every surface showing it is
+ *  read-only. */
+export interface RuleResolution {
+  source_identity: RepositorySource | null
+  namespaces: NamespaceResolution[]
+  effective_namespaces: string[]
+  effective_rules: EffectiveRule[]
+  warnings: string[]
+}
+
 // --- Settings + learning -----------------------------------------------------
 
 export interface Settings {
   model: string | null
   effort: string
   active_namespaces: string[]
+  /** Keyed by namespace name. A namespace absent from this map has no binding. */
+  namespace_bindings: Record<string, NamespaceBinding>
   max_concurrent: number
 }
 

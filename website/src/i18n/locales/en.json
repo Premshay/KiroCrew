@@ -556,6 +556,22 @@
           "show_all_count": "Show all ({{count}})",
           "this_repo_only": "{{repo}} only"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "That does not read as a repository. Use owner/repo, or paste the repository URL.",
+          "error_repository_required": "Enter a repository as owner/repo, or paste its URL.",
+          "no_namespaces": "No namespaces yet.",
+          "option_global": "All repositories",
+          "option_repository": "One repository",
+          "option_unscoped": "Not scoped yet",
+          "repository_for": "Repository for {{name}}",
+          "repository_placeholder": "owner/repo or repository URL",
+          "row_unscoped_note": "Applies to every repository until you scope it.",
+          "rule_scope": "Rule scope",
+          "save": "Save",
+          "scope_for": "Rule scope for {{name}}",
+          "scope_intro": "Learned rules load per namespace. Scope one to a repository and its rules stop applying to reviews of every other repository.",
+          "unscoped_warning": "These active namespaces have no scope yet, so their rules apply to every repository: {{names}}"
+        },
         "postCommentsButton": {
           "cancel": "Cancel",
           "confirm_post_one": "Draft {{count}} comment as a pending review?",
@@ -709,6 +725,24 @@
           "continue_session": "Continue the follow-up session",
           "run_live_notice": "This review is still running. Its findings can change until it finishes, so there is nothing to ask about yet.",
           "loading": "Loading…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "Frozen when this review started, so it is what the reviewer actually loaded. Change a scope in Settings and it applies to the next review.",
+          "hide_rules": "Hide rules",
+          "loaded": "Loaded",
+          "no_rules": "No rules were loaded for this change.",
+          "no_source_identity": "no repository identity",
+          "not_loaded": "Not loaded",
+          "reason_explicit_global_binding": "Scoped to all repositories",
+          "reason_legacy_active_namespace": "Active, not scoped yet",
+          "reason_namespace_missing": "Namespace no longer exists",
+          "reason_repository_binding_match": "Scoped to this repository",
+          "reason_repository_binding_mismatch": "Scoped to another repository",
+          "reason_source_identity_unavailable": "This change names no repository",
+          "reason_unknown": "Reason not reported",
+          "rules_applied": "Rules applied",
+          "show_rules": "Show rules",
+          "source_is": "Source: {{source}}"
         },
         "runCard": {
           "cancel": "Cancel",

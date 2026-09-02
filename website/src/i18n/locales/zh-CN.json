@@ -667,6 +667,22 @@
           "show_all_count": "显示全部（{{count}}）",
           "this_repo_only": "仅 {{repo}}"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "这看起来不像一个仓库。请使用 owner/repo，或粘贴仓库 URL。",
+          "error_repository_required": "请以 owner/repo 的形式填写仓库，或粘贴它的 URL。",
+          "no_namespaces": "还没有 namespace。",
+          "option_global": "全部仓库",
+          "option_repository": "单个仓库",
+          "option_unscoped": "尚未限定",
+          "repository_for": "{{name}} 对应的仓库",
+          "repository_placeholder": "owner/repo 或仓库 URL",
+          "row_unscoped_note": "在限定之前，它会作用于每一个仓库。",
+          "rule_scope": "规则作用范围",
+          "save": "保存",
+          "scope_for": "{{name}} 的规则作用范围",
+          "scope_intro": "学到的规则按 namespace 加载。把一个 namespace 限定到某个仓库后，它的规则就不再作用于其他仓库的评审。",
+          "unscoped_warning": "这些已启用的 namespace 还没有作用范围，它们的规则会作用于每一个仓库：{{names}}"
+        },
         "postCommentsButton": {
           "cancel": "取消",
           "confirm_post_other": "把 {{count}} 条评论发布到 pull request 上？",
@@ -810,6 +826,24 @@
           "continue_session": "继续追问会话",
           "run_live_notice": "这次审查还在运行。完成前发现可能仍会变化，因此现在还没有可提问的内容。",
           "loading": "加载中…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "在本次评审开始时就已冻结，因此这正是评审方实际加载的内容。在设置里修改作用范围，将对下一次评审生效。",
+          "hide_rules": "隐藏规则",
+          "loaded": "已加载",
+          "no_rules": "本次变更没有加载任何规则。",
+          "no_source_identity": "没有仓库标识",
+          "not_loaded": "未加载",
+          "reason_explicit_global_binding": "限定到全部仓库",
+          "reason_legacy_active_namespace": "已启用，但尚未限定",
+          "reason_namespace_missing": "Namespace 已不存在",
+          "reason_repository_binding_match": "限定到当前仓库",
+          "reason_repository_binding_mismatch": "限定到其他仓库",
+          "reason_source_identity_unavailable": "本次变更没有指明仓库",
+          "reason_unknown": "未给出原因",
+          "rules_applied": "已应用的规则",
+          "show_rules": "显示规则",
+          "source_is": "来源：{{source}}"
         },
         "runCard": {
           "cancel": "取消",

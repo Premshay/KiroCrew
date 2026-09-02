@@ -667,6 +667,22 @@
           "show_all_count": "すべて表示（{{count}}）",
           "this_repo_only": "{{repo}} のみ"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "リポジトリとして読み取れません。owner/repo を使うか、リポジトリの URL を貼り付けてください。",
+          "error_repository_required": "リポジトリを owner/repo の形式で入力するか、その URL を貼り付けてください。",
+          "no_namespaces": "名前空間はまだありません。",
+          "option_global": "すべてのリポジトリ",
+          "option_repository": "単一のリポジトリ",
+          "option_unscoped": "まだ未設定",
+          "repository_for": "{{name}} のリポジトリ",
+          "repository_placeholder": "owner/repo またはリポジトリの URL",
+          "row_unscoped_note": "適用範囲を決めるまで、すべてのリポジトリに適用されます。",
+          "rule_scope": "ルールの適用範囲",
+          "save": "保存",
+          "scope_for": "{{name}} のルールの適用範囲",
+          "scope_intro": "学習したルールは名前空間ごとに読み込まれます。名前空間をリポジトリに結び付けると、そのルールは他のリポジトリのレビューには適用されなくなります。",
+          "unscoped_warning": "これらの有効な名前空間にはまだ適用範囲がないため、ルールがすべてのリポジトリに適用されます: {{names}}"
+        },
         "postCommentsButton": {
           "cancel": "キャンセル",
           "confirm_post_other": "{{count}} 件のコメントをプルリクエストに投稿しますか？",
@@ -810,6 +826,24 @@
           "continue_session": "フォローアップのセッションを続ける",
           "run_live_notice": "このレビューは実行中です。完了まで指摘は変わる可能性があるため、まだ質問できることはありません。",
           "loading": "読み込み中…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "このレビューの開始時に固定されたもので、レビュー担当が実際に読み込んだ内容です。適用範囲は設定で変更でき、次のレビューから反映されます。",
+          "hide_rules": "ルールを隠す",
+          "loaded": "読み込み済み",
+          "no_rules": "この変更に読み込まれたルールはありません。",
+          "no_source_identity": "リポジトリ識別子なし",
+          "not_loaded": "未読み込み",
+          "reason_explicit_global_binding": "すべてのリポジトリに設定",
+          "reason_legacy_active_namespace": "有効、適用範囲は未設定",
+          "reason_namespace_missing": "名前空間はもう存在しません",
+          "reason_repository_binding_match": "このリポジトリに設定",
+          "reason_repository_binding_mismatch": "別のリポジトリに設定",
+          "reason_source_identity_unavailable": "この変更はリポジトリを示していません",
+          "reason_unknown": "理由は報告されていません",
+          "rules_applied": "適用されたルール",
+          "show_rules": "ルールを表示",
+          "source_is": "ソース: {{source}}"
         },
         "runCard": {
           "cancel": "キャンセル",

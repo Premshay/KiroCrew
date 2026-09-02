@@ -689,6 +689,22 @@
           "show_all_count": "Mostrar todas ({{count}})",
           "this_repo_only": "solo {{repo}}"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "Eso no se lee como un repositorio. Usa owner/repo, o pega la URL del repositorio.",
+          "error_repository_required": "Escribe el repositorio como owner/repo, o pega su URL.",
+          "no_namespaces": "Todavía no hay namespaces.",
+          "option_global": "Todos los repositorios",
+          "option_repository": "Un repositorio",
+          "option_unscoped": "Sin limitar todavía",
+          "repository_for": "Repositorio de {{name}}",
+          "repository_placeholder": "owner/repo o URL del repositorio",
+          "row_unscoped_note": "Se aplica a todos los repositorios hasta que lo limites.",
+          "rule_scope": "Alcance de las reglas",
+          "save": "Guardar",
+          "scope_for": "Alcance de las reglas de {{name}}",
+          "scope_intro": "Las reglas aprendidas se cargan por namespace. Limita uno a un repositorio y sus reglas dejan de aplicarse a las revisiones de los demás.",
+          "unscoped_warning": "Estos namespaces activos todavía no tienen alcance, así que sus reglas se aplican a todos los repositorios: {{names}}"
+        },
         "postCommentsButton": {
           "cancel": "Cancelar",
           "confirm_post_many": "¿Publicar {{count}} comentarios en el pull request?",
@@ -852,6 +868,24 @@
           "continue_session": "Continuar la sesión de seguimiento",
           "run_live_notice": "Esta revisión sigue en curso. Sus hallazgos pueden cambiar hasta que termine, así que aún no hay nada que preguntar.",
           "loading": "Cargando…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "Se congeló al empezar esta revisión, así que es lo que el revisor cargó de verdad. Cambia un alcance en Ajustes y se aplicará a la próxima revisión.",
+          "hide_rules": "Ocultar reglas",
+          "loaded": "Cargados",
+          "no_rules": "No se cargó ninguna regla para este cambio.",
+          "no_source_identity": "sin identidad de repositorio",
+          "not_loaded": "No cargados",
+          "reason_explicit_global_binding": "Limitado a todos los repositorios",
+          "reason_legacy_active_namespace": "Activo, sin limitar todavía",
+          "reason_namespace_missing": "El namespace ya no existe",
+          "reason_repository_binding_match": "Limitado a este repositorio",
+          "reason_repository_binding_mismatch": "Limitado a otro repositorio",
+          "reason_source_identity_unavailable": "Este cambio no nombra ningún repositorio",
+          "reason_unknown": "No se indicó el motivo",
+          "rules_applied": "Reglas aplicadas",
+          "show_rules": "Mostrar reglas",
+          "source_is": "Origen: {{source}}"
         },
         "runCard": {
           "cancel": "Cancelar",

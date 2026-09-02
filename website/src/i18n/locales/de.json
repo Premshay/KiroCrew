@@ -678,6 +678,22 @@
           "show_all_count": "Alle anzeigen ({{count}})",
           "this_repo_only": "nur {{repo}}"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "Das liest sich nicht wie ein Repository. Nimm owner/repo oder füge die Repository-URL ein.",
+          "error_repository_required": "Gib das Repository als owner/repo an oder füge seine URL ein.",
+          "no_namespaces": "Noch keine Namespaces.",
+          "option_global": "Alle Repositories",
+          "option_repository": "Ein Repository",
+          "option_unscoped": "Noch nicht gebunden",
+          "repository_for": "Repository für {{name}}",
+          "repository_placeholder": "owner/repo oder Repository-URL",
+          "row_unscoped_note": "Gilt für jedes Repository, solange du es nicht bindest.",
+          "rule_scope": "Geltungsbereich der Regeln",
+          "save": "Speichern",
+          "scope_for": "Geltungsbereich der Regeln von {{name}}",
+          "scope_intro": "Gelernte Regeln werden pro Namespace geladen. Binde einen an ein Repository, und seine Regeln gelten nicht mehr für Reviews aller anderen Repositories.",
+          "unscoped_warning": "Diese aktiven Namespaces haben noch keinen Geltungsbereich, ihre Regeln gelten also für jedes Repository: {{names}}"
+        },
         "postCommentsButton": {
           "cancel": "Abbrechen",
           "confirm_post_one": "{{count}} Kommentar am Pull-Request veröffentlichen?",
@@ -831,6 +847,24 @@
           "continue_session": "Folgesitzung fortsetzen",
           "run_live_notice": "Diese Review läuft noch. Ihre Befunde können sich bis zum Ende ändern, daher gibt es noch nichts zu fragen.",
           "loading": "Wird geladen…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "Beim Start dieses Reviews eingefroren — genau das hat der Reviewer geladen. Ändere einen Geltungsbereich in den Einstellungen, er gilt dann für das nächste Review.",
+          "hide_rules": "Regeln ausblenden",
+          "loaded": "Geladen",
+          "no_rules": "Für diese Änderung wurde keine Regel geladen.",
+          "no_source_identity": "keine Repository-Identität",
+          "not_loaded": "Nicht geladen",
+          "reason_explicit_global_binding": "An alle Repositories gebunden",
+          "reason_legacy_active_namespace": "Aktiv, noch nicht gebunden",
+          "reason_namespace_missing": "Namespace existiert nicht mehr",
+          "reason_repository_binding_match": "An dieses Repository gebunden",
+          "reason_repository_binding_mismatch": "An ein anderes Repository gebunden",
+          "reason_source_identity_unavailable": "Diese Änderung nennt kein Repository",
+          "reason_unknown": "Kein Grund gemeldet",
+          "rules_applied": "Angewandte Regeln",
+          "show_rules": "Regeln anzeigen",
+          "source_is": "Quelle: {{source}}"
         },
         "runCard": {
           "cancel": "Abbrechen",

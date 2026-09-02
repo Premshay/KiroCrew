@@ -689,6 +689,22 @@
           "show_all_count": "Tout afficher ({{count}})",
           "this_repo_only": "{{repo}} seulement"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "Cela ne ressemble pas à un dépôt. Utilise owner/repo, ou colle l’URL du dépôt.",
+          "error_repository_required": "Écris le dépôt sous la forme owner/repo, ou colle son URL.",
+          "no_namespaces": "Aucun namespace pour l’instant.",
+          "option_global": "Tous les dépôts",
+          "option_repository": "Un seul dépôt",
+          "option_unscoped": "Pas encore limité",
+          "repository_for": "Dépôt de {{name}}",
+          "repository_placeholder": "owner/repo ou URL du dépôt",
+          "row_unscoped_note": "S’applique à tous les dépôts tant que tu ne l’as pas limité.",
+          "rule_scope": "Portée des règles",
+          "save": "Enregistrer",
+          "scope_for": "Portée des règles de {{name}}",
+          "scope_intro": "Les règles apprises se chargent par namespace. Limite-en un à un dépôt et ses règles cessent de s’appliquer aux revues des autres dépôts.",
+          "unscoped_warning": "Ces namespaces actifs n’ont pas encore de portée, donc leurs règles s’appliquent à tous les dépôts : {{names}}"
+        },
         "postCommentsButton": {
           "cancel": "Annuler",
           "confirm_post_many": "Publier {{count}} commentaires sur la pull request ?",
@@ -852,6 +868,24 @@
           "continue_session": "Reprendre la session de suivi",
           "run_live_notice": "Cette relecture est encore en cours. Ses constats peuvent changer jusqu'à la fin, il n'y a donc rien à demander pour l'instant.",
           "loading": "Chargement…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "Figé au démarrage de cette revue : c’est bien ce que le relecteur a chargé. Change une portée dans les Réglages, cela vaudra pour la prochaine revue.",
+          "hide_rules": "Masquer les règles",
+          "loaded": "Chargés",
+          "no_rules": "Aucune règle n’a été chargée pour ce changement.",
+          "no_source_identity": "aucune identité de dépôt",
+          "not_loaded": "Non chargés",
+          "reason_explicit_global_binding": "Limité à tous les dépôts",
+          "reason_legacy_active_namespace": "Actif, pas encore limité",
+          "reason_namespace_missing": "Le namespace n’existe plus",
+          "reason_repository_binding_match": "Limité à ce dépôt",
+          "reason_repository_binding_mismatch": "Limité à un autre dépôt",
+          "reason_source_identity_unavailable": "Ce changement ne nomme aucun dépôt",
+          "reason_unknown": "Motif non indiqué",
+          "rules_applied": "Règles appliquées",
+          "show_rules": "Afficher les règles",
+          "source_is": "Source : {{source}}"
         },
         "runCard": {
           "cancel": "Annuler",

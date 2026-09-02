@@ -678,6 +678,22 @@
           "show_all_count": "সব দেখাও ({{count}})",
           "this_repo_only": "শুধু {{repo}}"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "এটা রেপোর মতো পড়া যাচ্ছে না। owner/repo ব্যবহার করো, বা রিপোজিটরি URL পেস্ট করো।",
+          "error_repository_required": "রেপোটা owner/repo হিসেবে লেখো, বা তার URL পেস্ট করো।",
+          "no_namespaces": "এখনো কোনো namespace নেই।",
+          "option_global": "সব রেপো",
+          "option_repository": "একটা রেপো",
+          "option_unscoped": "এখনো বাঁধা হয়নি",
+          "repository_for": "{{name}}-এর রেপো",
+          "repository_placeholder": "owner/repo বা রিপোজিটরি URL",
+          "row_unscoped_note": "পরিধি ঠিক না করা পর্যন্ত এটা প্রতিটা রেপোতে খাটে।",
+          "rule_scope": "নিয়মের পরিধি",
+          "save": "সেভ করো",
+          "scope_for": "{{name}}-এর নিয়মের পরিধি",
+          "scope_intro": "শেখা নিয়ম namespace ধরে ধরে লোড হয়। কোনো namespace-কে একটা রেপোতে বেঁধে দিলে তার নিয়ম আর বাকি রেপোর রিভিউয়ে খাটবে না।",
+          "unscoped_warning": "এই চালু namespace-গুলোর এখনো কোনো পরিধি নেই, তাই এদের নিয়ম প্রতিটা রেপোতেই খাটে: {{names}}"
+        },
         "postCommentsButton": {
           "cancel": "বাতিল করো",
           "confirm_post_one": "{{count}} মন্তব্য pull request-এ দেব?",
@@ -831,6 +847,24 @@
           "continue_session": "ফলো-অাপ সেশন চালিয়ে যান",
           "run_live_notice": "এই পর্যালোচনা এখনও চলছে। শেষ হওয়ার আগে পর্যবেক্ষণ বদলাতে পারে, তাই এখনই জিজ্ঞাসা করার কিছু নেই।",
           "loading": "লোড হচ্ছে…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "এই রিভিউ শুরু হওয়ার সময়েই এটা আটকে গেছে, তাই রিভিউয়ার আসলে এটাই লোড করেছিল। সেটিংসে পরিধি বদলাও, সেটা পরের রিভিউয়ে খাটবে।",
+          "hide_rules": "নিয়ম লুকাও",
+          "loaded": "লোড হয়েছে",
+          "no_rules": "এই বদলের জন্য কোনো নিয়ম লোড হয়নি।",
+          "no_source_identity": "কোনো রেপো পরিচয় নেই",
+          "not_loaded": "লোড হয়নি",
+          "reason_explicit_global_binding": "সব রেপোতে বাঁধা",
+          "reason_legacy_active_namespace": "চালু, কিন্তু এখনো বাঁধা হয়নি",
+          "reason_namespace_missing": "Namespace আর নেই",
+          "reason_repository_binding_match": "এই রেপোতে বাঁধা",
+          "reason_repository_binding_mismatch": "অন্য একটা রেপোতে বাঁধা",
+          "reason_source_identity_unavailable": "এই বদল কোনো রেপোর নাম বলে না",
+          "reason_unknown": "কারণ জানানো হয়নি",
+          "rules_applied": "যে নিয়ম খেটেছে",
+          "show_rules": "নিয়ম দেখাও",
+          "source_is": "উৎস: {{source}}"
         },
         "runCard": {
           "cancel": "বাতিল করো",

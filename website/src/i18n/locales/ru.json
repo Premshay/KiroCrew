@@ -700,6 +700,22 @@
           "show_all_count": "Показать все ({{count}})",
           "this_repo_only": "только {{repo}}"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "Это не читается как репозиторий. Используй owner/repo или вставь URL репозитория.",
+          "error_repository_required": "Укажи репозиторий как owner/repo или вставь его URL.",
+          "no_namespaces": "Namespace’ов пока нет.",
+          "option_global": "Все репозитории",
+          "option_repository": "Один репозиторий",
+          "option_unscoped": "Пока не привязан",
+          "repository_for": "Репозиторий для {{name}}",
+          "repository_placeholder": "owner/repo или URL репозитория",
+          "row_unscoped_note": "Пока не привяжешь, действует во всех репозиториях.",
+          "rule_scope": "Область действия правил",
+          "save": "Сохранить",
+          "scope_for": "Область действия правил {{name}}",
+          "scope_intro": "Выученные правила загружаются по namespace. Привяжи namespace к репозиторию — и его правила перестанут действовать в ревью остальных репозиториев.",
+          "unscoped_warning": "У этих активных namespace ещё нет области действия, поэтому их правила действуют во всех репозиториях: {{names}}"
+        },
         "postCommentsButton": {
           "cancel": "Отмена",
           "confirm_post_few": "Опубликовать {{count}} комментария в pull request?",
@@ -873,6 +889,24 @@
           "continue_session": "Продолжить сеанс",
           "run_live_notice": "Эта проверка ещё идёт. До её завершения замечания могут измениться, поэтому спрашивать пока не о чем.",
           "loading": "Загрузка…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "Зафиксировано в момент старта этого ревью, так что это ровно то, что загрузил ревьюер. Меняй область действия в настройках — она применится к следующему ревью.",
+          "hide_rules": "Скрыть правила",
+          "loaded": "Загружены",
+          "no_rules": "Для этого изменения не загрузилось ни одного правила.",
+          "no_source_identity": "нет идентичности репозитория",
+          "not_loaded": "Не загружены",
+          "reason_explicit_global_binding": "Привязан ко всем репозиториям",
+          "reason_legacy_active_namespace": "Активен, пока не привязан",
+          "reason_namespace_missing": "Namespace больше не существует",
+          "reason_repository_binding_match": "Привязан к этому репозиторию",
+          "reason_repository_binding_mismatch": "Привязан к другому репозиторию",
+          "reason_source_identity_unavailable": "Это изменение не называет репозиторий",
+          "reason_unknown": "Причина не указана",
+          "rules_applied": "Применённые правила",
+          "show_rules": "Показать правила",
+          "source_is": "Источник: {{source}}"
         },
         "runCard": {
           "cancel": "Отмена",

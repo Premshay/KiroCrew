@@ -8,7 +8,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2, Settings as SettingsIcon } from 'lucide-react'
 
 import { sageApi } from '../api'
-import type { Settings } from '../lib/types'
+import type { NamespaceBinding, Settings } from '../lib/types'
+import NamespaceScopePanel from '../components/NamespaceScopePanel'
 
 import SimpleSelect from '../../../components/SimpleSelect'
 import { i18nT } from '../../../i18n/t'
@@ -134,6 +135,17 @@ export default function SettingsView() {
               />
             </Field>
           </div>
+        )}
+
+        {data && s && (
+          <NamespaceScopePanel
+            namespaces={data.namespaces ?? []}
+            activeNamespaces={s.active_namespaces ?? []}
+            bindings={s.namespace_bindings ?? {}}
+            onSave={(bindings: Record<string, NamespaceBinding>) =>
+              saveMut.mutate({ namespace_bindings: bindings })}
+            saving={saveMut.isPending}
+          />
         )}
 
         {saveMut.error && (

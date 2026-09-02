@@ -689,6 +689,22 @@
           "show_all_count": "Mostra tutte ({{count}})",
           "this_repo_only": "solo {{repo}}"
         },
+        "namespaceScopePanel": {
+          "error_repository_invalid": "Non si legge come un repository. Usa owner/repo, oppure incolla l’URL del repository.",
+          "error_repository_required": "Scrivi il repository come owner/repo, oppure incolla il suo URL.",
+          "no_namespaces": "Ancora nessun namespace.",
+          "option_global": "Tutti i repository",
+          "option_repository": "Un solo repository",
+          "option_unscoped": "Non ancora legato",
+          "repository_for": "Repository di {{name}}",
+          "repository_placeholder": "owner/repo o URL del repository",
+          "row_unscoped_note": "Vale per ogni repository finché non lo leghi a uno.",
+          "rule_scope": "Ambito delle regole",
+          "save": "Salva",
+          "scope_for": "Ambito delle regole di {{name}}",
+          "scope_intro": "Le regole apprese si caricano per namespace. Lega un namespace a un repository e le sue regole smettono di valere nelle revisioni degli altri.",
+          "unscoped_warning": "Questi namespace attivi non hanno ancora un ambito, quindi le loro regole valgono per ogni repository: {{names}}"
+        },
         "postCommentsButton": {
           "cancel": "Annulla",
           "confirm_post_many": "Pubblicare {{count}} commenti sulla pull request?",
@@ -852,6 +868,24 @@
           "continue_session": "Continua la sessione di follow-up",
           "run_live_notice": "Questa revisione è ancora in corso. I rilievi possono cambiare fino al termine, quindi non c'è ancora nulla da chiedere.",
           "loading": "Caricamento…"
+        },
+        "ruleProvenance": {
+          "frozen_note": "Congelato all’avvio di questa revisione: è ciò che il revisore ha caricato davvero. Cambia un ambito nelle Impostazioni e varrà dalla prossima revisione.",
+          "hide_rules": "Nascondi le regole",
+          "loaded": "Caricati",
+          "no_rules": "Per questa modifica non è stata caricata alcuna regola.",
+          "no_source_identity": "nessuna identità di repository",
+          "not_loaded": "Non caricati",
+          "reason_explicit_global_binding": "Legato a tutti i repository",
+          "reason_legacy_active_namespace": "Attivo, non ancora legato",
+          "reason_namespace_missing": "Il namespace non esiste più",
+          "reason_repository_binding_match": "Legato a questo repository",
+          "reason_repository_binding_mismatch": "Legato a un altro repository",
+          "reason_source_identity_unavailable": "Questa modifica non nomina alcun repository",
+          "reason_unknown": "Motivo non riportato",
+          "rules_applied": "Regole applicate",
+          "show_rules": "Mostra le regole",
+          "source_is": "Origine: {{source}}"
         },
         "runCard": {
           "cancel": "Annulla",
