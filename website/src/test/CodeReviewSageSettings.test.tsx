@@ -70,5 +70,6 @@ describe('Code Review Sage settings', () => {
     await waitFor(() => expect(screen.getByTestId('sage-reviewer-binding')).toHaveTextContent('local'))
     expect(screen.queryByRole('combobox', { name: /review model/i })).toBeNull()
     expect(screen.queryByRole('combobox', { name: /reasoning effort/i })).toBeNull()
+    expect(screen.getByText(/system default/i)).toBeInTheDocument()
   })
 })

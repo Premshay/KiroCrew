@@ -71,6 +71,7 @@ const mockApi = vi.hoisted(() => ({
   updateKirocrewAgent: vi.fn(),
   deleteKirocrewAgent: vi.fn(),
   agentResolvedModel: vi.fn(),
+  kirocrewAgentModels: vi.fn(),
   setDefaultAgent: vi.fn(),
   createChatSlot: vi.fn(),
   models: vi.fn(),
@@ -116,6 +117,7 @@ const OTHER_CREW = {
   workspace: 'oncall',
   memory_store: 'oncall-mem',
   model: 'claude-opus-5',
+  runtime_policy: { model: 'selectable' },
 }
 
 const AGENTS_RESPONSE = { agents: [DEFAULT_CREW, OTHER_CREW], default_agent: 'kirocrew' }
@@ -132,7 +134,10 @@ beforeEach(() => {
   mockApi.workspaces.mockResolvedValue(WORKSPACES_RESPONSE)
   mockApi.kirocrewConfig.mockResolvedValue(CONFIG_RESPONSE)
   mockApi.agentResolvedModel.mockResolvedValue({ model: '', pinned: false, kiro_agent: 'kirocrew' })
-  mockApi.models.mockResolvedValue([{ model_name: 'claude-opus-5' }])
+  mockApi.kirocrewAgentModels.mockResolvedValue({
+    models: [{ modelId: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', description: '' }],
+    effort_levels: [],
+  })
   // The mutation hooks read `.error` off the resolved body, so an undefined
   // resolution (a bare vi.fn()) would throw inside onSuccess.
   mockApi.createKirocrewAgent.mockResolvedValue({})
@@ -521,7 +526,9 @@ describe('crew editor — opening', () => {
     expect(within(sheet).getByRole('combobox', { name: 'Agent Template' })).toHaveTextContent('oncall-agent')
 
     gotoPane(sheet, 'model')
+    await waitFor(() => expect(mockApi.kirocrewAgentModels).toHaveBeenCalledWith('oncall'))
     expect(within(sheet).getByRole('combobox', { name: 'Edit default model' })).toHaveTextContent('claude-opus-5')
+    expect(mockApi.models).not.toHaveBeenCalled()
   })
 
   it('opens the create dialog from "New crew"', async () => {

@@ -22,6 +22,7 @@ const mockApi = vi.hoisted(() => ({
   agentMetadata: vi.fn(),
   agentMetadataSave: vi.fn(),
   kirocrewAgents: vi.fn(),
+  kirocrewAgentModels: vi.fn(),
   skills: vi.fn(),
   agentPatch: vi.fn(),
   agentDelete: vi.fn(),
@@ -129,9 +130,16 @@ beforeEach(() => {
     agents: [
       { name: 'default', kiro_agent: 'kirocrew', workspace: 'default', memory_store: 'default', description: '', source: 'user' },
       { name: 'oncall', kiro_agent: 'kirocrew', workspace: 'oncall', memory_store: 'oncall', description: '', source: 'user' },
-      { name: 'research', kiro_agent: 'reviewer', workspace: 'research', memory_store: 'research', description: '', source: 'user' },
+      {
+        name: 'research', kiro_agent: 'reviewer', workspace: 'research', memory_store: 'research',
+        description: '', source: 'user', runtime_policy: { model: 'selectable' },
+      },
     ],
     default_agent: 'default',
+  })
+  mockApi.kirocrewAgentModels.mockResolvedValue({
+    models: [{ modelId: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', description: '' }],
+    effort_levels: [],
   })
   mockApi.agentDetail.mockImplementation((name: string) => {
     if (name === 'kirocrew') return Promise.resolve(BUILTIN_DETAIL)
@@ -208,6 +216,20 @@ describe('agent templates inspector — overview', () => {
     await open('kirocrew')
 
     expect(await screen.findByText('No crews use this template yet')).toBeInTheDocument()
+  })
+
+  it('discovers a template model catalog through its sole bound crew', async () => {
+    renderPage()
+    await open('reviewer')
+
+    await waitFor(() => expect(mockApi.kirocrewAgentModels).toHaveBeenCalledWith('research'))
+  })
+
+  it('does not discover a generic model catalog for an unbound template', async () => {
+    renderPage()
+    await open('scratch')
+
+    expect(mockApi.kirocrewAgentModels).not.toHaveBeenCalled()
   })
 })
 

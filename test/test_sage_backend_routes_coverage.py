@@ -530,6 +530,8 @@ class TestReviewSectionIO(_SageRoutesBase):
         self.assertIsNone(review["model"])
         review = self.mod._write_review_section({"model": None})
         self.assertIsNone(review["model"])
+        review = self.mod._write_review_section({"model": "auto"})
+        self.assertIsNone(review["model"])
 
     def test_unknown_model_is_rejected(self):
         with unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
@@ -588,9 +590,9 @@ class TestValidModel(_SageRoutesBase):
             self.assertFalse(self.mod._valid_model("sonnet-9"))
             self.assertEqual(self.mod._known_models(), ["opus-4.8"])
 
-    def test_any_safe_token_passes_when_the_registry_is_unavailable(self):
+    def test_no_model_is_accepted_when_the_runtime_snapshot_is_unavailable(self):
         with unittest.mock.patch.object(self.mod, "_known_models", return_value=[]):
-            self.assertTrue(self.mod._valid_model("some.model_id-1"))
+            self.assertFalse(self.mod._valid_model("some.model_id-1"))
 
 
 # ── review settings: the HTTP handler ──

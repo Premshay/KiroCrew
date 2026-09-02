@@ -36,10 +36,12 @@ import json
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Callable, Optional
 
 from kiro_crew import model_registry
+from kiro_crew.acp.client import acp_model_config_options
 
 # The app root holds ``sage_lib/``; put it on sys.path so ``from sage_lib import store``
 # resolves on import (mirrors the sys.path setup in sibling ``review_driver.py``).
@@ -101,6 +103,30 @@ except Exception:  # pragma: no cover - standalone / test fallback
 from sage_lib import followup, store  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+_RUNTIME_MODEL_SNAPSHOTS: dict[str, tuple[str, ...]] = {}
+_RUNTIME_MODEL_SNAPSHOTS_LOCK = threading.Lock()
+
+
+def _record_runtime_model_snapshot(agent: str, handle: object) -> None:
+    """Cache the model ids the reviewer's own ACP session advertised."""
+    configured = acp_model_config_options(getattr(handle, "config_options", []))
+    advertised = configured or getattr(handle, "available_models", [])
+    models: list[str] = []
+    for entry in advertised:
+        model = entry.get("modelId") if isinstance(entry, dict) else None
+        if isinstance(model, str) and model and model not in models:
+            models.append(model)
+    if models:
+        with _RUNTIME_MODEL_SNAPSHOTS_LOCK:
+            _RUNTIME_MODEL_SNAPSHOTS[agent] = tuple(models)
+
+
+def _runtime_model_snapshot(agent: str) -> list[str]:
+    """Return the latest live Sage runtime capability snapshot for this agent."""
+    with _RUNTIME_MODEL_SNAPSHOTS_LOCK:
+        return list(_RUNTIME_MODEL_SNAPSHOTS.get(agent, ()))
 
 
 def runtime_preflight() -> str:
@@ -286,12 +312,7 @@ def reviewer_info() -> dict:
     agent = _resolve_review_agent()
     settings = _get_review_settings()
     model = _reviewer_model(agent)
-    try:
-        models = [row["model_name"] for row in model_registry.display_list("acp")]
-    except Exception:
-        models = []
-    # This pool starts AcpRuntime directly. Its process is kiro-cli's ACP mode,
-    # so only the ACP registry can safely populate an override picker.
+    models = _runtime_model_snapshot(agent)
     return {
         "agent": agent,
         "engine": "kiro-cli",
@@ -571,6 +592,7 @@ class ReviewPool:
                 # agent=None -> inherit the runtime's agent (spawned with --agent);
                 # cwd=app root so relative prompt paths + the effort overlay resolve.
                 handle = await runtime.create_session(cwd=self._work_dir, agent=None)
+                _record_runtime_model_snapshot(self._agent, handle)
                 if on_resolution is not None:
                     served = str(getattr(handle, "served_model", "") or "").strip()
                     on_resolution({
