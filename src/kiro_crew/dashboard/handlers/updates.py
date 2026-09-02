@@ -1430,6 +1430,7 @@ async def _venv_pip_install(proj: str, state: DashboardState) -> bool:
             timeout=600,
         ),
     )
+    await asyncio.sleep(0)
     return rc == 0
 
 
