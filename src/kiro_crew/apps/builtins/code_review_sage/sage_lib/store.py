@@ -106,6 +106,10 @@ DEFAULT_CONFIG: dict[str, object] = {
         "effort": "",          # "" = inherit the model/provider default effort
         "active_namespaces": ["default"],  # which namespaces to load during review
         "namespace_bindings": {},  # explicit global/repository applicability for namespaces
+        "active_context": {
+            "global": {"max_rules": 60, "max_tokens": 12000},
+            "repository": {"max_rules": 40, "max_tokens": 8000},
+        },
         "max_concurrent": 5,     # max reviews running at once on the shared runtime
                                  # (clamped to [1, 30]); "review all" can raise it.
         # Publish findings as a PENDING (draft) review on the PR itself.

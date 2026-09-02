@@ -54,6 +54,17 @@ LEARNING_RECORDS_SCHEMA = "code-review-sage-learning-records"
 LEARNING_RECORDS_VERSION = 1
 _LEARNING_LIFECYCLES = frozenset({"candidate", "active", "archived", "pinned"})
 _UNKNOWN_PROVENANCE = "unknown"
+_PROMOTION_RECURRENCE_COUNT = 2
+_ACTIVE_CONTEXT_BUDGETS = {
+    "global": {"max_rules": 60, "max_tokens": 12000},
+    "repository": {"max_rules": 40, "max_tokens": 8000},
+}
+_LIFECYCLE_TRANSITIONS = {
+    "candidate": frozenset({"active", "archived", "pinned"}),
+    "active": frozenset({"archived", "pinned"}),
+    "archived": frozenset({"candidate", "active", "pinned"}),
+    "pinned": frozenset({"active", "archived"}),
+}
 
 # A valid user namespace token: lowercase alphanumeric start/end, with hyphens,
 # dots and underscores in between, 2-64 chars. Deliberately excludes path
@@ -126,6 +137,27 @@ def _record_error(message: str) -> LearningRecordError:
     return LearningRecordError(f"invalid learning-record sidecar: {message}")
 
 
+def _validate_recurrence_evidence(evidence: object, count: object) -> None:
+    if not isinstance(evidence, list):
+        raise _record_error("record recurrence.evidence must be a list")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise _record_error("record recurrence.count must be a positive integer")
+    reviews: set[str] = set()
+    changes: set[str] = set()
+    for item in evidence:
+        if not isinstance(item, dict) or set(item) != {"review", "change", "observed_at"}:
+            raise _record_error("recurrence evidence must contain review, change, and observed_at")
+        for key in ("review", "change", "observed_at"):
+            if not isinstance(item[key], str) or not item[key].strip():
+                raise _record_error(f"recurrence evidence {key!r} must be a non-empty string")
+        if item["review"] in reviews or item["change"] in changes:
+            raise _record_error("recurrence evidence must name independent reviews and changes")
+        reviews.add(item["review"])
+        changes.add(item["change"])
+    if count != max(1, len(evidence)):
+        raise _record_error("record recurrence.count must match independent evidence")
+
+
 def _validate_learning_record(record: object) -> None:
     if not isinstance(record, dict):
         raise _record_error("record must be an object")
@@ -152,11 +184,9 @@ def _validate_learning_record(record: object) -> None:
     recurrence = record.get("recurrence")
     if not isinstance(recurrence, dict):
         raise _record_error("record recurrence must be an object")
-    count = recurrence.get("count")
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-        raise _record_error("record recurrence.count must be a positive integer")
-    if not isinstance(recurrence.get("evidence"), list):
-        raise _record_error("record recurrence.evidence must be a list")
+    if set(recurrence) != {"count", "evidence"}:
+        raise _record_error("record recurrence must contain count and evidence")
+    _validate_recurrence_evidence(recurrence.get("evidence"), recurrence.get("count"))
     if not isinstance(record.get("legacy"), bool):
         raise _record_error("record legacy must be a boolean")
 
@@ -199,6 +229,241 @@ def load_learning_records(root: Path | None = None, namespace: str | None = None
         learning_records_file(root, namespace), _namespace_dir(namespace, root)
     )
     return list(document["records"])
+
+
+def _write_learning_records(document: dict, root: Path | None, namespace: str | None) -> None:
+    validate_learning_records_document(document)
+    _atomic_write(
+        learning_records_file(root, namespace),
+        json.dumps(document, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def validate_active_context_budgets(review: object) -> dict[str, dict[str, int]]:
+    """Validate the bounded sidecar context configuration without repairing it."""
+    if not isinstance(review, dict):
+        raise ValueError("review configuration must be an object")
+    raw = review.get("active_context", _ACTIVE_CONTEXT_BUDGETS)
+    if not isinstance(raw, dict) or set(raw) != set(_ACTIVE_CONTEXT_BUDGETS):
+        raise ValueError("review.active_context must contain global and repository budgets")
+    normalized: dict[str, dict[str, int]] = {}
+    for scope in sorted(_ACTIVE_CONTEXT_BUDGETS):
+        budget = raw.get(scope)
+        if not isinstance(budget, dict) or set(budget) != {"max_rules", "max_tokens"}:
+            raise ValueError(f"review.active_context.{scope} must contain max_rules and max_tokens")
+        max_rules = budget.get("max_rules")
+        max_tokens = budget.get("max_tokens")
+        if (
+            isinstance(max_rules, bool)
+            or not isinstance(max_rules, int)
+            or max_rules < 1
+            or isinstance(max_tokens, bool)
+            or not isinstance(max_tokens, int)
+            or max_tokens < 1
+        ):
+            raise ValueError(f"review.active_context.{scope} budgets must be positive integers")
+        normalized[scope] = {"max_rules": max_rules, "max_tokens": max_tokens}
+    return normalized
+
+
+def _record_token_cost(record: dict) -> int:
+    return max(1, (len(str(record["rule"]).encode("utf-8")) + 3) // 4)
+
+
+def _record_recency(record: dict) -> str:
+    timestamps = record.get("timestamps") or {}
+    return str(timestamps.get("updated_at") or timestamps.get("created_at") or "")
+
+
+def _record_context_scope(record: dict, default_scope: str = "global") -> str:
+    if record.get("repository_identity") is not None:
+        return "repository"
+    return default_scope
+
+
+def _rank_context_records(candidates: list[dict]) -> list[dict]:
+    ranked = list(candidates)
+    ranked.sort(key=lambda item: str(item["record"]["id"]))
+    ranked.sort(key=lambda item: item["scope"] == "repository", reverse=True)
+    ranked.sort(key=lambda item: _record_recency(item["record"]), reverse=True)
+    ranked.sort(key=lambda item: item["record"]["recurrence"]["count"], reverse=True)
+    ranked.sort(key=lambda item: item["record"]["lifecycle"] == "pinned", reverse=True)
+    return ranked
+
+
+def select_active_context(candidates: list[dict], budgets: dict[str, dict[str, int]]) -> dict:
+    """Select a deterministic bounded context and retain every inclusion decision."""
+    selected: list[dict] = []
+    decisions: list[dict] = []
+    usage = {scope: {"rules": 0, "tokens": 0} for scope in budgets}
+    for candidate in _rank_context_records(candidates):
+        record = candidate["record"]
+        scope = candidate["scope"]
+        tokens = _record_token_cost(record)
+        reason = "selected"
+        if usage["global"]["rules"] >= budgets["global"]["max_rules"]:
+            reason = "excluded_global_rule_budget"
+        elif usage["global"]["tokens"] + tokens > budgets["global"]["max_tokens"]:
+            reason = "excluded_global_token_budget"
+        elif scope == "repository" and usage[scope]["rules"] >= budgets[scope]["max_rules"]:
+            reason = "excluded_repository_rule_budget"
+        elif (
+            scope == "repository" and usage[scope]["tokens"] + tokens > budgets[scope]["max_tokens"]
+        ):
+            reason = "excluded_repository_token_budget"
+        decision = {
+            "record_id": record["id"],
+            "namespace": candidate["namespace"],
+            "lifecycle": record["lifecycle"],
+            "scope": scope,
+            "token_cost": tokens,
+            "reason": reason,
+        }
+        decisions.append(decision)
+        if reason != "selected":
+            continue
+        selected.append(candidate)
+        usage["global"]["rules"] += 1
+        usage["global"]["tokens"] += tokens
+        if scope == "repository":
+            usage[scope]["rules"] += 1
+            usage[scope]["tokens"] += tokens
+    return {"selected": selected, "decisions": decisions, "usage": usage, "budgets": budgets}
+
+
+def record_recurrence_evidence(
+    record_id: str, evidence: object, *, root: Path | None = None, namespace: str | None = None
+) -> dict:
+    """Persist one independent recurrence signal; duplicate reviews or changes do not count."""
+    _validate_recurrence_evidence([evidence], 1)
+    with _candidate_lock(root, namespace):
+        path = learning_records_file(root, namespace)
+        document, _raw = _read_learning_records_document(path, _namespace_dir(namespace, root))
+        records = [dict(item) for item in document["records"]]
+        for index, record in enumerate(records):
+            if record["id"] != record_id:
+                continue
+            existing = record["recurrence"]["evidence"]
+            if any(
+                item["review"] == evidence["review"] or item["change"] == evidence["change"]
+                for item in existing
+            ):
+                return {
+                    "ok": True,
+                    "changed": False,
+                    "reason": "duplicate_recurrence_evidence",
+                    "record": record,
+                }
+            recurrence = {"count": len(existing) + 1, "evidence": [*existing, dict(evidence)]}
+            updated = dict(record)
+            updated["recurrence"] = recurrence
+            updated["timestamps"] = {**record["timestamps"], "updated_at": _utc_now()}
+            records[index] = updated
+            document = {**document, "records": records}
+            _write_learning_records(document, root, namespace)
+            return {"ok": True, "changed": True, "record": updated}
+    raise KeyError(f"learning record {record_id!r} does not exist")
+
+
+def enforce_active_context_budgets(
+    *, root: Path | None = None, namespace: str | None = None, config: dict | None = None
+) -> dict:
+    """Archive unpinned active overflow while preserving archived history and pins."""
+    cfg = config if config is not None else store.load_config(root)
+    review = cfg.get("review") if isinstance(cfg, dict) else None
+    budgets = validate_active_context_budgets(review)
+    bindings = validate_namespace_bindings(review.get("namespace_bindings"))
+    binding = bindings.get(namespace or DEFAULT_NAMESPACE, {})
+    default_scope = "repository" if binding.get("scope") == "repository" else "global"
+    with _candidate_lock(root, namespace):
+        path = learning_records_file(root, namespace)
+        document, _raw = _read_learning_records_document(path, _namespace_dir(namespace, root))
+        candidates = [
+            {
+                "record": record,
+                "namespace": namespace or DEFAULT_NAMESPACE,
+                "scope": _record_context_scope(record, default_scope),
+            }
+            for record in document["records"]
+            if record["lifecycle"] in {"active", "pinned"}
+        ]
+        selection = select_active_context(candidates, budgets)
+        overflow = {
+            decision["record_id"]
+            for decision in selection["decisions"]
+            if decision["reason"] != "selected" and decision["lifecycle"] == "active"
+        }
+        if not overflow:
+            return {"ok": True, "archived": [], **selection}
+        now = _utc_now()
+        updated_records = []
+        for record in document["records"]:
+            if record["id"] not in overflow:
+                updated_records.append(record)
+                continue
+            updated = dict(record)
+            updated["lifecycle"] = "archived"
+            updated["timestamps"] = {**record["timestamps"], "updated_at": now, "archived_at": now}
+            updated_records.append(updated)
+        updated_document = {**document, "records": updated_records}
+        _write_learning_records(updated_document, root, namespace)
+        return {"ok": True, "archived": sorted(overflow), **selection}
+
+
+def transition_learning_record(
+    record_id: str,
+    lifecycle: str,
+    *,
+    operator: str | None = None,
+    root: Path | None = None,
+    namespace: str | None = None,
+    config: dict | None = None,
+) -> dict:
+    """Apply one explicit lifecycle transition and enforce active-context capacity."""
+    if lifecycle not in _LEARNING_LIFECYCLES:
+        raise ValueError(f"unknown lifecycle {lifecycle!r}")
+    transitioned = False
+    with _candidate_lock(root, namespace):
+        path = learning_records_file(root, namespace)
+        document, _raw = _read_learning_records_document(path, _namespace_dir(namespace, root))
+        records = [dict(item) for item in document["records"]]
+        for index, record in enumerate(records):
+            if record["id"] != record_id:
+                continue
+            current = record["lifecycle"]
+            if lifecycle not in _LIFECYCLE_TRANSITIONS[current]:
+                raise ValueError(f"invalid lifecycle transition {current!r} -> {lifecycle!r}")
+            if (current == "pinned" or lifecycle == "pinned") and not (operator or "").strip():
+                raise ValueError("operator identity is required for a pin or unpin transition")
+            if (
+                current == "candidate"
+                and lifecycle == "active"
+                and (record["recurrence"]["count"] < _PROMOTION_RECURRENCE_COUNT)
+            ):
+                raise ValueError(
+                    "candidate promotion requires independent recurrence evidence or an operator pin"
+                )
+            now = _utc_now()
+            updated = dict(record)
+            updated["lifecycle"] = lifecycle
+            updated["timestamps"] = {
+                **record["timestamps"],
+                "updated_at": now,
+                "archived_at": now if lifecycle == "archived" else None,
+            }
+            records[index] = updated
+            _write_learning_records({**document, "records": records}, root, namespace)
+            transitioned = True
+            break
+    if not transitioned:
+        raise KeyError(f"learning record {record_id!r} does not exist")
+    capacity = enforce_active_context_budgets(root=root, namespace=namespace, config=config)
+    final = next(item for item in load_learning_records(root, namespace) if item["id"] == record_id)
+    return {"ok": True, "record": final, "capacity": capacity}
 
 
 def _legacy_record_id(namespace: str, lifecycle: str, occurrence: int, pattern: dict) -> str:
@@ -519,6 +784,17 @@ def resolve_effective_rules(
     cfg = config if config is not None else store.load_config(root)
     review = cfg.get("review") if isinstance(cfg, dict) else {}
     review = review if isinstance(review, dict) else {}
+    try:
+        active_context_budgets = validate_active_context_budgets(review)
+    except ValueError as exc:
+        return {
+            "source_identity": None,
+            "namespaces": [],
+            "effective_namespaces": [],
+            "effective_rules": [],
+            "active_context": {"fail_closed": True, "error": str(exc)},
+            "warnings": [str(exc)],
+        }
     raw_active = review.get("active_namespaces", [DEFAULT_NAMESPACE])
     active = raw_active if isinstance(raw_active, list) else [DEFAULT_NAMESPACE]
     try:
@@ -552,43 +828,127 @@ def resolve_effective_rules(
                 f"namespace {namespace!r} is active without a binding and applies globally"
             )
         elif binding["scope"] == "global":
-            entry.update({"included": True, "reason": "explicit_global_binding", "binding": binding})
+            entry.update(
+                {"included": True, "reason": "explicit_global_binding", "binding": binding}
+            )
         elif canonical_source is None:
-            entry.update({"included": False, "reason": "source_identity_unavailable", "binding": binding})
+            entry.update(
+                {"included": False, "reason": "source_identity_unavailable", "binding": binding}
+            )
         elif binding["repository"] == canonical_source:
-            entry.update({"included": True, "reason": "repository_binding_match", "binding": binding})
+            entry.update(
+                {"included": True, "reason": "repository_binding_match", "binding": binding}
+            )
         else:
-            entry.update({"included": False, "reason": "repository_binding_mismatch", "binding": binding})
+            entry.update(
+                {"included": False, "reason": "repository_binding_mismatch", "binding": binding}
+            )
         namespaces.append(entry)
         if entry["included"]:
             effective_namespaces.append(namespace)
 
     effective_rules: list[dict] = []
     seen_rule_ids: set[str] = set()
+    sidecar_candidates: list[dict] = []
+    legacy_rules: list[dict] = []
     for namespace_entry in namespaces:
         if not namespace_entry["included"]:
             continue
         namespace = namespace_entry["namespace"]
-        for pattern in sorted(list_patterns(root=root, namespace=namespace), key=lambda item: item["id"]):
-            rule_id = str(pattern["id"])
-            if rule_id in seen_rule_ids:
-                continue
-            seen_rule_ids.add(rule_id)
-            sidecar_ids, sidecar_error = _sidecar_rule_ids(namespace, pattern, root)
-            if sidecar_error and sidecar_error not in warnings:
-                warnings.append(sidecar_error)
-            effective_rules.append({
-                "namespace": namespace,
+        records_path = learning_records_file(root, namespace)
+        try:
+            records = load_learning_records(root, namespace) if records_path.exists() else []
+        except LearningRecordError as exc:
+            namespace_entry["sidecar"] = "invalid"
+            namespace_entry["sidecar_error"] = str(exc)
+            warnings.append(str(exc))
+            continue
+        if records:
+            namespace_entry["sidecar"] = "governing"
+            context_scope = (
+                "repository"
+                if namespace_entry.get("binding", {}).get("scope") == "repository"
+                else "global"
+            )
+            for record in records:
+                if record["lifecycle"] not in {"active", "pinned"}:
+                    namespace_entry.setdefault("record_decisions", []).append(
+                        {
+                            "record_id": record["id"],
+                            "lifecycle": record["lifecycle"],
+                            "reason": "excluded_lifecycle_" + record["lifecycle"],
+                        }
+                    )
+                    continue
+                sidecar_candidates.append(
+                    {
+                        "record": record,
+                        "namespace": namespace,
+                        "scope": _record_context_scope(record, context_scope),
+                        "namespace_reason": namespace_entry["reason"],
+                    }
+                )
+            continue
+        namespace_entry["sidecar"] = "legacy_markdown"
+        for pattern in sorted(
+            list_patterns(root=root, namespace=namespace), key=lambda item: item["id"]
+        ):
+            legacy_rules.append(
+                {
+                    "namespace": namespace,
+                    "rule_id": str(pattern["id"]),
+                    "pattern": pattern,
+                    "reason": namespace_entry["reason"],
+                    "sidecar_record_ids": [],
+                    "context_reason": "legacy_markdown_compatibility",
+                }
+            )
+
+    active_context = select_active_context(sidecar_candidates, active_context_budgets)
+    for decision in active_context["decisions"]:
+        for namespace_entry in namespaces:
+            if namespace_entry["namespace"] == decision["namespace"]:
+                namespace_entry.setdefault("record_decisions", []).append(decision)
+                break
+    for candidate in active_context["selected"]:
+        record = candidate["record"]
+        pattern = {
+            "id": record["id"],
+            "title": str(record["text"]).splitlines()[0],
+            "scope": record["scope"],
+            "impact": "medium",
+            "added_at": record["timestamps"].get("created_at") or "",
+            "guidance": record["rule"],
+        }
+        rule_id = pattern_id(pattern["title"], pattern["scope"])
+        if rule_id in seen_rule_ids:
+            continue
+        seen_rule_ids.add(rule_id)
+        effective_rules.append(
+            {
+                "namespace": candidate["namespace"],
                 "rule_id": rule_id,
                 "pattern": pattern,
-                "reason": namespace_entry["reason"],
-                "sidecar_record_ids": sidecar_ids,
-            })
+                "reason": candidate["namespace_reason"],
+                "sidecar_record_ids": [record["id"]],
+                "context_reason": "bounded_sidecar_record",
+                "lifecycle": record["lifecycle"],
+                "recurrence_count": record["recurrence"]["count"],
+                "token_cost": _record_token_cost(record),
+            }
+        )
+    for legacy_rule in legacy_rules:
+        rule_id = legacy_rule["rule_id"]
+        if rule_id in seen_rule_ids:
+            continue
+        seen_rule_ids.add(rule_id)
+        effective_rules.append(legacy_rule)
     return {
         "source_identity": canonical_source,
         "namespaces": namespaces,
         "effective_namespaces": effective_namespaces,
         "effective_rules": effective_rules,
+        "active_context": active_context,
         "warnings": warnings,
     }
 

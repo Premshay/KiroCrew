@@ -115,6 +115,18 @@ the namespace and inclusion reason for every pattern. This is the backend API
 seam for a later settings and provenance UI; it does not migrate sidecars or
 change learning consolidation.
 
+When a namespace has a populated `learning-records.v1.json` sidecar, that
+sidecar governs its prompt context. Records move explicitly among `candidate`,
+`active`, `archived`, and `pinned`: a candidate needs two independent
+review/change signals before it can become active, while an operator may pin it
+directly. Repeating the same review or change never increases recurrence.
+`review.active_context` bounds governed context with separate global and
+repository `{max_rules, max_tokens}` budgets (defaults: 60/12000 and 40/8000).
+Selection is deterministic: pinned records, then recurrence, recency, scope,
+and id. Unpinned active overflow is archived rather than deleted. Invalid
+lifecycle data or budgets fail closed for governed namespaces. Missing or empty
+sidecars keep the markdown-only compatibility behavior above.
+
 ## Enable
 
 Code Review Sage is a built-in app (listed in `kiro_crew.apps.builtins`). Enable
