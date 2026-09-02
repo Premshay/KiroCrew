@@ -77,6 +77,13 @@ code_review_sage/
 App-local runtime data lives under `~/.kiro/crew/apps/code-review-sage/data/`
 (honors `KIROCREW_HOME`; created on first use, never committed).
 
+The active and candidate markdown files remain the review-compatible source of
+truth. An explicit `sage_lib/learning.py export-records` command can add their
+entries to a versioned `learning-records.v1.json` sidecar for future governance.
+It never runs at startup or while reading rules, never rewrites markdown, retains
+valid sidecar records on repeat exports, and snapshots an existing sidecar before
+changing it. `rollback-records-export` restores that sidecar snapshot only.
+
 ## Enable
 
 Code Review Sage is a built-in app (listed in `kiro_crew.apps.builtins`). Enable

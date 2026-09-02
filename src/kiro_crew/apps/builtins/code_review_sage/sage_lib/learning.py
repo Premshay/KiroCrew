@@ -50,6 +50,11 @@ ADMISSIBLE_SOURCES = {"fix_introduce", "human_comment", "design_outcome", "impor
 
 DEFAULT_NAMESPACE = "default"
 
+LEARNING_RECORDS_SCHEMA = "code-review-sage-learning-records"
+LEARNING_RECORDS_VERSION = 1
+_LEARNING_LIFECYCLES = frozenset({"candidate", "active", "archived", "pinned"})
+_UNKNOWN_PROVENANCE = "unknown"
+
 # A valid user namespace token: lowercase alphanumeric start/end, with hyphens,
 # dots and underscores in between, 2-64 chars. Deliberately excludes path
 # separators and ".." so a namespace name can NEVER escape the namespaces/ dir.
@@ -89,6 +94,222 @@ def common_file(root: Path | None = None, namespace: str | None = None) -> Path:
 def candidate_file(root: Path | None = None, namespace: str | None = None) -> Path:
     """Append-only staging for new learnings, awaiting AI consolidation."""
     return _namespace_dir(namespace, root) / "learned-patterns.candidate.md"
+
+
+def learning_records_file(root: Path | None = None, namespace: str | None = None) -> Path:
+    """Versioned sidecar for governance metadata; markdown remains review input."""
+    return _namespace_dir(namespace, root) / "learning-records.v1.json"
+
+
+def learning_records_backup_file(root: Path | None = None, namespace: str | None = None) -> Path:
+    """The last validated sidecar state before an explicit export changes it."""
+    path = learning_records_file(root, namespace)
+    return path.with_name(path.name + ".pre-export")
+
+
+class LearningRecordError(ValueError):
+    """Raised when the durable learning-record sidecar is not trustworthy."""
+
+
+def _empty_learning_records_document() -> dict:
+    return {
+        "schema": LEARNING_RECORDS_SCHEMA,
+        "version": LEARNING_RECORDS_VERSION,
+        "records": [],
+    }
+
+
+def _record_error(message: str) -> LearningRecordError:
+    return LearningRecordError(f"invalid learning-record sidecar: {message}")
+
+
+def _validate_learning_record(record: object) -> None:
+    if not isinstance(record, dict):
+        raise _record_error("record must be an object")
+    for key in ("id", "text", "rule", "namespace", "scope", "lifecycle"):
+        if not isinstance(record.get(key), str) or not record[key].strip():
+            raise _record_error(f"record {key!r} must be a non-empty string")
+    if record["lifecycle"] not in _LEARNING_LIFECYCLES:
+        raise _record_error(f"unknown lifecycle {record['lifecycle']!r}")
+    origin = record.get("origin")
+    if not isinstance(origin, dict) or not isinstance(origin.get("source"), str):
+        raise _record_error("record origin.source must be a string")
+    if origin.get("reference") is not None and not isinstance(origin.get("reference"), str):
+        raise _record_error("record origin.reference must be a string or null")
+    if record.get("repository_identity") is not None and not isinstance(
+        record.get("repository_identity"), str
+    ):
+        raise _record_error("record repository_identity must be a string or null")
+    timestamps = record.get("timestamps")
+    if not isinstance(timestamps, dict):
+        raise _record_error("record timestamps must be an object")
+    for key in ("created_at", "updated_at", "archived_at"):
+        if timestamps.get(key) is not None and not isinstance(timestamps.get(key), str):
+            raise _record_error(f"record timestamps.{key} must be a string or null")
+    recurrence = record.get("recurrence")
+    if not isinstance(recurrence, dict):
+        raise _record_error("record recurrence must be an object")
+    count = recurrence.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise _record_error("record recurrence.count must be a positive integer")
+    if not isinstance(recurrence.get("evidence"), list):
+        raise _record_error("record recurrence.evidence must be a list")
+    if not isinstance(record.get("legacy"), bool):
+        raise _record_error("record legacy must be a boolean")
+
+
+def validate_learning_records_document(document: object) -> None:
+    """Validate the complete durable sidecar before it can replace any copy."""
+    if not isinstance(document, dict):
+        raise _record_error("document must be an object")
+    if document.get("schema") != LEARNING_RECORDS_SCHEMA:
+        raise _record_error("unexpected schema")
+    if document.get("version") != LEARNING_RECORDS_VERSION:
+        raise _record_error("unsupported version")
+    records = document.get("records")
+    if not isinstance(records, list):
+        raise _record_error("records must be a list")
+    ids: set[str] = set()
+    for record in records:
+        _validate_learning_record(record)
+        record_id = record["id"]
+        if record_id in ids:
+            raise _record_error(f"duplicate record id {record_id!r}")
+        ids.add(record_id)
+
+
+def _read_learning_records_document(path: Path, namespace_dir: Path) -> tuple[dict, str | None]:
+    if not path.exists():
+        return _empty_learning_records_document(), None
+    try:
+        raw = store.read_text_nolink(path, namespace_dir)
+        document = json.loads(raw or "")
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        raise _record_error(str(exc)) from exc
+    validate_learning_records_document(document)
+    return document, raw
+
+
+def load_learning_records(root: Path | None = None, namespace: str | None = None) -> list[dict]:
+    """Read durable records without migrating or otherwise changing disk state."""
+    document, _raw = _read_learning_records_document(
+        learning_records_file(root, namespace), _namespace_dir(namespace, root)
+    )
+    return list(document["records"])
+
+
+def _legacy_record_id(namespace: str, lifecycle: str, occurrence: int, pattern: dict) -> str:
+    payload = {
+        "namespace": namespace,
+        "lifecycle": lifecycle,
+        "occurrence": occurrence,
+        "title": pattern.get("title", ""),
+        "scope": pattern.get("scope", ""),
+        "guidance": pattern.get("guidance", ""),
+        "added_at": pattern.get("added_at", ""),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "legacy-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+
+
+def _legacy_record(pattern: dict, namespace: str, lifecycle: str, occurrence: int) -> dict:
+    rule = " ".join(str(pattern.get("guidance") or "").split())
+    title = " ".join(str(pattern.get("title") or "").split())
+    created_at = str(pattern.get("added_at") or "").strip() or None
+    return {
+        "id": _legacy_record_id(namespace, lifecycle, occurrence, pattern),
+        "text": "\n".join(part for part in (title, rule) if part),
+        "rule": rule or title,
+        "namespace": namespace,
+        "scope": str(pattern.get("scope") or "common"),
+        "lifecycle": lifecycle,
+        "origin": {"source": _UNKNOWN_PROVENANCE, "reference": None},
+        "repository_identity": None,
+        "timestamps": {"created_at": created_at, "updated_at": None, "archived_at": None},
+        "recurrence": {"count": 1, "evidence": []},
+        "legacy": True,
+    }
+
+
+def _read_markdown_patterns(path: Path, namespace_dir: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return parse_patterns(store.read_text_nolink(path, namespace_dir) or "")
+
+
+def export_learning_records(root: Path | None = None, namespace: str | None = None) -> dict:
+    """Add legacy markdown entries to the versioned sidecar without touching markdown.
+
+    This is an explicit migration/export operation. It never runs on import or a
+    normal read, retains valid existing records, and snapshots the old sidecar
+    before publishing a merged replacement.
+    """
+    ns = namespace or DEFAULT_NAMESPACE
+    ns_dir = _namespace_dir(namespace, root)
+    records_path = learning_records_file(root, namespace)
+    document, raw = _read_learning_records_document(records_path, ns_dir)
+    exported: list[dict] = []
+    for lifecycle, path in (
+        ("active", common_file(root, namespace)),
+        ("candidate", candidate_file(root, namespace)),
+    ):
+        occurrences: collections.Counter[str] = collections.Counter()
+        for pattern in _read_markdown_patterns(path, ns_dir):
+            identity = _legacy_record_id(ns, lifecycle, 0, pattern)
+            occurrences[identity] += 1
+            exported.append(_legacy_record(pattern, ns, lifecycle, occurrences[identity]))
+    existing_ids = {record["id"] for record in document["records"]}
+    additions = [record for record in exported if record["id"] not in existing_ids]
+    if not additions:
+        return {
+            "ok": True,
+            "path": str(records_path),
+            "added": 0,
+            "records": len(document["records"]),
+            "changed": False,
+        }
+    updated = dict(document)
+    updated["records"] = [*document["records"], *additions]
+    validate_learning_records_document(updated)
+    ns_dir.mkdir(parents=True, exist_ok=True)
+    backup: Path | None = None
+    if raw is not None:
+        backup = learning_records_backup_file(root, namespace)
+        _atomic_write(backup, raw)
+    _atomic_write(records_path, json.dumps(updated, indent=2, sort_keys=True) + "\n")
+    result = {
+        "ok": True,
+        "path": str(records_path),
+        "added": len(additions),
+        "records": len(updated["records"]),
+        "changed": True,
+    }
+    if backup is not None:
+        result["backup"] = str(backup)
+    return result
+
+
+def migrate_legacy_learning_records(root: Path | None = None, namespace: str | None = None) -> dict:
+    """Explicitly migrate compatible markdown entries into the record sidecar."""
+    return export_learning_records(root, namespace)
+
+
+def rollback_learning_records_export(
+    root: Path | None = None, namespace: str | None = None
+) -> dict:
+    """Restore the validated pre-export sidecar without changing markdown files."""
+    ns_dir = _namespace_dir(namespace, root)
+    records_path = learning_records_file(root, namespace)
+    backup_path = learning_records_backup_file(root, namespace)
+    if not backup_path.exists():
+        return {"ok": False, "error": "no pre-export sidecar snapshot exists"}
+    _current, _current_raw = _read_learning_records_document(records_path, ns_dir)
+    backup, backup_raw = _read_learning_records_document(backup_path, ns_dir)
+    if backup_raw is None:
+        raise _record_error("pre-export snapshot is empty")
+    validate_learning_records_document(backup)
+    _atomic_write(records_path, backup_raw)
+    return {"ok": True, "path": str(records_path), "records": len(backup["records"])}
 
 
 # One lock per (root, namespace) candidate file. `stage_learning` and the selective
@@ -593,6 +814,12 @@ def _main(argv: list[str] | None = None) -> int:
     cp.add_argument("--namespace", default=None)
     cc = sub.add_parser("clear-candidate")
     cc.add_argument("--namespace", default=None)
+    er = sub.add_parser(
+        "export-records", help="explicitly export legacy markdown into the record sidecar"
+    )
+    er.add_argument("--namespace", default=None)
+    rr = sub.add_parser("rollback-records-export", help="restore the pre-export record sidecar")
+    rr.add_argument("--namespace", default=None)
     sub.add_parser("list-namespaces")
     cn = sub.add_parser("create-namespace")
     cn.add_argument("name")
@@ -615,6 +842,10 @@ def _main(argv: list[str] | None = None) -> int:
         print(json.dumps(consolidate_apply(merged, namespace=args.namespace), indent=2))
     elif args.cmd == "clear-candidate":
         print(json.dumps({"cleared": clear_candidate(namespace=args.namespace)}))
+    elif args.cmd == "export-records":
+        print(json.dumps(export_learning_records(namespace=args.namespace), indent=2))
+    elif args.cmd == "rollback-records-export":
+        print(json.dumps(rollback_learning_records_export(namespace=args.namespace), indent=2))
     elif args.cmd == "list-namespaces":
         print(json.dumps(list_namespaces(), indent=2))
     elif args.cmd == "create-namespace":
