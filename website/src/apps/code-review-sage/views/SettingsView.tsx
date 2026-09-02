@@ -77,21 +77,34 @@ export default function SettingsView() {
 
         {data && s && (
           <div className="mt-6 rounded-xl border border-border bg-card px-4 py-4">
+            {data.reviewer && (
+              <Field
+                label={i18nT('apps.codeReviewSage.views.settingsView.review_model')}
+                hint={i18nT('apps.codeReviewSage.views.settingsView.which_model_performs_the_review_default_inherits')}
+              >
+                <span className="text-[12.5px] text-muted" data-testid="sage-reviewer-binding">
+                  {data.reviewer.engine} / {data.reviewer.provider} / {data.reviewer.agent}
+                  {' · '}{data.reviewer.model}
+                </span>
+              </Field>
+            )}
             <Field
               label={i18nT('apps.codeReviewSage.views.settingsView.model')}
               hint={i18nT('apps.codeReviewSage.views.settingsView.which_model_performs_the_review_default_inherits')}
             >
-              <SimpleSelect
-                aria-label={i18nT('apps.codeReviewSage.views.settingsView.review_model')}
-                options={data.models ?? []}
-                value={s.model ?? ''}
-                onChange={(v) => saveMut.mutate({ model: v || null })}
-                clearLabel={i18nT('apps.codeReviewSage.views.settingsView.default_agent_config')}
-                className={SELECT_CLASS}
-              />
+              {data.reviewer?.model_override_supported ? (
+                <SimpleSelect
+                  aria-label={i18nT('apps.codeReviewSage.views.settingsView.review_model')}
+                  options={data.models ?? []}
+                  value={s.model ?? ''}
+                  onChange={(v) => saveMut.mutate({ model: v || null })}
+                  clearLabel={i18nT('apps.codeReviewSage.views.settingsView.default_agent_config')}
+                  className={SELECT_CLASS}
+                />
+              ) : <span className="text-[12.5px] text-muted">{i18nT('apps.codeReviewSage.views.settingsView.default_agent_config')}</span>}
             </Field>
 
-            <Field
+            {data.reviewer?.effort_override_supported && <Field
               label={i18nT('apps.codeReviewSage.views.settingsView.reasoning_effort')}
               hint={i18nT('apps.codeReviewSage.views.settingsView.higher_effort_finds_more_costs_more_and_takes_lo')}
             >
@@ -103,7 +116,7 @@ export default function SettingsView() {
                 clearLabel={i18nT('apps.codeReviewSage.views.settingsView.default_model_provider')}
                 className={SELECT_CLASS}
               />
-            </Field>
+            </Field>}
 
             <Field
               label={i18nT('apps.codeReviewSage.views.settingsView.reviews_at_once')}

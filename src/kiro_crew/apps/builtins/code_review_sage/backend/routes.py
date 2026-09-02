@@ -40,7 +40,7 @@ from typing import Any
 
 from aiohttp import web
 
-from kiro_crew import hooks, model_registry
+from kiro_crew import hooks
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.loop_lock import LoopBoundLock
@@ -450,7 +450,12 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
             # event loop. The pool is a lazily-created process-wide singleton.
             loop = asyncio.get_running_loop()
             pool = review_pool.get_pool()
-            dispatch = review_pool.make_sync_dispatch(loop, pool)
+            def _record_runtime(resolution: dict) -> None:
+                # session/new is the point where the backend confirms its served
+                # model; retain that evidence instead of restating a requested value.
+                run["runtime"] = dict(resolution)
+
+            dispatch = review_pool.make_sync_dispatch(loop, pool, on_resolution=_record_runtime)
 
             # Bracket the batch: begin_batch() lazily spawns the ONE shared runtime;
             # end_batch() (in finally) kills it once this run's reviews all drain — so
@@ -1528,32 +1533,12 @@ async def _handle_repos(request: web.Request) -> web.Response:
 # exposes the full config (read), so this route is the WRITE path plus a focused
 # settings view that also enumerates available models, efforts, and namespaces.
 
-def _load_known_models() -> list[str]:
-    """Selectable models for the review-settings dropdown — the registry's
-    CANONICAL keys (e.g. ``opus-4.8-1m``), which are the wire/persisted format
-    the review worker consumes, NOT the provider ids from ``available_models``.
-
-    Provider ids carry a ``[1m]`` capability suffix (e.g.
-    ``global.anthropic.claude-opus-4-8[1m]``); the brackets fail ``_valid_model``'s
-    safe-token check, so sourcing the dropdown from provider ids made every 1M
-    variant unselectable (the PUT 400'd and the dropdown snapped back — only the
-    bracket-free plain ids survived). Canonical keys are bracket-free tokens that
-    both pass validation AND match what ``review_pool`` writes into the worker's
-    cli.json overlay. Empty on failure; the UI still offers 'Default (agent config)'."""
+def _known_models() -> list[str]:
+    """Models this review pool's resolved runtime accepts as overrides."""
     try:
-        return [row["model_name"] for row in model_registry.display_list("claude_code")]
+        return list(review_pool.reviewer_info().get("models") or [])
     except Exception:  # pragma: no cover - defensive
         return []
-
-
-# Computed once at import (the registry is immutable after load). A module-level
-# constant so the settings validator and the /settings enumerator share one list.
-_KNOWN_MODELS: list[str] = _load_known_models()
-
-
-def _known_models() -> list[str]:
-    """Back-compat accessor for the known-model allowlist (the constant above)."""
-    return _KNOWN_MODELS
 
 
 def _valid_model(m: str) -> bool:
@@ -1562,7 +1547,7 @@ def _valid_model(m: str) -> bool:
     is one it knows."""
     if not m or len(m) > 64 or not all(c.isalnum() or c in "._-" for c in m):
         return False
-    known = _KNOWN_MODELS
+    known = _known_models()
     return (m in known) if known else True
 
 
@@ -1658,8 +1643,10 @@ async def _handle_settings(request: web.Request) -> web.Response:
                     reviewer = None
             return {
                 "settings": _load_review_section(),
-                "models": _known_models(),
-                "efforts": list(review_pool.VALID_EFFORTS),
+                "models": list(reviewer.get("models") or []) if reviewer else [],
+                "efforts": (list(review_pool.VALID_EFFORTS)
+                            if reviewer and reviewer.get("effort_override_supported")
+                            else []),
                 "namespaces": namespaces,
                 "reviewer": reviewer,
                 "max_concurrent_max": review_pool.MAX_CONCURRENT_CEIL,

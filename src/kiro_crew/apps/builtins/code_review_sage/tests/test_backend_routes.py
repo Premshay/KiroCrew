@@ -570,7 +570,7 @@ class TestSettingsModelValidation(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_known_model_accepted(self):
-        known = self.mod._KNOWN_MODELS[0]
+        known = self.mod._known_models()[0]
         review = self.mod._write_review_section({"model": known})
         self.assertEqual(review["model"], known)
 
@@ -581,7 +581,7 @@ class TestSettingsModelValidation(unittest.TestCase):
             self.mod._write_review_section({"model": "evil-model-9000"})
 
     def test_empty_model_clears_override(self):
-        self.mod._write_review_section({"model": self.mod._KNOWN_MODELS[0]})
+        self.mod._write_review_section({"model": self.mod._known_models()[0]})
         review = self.mod._write_review_section({"model": None})
         self.assertIsNone(review["model"])
 
@@ -2583,7 +2583,7 @@ class TestWholeRunsSerialize:
 
         monkeypatch.setattr(mod.review_pool, "get_pool", lambda: _Pool())
         monkeypatch.setattr(mod.review_pool, "make_sync_dispatch",
-                            lambda loop, pool: (lambda *a, **k: {"ok": True}))
+                            lambda loop, pool, **_kw: (lambda *a, **k: {"ok": True}))
 
         runs = [{"run_id": f"run-{i}"} for i in range(3)]
         await asyncio.gather(*(mod._run_review_bg(r, [f"https://x/pull/{i}"])
@@ -2627,7 +2627,7 @@ class TestReviewersSerialize:
 
         monkeypatch.setattr(mod.review_pool, "get_pool", lambda: _Pool())
         monkeypatch.setattr(mod.review_pool, "make_sync_dispatch",
-                            lambda loop, pool: (lambda *a, **k: {"ok": True}))
+                            lambda loop, pool, **_kw: (lambda *a, **k: {"ok": True}))
 
         runs = [{"run_id": f"run-{i}"} for i in range(3)]
         await asyncio.gather(*(mod._run_review_bg(r, [f"https://x/pull/{i}"])

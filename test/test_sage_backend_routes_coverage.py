@@ -505,7 +505,7 @@ class TestReviewSectionIO(_SageRoutesBase):
 
     def test_write_seeds_the_layout_when_config_is_missing(self):
         self._cfg_path().unlink()
-        with unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", ["opus-4.8"]):
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
             review = self.mod._write_review_section({"model": "opus-4.8"})
         self.assertEqual(review["model"], "opus-4.8")
         self.assertTrue(self._cfg_path().is_file())
@@ -532,7 +532,7 @@ class TestReviewSectionIO(_SageRoutesBase):
         self.assertIsNone(review["model"])
 
     def test_unknown_model_is_rejected(self):
-        with unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", ["opus-4.8"]):
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
             with self.assertRaises(ValueError):
                 self.mod._write_review_section({"model": "sneaky[1m]"})
 
@@ -583,13 +583,13 @@ class TestValidModel(_SageRoutesBase):
                 self.assertFalse(self.mod._valid_model(bad))
 
     def test_registry_membership_is_required_when_known(self):
-        with unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", ["opus-4.8"]):
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
             self.assertTrue(self.mod._valid_model("opus-4.8"))
             self.assertFalse(self.mod._valid_model("sonnet-9"))
             self.assertEqual(self.mod._known_models(), ["opus-4.8"])
 
     def test_any_safe_token_passes_when_the_registry_is_unavailable(self):
-        with unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", []):
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=[]):
             self.assertTrue(self.mod._valid_model("some.model_id-1"))
 
 
@@ -606,8 +606,7 @@ class TestSettingsHandler(_SageRoutesBase):
         self.assertIn("settings", payload)
         self.assertIn("reviewer", payload)
         self.assertEqual(payload["namespaces"], ["default"])
-        self.assertEqual(payload["efforts"],
-                         list(self.mod.review_pool.VALID_EFFORTS))
+        self.assertEqual(payload["efforts"], [])
         self.assertEqual(payload["max_concurrent_max"],
                          self.mod.review_pool.MAX_CONCURRENT_CEIL)
         self.assertEqual(payload["settings"]["active_namespaces"], ["default"])
@@ -626,7 +625,7 @@ class TestSettingsHandler(_SageRoutesBase):
 
     async def test_put_persists_the_patch_and_audits_success(self):
         with self._patch_audit() as sel, \
-                unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", ["opus-4.8"]):
+                unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
             resp = await self.mod._handle_settings(_Req(
                 method="PUT",
                 body={"model": "opus-4.8", "effort": "high", "max_concurrent": 4}))
@@ -654,7 +653,7 @@ class TestSettingsHandler(_SageRoutesBase):
 
     async def test_put_rejects_an_invalid_model_and_audits_the_denial(self):
         with self._patch_audit() as sel, \
-                unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", ["opus-4.8"]):
+                unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
             resp = await self.mod._handle_settings(
                 _Req(method="PUT", body={"model": "evil[1m]"}))
         self.assertEqual(resp.status, 400)

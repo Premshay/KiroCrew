@@ -94,6 +94,13 @@ export interface Run {
   posted_review_ids?: Record<string, string>
   posting?: boolean
   post_error?: string | null
+  runtime?: {
+    engine: string
+    provider: string
+    agent: string
+    resolved_model: string | null
+    model_resolution: 'reported' | 'unavailable'
+  }
 }
 
 export interface PoolStats {
@@ -109,6 +116,12 @@ export interface ReviewerInfo {
   model?: string | null
   effort?: string
   agent?: string
+  engine?: string
+  provider?: string
+  model_source?: 'config' | 'agent-default'
+  model_override_supported?: boolean
+  effort_override_supported?: boolean
+  models?: string[]
 }
 
 export interface RunsResponse {

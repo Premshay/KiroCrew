@@ -44,6 +44,7 @@ class FakeHandle:
     def __init__(self, runtime, session_id, script=None, gate=None):
         self._runtime = runtime
         self.session_id = session_id
+        self.served_model = str(runtime.kw.get("model") or "")
         self._script = script or []
         self._gate = gate
         self.approvals: list = []
@@ -73,6 +74,7 @@ class FakeRuntime:
     def __init__(self, agent=None, work_dir=None, sandbox_mode="auto", **kw):
         self.agent = agent
         self.work_dir = work_dir
+        self.kw = kw
         self.spawned = False
         self.killed = False
         self.sessions: dict = {}
@@ -116,7 +118,7 @@ def _install_fake_runtime(test, script=None, gate=None):
     FakeRuntime.instances = []
 
     def factory(agent=None, work_dir=None, sandbox_mode="auto", **kw):
-        r = FakeRuntime(agent=agent, work_dir=work_dir, sandbox_mode=sandbox_mode)
+        r = FakeRuntime(agent=agent, work_dir=work_dir, sandbox_mode=sandbox_mode, **kw)
         r.script = script or []
         r.gate = gate
         return r
@@ -176,6 +178,29 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out2, "hi")
         # both sends multiplexed onto the ONE runtime (no respawn per task)
         self.assertEqual(len(FakeRuntime.instances), 1)
+        await pool.end_batch()
+
+    async def test_runtime_receives_the_resolved_reviewer_model(self):
+        _install_fake_runtime(self)
+        with unittest.mock.patch.object(rp, "reviewer_info", return_value={
+                "model": "gpt-5.3-codex", "effort": "", "agent": "reviewer"}):
+            pool = ReviewPool(work_dir="/tmp/x")
+            await pool.begin_batch()
+        self.assertEqual(FakeRuntime.instances[0].kw["model"], "gpt-5.3-codex")
+        await pool.end_batch()
+
+    async def test_records_the_backend_reported_session_model(self):
+        _install_fake_runtime(self)
+        resolved: list[dict] = []
+        with unittest.mock.patch.object(rp, "reviewer_info", return_value={
+                "model": "gpt-5.3-codex", "effort": "", "agent": "reviewer"}):
+            pool = ReviewPool(work_dir="/tmp/x")
+            await pool.begin_batch()
+            await pool.send("task", on_resolution=resolved.append)
+        self.assertEqual(resolved, [{
+            "engine": "kiro-cli", "provider": "acp", "agent": pool._agent,
+            "resolved_model": "gpt-5.3-codex", "model_resolution": "reported",
+        }])
         await pool.end_batch()
 
     async def test_end_batch_kills_runtime_only_when_drained(self):
