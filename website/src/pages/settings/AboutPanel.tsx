@@ -12,6 +12,7 @@ import { setUpdateProgress } from '../../store/dashboardSlice'
 import { codeBrowserBranchUrl, codeBrowserCommitUrl } from '../../lib/codeBrowser'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import SegmentedControl from '../../components/SegmentedControl'
+import RestartBlockers, { isRestartAckRequired } from '../../components/RestartBlockers'
 import ReportProblemCard from './ReportProblemCard'
 import { api, ApiError } from '../../api/client'
 import { copyToClipboard } from '../../utils/clipboard'
@@ -882,6 +883,12 @@ export function AboutPanel() {
   const [managedCmdCopied, setManagedCmdCopied] = useState(false)
   const [showConfirm, setShowConfirm] = useState(false)
   const [applyError, setApplyError] = useState('')
+  // The coordinated-reset barrier refused this apply: sessions are still
+  // holding a turn and NOTHING was updated or restarted. Kept apart from
+  // `applyError` because it is not an error line — it is the blocker panel's
+  // case, and the panel names who is holding it up and offers the one action
+  // over them. Rendering both would say the same thing twice.
+  const [ackBlocked, setAckBlocked] = useState(false)
   const [restarting, setRestarting] = useState(false)
   const [autoUpdate, setAutoUpdate] = useState(true)
   const { data: mcCfg } = useQuery({ queryKey: ['mc-config-autoupdate'], queryFn: () => api.kirocrewConfig() })
@@ -928,8 +935,14 @@ export function AboutPanel() {
   })
   const gwApply = useMutation({
     mutationFn: () => api.applyUpdate(),
+    onMutate: () => { setApplyError(''); setAckBlocked(false) },
     onSuccess: () => setRestarting(true),
     onError: (e: unknown) => {
+      // The barrier refusal is answered by the shared blocker panel rather than
+      // an error line, and it must be tested BEFORE the generic ApiError branch
+      // — it is a 409 too, so the branch below would swallow it into a sentence
+      // naming nobody and offering nothing.
+      if (isRestartAckRequired(e)) { setAckBlocked(true); return }
       // A real server rejection (e.g. 409 dirty tree, 400) arrives as ApiError
       // with a status code — surface it. A bare network failure means the POST's
       // connection was reset by the gateway restart the update itself triggers;
@@ -947,6 +960,7 @@ export function AboutPanel() {
   // (a real server rejection) is a failure worth showing.
   const gwRestart = useMutation({
     mutationFn: () => api.restartGateway(),
+    onMutate: () => { setApplyError(''); setAckBlocked(false) },
     onSuccess: () => setRestarting(true),
     onError: (e: unknown) => {
       if (e instanceof ApiError) setApplyError(e.message || i18nT('pages.settings.aboutPanel.restart_failed'))
@@ -1772,6 +1786,18 @@ export function AboutPanel() {
                 <AlertCircle size={13} className="lucide-inline shrink-0" /> {applyError}
               </span>
             )}
+            {/* The SAME panel the sessions-reset button raises, so a refused
+                restart names the same blockers wherever the operator meets it.
+                One instance for the whole card: both restart call sites and the
+                update apply feed one `ackBlocked`, and the confirm modal renders
+                its own copy while it is open, so this one stands down rather
+                than duplicating it behind the backdrop.
+
+                Retrying stays the operator's call. Clearing a worker's context
+                does not restart anything, and another session can start work in
+                the meantime, so the button above remains the only thing that
+                restarts. */}
+            {ackBlocked && !showConfirm && <RestartBlockers />}
           </div>
         )}
 
@@ -1829,6 +1855,12 @@ export function AboutPanel() {
               <p className="text-[12px] text-muted mb-3">{i18nT('pages.settings.aboutPanel.updating_restarts_the_gateway_active_sessions_wi')}</p>
             )}
             {applyError && <div className="text-[13px] text-danger mb-3 flex items-center gap-1.5"><AlertCircle size={13} className="lucide-inline" /> {applyError}</div>}
+            {/* Bounded like the changelog above it: the blocker list grows with
+                the number of live workers, and an unbounded panel pushes the
+                apply button off the bottom of the dialog. */}
+            {ackBlocked && (
+              <div className="max-h-56 overflow-y-auto mb-3"><RestartBlockers /></div>
+            )}
             {restarting ? (
               <div className="text-[13px] text-accent flex items-center justify-center gap-1.5 py-2" role="status">
                 <RefreshCw size={13} className="lucide-inline animate-spin" /> {i18nT('pages.settings.aboutPanel.updating_gateway_restarting')}

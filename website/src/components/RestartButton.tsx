@@ -1,22 +1,9 @@
 import { useState } from 'react'
 import { Zap } from 'lucide-react'
 import { api } from '../api/client'
-import { ApiError } from '../api/apiError'
-import RestartBlockers from './RestartBlockers'
+import RestartBlockers, { isRestartAckRequired } from './RestartBlockers'
 
 import { i18nT } from '../i18n/t'
-
-/** The gateway's refusal code when live sessions have not released the reset.
- *  It is the ONLY failure this button answers with the blocker panel: any other
- *  error is a plain message, because there is nothing for an operator to act on. */
-const ACK_REQUIRED = 'restart_ack_required'
-
-const isAckRequired = (e: unknown): boolean => {
-  if (!(e instanceof ApiError) || e.status !== 409) return false
-  try {
-    return (JSON.parse(e.body) as { code?: unknown })?.code === ACK_REQUIRED
-  } catch { return false }
-}
 
 export default function RestartButton() {
   const [restarting, setRestarting] = useState(false)
@@ -44,7 +31,7 @@ export default function RestartButton() {
       // panel below names who is holding it up and offers the one action over
       // them, so it stands IN PLACE OF the error line rather than beside it —
       // two sentences saying the same thing read as two different problems.
-      const waiting = isAckRequired(e)
+      const waiting = isRestartAckRequired(e)
       setBlocked(waiting)
       setIsError(!waiting)
       setMsg(

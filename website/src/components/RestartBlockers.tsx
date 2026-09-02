@@ -1,8 +1,29 @@
 import { useCallback, useEffect, useState } from 'react'
 import { AlertTriangle, Check, Ear, Hourglass, RotateCcw, Wrench, X } from 'lucide-react'
 import { api, type RestartBlockerReport, type RestartBlockerResult } from '../api/client'
+import { ApiError } from '../api/apiError'
 import { Badge, Btn } from './ui'
 import { i18nT } from '../i18n/t'
+
+/** The gateway's refusal code when live sessions have not released the reset. */
+const ACK_REQUIRED = 'restart_ack_required'
+
+/**
+ * Did this rejection come from the coordinated-reset barrier?
+ *
+ * Lives beside the panel because it is the panel's own entry condition, and it
+ * is shared rather than re-tested per caller: every endpoint that drains ACP
+ * sessions answers with this ONE code, and a second copy of the test is how one
+ * surface starts rendering the refusal as a plain error line while another
+ * offers the controls. Any other failure is a plain message, because there is
+ * nothing here for an operator to act on.
+ */
+export function isRestartAckRequired(e: unknown): boolean {
+  if (!(e instanceof ApiError) || e.status !== 409) return false
+  try {
+    return (JSON.parse(e.body) as { code?: unknown })?.code === ACK_REQUIRED
+  } catch { return false }
+}
 
 /** Worker state → the channel page's own label, so one vocabulary describes a
  *  worker wherever the operator meets it. A literal map (rather than a computed

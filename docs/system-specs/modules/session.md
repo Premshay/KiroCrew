@@ -408,6 +408,119 @@ rules, skills, and project context remain available.
 
 After a hard kill, `_eager_respawn(key)` calls `get_or_create(key)` in a background task so the next user message finds a warm session. On failure, logs at debug and does nothing — the next message triggers `get_or_create` again via the normal path.
 
+## Coordinated Reset Barrier
+
+Every surface that drains ACP sessions — `POST /api/sessions/restart` (reset all
+sessions) and `POST /api/update` (apply an update, which restarts the gateway) —
+passes through one acknowledgement barrier before anything is torn down. Draining
+a session kills whatever turn it owns, so the barrier's job is to refuse the
+drain while any live session still has work in flight, and to name what is
+holding it up.
+
+`RestartBarrier` (`dashboard/restart_barrier.py`) is deliberately process-local
+and in-memory: it protects only the interval between "an operator asked for a
+reset" and the reset itself, and a completed reset discards it. It is opened from
+`_restart_barrier_status(state, open_if_busy=True)`, which reads
+`SessionManager.restart_barrier_snapshot()` — every pooled session, its
+`semaphore.locked()` and its `last_used` marker — and splits the busy set two
+ways:
+
+- **Managed busy** — the session belongs to a dashboard slot. It goes in
+  `required` and must acknowledge for itself.
+- **Unmanaged busy** — a slotless session (a channel worker, a subagent). It goes
+  in `unmanaged_busy`, which nothing can acknowledge; it clears only when that
+  session stops owning a turn.
+
+`ready()` is `active and not pending() and not unmanaged_busy`. When it is false
+the request is refused with **409 `{"code": "restart_ack_required", "maintenance":
+<payload>}`** and NOTHING is stopped. The barrier is re-read immediately before
+the destructive step as well as at the start, so work that starts during a slow
+MCP reconcile cannot slip through an acknowledgement taken before it existed.
+
+### Slot acknowledgements
+
+A dashboard slot acknowledges through `POST /api/session-maintenance` with
+`{"action": "acknowledge"}` and its own `X-Session-Key` — in practice the agent
+calls the `maintenance_acknowledge` MCP tool for the slot it is running in. The
+barrier accepts it only when both hold:
+
+- **A checkpoint written since this barrier opened.** `open()` snapshots each
+  required key's `checkpoint_generation` as its baseline, and `acknowledge()`
+  refuses ("record a fresh session_checkpoint before acknowledging the reset")
+  while the current generation is still at that baseline. An acknowledgement is a
+  claim that the session's work is safely recorded, so it has to be backed by a
+  checkpoint the operator's request caused, not by one from an hour ago.
+- **The same activity marker.** `pending()` re-tests
+  `acknowledged_activity[key] == activity_markers[key]`, so a session that starts
+  another turn after acknowledging goes straight back to pending. Acknowledging
+  is not a promise to stay idle.
+
+Acknowledging never restarts anything: it releases this session's hold, and the
+operator still presses the button that restarts.
+
+### Channel workers: named, and cleared rather than acknowledged
+
+A channel worker is `unmanaged_busy` — it has no operator watching it and no way
+to acknowledge on its own behalf, so a reset simply stays refused. Two endpoints
+close that hole without weakening the barrier:
+
+- **`GET /api/sessions/restart-blockers`** resolves every `unmanaged_busy` key
+  through `ChannelManager.find_member()` and reports the worker by role, channel
+  topic and state. Membership is the authority, not the `channel:<id>:<agent>`
+  key shape — an attached dashboard session keeps its own `dashboard:` key and
+  still resolves to its member row. Anything with no safe action is listed with
+  the reason none is offered (`not_a_channel_worker`, or
+  `attached_dashboard_session`, which acknowledges through its own slot). This
+  read is `open_if_busy=False`: viewing the maintenance surface must never start
+  requiring acknowledgements from sessions nobody asked to reset.
+- **`POST /api/sessions/restart-blockers/clear`** takes
+  `{"confirm": true, "session_keys": [...]}` (confirmation travels in the request,
+  not in the UI's private state; at most 64 keys) and runs
+  `handlers_channel.clear_agent_context()` per key — the channel's own per-worker
+  **Clear context** lifecycle, so this surface adds reach rather than new
+  semantics. Under `_blocker_lock`, the barrier is re-read before every key and
+  once after the batch, so a worker that finished on its own between the
+  operator's read and their confirmation is **skipped**, and the returned blocker
+  list is measured after the fact rather than assumed. Each key is audited to SEL
+  (`channel.clear_context`, allowed or denied). Nothing here clears the barrier or
+  restarts anything.
+
+**What Clear context does and does not do.** It tears down the worker's ACP
+session, which ends the turn it was running; its channel membership, task, listen
+mode, exchange counts and the channel's shared message buffer all survive, and the
+worker cold-starts on fresh context at its next message.
+
+Three neighbouring actions must stay distinct, because only one of them releases
+the barrier:
+
+| Action | Ends the current turn | Keeps membership | Releases the barrier |
+|---|---|---|---|
+| Clear context | yes | yes | yes |
+| Cooperative stop (`stop_turn`) | yes (soft-cancel, then kill) | yes | yes |
+| **Dismiss** (`Channel.remove_agent`) | **no** | no | **no** |
+
+**Dismiss does not stop work.** It drops the membership row and leaves the
+session running, so the dismissed worker keeps its turn, keeps blocking the
+reset, and is no longer resolvable to a channel — it degrades from a named worker
+to a `not_a_channel_worker` row with no action at all. The maintenance surface
+therefore offers no dismissal control, and says in its own copy that clearing
+context is neither a stop nor a dismissal.
+
+### Surfaces
+
+`RestartBlockers` is the one component that renders this, and
+`isRestartAckRequired()` beside it is the single test for the refusal, so every
+caller decides it the same way. It is raised by the sessions-reset button
+(`RestartButton`) and by the update apply in Settings > About (`AboutPanel`);
+neither retries on the operator's behalf, because clearing a worker's context
+does not restart anything and another session can begin work in the meantime.
+
+`POST /api/restart` (restart the gateway without updating) is the one path that
+does not answer with `restart_ack_required`: it replies `200 {"status":
+"restarting"}` and re-execs in a background task, so its barrier refusal arrives
+later on the update-progress push as `("blocked", …)` and carries no blocker
+list.
+
 ## Session Resume (SessionMap)
 
 Persistent mapping of `session_key → provider_session_id` plus provider label stored at
