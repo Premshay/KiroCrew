@@ -340,6 +340,7 @@ export interface SettingsResponse {
   models: string[]
   efforts: string[]
   namespaces: string[]
+  pinned_repos: PinnedRepo[]
   reviewer?: ReviewerInfo | null
   max_concurrent_max: number
 }
@@ -350,6 +351,10 @@ export interface LearnedPattern {
   scope: string
   impact: string
   guidance: string
+  /** Present for governed sidecar records and on-demand legacy adoption rows. */
+  record_id?: string
+  lifecycle?: 'active' | 'pinned' | 'archived'
+  legacy?: boolean
 }
 
 export interface NamespacesResponse {

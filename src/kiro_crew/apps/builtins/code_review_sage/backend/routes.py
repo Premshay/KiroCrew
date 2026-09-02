@@ -1758,6 +1758,27 @@ def _write_review_section(patch: dict) -> dict:
                 raise ValueError(
                     "namespace bindings reference unknown namespaces: " + ", ".join(unknown)
                 )
+            pinned = discovery.read_repos()
+            allowed_repositories = {
+                ("github", "github.com", str(item["owner"]).lower(), str(item["repo"]).lower())
+                for item in pinned
+            }
+            unavailable = sorted(
+                f"{binding['repository']['owner']}/{binding['repository']['repository']}"
+                for binding in bindings.values()
+                if binding["scope"] == "repository"
+                and (
+                    binding["repository"]["provider"],
+                    binding["repository"]["host"],
+                    binding["repository"]["owner"],
+                    binding["repository"]["repository"],
+                ) not in allowed_repositories
+            )
+            if unavailable:
+                raise ValueError(
+                    "repository bindings must reference pinned Sage repositories: "
+                    + ", ".join(unavailable)
+                )
             review["namespace_bindings"] = bindings
         if "max_concurrent" in patch:
             # How many reviews run at once on the shared runtime. Clamped to
@@ -1803,6 +1824,7 @@ async def _handle_settings(request: web.Request) -> web.Response:
                     else []
                 ),
                 "namespaces": namespaces,
+                "pinned_repos": discovery.read_repos(),
                 "reviewer": reviewer,
                 "max_concurrent_max": review_pool.MAX_CONCURRENT_CEIL,
             }
@@ -2006,7 +2028,7 @@ async def _handle_learnings(request: web.Request) -> web.Response:
 
     def _build() -> dict:
         try:
-            patterns = learning.list_patterns(namespace=ns)
+            patterns = learning.list_rule_entries(namespace=ns)
         except Exception:
             patterns = []
         try:
@@ -2037,6 +2059,67 @@ async def _handle_learnings(request: web.Request) -> web.Response:
                 "consolidate_error": None,
             }
         )
+
+
+async def _handle_learning_rule_lifecycle(request: web.Request) -> web.Response:
+    """Archive or restore one governed rule after an explicit operator action."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    namespace = str(body.get("namespace") or learning.DEFAULT_NAMESPACE)
+    record_id = str(body.get("record_id") or "").strip()
+    if not record_id:
+        return web.json_response(
+            {"code": "record_required", "error": "record_id is required"}, status=400
+        )
+    action = "restore" if request.match_info.get("action") == "restore" else "archive"
+
+    async def _audit(outcome: str) -> None:
+        def _emit() -> None:
+            from kiro_crew.sel import sel
+
+            sel().log_api_access(
+                caller="code-review-sage",
+                operation=f"{action}_learning_rule",
+                outcome=outcome,
+                resources=f"learnings/{namespace}/{record_id}",
+            )
+
+        try:
+            await asyncio.to_thread(_emit)
+        except Exception:
+            logger.warning("SEL audit failed for %s learning rule", action, exc_info=True)
+
+    def _change() -> dict:
+        # A markdown-only namespace is adopted only because this operator asked
+        # to archive a rule. Normal reads and startup remain migration-free.
+        if action == "archive" and not learning.load_learning_records(namespace=namespace):
+            learning.migrate_legacy_learning_records(namespace=namespace)
+        if action == "archive":
+            return learning.archive_learning_record(
+                record_id, operator="dashboard", namespace=namespace
+            )
+        return learning.restore_learning_record(
+            record_id, operator="dashboard", namespace=namespace
+        )
+
+    try:
+        result = await asyncio.to_thread(_change)
+    except KeyError:
+        await _audit("denied")
+        return web.json_response(
+            {"code": "record_not_found", "error": "learning record not found"}, status=404
+        )
+    except ValueError as exc:
+        await _audit("denied")
+        return web.json_response(
+            {"code": "invalid_lifecycle", "error": str(exc)}, status=400
+        )
+    await _audit("success")
+    return web.json_response({"ok": True, "record": result["record"]})
 
 
 # Namespaces with a merge in flight. Consolidation replaces the whole ruleset, so
@@ -2659,6 +2742,10 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/apps/code-review-sage/namespaces", _handle_namespaces)
     app.router.add_delete("/api/apps/code-review-sage/namespaces", _handle_namespaces)
     app.router.add_get("/api/apps/code-review-sage/learnings", _handle_learnings)
+    app.router.add_post(
+        "/api/apps/code-review-sage/learnings/rules/{action:archive|restore}",
+        _handle_learning_rule_lifecycle,
+    )
     app.router.add_post("/api/apps/code-review-sage/learnings/consolidate", _handle_consolidate)
     app.router.add_get(
         "/api/apps/code-review-sage/learnings/consolidation-previews",

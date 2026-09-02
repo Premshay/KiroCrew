@@ -28,14 +28,37 @@ function ImpactTag({ impact }: { impact: string }) {
   )
 }
 
-function PatternRow({ p }: { p: LearnedPattern }) {
+function PatternRow({ p, busy, onArchive, onRestore }: {
+  p: LearnedPattern
+  busy: boolean
+  onArchive: () => void
+  onRestore: () => void
+}) {
   return (
     <li className="rounded-lg border border-border bg-card px-3.5 py-2.5">
       <div className="text-[13px]">
         <ImpactTag impact={p.impact} />
         <strong className="text-text">{p.title}</strong>
+        {p.lifecycle === 'archived' && (
+          <span className="ml-2 text-[12px] text-muted">
+            {i18nT('apps.meetings.review.archivedSection')}
+          </span>
+        )}
       </div>
       <div className="mt-1 text-[12.5px] text-muted leading-[1.6]">{p.guidance}</div>
+      {p.record_id && (
+        <div className="mt-2 flex justify-end">
+          {p.lifecycle === 'archived' ? (
+            <Btn type="button" disabled={busy} onClick={onRestore}>
+              {i18nT('pages.sessionStorage.restore')}
+            </Btn>
+          ) : (
+            <Btn type="button" disabled={busy} onClick={onArchive}>
+              {i18nT('apps.meetings.review.archive')}
+            </Btn>
+          )}
+        </div>
+      )}
     </li>
   )
 }
@@ -327,6 +350,14 @@ export default function LearningView() {
       })
     },
   })
+  const archiveRule = useMutation({
+    mutationFn: (recordId: string) => sageApi.archiveLearningRule(ns as string, recordId),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['code-review-sage', 'learnings', ns] }),
+  })
+  const restoreRule = useMutation({
+    mutationFn: (recordId: string) => sageApi.restoreLearningRule(ns as string, recordId),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['code-review-sage', 'learnings', ns] }),
+  })
 
   const activeList = settingsQuery.data?.settings.active_namespaces ?? []
   const isActive = !!ns && activeList.includes(ns)
@@ -449,7 +480,13 @@ export default function LearningView() {
             ) : (
               <ul className="list-none p-0 mt-2 flex flex-col gap-2">
                 {patterns.map((p) => (
-                  <PatternRow key={p.id} p={p} />
+                  <PatternRow
+                    key={p.record_id ?? p.id}
+                    p={p}
+                    busy={archiveRule.isPending || restoreRule.isPending}
+                    onArchive={() => p.record_id && archiveRule.mutate(p.record_id)}
+                    onRestore={() => p.record_id && restoreRule.mutate(p.record_id)}
+                  />
                 ))}
               </ul>
             )}

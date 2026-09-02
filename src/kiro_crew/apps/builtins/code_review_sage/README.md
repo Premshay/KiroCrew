@@ -127,6 +127,12 @@ and id. Unpinned active overflow is archived rather than deleted. Invalid
 lifecycle data or budgets fail closed for governed namespaces. Missing or empty
 sidecars keep the markdown-only compatibility behavior above.
 
+Individual active and pinned rules are archived instead of deleted. The archive
+record keeps its origin and recurrence provenance, is excluded from review
+context, and has an explicit restore control. Archiving a markdown-only rule
+first adopts that namespace into its sidecar on the operator's action; startup
+and normal reads never migrate legacy markdown.
+
 Consolidation is a two-step, namespace-local backend contract. `POST
 /learnings/consolidate` asks a worker for a machine-readable proposal and stores a
 versioned preview artifact; it never changes the live ruleset, sidecar, or candidates.

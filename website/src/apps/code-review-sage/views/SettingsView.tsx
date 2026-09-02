@@ -142,6 +142,7 @@ export default function SettingsView() {
             namespaces={data.namespaces ?? []}
             activeNamespaces={s.active_namespaces ?? []}
             bindings={s.namespace_bindings ?? {}}
+            pinnedRepos={data.pinned_repos ?? []}
             onSave={(bindings: Record<string, NamespaceBinding>) =>
               saveMut.mutate({ namespace_bindings: bindings })}
             saving={saveMut.isPending}

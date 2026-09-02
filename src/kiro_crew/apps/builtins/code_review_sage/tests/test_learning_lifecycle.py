@@ -150,6 +150,45 @@ class TestLearningLifecycle(unittest.TestCase):
         self.assertIsNotNone(records["overflow"]["timestamps"]["archived_at"])
         self.assertIn("overflow", records)
 
+    def test_archiving_a_pinned_rule_preserves_provenance_and_restore_target(self) -> None:
+        pinned = _record("pinned", "pinned")
+        self._write_records(pinned)
+
+        archived = learning.archive_learning_record(
+            "pinned", operator="operator", root=self.root, config=self._config()
+        )
+        resolved = learning.resolve_effective_rules(None, root=self.root, config=self._config())
+
+        self.assertEqual(archived["record"]["lifecycle"], "archived")
+        self.assertEqual(archived["record"]["archived_from"], "pinned")
+        self.assertEqual(archived["record"]["origin"], pinned["origin"])
+        self.assertEqual(resolved["effective_rules"], [])
+
+        restored = learning.restore_learning_record(
+            "pinned", operator="operator", root=self.root, config=self._config()
+        )
+        self.assertEqual(restored["record"]["lifecycle"], "pinned")
+
+    def test_legacy_rule_is_adopted_only_when_an_archive_action_requests_it(self) -> None:
+        pattern = learning._normalize_pattern(
+            {"title": "Legacy rule", "scope": "common", "guidance": "Keep it explicit."}
+        )
+        learning.common_file(self.root).write_text("# Rules\n\n" + learning.render_pattern(pattern))
+
+        entries = learning.list_rule_entries(self.root)
+        self.assertTrue(entries[0]["legacy"])
+        self.assertFalse(learning.learning_records_file(self.root).exists())
+
+        learning.migrate_legacy_learning_records(self.root)
+        archived = learning.archive_learning_record(
+            entries[0]["record_id"], operator="operator", root=self.root, config=self._config()
+        )
+        self.assertTrue(archived["record"]["legacy"])
+        self.assertEqual(archived["record"]["lifecycle"], "archived")
+        self.assertEqual(
+            learning.list_patterns_for_review(self.root), [], "archived legacy rules must not load"
+        )
+
     def test_repository_budget_applies_after_the_global_budget(self) -> None:
         self._write_records(
             _record(

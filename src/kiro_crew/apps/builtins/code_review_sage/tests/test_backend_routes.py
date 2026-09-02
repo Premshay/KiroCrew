@@ -585,6 +585,29 @@ class TestSettingsModelValidation(unittest.TestCase):
         review = self.mod._write_review_section({"model": None})
         self.assertIsNone(review["model"])
 
+    def test_repository_binding_must_reference_a_pinned_sage_repo(self):
+        binding = {
+            "namespace_bindings": {
+                "default": {
+                    "scope": "repository",
+                    "repository": {
+                        "provider": "github",
+                        "host": "github.com",
+                        "owner": "acme",
+                        "repository": "service",
+                    },
+                }
+            }
+        }
+        with unittest.mock.patch.object(self.mod.discovery, "read_repos", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "pinned Sage repositories"):
+                self.mod._write_review_section(binding)
+        with unittest.mock.patch.object(
+            self.mod.discovery, "read_repos", return_value=[{"owner": "acme", "repo": "service"}]
+        ):
+            review = self.mod._write_review_section(binding)
+        self.assertEqual(review["namespace_bindings"], binding["namespace_bindings"])
+
     def test_concurrent_settings_patches_preserve_both_updates(self):
         entered = threading.Event()
         release = threading.Event()
@@ -703,6 +726,26 @@ class TestLearningsEndpoint(unittest.IsolatedAsyncioTestCase):
         data = json.loads(resp.body)
         self.assertEqual(data["patterns"], [])
         self.assertEqual(data["candidate"], [])
+
+    async def test_archive_action_adopts_legacy_markdown_and_removes_it_from_context(self):
+        pattern = self.learning._normalize_pattern(
+            {"title": "Legacy rule", "scope": "common", "guidance": "Keep it explicit."}
+        )
+        self.learning.common_file().write_text("# Rules\n\n" + self.learning.render_pattern(pattern))
+        record_id = self.learning.list_rule_entries()[0]["record_id"]
+
+        class _Req:
+            match_info = {"action": "archive"}
+
+            async def json(self):
+                return {"namespace": "default", "record_id": record_id}
+
+        with unittest.mock.patch("kiro_crew.sel.sel"):
+            resp = await self.mod._handle_learning_rule_lifecycle(_Req())
+        data = json.loads(resp.body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["record"]["lifecycle"], "archived")
+        self.assertEqual(self.learning.list_patterns_for_review(), [])
 
 
 if __name__ == "__main__":
