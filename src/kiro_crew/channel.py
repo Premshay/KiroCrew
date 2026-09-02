@@ -782,6 +782,23 @@ class ChannelManager:
     def list_channels(self) -> list[dict[str, Any]]:
         return [ch.to_dict() for ch in self._channels.values()]
 
+    def find_member(self, session_key: str) -> tuple[Channel, ChannelAgent] | None:
+        """Resolve a live session key to the channel member that owns it.
+
+        Membership is the only authority on which slotless ACP session belongs
+        to a channel worker, so callers outside this module resolve identity
+        here rather than parsing the ``channel:<channel>:<agent>`` key shape --
+        an attached dashboard session keeps its own ``dashboard:`` key and must
+        still resolve to its member row.
+        """
+        if not session_key:
+            return None
+        for channel in self._channels.values():
+            for member in channel.members.values():
+                if member.session_key == session_key:
+                    return channel, member
+        return None
+
     @property
     def count(self) -> int:
         return len(self._channels)

@@ -7766,6 +7766,25 @@
       "path_copied": "Caminho copiado",
       "reveal_blocked": "Este caminho está protegido e não pode ser aberto.",
       "reveal_failed": "Não foi possível abrir este caminho na máquina que executa o {{productName}}."
+    },
+    "restartBlockers": {
+      "title": "O reinício está aguardando sessões ativas",
+      "pending_sessions": "Sessões de chat que ainda precisam confirmar",
+      "channel_workers": "Trabalhadores de canal que seguram o reinício",
+      "other_blockers": "Sessões bloqueadoras sem ação aqui",
+      "reason_not_a_channel_worker": "Não é um trabalhador de canal — aguarde ele terminar",
+      "reason_attached_dashboard_session": "Uma sessão de chat anexada — ela confirma por si mesma",
+      "clear_context": "Limpar contexto",
+      "confirm_clear": "Limpar o contexto deles",
+      "cancel": "Cancelar",
+      "clearing": "Limpando…",
+      "not_a_dismissal": "Limpar o contexto encerra o turno atual de cada trabalhador e lhe dá uma sessão nova. O trabalhador permanece em seu canal: isso não é uma dispensa, e dispensá-lo não liberaria o reinício.",
+      "outcome_cleared": "Contexto limpo",
+      "outcome_skipped": "Já terminou — nada foi limpo",
+      "outcome_failed": "Não foi possível limpar",
+      "nothing_blocking": "Nada está segurando um reinício.",
+      "load_failed": "Não foi possível ler o que está segurando o reinício",
+      "clear_failed": "Não foi possível limpar o contexto dos trabalhadores"
     }
   },
   "hooks": {

@@ -2138,6 +2138,25 @@
       "fork_failed": "Fork failed",
       "open_read_only_viewer": "Open read-only viewer (read & comment; open the original on {{name}} from there)"
     },
+    "restartBlockers": {
+      "title": "Restart is waiting on active sessions",
+      "pending_sessions": "Chat sessions still to acknowledge",
+      "channel_workers": "Channel workers holding up the restart",
+      "other_blockers": "Blocking sessions with no action here",
+      "reason_not_a_channel_worker": "Not a channel worker — wait for it to finish",
+      "reason_attached_dashboard_session": "An attached chat session — it acknowledges for itself",
+      "clear_context": "Clear context",
+      "confirm_clear": "Clear their context",
+      "cancel": "Cancel",
+      "clearing": "Clearing…",
+      "not_a_dismissal": "Clearing context ends each worker's current turn and gives it a fresh session. The worker stays in its channel: this is not a dismissal, and dismissing a worker would not release the restart.",
+      "outcome_cleared": "Context cleared",
+      "outcome_skipped": "Already finished — nothing cleared",
+      "outcome_failed": "Could not clear",
+      "nothing_blocking": "Nothing is holding up a restart.",
+      "load_failed": "Couldn't read what is holding up the restart",
+      "clear_failed": "Couldn't clear the workers' context"
+    },
     "restartButton": {
       "restart_failed": "Restart failed",
       "sessions_restarted_config_applied": "Sessions restarted — config applied."

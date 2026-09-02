@@ -117,6 +117,59 @@ export interface WorkflowDefinitionWrite {
   slug?: string
   derived_from?: WorkflowLineage | null
 }
+
+/** The coordinated-reset barrier as the maintenance surface reads it.
+ *
+ *  `pending` names dashboard slots that must acknowledge for THEMSELVES —
+ *  nothing here can acknowledge on their behalf. `unmanaged_busy` is the raw
+ *  key list the barrier blocks on; the named breakdown of it arrives as
+ *  `channel_blockers` / `other_blockers`. */
+export interface RestartMaintenance {
+  active: boolean
+  ready: boolean
+  required: string[]
+  pending: string[]
+  unmanaged_busy: string[]
+}
+
+/** A channel-owned worker holding up a reset, named by who it is rather than
+ *  by its session key. */
+export interface RestartChannelBlocker {
+  session_key: string
+  channel_id: string
+  channel_topic: string
+  agent_id: string
+  role: string
+  agent_name: string
+  state: string
+  is_coordinator: boolean
+}
+
+/** A blocking session the maintenance surface offers no action for. `reason`
+ *  says why there is no button, so the operator is not left guessing. */
+export interface RestartOtherBlocker {
+  session_key: string
+  reason: 'not_a_channel_worker' | 'attached_dashboard_session'
+}
+
+export interface RestartBlockerReport {
+  ok: boolean
+  maintenance: RestartMaintenance
+  channel_blockers: RestartChannelBlocker[]
+  other_blockers: RestartOtherBlocker[]
+}
+
+/** What one key in a bulk clear actually did. `skipped` is the ordinary outcome
+ *  for a worker that finished between the operator reading the list and
+ *  confirming it, so it is not an error. */
+export interface RestartBlockerResult {
+  session_key: string
+  outcome: 'cleared' | 'skipped' | 'failed'
+  reason: string
+  channel_id?: string
+  role?: string
+  detail?: string
+}
 /** The gateway's advisory reading of whether a server's backend can be shared.
  *
  *  `strength` is the evidence tier, weakest first: `unknown`, `no_objection`,
@@ -2276,6 +2329,20 @@ export const api = {
        *  restart, but against a config that may not match the sources. */
       mcp_sync_ok: boolean
     }>,
+  /** Who is blocking a coordinated reset. Read-only: it reports an already-open
+   *  barrier and never opens one, so polling this cannot start requiring
+   *  acknowledgements from sessions nobody asked to reset. */
+  restartBlockers: () =>
+    fetch('/api/sessions/restart-blockers').then(j) as Promise<RestartBlockerReport>,
+  /** Run the channel's own per-worker Clear context on the named blockers.
+   *  `confirm` is sent explicitly because the server refuses the batch without
+   *  it — the operator's confirmation is part of the request, not the UI's
+   *  private state. */
+  clearRestartBlockers: (sessionKeys: string[]) =>
+    post('/api/sessions/restart-blockers/clear', {
+      confirm: true,
+      session_keys: sessionKeys,
+    }).then(j) as Promise<RestartBlockerReport & { results: RestartBlockerResult[] }>,
   sessionsContext: () => fetch('/api/sessions/context').then(j),
   sessionsMemory: () => fetch('/api/sessions/memory').then(j) as Promise<{
     sessions: {

@@ -7766,6 +7766,25 @@
       "path_copied": "Ruta copiada",
       "reveal_blocked": "Esta ruta está protegida y no se puede abrir.",
       "reveal_failed": "No se pudo abrir esta ruta en el equipo donde se ejecuta {{productName}}."
+    },
+    "restartBlockers": {
+      "title": "El reinicio está esperando a sesiones activas",
+      "pending_sessions": "Sesiones de chat que aún deben confirmar",
+      "channel_workers": "Trabajadores de canal que retienen el reinicio",
+      "other_blockers": "Sesiones bloqueantes sin acción aquí",
+      "reason_not_a_channel_worker": "No es un trabajador de canal: espera a que termine",
+      "reason_attached_dashboard_session": "Una sesión de chat adjunta: confirma por sí misma",
+      "clear_context": "Borrar contexto",
+      "confirm_clear": "Borrar su contexto",
+      "cancel": "Cancelar",
+      "clearing": "Borrando…",
+      "not_a_dismissal": "Borrar el contexto termina el turno actual de cada trabajador y le da una sesión nueva. El trabajador permanece en su canal: esto no es una expulsión, y expulsarlo no liberaría el reinicio.",
+      "outcome_cleared": "Contexto borrado",
+      "outcome_skipped": "Ya había terminado: no se borró nada",
+      "outcome_failed": "No se pudo borrar",
+      "nothing_blocking": "Nada retiene un reinicio.",
+      "load_failed": "No se pudo leer qué retiene el reinicio",
+      "clear_failed": "No se pudo borrar el contexto de los trabajadores"
     }
   },
   "hooks": {

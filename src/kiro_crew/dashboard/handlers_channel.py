@@ -665,6 +665,41 @@ async def api_channel_approve_agent(request: web.Request) -> web.Response:
 # ── Context Management ──
 
 
+async def clear_agent_context(state: "DashboardState", agent) -> bool:
+    """Reset one channel worker's LLM session, preserving channel configuration.
+
+    This is the per-worker "Clear context" lifecycle in one place so every
+    surface that offers it runs the same semantics: the worker's ACP session is
+    torn down, while its membership, task, listen mode, and the channel's shared
+    message buffer are untouched, so its next message cold-starts on fresh
+    context. Returns ``False`` for a member that owns no session to reset.
+
+    Tearing the session down ends whatever turn it was running; it is neither a
+    cooperative stop nor a dismissal -- ``Channel.remove_agent`` drops the
+    membership row and leaves the session running. Any surface offering this
+    must keep those three distinct.
+    """
+    if not agent.session_key:
+        return False
+    await state.sessions.reset(agent.session_key)
+    return True
+
+
+def broadcast_context_cleared(
+    channel, scope: str, agent_id: str | None, cleared: list[str]
+) -> None:
+    """Tell other clients their buffered view of this channel is stale."""
+    channel._broadcast(
+        "channel_context_cleared",
+        {
+            "channel_id": channel.id,
+            "scope": scope,
+            "agent_id": agent_id,
+            "cleared": cleared,
+        },
+    )
+
+
 async def api_channel_clear_context(request: web.Request) -> web.Response:
     """Clear LLM context for one or all agents in a channel.
 
@@ -738,13 +773,11 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
                 resources=f"{ch.id}:{agent_id}",
             )
             return web.json_response({"error": "agent not found"}, status=404)
-        if agent.session_key:
-            await state.sessions.reset(agent.session_key)
+        if await clear_agent_context(state, agent):
             cleared.append(agent.role or agent.id)
     else:
         for agent in ch.members.values():
-            if agent.session_key:
-                await state.sessions.reset(agent.session_key)
+            if await clear_agent_context(state, agent):
                 cleared.append(agent.role or agent.id)
         ch.messages.clear()
         ch._msg_index.clear()
@@ -758,14 +791,6 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
     )
 
     # Notify other clients (multi-tab UX) so their stale message buffers refresh.
-    ch._broadcast(
-        "channel_context_cleared",
-        {
-            "channel_id": ch.id,
-            "scope": scope,
-            "agent_id": agent_id if scope == "agent" else None,
-            "cleared": cleared,
-        },
-    )
+    broadcast_context_cleared(ch, scope, agent_id if scope == "agent" else None, cleared)
 
     return web.json_response({"ok": True, "cleared": cleared})

@@ -7660,6 +7660,25 @@
       "path_copied": "Pfad kopiert",
       "reveal_blocked": "Dieser Pfad ist geschützt und kann nicht geöffnet werden.",
       "reveal_failed": "Dieser Pfad konnte auf dem Computer, auf dem {{productName}} läuft, nicht geöffnet werden."
+    },
+    "restartBlockers": {
+      "title": "Neustart wartet auf aktive Sitzungen",
+      "pending_sessions": "Chat-Sitzungen, die noch bestätigen müssen",
+      "channel_workers": "Channel-Worker, die den Neustart aufhalten",
+      "other_blockers": "Blockierende Sitzungen ohne Aktion hier",
+      "reason_not_a_channel_worker": "Kein Channel-Worker – warten Sie, bis er fertig ist",
+      "reason_attached_dashboard_session": "Eine angehängte Chat-Sitzung – sie bestätigt selbst",
+      "clear_context": "Kontext löschen",
+      "confirm_clear": "Kontext löschen",
+      "cancel": "Abbrechen",
+      "clearing": "Wird gelöscht…",
+      "not_a_dismissal": "Das Löschen des Kontexts beendet den aktuellen Zug jedes Workers und gibt ihm eine neue Sitzung. Der Worker bleibt in seinem Channel: Das ist keine Entlassung, und eine Entlassung würde den Neustart nicht freigeben.",
+      "outcome_cleared": "Kontext gelöscht",
+      "outcome_skipped": "Bereits fertig – nichts gelöscht",
+      "outcome_failed": "Löschen nicht möglich",
+      "nothing_blocking": "Nichts hält einen Neustart auf.",
+      "load_failed": "Konnte nicht lesen, was den Neustart aufhält",
+      "clear_failed": "Kontext der Worker konnte nicht gelöscht werden"
     }
   },
   "hooks": {

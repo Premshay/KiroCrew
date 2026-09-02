@@ -4110,6 +4110,9 @@ class DashboardState:
         # A process-local safety gate for coordinated session resets.  The
         # handlers refresh its live work set immediately before any reset.
         self.restart_barrier = RestartBarrier()
+        # Serialises the operator's bulk clear of channel-owned reset blockers.
+        # Bound on first use so it belongs to the loop that serves the request.
+        self._restart_blocker_lock: asyncio.Lock | None = None
         self.no_crons: bool = False  # --no-crons flag: cron execution disabled
         self._hook_store: Any = None  # Lazy-init ScriptHookStore
         # Task refine state (background LLM spec generation)

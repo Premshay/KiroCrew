@@ -1,17 +1,34 @@
 import { useState } from 'react'
 import { Zap } from 'lucide-react'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
+import RestartBlockers from './RestartBlockers'
 
 import { i18nT } from '../i18n/t'
+
+/** The gateway's refusal code when live sessions have not released the reset.
+ *  It is the ONLY failure this button answers with the blocker panel: any other
+ *  error is a plain message, because there is nothing for an operator to act on. */
+const ACK_REQUIRED = 'restart_ack_required'
+
+const isAckRequired = (e: unknown): boolean => {
+  if (!(e instanceof ApiError) || e.status !== 409) return false
+  try {
+    return (JSON.parse(e.body) as { code?: unknown })?.code === ACK_REQUIRED
+  } catch { return false }
+}
+
 export default function RestartButton() {
   const [restarting, setRestarting] = useState(false)
   const [msg, setMsg] = useState('')
   const [isError, setIsError] = useState(false)
+  const [blocked, setBlocked] = useState(false)
 
   const restart = async () => {
     setRestarting(true)
     try {
       const res = await api.restartSessions()
+      setBlocked(false)
       // The sessions DID restart, but a failed reconcile means they restarted
       // against a config that may not match the sources — reporting "config
       // applied" there would be the exact lie this button exists to avoid.
@@ -23,8 +40,18 @@ export default function RestartButton() {
         setMsg(i18nT('components.restartButton.sessions_restarted_config_applied'))
       }
     } catch (e: unknown) {
-      setIsError(true)
-      setMsg(e instanceof Error ? e.message : i18nT('components.restartButton.restart_failed'))
+      // A refused restart is not a message to fade out after five seconds. The
+      // panel below names who is holding it up and offers the one action over
+      // them, so it stands IN PLACE OF the error line rather than beside it —
+      // two sentences saying the same thing read as two different problems.
+      const waiting = isAckRequired(e)
+      setBlocked(waiting)
+      setIsError(!waiting)
+      setMsg(
+        waiting
+          ? ''
+          : e instanceof Error ? e.message : i18nT('components.restartButton.restart_failed'),
+      )
     } finally {
       setRestarting(false)
       setTimeout(() => setMsg(''), 5000)
@@ -32,6 +59,7 @@ export default function RestartButton() {
   }
 
   return (
+    <div className="flex flex-col items-end gap-1">
     <div className="flex items-center gap-2">
       {msg && <span className={`text-[13px] animate-rise ${isError ? 'text-danger' : 'text-ok'}`}>{msg}</span>}
       <button
@@ -50,6 +78,11 @@ export default function RestartButton() {
           : <span>{i18nT('components.restartButton.apply_restart')}</span>
         }
       </button>
+    </div>
+      {/* Retrying is the operator's call, not an automatic consequence of a
+          clear: another session can start work in the meantime, so the panel
+          re-reads the barrier and this button stays the one thing that restarts. */}
+      {blocked && <RestartBlockers onCleared={() => setMsg('')} />}
     </div>
   )
 }

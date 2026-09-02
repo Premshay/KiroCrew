@@ -80,6 +80,12 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/tailnet/mobile/unpublish", handlers.api_tailnet_mobile_unpublish)
     app.router.add_post("/api/tailnet/mobile/qr", handlers.api_tailnet_mobile_qr)
     app.router.add_post("/api/sessions/restart", handlers.api_sessions_restart)
+    # Registered before "/api/sessions/{key}" for the same reason as /search:
+    # the path parameter would otherwise capture "restart-blockers".
+    app.router.add_get("/api/sessions/restart-blockers", handlers.api_sessions_restart_blockers)
+    app.router.add_post(
+        "/api/sessions/restart-blockers/clear", handlers.api_sessions_clear_restart_blockers
+    )
     # NOTE: /search must be registered before /{key} to avoid the path param catching "search"
     app.router.add_get("/api/sessions/search", handlers.api_sessions_search)
     app.router.add_post("/api/sessions/summarize", handlers.api_sessions_summarize)

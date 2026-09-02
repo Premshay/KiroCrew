@@ -2409,6 +2409,264 @@ async def api_sessions_restart(request: web.Request) -> web.Response:
     )
 
 
+# ── Coordinated-reset blockers owned by channels ──
+
+# A blocking slotless session this surface has no safe action for. The reason is
+# what the operator is shown INSTEAD of a control, so each value names why no
+# button appears rather than collapsing to "unknown".
+_BLOCKER_NOT_A_CHANNEL_WORKER = "not_a_channel_worker"
+_BLOCKER_ATTACHED_DASHBOARD_SESSION = "attached_dashboard_session"
+# Rejected on the clear path only: the barrier moved between the operator
+# reading the list and confirming, so this key is no longer blocking anything.
+_BLOCKER_NOT_BLOCKING = "not_blocking"
+
+# One confirmation covers a bounded batch. A request naming more keys than any
+# channel could hold is a malformed caller, not an operator clicking a button.
+_MAX_BLOCKER_CLEAR_KEYS = 64
+
+
+def _blocker_lock(state: DashboardState) -> asyncio.Lock:
+    """Serialise bulk clears so two operators cannot interleave one batch.
+
+    Bound on first use rather than in ``DashboardState.__init__`` so the lock
+    belongs to the loop that actually serves the request; the state object is
+    constructed before that loop exists.
+    """
+    lock = getattr(state, "_restart_blocker_lock", None)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        state._restart_blocker_lock = lock
+    return lock
+
+
+def _restart_blocker_view(
+    state: DashboardState, status: dict[str, object]
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Name every slotless session blocking the reset, and who owns it.
+
+    Dashboard-slot sessions are deliberately absent: they acknowledge for
+    themselves through ``/api/session-maintenance`` and are reported by the
+    barrier's own ``pending`` list.  This split is what keeps a channel-owned
+    worker -- which has no operator to acknowledge on its behalf -- from being
+    the anonymous "busy slotless worker" that a reset simply refuses on.
+    """
+    manager = getattr(state, "channel_manager", None)
+    finder = getattr(manager, "find_member", None) if manager is not None else None
+    channel_blockers: list[dict[str, object]] = []
+    other_blockers: list[dict[str, object]] = []
+    raw = status.get("unmanaged_busy")
+    for key in raw if isinstance(raw, list) else []:
+        if not isinstance(key, str):
+            continue
+        found = finder(key) if callable(finder) else None
+        if found is None:
+            other_blockers.append({"session_key": key, "reason": _BLOCKER_NOT_A_CHANNEL_WORKER})
+            continue
+        channel, member = found
+        if member.attached_session:
+            # An attached member is an operator's own dashboard session that
+            # joined a channel. Its reset belongs to the slot that owns it, not
+            # to a channel-maintenance control, so no action is offered here.
+            other_blockers.append(
+                {"session_key": key, "reason": _BLOCKER_ATTACHED_DASHBOARD_SESSION}
+            )
+            continue
+        channel_blockers.append(
+            {
+                "session_key": key,
+                "channel_id": channel.id,
+                "channel_topic": channel.topic,
+                "agent_id": member.id,
+                "role": member.role,
+                "agent_name": member.agent_name,
+                "state": member.state,
+                "is_coordinator": channel.is_active_coordinator(member),
+            }
+        )
+    channel_blockers.sort(key=lambda row: str(row["session_key"]))
+    other_blockers.sort(key=lambda row: str(row["session_key"]))
+    return channel_blockers, other_blockers
+
+
+def _blocker_payload(state: DashboardState, status: dict[str, object]) -> dict[str, object]:
+    """The wire shape both endpoints answer with."""
+    channel_blockers, other_blockers = _restart_blocker_view(state, status)
+    return {"channel_blockers": channel_blockers, "other_blockers": other_blockers}
+
+
+async def api_sessions_restart_blockers(request: web.Request) -> web.Response:
+    """GET /api/sessions/restart-blockers — name what is blocking a reset.
+
+    Read-only: it refreshes an ALREADY-OPEN barrier against live work but never
+    opens one, so merely viewing the maintenance surface cannot start requiring
+    acknowledgements from sessions nobody asked to reset.
+    """
+    state: DashboardState = request.app["state"]
+    status = await _restart_barrier_status(state, open_if_busy=False)
+    return web.json_response({"ok": True, "maintenance": status, **_blocker_payload(state, status)})
+
+
+async def api_sessions_clear_restart_blockers(request: web.Request) -> web.Response:
+    """POST /api/sessions/restart-blockers/clear — clear channel workers' context.
+
+    Body: ``{"confirm": true, "session_keys": ["channel:<id>:<agent>", ...]}``.
+
+    Each key runs the channel's own per-worker Clear context lifecycle
+    (:func:`kiro_crew.dashboard.handlers_channel.clear_agent_context`), so this
+    surface adds reach, not new semantics: channel membership, the shared
+    message buffer and exchange counts all survive, and the worker cold-starts
+    on its next message.  It is NOT a dismissal and not a cooperative stop.
+
+    The barrier is re-read before every key and once more at the end, so a
+    worker that finished on its own between the operator's read and their
+    confirmation is skipped rather than reset, and the returned blocker list is
+    the state after the batch rather than the state that prompted it.
+    """
+    state: DashboardState = request.app["state"]
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "invalid_request"}, status=400
+        )
+    keys = body.get("session_keys")
+    if not isinstance(keys, list) or not keys or not all(isinstance(k, str) and k for k in keys):
+        return web.json_response(
+            {
+                "error": "session_keys must be a non-empty list of strings",
+                "code": "invalid_request",
+            },
+            status=400,
+        )
+    # Deduplicated, but order-preserving: the operator sees results in the order
+    # the list was shown to them.
+    requested: list[str] = list(dict.fromkeys(keys))
+    if len(requested) > _MAX_BLOCKER_CLEAR_KEYS:
+        return web.json_response(
+            {"error": "too many session keys", "code": "too_many_keys"}, status=400
+        )
+    if body.get("confirm") is not True:
+        return web.json_response(
+            {
+                "error": "clearing channel worker context requires confirmation",
+                "code": "confirmation_required",
+            },
+            status=409,
+        )
+
+    manager = getattr(state, "channel_manager", None)
+    if manager is None or not callable(getattr(manager, "find_member", None)):
+        return web.json_response(
+            {"error": "channels are unavailable", "code": "channels_unavailable"}, status=409
+        )
+
+    # Deferred: handlers_channel imports the channel runtime, which this module
+    # sits upstream of in the dashboard's import order.
+    from kiro_crew.dashboard.handlers_channel import (
+        broadcast_context_cleared,
+        clear_agent_context,
+    )
+
+    results: list[dict[str, object]] = []
+    async with _blocker_lock(state):
+        status = await _restart_barrier_status(state, open_if_busy=False)
+        if status.get("active") is not True:
+            return web.json_response(
+                {
+                    "error": "no coordinated reset is waiting on these sessions",
+                    "code": "no_active_barrier",
+                    "maintenance": status,
+                    **_blocker_payload(state, status),
+                },
+                status=409,
+            )
+        for key in requested:
+            # Re-read per key: an earlier clear in this batch, an unrelated
+            # reset, or the worker simply finishing all change what is still
+            # blocking, and a stale membership row must not authorise a reset.
+            status = await _restart_barrier_status(state, open_if_busy=False)
+            clearable, unactionable = _restart_blocker_view(state, status)
+            row = next(
+                (candidate for candidate in clearable if candidate["session_key"] == key), None
+            )
+            if row is None:
+                blocked = next(
+                    (candidate for candidate in unactionable if candidate["session_key"] == key),
+                    None,
+                )
+                reason = str(blocked["reason"]) if blocked else _BLOCKER_NOT_BLOCKING
+                _sel().log_api_access(
+                    caller="dashboard",
+                    operation="channel.clear_context",
+                    outcome="denied",
+                    source="dashboard",
+                    resources=f"restart-blocker:{key}:{reason}",
+                )
+                results.append({"session_key": key, "outcome": "skipped", "reason": reason})
+                continue
+            found = manager.find_member(key)
+            if found is None:
+                results.append(
+                    {"session_key": key, "outcome": "skipped", "reason": _BLOCKER_NOT_BLOCKING}
+                )
+                continue
+            channel, member = found
+            try:
+                cleared = await clear_agent_context(state, member)
+            except asyncio.CancelledError:
+                # The operator's request went away mid-batch. Report nothing as
+                # having happened that did not, and let the cancel propagate.
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Clearing channel worker %s during restart maintenance failed",
+                    key,
+                    exc_info=True,
+                )
+                _sel().log_api_access(
+                    caller="dashboard",
+                    operation="channel.clear_context",
+                    outcome="denied",
+                    source="dashboard",
+                    resources=f"restart-blocker:{key}",
+                    error=redact(str(exc)),
+                )
+                results.append(
+                    {
+                        "session_key": key,
+                        "outcome": "failed",
+                        "reason": "clear_failed",
+                        "detail": redact(str(exc)),
+                    }
+                )
+                continue
+            label = member.role or member.id
+            _sel().log_api_access(
+                caller="dashboard",
+                operation="channel.clear_context",
+                outcome="allowed",
+                source="dashboard",
+                resources=f"restart-blocker:{channel.id}:agent:{label}",
+            )
+            broadcast_context_cleared(channel, "agent", member.id, [label] if cleared else [])
+            results.append(
+                {
+                    "session_key": key,
+                    "outcome": "cleared" if cleared else "skipped",
+                    "reason": "" if cleared else "no_session",
+                    "channel_id": channel.id,
+                    "role": member.role,
+                }
+            )
+        status = await _restart_barrier_status(state, open_if_busy=False)
+    _publish_restart_barrier(state)
+    return web.json_response(
+        {"ok": True, "results": results, "maintenance": status, **_blocker_payload(state, status)}
+    )
+
+
 async def api_session_archive_list(request: web.Request) -> web.Response:
     """GET /api/session/archive?key=... — list archive files for a session key."""
     from typing import Any

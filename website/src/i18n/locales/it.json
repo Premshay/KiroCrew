@@ -7766,6 +7766,25 @@
       "path_copied": "Percorso copiato",
       "reveal_blocked": "Questo percorso è protetto e non può essere aperto.",
       "reveal_failed": "Impossibile aprire questo percorso sul computer che esegue {{productName}}."
+    },
+    "restartBlockers": {
+      "title": "Il riavvio è in attesa di sessioni attive",
+      "pending_sessions": "Sessioni di chat che devono ancora confermare",
+      "channel_workers": "Worker di canale che trattengono il riavvio",
+      "other_blockers": "Sessioni bloccanti senza azione qui",
+      "reason_not_a_channel_worker": "Non è un worker di canale: attendi che finisca",
+      "reason_attached_dashboard_session": "Una sessione di chat collegata: conferma da sé",
+      "clear_context": "Cancella contesto",
+      "confirm_clear": "Cancella il loro contesto",
+      "cancel": "Annulla",
+      "clearing": "Cancellazione…",
+      "not_a_dismissal": "Cancellare il contesto termina il turno corrente di ogni worker e gli assegna una sessione nuova. Il worker resta nel suo canale: non è una rimozione, e rimuoverlo non libererebbe il riavvio.",
+      "outcome_cleared": "Contesto cancellato",
+      "outcome_skipped": "Già terminato: niente da cancellare",
+      "outcome_failed": "Cancellazione non riuscita",
+      "nothing_blocking": "Nulla trattiene un riavvio.",
+      "load_failed": "Impossibile leggere cosa trattiene il riavvio",
+      "clear_failed": "Impossibile cancellare il contesto dei worker"
     }
   },
   "hooks": {

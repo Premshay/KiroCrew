@@ -7554,6 +7554,25 @@
       "path_copied": "路径已复制",
       "reveal_blocked": "此路径受保护，无法打开。",
       "reveal_failed": "无法在运行 {{productName}} 的计算机上打开此路径。"
+    },
+    "restartBlockers": {
+      "title": "重启正在等待活动会话",
+      "pending_sessions": "仍需确认的聊天会话",
+      "channel_workers": "阻碍重启的频道工作代理",
+      "other_blockers": "此处无法操作的阻塞会话",
+      "reason_not_a_channel_worker": "不是频道工作代理 — 请等待它完成",
+      "reason_attached_dashboard_session": "已附加的聊天会话 — 它自行确认",
+      "clear_context": "清除上下文",
+      "confirm_clear": "清除它们的上下文",
+      "cancel": "取消",
+      "clearing": "正在清除…",
+      "not_a_dismissal": "清除上下文会结束每个工作代理当前的回合并给它一个新会话。工作代理仍留在其频道中：这不是移除，移除工作代理也不会解除重启阻塞。",
+      "outcome_cleared": "上下文已清除",
+      "outcome_skipped": "已经完成 — 无需清除",
+      "outcome_failed": "无法清除",
+      "nothing_blocking": "没有任何东西阻碍重启。",
+      "load_failed": "无法读取是什么阻碍了重启",
+      "clear_failed": "无法清除工作代理的上下文"
     }
   },
   "hooks": {

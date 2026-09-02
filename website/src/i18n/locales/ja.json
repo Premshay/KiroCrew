@@ -7554,6 +7554,25 @@
       "path_copied": "パスをコピーしました",
       "reveal_blocked": "このパスは保護されているため開けません。",
       "reveal_failed": "{{productName}} を実行しているマシンでこのパスを開けませんでした。"
+    },
+    "restartBlockers": {
+      "title": "再起動はアクティブなセッションを待っています",
+      "pending_sessions": "まだ承認していないチャットセッション",
+      "channel_workers": "再起動を止めているチャンネルワーカー",
+      "other_blockers": "ここでは操作できないブロック中のセッション",
+      "reason_not_a_channel_worker": "チャンネルワーカーではありません — 完了をお待ちください",
+      "reason_attached_dashboard_session": "接続済みのチャットセッション — 自分で承認します",
+      "clear_context": "コンテキストをクリア",
+      "confirm_clear": "コンテキストをクリアする",
+      "cancel": "キャンセル",
+      "clearing": "クリア中…",
+      "not_a_dismissal": "コンテキストのクリアは各ワーカーの現在のターンを終了し、新しいセッションを与えます。ワーカーはチャンネルに残ります。これは解除ではなく、ワーカーを解除しても再起動は解放されません。",
+      "outcome_cleared": "コンテキストをクリアしました",
+      "outcome_skipped": "すでに完了 — クリアするものはありません",
+      "outcome_failed": "クリアできませんでした",
+      "nothing_blocking": "再起動を止めているものはありません。",
+      "load_failed": "再起動を止めているものを読み取れませんでした",
+      "clear_failed": "ワーカーのコンテキストをクリアできませんでした"
     }
   },
   "hooks": {
