@@ -1157,7 +1157,7 @@ def _candidate_patterns_with_occurrence_ids(patterns: Sequence[dict], namespace:
         occurrences[logical_id] += 1
         if item.get("occurrence_id"):
             item["id"] = str(item["occurrence_id"])
-        elif counts[logical_id] > 1:
+        elif counts[logical_id] > 1 and occurrences[logical_id] > 1:
             occurrence_id = _legacy_candidate_occurrence_id(
                 namespace, occurrences[logical_id], item
             )

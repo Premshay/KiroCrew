@@ -208,7 +208,10 @@ class TestConsolidateMerge(_Base):
                          ["Kept"])
         # And the candidate is NOT cleared, so nothing staged is lost either.
         self.assertEqual(learning.candidate_count(), 1)
-        self.assertIn("turn failed", routes._CONSOLIDATE_STATE["default"]["error"])
+        self.assertEqual(
+            routes._CONSOLIDATE_STATE["default"]["error"],
+            "the consolidation worker could not complete; try again",
+        )
 
     async def test_a_failed_worker_that_wrote_a_partial_ruleset_is_refused(self):
         # The dangerous shape: the turn FAILED, but it had already emitted one
@@ -236,8 +239,10 @@ class TestConsolidateMerge(_Base):
             ["Kept one", "Kept two"])
         # And the staged candidate is still staged, so nothing pending is lost.
         self.assertEqual(learning.candidate_count(), 1)
-        self.assertIn("timed out mid-write",
-                      routes._CONSOLIDATE_STATE["default"]["error"])
+        self.assertEqual(
+            routes._CONSOLIDATE_STATE["default"]["error"],
+            "the consolidation worker could not complete; try again",
+        )
 
     async def test_a_successful_worker_still_applies_its_merge(self):
         # The guard must not refuse legitimate merges: ok=True still applies.
