@@ -84,6 +84,37 @@ It never runs at startup or while reading rules, never rewrites markdown, retain
 valid sidecar records on repeat exports, and snapshots an existing sidecar before
 changing it. `rollback-records-export` restores that sidecar snapshot only.
 
+Namespace applicability is configured under `review.namespace_bindings` in the
+app's `config.json`. An active namespace without a binding remains globally
+applicable for compatibility and is reported as a migration warning. Mark a
+deliberately global namespace explicitly, or bind it to one canonical review
+source identity:
+
+```json
+{
+  "review": {
+    "active_namespaces": ["default", "service-rules"],
+    "namespace_bindings": {
+      "default": {"scope": "global"},
+      "service-rules": {
+        "scope": "repository",
+        "repository": {
+          "provider": "github",
+          "host": "github.com",
+          "owner": "acme",
+          "repository": "service"
+        }
+      }
+    }
+  }
+}
+```
+
+The review run stores its frozen source identity and effective rules, including
+the namespace and inclusion reason for every pattern. This is the backend API
+seam for a later settings and provenance UI; it does not migrate sidecars or
+change learning consolidation.
+
 ## Enable
 
 Code Review Sage is a built-in app (listed in `kiro_crew.apps.builtins`). Enable

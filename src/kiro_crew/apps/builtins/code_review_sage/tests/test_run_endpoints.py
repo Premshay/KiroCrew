@@ -20,6 +20,7 @@ style as ``test_backend_routes.py`` — rather than through a live aiohttp clien
 because the handlers only touch ``request.match_info`` / ``request.query`` /
 ``request.json()`` / ``request.method``.
 """
+import asyncio
 import importlib.util
 import json
 import os
@@ -98,6 +99,30 @@ class TestRunDetail(_RunEndpointBase):
     async def test_detail_404_for_unknown(self):
         resp = await self.mod._handle_run_detail(_Req(run_id="nope"))
         self.assertEqual(resp.status, 404)
+
+
+class TestRunRuleProvenance(_RunEndpointBase):
+    async def test_review_run_persists_frozen_source_rule_resolution(self):
+        async def no_review(_run, _changes):
+            return None
+
+        url = "https://github.com/Acme/Service/pull/7"
+        with unittest.mock.patch.object(self.mod, "_run_review_bg", new=no_review):
+            response = await self.mod._handle_review(
+                _Req(method="POST", body={"changes": [url]})
+            )
+            await asyncio.sleep(0)
+
+        self.assertEqual(response.status, 200)
+        run = self.mod._RUNS[0]
+        resolution = run["rule_resolutions"][url]
+        self.assertEqual(resolution["source_identity"], {
+            "provider": "github",
+            "host": "github.com",
+            "owner": "acme",
+            "repository": "service",
+        })
+        self.assertIn("effective_rules", resolution)
 
 
 class TestRunReport(_RunEndpointBase):

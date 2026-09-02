@@ -392,7 +392,7 @@ def _accepts_activity(dispatch: Callable[..., Any]) -> bool:
     return _accepts_kwarg(dispatch, "on_activity")
 
 
-def build_review_task(change_link: str) -> str:
+def build_review_task(change_link: str, rule_resolution: dict | None = None) -> str:
     """Single-pass review prompt: ONE isolated session does the WHOLE review —
     design reasoning AND every code-level dimension — in a single turn, and writes
     the complete result record (phase1 design fields + findings + counts +
@@ -401,6 +401,8 @@ def build_review_task(change_link: str) -> str:
     loop. The session RECORDS findings only — it never posts (the driver builds the
     Python-redacted bodies and a separate poster publishes them verbatim)."""
     py = python_command()
+    resolution = rule_resolution or pipeline.resolve_rules_for_review_link(change_link)
+    rules_json = json.dumps(resolution, sort_keys=True)
     return (
         "You are a Code Review Sage reviewer running in an ISOLATED, CLEAN session. "
         "Do the COMPLETE review of EXACTLY ONE change in a SINGLE thorough pass: "
@@ -411,8 +413,9 @@ def build_review_task(change_link: str) -> str:
         "absolute path verbatim (quote it as YOUR shell requires if it contains "
         "spaces); do NOT substitute `python3` or `python`.\n"
         "Load the `sage-review` skill and follow its per-change review ruleset:\n"
-        "  1. Self-heal the store; load patterns from active namespaces "
-        "(`" + py + " sage_lib/learning.py list-for-review`).\n"
+        "  1. Self-heal the store. The effective namespace/rule resolution was "
+        "frozen before this worker started; use exactly this payload and do not "
+        "reload namespace configuration: `" + rules_json + "`.\n"
         "  2. Resolve the per-repo rule pack (if any) and apply it as additional rules.\n"
         "  3. Fetch the change — " + _fetch_instruction(change_link) + " — and "
         "normalize via `" + py + " sage_lib/pipeline.py prepare --link " + change_link
@@ -468,13 +471,15 @@ def build_review_task(change_link: str) -> str:
     )
 
 
-def build_review_followup_task(change_link: str) -> str:
+def build_review_followup_task(change_link: str, rule_resolution: dict | None = None) -> str:
     """Bounded coverage backstop — dispatched AT MOST ONCE, and only when the single
     review reported ``coverage_complete=false``. It reviews the STILL-UNCOVERED
     changed files and APPENDS only net-new findings (never repeats/removes existing
     ones), then marks coverage complete. It runs at most one targeted pass,
     signal-driven, not count-delta-driven."""
     py = python_command()
+    resolution = rule_resolution or pipeline.resolve_rules_for_review_link(change_link)
+    rules_json = json.dumps(resolution, sort_keys=True)
     return (
         "You are a Code Review Sage reviewer running in an ISOLATED, CLEAN session. "
         "A prior pass reviewed EXACTLY ONE change: " + change_link + " but reported "
@@ -484,8 +489,8 @@ def build_review_followup_task(change_link: str) -> str:
         "absolute path verbatim (quote it as YOUR shell requires if it contains "
         "spaces); do NOT substitute `python3` or `python`.\n"
         "Load the `sage-review` skill and follow its per-change review ruleset:\n"
-        "  1. Self-heal the store; load patterns "
-        "(`" + py + " sage_lib/learning.py list-for-review`).\n"
+        "  1. Self-heal the store. Reuse this frozen effective namespace/rule "
+        "resolution: `" + rules_json + "`.\n"
         "  2. Resolve the per-repo rule pack (if any) and apply it as additional rules.\n"
         "  3. Fetch the change — " + _fetch_instruction(change_link) + " — and "
         "normalize via `" + py + " sage_lib/pipeline.py prepare --link " + change_link
@@ -1037,7 +1042,8 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
                concurrency: int = 0, timeout: int = DEFAULT_TASK_TIMEOUT,
                generate_report: bool = True, root: Path | None = None,
                progress=None, run_id: str | None = None, cancelled=None,
-               post: bool | None = None, confirm=None, preflight=None) -> dict:
+               post: bool | None = None, confirm=None, preflight=None,
+               rule_resolutions: dict[str, dict] | None = None) -> dict:
     """Two-stage per change (bounded concurrency): a Phase-1 gate task, then a
     Phase-2 deep-review task for every usable verdict (PASS / CONCERNS / BLOCK).
     Each task is dispatched to the reusable worker pool (``dispatch``) and the
@@ -1084,6 +1090,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
     dispatch = dispatch or _unconfigured_dispatch
     progress = progress or (lambda *a, **k: None)   # (change_id, phase, extra) sink
     is_cancelled = cancelled or (lambda: False)
+    frozen_resolutions = rule_resolutions or {}
 
     # Fail-fast runtime preflight. Runs BEFORE the clean-slate resets below, so a
     # host that cannot spawn a reviewer keeps its previous report and staged
@@ -1157,6 +1164,9 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
 
     def _one(link: str) -> dict:
         change_id = _cid(link)
+        rule_resolution = frozen_resolutions.get(link)
+        if rule_resolution is None:
+            rule_resolution = pipeline.resolve_rules_for_review_link(link, root=root)
 
         # Cooperative cancellation checkpoint. A change that has not started yet is
         # dropped here rather than paying for a full review the user already
@@ -1209,7 +1219,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         # would route the worker at public github.com — reviewing (and later
         # posting about) a same-slug public PR instead of the intended one.
         try:
-            review_prompt = build_review_task(link)
+            review_prompt = build_review_task(link, rule_resolution)
         except pipeline.adapters.AdapterError as exc:
             refused = f"refusing to review: {exc}"
             progress(change_id, "failed", {"error": refused})
@@ -1257,6 +1267,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
             "result_recorded": rev_rec is not None,
             "design_block": (verdict == "BLOCK"),
             "deep_rounds": 1,
+            "rule_resolution": rule_resolution,
         }
 
         # Fail only when the turn failed OR nothing usable was recorded — never
@@ -1298,7 +1309,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
             # Same fail-closed contract as the first pass: no confirmed host, no
             # follow-up turn. A failed follow-up keeps the first pass's record.
             try:
-                followup_prompt: str | None = build_review_followup_task(link)
+                followup_prompt: str | None = build_review_followup_task(link, rule_resolution)
             except pipeline.adapters.AdapterError:
                 followup_prompt = None
             second_pass = (dispatch(followup_prompt, timeout)

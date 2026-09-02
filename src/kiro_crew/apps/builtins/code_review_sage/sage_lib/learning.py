@@ -59,6 +59,9 @@ _UNKNOWN_PROVENANCE = "unknown"
 # dots and underscores in between, 2-64 chars. Deliberately excludes path
 # separators and ".." so a namespace name can NEVER escape the namespaces/ dir.
 _NS_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}[a-z0-9]$")
+_HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
+_REPOSITORY_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_BINDING_SCOPES = frozenset({"global", "repository"})
 
 
 def _is_valid_ns_name(name: str) -> bool:
@@ -432,6 +435,164 @@ def get_active_namespaces(root: Path | None = None) -> list[str]:
     return cfg.get("review", {}).get("active_namespaces", [DEFAULT_NAMESPACE])
 
 
+def canonical_repository_source(source: object) -> dict[str, str]:
+    """Validate and canonicalize the repository identity used by a binding."""
+    if not isinstance(source, dict):
+        raise ValueError("repository source must be an object")
+    expected = {"provider", "host", "owner", "repository"}
+    if set(source) != expected:
+        raise ValueError("repository source must contain provider, host, owner, and repository")
+    provider = str(source["provider"] or "").strip().lower()
+    host = str(source["host"] or "").strip().lower()
+    owner = str(source["owner"] or "").strip().lower()
+    repository = str(source["repository"] or "").strip().removesuffix(".git").lower()
+    if provider != "github":
+        raise ValueError(f"unsupported repository provider: {provider!r}")
+    if host == "www.github.com":
+        host = "github.com"
+    if not _HOST_RE.fullmatch(host) or not (
+        _REPOSITORY_SEGMENT_RE.fullmatch(owner) and _REPOSITORY_SEGMENT_RE.fullmatch(repository)
+    ):
+        raise ValueError("repository source has an invalid host, owner, or repository")
+    return {"provider": provider, "host": host, "owner": owner, "repository": repository}
+
+
+def validate_namespace_bindings(bindings: object) -> dict[str, dict]:
+    """Validate the persisted namespace-binding configuration without changing it."""
+    if bindings is None:
+        return {}
+    if not isinstance(bindings, dict):
+        raise ValueError("namespace_bindings must be an object")
+    normalized: dict[str, dict] = {}
+    for namespace, binding in bindings.items():
+        if not isinstance(namespace, str) or (
+            namespace != DEFAULT_NAMESPACE and not _is_valid_ns_name(namespace)
+        ):
+            raise ValueError(f"invalid namespace binding name: {namespace!r}")
+        if not isinstance(binding, dict) or not isinstance(binding.get("scope"), str):
+            raise ValueError(f"binding for {namespace!r} must name a scope")
+        scope = binding["scope"]
+        if scope not in _BINDING_SCOPES:
+            raise ValueError(f"binding for {namespace!r} has unsupported scope {scope!r}")
+        if scope == "global":
+            if set(binding) != {"scope"}:
+                raise ValueError(f"global binding for {namespace!r} cannot name a repository")
+            normalized[namespace] = {"scope": scope}
+            continue
+        if set(binding) != {"scope", "repository"}:
+            raise ValueError(f"repository binding for {namespace!r} must name one repository")
+        normalized[namespace] = {
+            "scope": scope,
+            "repository": canonical_repository_source(binding["repository"]),
+        }
+    return normalized
+
+
+def _sidecar_rule_ids(namespace: str, pattern: dict, root: Path | None) -> tuple[list[str], str | None]:
+    """Return optional SAGE-1 record ids without making sidecar export implicit."""
+    try:
+        records = load_learning_records(root, namespace)
+    except LearningRecordError as exc:
+        return [], str(exc)
+    rule = " ".join(str(pattern.get("guidance") or "").split())
+    ids = [
+        str(record["id"])
+        for record in records
+        if record.get("lifecycle") in {"active", "pinned"}
+        and " ".join(str(record.get("rule") or "").split()) == rule
+    ]
+    return sorted(ids), None
+
+
+def resolve_effective_rules(
+    source_identity: dict[str, str] | None,
+    *,
+    config: dict | None = None,
+    root: Path | None = None,
+) -> dict:
+    """Resolve eligible namespace rules and retain enough provenance for a later UI.
+
+    Legacy active namespaces have no binding and remain globally applicable for
+    compatibility. They are labelled separately from an explicit global binding
+    so callers can present a migration action without changing review behaviour.
+    """
+    cfg = config if config is not None else store.load_config(root)
+    review = cfg.get("review") if isinstance(cfg, dict) else {}
+    review = review if isinstance(review, dict) else {}
+    raw_active = review.get("active_namespaces", [DEFAULT_NAMESPACE])
+    active = raw_active if isinstance(raw_active, list) else [DEFAULT_NAMESPACE]
+    try:
+        bindings = validate_namespace_bindings(review.get("namespace_bindings"))
+        binding_error = None
+    except ValueError as exc:
+        bindings = {}
+        binding_error = str(exc)
+    try:
+        canonical_source = canonical_repository_source(source_identity) if source_identity else None
+    except ValueError:
+        canonical_source = None
+
+    available = set(list_namespaces(root))
+    namespaces: list[dict] = []
+    effective_namespaces: list[str] = []
+    warnings: list[str] = [binding_error] if binding_error else []
+    seen_namespaces: set[str] = set()
+    for value in active:
+        namespace = str(value)
+        if namespace in seen_namespaces:
+            continue
+        seen_namespaces.add(namespace)
+        binding = bindings.get(namespace)
+        entry: dict = {"namespace": namespace}
+        if namespace not in available:
+            entry.update({"included": False, "reason": "namespace_missing"})
+        elif binding is None:
+            entry.update({"included": True, "reason": "legacy_active_namespace"})
+            warnings.append(
+                f"namespace {namespace!r} is active without a binding and applies globally"
+            )
+        elif binding["scope"] == "global":
+            entry.update({"included": True, "reason": "explicit_global_binding", "binding": binding})
+        elif canonical_source is None:
+            entry.update({"included": False, "reason": "source_identity_unavailable", "binding": binding})
+        elif binding["repository"] == canonical_source:
+            entry.update({"included": True, "reason": "repository_binding_match", "binding": binding})
+        else:
+            entry.update({"included": False, "reason": "repository_binding_mismatch", "binding": binding})
+        namespaces.append(entry)
+        if entry["included"]:
+            effective_namespaces.append(namespace)
+
+    effective_rules: list[dict] = []
+    seen_rule_ids: set[str] = set()
+    for namespace_entry in namespaces:
+        if not namespace_entry["included"]:
+            continue
+        namespace = namespace_entry["namespace"]
+        for pattern in sorted(list_patterns(root=root, namespace=namespace), key=lambda item: item["id"]):
+            rule_id = str(pattern["id"])
+            if rule_id in seen_rule_ids:
+                continue
+            seen_rule_ids.add(rule_id)
+            sidecar_ids, sidecar_error = _sidecar_rule_ids(namespace, pattern, root)
+            if sidecar_error and sidecar_error not in warnings:
+                warnings.append(sidecar_error)
+            effective_rules.append({
+                "namespace": namespace,
+                "rule_id": rule_id,
+                "pattern": pattern,
+                "reason": namespace_entry["reason"],
+                "sidecar_record_ids": sidecar_ids,
+            })
+    return {
+        "source_identity": canonical_source,
+        "namespaces": namespaces,
+        "effective_namespaces": effective_namespaces,
+        "effective_rules": effective_rules,
+        "warnings": warnings,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pattern <-> markdown
 # ---------------------------------------------------------------------------
@@ -505,17 +666,13 @@ def list_patterns(scope: str = "common", repo_identity: str | None = None,
     return parse_patterns(path.read_text(encoding="utf-8"))
 
 
-def list_patterns_for_review(root: Path | None = None) -> list[dict]:
-    """Load patterns from ALL active namespaces (union). Used by review workers."""
-    active = get_active_namespaces(root)
-    all_patterns: list[dict] = []
-    seen_ids: set[str] = set()
-    for ns in active:
-        for p in list_patterns(root=root, namespace=ns):
-            if p["id"] not in seen_ids:
-                seen_ids.add(p["id"])
-                all_patterns.append(p)
-    return all_patterns
+def list_patterns_for_review(
+    root: Path | None = None, source_identity: dict[str, str] | None = None
+) -> list[dict]:
+    """Load rules eligible for a review source, preserving legacy behaviour."""
+    return [item["pattern"] for item in resolve_effective_rules(
+        source_identity, root=root
+    )["effective_rules"]]
 
 
 # ---------------------------------------------------------------------------

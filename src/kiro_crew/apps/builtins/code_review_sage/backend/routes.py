@@ -479,6 +479,7 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                     review_driver.run_review, changes,  # type: ignore[attr-defined]
                     dispatch=dispatch, progress=_make_progress(run),
                     run_id=run_id, cancelled=lambda: run_id in _CANCELLED,
+                    rule_resolutions=run.get("rule_resolutions"),
                     preflight=lambda: runtime_error,
                     # One reviewer at a time. Workers share the staging directory and
                     # each has shell and file tools, so two running at once means one
@@ -650,6 +651,10 @@ async def _handle_review(request: web.Request) -> web.Response:
             status=400,
         )
 
+    rule_resolutions = await asyncio.to_thread(
+        lambda: {change: pipeline.resolve_rules_for_review_link(change) for change in changes}
+    )
+
     run: dict[str, Any] = {
         "run_id": uuid.uuid4().hex[:12],
         "changes": changes,
@@ -660,6 +665,7 @@ async def _handle_review(request: web.Request) -> web.Response:
         "status": "running",
         "started_at": _now(),
         "progress": {},
+        "rule_resolutions": rule_resolutions,
     }
     await _record(run)
 
@@ -1552,7 +1558,7 @@ def _valid_model(m: str) -> bool:
 
 
 def _load_review_section() -> dict:
-    """Read the persisted review settings (model/effort/active_namespaces)."""
+    """Read persisted model, effort, and namespace-resolution settings."""
     try:
         cfg = store.load_config()
     except Exception:
@@ -1564,13 +1570,14 @@ def _load_review_section() -> dict:
         "model": review.get("model") or None,
         "effort": review.get("effort", ""),
         "active_namespaces": review.get("active_namespaces") or ["default"],
+        "namespace_bindings": review.get("namespace_bindings") or {},
         "max_concurrent": review_pool.effective_max_concurrent(),
     }
 
 
 def _write_review_section(patch: dict) -> dict:
     """Merge a partial review-settings patch into config.json atomically. Only
-    the model/effort/active_namespaces keys are writable; everything else in the
+    the model/effort/active_namespaces/namespace_bindings keys are writable; everything else in the
     config is preserved. Returns the resulting review section."""
     cfg_path = store.data_dir() / "config.json"
     try:
@@ -1606,6 +1613,12 @@ def _write_review_section(patch: dict) -> dict:
             avail = set(learning.list_namespaces())
             cleaned = [str(n) for n in ns if str(n) in avail]
             review["active_namespaces"] = cleaned or ["default"]
+    if "namespace_bindings" in patch:
+        bindings = learning.validate_namespace_bindings(patch["namespace_bindings"])
+        unknown = sorted(set(bindings) - set(learning.list_namespaces()))
+        if unknown:
+            raise ValueError("namespace bindings reference unknown namespaces: " + ", ".join(unknown))
+        review["namespace_bindings"] = bindings
     if "max_concurrent" in patch:
         # How many reviews run at once on the shared runtime. Clamped to
         # [1, MAX_CONCURRENT_CEIL] so "review all" can fan out without letting a
@@ -1625,7 +1638,7 @@ def _write_review_section(patch: dict) -> dict:
 
 async def _handle_settings(request: web.Request) -> web.Response:
     """GET  -> {settings, models, efforts, namespaces}
-       PUT  body {model?, effort?, active_namespaces?} -> {ok, settings}."""
+       PUT  body {model?, effort?, active_namespaces?, namespace_bindings?} -> {ok, settings}."""
     if request.method == "GET":
         # All of this is synchronous file IO (config read + namespaces dir walk +
         # reviewer_info file read) — offload to a thread so it never blocks the
@@ -1685,6 +1698,7 @@ async def _handle_settings(request: web.Request) -> web.Response:
             "model": review.get("model") or None,
             "effort": review.get("effort", ""),
             "active_namespaces": review.get("active_namespaces") or ["default"],
+            "namespace_bindings": review.get("namespace_bindings") or {},
             "max_concurrent": review.get("max_concurrent") or review_pool.effective_max_concurrent(),
         }})
     except ValueError as exc:
@@ -1785,12 +1799,18 @@ async def _handle_namespaces(request: web.Request) -> web.Response:
                     return res
                 try:
                     sec = _load_review_section()
+                    patch: dict[str, Any] = {}
                     if name in (sec.get("active_namespaces") or []):
                         remaining = [n for n in sec["active_namespaces"] if n != name]
-                        _write_review_section(
-                            {"active_namespaces": remaining or ["default"]})
+                        patch["active_namespaces"] = remaining or ["default"]
+                    bindings = dict(sec.get("namespace_bindings") or {})
+                    if name in bindings:
+                        bindings.pop(name)
+                        patch["namespace_bindings"] = bindings
+                    if patch:
+                        _write_review_section(patch)
                 except Exception:
-                    logger.debug("could not prune deleted ns from active list",
+                    logger.debug("could not prune deleted namespace from review settings",
                                  exc_info=True)
                 return res
 
