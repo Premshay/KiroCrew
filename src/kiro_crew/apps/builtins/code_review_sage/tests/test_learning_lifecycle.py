@@ -191,6 +191,35 @@ class TestLearningLifecycle(unittest.TestCase):
         )
         self.assertEqual(resolved["namespaces"][0]["sidecar"], "legacy_markdown")
 
+    def test_governed_staging_persists_one_lifecycle_record_per_occurrence(self) -> None:
+        self._write_records(_record("existing", "active"))
+        pattern = {
+            "title": "Same discovery",
+            "scope": "common",
+            "guidance": "Inspect the same edge case.",
+        }
+
+        learning.stage_learning(pattern, "human_comment", self.root)
+        learning.stage_learning(pattern, "human_comment", self.root)
+
+        candidates = learning.list_candidate(self.root)
+        records = {record["id"]: record for record in learning.load_learning_records(self.root)}
+        candidate_ids = [candidate["id"] for candidate in candidates]
+        self.assertEqual(len(candidate_ids), 2)
+        self.assertEqual(len(set(candidate_ids)), 2)
+        self.assertTrue(all(candidate_id in records for candidate_id in candidate_ids))
+        for candidate_id in candidate_ids:
+            self.assertEqual(records[candidate_id]["lifecycle"], "candidate")
+            self.assertEqual(
+                records[candidate_id]["origin"], {"source": "human_comment", "reference": None}
+            )
+
+    def test_default_context_budgets_are_bounded_for_active_review_prompts(self) -> None:
+        budgets = learning.validate_active_context_budgets({})
+
+        self.assertEqual(budgets["global"], {"max_rules": 20, "max_tokens": 4000})
+        self.assertEqual(budgets["repository"], {"max_rules": 12, "max_tokens": 2400})
+
     def test_prompt_freezes_bounded_governed_records(self) -> None:
         self._write_records(
             _record("candidate"),

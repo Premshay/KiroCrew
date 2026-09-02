@@ -28,8 +28,10 @@ detail still comes from the on-disk result records the driver writes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -116,6 +118,23 @@ _TASKS: set[asyncio.Task] = set()  # type: ignore[type-arg]
 # so the state has to be reachable without one. Populated lazily and treated as
 # optional everywhere (tests register routes on a bare aiohttp app).
 _APP_STATE: dict[str, Any] = {}
+_SETTINGS_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _review_settings_lock():
+    """Serialize config read-modify-write across gateway workers and processes."""
+    lock_path = store.data_dir() / "review-settings.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _SETTINGS_LOCK:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            from kiro_crew import platform_compat
+
+            with platform_compat.file_lock(fd, exclusive=True):
+                yield
+        finally:
+            os.close(fd)
 
 
 def _make_progress(run: dict):
@@ -1697,63 +1716,64 @@ def _write_review_section(patch: dict) -> dict:
     """Merge a partial review-settings patch into config.json atomically. Only
     the model/effort/active_namespaces/namespace_bindings keys are writable; everything else in the
     config is preserved. Returns the resulting review section."""
-    cfg_path = store.data_dir() / "config.json"
-    try:
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        if not isinstance(cfg, dict):
-            cfg = {}
-    except (json.JSONDecodeError, OSError, FileNotFoundError):
-        store.ensure_layout()
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    review = cfg.get("review")
-    if not isinstance(review, dict):
-        review = {}
-
-    if "model" in patch:
-        m = patch["model"]
-        # Empty/None clears the override (inherits the system/agent default model).
-        # A non-empty value is validated (safe token + known to the registry when
-        # available) before persisting, since it later becomes a cli.json overlay
-        # key for the review worker subprocess — raw request input must not reach it.
-        if not m:
-            review["model"] = None
-        elif _valid_model(str(m)):
-            review["model"] = str(m)
-        else:
-            raise ValueError(f"unknown or invalid model {str(m)!r}")
-    if "effort" in patch:
-        eff = str(patch["effort"]).lower()
-        # "" = inherit the model/provider default; otherwise a concrete level.
-        review["effort"] = eff if (eff == "" or eff in review_pool.VALID_EFFORTS) else ""
-    if "active_namespaces" in patch:
-        ns = patch["active_namespaces"]
-        if isinstance(ns, list) and ns:
-            avail = set(learning.list_namespaces())
-            cleaned = [str(n) for n in ns if str(n) in avail]
-            review["active_namespaces"] = cleaned or ["default"]
-    if "namespace_bindings" in patch:
-        bindings = learning.validate_namespace_bindings(patch["namespace_bindings"])
-        unknown = sorted(set(bindings) - set(learning.list_namespaces()))
-        if unknown:
-            raise ValueError(
-                "namespace bindings reference unknown namespaces: " + ", ".join(unknown)
-            )
-        review["namespace_bindings"] = bindings
-    if "max_concurrent" in patch:
-        # How many reviews run at once on the shared runtime. Clamped to
-        # [1, MAX_CONCURRENT_CEIL] so "review all" can fan out without letting a
-        # user set an unbounded value that would saturate the host.
+    with _review_settings_lock():
+        cfg_path = store.data_dir() / "config.json"
         try:
-            mc = int(patch["max_concurrent"])
-        except (TypeError, ValueError):
-            raise ValueError("max_concurrent must be an integer")
-        review["max_concurrent"] = max(1, min(mc, review_pool.MAX_CONCURRENT_CEIL))
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if not isinstance(cfg, dict):
+                cfg = {}
+        except (json.JSONDecodeError, OSError, FileNotFoundError):
+            store.ensure_layout()
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        review = cfg.get("review")
+        if not isinstance(review, dict):
+            review = {}
 
-    cfg["review"] = review
-    # Same helper, same reasons as ``_write_runs`` -- including the retrying
-    # replace this write also lacked.
-    atomic_write(cfg_path, json.dumps(cfg, indent=2), restrict_to_owner=True)
-    return review
+        if "model" in patch:
+            m = patch["model"]
+            # Empty/None clears the override (inherits the system/agent default model).
+            # A non-empty value is validated (safe token + known to the registry when
+            # available) before persisting, since it later becomes a cli.json overlay
+            # key for the review worker subprocess — raw request input must not reach it.
+            if not m:
+                review["model"] = None
+            elif _valid_model(str(m)):
+                review["model"] = str(m)
+            else:
+                raise ValueError(f"unknown or invalid model {str(m)!r}")
+        if "effort" in patch:
+            eff = str(patch["effort"]).lower()
+            # "" = inherit the model/provider default; otherwise a concrete level.
+            review["effort"] = eff if (eff == "" or eff in review_pool.VALID_EFFORTS) else ""
+        if "active_namespaces" in patch:
+            ns = patch["active_namespaces"]
+            if isinstance(ns, list) and ns:
+                avail = set(learning.list_namespaces())
+                cleaned = [str(n) for n in ns if str(n) in avail]
+                review["active_namespaces"] = cleaned or ["default"]
+        if "namespace_bindings" in patch:
+            bindings = learning.validate_namespace_bindings(patch["namespace_bindings"])
+            unknown = sorted(set(bindings) - set(learning.list_namespaces()))
+            if unknown:
+                raise ValueError(
+                    "namespace bindings reference unknown namespaces: " + ", ".join(unknown)
+                )
+            review["namespace_bindings"] = bindings
+        if "max_concurrent" in patch:
+            # How many reviews run at once on the shared runtime. Clamped to
+            # [1, MAX_CONCURRENT_CEIL] so "review all" can fan out without letting a
+            # user set an unbounded value that would saturate the host.
+            try:
+                mc = int(patch["max_concurrent"])
+            except (TypeError, ValueError):
+                raise ValueError("max_concurrent must be an integer")
+            review["max_concurrent"] = max(1, min(mc, review_pool.MAX_CONCURRENT_CEIL))
+
+        cfg["review"] = review
+        # Same helper, same reasons as ``_write_runs`` -- including the retrying
+        # replace this write also lacked.
+        atomic_write(cfg_path, json.dumps(cfg, indent=2), restrict_to_owner=True)
+        return review
 
 
 async def _handle_settings(request: web.Request) -> web.Response:
@@ -2080,11 +2100,12 @@ async def _consolidate_bg(
             logger.debug("consolidation proposal read rejected", exc_info=True)
         if not spawn.get("ok") or raw is None:
             worker_error = str(spawn.get("error") or "worker_failed")
+            logger.warning("consolidation worker failed for ns=%s: %s", ns, worker_error)
             _CONSOLIDATE_STATE[ns] = {
                 "running": False,
                 "code": "worker_failed",
                 "error_code": "worker_failed",
-                "error": worker_error,
+                "error": "the consolidation worker could not complete; try again",
             }
             return
         try:

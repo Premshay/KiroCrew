@@ -63,8 +63,8 @@ _LEARNING_LIFECYCLES = frozenset({"candidate", "active", "archived", "pinned"})
 _UNKNOWN_PROVENANCE = "unknown"
 _PROMOTION_RECURRENCE_COUNT = 2
 _ACTIVE_CONTEXT_BUDGETS = {
-    "global": {"max_rules": 60, "max_tokens": 12000},
-    "repository": {"max_rules": 40, "max_tokens": 8000},
+    "global": {"max_rules": 20, "max_tokens": 4000},
+    "repository": {"max_rules": 12, "max_tokens": 2400},
 }
 _LIFECYCLE_TRANSITIONS = {
     "candidate": frozenset({"active", "archived", "pinned"}),
@@ -521,48 +521,49 @@ def export_learning_records(root: Path | None = None, namespace: str | None = No
     before publishing a merged replacement.
     """
     ns = namespace or DEFAULT_NAMESPACE
-    ns_dir = _namespace_dir(namespace, root)
-    records_path = learning_records_file(root, namespace)
-    document, raw = _read_learning_records_document(records_path, ns_dir)
-    exported: list[dict] = []
-    for lifecycle, path in (
-        ("active", common_file(root, namespace)),
-        ("candidate", candidate_file(root, namespace)),
-    ):
-        occurrences: collections.Counter[str] = collections.Counter()
-        for pattern in _read_markdown_patterns(path, ns_dir):
-            identity = _legacy_record_id(ns, lifecycle, 0, pattern)
-            occurrences[identity] += 1
-            exported.append(_legacy_record(pattern, ns, lifecycle, occurrences[identity]))
-    existing_ids = {record["id"] for record in document["records"]}
-    additions = [record for record in exported if record["id"] not in existing_ids]
-    if not additions:
-        return {
+    with _candidate_lock(root, namespace):
+        ns_dir = _namespace_dir(namespace, root)
+        records_path = learning_records_file(root, namespace)
+        document, raw = _read_learning_records_document(records_path, ns_dir)
+        exported: list[dict] = []
+        for lifecycle, path in (
+            ("active", common_file(root, namespace)),
+            ("candidate", candidate_file(root, namespace)),
+        ):
+            occurrences: collections.Counter[str] = collections.Counter()
+            for pattern in _read_markdown_patterns(path, ns_dir):
+                identity = _legacy_record_id(ns, lifecycle, 0, pattern)
+                occurrences[identity] += 1
+                exported.append(_legacy_record(pattern, ns, lifecycle, occurrences[identity]))
+        existing_ids = {record["id"] for record in document["records"]}
+        additions = [record for record in exported if record["id"] not in existing_ids]
+        if not additions:
+            return {
+                "ok": True,
+                "path": str(records_path),
+                "added": 0,
+                "records": len(document["records"]),
+                "changed": False,
+            }
+        updated = dict(document)
+        updated["records"] = [*document["records"], *additions]
+        validate_learning_records_document(updated)
+        ns_dir.mkdir(parents=True, exist_ok=True)
+        backup: Path | None = None
+        if raw is not None:
+            backup = learning_records_backup_file(root, namespace)
+            _atomic_write(backup, raw)
+        _atomic_write(records_path, json.dumps(updated, indent=2, sort_keys=True) + "\n")
+        result = {
             "ok": True,
             "path": str(records_path),
-            "added": 0,
-            "records": len(document["records"]),
-            "changed": False,
+            "added": len(additions),
+            "records": len(updated["records"]),
+            "changed": True,
         }
-    updated = dict(document)
-    updated["records"] = [*document["records"], *additions]
-    validate_learning_records_document(updated)
-    ns_dir.mkdir(parents=True, exist_ok=True)
-    backup: Path | None = None
-    if raw is not None:
-        backup = learning_records_backup_file(root, namespace)
-        _atomic_write(backup, raw)
-    _atomic_write(records_path, json.dumps(updated, indent=2, sort_keys=True) + "\n")
-    result = {
-        "ok": True,
-        "path": str(records_path),
-        "added": len(additions),
-        "records": len(updated["records"]),
-        "changed": True,
-    }
-    if backup is not None:
-        result["backup"] = str(backup)
-    return result
+        if backup is not None:
+            result["backup"] = str(backup)
+        return result
 
 
 def migrate_legacy_learning_records(root: Path | None = None, namespace: str | None = None) -> dict:
@@ -574,18 +575,19 @@ def rollback_learning_records_export(
     root: Path | None = None, namespace: str | None = None
 ) -> dict:
     """Restore the validated pre-export sidecar without changing markdown files."""
-    ns_dir = _namespace_dir(namespace, root)
-    records_path = learning_records_file(root, namespace)
-    backup_path = learning_records_backup_file(root, namespace)
-    if not backup_path.exists():
-        return {"ok": False, "error": "no pre-export sidecar snapshot exists"}
-    _current, _current_raw = _read_learning_records_document(records_path, ns_dir)
-    backup, backup_raw = _read_learning_records_document(backup_path, ns_dir)
-    if backup_raw is None:
-        raise _record_error("pre-export snapshot is empty")
-    validate_learning_records_document(backup)
-    _atomic_write(records_path, backup_raw)
-    return {"ok": True, "path": str(records_path), "records": len(backup["records"])}
+    with _candidate_lock(root, namespace):
+        ns_dir = _namespace_dir(namespace, root)
+        records_path = learning_records_file(root, namespace)
+        backup_path = learning_records_backup_file(root, namespace)
+        if not backup_path.exists():
+            return {"ok": False, "error": "no pre-export sidecar snapshot exists"}
+        _current, _current_raw = _read_learning_records_document(records_path, ns_dir)
+        backup, backup_raw = _read_learning_records_document(backup_path, ns_dir)
+        if backup_raw is None:
+            raise _record_error("pre-export snapshot is empty")
+        validate_learning_records_document(backup)
+        _atomic_write(records_path, backup_raw)
+        return {"ok": True, "path": str(records_path), "records": len(backup["records"])}
 
 
 # One lock per (root, namespace) candidate file. `stage_learning` and the selective
@@ -642,9 +644,88 @@ def _candidate_lock(root: Path | None, namespace: str | None):
             if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
                 raise OSError(f"refusing to lock {lock_path}: not a lone regular file")
             with platform_compat.file_lock(fd, exclusive=True):
+                _recover_consolidation_preview_transaction(root, namespace)
                 yield
         finally:
             os.close(fd)
+
+
+_PREVIEW_TRANSACTION_SCHEMA = "code-review-sage-consolidation-apply"
+_PREVIEW_TRANSACTION_VERSION = 1
+_PREVIEW_TRANSACTION_FILES = ("live", "sidecar", "candidate", "preview")
+
+
+def _preview_transaction_path(root: Path | None, namespace: str | None) -> Path:
+    return _namespace_dir(namespace, root) / "consolidation-apply.v1.json"
+
+
+def _preview_transaction_paths(
+    preview_id: str, root: Path | None, namespace: str | None
+) -> dict[str, Path]:
+    ns = namespace or DEFAULT_NAMESPACE
+    return {
+        "live": common_file(root, ns),
+        "sidecar": learning_records_file(root, ns),
+        "candidate": candidate_file(root, ns),
+        "preview": _preview_path(preview_id, root, ns),
+    }
+
+
+def _read_preview_transaction(root: Path | None, namespace: str | None) -> dict | None:
+    path = _preview_transaction_path(root, namespace)
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(store.read_text_nolink(path, _namespace_dir(namespace, root)) or "")
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        raise LearningRecordError("invalid consolidation apply journal") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != _PREVIEW_TRANSACTION_SCHEMA
+        or value.get("version") != _PREVIEW_TRANSACTION_VERSION
+        or value.get("status") not in {"prepared", "committed"}
+        or not isinstance(value.get("preview_id"), str)
+        or set(value.get("before") or {}) != set(_PREVIEW_TRANSACTION_FILES)
+        or set(value.get("after") or {}) != set(_PREVIEW_TRANSACTION_FILES)
+        or any(
+            raw is not None and not isinstance(raw, str)
+            for snapshot in (value["before"], value["after"])
+            for raw in snapshot.values()
+        )
+    ):
+        raise LearningRecordError("invalid consolidation apply journal")
+    return value
+
+
+def _write_preview_transaction(root: Path | None, namespace: str | None, transaction: dict) -> None:
+    _atomic_write(
+        _preview_transaction_path(root, namespace),
+        json.dumps(transaction, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def _write_preview_snapshot(paths: dict[str, Path], snapshot: dict[str, str | None]) -> None:
+    for name in _PREVIEW_TRANSACTION_FILES:
+        path = paths[name]
+        raw = snapshot[name]
+        if raw is None:
+            if path.exists():
+                path.unlink()
+        elif _read_current_text(path, path.parent) != raw:
+            _atomic_write(path, raw)
+
+
+def _recover_consolidation_preview_transaction(root: Path | None, namespace: str | None) -> None:
+    """Finish or undo an interrupted preview apply before exposing namespace state."""
+    transaction = _read_preview_transaction(root, namespace)
+    if transaction is None:
+        return
+    paths = _preview_transaction_paths(transaction["preview_id"], root, namespace)
+    snapshot = (
+        transaction["after"] if transaction["status"] == "committed" else transaction["before"]
+    )
+    _write_preview_snapshot(paths, snapshot)
+    _preview_transaction_path(root, namespace).unlink(missing_ok=True)
 
 
 def _consolidations_log(root: Path | None = None) -> Path:
@@ -984,10 +1065,12 @@ def render_pattern(p: dict) -> str:
     high-level, code-agnostic review heuristic: the title + guidance are the
     whole rule. If a rule needs a symptom anecdote or a concrete example to be
     understood, the guidance is underspecified — sharpen it instead."""
+    occurrence = str(p.get("occurrence_id") or "").strip()
+    occurrence_comment = f" <!-- sage-id:{occurrence} -->" if occurrence else ""
     return (
         f"### {p['title']} <!-- scope:{p.get('scope', 'common')} -->"
         f" <!-- impact:{p.get('impact', 'medium')} -->"
-        f" <!-- added:{p.get('added_at', '')} -->\n"
+        f" <!-- added:{p.get('added_at', '')} -->{occurrence_comment}\n"
         f"{' '.join(p.get('guidance', '').split())}\n"
     )
 
@@ -995,7 +1078,8 @@ def render_pattern(p: dict) -> str:
 _HDR = re.compile(
     r"###\s+(?P<title>.*?)\s*(?:<!--\s*scope:(?P<scope>\w+)\s*-->)?"
     r"\s*(?:<!--\s*impact:(?P<impact>\w+)\s*-->)?"
-    r"\s*(?:<!--\s*added:(?P<added>[^>]*?)\s*-->)?\s*$"
+    r"\s*(?:<!--\s*added:(?P<added>[^>]*?)\s*-->)?"
+    r"\s*(?:<!--\s*sage-id:(?P<occurrence>(?:[0-9a-f-]{36}|legacy-[0-9a-f]{24}))\s*-->)?\s*$"
 )
 
 
@@ -1023,16 +1107,18 @@ def parse_patterns(md: str) -> list[dict]:
             # skipped, so the round-trip stays lossless for multi-line guidance.
             if s and not s.startswith("**"):
                 guidance_lines.append(s)
-        out.append(
-            {
-                "id": pattern_id(title, scope),
-                "title": title,
-                "scope": scope,
-                "impact": m.group("impact") or "medium",
-                "added_at": (m.group("added") or "").strip(),
-                "guidance": " ".join(guidance_lines),
-            }
-        )
+        pattern = {
+            "id": pattern_id(title, scope),
+            "title": title,
+            "scope": scope,
+            "impact": m.group("impact") or "medium",
+            "added_at": (m.group("added") or "").strip(),
+            "guidance": " ".join(guidance_lines),
+        }
+        occurrence = m.group("occurrence")
+        if occurrence:
+            pattern["occurrence_id"] = occurrence
+        out.append(pattern)
     return out
 
 
@@ -1047,6 +1133,38 @@ def list_patterns(
     if not path.exists():
         return []
     return parse_patterns(path.read_text(encoding="utf-8"))
+
+
+def _legacy_candidate_occurrence_id(namespace: str, occurrence: int, pattern: dict) -> str:
+    """Derive a stable selector for duplicated pre-governance markdown entries."""
+    return _legacy_record_id(namespace, "candidate", occurrence, pattern)
+
+
+def _candidate_patterns_with_occurrence_ids(patterns: Sequence[dict], namespace: str) -> list[dict]:
+    """Expose one selector per candidate without rewriting legacy markdown.
+
+    Legacy candidate files identify rules by title and scope, so identical entries
+    share their historical id. Only collisions receive a deterministic ordinal
+    selector; unique legacy entries retain their public id while governed entries
+    carry the durable UUID written at staging time.
+    """
+    counts = collections.Counter(str(item.get("id") or "") for item in patterns)
+    occurrences: collections.Counter[str] = collections.Counter()
+    resolved: list[dict] = []
+    for pattern in patterns:
+        item = dict(pattern)
+        logical_id = str(item.get("id") or "")
+        occurrences[logical_id] += 1
+        if item.get("occurrence_id"):
+            item["id"] = str(item["occurrence_id"])
+        elif counts[logical_id] > 1:
+            occurrence_id = _legacy_candidate_occurrence_id(
+                namespace, occurrences[logical_id], item
+            )
+            item["id"] = occurrence_id
+            item["occurrence_id"] = occurrence_id
+        resolved.append(item)
+    return resolved
 
 
 def list_patterns_for_review(
@@ -1075,7 +1193,7 @@ def _normalize_pattern(pattern: dict) -> dict:
     p.setdefault("impact", "medium")
     p.setdefault("added_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     p.setdefault("seed", False)
-    p["id"] = pattern_id(p.get("title", ""), p["scope"])
+    p["id"] = str(p.get("id") or pattern_id(p.get("title", ""), p["scope"]))
     return p
 
 
@@ -1120,6 +1238,41 @@ def stage_learning(
             body = existing.rstrip() + "\n\n" + render_pattern(p) + "\n"
         else:
             body = _CANDIDATE_HEADER + render_pattern(p) + "\n"
+        records_path = learning_records_file(root, namespace)
+        records, _raw = _read_learning_records_document(records_path, ns_dir)
+        if records["records"]:
+            # A governed namespace must never fall back to content-derived
+            # candidate identity: identical discoveries are separate lifecycle
+            # occurrences with distinct provenance and operator actions.
+            occurrence_id = str(uuid.uuid4())
+            p["occurrence_id"] = occurrence_id
+            rendered = render_pattern(p)
+            body = (
+                existing.rstrip() + "\n\n" + rendered + "\n"
+                if existing.strip()
+                else _CANDIDATE_HEADER + rendered + "\n"
+            )
+            now = _utc_now()
+            record = {
+                "id": occurrence_id,
+                "text": "\n".join(
+                    part
+                    for part in (str(p.get("title") or ""), str(p.get("guidance") or ""))
+                    if part
+                ),
+                "rule": str(p.get("guidance") or "") or str(p.get("title") or ""),
+                "namespace": namespace or DEFAULT_NAMESPACE,
+                "scope": str(p.get("scope") or "common"),
+                "lifecycle": "candidate",
+                "origin": {"source": source, "reference": None},
+                "repository_identity": None,
+                "timestamps": {"created_at": now, "updated_at": now, "archived_at": None},
+                "recurrence": {"count": 1, "evidence": []},
+                "legacy": False,
+            }
+            _write_learning_records(
+                {**records, "records": [*records["records"], record]}, root, namespace
+            )
         _atomic_write(cf, body)
     return {
         "ok": True,
@@ -1130,13 +1283,21 @@ def stage_learning(
     }
 
 
-def list_candidate(root: Path | None = None, namespace: str | None = None) -> list[dict]:
+def _list_candidate_unlocked(root: Path | None = None, namespace: str | None = None) -> list[dict]:
     cf = candidate_file(root, namespace)
     if not cf.exists():
         return []
     # The dashboard renders what this returns, so an unguarded read would make a
     # planted symlink an egress path, not just a corrupted catalog.
-    return parse_patterns(store.read_text_nolink(cf, _namespace_dir(namespace, root)) or "")
+    return _candidate_patterns_with_occurrence_ids(
+        parse_patterns(store.read_text_nolink(cf, _namespace_dir(namespace, root)) or ""),
+        namespace or DEFAULT_NAMESPACE,
+    )
+
+
+def list_candidate(root: Path | None = None, namespace: str | None = None) -> list[dict]:
+    with _candidate_lock(root, namespace):
+        return _list_candidate_unlocked(root, namespace)
 
 
 def candidate_count(root: Path | None = None, namespace: str | None = None) -> int:
@@ -1191,7 +1352,7 @@ def clear_candidate(
         # Same guard as the staging read: a worker can swap this catalog for a
         # symlink, and re-serializing the target would publish it to the
         # dashboard-readable candidate file.
-        for p in parse_patterns(store.read_text_nolink(cf, _namespace_dir(namespace, root)) or ""):
+        for p in _list_candidate_unlocked(root, namespace):
             # An entry with no id has no budget entry, so it is kept — the safe
             # direction when the snapshot cannot account for it.
             pid = str(p.get("id") or "")
@@ -1368,7 +1529,10 @@ def _read_current_text(path: Path, namespace_dir: Path) -> str | None:
 def _candidate_snapshot_entry(pattern: dict) -> dict:
     normalized = _normalize_pattern(pattern)
     return {
-        "id": normalized["id"],
+        # ``list_candidate`` may replace a legacy duplicate's historical
+        # content id with an ordinal selector. Keep that selector in snapshots;
+        # otherwise one preview decision would target every identical entry.
+        "id": str(pattern.get("id") or normalized["id"]),
         "digest": _sha256_json(normalized),
         "pattern": normalized,
     }
@@ -1567,7 +1731,7 @@ def create_consolidation_preview(
         raise ValueError("invalid_namespace")
     with _candidate_lock(root, ns):
         ns_dir = _namespace_dir(ns, root)
-        current_candidates = list_candidate(root, ns)
+        current_candidates = _list_candidate_unlocked(root, ns)
         if not current_candidates:
             raise ValueError("nothing_to_consolidate")
         available_ids = {str(item["id"]) for item in current_candidates}
@@ -1675,7 +1839,7 @@ def _read_consolidation_preview(preview_id: str, root: Path | None, namespace: s
     return preview
 
 
-def consolidation_preview_state(
+def _consolidation_preview_state_unlocked(
     preview: dict,
     *,
     root: Path | None = None,
@@ -1688,7 +1852,7 @@ def consolidation_preview_state(
     ns_dir = _namespace_dir(ns, root)
     active_raw = _read_current_text(common_file(root, ns), ns_dir)
     sidecar_raw = _read_current_text(learning_records_file(root, ns), ns_dir)
-    candidates = list_candidate(root, ns)
+    candidates = _list_candidate_unlocked(root, ns)
     stale_reasons: list[str] = []
     if _content_generation(active_raw) != preview["active_ruleset_generation"]:
         stale_reasons.append("active_ruleset_changed")
@@ -1705,6 +1869,19 @@ def consolidation_preview_state(
         "stale_reasons": stale_reasons,
         "expires_at_epoch": preview["expires_at_epoch"],
     }
+
+
+def consolidation_preview_state(
+    preview: dict,
+    *,
+    root: Path | None = None,
+    namespace: str | None = None,
+    now: float | None = None,
+) -> dict:
+    with _candidate_lock(root, namespace):
+        return _consolidation_preview_state_unlocked(
+            preview, root=root, namespace=namespace, now=now
+        )
 
 
 def get_consolidation_preview(
@@ -1749,16 +1926,6 @@ def list_consolidation_previews(
     return sorted(previews, key=lambda item: str(item["created_at"]), reverse=True)
 
 
-def _restore_preview_transaction(before: dict[Path, str | None]) -> None:
-    for path, raw in before.items():
-        if raw is None:
-            if path.exists():
-                path.unlink()
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            store.atomic_write_text(path, raw)
-
-
 def apply_consolidation_preview(
     preview_id: str,
     *,
@@ -1767,7 +1934,7 @@ def apply_consolidation_preview(
     namespace: str | None = None,
     now: float | None = None,
 ) -> dict:
-    """Confirm one fresh preview, with rollback before any staged candidate is consumed."""
+    """Confirm one fresh preview through a recoverable durable transaction."""
     if not confirmed:
         return {"ok": False, "code": "confirmation_required"}
     ns = namespace or DEFAULT_NAMESPACE
@@ -1775,13 +1942,13 @@ def apply_consolidation_preview(
         preview = _read_consolidation_preview(preview_id, root, ns)
         if preview["status"] == "applied":
             return {"ok": False, "code": "preview_already_applied"}
-        state = consolidation_preview_state(preview, root=root, namespace=ns, now=now)
+        state = _consolidation_preview_state_unlocked(preview, root=root, namespace=ns, now=now)
         if state["expired"]:
             return {"ok": False, "code": "preview_expired", "state": state}
         if state["stale"]:
             return {"ok": False, "code": "preview_stale", "state": state}
         ns_dir = _namespace_dir(ns, root)
-        current_candidates = list_candidate(root, ns)
+        current_candidates = _list_candidate_unlocked(root, ns)
         consumed_ids = {
             item["candidate_id"]
             for item in preview["per_candidate_decisions"]
@@ -1792,28 +1959,48 @@ def apply_consolidation_preview(
         live_path = common_file(root, ns)
         sidecar_path = learning_records_file(root, ns)
         candidate_path = candidate_file(root, ns)
+        paths = _preview_transaction_paths(preview_id, root, ns)
         before = {
-            live_path: _read_current_text(live_path, ns_dir),
-            sidecar_path: _read_current_text(sidecar_path, ns_dir),
-            candidate_path: _read_current_text(candidate_path, ns_dir),
+            "live": _read_current_text(live_path, ns_dir),
+            "sidecar": _read_current_text(sidecar_path, ns_dir),
+            "candidate": _read_current_text(candidate_path, ns_dir),
+            "preview": _read_current_text(_preview_path(preview_id, root, ns), ns_dir),
         }
-        writes: list[tuple[Path, str]] = [(live_path, preview["proposed_ruleset_markdown"])]
-        if preview["proposed_sidecar_document"] is not None:
-            writes.append(
-                (
-                    sidecar_path,
-                    json.dumps(preview["proposed_sidecar_document"], indent=2, sort_keys=True)
-                    + "\n",
-                )
-            )
-        writes.append((candidate_path, candidate_body))
         try:
-            for path, body in writes:
-                if before[path] != body:
-                    _atomic_write(path, body)
+            applied_preview = {
+                **preview,
+                "status": "applied",
+                "artifact_generation": preview["artifact_generation"] + 1,
+                "applied_at": _utc_now(),
+                "applied_at_epoch": time.time() if now is None else now,
+            }
+            after = {
+                "live": preview["proposed_ruleset_markdown"],
+                "sidecar": (
+                    json.dumps(preview["proposed_sidecar_document"], indent=2, sort_keys=True)
+                    + "\n"
+                    if preview["proposed_sidecar_document"] is not None
+                    else before["sidecar"]
+                ),
+                "candidate": candidate_body,
+                "preview": json.dumps(applied_preview, indent=2, sort_keys=True) + "\n",
+            }
+            transaction = {
+                "schema": _PREVIEW_TRANSACTION_SCHEMA,
+                "version": _PREVIEW_TRANSACTION_VERSION,
+                "status": "prepared",
+                "preview_id": preview_id,
+                "before": before,
+                "after": after,
+            }
+            _write_preview_transaction(root, ns, transaction)
+            _write_preview_snapshot(paths, after)
+            transaction["status"] = "committed"
+            _write_preview_transaction(root, ns, transaction)
+            _preview_transaction_path(root, ns).unlink(missing_ok=True)
         except Exception as exc:
             try:
-                _restore_preview_transaction(before)
+                _recover_consolidation_preview_transaction(root, ns)
             except Exception as rollback_exc:
                 return {
                     "ok": False,
@@ -1821,17 +2008,6 @@ def apply_consolidation_preview(
                     "error_code": type(rollback_exc).__name__,
                 }
             return {"ok": False, "code": "apply_rolled_back", "error_code": type(exc).__name__}
-        preview = {
-            **preview,
-            "status": "applied",
-            "artifact_generation": preview["artifact_generation"] + 1,
-            "applied_at": _utc_now(),
-            "applied_at_epoch": time.time() if now is None else now,
-        }
-        _atomic_write(
-            _preview_path(preview_id, root, ns),
-            json.dumps(preview, indent=2, sort_keys=True) + "\n",
-        )
         return {
             "ok": True,
             "code": "preview_applied",

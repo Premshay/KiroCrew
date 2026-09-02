@@ -3,7 +3,9 @@
 import shutil
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from sage_lib import learning, store
 
@@ -149,6 +151,23 @@ class TestLearningRecordExport(unittest.TestCase):
         self.assertEqual(active.read_bytes(), active_before)
         self.assertEqual(candidate.read_bytes(), candidate_before)
         self.assertEqual(len(learning.load_learning_records(self.root)), 2)
+
+    def test_export_and_rollback_take_the_candidate_lifecycle_lock(self) -> None:
+        self._write_active_and_candidate()
+        lock_calls: list[str | None] = []
+        real_lock = learning._candidate_lock
+
+        @contextmanager
+        def tracked_lock(root: Path | None, namespace: str | None):
+            lock_calls.append(namespace)
+            with real_lock(root, namespace):
+                yield
+
+        with patch.object(learning, "_candidate_lock", tracked_lock):
+            learning.export_learning_records(self.root)
+            learning.rollback_learning_records_export(self.root)
+
+        self.assertEqual(lock_calls, [None, None])
 
 
 if __name__ == "__main__":

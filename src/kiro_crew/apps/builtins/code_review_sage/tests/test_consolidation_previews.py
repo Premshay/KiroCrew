@@ -1,6 +1,7 @@
 """Snapshot-safe confirmation contracts for Sage consolidation previews."""
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import unittest
@@ -83,6 +84,20 @@ class TestConsolidationPreviews(unittest.TestCase):
             [item["title"] for item in learning.list_patterns(root=self.root)], ["Merged rule"]
         )
 
+    def test_duplicate_legacy_candidates_are_selected_and_applied_one_at_a_time(self) -> None:
+        candidates = self._stage("Duplicate", "Duplicate")
+        self.assertNotEqual(candidates[0]["id"], candidates[1]["id"])
+
+        preview = self._preview([candidates[0]])
+        applied = learning.apply_consolidation_preview(
+            preview["preview_id"], confirmed=True, root=self.root
+        )
+
+        self.assertTrue(applied["ok"])
+        remaining = learning.list_candidate(self.root)
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["id"], candidates[1]["id"])
+
     def test_unselected_or_unknown_ids_are_rejected_without_preview(self) -> None:
         candidates = self._stage("Only")
         with self.assertRaisesRegex(ValueError, "invalid_candidate_ids"):
@@ -155,6 +170,46 @@ class TestConsolidationPreviews(unittest.TestCase):
         self.assertEqual(result["code"], "apply_rolled_back")
         self.assertEqual(learning.common_file(self.root).read_bytes(), before)
         self.assertEqual(learning.candidate_count(self.root), 1)
+
+    def test_interrupted_preview_apply_recovers_all_files_from_the_durable_journal(self) -> None:
+        candidates = self._stage("Interrupted")
+        preview = self._preview(candidates)
+        ns = "default"
+        paths = learning._preview_transaction_paths(preview["preview_id"], self.root, ns)
+        before = {
+            name: learning._read_current_text(path, learning._namespace_dir(ns, self.root))
+            for name, path in paths.items()
+        }
+        applied_preview = {
+            **preview,
+            "status": "applied",
+            "artifact_generation": preview["artifact_generation"] + 1,
+            "applied_at": "2026-09-02T00:00:00Z",
+            "applied_at_epoch": 1.0,
+        }
+        after = {
+            "live": preview["proposed_ruleset_markdown"],
+            "sidecar": before["sidecar"],
+            "candidate": learning._CANDIDATE_HEADER,
+            "preview": json.dumps(applied_preview, indent=2, sort_keys=True) + "\n",
+        }
+        transaction = {
+            "schema": learning._PREVIEW_TRANSACTION_SCHEMA,
+            "version": learning._PREVIEW_TRANSACTION_VERSION,
+            "status": "prepared",
+            "preview_id": preview["preview_id"],
+            "before": before,
+            "after": after,
+        }
+        learning._write_preview_transaction(self.root, ns, transaction)
+        learning._atomic_write(paths["live"], after["live"])
+
+        self.assertEqual(learning.list_candidate(self.root), candidates)
+        self.assertEqual(
+            learning._read_current_text(paths["live"], learning._namespace_dir(ns, self.root)),
+            before["live"],
+        )
+        self.assertFalse(learning._preview_transaction_path(self.root, ns).exists())
 
     def test_governed_and_legacy_sidecars_have_distinct_preview_contracts(self) -> None:
         candidates = self._stage("Legacy")

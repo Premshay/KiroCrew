@@ -121,7 +121,7 @@ sidecar governs its prompt context. Records move explicitly among `candidate`,
 review/change signals before it can become active, while an operator may pin it
 directly. Repeating the same review or change never increases recurrence.
 `review.active_context` bounds governed context with separate global and
-repository `{max_rules, max_tokens}` budgets (defaults: 60/12000 and 40/8000).
+repository `{max_rules, max_tokens}` budgets (defaults: 20/4000 and 12/2400).
 Selection is deterministic: pinned records, then recurrence, recency, scope,
 and id. Unpinned active overflow is archived rather than deleted. Invalid
 lifecycle data or budgets fail closed for governed namespaces. Missing or empty

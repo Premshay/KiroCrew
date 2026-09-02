@@ -585,6 +585,76 @@ class TestSettingsModelValidation(unittest.TestCase):
         review = self.mod._write_review_section({"model": None})
         self.assertIsNone(review["model"])
 
+    def test_concurrent_settings_patches_preserve_both_updates(self):
+        entered = threading.Event()
+        release = threading.Event()
+        real_valid = self.mod._valid_model
+
+        def delayed_valid(model: str) -> bool:
+            entered.set()
+            self.assertTrue(release.wait(timeout=2))
+            return real_valid(model)
+
+        with unittest.mock.patch.object(self.mod, "_valid_model", side_effect=delayed_valid):
+            first = threading.Thread(
+                target=self.mod._write_review_section,
+                args=({"model": self.mod._known_models()[0]},),
+            )
+            second = threading.Thread(
+                target=self.mod._write_review_section,
+                args=({"effort": "low"},),
+            )
+            first.start()
+            self.assertTrue(entered.wait(timeout=2))
+            second.start()
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        review = self.mod._load_review_section()
+        self.assertEqual(review["model"], self.mod._known_models()[0])
+        self.assertEqual(review["effort"], "low")
+
+
+class TestConsolidationWorkerFailures(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+        store.ensure_layout()
+        self.mod._CONSOLIDATE_STATE.clear()
+
+    def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_consolidation_worker_error_is_logged_but_not_returned_to_clients(self):
+        class Pool:
+            async def begin_batch(self):
+                return None
+
+            async def end_batch(self):
+                return None
+
+        with (
+            unittest.mock.patch.object(self.mod.review_pool, "get_pool", return_value=Pool()),
+            unittest.mock.patch.object(
+                self.mod.review_pool,
+                "make_sync_dispatch",
+                return_value=lambda _task: {"ok": False, "error": "spawn /private/token failed"},
+            ),
+        ):
+            asyncio.run(self.mod._consolidate_bg("default", [], []))
+
+        state = self.mod._CONSOLIDATE_STATE["default"]
+        self.assertEqual(state["code"], "worker_failed")
+        self.assertEqual(state["error_code"], "worker_failed")
+        self.assertNotIn("/private/token", state["error"])
+
 
 class TestLearningsEndpoint(unittest.IsolatedAsyncioTestCase):
     """GET /learnings surfaces a namespace's consolidated patterns AND the pending
