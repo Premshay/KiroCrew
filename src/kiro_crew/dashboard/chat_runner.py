@@ -6707,6 +6707,9 @@ async def _run_chat(
             # context, taking the skills index with it. Read-and-clear the flag
             # here so this turn re-injects the index exactly once.
             _needs_reinjection = state.sessions.consume_needs_reinjection(session_key)
+            _post_compaction_checkpoint = (
+                slot.session_checkpoint_payload() if _needs_reinjection else None
+            )
             _channel_prefix = channel_collaboration_prefix(
                 state,
                 slot,
@@ -6760,6 +6763,7 @@ async def _run_chat(
                 ),
                 user_span_out=_user_span,
                 needs_reinjection=_needs_reinjection,
+                post_compaction_checkpoint=_post_compaction_checkpoint,
                 include_session_history=not rewound,
             )
             # The reported span is valid for the message as build_message
