@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -401,7 +402,11 @@ def _accepts_activity(dispatch: Callable[..., Any]) -> bool:
     return _accepts_kwarg(dispatch, "on_activity")
 
 
-def build_review_task(change_link: str, rule_resolution: dict | None = None) -> str:
+def build_review_task(
+    change_link: str,
+    rule_resolution: dict | None = None,
+    result_capability: str | None = None,
+) -> str:
     """Single-pass review prompt: ONE isolated session does the WHOLE review —
     design reasoning AND every code-level dimension — in a single turn, and writes
     the complete result record (phase1 design fields + findings + counts +
@@ -467,7 +472,15 @@ def build_review_task(change_link: str, rule_resolution: dict | None = None) -> 
         "suggestion, snippet, lang); `counts` {red,yellow}; `ship_summary` (ONE straightforward "
         "line: good-to-ship + reason when there are no 🔴, or not-ready + the "
         "must-fix/design reason otherwise); `files_covered`; `coverage_complete`; "
-        "deep_reviewed=true. The driver builds the redacted bodies and a separate "
+        "deep_reviewed=true."
+        + (
+            " Include top-level `result_capability` exactly as `"
+            + result_capability
+            + "`; it binds this record to this review dispatch."
+            if result_capability
+            else ""
+        )
+        + " The driver builds the redacted bodies and a separate "
         "poster publishes them — you MUST NOT call any comment tool.\n"
         "     `headline` is the finding's CONCLUSION in ONE sentence under about 100 "
         "characters: what is actually wrong, stated directly. It is the only line a "
@@ -484,7 +497,11 @@ def build_review_task(change_link: str, rule_resolution: dict | None = None) -> 
     )
 
 
-def build_review_followup_task(change_link: str, rule_resolution: dict | None = None) -> str:
+def build_review_followup_task(
+    change_link: str,
+    rule_resolution: dict | None = None,
+    result_capability: str | None = None,
+) -> str:
     """Bounded coverage backstop — dispatched AT MOST ONCE, and only when the single
     review reported ``coverage_complete=false``. It reviews the STILL-UNCOVERED
     changed files and APPENDS only net-new findings (never repeats/removes existing
@@ -524,7 +541,15 @@ def build_review_followup_task(change_link: str, rule_resolution: dict | None = 
         "{red,yellow} over "
         "the FULL list; refresh `ship_summary`; extend `files_covered` to include "
         "every changed file and set `coverage_complete=true`; keep deep_reviewed=true "
-        "and PRESERVE the phase1 block. You MUST NOT call any comment tool.\n"
+        "and PRESERVE the phase1 block."
+        + (
+            " Preserve top-level `result_capability` exactly as `"
+            + result_capability
+            + "`."
+            if result_capability
+            else ""
+        )
+        + " You MUST NOT call any comment tool.\n"
         "Do NOT spawn further subagents. Execute; do not ask questions."
     )
 
@@ -895,7 +920,13 @@ def post_recorded(
             "posted_keys": list(already),
         }
     spawn = dispatch(post_prompt, timeout)
-    results.adopt_from_shared(change_id, root, run_id)
+    capability = cur.get("result_capability")
+    results.adopt_from_shared(
+        change_id,
+        root,
+        run_id,
+        expected_capability=capability if isinstance(capability, str) else None,
+    )
     after = results.read_result(change_id, root, run_id) or {}
     ok = bool(spawn.get("ok", False))
     # The poster writes the count it actually delivered. That write is the ONLY
@@ -1243,6 +1274,10 @@ def run_review(
         progress(_cid(_link), "queued", {})
 
     concurrency = _resolve_concurrency(concurrency)
+    if not run_id:
+        # Legacy standalone callers have no private adoption boundary, so retain
+        # their single-writer contract rather than claim parallel attribution.
+        concurrency = 1
     per_change: list[dict] = []
 
     def _post_pending(change_id: str, link: str) -> dict:
@@ -1258,6 +1293,7 @@ def run_review(
 
     def _one(link: str) -> dict:
         change_id = _cid(link)
+        result_capability = secrets.token_urlsafe(32) if run_id else None
         rule_resolution = frozen_resolutions.get(link)
         if rule_resolution is None:
             rule_resolution = pipeline.resolve_rules_for_review_link(link, root=root)
@@ -1320,7 +1356,7 @@ def run_review(
         # would route the worker at public github.com — reviewing (and later
         # posting about) a same-slug public PR instead of the intended one.
         try:
-            review_prompt = build_review_task(link, rule_resolution)
+            review_prompt = build_review_task(link, rule_resolution, result_capability)
         except pipeline.adapters.AdapterError as exc:
             refused = f"refusing to review: {exc}"
             progress(change_id, "failed", {"error": refused})
@@ -1353,7 +1389,12 @@ def run_review(
         # move it into this run's private dir before reading. Without this the
         # run's dir stays empty and a completed review reports no findings.
         if slot_clear:
-            results.adopt_from_shared(change_id, root, run_id)
+            results.adopt_from_shared(
+                change_id,
+                root,
+                run_id,
+                expected_capability=result_capability,
+            )
         rev_rec = results.read_result(change_id, root, run_id)
         verdict = str(((rev_rec or {}).get("phase1") or {}).get("gate_verdict", "")).upper()
 
@@ -1419,7 +1460,9 @@ def run_review(
             # Same fail-closed contract as the first pass: no confirmed host, no
             # follow-up turn. A failed follow-up keeps the first pass's record.
             try:
-                followup_prompt: str | None = build_review_followup_task(link, rule_resolution)
+                followup_prompt: str | None = build_review_followup_task(
+                    link, rule_resolution, result_capability
+                )
             except pipeline.adapters.AdapterError:
                 followup_prompt = None
             second_pass = (
@@ -1428,7 +1471,12 @@ def run_review(
                 else {"ok": False}
             )
             if second_pass.get("ok", False):
-                results.adopt_from_shared(change_id, root, run_id)
+                results.adopt_from_shared(
+                    change_id,
+                    root,
+                    run_id,
+                    expected_capability=result_capability,
+                )
                 rev_rec = results.read_result(change_id, root, run_id) or rev_rec
                 rec["deep_rounds"] = 2
                 rec["deep_reviewed"] = bool((rev_rec or {}).get("deep_reviewed"))
