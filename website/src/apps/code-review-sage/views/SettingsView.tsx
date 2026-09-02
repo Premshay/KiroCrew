@@ -102,7 +102,12 @@ export default function SettingsView() {
                   clearLabel={i18nT('apps.codeReviewSage.views.settingsView.default_agent_config')}
                   className={SELECT_CLASS}
                 />
-              ) : <span className="text-[12.5px] text-muted">{i18nT('apps.codeReviewSage.views.settingsView.default_agent_config')}</span>}
+              ) : (
+                <div className="text-[12.5px] text-muted text-right max-w-[360px]">
+                  <div>{i18nT('apps.codeReviewSage.views.settingsView.default_agent_config')}</div>
+                  <div className="mt-1">{i18nT('pages.settings.chatPanel.default_defers_to_your_agent_config_and_then_to')}</div>
+                </div>
+              )}
             </Field>
 
             {data.reviewer?.effort_override_supported && <Field

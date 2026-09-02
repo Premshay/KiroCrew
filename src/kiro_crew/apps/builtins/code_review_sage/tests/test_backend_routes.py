@@ -570,8 +570,9 @@ class TestSettingsModelValidation(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_known_model_accepted(self):
-        known = self.mod._known_models()[0]
-        review = self.mod._write_review_section({"model": known})
+        known = "runtime-only-model"
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=[known]):
+            review = self.mod._write_review_section({"model": known})
         self.assertEqual(review["model"], known)
 
     def test_unknown_model_rejected(self):
@@ -581,8 +582,9 @@ class TestSettingsModelValidation(unittest.TestCase):
             self.mod._write_review_section({"model": "evil-model-9000"})
 
     def test_empty_model_clears_override(self):
-        self.mod._write_review_section({"model": self.mod._known_models()[0]})
-        review = self.mod._write_review_section({"model": None})
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["runtime-only-model"]):
+            self.mod._write_review_section({"model": "runtime-only-model"})
+            review = self.mod._write_review_section({"model": None})
         self.assertIsNone(review["model"])
 
     def test_repository_binding_must_reference_a_pinned_sage_repo(self):
@@ -618,10 +620,11 @@ class TestSettingsModelValidation(unittest.TestCase):
             self.assertTrue(release.wait(timeout=2))
             return real_valid(model)
 
-        with unittest.mock.patch.object(self.mod, "_valid_model", side_effect=delayed_valid):
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["runtime-only-model"]), \
+                unittest.mock.patch.object(self.mod, "_valid_model", side_effect=delayed_valid):
             first = threading.Thread(
                 target=self.mod._write_review_section,
-                args=({"model": self.mod._known_models()[0]},),
+                args=({"model": "runtime-only-model"},),
             )
             second = threading.Thread(
                 target=self.mod._write_review_section,
@@ -635,7 +638,7 @@ class TestSettingsModelValidation(unittest.TestCase):
             second.join(timeout=2)
 
         review = self.mod._load_review_section()
-        self.assertEqual(review["model"], self.mod._known_models()[0])
+        self.assertEqual(review["model"], "runtime-only-model")
         self.assertEqual(review["effort"], "low")
 
 

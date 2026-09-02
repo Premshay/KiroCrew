@@ -1686,12 +1686,12 @@ def _known_models() -> list[str]:
 
 def _valid_model(m: str) -> bool:
     """A model id is acceptable if it is a safe token (it becomes a cli.json
-    overlay key for the worker subprocess) and, when the registry is available,
-    is one it knows."""
+    overlay key for the worker subprocess) and belongs to Sage's latest runtime
+    capability snapshot."""
     if not m or len(m) > 64 or not all(c.isalnum() or c in "._-" for c in m):
         return False
     known = _known_models()
-    return (m in known) if known else True
+    return m in known
 
 
 def _load_review_section() -> dict:
@@ -1732,10 +1732,10 @@ def _write_review_section(patch: dict) -> dict:
         if "model" in patch:
             m = patch["model"]
             # Empty/None clears the override (inherits the system/agent default model).
-            # A non-empty value is validated (safe token + known to the registry when
-            # available) before persisting, since it later becomes a cli.json overlay
+            # A non-empty value is validated against Sage's runtime snapshot before
+            # persisting, since it later becomes a cli.json overlay
             # key for the review worker subprocess — raw request input must not reach it.
-            if not m:
+            if not m or str(m).lower() == "auto":
                 review["model"] = None
             elif _valid_model(str(m)):
                 review["model"] = str(m)

@@ -684,15 +684,6 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   })
   const memoryStoreOptions = kirocrewCfg?.memory_stores ? Object.keys(kirocrewCfg.memory_stores) : ['default']
 
-  // Model list for the per-agent default. Same query key as every other model
-  // picker so the list is fetched once. INHERIT_MODEL leads so "no pin" is the
-  // obvious choice rather than an absent option.
-  const availableModels = useAvailableModels()
-  const modelOptions = [
-    INHERIT_MODEL,
-    ...(availableModels || []).map((m: { name: string }) => m.name).filter((n: string) => n && n !== INHERIT_MODEL),
-  ]
-
   const [filter, setFilter] = useState('')
   const [view, setView] = useState<CrewView>(readStoredView)
   const [error, setError] = useState('')
@@ -730,6 +721,17 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
   const editing = sheet?.mode === 'edit' ? sheet.name : ''
   const editingAgent = agents.find(a => a.name === editing)
+  const availableModels = useAvailableModels({
+    agent: editingAgent,
+    enabled: Boolean(editingAgent),
+    fallback: 'none',
+  })
+  const modelOptions = [
+    INHERIT_MODEL,
+    ...availableModels.map(model => model.name).filter(name => name && name !== INHERIT_MODEL),
+  ]
+  const modelPickerAvailable = editingAgent?.runtime_policy?.model === 'selectable'
+    && availableModels.some(model => model.name !== INHERIT_MODEL)
 
   /** The model a new session on this crew would actually run on, resolved by
    *  the backend so the precedence is not re-derived (and drifted) here. */
@@ -1299,7 +1301,18 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
                   {pane === 'model' && (
                     <>
-                      <ModelField options={modelOptions} value={editModel} onChange={setEditModel} />
+                      {modelPickerAvailable ? (
+                        <ModelField options={modelOptions} value={editModel} onChange={setEditModel} />
+                      ) : (
+                        <div className="rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                          <span className={editModel === INHERIT_MODEL ? 'italic' : 'font-mono text-text'}>
+                            {editModel === INHERIT_MODEL ? i18nT('pages.kiroCrewAgentsPage.inherited') : editModel}
+                          </span>
+                          {editModel === INHERIT_MODEL && (
+                            <span>{' — '}{i18nT('pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses')}</span>
+                          )}
+                        </div>
+                      )}
                       {resolved && (
                         <div className="rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
                           <span className="text-text">

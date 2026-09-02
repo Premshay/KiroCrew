@@ -45,6 +45,10 @@ class FakeHandle:
         self._runtime = runtime
         self.session_id = session_id
         self.served_model = str(runtime.kw.get("model") or "")
+        self.config_options = []
+        self.available_models = [
+            {"modelId": "runtime-only-model", "name": "Runtime Only Model"}
+        ]
         self._script = script or []
         self._gate = gate
         self.approvals: list = []
@@ -226,13 +230,15 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_session_created_and_destroyed_per_task(self):
         _install_fake_runtime(self, script=[_ev(rp.EVENT_TEXT_CHUNK, text="x")])
         pool = ReviewPool(work_dir="/tmp/x")
-        await pool.begin_batch()
-        await pool.send("task")
-        rt = FakeRuntime.instances[0]
-        # exactly one session was created, and it was destroyed (no leak)
-        self.assertEqual(rt._seq, 1)
-        self.assertEqual(rt._session_queues, {})          # destroyed -> unregistered
-        await pool.end_batch()
+        with unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True):
+            await pool.begin_batch()
+            await pool.send("task")
+            rt = FakeRuntime.instances[0]
+            # exactly one session was created, and it was destroyed (no leak)
+            self.assertEqual(rt._seq, 1)
+            self.assertEqual(rt._session_queues, {})          # destroyed -> unregistered
+            self.assertEqual(rp._runtime_model_snapshot(pool._agent), ["runtime-only-model"])
+            await pool.end_batch()
 
     async def test_standalone_send_lazily_spawns(self):
         # No begin_batch (standalone CLI path) -> acquire() spawns on first send.
@@ -573,3 +579,26 @@ class TestRuntimePreflight(unittest.TestCase):
                 unittest.mock.patch.object(rp, "resolve_kiro_cli", _resolver):
             rp.runtime_preflight()
         self.assertEqual(calls, ["resolve"])
+
+
+class TestRuntimeModelSnapshots(unittest.TestCase):
+    def test_reviewer_info_exposes_only_its_own_runtime_snapshot(self):
+        with unittest.mock.patch.object(rp, "_resolve_review_agent", return_value="reviewer"), \
+                unittest.mock.patch.object(rp, "_get_review_settings", return_value={"model": None, "effort": ""}), \
+                unittest.mock.patch.dict(
+                    rp._RUNTIME_MODEL_SNAPSHOTS,
+                    {"reviewer": ("gpt-5.6-sol",), "other": ("claude-opus-5",)},
+                    clear=True,
+                ):
+            info = reviewer_info()
+
+        self.assertEqual(info["models"], ["gpt-5.6-sol"])
+        self.assertTrue(info["model_override_supported"])
+
+    def test_missing_snapshot_suppresses_the_override_catalog(self):
+        with unittest.mock.patch.object(rp, "_resolve_review_agent", return_value="reviewer"), \
+                unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True):
+            info = reviewer_info()
+
+        self.assertEqual(info["models"], [])
+        self.assertFalse(info["model_override_supported"])

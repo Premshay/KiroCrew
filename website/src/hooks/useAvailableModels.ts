@@ -18,10 +18,9 @@ const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
  *
  * ## Why a hook and not six `useQuery` calls
  *
- * Six surfaces render a model picker (ChatPage, ChatPane, ChatSidebar's bulk
- * switcher, AgentsPage, Settings ▸ Chat, KiroCrewAgentsPage) and all six used
- * the SAME query key — deliberately, so kiro-cli's `--list-models` is spawned
- * once — while each declared its own `queryFn`. React Query stores one cache
+ * Generic model pickers share the SAME query key — deliberately, so kiro-cli's
+ * `--list-models` is spawned once — while each declared its own `queryFn`.
+ * React Query stores one cache
  * entry per key and the fetching observer's options win, so with divergent
  * fetchers the array every picker reads is decided by *which surface fetched
  * last*.
@@ -56,16 +55,22 @@ type ModelPickerAgent = {
 export function useAvailableModels({
   enabled,
   agent,
+  fallback = 'global',
 }: {
   enabled?: boolean
   agent?: ModelPickerAgent
+  /** Suppress generic provider discovery when no resolved crew owns this picker. */
+  fallback?: 'global' | 'none'
 } = {}): ModelInfo[] {
   const provider = useProvider()
   const selectableAgent = agent?.runtime_policy?.model === 'selectable' ? agent : undefined
+  const canDiscover = Boolean(selectableAgent) || fallback === 'global'
   const { data } = useQuery({
     queryKey: selectableAgent
       ? ['available-models', provider.id, 'agent', selectableAgent.name]
-      : ['available-models', provider.id],
+      : fallback === 'global'
+        ? ['available-models', provider.id]
+        : ['available-models', provider.id, 'none'],
     queryFn: async () => {
       if (selectableAgent) {
         const discovered = await api.kirocrewAgentModels(selectableAgent.name)
@@ -78,7 +83,7 @@ export function useAvailableModels({
       return withAutoFirst(await provider.fetchAvailableModels())
     },
     refetchInterval: selectableAgent ? false : modelListRefetchInterval,
-    ...(enabled === undefined ? {} : { enabled }),
+    enabled: (enabled ?? true) && canDiscover,
   })
-  return data ?? PLACEHOLDER
+  return data ?? (fallback === 'none' ? [] : PLACEHOLDER)
 }

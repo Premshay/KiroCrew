@@ -480,7 +480,19 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   const [filter, setFilter] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
-  const modelOptions = useAvailableModels()
+  const selectedName = selectedAgent?.name
+  const usedBy = useMemo(
+    () => (selectedName ? crews.filter(c => c.kiro_agent === selectedName) : []),
+    [crews, selectedName],
+  )
+  const modelPickerCrew = usedBy.length === 1 ? usedBy[0] : undefined
+  const modelOptions = useAvailableModels({
+    agent: modelPickerCrew,
+    enabled: Boolean(modelPickerCrew),
+    fallback: 'none',
+  })
+  const modelPickerAvailable = modelPickerCrew?.runtime_policy?.model === 'selectable'
+    && modelOptions.some(model => model.name !== 'auto')
   const { open: modelDropOpen, setOpen: setModelDropOpen, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(modelOptions)
   // Roving-focus keyboard nav for the model dropdown (shared with StyledSelect/AgentSelector).
   const { onListKeyDown: onModelListKeyDown } = useListboxKeyboard({
@@ -585,7 +597,6 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   // above, and a delete that clears the pane. A layout effect resets the pane
   // before its newly rendered tabs can be activated; `select()` disarms
   // synchronously before awaiting detail.
-  const selectedName = selectedAgent?.name
   useLayoutEffect(() => { setTab('overview'); setConfirmDelete(false); setDeleteError(null) }, [selectedName])
 
   /** Arming the delete unmounts the button that was focused, which would drop
@@ -615,10 +626,6 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   }, [filtered])
 
   const listed = installed.find(a => a.name === selectedAgent?.name)
-  const usedBy = useMemo(
-    () => (selectedName ? crews.filter(c => c.kiro_agent === selectedName) : []),
-    [crews, selectedName],
-  )
   /** Deleting a template something still points at leaves a dangling reference,
    *  and the next session that resolves it fails to start — a crew bound to it
    *  boots from nothing, and the fallback name is handed to kiro-cli as an
@@ -874,11 +881,12 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
                 <div className="flex-1 min-h-0 overflow-y-auto p-4 flex flex-col gap-5">
                   {tab === 'overview' && (<>
                     <Section title={i18nT('pages.agentsPage.model')}>
-                      <div className="relative w-fit">
-                        <Btn ref={modelBtnRef} className="flex items-center gap-1 px-2 py-1 text-[12.5px] font-mono font-medium" onClick={() => setModelDropOpen(!modelDropOpen)}>
-                          <span><Brain className="lucide-inline" /></span> {modelLabel(selectedAgent.model)} <span className="text-muted text-[10px]"><ChevronDown className="lucide-inline" /></span>
-                        </Btn>
-                        {modelDropOpen && modelBtnRef.current && createPortal(
+                      {modelPickerAvailable ? (
+                        <div className="relative w-fit">
+                          <Btn ref={modelBtnRef} className="flex items-center gap-1 px-2 py-1 text-[12.5px] font-mono font-medium" onClick={() => setModelDropOpen(!modelDropOpen)}>
+                            <span><Brain className="lucide-inline" /></span> {modelLabel(selectedAgent.model)} <span className="text-muted text-[10px]"><ChevronDown className="lucide-inline" /></span>
+                          </Btn>
+                          {modelDropOpen && modelBtnRef.current && createPortal(
                           // Presentational positioning wrapper: the interactive semantics live
                           // on the inner role="listbox" and its option buttons. This element only
                           // hosts the roving-focus keydown handler for the composite widget, so it
@@ -892,9 +900,12 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
                               <ModelDropdownList models={filteredModels} activeModel={modelLabel(selectedAgent.model)} onSelect={name => { const val = name === 'auto' ? '' : name; patchModelMut.mutate({ name: selectedAgent.name, model: val }); setModelDropOpen(false) }} />
                             </div>
                           </div>,
-                          document.body
-                        )}
-                      </div>
+                            document.body
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-[12.5px] font-mono text-muted">{modelLabel(selectedAgent.model)}</span>
+                      )}
                       {/* Where the pin actually lands, in words. "auto" told a
                           first-run reader nothing about which model runs. */}
                       <p className="m-0 rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
