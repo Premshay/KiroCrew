@@ -127,6 +127,17 @@ and id. Unpinned active overflow is archived rather than deleted. Invalid
 lifecycle data or budgets fail closed for governed namespaces. Missing or empty
 sidecars keep the markdown-only compatibility behavior above.
 
+Consolidation is a two-step, namespace-local backend contract. `POST
+/learnings/consolidate` asks a worker for a machine-readable proposal and stores a
+versioned preview artifact; it never changes the live ruleset, sidecar, or candidates.
+The preview records candidate and active generations, the selected ids, per-candidate
+`promote`/`merge`/`archive`/`retain` decisions, and budget impact. Read-only preview
+list/detail APIs expose expiry and stale state. `POST
+/learnings/consolidation-previews/apply` requires `preview_id` and `confirm: true`;
+it rejects expired, stale, or already-applied previews with machine-readable codes.
+Apply rechecks snapshots, restores on a write failure, consumes only the snapshotted
+decisions, and keeps unselected or concurrently staged candidates.
+
 ## Enable
 
 Code Review Sage is a built-in app (listed in `kiro_crew.apps.builtins`). Enable

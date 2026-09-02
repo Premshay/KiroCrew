@@ -12,6 +12,7 @@ must leave the ruleset exactly as it was.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -143,14 +144,21 @@ class TestConsolidateMerge(_Base):
     """The background half: what the worker writes, and what is done with it."""
 
     def _pool(self, writes: str | None, ok: bool = True, error: str = ""):
-        """Fake the pool so the 'worker' writes (or fails to write) a merge file."""
+        """Fake the pool so the worker writes a proposal, never live state."""
         ns_dir = learning._namespace_dir("default")
-        out = Path(ns_dir) / "learned-patterns.merge.md"
+        out = Path(ns_dir) / "consolidation-proposal.json"
 
         def dispatch(task, timeout=0, on_activity=None):
             if writes is not None:
                 out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_text(writes, encoding="utf-8")
+                out.write_text(json.dumps({
+                    "ruleset_markdown": writes,
+                    "decisions": [
+                        {"candidate_id": item["id"], "action": "merge",
+                         "reason_code": "candidate_merged"}
+                        for item in learning.list_candidate()
+                    ],
+                }), encoding="utf-8")
             return {"ok": ok, "output": "done", "error": error}
 
         pool = AsyncMock()
@@ -160,10 +168,17 @@ class TestConsolidateMerge(_Base):
 
     async def _run(self, writes: str | None, ok: bool = True, error: str = ""):
         dispatch, pool, out = self._pool(writes, ok, error)
+        candidates = learning.list_candidate()
+        candidate_ids = sorted({item["id"] for item in candidates})
+        snapshot = [learning._candidate_snapshot_entry(item) for item in candidates]
         with patch.object(routes.review_pool, "get_pool", return_value=pool), \
                 patch.object(routes.review_pool, "make_sync_dispatch",
                              return_value=dispatch):
-            await routes._consolidate_bg("default")
+            await routes._consolidate_bg("default", candidate_ids, snapshot)
+        preview_id = routes._CONSOLIDATE_STATE["default"].get("preview_id")
+        if preview_id:
+            applied = learning.apply_consolidation_preview(preview_id, confirmed=True)
+            self.assertTrue(applied["ok"])
         return out
 
     async def test_applies_the_merge_the_worker_wrote(self):
@@ -242,7 +257,7 @@ class TestConsolidateMerge(_Base):
         learning.stage_learning(_pattern("Known at dispatch"), "fix_introduce")
 
         ns_dir = learning._namespace_dir("default")
-        out = Path(ns_dir) / "learned-patterns.merge.md"
+        out = Path(ns_dir) / "consolidation-proposal.json"
         merged = (
             "# Common learned patterns\n\n"
             "### Known at dispatch <!-- scope:common --> <!-- impact:high -->"
@@ -255,7 +270,11 @@ class TestConsolidateMerge(_Base):
             # `merged` — and must therefore not be cleared by this merge.
             learning.stage_learning(_pattern("Staged mid-merge"), "fix_introduce")
             out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(merged, encoding="utf-8")
+            out.write_text(json.dumps({
+                "ruleset_markdown": merged,
+                "decisions": [{"candidate_id": learning.list_candidate()[0]["id"],
+                               "action": "merge", "reason_code": "candidate_merged"}],
+            }), encoding="utf-8")
             return {"ok": True, "output": "done", "error": ""}
 
         pool = AsyncMock()
@@ -264,7 +283,15 @@ class TestConsolidateMerge(_Base):
         with patch.object(routes.review_pool, "get_pool", return_value=pool), \
                 patch.object(routes.review_pool, "make_sync_dispatch",
                              return_value=dispatch):
-            await routes._consolidate_bg("default")
+            before = learning.list_candidate()
+            await routes._consolidate_bg(
+                "default",
+                [before[0]["id"]],
+                [learning._candidate_snapshot_entry(item) for item in before],
+            )
+
+        preview_id = routes._CONSOLIDATE_STATE["default"]["preview_id"]
+        self.assertTrue(learning.apply_consolidation_preview(preview_id, confirmed=True)["ok"])
 
         # The merge landed.
         self.assertEqual([p["title"] for p in learning.list_patterns_for_review()],

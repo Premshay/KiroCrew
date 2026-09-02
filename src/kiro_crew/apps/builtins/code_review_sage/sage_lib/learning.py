@@ -20,6 +20,7 @@ Namespaces: learnings are grouped by namespace. The "default" namespace maps to
 under ``data/learnings/namespaces/<name>/``. Reviews load patterns from the
 configured active namespace(s).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -34,6 +35,7 @@ import stat
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -52,6 +54,11 @@ DEFAULT_NAMESPACE = "default"
 
 LEARNING_RECORDS_SCHEMA = "code-review-sage-learning-records"
 LEARNING_RECORDS_VERSION = 1
+CONSOLIDATION_PREVIEW_SCHEMA = "code-review-sage-consolidation-preview"
+CONSOLIDATION_PREVIEW_VERSION = 1
+CONSOLIDATION_PREVIEW_TTL_SECONDS = 15 * 60
+_CONSOLIDATION_ACTIONS = frozenset({"promote", "merge", "archive", "retain"})
+_CONSOLIDATION_REASON_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{2,80}$")
 _LEARNING_LIFECYCLES = frozenset({"candidate", "active", "archived", "pinned"})
 _UNKNOWN_PROVENANCE = "unknown"
 _PROMOTION_RECURRENCE_COUNT = 2
@@ -83,6 +90,7 @@ def _is_valid_ns_name(name: str) -> bool:
 # ---------------------------------------------------------------------------
 # Paths — namespace-aware
 # ---------------------------------------------------------------------------
+
 
 def _namespace_dir(namespace: str | None = None, root: Path | None = None) -> Path:
     """Resolve the directory for a namespace. 'default' (or None) -> common/.
@@ -632,8 +640,7 @@ def _candidate_lock(root: Path | None, namespace: str | None):
         try:
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-                raise OSError(
-                    f"refusing to lock {lock_path}: not a lone regular file")
+                raise OSError(f"refusing to lock {lock_path}: not a lone regular file")
             with platform_compat.file_lock(fd, exclusive=True):
                 yield
         finally:
@@ -647,6 +654,7 @@ def _consolidations_log(root: Path | None = None) -> Path:
 # ---------------------------------------------------------------------------
 # Namespace management
 # ---------------------------------------------------------------------------
+
 
 def list_namespaces(root: Path | None = None) -> list[str]:
     """Return all available namespace names. 'default' is always present."""
@@ -663,7 +671,10 @@ def create_namespace(name: str, root: Path | None = None) -> dict:
     """Create a new namespace with an empty learnings file."""
     name = name.strip().lower().replace(" ", "-")
     if not _is_valid_ns_name(name):
-        return {"ok": False, "error": f"invalid namespace name: {name!r} (use lowercase alphanumeric, hyphens, dots, 2-64 chars)"}
+        return {
+            "ok": False,
+            "error": f"invalid namespace name: {name!r} (use lowercase alphanumeric, hyphens, dots, 2-64 chars)",
+        }
     if name == DEFAULT_NAMESPACE:
         return {"ok": False, "error": "'default' namespace already exists (it maps to common/)"}
     ns_path = _namespace_dir(name, root)
@@ -753,7 +764,9 @@ def validate_namespace_bindings(bindings: object) -> dict[str, dict]:
     return normalized
 
 
-def _sidecar_rule_ids(namespace: str, pattern: dict, root: Path | None) -> tuple[list[str], str | None]:
+def _sidecar_rule_ids(
+    namespace: str, pattern: dict, root: Path | None
+) -> tuple[list[str], str | None]:
     """Return optional SAGE-1 record ids without making sidecar export implicit."""
     try:
         records = load_learning_records(root, namespace)
@@ -957,6 +970,7 @@ def resolve_effective_rules(
 # Pattern <-> markdown
 # ---------------------------------------------------------------------------
 
+
 def pattern_id(title: str, scope: str) -> str:
     # A content-derived dedup key over (title, scope), recomputed on every load
     # rather than persisted, so the digest algorithm can change freely. SHA-256
@@ -1009,16 +1023,25 @@ def parse_patterns(md: str) -> list[dict]:
             # skipped, so the round-trip stays lossless for multi-line guidance.
             if s and not s.startswith("**"):
                 guidance_lines.append(s)
-        out.append({
-            "id": pattern_id(title, scope), "title": title, "scope": scope,
-            "impact": m.group("impact") or "medium", "added_at": (m.group("added") or "").strip(),
-            "guidance": " ".join(guidance_lines),
-        })
+        out.append(
+            {
+                "id": pattern_id(title, scope),
+                "title": title,
+                "scope": scope,
+                "impact": m.group("impact") or "medium",
+                "added_at": (m.group("added") or "").strip(),
+                "guidance": " ".join(guidance_lines),
+            }
+        )
     return out
 
 
-def list_patterns(scope: str = "common", repo_identity: str | None = None,
-                  root: Path | None = None, namespace: str | None = None) -> list[dict]:
+def list_patterns(
+    scope: str = "common",
+    repo_identity: str | None = None,
+    root: Path | None = None,
+    namespace: str | None = None,
+) -> list[dict]:
     """Parsed patterns from the consolidated file for a namespace."""
     path = common_file(root, namespace)
     if not path.exists():
@@ -1030,14 +1053,16 @@ def list_patterns_for_review(
     root: Path | None = None, source_identity: dict[str, str] | None = None
 ) -> list[dict]:
     """Load rules eligible for a review source, preserving legacy behaviour."""
-    return [item["pattern"] for item in resolve_effective_rules(
-        source_identity, root=root
-    )["effective_rules"]]
+    return [
+        item["pattern"]
+        for item in resolve_effective_rules(source_identity, root=root)["effective_rules"]
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Atomic write
 # ---------------------------------------------------------------------------
+
 
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1056,7 +1081,7 @@ def _normalize_pattern(pattern: dict) -> dict:
 
 _CANDIDATE_HEADER = (
     "# Pending learnings (candidate) — awaiting consolidation\n\n"
-    "<!-- New learnings are appended here during reviews. Trigger \"Consolidate\" "
+    '<!-- New learnings are appended here during reviews. Trigger "Consolidate" '
     "to AI-merge them into learned-patterns.md, after which this file is cleared. "
     "You may edit/curate this file directly before consolidating. -->\n\n"
 )
@@ -1066,15 +1091,18 @@ _CANDIDATE_HEADER = (
 # Stage (append a new learning to the candidate) — cheap, no model call
 # ---------------------------------------------------------------------------
 
-def stage_learning(pattern: dict, source: str, root: Path | None = None,
-                   namespace: str | None = None) -> dict:
+
+def stage_learning(
+    pattern: dict, source: str, root: Path | None = None, namespace: str | None = None
+) -> dict:
     """Append one new learning to the candidate file. Admissible-sources only
     (no self-poisoning). Deterministic; the AI merge happens later in
     ``consolidate_apply``."""
     if source not in ADMISSIBLE_SOURCES:
         raise ValueError(
             f"inadmissible learning source {source!r}; allowed: {sorted(ADMISSIBLE_SOURCES)} "
-            "(the reviewer never learns from its own unpublished findings)")
+            "(the reviewer never learns from its own unpublished findings)"
+        )
     store.ensure_layout(root)
     ns_dir = _namespace_dir(namespace, root)
     ns_dir.mkdir(parents=True, exist_ok=True)
@@ -1089,14 +1117,17 @@ def stage_learning(pattern: dict, source: str, root: Path | None = None,
         # window where the file changes between the emptiness test and the append.
         existing = (store.read_text_nolink(cf, ns_dir) or "") if cf.exists() else ""
         if existing.strip():
-            body = (existing.rstrip() + "\n\n"
-                    + render_pattern(p) + "\n")
+            body = existing.rstrip() + "\n\n" + render_pattern(p) + "\n"
         else:
             body = _CANDIDATE_HEADER + render_pattern(p) + "\n"
         _atomic_write(cf, body)
-    return {"ok": True, "path": str(cf), "source": source,
-            "namespace": namespace or DEFAULT_NAMESPACE,
-            "staged": len(parse_patterns(body))}
+    return {
+        "ok": True,
+        "path": str(cf),
+        "source": source,
+        "namespace": namespace or DEFAULT_NAMESPACE,
+        "staged": len(parse_patterns(body)),
+    }
 
 
 def list_candidate(root: Path | None = None, namespace: str | None = None) -> list[dict]:
@@ -1105,16 +1136,16 @@ def list_candidate(root: Path | None = None, namespace: str | None = None) -> li
         return []
     # The dashboard renders what this returns, so an unguarded read would make a
     # planted symlink an egress path, not just a corrupted catalog.
-    return parse_patterns(
-        store.read_text_nolink(cf, _namespace_dir(namespace, root)) or "")
+    return parse_patterns(store.read_text_nolink(cf, _namespace_dir(namespace, root)) or "")
 
 
 def candidate_count(root: Path | None = None, namespace: str | None = None) -> int:
     return len(list_candidate(root, namespace))
 
 
-def clear_candidate(root: Path | None = None, namespace: str | None = None,
-                    only_ids: Sequence[str] | None = None) -> bool:
+def clear_candidate(
+    root: Path | None = None, namespace: str | None = None, only_ids: Sequence[str] | None = None
+) -> bool:
     """Clear staged candidates.
 
     With ``only_ids``, keep every entry the snapshot did not account for instead of
@@ -1141,7 +1172,7 @@ def clear_candidate(root: Path | None = None, namespace: str | None = None,
     # the unlink and be deleted without ever being read — the same read-modify-
     # write race the selective branch takes the lock for.
     with _candidate_lock(root, namespace):
-        if not cf.exists():          # a concurrent clear got there first
+        if not cf.exists():  # a concurrent clear got there first
             return False
         if only_ids is None:
             cf.unlink()
@@ -1155,14 +1186,12 @@ def clear_candidate(root: Path | None = None, namespace: str | None = None,
         # saw, which is the loss this whole `only_ids` path exists to prevent.
         # Entries are appended, so consuming the budget in file order keeps the
         # newest duplicate.
-        budget: collections.Counter[str] = collections.Counter(
-            str(i) for i in only_ids)
+        budget: collections.Counter[str] = collections.Counter(str(i) for i in only_ids)
         kept = []
         # Same guard as the staging read: a worker can swap this catalog for a
         # symlink, and re-serializing the target would publish it to the
         # dashboard-readable candidate file.
-        for p in parse_patterns(
-                store.read_text_nolink(cf, _namespace_dir(namespace, root)) or ""):
+        for p in parse_patterns(store.read_text_nolink(cf, _namespace_dir(namespace, root)) or ""):
             # An entry with no id has no budget entry, so it is kept — the safe
             # direction when the snapshot cannot account for it.
             pid = str(p.get("id") or "")
@@ -1173,8 +1202,7 @@ def clear_candidate(root: Path | None = None, namespace: str | None = None,
         if not kept:
             cf.unlink()
             return True
-        _atomic_write(cf, _CANDIDATE_HEADER
-                      + "\n".join(render_pattern(p) for p in kept) + "\n")
+        _atomic_write(cf, _CANDIDATE_HEADER + "\n".join(render_pattern(p) for p in kept) + "\n")
     return True
 
 
@@ -1182,11 +1210,16 @@ def clear_candidate(root: Path | None = None, namespace: str | None = None,
 # Consolidate (apply the AI-merged result) — replaces learned-patterns.md
 # ---------------------------------------------------------------------------
 
-def _record_consolidation(consolidated: int, namespace: str | None = None,
-                          root: Path | None = None) -> None:
+
+def _record_consolidation(
+    consolidated: int, namespace: str | None = None, root: Path | None = None
+) -> None:
     ns = namespace or DEFAULT_NAMESPACE
-    entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-             "consolidated": consolidated, "namespace": ns}
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "consolidated": consolidated,
+        "namespace": ns,
+    }
     path = _consolidations_log(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
@@ -1208,9 +1241,12 @@ def _redact(text: str) -> str:
     return redact_credentials(redact_exfiltration_urls(text)[0])[0]
 
 
-def consolidate_apply(merged_md: str, root: Path | None = None,
-                      namespace: str | None = None,
-                      candidate_ids: Sequence[str] | None = None) -> dict:
+def consolidate_apply(
+    merged_md: str,
+    root: Path | None = None,
+    namespace: str | None = None,
+    candidate_ids: Sequence[str] | None = None,
+) -> dict:
     """Atomically replace learned-patterns.md with the AI-merged content, then
     clear the candidate. Refuses to write empty content (never wipes the ruleset
     on a bad merge).
@@ -1225,14 +1261,19 @@ def consolidate_apply(merged_md: str, root: Path | None = None,
     wrong file, not against the content of the right one.
     """
     if not merged_md or not merged_md.strip():
-        return {"ok": False, "error": "merged content is empty; refusing to overwrite learned-patterns.md"}
+        return {
+            "ok": False,
+            "error": "merged content is empty; refusing to overwrite learned-patterns.md",
+        }
     if not parse_patterns(merged_md):
         # Non-empty prose is not a ruleset. Writing it would replace every pattern
         # with commentary and clear the candidate file in the same call, so the
         # staged learnings would be gone with nothing to show for them.
-        return {"ok": False,
-                "error": "merged content has no recognizable patterns; "
-                         "refusing to overwrite learned-patterns.md"}
+        return {
+            "ok": False,
+            "error": "merged content has no recognizable patterns; "
+            "refusing to overwrite learned-patterns.md",
+        }
     merged_md = _redact(merged_md)
     store.ensure_layout(root)
     staged = candidate_count(root, namespace)
@@ -1249,10 +1290,14 @@ def consolidate_apply(merged_md: str, root: Path | None = None,
     _atomic_write(common_file(root, namespace), body)
     cleared = clear_candidate(root, namespace, only_ids=candidate_ids)
     _record_consolidation(staged, namespace, root)
-    result = {"ok": True, "path": str(common_file(root, namespace)),
-              "namespace": namespace or DEFAULT_NAMESPACE,
-              "consolidated_from_candidate": staged, "candidate_cleared": cleared,
-              "patterns_now": len(list_patterns(root=root, namespace=namespace))}
+    result = {
+        "ok": True,
+        "path": str(common_file(root, namespace)),
+        "namespace": namespace or DEFAULT_NAMESPACE,
+        "consolidated_from_candidate": staged,
+        "candidate_cleared": cleared,
+        "patterns_now": len(list_patterns(root=root, namespace=namespace)),
+    }
     if backup is not None:
         result["backup"] = str(backup)
     return result
@@ -1286,16 +1331,539 @@ def _snapshot_before_apply(root: Path | None, namespace: str | None) -> Path | N
 
 
 # ---------------------------------------------------------------------------
+# Curated consolidation previews
+# ---------------------------------------------------------------------------
+
+
+def _sha256_json(value: object) -> str:
+    """Return a stable digest for durable snapshots and generations."""
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _content_generation(raw: str | None) -> str:
+    """Represent an absent file distinctly from an empty durable document."""
+    return _sha256_json({"raw": raw, "present": raw is not None})
+
+
+def consolidation_preview_dir(root: Path | None = None, namespace: str | None = None) -> Path:
+    """Directory containing immutable, namespace-local consolidation proposals."""
+    return _namespace_dir(namespace, root) / "consolidation-previews"
+
+
+def _preview_path(preview_id: str, root: Path | None, namespace: str | None) -> Path:
+    try:
+        parsed = uuid.UUID(preview_id)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("invalid consolidation preview id") from exc
+    return consolidation_preview_dir(root, namespace) / (str(parsed) + ".v1.json")
+
+
+def _read_current_text(path: Path, namespace_dir: Path) -> str | None:
+    if not path.exists():
+        return None
+    return store.read_text_nolink(path, namespace_dir)
+
+
+def _candidate_snapshot_entry(pattern: dict) -> dict:
+    normalized = _normalize_pattern(pattern)
+    return {
+        "id": normalized["id"],
+        "digest": _sha256_json(normalized),
+        "pattern": normalized,
+    }
+
+
+def _candidate_snapshot_matches(snapshot: Sequence[dict], current: Sequence[dict]) -> bool:
+    """Require every snapshotted record while allowing later append-only staging."""
+    expected = collections.Counter(
+        (str(item.get("id") or ""), str(item.get("digest") or "")) for item in snapshot
+    )
+    actual = collections.Counter(
+        (entry["id"], entry["digest"])
+        for entry in (_candidate_snapshot_entry(item) for item in current)
+    )
+    return all(actual[key] >= count for key, count in expected.items())
+
+
+def _candidate_body_after_consuming(current: Sequence[dict], consumed: Sequence[dict]) -> str:
+    """Keep unpreviewed and concurrently appended entries byte-independent of a preview."""
+    budget = collections.Counter((item["id"], item["digest"]) for item in consumed)
+    kept: list[dict] = []
+    for pattern in current:
+        entry = _candidate_snapshot_entry(pattern)
+        key = (entry["id"], entry["digest"])
+        if budget.get(key, 0):
+            budget[key] -= 1
+            continue
+        kept.append(entry["pattern"])
+    return _CANDIDATE_HEADER + "\n".join(render_pattern(item) for item in kept) + "\n"
+
+
+def _matching_candidate_record_ids(records: Sequence[dict], pattern: dict) -> list[str]:
+    """Find governed candidate records without making legacy markdown governing."""
+    rule = " ".join(str(pattern.get("guidance") or "").split())
+    return [
+        str(record["id"])
+        for record in records
+        if record.get("lifecycle") == "candidate"
+        and (
+            record.get("id") == pattern.get("id")
+            or " ".join(str(record.get("rule") or "").split()) == rule
+        )
+    ]
+
+
+def _preview_sidecar_document(
+    document: dict | None,
+    decisions: Sequence[dict],
+    snapshot: Sequence[dict],
+    *,
+    root: Path | None,
+    namespace: str | None,
+) -> tuple[dict | None, dict]:
+    """Apply deterministic lifecycle effects to a copy, never the live sidecar."""
+    if document is None:
+        return None, {"governed": False, "archived_record_ids": [], "selection": None}
+    proposed = json.loads(json.dumps(document))
+    decision_by_id = {item["candidate_id"]: item for item in decisions}
+    snapshot_by_id: dict[str, list[dict]] = {}
+    for item in snapshot:
+        snapshot_by_id.setdefault(item["id"], []).append(item)
+    now = _utc_now()
+    for record in proposed["records"]:
+        for candidate in snapshot_by_id.get(str(record.get("id") or ""), []):
+            decision = decision_by_id.get(candidate["id"])
+            if decision is None:
+                continue
+            action = decision["action"]
+            if action in {"merge", "promote"} and record["lifecycle"] == "candidate":
+                if record["recurrence"]["count"] < _PROMOTION_RECURRENCE_COUNT:
+                    raise ValueError("candidate_promotion_not_eligible")
+                record["lifecycle"] = "active"
+                record["timestamps"] = {
+                    **record["timestamps"],
+                    "updated_at": now,
+                    "archived_at": None,
+                }
+            elif action == "archive" and record["lifecycle"] != "archived":
+                record["lifecycle"] = "archived"
+                record["timestamps"] = {
+                    **record["timestamps"],
+                    "updated_at": now,
+                    "archived_at": now,
+                }
+    # Legacy sidecars carry different record ids. Match their rule payloads only when
+    # the candidate relation is unambiguous, avoiding a guessed lifecycle transition.
+    for entry in snapshot:
+        decision = decision_by_id[entry["id"]]
+        matches = _matching_candidate_record_ids(proposed["records"], entry["pattern"])
+        if len(matches) != 1:
+            continue
+        record = next(item for item in proposed["records"] if item["id"] == matches[0])
+        if decision["action"] in {"merge", "promote"}:
+            if record["recurrence"]["count"] < _PROMOTION_RECURRENCE_COUNT:
+                raise ValueError("candidate_promotion_not_eligible")
+            record["lifecycle"] = "active"
+            record["timestamps"] = {**record["timestamps"], "updated_at": now, "archived_at": None}
+        elif decision["action"] == "archive":
+            record["lifecycle"] = "archived"
+            record["timestamps"] = {**record["timestamps"], "updated_at": now, "archived_at": now}
+
+    cfg = store.load_config(root)
+    review = cfg.get("review") if isinstance(cfg, dict) else None
+    budgets = validate_active_context_budgets(review)
+    bindings = validate_namespace_bindings((review or {}).get("namespace_bindings"))
+    binding = bindings.get(namespace or DEFAULT_NAMESPACE, {})
+    default_scope = "repository" if binding.get("scope") == "repository" else "global"
+    candidates = [
+        {
+            "record": record,
+            "namespace": namespace or DEFAULT_NAMESPACE,
+            "scope": _record_context_scope(record, default_scope),
+        }
+        for record in proposed["records"]
+        if record["lifecycle"] in {"active", "pinned"}
+    ]
+    selection = select_active_context(candidates, budgets)
+    overflow = {
+        item["record_id"]
+        for item in selection["decisions"]
+        if item["reason"] != "selected" and item["lifecycle"] == "active"
+    }
+    if overflow:
+        for record in proposed["records"]:
+            if record["id"] in overflow:
+                record["lifecycle"] = "archived"
+                record["timestamps"] = {
+                    **record["timestamps"],
+                    "updated_at": now,
+                    "archived_at": now,
+                }
+    validate_learning_records_document(proposed)
+    return proposed, {
+        "governed": True,
+        "archived_record_ids": sorted(overflow),
+        "selection": {
+            "usage": selection["usage"],
+            "budgets": selection["budgets"],
+            "decisions": selection["decisions"],
+        },
+    }
+
+
+def _validate_consolidation_proposal(
+    proposal: object, selected_ids: set[str]
+) -> tuple[str, list[dict]]:
+    """Accept only a complete, machine-readable worker proposal."""
+    if not isinstance(proposal, dict) or set(proposal) != {"ruleset_markdown", "decisions"}:
+        raise ValueError("malformed_worker_output")
+    ruleset = proposal.get("ruleset_markdown")
+    decisions = proposal.get("decisions")
+    if (
+        not isinstance(ruleset, str)
+        or not parse_patterns(ruleset)
+        or not isinstance(decisions, list)
+    ):
+        raise ValueError("malformed_worker_output")
+    normalized: list[dict] = []
+    ids: set[str] = set()
+    for item in decisions:
+        if not isinstance(item, dict) or set(item) != {"candidate_id", "action", "reason_code"}:
+            raise ValueError("malformed_worker_output")
+        candidate_id = item.get("candidate_id")
+        action = item.get("action")
+        reason_code = item.get("reason_code")
+        if (
+            not isinstance(candidate_id, str)
+            or candidate_id not in selected_ids
+            or candidate_id in ids
+            or action not in _CONSOLIDATION_ACTIONS
+            or not isinstance(reason_code, str)
+            or not _CONSOLIDATION_REASON_CODE_RE.fullmatch(reason_code)
+        ):
+            raise ValueError("malformed_worker_output")
+        ids.add(candidate_id)
+        normalized.append(
+            {"candidate_id": candidate_id, "action": action, "reason_code": reason_code}
+        )
+    if ids != selected_ids:
+        raise ValueError("malformed_worker_output")
+    return ruleset if ruleset.endswith("\n") else ruleset + "\n", normalized
+
+
+def create_consolidation_preview(
+    proposal: object,
+    *,
+    candidate_ids: Sequence[str] | None = None,
+    candidate_snapshot: Sequence[dict] | None = None,
+    root: Path | None = None,
+    namespace: str | None = None,
+    now: float | None = None,
+) -> dict:
+    """Persist a no-write preview from an LLM proposal and immutable local snapshots."""
+    ns = namespace or DEFAULT_NAMESPACE
+    if ns != DEFAULT_NAMESPACE and not _is_valid_ns_name(ns):
+        raise ValueError("invalid_namespace")
+    with _candidate_lock(root, ns):
+        ns_dir = _namespace_dir(ns, root)
+        current_candidates = list_candidate(root, ns)
+        if not current_candidates:
+            raise ValueError("nothing_to_consolidate")
+        available_ids = {str(item["id"]) for item in current_candidates}
+        selected_ids = available_ids if candidate_ids is None else set(candidate_ids)
+        if (
+            not selected_ids
+            or any(not isinstance(item, str) or item not in available_ids for item in selected_ids)
+            or (candidate_ids is not None and len(set(candidate_ids)) != len(candidate_ids))
+        ):
+            raise ValueError("invalid_candidate_ids")
+        snapshot = []
+        for item in candidate_snapshot or current_candidates:
+            pattern = item.get("pattern") if candidate_snapshot is not None else item
+            if not isinstance(pattern, dict):
+                raise ValueError("invalid_candidate_snapshot")
+            entry = _candidate_snapshot_entry(pattern)
+            if candidate_snapshot is not None and (
+                item.get("id") != entry["id"] or item.get("digest") != entry["digest"]
+            ):
+                raise ValueError("invalid_candidate_snapshot")
+            snapshot.append(entry)
+        if not _candidate_snapshot_matches(snapshot, current_candidates):
+            raise ValueError("candidate_snapshot_changed")
+        selected_snapshot = [item for item in snapshot if item["id"] in selected_ids]
+        ruleset, decisions = _validate_consolidation_proposal(proposal, selected_ids)
+        active_raw = _read_current_text(common_file(root, ns), ns_dir)
+        sidecar_path = learning_records_file(root, ns)
+        sidecar_raw = _read_current_text(sidecar_path, ns_dir)
+        sidecar_document = None
+        if sidecar_raw is not None:
+            sidecar_document, _ = _read_learning_records_document(sidecar_path, ns_dir)
+        proposed_sidecar, budget_impact = _preview_sidecar_document(
+            sidecar_document, decisions, selected_snapshot, root=root, namespace=ns
+        )
+        generated_at = time.time() if now is None else now
+        preview_id = str(uuid.uuid4())
+        preview = {
+            "schema": CONSOLIDATION_PREVIEW_SCHEMA,
+            "version": CONSOLIDATION_PREVIEW_VERSION,
+            "artifact_generation": 1,
+            "preview_id": preview_id,
+            "namespace": ns,
+            "created_at": _utc_now(),
+            "created_at_epoch": generated_at,
+            "expires_at_epoch": generated_at + CONSOLIDATION_PREVIEW_TTL_SECONDS,
+            "status": "pending_confirmation",
+            "candidate_snapshot": snapshot,
+            "candidate_snapshot_digest": _sha256_json(snapshot),
+            "selected_candidate_ids": sorted(selected_ids),
+            "selected_candidate_digest": _sha256_json(selected_snapshot),
+            "active_ruleset_generation": _content_generation(active_raw),
+            "sidecar_generation": _content_generation(sidecar_raw),
+            "proposed_ruleset_markdown": ruleset,
+            "proposed_ruleset_digest": _content_generation(ruleset),
+            "proposed_sidecar_document": proposed_sidecar,
+            "per_candidate_decisions": decisions,
+            "budget_impact": budget_impact,
+        }
+        consolidation_preview_dir(root, ns).mkdir(parents=True, exist_ok=True)
+        _atomic_write(
+            _preview_path(preview_id, root, ns),
+            json.dumps(preview, indent=2, sort_keys=True) + "\n",
+        )
+    return preview
+
+
+def _read_consolidation_preview(preview_id: str, root: Path | None, namespace: str | None) -> dict:
+    path = _preview_path(preview_id, root, namespace)
+    raw = store.read_text_nolink(path, consolidation_preview_dir(root, namespace))
+    try:
+        preview = json.loads(raw or "")
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("invalid_preview_artifact") from exc
+    required = {
+        "schema",
+        "version",
+        "artifact_generation",
+        "preview_id",
+        "namespace",
+        "created_at",
+        "created_at_epoch",
+        "expires_at_epoch",
+        "status",
+        "candidate_snapshot",
+        "candidate_snapshot_digest",
+        "selected_candidate_ids",
+        "selected_candidate_digest",
+        "active_ruleset_generation",
+        "sidecar_generation",
+        "proposed_ruleset_markdown",
+        "proposed_ruleset_digest",
+        "proposed_sidecar_document",
+        "per_candidate_decisions",
+        "budget_impact",
+    }
+    if (
+        not isinstance(preview, dict)
+        or set(preview) - {"applied_at", "applied_at_epoch", *required}
+        or not required.issubset(preview)
+        or preview.get("schema") != CONSOLIDATION_PREVIEW_SCHEMA
+        or preview.get("version") != CONSOLIDATION_PREVIEW_VERSION
+        or preview.get("namespace") != (namespace or DEFAULT_NAMESPACE)
+    ):
+        raise ValueError("invalid_preview_artifact")
+    return preview
+
+
+def consolidation_preview_state(
+    preview: dict,
+    *,
+    root: Path | None = None,
+    namespace: str | None = None,
+    now: float | None = None,
+) -> dict:
+    """Compute expiry and freshness without mutating a proposal artifact."""
+    current = time.time() if now is None else now
+    ns = namespace or DEFAULT_NAMESPACE
+    ns_dir = _namespace_dir(ns, root)
+    active_raw = _read_current_text(common_file(root, ns), ns_dir)
+    sidecar_raw = _read_current_text(learning_records_file(root, ns), ns_dir)
+    candidates = list_candidate(root, ns)
+    stale_reasons: list[str] = []
+    if _content_generation(active_raw) != preview["active_ruleset_generation"]:
+        stale_reasons.append("active_ruleset_changed")
+    if _content_generation(sidecar_raw) != preview["sidecar_generation"]:
+        stale_reasons.append("sidecar_changed")
+    if not _candidate_snapshot_matches(preview["candidate_snapshot"], candidates):
+        stale_reasons.append("candidate_snapshot_changed")
+    return {
+        "preview_id": preview["preview_id"],
+        "namespace": ns,
+        "status": preview["status"],
+        "expired": current >= preview["expires_at_epoch"],
+        "stale": bool(stale_reasons),
+        "stale_reasons": stale_reasons,
+        "expires_at_epoch": preview["expires_at_epoch"],
+    }
+
+
+def get_consolidation_preview(
+    preview_id: str,
+    *,
+    root: Path | None = None,
+    namespace: str | None = None,
+    now: float | None = None,
+) -> dict:
+    preview = _read_consolidation_preview(preview_id, root, namespace)
+    return {
+        **preview,
+        "state": consolidation_preview_state(preview, root=root, namespace=namespace, now=now),
+    }
+
+
+def list_consolidation_previews(
+    *, root: Path | None = None, namespace: str | None = None, now: float | None = None
+) -> list[dict]:
+    directory = consolidation_preview_dir(root, namespace)
+    if not directory.is_dir():
+        return []
+    previews: list[dict] = []
+    for path in directory.glob("*.v1.json"):
+        try:
+            preview = _read_consolidation_preview(
+                path.name.removesuffix(".v1.json"), root, namespace
+            )
+            previews.append(
+                {
+                    "preview_id": preview["preview_id"],
+                    "namespace": preview["namespace"],
+                    "created_at": preview["created_at"],
+                    "selected_candidate_ids": preview["selected_candidate_ids"],
+                    "state": consolidation_preview_state(
+                        preview, root=root, namespace=namespace, now=now
+                    ),
+                }
+            )
+        except (OSError, ValueError):
+            continue
+    return sorted(previews, key=lambda item: str(item["created_at"]), reverse=True)
+
+
+def _restore_preview_transaction(before: dict[Path, str | None]) -> None:
+    for path, raw in before.items():
+        if raw is None:
+            if path.exists():
+                path.unlink()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            store.atomic_write_text(path, raw)
+
+
+def apply_consolidation_preview(
+    preview_id: str,
+    *,
+    confirmed: bool,
+    root: Path | None = None,
+    namespace: str | None = None,
+    now: float | None = None,
+) -> dict:
+    """Confirm one fresh preview, with rollback before any staged candidate is consumed."""
+    if not confirmed:
+        return {"ok": False, "code": "confirmation_required"}
+    ns = namespace or DEFAULT_NAMESPACE
+    with _candidate_lock(root, ns):
+        preview = _read_consolidation_preview(preview_id, root, ns)
+        if preview["status"] == "applied":
+            return {"ok": False, "code": "preview_already_applied"}
+        state = consolidation_preview_state(preview, root=root, namespace=ns, now=now)
+        if state["expired"]:
+            return {"ok": False, "code": "preview_expired", "state": state}
+        if state["stale"]:
+            return {"ok": False, "code": "preview_stale", "state": state}
+        ns_dir = _namespace_dir(ns, root)
+        current_candidates = list_candidate(root, ns)
+        consumed_ids = {
+            item["candidate_id"]
+            for item in preview["per_candidate_decisions"]
+            if item["action"] != "retain"
+        }
+        consumed = [item for item in preview["candidate_snapshot"] if item["id"] in consumed_ids]
+        candidate_body = _candidate_body_after_consuming(current_candidates, consumed)
+        live_path = common_file(root, ns)
+        sidecar_path = learning_records_file(root, ns)
+        candidate_path = candidate_file(root, ns)
+        before = {
+            live_path: _read_current_text(live_path, ns_dir),
+            sidecar_path: _read_current_text(sidecar_path, ns_dir),
+            candidate_path: _read_current_text(candidate_path, ns_dir),
+        }
+        writes: list[tuple[Path, str]] = [(live_path, preview["proposed_ruleset_markdown"])]
+        if preview["proposed_sidecar_document"] is not None:
+            writes.append(
+                (
+                    sidecar_path,
+                    json.dumps(preview["proposed_sidecar_document"], indent=2, sort_keys=True)
+                    + "\n",
+                )
+            )
+        writes.append((candidate_path, candidate_body))
+        try:
+            for path, body in writes:
+                if before[path] != body:
+                    _atomic_write(path, body)
+        except Exception as exc:
+            try:
+                _restore_preview_transaction(before)
+            except Exception as rollback_exc:
+                return {
+                    "ok": False,
+                    "code": "apply_rollback_failed",
+                    "error_code": type(rollback_exc).__name__,
+                }
+            return {"ok": False, "code": "apply_rolled_back", "error_code": type(exc).__name__}
+        preview = {
+            **preview,
+            "status": "applied",
+            "artifact_generation": preview["artifact_generation"] + 1,
+            "applied_at": _utc_now(),
+            "applied_at_epoch": time.time() if now is None else now,
+        }
+        _atomic_write(
+            _preview_path(preview_id, root, ns),
+            json.dumps(preview, indent=2, sort_keys=True) + "\n",
+        )
+        return {
+            "ok": True,
+            "code": "preview_applied",
+            "preview_id": preview_id,
+            "namespace": ns,
+            "consumed_candidate_ids": sorted(consumed_ids),
+            "retained_candidate_ids": sorted(set(preview["selected_candidate_ids"]) - consumed_ids),
+            "budget_impact": preview["budget_impact"],
+        }
+
+
+# ---------------------------------------------------------------------------
 # Seed set — deliberately MINIMAL (bootstraps the common warm-start layer)
 # ---------------------------------------------------------------------------
 
 DEFAULT_SEED_PATTERNS: list[dict] = [
-    {"title": "Reset guard flags on every exit path", "scope": "common", "impact": "high",
-     "dimension": "correctness", "seed": True,
-     "guidance": "When a boolean guard gates a loop or state machine, ensure it is reset on ALL exit paths, including early returns and exceptions, so the next cycle never reads a stale invariant."},
-    {"title": "Authorize by confirming the owner, not by rejecting known-bad", "scope": "common", "impact": "high",
-     "dimension": "security", "seed": True,
-     "guidance": "Authorization must positively confirm the authenticated principal. Negative-only checks (reject known-bad, reject if disabled) are fail-open — any unanticipated caller passes."},
+    {
+        "title": "Reset guard flags on every exit path",
+        "scope": "common",
+        "impact": "high",
+        "dimension": "correctness",
+        "seed": True,
+        "guidance": "When a boolean guard gates a loop or state machine, ensure it is reset on ALL exit paths, including early returns and exceptions, so the next cycle never reads a stale invariant.",
+    },
+    {
+        "title": "Authorize by confirming the owner, not by rejecting known-bad",
+        "scope": "common",
+        "impact": "high",
+        "dimension": "security",
+        "seed": True,
+        "guidance": "Authorization must positively confirm the authenticated principal. Negative-only checks (reject known-bad, reject if disabled) are fail-open — any unanticipated caller passes.",
+    },
 ]
 
 
@@ -1314,8 +1882,11 @@ def seed_common(root: Path | None = None, force: bool = False) -> int:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Code Review Sage learning store (V2, file-centric + namespaces)")
+    ap = argparse.ArgumentParser(
+        description="Code Review Sage learning store (V2, file-centric + namespaces)"
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("seed").add_argument("--force", action="store_true")
     lp = sub.add_parser("list-patterns")
@@ -1326,8 +1897,12 @@ def _main(argv: list[str] | None = None) -> int:
     sp.add_argument("--file", required=True, help="JSON pattern file")
     sp.add_argument("--source", required=True, choices=sorted(ADMISSIBLE_SOURCES))
     sp.add_argument("--namespace", default=None)
-    cp = sub.add_parser("consolidate", help="apply the AI-merged learned-patterns.md and clear the candidate")
-    cp.add_argument("--merged-file", required=True, help="file holding the AI-merged learned-patterns.md")
+    cp = sub.add_parser(
+        "consolidate", help="apply the AI-merged learned-patterns.md and clear the candidate"
+    )
+    cp.add_argument(
+        "--merged-file", required=True, help="file holding the AI-merged learned-patterns.md"
+    )
     cp.add_argument("--namespace", default=None)
     cc = sub.add_parser("clear-candidate")
     cc.add_argument("--namespace", default=None)
