@@ -327,6 +327,17 @@ export default function LearningView() {
         queryKey: ['code-review-sage', 'consolidation-previews', ns],
       })
     },
+    onError: (error) => {
+      if (error instanceof SageApiError && error.code === 'consolidation_in_progress') {
+        setPreviewIdsBeforeRequest(previewsQuery.data?.previews.map((p) => p.preview_id) ?? [])
+        setPreviewFailure(null)
+        setAwaitingPreview(true)
+        void qc.invalidateQueries({ queryKey: ['code-review-sage', 'learnings', ns] })
+        void qc.invalidateQueries({
+          queryKey: ['code-review-sage', 'consolidation-previews', ns],
+        })
+      }
+    },
   })
   const applyPreview = useMutation({
     mutationFn: () =>
@@ -392,7 +403,6 @@ export default function LearningView() {
       setPreviewFailure(i18nT('apps.codeReviewSage.views.learningView.preview_failed'))
     }
   }, [awaitingPreview, learningsQuery.data?.consolidate_error])
-
   if (!ns) {
     return (
       <div className="h-full overflow-y-auto scrollbar-none px-4 md:px-6 py-6">
@@ -414,10 +424,14 @@ export default function LearningView() {
       current.includes(id) ? current.filter((candidateId) => candidateId !== id) : [...current, id],
     )
   }
+  const followingExistingPreview =
+    awaitingPreview &&
+    previewRequest.error instanceof SageApiError &&
+    previewRequest.error.code === 'consolidation_in_progress'
   const requestError =
-    previewRequest.error instanceof SageApiError
+    !followingExistingPreview && previewRequest.error instanceof SageApiError
       ? localizedCode(previewRequest.error.code, 'request')
-      : previewRequest.error
+      : !followingExistingPreview && previewRequest.error
         ? i18nT('apps.codeReviewSage.views.learningView.request_unknown')
         : null
   const applyError =
@@ -448,6 +462,62 @@ export default function LearningView() {
             'apps.codeReviewSage.views.learningView.reviews_read_the_consolidated_ruleset_below_neve',
           )}
         </p>
+
+        <section className="mt-6" aria-labelledby="sage-preview-list-heading">
+          <div className="flex flex-wrap items-center gap-2">
+            <FileText className="lucide-inline text-muted" aria-hidden="true" />
+            <h2
+              id="sage-preview-list-heading"
+              className="text-[11px] font-semibold uppercase tracking-wider text-muted"
+            >
+              {i18nT('apps.codeReviewSage.views.learningView.preview_history')}
+            </h2>
+          </div>
+          {awaitingPreview && (
+            <p className="mt-2 inline-flex items-center gap-2 text-[12.5px] text-muted">
+              <Loader2
+                className="lucide-inline animate-spin motion-reduce:animate-none"
+                aria-hidden="true"
+              />
+              {i18nT('apps.codeReviewSage.views.learningView.preparing_preview')}
+            </p>
+          )}
+          {(previewFailure || requestError || applyError) && (
+            <p className="mt-2 text-[12.5px] text-danger">
+              {previewFailure || requestError || applyError}
+            </p>
+          )}
+          {previewsQuery.error && (
+            <p className="mt-2 text-[12.5px] text-danger">
+              {i18nT('apps.codeReviewSage.views.learningView.previews_unavailable')}
+            </p>
+          )}
+          {(previewsQuery.data?.previews.length ?? 0) > 0 && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {previewsQuery.data?.previews.map((preview) => (
+                <Btn
+                  key={preview.preview_id}
+                  type="button"
+                  onClick={() => setPreviewId(preview.preview_id)}
+                  className={
+                    activePreviewId === preview.preview_id ? '!border-accent !text-accent' : ''
+                  }
+                >
+                  {i18nT('apps.codeReviewSage.views.learningView.preview_selected_count', {
+                    count: preview.selected_candidate_ids.length,
+                  })}
+                </Btn>
+              ))}
+            </div>
+          )}
+          {previewDetailQuery.data?.preview && (
+            <PreviewPane
+              preview={previewDetailQuery.data.preview}
+              applying={applyPreview.isPending}
+              onApply={() => applyPreview.mutate()}
+            />
+          )}
+        </section>
 
         {learningsQuery.isLoading && (
           <div className="mt-6 inline-flex items-center gap-2 text-[13px] text-muted">
@@ -578,61 +648,6 @@ export default function LearningView() {
               </ul>
             )}
 
-            <section className="mt-7" aria-labelledby="sage-preview-list-heading">
-              <div className="flex flex-wrap items-center gap-2">
-                <FileText className="lucide-inline text-muted" aria-hidden="true" />
-                <h2
-                  id="sage-preview-list-heading"
-                  className="text-[11px] font-semibold uppercase tracking-wider text-muted"
-                >
-                  {i18nT('apps.codeReviewSage.views.learningView.preview_history')}
-                </h2>
-              </div>
-              {awaitingPreview && (
-                <p className="mt-2 inline-flex items-center gap-2 text-[12.5px] text-muted">
-                  <Loader2
-                    className="lucide-inline animate-spin motion-reduce:animate-none"
-                    aria-hidden="true"
-                  />
-                  {i18nT('apps.codeReviewSage.views.learningView.preparing_preview')}
-                </p>
-              )}
-              {(previewFailure || requestError || applyError) && (
-                <p className="mt-2 text-[12.5px] text-danger">
-                  {previewFailure || requestError || applyError}
-                </p>
-              )}
-              {previewsQuery.error && (
-                <p className="mt-2 text-[12.5px] text-danger">
-                  {i18nT('apps.codeReviewSage.views.learningView.previews_unavailable')}
-                </p>
-              )}
-              {(previewsQuery.data?.previews.length ?? 0) > 0 && (
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {previewsQuery.data?.previews.map((preview) => (
-                    <Btn
-                      key={preview.preview_id}
-                      type="button"
-                      onClick={() => setPreviewId(preview.preview_id)}
-                      className={
-                        activePreviewId === preview.preview_id ? '!border-accent !text-accent' : ''
-                      }
-                    >
-                      {i18nT('apps.codeReviewSage.views.learningView.preview_selected_count', {
-                        count: preview.selected_candidate_ids.length,
-                      })}
-                    </Btn>
-                  ))}
-                </div>
-              )}
-              {previewDetailQuery.data?.preview && (
-                <PreviewPane
-                  preview={previewDetailQuery.data.preview}
-                  applying={applyPreview.isPending}
-                  onApply={() => applyPreview.mutate()}
-                />
-              )}
-            </section>
           </>
         )}
       </div>
