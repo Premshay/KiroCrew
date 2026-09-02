@@ -26,7 +26,14 @@ function mount() {
       mutations: { retry: false },
     },
   })
-  return { qc, ...render(<QueryClientProvider client={qc}><SettingsView /></QueryClientProvider>) }
+  return {
+    qc,
+    ...render(
+      <QueryClientProvider client={qc}>
+        <SettingsView />
+      </QueryClientProvider>,
+    ),
+  }
 }
 
 /** Radix Select: open the trigger, then click the option by its accessible name. */
@@ -37,11 +44,23 @@ async function pick(triggerName: RegExp, optionName: string | RegExp): Promise<v
 
 const SETTINGS = {
   settings: {
-    model: 'zzz-model-a', effort: 'medium', active_namespaces: ['default'], max_concurrent: 2,
+    model: 'zzz-model-a',
+    effort: 'medium',
+    active_namespaces: ['default'],
+    max_concurrent: 2,
   },
   models: ['zzz-model-a', 'zzz-model-b'],
   efforts: ['zzz-low', 'zzz-high'],
   namespaces: ['default'],
+  reviewer: {
+    model: 'zzz-model-a',
+    effort: 'medium',
+    agent: 'sage-reviewer',
+    engine: 'acp',
+    provider: 'acp',
+    model_override_supported: true,
+    effort_override_supported: true,
+  },
   max_concurrent_max: 3,
 }
 
@@ -54,7 +73,11 @@ beforeEach(() => {
 describe('SettingsView', () => {
   it('says it is loading before the settings arrive', async () => {
     let release: (v: unknown) => void = () => {}
-    api.settings.mockReturnValue(new Promise(res => { release = res }))
+    api.settings.mockReturnValue(
+      new Promise((res) => {
+        release = res
+      }),
+    )
     mount()
     expect(screen.getByText(/Loading settings/i)).toBeInTheDocument()
     release(SETTINGS)
@@ -70,7 +93,9 @@ describe('SettingsView', () => {
 
   it('renders one control per setting, seeded from the server', async () => {
     mount()
-    expect(await screen.findByRole('combobox', { name: /Review model/i })).toHaveTextContent('zzz-model-a')
+    expect(await screen.findByRole('combobox', { name: /Review model/i })).toHaveTextContent(
+      'zzz-model-a',
+    )
     expect(screen.getByRole('combobox', { name: /Reasoning effort/i })).toBeInTheDocument()
     expect(screen.getByRole('combobox', { name: /Reviews at once/i })).toHaveTextContent('2')
   })
@@ -100,7 +125,7 @@ describe('SettingsView', () => {
   it('caps the concurrency options at the server-declared maximum', async () => {
     mount()
     fireEvent.click(await screen.findByRole('combobox', { name: /Reviews at once/i }))
-    const labels = (await screen.findAllByRole('option')).map(o => o.textContent)
+    const labels = (await screen.findAllByRole('option')).map((o) => o.textContent)
     expect(labels).toEqual(['1', '2', '3'])
   })
 
@@ -116,8 +141,12 @@ describe('SettingsView', () => {
     const invalidate = vi.spyOn(qc, 'invalidateQueries')
     await pick(/Reasoning effort/i, 'zzz-low')
     await waitFor(() => {
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['code-review-sage', 'runs'] })
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: ['code-review-sage', 'runs'],
+      })
     })
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['code-review-sage', 'settings'] })
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ['code-review-sage', 'settings'],
+    })
   })
 })

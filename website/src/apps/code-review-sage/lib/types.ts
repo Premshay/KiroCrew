@@ -4,20 +4,10 @@
 // requests, with its own private results + report. Several can be live at once.
 
 /** Terminal + live states a run can be in (backend ``run["status"]``). */
-export type RunStatus =
-  | 'running'
-  | 'done'
-  | 'error'
-  | 'cancelled'
-  | 'interrupted'
+export type RunStatus = 'running' | 'done' | 'error' | 'cancelled' | 'interrupted'
 
 /** Per-change phase the driver reports as it works (``run.progress[change_id]``). */
-export type ChangePhase =
-  | 'queued'
-  | 'reviewing'
-  | 'done'
-  | 'failed'
-  | 'cancelled'
+export type ChangePhase = 'queued' | 'reviewing' | 'done' | 'failed' | 'cancelled'
 
 /** What the reviewer is doing right now, relayed from its tool stream. The only
  * real evidence of forward motion inside a single multi-minute worker turn. */
@@ -294,8 +284,7 @@ export interface RepositorySource {
  *  neither of these: it is a legacy active namespace, still applied everywhere
  *  for compatibility and reported as a migration warning. */
 export type NamespaceBinding =
-  | { scope: 'global' }
-  | { scope: 'repository'; repository: RepositorySource }
+  { scope: 'global' } | { scope: 'repository'; repository: RepositorySource }
 
 /** Why a namespace was included in, or left out of, one review's ruleset. Widened
  *  with `string` because the backend owns the vocabulary and an unknown reason
@@ -364,7 +353,12 @@ export interface LearnedPattern {
 }
 
 export interface NamespacesResponse {
-  namespaces: { name: string; patterns: number; candidate: number; active: boolean }[]
+  namespaces: {
+    name: string
+    patterns: number
+    candidate: number
+    active: boolean
+  }[]
   active: string[]
 }
 
@@ -376,15 +370,89 @@ export interface AddRepoResponse {
   /** Set when a PULL REQUEST url was pasted: its repo was pinned and this is the
    *  pull request itself, so the caller can open it. */
   pull_request?: {
-    owner: string; repo: string; number: number; url: string; change_id: string
+    owner: string
+    repo: string
+    number: number
+    url: string
+    change_id: string
   }
 }
 
-export interface ConsolidateResponse {
+export interface ConsolidationPreviewRequest {
   ok: boolean
+  code: string
   namespace: string
-  staged: number
+  candidate_ids: string[]
   running: boolean
+}
+
+export interface ConsolidationPreviewState {
+  preview_id: string
+  namespace: string
+  status: string
+  expired: boolean
+  stale: boolean
+  stale_reasons: string[]
+  expires_at_epoch: number
+}
+
+export interface ConsolidationPreviewSummary {
+  preview_id: string
+  namespace: string
+  created_at: string
+  selected_candidate_ids: string[]
+  state: ConsolidationPreviewState
+}
+
+export interface ConsolidationPreviewListResponse {
+  code: string
+  namespace: string
+  previews: ConsolidationPreviewSummary[]
+}
+
+export interface ConsolidationPreviewDecision {
+  candidate_id: string
+  action: 'promote' | 'merge' | 'archive' | 'retain' | string
+  reason_code: string
+}
+
+export interface ConsolidationBudgetImpact {
+  governed: boolean
+  archived_record_ids: string[]
+  selection: {
+    usage: Record<string, { rules: number; tokens: number }>
+    budgets: Record<string, { max_rules: number; max_tokens: number }>
+  } | null
+}
+
+/** Snapshot-bound, server-owned proposal. String unions remain open because a
+ * newer gateway must degrade to a safe, localized unavailable action rather
+ * than make its preview impossible to inspect. */
+export interface ConsolidationPreview {
+  preview_id: string
+  namespace: string
+  status: string
+  selected_candidate_ids: string[]
+  proposed_ruleset_markdown: string
+  per_candidate_decisions: ConsolidationPreviewDecision[]
+  budget_impact: ConsolidationBudgetImpact
+  state: ConsolidationPreviewState
+}
+
+export interface ConsolidationPreviewDetailResponse {
+  code: string
+  preview: ConsolidationPreview
+}
+
+export interface ConsolidationPreviewApplyResponse {
+  ok: boolean
+  code: string
+  preview_id?: string
+  namespace?: string
+  consumed_candidate_ids?: string[]
+  retained_candidate_ids?: string[]
+  budget_impact?: ConsolidationBudgetImpact
+  state?: ConsolidationPreviewState
 }
 
 export interface LearningsResponse {

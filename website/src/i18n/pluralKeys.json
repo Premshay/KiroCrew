@@ -38,6 +38,8 @@
   "apps.codeReviewSage.views.learningView.confirm_merge",
   "apps.codeReviewSage.views.learningView.consolidate_pending",
   "apps.codeReviewSage.views.learningView.pattern",
+  "apps.codeReviewSage.views.learningView.preview_selected_count",
+  "apps.codeReviewSage.views.learningView.selected_count",
   "apps.crewCompanion.memories.days_together",
   "apps.crewCompanion.memories.row_breathing",
   "apps.crewCompanion.memories.row_reminders",
