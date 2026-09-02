@@ -18,7 +18,7 @@ import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-li
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { store } from '../store'
-import { sseStatus } from '../store/dashboardSlice'
+import { setUpdateProgress, sseStatus } from '../store/dashboardSlice'
 import { MemoryRouter } from 'react-router-dom'
 import { AboutPanel } from '../pages/settings/AboutPanel'
 
@@ -156,6 +156,27 @@ describe('AboutPanel maintenance blockers', () => {
 
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     expect(await screen.findByTestId('restart-blockers')).toBeInTheDocument()
+  })
+
+  it('leaves updating and shows blockers when a late barrier event arrives', async () => {
+    // The apply request succeeded long ago, then a session started while the
+    // update was building. The restart's only remaining reply path is the
+    // structured update-progress event, not the original HTTP response.
+    stubFetch({ applyStatus: 200, applyBody: { ok: true, status: 'updating' } })
+    mountWeb()
+
+    const dialog = await applyUpdate()
+    await within(dialog).findByText('Updating — gateway restarting…')
+
+    store.dispatch(setUpdateProgress({
+      step: 'blocked',
+      detail: 'restart waiting',
+      maintenance: ACK_BODY.maintenance,
+    }))
+
+    expect(await within(dialog).findByTestId('restart-blockers')).toBeInTheDocument()
+    await waitFor(() => expect(within(dialog).queryByText('Updating — gateway restarting…')).not.toBeInTheDocument())
+    expect(within(dialog).getByRole('button', { name: /update now/i })).not.toBeDisabled()
   })
 
   it('drops the panel when the operator starts a fresh restart', async () => {

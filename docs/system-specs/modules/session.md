@@ -433,9 +433,14 @@ ways:
 
 `ready()` is `active and not pending() and not unmanaged_busy`. When it is false
 the request is refused with **409 `{"code": "restart_ack_required", "maintenance":
-<payload>}`** and NOTHING is stopped. The barrier is re-read immediately before
-the destructive step as well as at the start, so work that starts during a slow
-MCP reconcile cannot slip through an acknowledgement taken before it existed.
+<payload>}`** and NOTHING is stopped. The barrier is checked before a
+policy-owned update command as well as before the normal update path, so an
+immediately blocked request has no update side effect. It is re-read immediately
+before the destructive step too, so work that starts during a slow update, build,
+install, or MCP reconcile cannot slip through an acknowledgement taken before it
+existed. A late refusal is carried as `update_progress` `{"step": "blocked",
+"maintenance": <payload>}` so the dashboard leaves its updating state and shows
+the same blocker controls.
 
 ### Slot acknowledgements
 
@@ -518,8 +523,9 @@ does not restart anything and another session can begin work in the meantime.
 `POST /api/restart` (restart the gateway without updating) is the one path that
 does not answer with `restart_ack_required`: it replies `200 {"status":
 "restarting"}` and re-execs in a background task, so its barrier refusal arrives
-later on the update-progress push as `("blocked", …)` and carries no blocker
-list.
+later on the structured `update_progress` push with the same `maintenance`
+payload. `RestartBlockers` then reads the named-worker report from its existing
+endpoint.
 
 ## Session Resume (SessionMap)
 

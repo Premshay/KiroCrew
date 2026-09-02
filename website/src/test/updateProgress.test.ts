@@ -78,4 +78,20 @@ describe('updateProgress in dashboardSlice', () => {
     expect(state.updateProgress?.step).toBe('failed')
     expect(state.updateProgress?.detail).toBe('Build error')
   })
+
+  it('retains maintenance details for a blocked restart', () => {
+    const maintenance = {
+      active: true,
+      ready: false,
+      required: ['dashboard:owner'],
+      pending: ['dashboard:owner'],
+      unmanaged_busy: [],
+    }
+    const state = reducer(initial, setUpdateProgress({
+      step: 'blocked',
+      detail: 'Restart acknowledgement required',
+      maintenance,
+    }))
+    expect(state.updateProgress?.maintenance).toEqual(maintenance)
+  })
 })

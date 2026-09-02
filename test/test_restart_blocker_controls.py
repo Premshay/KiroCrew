@@ -11,11 +11,13 @@ import pytest
 from kiro_crew.channel import ChannelManager
 from kiro_crew.dashboard import handlers
 from kiro_crew.dashboard.handlers.sessions import (
+    _blocker_lock,
     api_sessions_clear_restart_blockers,
     api_sessions_restart_blockers,
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import ConversationLog
+from kiro_crew.loop_lock import LoopBoundLock
 
 
 def _make_state(tmp_path) -> DashboardState:
@@ -359,3 +361,20 @@ class TestRouting:
     def test_the_dashboard_router_exports_both_handlers(self) -> None:
         assert handlers.api_sessions_restart_blockers is api_sessions_restart_blockers
         assert handlers.api_sessions_clear_restart_blockers is api_sessions_clear_restart_blockers
+
+
+class TestBlockerLock:
+    def test_long_lived_state_uses_a_loop_bound_lock(self, tmp_path) -> None:
+        state = _make_state(tmp_path)
+        lock = _blocker_lock(state)
+
+        assert isinstance(lock, LoopBoundLock)
+
+        async def _one_request_loop() -> None:
+            async with lock:
+                assert lock.locked() is True
+
+        # DashboardState can survive a test-server teardown and be re-used by a
+        # new request loop; the lock must bind safely on each loop.
+        asyncio.run(_one_request_loop())
+        asyncio.run(_one_request_loop())

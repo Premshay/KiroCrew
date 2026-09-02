@@ -36,6 +36,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew.config.loader import ConfigReadError
 from kiro_crew.dashboard.handlers import updates
+from kiro_crew.dashboard.restart_barrier import RestartBarrier
 from kiro_crew.platform import update_layout
 
 
@@ -81,6 +82,9 @@ def _request(body: object = None, *, query: dict[str, str] | None = None) -> Mag
     req.query = dict(query or {})
     state = MagicMock()
     state._background_tasks = set()
+    state._slots = {}
+    state.restart_barrier = RestartBarrier()
+    state.sessions.restart_barrier_snapshot = AsyncMock(return_value=[])
     req.app = {"state": state}
     return req
 

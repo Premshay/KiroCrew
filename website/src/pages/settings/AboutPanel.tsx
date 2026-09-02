@@ -545,6 +545,7 @@ function InAppUpdateFlow({ version, manualCommand, isChannelMove }: {
 
 export function AboutPanel() {
   const { botName, avatar } = useBranding()
+  const updateProgress = useAppSelector(s => s.dashboard.updateProgress)
   const gatewayVersion = useAppSelector(s => s.dashboard.status?.version) || ''
   const buildBranch = useAppSelector(s => s.dashboard.status?.branch) || ''
   const buildCommit = useAppSelector(s => s.dashboard.status?.commit) || ''
@@ -951,6 +952,15 @@ export function AboutPanel() {
       else setRestarting(true)
     },
   })
+  // A long update can pass its initial barrier check and later find a new busy
+  // session at restart time. The progress event is the only reply still open at
+  // that point; consume its structured maintenance payload as the same blocker
+  // state as an immediate 409 rather than leaving the dialog on "updating".
+  useEffect(() => {
+    if (updateProgress?.step !== 'blocked' || !updateProgress.maintenance) return
+    setRestarting(false)
+    setAckBlocked(true)
+  }, [updateProgress])
   // Restart WITHOUT updating: the missing half of the non-self-updatable flow.
   // After the user runs the copied installer command in a terminal, the running
   // gateway is still executing the old code and had no in-app way to reload.

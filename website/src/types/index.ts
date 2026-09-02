@@ -87,7 +87,18 @@ export interface StatusData {
   update_required?: boolean
   /** The floor that made the update mandatory (bare release, '' when none). */
   update_min_version?: string
-  update_progress?: { step: string; detail: string } | null
+  update_progress?: {
+    step: string
+    detail: string
+    /** Present when a late coordinated-reset barrier refusal stopped a restart. */
+    maintenance?: {
+      active: boolean
+      ready: boolean
+      required: string[]
+      pending: string[]
+      unmanaged_busy: string[]
+    }
+  } | null
   version?: string
   /**
    * The RUNNING build's version folded for display — the clean base on the

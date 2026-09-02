@@ -2425,16 +2425,16 @@ _BLOCKER_NOT_BLOCKING = "not_blocking"
 _MAX_BLOCKER_CLEAR_KEYS = 64
 
 
-def _blocker_lock(state: DashboardState) -> asyncio.Lock:
+def _blocker_lock(state: DashboardState) -> LoopBoundLock:
     """Serialise bulk clears so two operators cannot interleave one batch.
 
-    Bound on first use rather than in ``DashboardState.__init__`` so the lock
-    belongs to the loop that actually serves the request; the state object is
-    constructed before that loop exists.
+    DashboardState can outlive the event loop that first serves this endpoint,
+    so a LoopBoundLock prevents a later loop from awaiting a lock bound to a
+    closed predecessor.
     """
     lock = getattr(state, "_restart_blocker_lock", None)
-    if not isinstance(lock, asyncio.Lock):
-        lock = asyncio.Lock()
+    if not isinstance(lock, LoopBoundLock):
+        lock = LoopBoundLock()
         state._restart_blocker_lock = lock
     return lock
 

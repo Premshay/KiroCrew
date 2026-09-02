@@ -26,7 +26,7 @@ interface DashboardState {
   refreshTrigger: number
   unreadSlots: string[]
   slotsLoaded: boolean
-  updateProgress: { step: string; detail: string } | null
+  updateProgress: StatusData['update_progress']
   // Desktop updater: an update is discoverable/staged (found|downloading|
   // downloaded). Drives the Settings nav dot + the About tab dot. Mirrored
   // from the Electron update-state events by useUpdateSubscription.
@@ -356,7 +356,7 @@ const dashboardSlice = createSlice({
       state.unreadSlots = state.unreadSlots.filter(k => k !== action.payload)
       safeSet('mc-unread-slots', JSON.stringify(state.unreadSlots))
     },
-    setUpdateProgress(state, action: PayloadAction<{ step: string; detail: string } | null>) {
+    setUpdateProgress(state, action: PayloadAction<StatusData['update_progress']>) {
       state.updateProgress = action.payload
     },
     setDesktopUpdateAvailable(state, action: PayloadAction<boolean>) {

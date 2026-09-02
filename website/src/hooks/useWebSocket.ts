@@ -1838,7 +1838,7 @@ export function useWebSocket() {
             invalidateRefreshQueries(queryClient)
             break
           case 'update_progress': {
-            const prog = data as { step: string; detail: string }
+            const prog = data as NonNullable<import('../types').StatusData['update_progress']>
             if (prog.step === 'done') {
               dispatch(setUpdateProgress(null))
             } else {

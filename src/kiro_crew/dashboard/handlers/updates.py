@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
@@ -73,6 +74,24 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 logger = logging.getLogger(__name__)
 
 _SSE_INTERVAL_SECS = 5
+
+
+@dataclass(frozen=True)
+class GatewayRestartResult:
+    """The observed outcome of one gateway restart attempt.
+
+    A reset can become unsafe after a long update has already completed.  The
+    maintenance payload preserves that refusal for the caller that still has a
+    browser connection, instead of reducing it to a falsey result and leaving
+    the UI to wait for a restart that will not happen.
+    """
+
+    restarted: bool
+    maintenance: dict[str, object] | None = None
+
+    @property
+    def blocked(self) -> bool:
+        return self.maintenance is not None
 
 # ── Update ──
 
@@ -1414,7 +1433,7 @@ async def _venv_pip_install(proj: str, state: DashboardState) -> bool:
     return rc == 0
 
 
-async def _restart_gateway(state: DashboardState) -> bool:
+async def _restart_gateway(state: DashboardState) -> GatewayRestartResult:
     """Save state, close sessions, and exec the same Python process once.
 
     Restart is a process-wide transition.  Two callers must never both drain
@@ -1424,7 +1443,7 @@ async def _restart_gateway(state: DashboardState) -> bool:
     """
     if state._gateway_restart_in_progress:
         logger.info("Gateway restart already in progress; coalescing duplicate request")
-        return False
+        return GatewayRestartResult(restarted=False)
     state._gateway_restart_in_progress = True
     try:
         # This route bypasses ``/api/sessions/restart`` and would otherwise kill
@@ -1443,8 +1462,9 @@ async def _restart_gateway(state: DashboardState) -> bool:
                 "blocked",
                 "Gateway restart is waiting for session acknowledgements; "
                 "no sessions were stopped.",
+                maintenance=status,
             )
-            return False
+            return GatewayRestartResult(restarted=False, maintenance=status)
         state.restart_barrier.clear()
         _publish_restart_barrier(state)
         state.push_update_progress("restarting", "Restarting server…")
@@ -1463,7 +1483,7 @@ async def _restart_gateway(state: DashboardState) -> bool:
         exe = await asyncio.to_thread(respawn_executable)
         if not os.path.isfile(exe) or not os.access(exe, os.X_OK):
             state.push_update_progress("error", "Cannot restart: invalid Python executable path")
-            return False
+            return GatewayRestartResult(restarted=False)
         # circular import: kiro_crew.dashboard.chat imports from
         # kiro_crew.dashboard.handlers (which re-exports this module), so this
         # must stay inline to avoid an import cycle at module load.
@@ -1502,7 +1522,7 @@ async def _restart_gateway(state: DashboardState) -> bool:
             logger.debug("Breadcrumb flush before restart failed", exc_info=True)
         await asyncio.sleep(0.5)
         reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
-        return True
+        return GatewayRestartResult(restarted=True)
     finally:
         state._gateway_restart_in_progress = False
 
@@ -1510,6 +1530,21 @@ async def _restart_gateway(state: DashboardState) -> bool:
 async def api_update_apply(request: web.Request) -> web.Response:
     """POST /api/update — git pull, rebuild, restart gateway."""
     state: DashboardState = request.app["state"]
+
+    # Refuse before a policy-owned update command can mutate the installation.
+    # A later recheck in _restart_gateway still catches work that begins while
+    # a long update, build, or install is running.
+    from kiro_crew.dashboard.handlers.sessions import (
+        _publish_restart_barrier,
+        _restart_barrier_status,
+    )
+
+    status = await _restart_barrier_status(state, open_if_busy=True)
+    if status["ready"] is not True:
+        _publish_restart_barrier(state)
+        return web.json_response(
+            {"ok": False, "code": "restart_ack_required", "maintenance": status}, status=409
+        )
 
     # A policy-defined provider OWNS the update on this host. Checked before the
     # git precondition below so an authenticated operator clicking Update cannot
@@ -1531,22 +1566,17 @@ async def api_update_apply(request: web.Request) -> web.Response:
                 },
                 status=500,
             )
-        await _restart_gateway(state)
+        restart = await _restart_gateway(state)
+        if restart.blocked:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "code": "restart_ack_required",
+                    "maintenance": restart.maintenance,
+                },
+                status=409,
+            )
         return web.json_response({"ok": True, "status": "updating"})
-    # Refuse before pulling or reinstalling when the resulting self-restart is
-    # unsafe. The second check in ``_restart_gateway`` still covers work that
-    # starts while the update is running.
-    from kiro_crew.dashboard.handlers.sessions import (
-        _publish_restart_barrier,
-        _restart_barrier_status,
-    )
-
-    status = await _restart_barrier_status(state, open_if_busy=True)
-    if status["ready"] is not True:
-        _publish_restart_barrier(state)
-        return web.json_response(
-            {"ok": False, "code": "restart_ack_required", "maintenance": status}, status=409
-        )
 
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
     if not proj:
@@ -1735,7 +1765,13 @@ async def api_update_apply(request: web.Request) -> web.Response:
 
             # Restart: save history + clean up sessions then exec the same process.
             logger.info("Update complete — saving history and cleaning up before restart")
-            await _restart_gateway(state)
+            restart = await _restart_gateway(state)
+            if restart.blocked:
+                # The initial request already returned 200 before this long
+                # operation reached its second barrier check.  The structured
+                # progress event is therefore the response path the UI can use
+                # to stop its updating state and render the blocker controls.
+                return
         except Exception:
             logger.exception("Update failed")
             state.push_update_progress("failed", "Update failed — check logs")
@@ -2246,6 +2282,12 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
     layout, including a desktop bundle's embedded gateway.
     """
     state: DashboardState = request.app["state"]
+    if state._gateway_restart_in_progress:
+        return web.json_response({"ok": True, "already_in_progress": True})
+
+    # Claim before the response-flush delay, or a second click could schedule a
+    # second task before _restart_gateway reaches its own process-wide guard.
+    state._gateway_restart_in_progress = True
 
     # Reply BEFORE restarting. os.execv replaces the process image, so a restart
     # kicked off inline would tear down the connection mid-response and the
@@ -2254,10 +2296,15 @@ async def api_gateway_restart(request: web.Request) -> web.Response:
         # Let the response flush before the process image is replaced.
         await asyncio.sleep(0.25)
         try:
+            # No await occurs between releasing the response-time reservation
+            # and entering _restart_gateway, whose claim is synchronous.
+            state._gateway_restart_in_progress = False
             await _restart_gateway(state)
         except Exception:
             logger.exception("Gateway restart failed")
             state.push_update_progress("failed", "Restart failed — check logs")
+        finally:
+            state._gateway_restart_in_progress = False
 
     task = asyncio.create_task(_restart())
     state._background_tasks.add(task)
