@@ -339,9 +339,19 @@ class TestSelectivePosting(_Base):
 
 
 class TestRecordsSurviveForPosting(_Base):
+    @staticmethod
+    def _record_for_task(task):
+        import re
+
+        capability = re.search(r"result_capability` exactly as `([^`]+)`", task)
+        assert capability is not None
+        record = _record()
+        record["result_capability"] = capability.group(1)
+        return record
+
     def _dispatch(self):
         def dispatch(task, timeout=0):
-            results.write_result(_record(), self.root)
+            results.write_result(self._record_for_task(task), self.root)
             return {"ok": True, "output": "done", "error": ""}
         return dispatch
 
@@ -364,7 +374,7 @@ class TestRecordsSurviveForPosting(_Base):
 
         def dispatch(task, timeout=0):
             if "SINGLE thorough pass" in task:
-                results.write_result(_record(), self.root)
+                results.write_result(self._record_for_task(task), self.root)
             else:
                 rec = results.read_result("CR-1", self.root, None)
                 if rec:

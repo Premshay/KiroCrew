@@ -2614,11 +2614,11 @@ class TestNoRowFieldIsExemptFromRedaction(unittest.TestCase):
         return report.__file__
 
 
-class TestWholeRunsSerialize:
-    """A second run's body must not start while the first is still reviewing."""
+class TestRunsDispatchInParallel:
+    """Independent claimed changes do not wait behind another run."""
 
     @pytest.mark.asyncio
-    async def test_run_bodies_do_not_overlap(self, monkeypatch, tmp_path):
+    async def test_run_bodies_overlap_after_claiming(self, monkeypatch, tmp_path):
         import asyncio
 
         mod = _load_routes_module()
@@ -2631,8 +2631,7 @@ class TestWholeRunsSerialize:
             inside += 1
             if inside > 1:
                 overlapped.append(True)
-            # Yield the GIL the way real work does, so an unserialized second body
-            # would get in here.
+            # Yield the GIL as a real review does while it waits on a worker.
             import time
             time.sleep(0.05)
             inside -= 1
@@ -2659,19 +2658,14 @@ class TestWholeRunsSerialize:
         await asyncio.gather(*(mod._run_review_bg(r, [f"https://x/pull/{i}"])
                                for i, r in enumerate(runs)))
 
-        assert not overlapped, "two run bodies were inside run_review at once"
+        assert overlapped, "independent review runs should dispatch concurrently"
 
 
-class TestReviewersSerialize:
-    """Reviewers inside one run are serialized.
-
-    Workers share the staging directory and each has file tools, so two live at
-    once lets one write another change's record between that slot being cleared
-    and its own worker writing -- findings attributed to the wrong pull request.
-    """
+class TestReviewersUsePoolCapacity:
+    """Result capabilities allow the driver to use the bounded pool capacity."""
 
     @pytest.mark.asyncio
-    async def test_one_reviewer_at_a_time(self, monkeypatch, tmp_path):
+    async def test_reviewers_use_the_configured_pool_capacity(self, monkeypatch, tmp_path):
         import asyncio
 
         mod = _load_routes_module()
@@ -2703,8 +2697,8 @@ class TestReviewersSerialize:
         await asyncio.gather(*(mod._run_review_bg(r, [f"https://x/pull/{i}"])
                                for i, r in enumerate(runs)))
 
-        assert seen.get("concurrency") == 1, (
-            "the backend must ask for one reviewer at a time; got "
+        assert seen.get("concurrency") == 0, (
+            "the backend must defer to the pool concurrency cap; got "
             f"{seen.get('concurrency')!r}")
 
 

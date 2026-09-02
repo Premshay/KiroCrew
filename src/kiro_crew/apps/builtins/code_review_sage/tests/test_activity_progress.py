@@ -31,6 +31,16 @@ def _record(cid: str = "CR-1") -> dict:
 
 
 class TestActivityRelay(unittest.TestCase):
+    @staticmethod
+    def _record_for_task(task):
+        import re
+
+        capability = re.search(r"result_capability` exactly as `([^`]+)`", task)
+        assert capability is not None
+        record = _record()
+        record["result_capability"] = capability.group(1)
+        return record
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self._old = os.environ.get("KIROCREW_HOME")
@@ -54,7 +64,7 @@ class TestActivityRelay(unittest.TestCase):
             if on_activity is not None:
                 on_activity("execute_bash", 1)
                 on_activity("fs_read", 2)
-            results.write_result(_record(), self.root)
+            results.write_result(self._record_for_task(task), self.root)
             return {"ok": True, "output": "done", "error": ""}
 
         D.run_review(["CR-1"], dispatch=dispatch, generate_report=False,
@@ -72,7 +82,7 @@ class TestActivityRelay(unittest.TestCase):
 
         def dispatch(task, timeout=0):
             calls.append(task)
-            results.write_result(_record(), self.root)
+            results.write_result(self._record_for_task(task), self.root)
             return {"ok": True, "output": "done", "error": ""}
 
         out = D.run_review(["CR-1"], dispatch=dispatch, generate_report=False,
@@ -95,7 +105,7 @@ class TestActivityRelay(unittest.TestCase):
             # itself, not rely on the pool's guard being the only net.
             if on_activity is not None:
                 on_activity("execute_bash", 1)
-            results.write_result(_record(), self.root)
+            results.write_result(self._record_for_task(task), self.root)
             return {"ok": True, "output": "done", "error": ""}
 
         def boom(cid, phase, extra=None):
