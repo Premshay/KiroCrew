@@ -1388,6 +1388,16 @@ def rewrite_agents(
         work_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         logger.warning("failed to create work_dir %s: %s", work_dir, exc)
+    shared_readonly_work_dir = overlay_dir.parent / "shared-readonly"
+    if shared_readonly_set:
+        try:
+            shared_readonly_work_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "failed to create shared-readonly work_dir %s: %s",
+                shared_readonly_work_dir,
+                exc,
+            )
 
     # Per-agent stub scaffolding lives here: the env sidecars written by
     # _build_stub_entry. There is no launcher script -- the overlay entry runs

@@ -168,6 +168,37 @@ class TestSharedReadonlyServers:
         assert first_args[first_args.index("--agent") + 1] == "kirocrew-shared-readonly"
         assert first_args[first_args.index("--work-dir") + 1].endswith("shared-readonly")
 
+    def test_allowlisted_server_creates_its_shared_work_directory(
+        self, tmp_path: Path
+    ) -> None:
+        from kiro_crew.mcp_gateway.rewriter import rewrite_agents
+
+        source_dir = tmp_path / "agents"
+        source_dir.mkdir()
+        (source_dir / "reviewer.json").write_text(
+            json.dumps(
+                {
+                    "name": "reviewer",
+                    "mcpServers": {
+                        "context7": {"command": sys.executable},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        overlay_dir = tmp_path / "gateway" / "agents"
+
+        rewrite_agents(
+            source_dir=source_dir,
+            overlay_dir=overlay_dir,
+            socket_path=tmp_path / "gateway.sock",
+            work_dir=tmp_path / "workspace",
+            stub_servers=frozenset({"context7"}),
+            shared_readonly_servers=frozenset({"context7"}),
+        )
+
+        assert (overlay_dir.parent / "shared-readonly").is_dir()
+
     def test_environment_bearing_server_stays_session_scoped(self, tmp_path: Path) -> None:
         out, _ = _rewrite(
             {

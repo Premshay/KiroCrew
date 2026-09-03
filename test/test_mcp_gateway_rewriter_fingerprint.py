@@ -43,6 +43,7 @@ def test_rewrite_agents_signature_is_pinned_to_fingerprint_inputs() -> None:
         "sandbox_mode",
         "approval_mode",
         "stub_servers",
+        "shared_readonly_servers",
         "pooling_enabled",
     }
 
