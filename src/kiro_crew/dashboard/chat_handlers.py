@@ -4354,6 +4354,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # silently erase an action that happened after the agent pick).
         pre_await_workspace = slot.workspace
         pre_await_project = slot.project
+        prior_agent = slot.agent
 
         # Commit the agent BEFORE any await in this section: a message send
         # landing while the resolution warm-up or the reset await is in
@@ -4368,6 +4369,13 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # mid-reset already runs it. Restoring the old label would advertise
         # a binding nothing runs (and tear against that replacement).
         slot.agent = agent_name
+        if agent_name != prior_agent:
+            slot.model = ""
+            slot._active_fallback_model = ""
+            slot._fallback_primary_model = ""
+            slot._fallback_slot_model = ""
+            slot._fallback_candidate_idx = 0
+            slot._fallback_walked = []
 
         # Resolve workspace from agent bindings. The response value is seeded
         # from the slot's CURRENT workspace, not a "default" literal: if
@@ -4453,7 +4461,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 await asyncio.to_thread(
                     state.conversation_log.update_metadata,
                     _history_key_for(name),
-                    {"agent": agent_name},
+                    {"agent": agent_name, "model": slot.model},
                 )
             except Exception:
                 logger.warning("Failed to persist agent for slot %s", name, exc_info=True)

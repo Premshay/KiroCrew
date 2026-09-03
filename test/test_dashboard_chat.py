@@ -7868,15 +7868,19 @@ class TestRuntimeWiring:
             assert slot.project == "/workspace/new-ws"
 
     @pytest.mark.asyncio
-    async def test_api_chat_slot_agent_persists_to_metadata(self, tmp_path, monkeypatch):
-        """Switching a slot's agent writes the new value to the JSONL metadata.
+    async def test_api_chat_slot_agent_resets_model_and_persists_bindings(self, tmp_path, monkeypatch):
+        """Switching agents resets the old model and persists both bindings.
 
         Without this, a session resumed after a gateway restart reverts to
         whatever agent (if any) was recorded in the initial metadata line.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
-        state.get_or_create_slot("s1")
+        slot = state.get_or_create_slot("s1")
+        slot.model = "gpt-5.6-terra"
+        slot._active_fallback_model = "gpt-5.6-luna"
+        slot._fallback_primary_model = "gpt-5.6-terra"
+        slot._fallback_slot_model = "gpt-5.6-terra"
         state.sessions.reset = AsyncMock()
 
         # Seed a session file so update_metadata has something to patch.
@@ -7888,6 +7892,7 @@ class TestRuntimeWiring:
         # leave the "dashboard_s1" cache entry stale.
         history_key = "dashboard:s1"
         state.conversation_log.append(history_key, "user", "hi", agent="old-agent")
+        state.conversation_log.update_metadata(history_key, {"model": "gpt-5.6-terra"})
         assert state.conversation_log.get_metadata(history_key).get("agent") == "old-agent"
 
         # Minimal config stub (agent-binding resolution is exercised by the
@@ -7907,6 +7912,30 @@ class TestRuntimeWiring:
         assert (
             meta.get("agent") == "new-agent"
         ), f"expected new-agent in metadata, got {meta.get('agent')!r}"
+        assert slot.model == ""
+        assert slot._active_fallback_model == ""
+        assert slot._fallback_primary_model == ""
+        assert slot._fallback_slot_model == ""
+        assert meta.get("model") == ""
+
+    @pytest.mark.asyncio
+    async def test_api_chat_slot_agent_same_agent_keeps_model(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.agent = "same-agent"
+        slot.model = "gpt-5.6-terra"
+        state.sessions.reset = AsyncMock()
+
+        mock_cfg = MagicMock()
+        mock_cfg.agents = {}
+        monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", lambda: mock_cfg)
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "same-agent"})
+            assert resp.status == 200
+
+        assert slot.model == "gpt-5.6-terra"
 
     @pytest.mark.asyncio
     async def test_api_chat_slot_create_response_includes_workspace(self, tmp_path, monkeypatch):
