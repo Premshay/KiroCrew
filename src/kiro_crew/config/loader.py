@@ -5746,6 +5746,16 @@ class McpGatewayConfig:
             "auto-approved tools stay session-scoped. Empty by default.",
         ),
     )
+    claude_session_servers: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Claude Session Servers",
+            "Optional explicit MCP profile for Claude ACP sessions. A non-empty "
+            "list suppresses user-level MCP discovery for those sessions and "
+            "injects only named, enabled servers from the selected KiroCrew "
+            "agent spec. Empty preserves normal Claude Code behaviour.",
+        ),
+    )
     poolable_servers: list[str] = field(
         default_factory=list,
         metadata=_meta(
@@ -9232,6 +9242,11 @@ class KiroCrewConfig:
                     for s in mcp_gateway_data.get("shared_readonly_servers", [])
                     if isinstance(s, str) and s.strip()
                 ],
+                claude_session_servers=[
+                    s.strip()
+                    for s in mcp_gateway_data.get("claude_session_servers", [])
+                    if isinstance(s, str) and s.strip()
+                ],
                 # Hand-editable list of env NAMES; keep only strings and drop
                 # blanks so a stray null or nested object cannot reach the
                 # hashing layer as a key. Not deduplicated here — every consumer
@@ -9742,7 +9757,7 @@ class KiroCrewConfig:
 
         return creds
 
-    def mcp_gateway_provider_kwargs(self) -> dict[str, str | None]:
+    def mcp_gateway_provider_kwargs(self) -> dict[str, Any]:
         """Return the config-owned MCP gateway values for an ACP provider."""
         gateway = self.mcp_gateway
         if not gateway.enabled:
@@ -9750,6 +9765,7 @@ class KiroCrewConfig:
                 "mcp_gateway_overlay": None,
                 "mcp_gateway_settings_mcp_json": None,
                 "mcp_gateway_socket": None,
+                "mcp_gateway_claude_servers": [],
             }
 
         overlay = gateway.overlay_dir or str(default_overlay_dir())
@@ -9757,6 +9773,7 @@ class KiroCrewConfig:
             "mcp_gateway_overlay": overlay,
             "mcp_gateway_settings_mcp_json": str(Path(overlay).parent / "settings" / "mcp.json"),
             "mcp_gateway_socket": gateway.socket_path or str(default_socket_path()),
+            "mcp_gateway_claude_servers": gateway.claude_session_servers,
         }
 
     def create_provider_factory(self) -> Callable:
@@ -9912,6 +9929,7 @@ class KiroCrewConfig:
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_settings_mcp_json=_gw_settings,
                 mcp_gateway_socket=_gw_socket,
+                mcp_gateway_claude_servers=_gw.claude_session_servers,
             )
 
         return _acp

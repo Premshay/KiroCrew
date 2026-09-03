@@ -1255,6 +1255,64 @@ class TestClaudeAutonomousReader:
         }
         assert {entry["type"] for entry in filters} == {"user", "assistant", "result"}
 
+    def test_explicit_mcp_profile_excludes_user_setting_source(self, tmp_path):
+        overlay = tmp_path / "overlay"
+        overlay.mkdir()
+        (overlay / "kirocrew.json").write_text(
+            '{"name":"kirocrew","mcpServers":{"context7":'
+            '{"command":"context7","args":[]}}}',
+            encoding="utf-8",
+        )
+        client = AcpClient(
+            work_dir=tmp_path,
+            acp_backend=ACP_BACKEND_CLAUDE,
+            mcp_gateway_claude_servers=["context7"],
+            mcp_gateway_overlay=overlay,
+        )
+
+        options = client._claude_session_meta()["claudeCode"]["options"]
+
+        assert options["settingSources"] == ["project", "local"]
+
+    def test_unavailable_explicit_profile_preserves_user_setting_source(self, tmp_path):
+        client = AcpClient(
+            work_dir=tmp_path,
+            acp_backend=ACP_BACKEND_CLAUDE,
+            mcp_gateway_claude_servers=["context7"],
+            mcp_gateway_overlay=tmp_path / "missing",
+        )
+
+        assert client._claude_session_meta()["claudeCode"]["options"] == {}
+
+    def test_default_mcp_profile_keeps_existing_setting_sources(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+
+        assert client._claude_session_meta()["claudeCode"]["options"] == {}
+
+    @pytest.mark.asyncio
+    async def test_explicit_stub_is_not_injected_twice(self, tmp_path, monkeypatch):
+        overlay = tmp_path / "overlay"
+        overlay.mkdir()
+        (overlay / "kirocrew.json").write_text(
+            '{"name":"kirocrew","mcpServers":{"context7":'
+            '{"command":"context7","args":[]}}}',
+            encoding="utf-8",
+        )
+        client = AcpClient(
+            work_dir=tmp_path,
+            acp_backend=ACP_BACKEND_CLAUDE,
+            mcp_gateway_claude_servers=["context7"],
+            mcp_gateway_overlay=overlay,
+        )
+        monkeypatch.setattr(client, "_session_capability_mcp_servers", lambda: [])
+        monkeypatch.setattr(
+            client,
+            "_pooled_mcp_servers",
+            lambda: [{"name": "context7", "command": "context7", "args": [], "env": []}],
+        )
+
+        assert [entry["name"] for entry in await client._session_mcp_servers()] == ["context7"]
+
     @staticmethod
     def _sdk_message(message: dict) -> "JsonRpcMessage":
         from kiro_crew.acp.types import JsonRpcMessage

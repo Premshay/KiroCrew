@@ -27,6 +27,7 @@ from kiro_crew.mcp_gateway.rewriter import _WRAPPER_MARKER
 from kiro_crew.mcp_gateway.session_servers import (
     _acp_env,
     _acp_server_entry,
+    explicit_session_servers,
     pooled_session_servers,
 )
 
@@ -71,6 +72,27 @@ def test_unpooled_server_env_is_never_transmitted(tmp_path):
     })
     assert pooled_session_servers(overlay, "kirocrew") == []
     assert "s3cr3t" not in json.dumps(pooled_session_servers(overlay, "kirocrew"))
+
+
+def test_explicit_profile_injects_only_enabled_named_servers(tmp_path):
+    overlay = _write_overlay(tmp_path, "kirocrew", {
+        "context7": _stub(),
+        "browser": {"command": "browser-mcp", "args": ["serve"]},
+        "disabled": {"command": "disabled-mcp", "disabled": True},
+    })
+
+    servers = explicit_session_servers(
+        overlay, "kirocrew", {"context7", "disabled"}, "channel-1"
+    )
+
+    assert [entry["name"] for entry in servers] == ["context7"]
+    assert servers[0]["args"][-2:] == ["--channel-id", "channel-1"]
+
+
+def test_explicit_profile_does_not_widen_an_empty_allowlist(tmp_path):
+    overlay = _write_overlay(tmp_path, "kirocrew", {"context7": _stub()})
+
+    assert explicit_session_servers(overlay, "kirocrew", set()) == []
 
 
 def test_stub_name_is_preserved_so_it_shadows_the_spec_entry(tmp_path):

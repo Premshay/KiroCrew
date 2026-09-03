@@ -4176,13 +4176,28 @@ class TestOrchestratorWatchdogThemeAreParsed:
         """ACP factories and companion mappings share gateway path resolution."""
         monkeypatch.setattr(loader_module, "default_overlay_dir", lambda: Path("/run/kiro/overlay"))
         monkeypatch.setattr(loader_module, "default_socket_path", lambda: Path("/run/kiro/gateway.sock"))
-        cfg = _load_from_dict({"mcp_gateway": {"enabled": True}})
+        cfg = _load_from_dict(
+            {
+                "mcp_gateway": {
+                    "enabled": True,
+                    "claude_session_servers": ["context7"],
+                }
+            }
+        )
 
         assert cfg.mcp_gateway_provider_kwargs() == {
             "mcp_gateway_overlay": "/run/kiro/overlay",
             "mcp_gateway_settings_mcp_json": "/run/kiro/settings/mcp.json",
             "mcp_gateway_socket": "/run/kiro/gateway.sock",
+            "mcp_gateway_claude_servers": ["context7"],
         }
+
+    def test_claude_session_server_profile_drops_invalid_entries(self) -> None:
+        cfg = _load_from_dict(
+            {"mcp_gateway": {"claude_session_servers": ["context7", 7, "", None]}}
+        )
+
+        assert cfg.mcp_gateway.claude_session_servers == ["context7"]
 
     def test_per_agent_watchdog_overrides_are_parsed(self) -> None:
         """agents.*.watchdog_tool_stall_* overrides survive load(); read by

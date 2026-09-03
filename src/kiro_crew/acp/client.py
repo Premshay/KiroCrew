@@ -149,7 +149,10 @@ from kiro_crew.hooks import (
 )
 from kiro_crew.kiro_cli import known_kiro_cli_dirs, resolve_kiro_cli
 from kiro_crew.mcp_gateway.claim import schedule_claim
-from kiro_crew.mcp_gateway.session_servers import pooled_session_servers
+from kiro_crew.mcp_gateway.session_servers import (
+    explicit_session_servers,
+    pooled_session_servers,
+)
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
@@ -2412,6 +2415,7 @@ class AcpClient:
         mcp_gateway_overlay: str | Path | None = None,
         mcp_gateway_settings_mcp_json: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
+        mcp_gateway_claude_servers: list[str] | tuple[str, ...] | None = None,
         permission_mode: str | None = None,
         model_switch_method: str = "",
     ):
@@ -2458,6 +2462,13 @@ class AcpClient:
             str(mcp_gateway_settings_mcp_json) if mcp_gateway_settings_mcp_json else None
         )
         self._mcp_gateway_socket = str(mcp_gateway_socket) if mcp_gateway_socket else None
+        # Empty preserves the provider's normal MCP discovery. A non-empty
+        # allowlist opts a Claude ACP session into the selected agent profile.
+        self._mcp_gateway_claude_servers = frozenset(
+            str(name).strip()
+            for name in (mcp_gateway_claude_servers or ())
+            if isinstance(name, str) and str(name).strip()
+        )
         self._sandbox_cleanup: str | None = None
         self._bound_workspace_fd: int | None = None
         self._spawn_work_dir = str(self._work_dir)
@@ -2726,13 +2737,27 @@ class AcpClient:
         kirocrew-core/cron + user MCP servers; closing it for the public build means
         translating ``kirocrew.mcp.json`` into this array here.
         """
-        return []
+        if not self._mcp_gateway_claude_servers:
+            return []
+        return explicit_session_servers(
+            self._mcp_gateway_overlay,
+            self._agent,
+            self._mcp_gateway_claude_servers,
+            self._channel_id,
+        )
 
     def _claude_session_meta(self) -> dict[str, Any]:
         """Return the adapter extension requested on every Claude session bind."""
+        options: dict[str, Any] = {}
+        if self._claude_session_mcp_servers():
+            # The explicit ACP list above is the complete KiroCrew profile. Do
+            # not also discover the user's interactive MCP registry, or every
+            # dashboard worker recreates its browser/filesystem/research fleet.
+            # Project/local settings remain available for task-owned policy.
+            options["settingSources"] = ["project", "local"]
         return {
             "claudeCode": {
-                "options": {},
+                "options": options,
                 "emitRawSDKMessages": [
                     *(
                         {"type": "user", "origin": origin}
@@ -2746,6 +2771,28 @@ class AcpClient:
                 ],
             }
         }
+
+    async def _session_mcp_servers(self) -> list[dict[str, Any]]:
+        """Build one deduplicated MCP roster for an ACP session bind.
+
+        Explicit Claude profiles can contain broker stubs.  The broker roster
+        is also appended for every backend, so retain the earlier capability
+        entry and prevent the adapter from receiving one server name twice.
+        """
+        candidates = [
+            *self._session_capability_mcp_servers(),
+            *self._claude_session_mcp_servers(),
+            *(await asyncio.to_thread(self._pooled_mcp_servers)),
+        ]
+        seen: set[str] = set()
+        roster: list[dict[str, Any]] = []
+        for entry in candidates:
+            name = entry.get("name")
+            if not isinstance(name, str) or not name or name in seen:
+                continue
+            seen.add(name)
+            roster.append(entry)
+        return roster
 
     async def set_claude_autonomous_turn_handler(
         self, handler: Callable[[ClaudeAutonomousTurn], Awaitable[None]] | None
@@ -4027,11 +4074,7 @@ class AcpClient:
             # Pooled broker stubs are appended for kiro-cli: a session-injected
             # server outranks the same-named entry in the agent spec, which is
             # how pooling takes effect without writing a spec anywhere.
-            "mcpServers": [
-                *self._session_capability_mcp_servers(),
-                *self._claude_session_mcp_servers(),
-                *(await asyncio.to_thread(self._pooled_mcp_servers)),
-            ],
+            "mcpServers": await self._session_mcp_servers(),
         }
         if self._is_claude:
             new_params["_meta"] = self._claude_session_meta()
@@ -4165,11 +4208,7 @@ class AcpClient:
                         # unchanged; a companion overrides the hook (see
                         # session/new above). Pooled stubs are re-declared so a
                         # resumed session keeps talking to the broker.
-                        "mcpServers": [
-                            *self._session_capability_mcp_servers(),
-                            *self._claude_session_mcp_servers(),
-                            *(await asyncio.to_thread(self._pooled_mcp_servers)),
-                        ],
+                        "mcpServers": await self._session_mcp_servers(),
                     }
                     if self._is_claude:
                         load_params["_meta"] = self._claude_session_meta()

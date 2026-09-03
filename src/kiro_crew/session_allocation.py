@@ -223,6 +223,7 @@ def _collect_parent_runtime_kwargs(
         ("_mcp_gateway_overlay", "mcp_gateway_overlay"),
         ("_mcp_gateway_settings_mcp_json", "mcp_gateway_settings_mcp_json"),
         ("_mcp_gateway_socket", "mcp_gateway_socket"),
+        ("_mcp_gateway_claude_servers", "mcp_gateway_claude_servers"),
         ("backend", "acp_backend"),
     ):
         value = getattr(client, attribute, None)
