@@ -5736,6 +5736,16 @@ class McpGatewayConfig:
             "(mcp_gateway.enabled). Managed from MCP Management.",
         ),
     )
+    shared_readonly_servers: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Shared Read-only Servers",
+            "Subset of Routed Servers allowed to share one backend across agents and "
+            "workspaces. Use only stateless, credential-free, read-only services such "
+            "as a documentation index. Entries with declared environment or "
+            "auto-approved tools stay session-scoped. Empty by default.",
+        ),
+    )
     poolable_servers: list[str] = field(
         default_factory=list,
         metadata=_meta(

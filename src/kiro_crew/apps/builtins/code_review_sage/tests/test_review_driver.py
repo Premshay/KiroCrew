@@ -323,6 +323,15 @@ class TestReviewDriver(unittest.TestCase):
         self.assertIn("spawn further subagents", task)
         self.assertIn("github.com/o/r/pull/7", task)
 
+    def test_review_task_binds_the_result_to_its_dispatch(self):
+        task = D.build_review_task("CR-7", result_capability="dispatch-capability")
+        followup = D.build_review_followup_task(
+            "CR-7", result_capability="dispatch-capability"
+        )
+        self.assertIn("result_capability", task)
+        self.assertIn("dispatch-capability", task)
+        self.assertIn("dispatch-capability", followup)
+
     def test_review_task_has_inline_learning(self):
         task = D.build_review_task("CR-8")
         self.assertIn("ISOLATED", task)

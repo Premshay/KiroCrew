@@ -8,6 +8,7 @@ diff snippets). Records follow the findings JSON contract in the skill.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -102,6 +103,9 @@ def validate_result(record: dict) -> list[str]:
     errs: list[str] = []
     if not isinstance(record, dict):
         return ["record must be an object"]
+    capability = record.get("result_capability")
+    if capability is not None and not isinstance(capability, str):
+        errs.append("result_capability must be a string")
     for k in REQUIRED_TOP:
         if k not in record:
             errs.append(f"missing top-level key: {k}")
@@ -362,8 +366,13 @@ def stake_shared(change_id: str, root: Path | None = None) -> bool:
     return True
 
 
-def adopt_from_shared(change_id: str, root: Path | None = None,
-                      run_id: str | None = None) -> bool:
+def adopt_from_shared(
+    change_id: str,
+    root: Path | None = None,
+    run_id: str | None = None,
+    *,
+    expected_capability: str | None = None,
+) -> bool:
     """Move a worker-written record from the shared dir into the run's dir.
 
     Returns True when a record was adopted. A no-op (returning False) when the
@@ -440,6 +449,12 @@ def adopt_from_shared(change_id: str, root: Path | None = None,
         # a byte-exact match is what a correct record already produces; anything
         # else is a different change or a malformed one, and both must be refused.
         return False
+    if expected_capability is not None:
+        actual_capability = parsed.get("result_capability")
+        if not isinstance(actual_capability, str) or not hmac.compare_digest(
+            actual_capability, expected_capability
+        ):
+            return False
     store.ensure_run_layout(run_id, root)
     dst = result_path(change_id, root, run_id)
     # Write a private temp file in the destination directory, then rename over

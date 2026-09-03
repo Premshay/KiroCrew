@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -117,6 +118,25 @@ class TestAdoption(_Base):
         results.adopt_from_shared("CR-1", self.root, "run-a")
         self.assertIsNone(results.read_result("CR-1", self.root, "run-b"))
 
+    def test_adoption_requires_the_dispatch_capability_when_requested(self):
+        record = _record()
+        record["result_capability"] = "correct-capability"
+        results.write_result(record, self.root)
+
+        self.assertFalse(
+            results.adopt_from_shared(
+                "CR-1", self.root, "run-a", expected_capability="wrong-capability"
+            )
+        )
+        self.assertIsNotNone(results.read_result("CR-1", self.root))
+        self.assertIsNone(results.read_result("CR-1", self.root, "run-a"))
+
+        self.assertTrue(
+            results.adopt_from_shared(
+                "CR-1", self.root, "run-a", expected_capability="correct-capability"
+            )
+        )
+
 
 class TestDriverAdopts(_Base):
     """End-to-end: a worker that writes ONLY the shared path must still produce a
@@ -126,7 +146,11 @@ class TestDriverAdopts(_Base):
         def dispatch(task: str, timeout: int = 0):
             if "SINGLE thorough pass" in task:
                 # Exactly what the real worker does: the path its prompt names.
-                results.write_result(_record(), self.root)
+                capability = re.search(r"result_capability` exactly as `([^`]+)`", task)
+                record = _record()
+                if capability:
+                    record["result_capability"] = capability.group(1)
+                results.write_result(record, self.root)
             return {"ok": True, "output": "done", "error": ""}
         return dispatch
 
@@ -299,9 +323,9 @@ class TestStakedSlot(_Base):
         self.assertEqual(int(out.get("result_records") or 0), 0)
 
     def test_a_worker_cannot_plant_a_later_change_in_the_same_run(self):
-        # Reviewers are serialized, so the live attack is an earlier worker writing a
-        # LATER change's slot mid-run: the run-start sweep has already happened, and
-        # nothing else distinguishes that record from one the victim's own worker wrote.
+        # A malicious worker can write a later change's slot after the run-start
+        # sweep. Its capability belongs to its own dispatch, so the later change
+        # must refuse the planted record.
         first = "https://github.com/o/r/pull/1"
         victim = "https://github.com/o/r/pull/2"
         vid = D._cid(victim)
@@ -313,10 +337,12 @@ class TestStakedSlot(_Base):
         planted_by: list[bool] = []
 
         def dispatch(task, timeout):
-            # The injected worker reviewing the FIRST change writes the victim's slot
-            # and records nothing for itself. Plant on the first dispatch only, keyed on
-            # call order rather than on the task's text, which the driver owns.
+            # The injected first worker plants the victim's slot using its OWN
+            # capability. The victim receives a different capability.
             if not planted_by:
+                capability = re.search(r"result_capability` exactly as `([^`]+)`", task)
+                self.assertIsNotNone(capability)
+                planted["result_capability"] = capability.group(1)
                 results.write_result(planted, self.root)
                 planted_by.append(True)
             return {"ok": True, "output": "", "error": ""}

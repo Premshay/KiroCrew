@@ -439,124 +439,66 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
     relay) and warm workers are reused across CRs with a clean-slate reset
     between them.
 
-    Whole runs ARE serialized against each other, and reviews within a run run one
-    at a time. Neither is a performance choice: results come back through
-    ``data/results/<change_id>.json``, which is SHARED across runs, so two live runs
-    are two writers to one path and a prompt-injected worker could get its findings
-    adopted by the other run. Run-scoped subtrees narrow that window but do not
-    close it, because the hand-back still crosses the shared path. Serializing is
-    what makes adoption attributable.
-
-    The cost is real and worth stating: a second review waits for the first. The
-    exchange is a shared-path race for latency, and until the hand-back stops going
-    through a shared path, latency is the right thing to give up."""
+    The claim lock only decides which changes this run owns. Each worker receives
+    an unguessable result capability; adoption checks that capability before a
+    shared-path record enters the run, so unrelated reviews can proceed in the
+    bounded pool without cross-run attribution."""
     run_id = str(run.get("run_id") or "")
     try:
         async with _RUN_LOCK:
-            # Serialize the WHOLE run, not just the claim. Workers hand results back
-            # through `data/results/<change_id>.json`, which is shared across runs
-            # (`publish_to_shared` writes to `results_dir(root, None)`), so two live runs
-            # means two writers to one path. The claim cannot substitute for this: it
-            # coordinates honest runs, while a prompt-injected worker writes whatever
-            # change id it likes and a concurrent run then adopts findings it did not
-            # produce. Concurrent starts queue here instead of interleaving.
-            # Inner guard, still worth holding: two runs reviewing the same PR, and
-            # re-reviewing a head a just-finished run already delivered.
             changes = await asyncio.to_thread(_claim_changes_under_lock, run, changes)
-            if not changes:
-                run["summary"] = {
-                    "ok": True,
-                    "changes": 0,
-                    "note": "all PRs already reviewed or in flight " "in a concurrent run",
-                }
-                run["status"] = "done"
-                return
-            # Bridge the threaded driver to the async pool running on THIS (gateway)
-            # event loop. The pool is a lazily-created process-wide singleton.
-            loop = asyncio.get_running_loop()
-            pool = review_pool.get_pool()
+        if not changes:
+            run["summary"] = {
+                "ok": True,
+                "changes": 0,
+                "note": "all PRs already reviewed or in flight in a concurrent run",
+            }
+            run["status"] = "done"
+            return
+        loop = asyncio.get_running_loop()
+        pool = review_pool.get_pool()
 
-            def _record_runtime(resolution: dict) -> None:
-                # session/new is the point where the backend confirms its served
-                # model; retain that evidence instead of restating a requested value.
-                run["runtime"] = dict(resolution)
+        def _record_runtime(resolution: dict) -> None:
+            run["runtime"] = dict(resolution)
 
-            dispatch = review_pool.make_sync_dispatch(loop, pool, on_resolution=_record_runtime)
-
-            # Bracket the batch: begin_batch() lazily spawns the ONE shared runtime;
-            # end_batch() (in finally) kills it once this run's reviews all drain — so
-            # the subprocess (and its memory) lives exactly as long as the batch. The
-            # holder is reference-counted, so overlapping runs share one runtime and the
-            # last one out tears it down.
-            #
-            # Runtime preflight, read ONCE and reused: when the host cannot spawn a
-            # reviewer (no kiro-cli, ACP runtime unimportable) the batch is never
-            # opened — begin_batch would raise inside the spawn with a generic
-            # message — and the same verdict is handed to run_review, which fails
-            # every change fast with a reason naming the missing runtime. One
-            # reading keeps the bracket and the driver's verdict consistent.
-            # Offloaded: the executable resolution stats candidates across every
-            # PATH entry, and one stale network mount there would stall the loop.
-            runtime_error = await asyncio.to_thread(review_pool.runtime_preflight)
+        dispatch = review_pool.make_sync_dispatch(loop, pool, on_resolution=_record_runtime)
+        runtime_error = await asyncio.to_thread(review_pool.runtime_preflight)
+        if not runtime_error:
+            await pool.begin_batch()
+        try:
+            summary = await asyncio.to_thread(
+                review_driver.run_review,
+                changes,
+                dispatch=dispatch,
+                progress=_make_progress(run),
+                run_id=run_id,
+                cancelled=lambda: run_id in _CANCELLED,
+                rule_resolutions=run.get("rule_resolutions"),
+                preflight=lambda: runtime_error,
+                concurrency=0,
+            )
+        finally:
             if not runtime_error:
-                await pool.begin_batch()
-            try:
-                summary = await asyncio.to_thread(
-                    review_driver.run_review,
-                    changes,  # type: ignore[attr-defined]
-                    dispatch=dispatch,
-                    progress=_make_progress(run),
-                    run_id=run_id,
-                    cancelled=lambda: run_id in _CANCELLED,
-                    rule_resolutions=run.get("rule_resolutions"),
-                    preflight=lambda: runtime_error,
-                    # One reviewer at a time. Workers share the staging directory and
-                    # each has shell and file tools, so two running at once means one
-                    # can write another change's record between that change's slot
-                    # being cleared and its own worker writing -- attacker-controlled
-                    # findings attributed to the victim pull request. Serializing makes
-                    # "the record in this slot" mean "written by the worker just
-                    # dispatched". Restoring parallelism needs per-dispatch staging
-                    # whose path a sibling worker cannot guess.
-                    concurrency=1,
-                )
-            finally:
-                if not runtime_error:
-                    await pool.end_batch()
-            run["summary"] = summary
-            _collect_delivered(run, summary)
-            run["report_slug"] = summary.get("report_slug") or run.get("report_slug")
-            recorded = int(summary.get("result_records") or 0)
-            deep = int(summary.get("deep_reviewed") or 0)
-            attempted = int(summary.get("changes") or 0) - int(summary.get("cancelled") or 0)
-            if run_id in _CANCELLED:
-                run["status"] = "cancelled"
-            elif not summary.get("ok"):
-                run["status"] = "error"
-            elif attempted > 0 and (recorded == 0 or deep == 0):
-                # run_review returns ok=True for any run with >=1 change, so a run
-                # whose every change failed used to report "done" with an empty
-                # report. Nothing was reviewed; say so rather than letting the UI
-                # claim success and then show an empty report.
-                #
-                # `deep == 0` is checked as well as `recorded == 0`: a change can
-                # persist a record and still never be deep-reviewed, which cleared the
-                # record count while leaving the report with no findings in it. Both
-                # are the same "claimed success, delivered nothing" failure.
-                run["status"] = "error"
-                run["error"] = _first_change_error(summary) or (
-                    "the reviewer produced no result record"
-                )
-            else:
-                # "done" even if SOME changes failed — those are surfaced per change.
-                run["status"] = "done"
-            if not summary.get("ok"):
-                run["error"] = summary.get("error", "review failed")
-            else:
-                # Durable dedup index: record each reviewed PR's head SHA so a later
-                # repo-review skips it until its head changes. Only repo-review runs
-                # carry head_shas; pasted-link runs skip this (no-op).
-                await asyncio.to_thread(_record_reviewed, run)
+                await pool.end_batch()
+        run["summary"] = summary
+        _collect_delivered(run, summary)
+        run["report_slug"] = summary.get("report_slug") or run.get("report_slug")
+        recorded = int(summary.get("result_records") or 0)
+        deep = int(summary.get("deep_reviewed") or 0)
+        attempted = int(summary.get("changes") or 0) - int(summary.get("cancelled") or 0)
+        if run_id in _CANCELLED:
+            run["status"] = "cancelled"
+        elif not summary.get("ok"):
+            run["status"] = "error"
+        elif attempted > 0 and (recorded == 0 or deep == 0):
+            run["status"] = "error"
+            run["error"] = _first_change_error(summary) or "the reviewer produced no result record"
+        else:
+            run["status"] = "done"
+        if not summary.get("ok"):
+            run["error"] = summary.get("error", "review failed")
+        else:
+            await asyncio.to_thread(_record_reviewed, run)
     except Exception as exc:  # pragma: no cover - defensive
         run["status"] = "error"
         run["error"] = str(exc)
