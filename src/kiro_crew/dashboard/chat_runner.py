@@ -5472,6 +5472,16 @@ async def _run_chat(
     _stop_gen_at_entry = slot._stop_generation
 
     session_key = effective_session_key(slot)
+
+    def _restore_checkpoint_after_compaction() -> None:
+        """Re-inject the slot-owned checkpoint on the next successful turn."""
+        try:
+            state.sessions.mark_needs_reinjection(session_key)
+        except Exception:
+            logger.warning(
+                "post-compaction checkpoint reinjection could not be armed",
+                exc_info=True,
+            )
     if _post_restart_continuation:
         pending = slot.post_restart_continuation()
         if not pending:
@@ -7409,6 +7419,7 @@ async def _run_chat(
                 # immediately instead of leaving a pre-compaction percentage in
                 # the sidebar until a later turn happens to report usage again.
                 if event.is_context_compaction and event.tool_final:
+                    _restore_checkpoint_after_compaction()
                     state.broadcast_context_usage(
                         slot.key, _context_usage_payload(slot.key, client)
                     )
@@ -8724,6 +8735,7 @@ async def _run_chat(
             elif event.kind == EVENT_COMPACTION_STATUS:
                 logger.debug("Main loop: compaction event text=%r", event.text)
                 if _broadcast_compaction_result(state, slot, event):
+                    _restore_checkpoint_after_compaction()
                     saw_compaction = True
                     _produced_visible_output = True
                     assistant_text = ""
@@ -9367,6 +9379,7 @@ async def _run_chat(
             # field), pipe it through redact_credentials + redact_exfiltration_urls
             # before interpolation — matching the kiro-cli path below.
             if is_claude_backend(client):
+                _restore_checkpoint_after_compaction()
                 msg = "✅ Conversation compacted."
                 _append_compaction_notice(state, slot, msg)
                 state.broadcast_context_usage(slot.key, _context_usage_payload(slot.key, client))
@@ -9382,6 +9395,7 @@ async def _run_chat(
                 compaction_result = await client.wait_for_compaction()
                 logger.info("Deferred compaction result: %s", compaction_result)
                 if compaction_result["type"] == "completed":
+                    _restore_checkpoint_after_compaction()
                     summary, _ = redact_credentials(compaction_result.get("summary", ""))
                     summary, _ = redact_exfiltration_urls(summary)
                     msg = (

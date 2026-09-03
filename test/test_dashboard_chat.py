@@ -6007,6 +6007,7 @@ class TestRunChatCompactDeferredWait:
         await _run_chat(state, slot, "/compact")
 
         client.wait_for_compaction.assert_not_called()
+        state.sessions.mark_needs_reinjection.assert_called_once_with("dashboard:s1")
         assistant_msgs = [m for m in slot.messages if m.get("role") == "assistant"]
         assert any("Conversation compacted" in m["content"] for m in assistant_msgs)
         assert not any("timed out" in m["content"] for m in assistant_msgs)
@@ -6058,6 +6059,38 @@ class TestRunChatCompactDeferredWait:
         )
 
     @pytest.mark.asyncio
+    async def test_native_compaction_events_arm_checkpoint_recovery(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.providers.base import (
+            EVENT_COMPACTION_STATUS,
+            EVENT_COMPLETE,
+            EVENT_TOOL_RESULT,
+            LLMEvent,
+        )
+
+        for compaction_event in (
+            LLMEvent(kind=EVENT_COMPACTION_STATUS, text="completed"),
+            LLMEvent(
+                kind=EVENT_TOOL_RESULT,
+                is_context_compaction=True,
+                tool_final=True,
+            ),
+        ):
+            state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+            slot = state.get_or_create_slot("s1")
+            client = self._make_mock_client(
+                [compaction_event, LLMEvent(kind=EVENT_COMPLETE)]
+            )
+            state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+            from kiro_crew.dashboard.chat import _run_chat
+
+            await _run_chat(state, slot, "continue after provider compaction")
+
+            state.sessions.mark_needs_reinjection.assert_called_once_with("dashboard:s1")
+
+    @pytest.mark.asyncio
     async def test_kiro_backend_still_waits_for_compaction(self, tmp_path, monkeypatch):
         """kiro-cli backend keeps the original deferred-wait path."""
         from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
@@ -6088,6 +6121,7 @@ class TestRunChatCompactDeferredWait:
         await _run_chat(state, slot, "/compact")
 
         client.wait_for_compaction.assert_awaited_once()
+        state.sessions.mark_needs_reinjection.assert_called_once_with("dashboard:s1")
         assistant_msgs = [m for m in slot.messages if m.get("role") == "assistant"]
         assert any("summary text" in m["content"] for m in assistant_msgs)
         # A completed deferred compaction must send the `reset` form — the
