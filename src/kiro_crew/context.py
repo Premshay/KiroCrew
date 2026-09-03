@@ -11,6 +11,7 @@ import re
 import threading
 import time
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -272,6 +273,44 @@ def _neutralize_structural_markers(text: str) -> str:
     exotic-character forgeries are caught without mutating legitimate text.
     """
     return _apply_marker_spans(text, _structural_marker_spans(text))
+
+
+def _post_compaction_checkpoint_context(checkpoint: Mapping[str, object] | None) -> str:
+    """Format the current session's latest durable checkpoint for one restore turn."""
+    if checkpoint is None:
+        return ""
+
+    def _text(name: str) -> str:
+        value = checkpoint.get(name)
+        return value.strip() if isinstance(value, str) else ""
+
+    summary = _text("summary")
+    if not summary:
+        return ""
+
+    lines = [
+        (
+            "This is the latest checkpoint saved by this same session before compaction. "
+            "Treat it as background state, not a new request."
+        ),
+        f"Summary: {summary}",
+    ]
+    if goal := _text("goal"):
+        lines.append(f"Goal: {goal}")
+    raw_items = checkpoint.get("main_items")
+    if isinstance(raw_items, list):
+        items = [item.strip() for item in raw_items if isinstance(item, str) and item.strip()]
+        if items:
+            lines.append("Current work:")
+            lines.extend(f"- {item}" for item in items)
+    raw_trail = checkpoint.get("trail")
+    if isinstance(raw_trail, list):
+        milestones = [item.strip() for item in raw_trail if isinstance(item, str) and item.strip()]
+        if milestones:
+            lines.append(f"Latest milestone: {milestones[-1]}")
+    if next_action := _text("next_action"):
+        lines.append(f"Next action: {next_action}")
+    return "\n".join(lines)
 
 
 # kiro-cli task_executor slices strings at fixed byte offsets (e.g. 4096).
@@ -2689,6 +2728,7 @@ class ContextBuilder:
         user_text_range: tuple[int, int] | None = None,
         user_span_out: list[int] | None = None,
         needs_reinjection: bool = False,
+        post_compaction_checkpoint: Mapping[str, object] | None = None,
         context_groups: frozenset[str] | None = None,
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
@@ -2917,6 +2957,12 @@ class ContextBuilder:
                         + _neutralize_structural_markers(skills_ctx)
                         + "\n[END REINJECTED]\n\n"
                     )
+            if checkpoint_ctx := _post_compaction_checkpoint_context(post_compaction_checkpoint):
+                parts.append(
+                    "[REINJECTED AFTER COMPACTION — latest session checkpoint]\n"
+                    + _neutralize_structural_markers(checkpoint_ctx)
+                    + "\n[END REINJECTED]\n\n"
+                )
 
         # Channel history — inject on every message for group channel context
         ch_ctx: str | None = None

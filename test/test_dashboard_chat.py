@@ -8052,6 +8052,7 @@ class TestRuntimeWiring:
         slot = state.get_or_create_slot("reinject-test")
 
         mock_client = MagicMock()
+        mock_client.client = None
         mock_client.stream = MagicMock(return_value=AsyncIterator([]))
         state.sessions.get_or_create = AsyncMock(return_value=(mock_client, True, False))
         state.sessions.get_pid = MagicMock(return_value=None)
@@ -8071,6 +8072,13 @@ class TestRuntimeWiring:
 
         state.sessions.consume_needs_reinjection = MagicMock(side_effect=_consume)
         state.sessions.mark_needs_reinjection = MagicMock(side_effect=_mark)
+        slot.set_session_checkpoint(
+            {
+                "summary": "Preserve the verified result.",
+                "milestone": "Compaction test prepared",
+                "next_action": "Resume from the checkpoint.",
+            }
+        )
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -8084,6 +8092,9 @@ class TestRuntimeWiring:
         assert (
             build_message_calls[0]["kwargs"].get("needs_reinjection") is True
         ), "the turn right after a compaction must re-inject the skills index"
+        assert build_message_calls[0]["kwargs"].get("post_compaction_checkpoint") == (
+            slot.session_checkpoint_payload()
+        )
         assert state.sessions.mark_needs_reinjection.called, (
             "a turn that consumed the flag but did not land must restore it, "
             "or the skills index is lost for the rest of the session"

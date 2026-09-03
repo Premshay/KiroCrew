@@ -6269,6 +6269,9 @@ async def _run_chat(
             # context, taking the skills index with it. Read-and-clear the flag
             # here so this turn re-injects the index exactly once.
             _needs_reinjection = state.sessions.consume_needs_reinjection(session_key)
+            _post_compaction_checkpoint = (
+                slot.session_checkpoint_payload() if _needs_reinjection else None
+            )
             full_message, _ = await run_in_embed_pool(
                 state.context_builder.build_message,
                 message,
@@ -6295,6 +6298,7 @@ async def _run_chat(
                 ),
                 user_span_out=_user_span,
                 needs_reinjection=_needs_reinjection,
+                post_compaction_checkpoint=_post_compaction_checkpoint,
             )
             # The reported span is valid for the message as build_message
             # returned it. Several later steps PREPEND to the finished prompt

@@ -226,6 +226,10 @@ send time.
   the cooldown, with the mid-stream overflow guard covering the interim).
   Blind
   fallback after 40 prompts if metadata never reports %.
+  The first successful post-compaction turn also restores the latest
+  session-owned Multiplex checkpoint alongside the skills index. It is a bounded
+  slot snapshot, not transcript-derived content, and is injected as background
+  state only for that one turn.
 - **Circuit breaker**: force-resets session after 5 consecutive failures.
 - **Dead provider detection**: `get_or_create()` checks `provider.is_alive()`
   on the fast path. If the backing process died (crash, SIGKILL, orphan
