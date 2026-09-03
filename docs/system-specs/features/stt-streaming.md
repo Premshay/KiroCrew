@@ -4,13 +4,18 @@
 
 Live speech-to-text for the dashboard composer. The browser streams 16 kHz mono Int16 PCM over a WebSocket and the server relays partial hypotheses, one or more final transcripts, and (when enabled) an auto-submit signal.
 
-All selectable providers implement streaming (`stt_stream._STREAMING_PROVIDERS`): `local` processes audio in this process, `apple` processes it on-device, and `transcribe` sends it to AWS Transcribe Streaming.
+Streaming providers are explicitly listed by `stt_stream._STREAMING_PROVIDERS`:
+`local` processes audio in this process, `apple` processes it on-device, and
+`transcribe` sends it to AWS Transcribe Streaming. `bridge` is intentionally
+batch-only, so the composer uses the record-then-upload path and hands-free
+dictation remains available.
 
 | `stt.provider` | Where recognition runs | Cost | Precondition |
 |---|---|---|---|
 | `local` (default) | this process, whisper.cpp held loaded by [`kiro_crew.stt`](../../../src/kiro_crew/stt/__init__.py) | free | desktop builds include the runtime; select a model and click **Download now** |
 | `apple` | the OS, on-device SpeechAnalyzer | free | macOS 26 or later, and a Swift toolchain to build the helper |
 | `transcribe` | AWS Transcribe Streaming | billed per audio-second | the `voice` extra, and a recorded AWS consent |
+| `bridge` | operator-managed batch recogniser | operator-managed | an executable in `KIROCREW_STT_BRIDGE` |
 
 The batch path at `POST /api/stt/transcribe` (`transcribe.transcribe_audio`)
 serves whole files instead: a Slack voice memo, a channel voice note, an upload.
@@ -130,7 +135,7 @@ surface: a spoken credential must not flash unredacted.
 
 ## Activation
 
-The endpoint answers **503** unless all three hold:
+The streaming endpoint answers **503** unless all three hold:
 
 1. `stt.enabled`
 2. `stt.streaming`

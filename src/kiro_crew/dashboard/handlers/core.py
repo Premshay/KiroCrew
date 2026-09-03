@@ -1008,7 +1008,7 @@ def _stt_prereq_commands(provider: str = "local") -> list[str]:
     # an unsupported notice there instead of a command that cannot succeed.
     if needs_extra and _pip_install_channel_available():
         cmds.append(pip_extra_install_command("voice"))
-    if not platform_compat.is_bundled_interpreter():
+    if provider != "bridge" and not platform_compat.is_bundled_interpreter():
         cmds.extend(_ffmpeg_install_commands())
     return cmds
 

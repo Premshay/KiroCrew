@@ -1,4 +1,4 @@
-"""Speech-to-text for whole audio files: one local recogniser, two adapted ones.
+"""Speech-to-text for whole audio files: one local recogniser, three adapted ones.
 
 The default provider is ``local``: the whisper.cpp recogniser that
 :mod:`kiro_crew.stt` holds loaded in this process. Keeping the model resident is
@@ -15,6 +15,8 @@ first-class, and neither may add a step to the local path:
   model because the OS ships the assets. Owned by :mod:`kiro_crew.apple_speech`.
 - ``transcribe``: AWS Transcribe Streaming, a paid service, gated on the recorded
   operator consent in :mod:`kiro_crew.aws_consent`.
+- ``bridge``: an operator-managed batch recogniser invoked through the gateway's
+  service environment. It deliberately has no streaming surface or model catalog.
 
 Compressed input still needs ffmpeg: a Slack voice memo arrives as ogg/Opus and
 the dashboard records webm. Desktop releases carry a pinned imageio-ffmpeg wheel
@@ -960,6 +962,14 @@ CODE_APPLE_UNSUPPORTED = "stt_apple_unsupported"
 #: fix and that one does not.
 CODE_APPLE_NEEDS_TOOLCHAIN = "stt_apple_needs_toolchain"
 
+#: An operator-configured bridge cannot run because its executable is absent or
+#: not executable. This is distinct from a missing local voice extra: installing
+#: the upstream recogniser would create a second STT runtime instead of repairing
+#: the configured bridge.
+CODE_BRIDGE_UNAVAILABLE = "stt_bridge_unavailable"
+
+_BRIDGE_ENV = "KIROCREW_STT_BRIDGE"
+
 #: What to do about a missing AWS Transcribe client. Named once because doctor,
 #: the settings panel and the failure log all report it, and a divergent copy
 #: sends a user to install the wrong thing.
@@ -999,10 +1009,34 @@ def _apple_availability() -> stt.Availability:
     return stt.Availability(False, code, result.reason)
 
 
+def _bridge_command() -> str | None:
+    """Return the operator-owned bridge executable when it can be run."""
+    command = os.environ.get(_BRIDGE_ENV, "").strip()
+    if not command or not os.path.isabs(command):
+        return None
+    try:
+        mode = os.stat(command).st_mode
+    except OSError:
+        return None
+    if not stat.S_ISREG(mode) or not os.access(command, os.X_OK):
+        return None
+    return command
+
+
+def _bridge_availability() -> stt.Availability:
+    if _bridge_command() is None:
+        return stt.Availability(
+            False,
+            CODE_BRIDGE_UNAVAILABLE,
+            f"speech bridge is not configured through {_BRIDGE_ENV}",
+        )
+    return stt.Availability(True)
+
+
 def availability_detail(stt_config=None) -> stt.Availability:  # type: ignore[no-untyped-def]
     """Whether speech-to-text can run, and when it cannot, precisely why.
 
-    One shape for all three providers so a caller renders one set of reasons.
+    One shape for all providers so a caller renders one set of reasons.
     Distinguishing them is the point: "install an extra", "your platform has no
     prebuilt wheel" and "this needs a newer macOS" lead to completely different
     actions, and collapsing them into a boolean is what makes a feature feel
@@ -1023,6 +1057,8 @@ def availability_detail(stt_config=None) -> stt.Availability:  # type: ignore[no
         return _aws_availability()
     if provider == "apple":
         return _apple_availability()
+    if provider == "bridge":
+        return _bridge_availability()
     # ``local`` is the floor every other value degrades to; see
     # :func:`transcribe_audio` for why that is answered here rather than raised.
     # The first call links the recogniser's native extension, then ``sys.modules``
@@ -1091,6 +1127,8 @@ async def transcribe_audio(audio_path: str, stt_config=None) -> str | None:  # t
         result = await _transcribe_aws(audio_path, stt_config)
     elif provider == "apple":
         result = await _transcribe_apple(audio_path, stt_config)
+    elif provider == "bridge":
+        result = await _transcribe_bridge(audio_path, stt_config)
     else:
         # ``local`` is the floor. The config loader already degrades a retired or
         # unrecognised provider onto it with a logged reason, and landing here
@@ -1102,6 +1140,55 @@ async def transcribe_audio(audio_path: str, stt_config=None) -> str | None:  # t
         # Unconditional, on every provider's output, in one off-loop hop.
         result = await asyncio.to_thread(_redact_transcript, result)
     return result
+
+
+def _read_bridge_transcript(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return stream.read().strip() or None
+    except OSError:
+        return None
+
+
+async def _transcribe_bridge(audio_path: str, stt_config) -> str | None:  # type: ignore[no-untyped-def]
+    """Invoke the operator's batch STT bridge and collect its text file."""
+    command = await asyncio.to_thread(_bridge_command)
+    if command is None:
+        logger.error("speech bridge unavailable: %s is not executable", _BRIDGE_ENV)
+        return None
+    out_dir = await asyncio.to_thread(tempfile.mkdtemp)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            command,
+            audio_path,
+            "--output_dir",
+            out_dir,
+            "--output_format",
+            "txt",
+            "--language",
+            stt_config.language_code or "en-US",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=stt_config.timeout_secs
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            logger.error("speech bridge timed out after %ds", stt_config.timeout_secs)
+            return None
+        if proc.returncode != 0:
+            detail = stderr.decode(errors="replace").strip()[-500:] if stderr else ""
+            logger.error("speech bridge exited %s: %s", proc.returncode, detail or "(no stderr)")
+            return None
+        base = os.path.splitext(os.path.basename(audio_path))[0]
+        return await asyncio.to_thread(
+            _read_bridge_transcript, os.path.join(out_dir, f"{base}.txt")
+        )
+    finally:
+        await asyncio.to_thread(shutil.rmtree, out_dir, ignore_errors=True)
 
 
 class _ProfileCredentialResolver(CredentialResolver):

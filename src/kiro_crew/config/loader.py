@@ -5077,11 +5077,16 @@ class ChannelConfig:
 #: supported OS, with no account, no platform floor, and no separate install.
 STT_PROVIDER_LOCAL = "local"
 
+#: Batch recogniser owned by the operator's service environment. Unlike the
+#: bundled local recogniser, it does not expose a model catalogue or a streaming
+#: protocol to the dashboard.
+STT_PROVIDER_BRIDGE = "bridge"
+
 #: The recognisers a user can select. ``local`` runs whisper.cpp in-process,
 #: ``apple`` uses macOS 26+ on-device recognition, and ``transcribe`` sends audio
 #: to AWS Transcribe (billed, and gated on the AWS consent prompt). All three
 #: produce partial results, so streaming is not a per-provider capability.
-_VALID_STT_PROVIDERS = (STT_PROVIDER_LOCAL, "apple", "transcribe")
+_VALID_STT_PROVIDERS = (STT_PROVIDER_LOCAL, STT_PROVIDER_BRIDGE, "apple", "transcribe")
 
 #: Providers a stored config may still name. Each of these needed an out-of-band
 #: install the user had to perform themselves (a whisper CLI on ``PATH``, or an
@@ -5464,10 +5469,10 @@ class SttConfig:
         metadata=_meta(
             "Provider",
             "Where speech is recognised. `local` runs on this machine and needs no "
-            "account (it downloads one model the first time you dictate), `apple` "
-            "uses the on-device recogniser built into macOS 26 and later, and "
-            "`transcribe` sends your audio to AWS Transcribe, which bills your AWS "
-            "account.",
+            "account (it downloads one model the first time you dictate), `bridge` "
+            "uses an operator-configured batch recogniser, `apple` uses the on-device "
+            "recogniser built into macOS 26 and later, and `transcribe` sends your "
+            "audio to AWS Transcribe, which bills your AWS account.",
             enum=list(_VALID_STT_PROVIDERS),
         ),
     )

@@ -2435,6 +2435,9 @@ class TestSttRetiredProviders:
         assert _loaded_stt(tmp_path, {"provider": None}).provider == STT_PROVIDER_LOCAL
         assert _loaded_stt(tmp_path, {"provider": 7}).provider == STT_PROVIDER_LOCAL
 
+    def test_bridge_is_selectable(self, tmp_path: Path) -> None:
+        assert _loaded_stt(tmp_path, {"provider": "bridge"}).provider == "bridge"
+
 
 class TestSttRemovedFieldsAreInert:
     """A config written for the retired providers still loads, and is not degraded.

@@ -18,6 +18,7 @@ import sys
 import threading
 import types
 import wave
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -297,6 +298,12 @@ class TestAvailabilityDetail:
         assert detail.ok is True
         assert detail.code == stt.CODE_OK
 
+    def test_bridge_requires_an_operator_command(self, monkeypatch):
+        monkeypatch.delenv(transcribe._BRIDGE_ENV, raising=False)
+        detail = self._detail(SttConfig(enabled=True, provider="bridge"))
+        assert detail.ok is False
+        assert detail.code == transcribe.CODE_BRIDGE_UNAVAILABLE
+
     def test_retired_provider_answers_on_the_local_floor(self, monkeypatch):
         """A hand-edited config naming a retired provider must not report a fault.
 
@@ -371,6 +378,28 @@ class TestTranscribeAudio:
         monkeypatch.setattr(transcribe, "_pcm_from_wav", _never)
         assert await transcribe_audio(str(audio), cfg) is None
         assert decoded == []
+
+    @pytest.mark.asyncio
+    async def test_bridge_collects_its_transcript(self, tmp_path, monkeypatch):
+        audio = tmp_path / "voice.wav"
+        audio.write_bytes(b"audio")
+        cfg = SttConfig(enabled=True, provider="bridge", language_code="en-US")
+        monkeypatch.setattr(transcribe, "_bridge_command", lambda: "/operator/bridge")
+
+        class Process:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b""
+
+        async def create(command, _audio, *args, **kwargs):
+            assert command == "/operator/bridge"
+            out_dir = args[args.index("--output_dir") + 1]
+            (Path(out_dir) / "voice.txt").write_text("  bridge transcript  ", encoding="utf-8")
+            return Process()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+        assert await transcribe_audio(str(audio), cfg) == "bridge transcript"
 
     @pytest.mark.asyncio
     async def test_local_availability_probe_runs_off_event_loop(self, tmp_path, monkeypatch):
