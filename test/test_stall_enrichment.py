@@ -8,10 +8,12 @@ against the real ``/proc`` of the test process.
 from __future__ import annotations
 
 import sys
+import threading
 
 from kiro_crew.dashboard.stall_enrichment import (
     _decode_proc_addr,
     _established_lines,
+    _event_loop_stack_lines,
     collect_stall_enrichment,
 )
 
@@ -63,6 +65,7 @@ def test_collect_smoke_on_linux() -> None:
     lines = collect_stall_enrichment(12.5)
     assert "STALL ENRICHMENT" in lines[0]
     assert "12.5s" in lines[0]
+    assert any(line.startswith("EVENT LOOP STACK") for line in lines)
     assert len(lines) >= 2  # header plus at least one capture/degradation line
     if sys.platform.startswith("linux"):
         # Real /proc walk must not degrade to the failure line.
@@ -73,3 +76,15 @@ def test_collect_never_raises_even_if_silence_weird() -> None:
     # Degenerate inputs must not blow up the watchdog thread.
     assert collect_stall_enrichment(0.0)
     assert collect_stall_enrichment(1e9)
+
+
+def test_event_loop_stack_is_bounded_and_path_shortened() -> None:
+    frame = sys._getframe()
+    thread_id = threading.main_thread().ident
+    assert thread_id is not None
+
+    lines = _event_loop_stack_lines({thread_id: frame})
+
+    assert lines[0] == "EVENT LOOP STACK (outermost -> innermost):"
+    assert len(lines) <= 21
+    assert any("test_stall_enrichment.py" in line for line in lines)
