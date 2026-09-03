@@ -126,6 +126,7 @@ def _rewrite(
     tmp_path: Path,
     *,
     stub_servers: frozenset[str] = frozenset(),
+    shared_readonly_servers: frozenset[str] = frozenset(),
     pooling_enabled: bool = True,
     forward_env: bool = False,
 ) -> tuple[dict, int]:
@@ -137,9 +138,51 @@ def _rewrite(
         sandbox_mode="auto",
         approval_mode="interactive",
         stub_servers=stub_servers,
+        shared_readonly_servers=shared_readonly_servers,
         pooling_enabled=pooling_enabled,
         forward_env=forward_env,
     )
+
+
+class TestSharedReadonlyServers:
+    def test_allowlisted_credential_free_server_uses_one_neutral_pool_identity(
+        self, tmp_path: Path
+    ) -> None:
+        server = {"command": sys.executable, "args": ["-m", "context7"]}
+        first, _ = _rewrite(
+            {"name": "reviewer", "mcpServers": {"context7": server}},
+            tmp_path,
+            stub_servers=frozenset({"context7"}),
+            shared_readonly_servers=frozenset({"context7"}),
+        )
+        second, _ = _rewrite(
+            {"name": "implementer", "mcpServers": {"context7": server}},
+            tmp_path,
+            stub_servers=frozenset({"context7"}),
+            shared_readonly_servers=frozenset({"context7"}),
+        )
+
+        first_args = first["mcpServers"]["context7"]["args"]
+        second_args = second["mcpServers"]["context7"]["args"]
+        assert first_args == second_args
+        assert first_args[first_args.index("--agent") + 1] == "kirocrew-shared-readonly"
+        assert first_args[first_args.index("--work-dir") + 1].endswith("shared-readonly")
+
+    def test_environment_bearing_server_stays_session_scoped(self, tmp_path: Path) -> None:
+        out, _ = _rewrite(
+            {
+                "name": "reviewer",
+                "mcpServers": {
+                    "context7": {"command": sys.executable, "env": {"TOKEN": "x"}}
+                },
+            },
+            tmp_path,
+            stub_servers=frozenset({"context7"}),
+            shared_readonly_servers=frozenset({"context7"}),
+            forward_env=True,
+        )
+        args = out["mcpServers"]["context7"]["args"]
+        assert args[args.index("--agent") + 1] == "reviewer"
 
 
 def test_disabled_poolable_server_is_not_wrapped(tmp_path: Path) -> None:

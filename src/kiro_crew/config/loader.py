@@ -9217,6 +9217,11 @@ class KiroCrewConfig:
                     s for s in mcp_gateway_data.get("poolable_servers", []) if isinstance(s, str)
                 ],
                 stub_servers=_resolve_stub_servers(mcp_gateway_data),
+                shared_readonly_servers=[
+                    s.strip()
+                    for s in mcp_gateway_data.get("shared_readonly_servers", [])
+                    if isinstance(s, str) and s.strip()
+                ],
                 # Hand-editable list of env NAMES; keep only strings and drop
                 # blanks so a stray null or nested object cannot reach the
                 # hashing layer as a key. Not deduplicated here — every consumer

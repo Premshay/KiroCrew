@@ -129,6 +129,12 @@ _WRAPPER_MARKER_LEGACY = "_mc_mcp_gateway_wrapped"
 # ``--target-args-sep`` flag (not used here; not a problem in practice).
 _TARGET_ARGS_SEP = "|"
 
+# A deliberately uninteresting identity and workspace for a service the
+# operator explicitly marked safe to share across all KiroCrew sessions. The
+# ordinary PoolKey includes both fields so project-aware and credentialed
+# servers cannot cross this boundary by accident.
+_SHARED_READONLY_AGENT = "kirocrew-shared-readonly"
+
 #: The stub is launched as a module by the interpreter running KiroCrew.
 #: ``sys.executable`` is baked into the overlay rather than resolved at
 #: launch time because kiro-cli strips env when it spawns MCP
@@ -558,6 +564,7 @@ def _rewrite_single_spec(
     sandbox_mode: str,
     approval_mode: str,
     stub_servers: frozenset[str],
+    shared_readonly_servers: frozenset[str] = frozenset(),
     pooling_enabled: bool = True,
     forward_env: bool = False,
     identity_keys: Collection[str] = (),
@@ -696,15 +703,30 @@ def _rewrite_single_spec(
             )
             new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
             continue
+        shared_readonly = (
+            name in shared_readonly_servers
+            or mcp_server_alias(name) in shared_readonly_servers
+        )
+        # This profile is intentionally stricter than ordinary pooling. A
+        # declared environment or auto-approved tool is evidence that the
+        # backend is not a generic host-read-only service, so preserve its
+        # per-agent/workspace partition even when it was configured by name.
+        if shared_readonly and (entry_env or entry.get("autoApprove")):
+            logger.warning(
+                "rewriter: shared-readonly server %r declares environment or "
+                "auto-approved tools; keeping it session-scoped",
+                name,
+            )
+            shared_readonly = False
         new_servers[name] = _build_stub_entry(
             stubs_dir=stubs_dir,
             server_name=name,
-            agent_name=agent_name,
+            agent_name=_SHARED_READONLY_AGENT if shared_readonly else agent_name,
             original=entry,
             env_pairs=entry_env,
             target_command=resolved_cmd,
             socket_path=socket_path,
-            work_dir=work_dir,
+            work_dir=(stubs_dir.parent / "shared-readonly") if shared_readonly else work_dir,
             sandbox_mode=sandbox_mode,
             approval_mode=approval_mode,
             sidecars_written=sidecars_written,
@@ -800,15 +822,25 @@ def _rewrite_single_spec(
             new_servers[alias] = {k: v for k, v in entry.items() if k != "poolable"}
             seen_targets.add(inject_sig)
             continue
+        shared_readonly = (
+            name in shared_readonly_servers or alias in shared_readonly_servers
+        )
+        if shared_readonly and (entry_env or entry.get("autoApprove")):
+            logger.warning(
+                "rewriter: shared-readonly settings server %r declares environment "
+                "or auto-approved tools; keeping it session-scoped",
+                alias,
+            )
+            shared_readonly = False
         new_servers[alias] = _build_stub_entry(
             stubs_dir=stubs_dir,
             server_name=alias,
-            agent_name=agent_name,
+            agent_name=_SHARED_READONLY_AGENT if shared_readonly else agent_name,
             original=entry,
             env_pairs=entry_env,
             target_command=resolved_cmd,
             socket_path=socket_path,
-            work_dir=work_dir,
+            work_dir=(stubs_dir.parent / "shared-readonly") if shared_readonly else work_dir,
             sandbox_mode=sandbox_mode,
             approval_mode=approval_mode,
             sidecars_written=sidecars_written,
@@ -949,6 +981,7 @@ def _rewrite_inputs_fingerprint(
     sandbox_mode: str,
     approval_mode: str,
     stub_set: frozenset[str],
+    shared_readonly_set: frozenset[str],
     pooling_enabled: bool,
     forward_env: bool,
     identity_keys: Collection[str],
@@ -1005,6 +1038,7 @@ def _rewrite_inputs_fingerprint(
         "sandbox_mode": sandbox_mode,
         "approval_mode": approval_mode,
         "stub_servers": sorted(stub_set),
+        "shared_readonly_servers": sorted(shared_readonly_set),
         "pooling_enabled": bool(pooling_enabled),
         "sources": sources,
         "settings": _stat_sig(settings_path),
@@ -1287,6 +1321,7 @@ def rewrite_agents(
     sandbox_mode: str = "auto",
     approval_mode: str = "interactive",
     stub_servers: frozenset[str] | None = None,
+    shared_readonly_servers: frozenset[str] | None = None,
     pooling_enabled: bool = True,
 ) -> tuple[dict[str, int], dict[str, str]]:
     """Populate ``overlay_dir`` with rewritten copies of ``source_dir/*.json``.
@@ -1319,6 +1354,10 @@ def rewrite_agents(
             session to launch itself, which is what keeps the default free of both
             a daemon and a stub process. ``None`` is treated as an empty set,
             meaning nothing is rewritten at all.
+        shared_readonly_servers: Routed server names explicitly allowed to share
+            one credential-free, read-only backend across agent/workspace
+            boundaries. This is empty by default and cannot make an unstubbed
+            server shareable.
         pooling_enabled: ``config.mcp_gateway.enabled``. Sharing is global over
             the stub set: when ``False`` no stub is marked shareable, so each
             connection gets its own backend while the stubs stay in place — the
@@ -1335,6 +1374,11 @@ def rewrite_agents(
           to spawn for a new pool key.
     """
     stub_set = stub_servers or frozenset()
+    shared_readonly_set = frozenset(
+        name
+        for name in (shared_readonly_servers or ())
+        if name in stub_set or mcp_server_alias(name) in stub_set
+    )
     if not source_dir.is_dir():
         logger.warning("agent source dir missing: %s", source_dir)
         return {}, {}
@@ -1379,6 +1423,7 @@ def rewrite_agents(
         sandbox_mode=sandbox_mode,
         approval_mode=approval_mode,
         stub_set=stub_set,
+        shared_readonly_set=shared_readonly_set,
         pooling_enabled=pooling_enabled,
         forward_env=forward_env,
         identity_keys=identity_keys,
@@ -1494,6 +1539,7 @@ def rewrite_agents(
             sandbox_mode=sandbox_mode,
             approval_mode=approval_mode,
             stub_servers=stub_set,
+            shared_readonly_servers=shared_readonly_set,
             pooling_enabled=pooling_enabled,
             forward_env=forward_env,
             identity_keys=identity_keys,

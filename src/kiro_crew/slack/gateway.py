@@ -8337,6 +8337,7 @@ class GatewayOrchestrator:
                     sandbox_mode=self._cfg.agent.sandbox,
                     approval_mode=self._cfg.agent.approval_mode,
                     stub_servers=stubs,
+                    shared_readonly_servers=frozenset(cfg_gw.shared_readonly_servers),
                     pooling_enabled=cfg_gw.enabled,
                 ),
             )
