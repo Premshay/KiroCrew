@@ -8,6 +8,7 @@ diff snippets). Records follow the findings JSON contract in the skill.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -97,11 +98,24 @@ def result_path(change_id: str, root: Path | None = None,
     return results_dir(root, run_id) / f"{safe_change_id(change_id)}.json"
 
 
+def dispatch_results_dir(capability: str, root: Path | None = None) -> Path:
+    """Private, capability-addressed staging for one reviewer dispatch."""
+    return store.data_dir(root) / "dispatches" / safe_change_id(capability)
+
+
+def dispatch_result_path(change_id: str, capability: str,
+                         root: Path | None = None) -> Path:
+    return dispatch_results_dir(capability, root) / f"{safe_change_id(change_id)}.json"
+
+
 def validate_result(record: dict) -> list[str]:
     """Return a list of contract violations (empty == valid)."""
     errs: list[str] = []
     if not isinstance(record, dict):
         return ["record must be an object"]
+    capability = record.get("result_capability")
+    if capability is not None and not isinstance(capability, str):
+        errs.append("result_capability must be a string")
     for k in REQUIRED_TOP:
         if k not in record:
             errs.append(f"missing top-level key: {k}")
@@ -231,11 +245,18 @@ def write_result(record: dict, root: Path | None = None,
     errs = validate_result(record)
     if errs:
         raise ValueError("invalid result record: " + "; ".join(errs))
+    capability = record.get("result_capability")
     if run_id:
         store.ensure_run_layout(run_id, root)
+        path = result_path(record["change_id"], root, run_id)
+    elif isinstance(capability, str):
+        directory = dispatch_results_dir(capability, root)
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        path = dispatch_result_path(record["change_id"], capability, root)
     else:
         store.ensure_layout(root)
-    path = result_path(record["change_id"], root, run_id)
+        path = result_path(record["change_id"], root, run_id)
     data = json.dumps(record, indent=2).encode("utf-8")
     store.atomic_write_locked(path, data)
     return path
@@ -338,7 +359,8 @@ def clear_staged(change_ids, root: Path | None = None) -> int:
     return removed
 
 
-def stake_shared(change_id: str, root: Path | None = None) -> bool:
+def stake_shared(change_id: str, root: Path | None = None,
+                 expected_capability: str | None = None) -> bool:
     """Clear this change's shared slot. True == it is now empty and safe to adopt from.
 
     Adoption cannot tell WHO wrote the file it adopts: the payload check only proves the
@@ -352,7 +374,8 @@ def stake_shared(change_id: str, root: Path | None = None) -> bool:
     planted at the path is discarded rather than dereferenced. Returning False (the slot
     could not be cleared) tells the driver not to trust whatever turns up there.
     """
-    path = result_path(change_id, root, None)
+    path = (dispatch_result_path(change_id, expected_capability, root)
+            if expected_capability else result_path(change_id, root, None))
     try:
         os.unlink(path)
     except FileNotFoundError:
@@ -362,8 +385,19 @@ def stake_shared(change_id: str, root: Path | None = None) -> bool:
     return True
 
 
-def adopt_from_shared(change_id: str, root: Path | None = None,
-                      run_id: str | None = None) -> bool:
+def stake_dispatch(change_id: str, capability: str,
+                   root: Path | None = None) -> bool:
+    """Clear one capability-addressed staging path before its worker starts."""
+    return stake_shared(change_id, root, capability)
+
+
+def adopt_from_shared(
+    change_id: str,
+    root: Path | None = None,
+    run_id: str | None = None,
+    *,
+    expected_capability: str | None = None,
+) -> bool:
     """Move a worker-written record from the shared dir into the run's dir.
 
     Returns True when a record was adopted. A no-op (returning False) when the
@@ -388,8 +422,10 @@ def adopt_from_shared(change_id: str, root: Path | None = None,
     """
     if not run_id:
         return False
-    shared = results_dir(root, None)
-    src = shared / f"{safe_change_id(change_id)}.json"
+    shared = (dispatch_results_dir(expected_capability, root)
+              if expected_capability else results_dir(root, None))
+    src = (dispatch_result_path(change_id, expected_capability, root)
+           if expected_capability else shared / f"{safe_change_id(change_id)}.json")
     # lstat, so a dangling or planted symlink is not mistaken for a record.
     if not src.is_file() or src.is_symlink():
         if not src.is_symlink():
@@ -440,6 +476,13 @@ def adopt_from_shared(change_id: str, root: Path | None = None,
         # a byte-exact match is what a correct record already produces; anything
         # else is a different change or a malformed one, and both must be refused.
         return False
+    if expected_capability is not None:
+        actual_capability = parsed.get("result_capability")
+        if (not isinstance(actual_capability, str)
+                or not hmac.compare_digest(
+                    actual_capability.encode("utf-8", "surrogatepass"),
+                    expected_capability.encode("utf-8", "surrogatepass"))):
+            return False
     store.ensure_run_layout(run_id, root)
     dst = result_path(change_id, root, run_id)
     # Write a private temp file in the destination directory, then rename over
@@ -457,7 +500,8 @@ def adopt_from_shared(change_id: str, root: Path | None = None,
 
 
 def publish_to_shared(change_id: str, root: Path | None = None,
-                      run_id: str | None = None) -> bool:
+                      run_id: str | None = None,
+                      *, result_capability: str | None = None) -> bool:
     """Copy a run-scoped record back to the shared dir the poster reads.
 
     Only needed on the opt-in posting path: the poster prompt also refers to
@@ -477,9 +521,15 @@ def publish_to_shared(change_id: str, root: Path | None = None,
     src = result_path(change_id, root, run_id)
     if not src.is_file():
         return False
-    store.ensure_layout(root)
-    shared = results_dir(root, None)
-    dst = shared / f"{safe_change_id(change_id)}.json"
+    if result_capability:
+        shared = dispatch_results_dir(result_capability, root)
+        shared.mkdir(parents=True, exist_ok=True)
+        os.chmod(shared, 0o700)
+        dst = dispatch_result_path(change_id, result_capability, root)
+    else:
+        store.ensure_layout(root)
+        shared = results_dir(root, None)
+        dst = shared / f"{safe_change_id(change_id)}.json"
     try:
         # Read through the same no-follow guard the adoption direction uses. The
         # RUN results dir is worker-writable too, so a worker that replaced its

@@ -397,7 +397,7 @@ class TestReviewDriver(unittest.TestCase):
         # `build_review_task` fails CLOSED when the link's host no longer
         # revalidates. Patched rather than reached through a crafted URL so the
         # test pins THIS site's payload, not the host-allowlist rules.
-        def refuse(link):
+        def refuse(link, result_capability=None):
             raise D.pipeline.adapters.AdapterError("host is not allowed")
 
         with mock.patch.object(D, "build_review_task", refuse):
@@ -413,6 +413,15 @@ class TestReviewDriver(unittest.TestCase):
         self.assertIn("DESIGN dimension", task)
         self.assertIn("spawn further subagents", task)
         self.assertIn("github.com/o/r/pull/7", task)
+
+    def test_review_task_binds_the_result_to_its_dispatch(self):
+        dispatch_path = "/private/dispatch/CR-7.json"
+        task = D.build_review_task("CR-7", "dispatch-capability", dispatch_path)
+        followup = D.build_review_followup_task("CR-7", "dispatch-capability")
+        self.assertIn("result_capability", task)
+        self.assertIn("dispatch-capability", task)
+        self.assertIn(dispatch_path, task)
+        self.assertIn("dispatch-capability", followup)
 
     def test_review_task_has_inline_learning(self):
         task = D.build_review_task("CR-8")

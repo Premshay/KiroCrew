@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -392,7 +393,8 @@ def _accepts_activity(dispatch: Callable[..., Any]) -> bool:
     return _accepts_kwarg(dispatch, "on_activity")
 
 
-def build_review_task(change_link: str) -> str:
+def build_review_task(change_link: str, result_capability: str | None = None,
+                      result_path: str | None = None) -> str:
     """Single-pass review prompt: ONE isolated session does the WHOLE review —
     design reasoning AND every code-level dimension — in a single turn, and writes
     the complete result record (phase1 design fields + findings + counts +
@@ -444,14 +446,23 @@ def build_review_task(change_link: str) -> str:
         "actually reviewed, and `coverage_complete` to true ONLY if that list covers "
         "every changed file — otherwise set it false (the driver will run ONE "
         "targeted follow-up on the remainder). Do not pad the list; report honestly.\n"
-        "  7. RECORD ONLY — do NOT post any comments. Write data/results/<id>.json: "
+        "  7. RECORD ONLY — do NOT post any comments. Write "
+        + (result_path or "data/results/<id>.json") + ": "
         "phase1 (gate_verdict, design_risk, criticality, design_headline, problem, "
         "why_it_matters, solution_assessment) + blast_radius; `findings` (each with "
         "file, line, severity 🔴/🟡, dimension, headline, observation, consequence, "
         "suggestion, snippet, lang); `counts` {red,yellow}; `ship_summary` (ONE straightforward "
         "line: good-to-ship + reason when there are no 🔴, or not-ready + the "
         "must-fix/design reason otherwise); `files_covered`; `coverage_complete`; "
-        "deep_reviewed=true. The driver builds the redacted bodies and a separate "
+        "deep_reviewed=true."
+        + (
+            " Include top-level `result_capability` exactly as `"
+            + result_capability
+            + "`; it binds this record to this review dispatch."
+            if result_capability
+            else ""
+        )
+        + " The driver builds the redacted bodies and a separate "
         "poster publishes them — you MUST NOT call any comment tool.\n"
         "     `headline` is the finding's CONCLUSION in ONE sentence under about 100 "
         "characters: what is actually wrong, stated directly. It is the only line a "
@@ -468,7 +479,10 @@ def build_review_task(change_link: str) -> str:
     )
 
 
-def build_review_followup_task(change_link: str) -> str:
+def build_review_followup_task(
+    change_link: str, result_capability: str | None = None,
+    result_path: str | None = None,
+) -> str:
     """Bounded coverage backstop — dispatched AT MOST ONCE, and only when the single
     review reported ``coverage_complete=false``. It reviews the STILL-UNCOVERED
     changed files and APPENDS only net-new findings (never repeats/removes existing
@@ -478,7 +492,8 @@ def build_review_followup_task(change_link: str) -> str:
     return (
         "You are a Code Review Sage reviewer running in an ISOLATED, CLEAN session. "
         "A prior pass reviewed EXACTLY ONE change: " + change_link + " but reported "
-        "INCOMPLETE file coverage (coverage_complete=false) in data/results/<id>.json.\n"
+        "INCOMPLETE file coverage (coverage_complete=false) in "
+        + (result_path or "data/results/<id>.json") + ".\n"
         "Run every `sage_lib/...` command — the ones below AND the ones the skill "
         "writes as `<python> ...` — with this interpreter: `" + py + "`. Use that "
         "absolute path verbatim (quote it as YOUR shell requires if it contains "
@@ -503,12 +518,20 @@ def build_review_followup_task(change_link: str) -> str:
         "{red,yellow} over "
         "the FULL list; refresh `ship_summary`; extend `files_covered` to include "
         "every changed file and set `coverage_complete=true`; keep deep_reviewed=true "
-        "and PRESERVE the phase1 block. You MUST NOT call any comment tool.\n"
+        "and PRESERVE the phase1 block."
+        + (
+            " Preserve top-level `result_capability` exactly as `"
+            + result_capability
+            + "`."
+            if result_capability
+            else ""
+        )
+        + " You MUST NOT call any comment tool.\n"
         "Do NOT spawn further subagents. Execute; do not ask questions."
     )
 
 
-def build_post_task(change_link: str) -> str:
+def build_post_task(change_link: str, result_path: str | None = None) -> str:
     """Poster prompt: publish the driver-built, Python-REDACTED DRAFT comments for
     one change. The bodies are authoritative and already scrubbed in Python — the
     poster posts them VERBATIM and only resolves the (non-sensitive) anchor. This
@@ -543,7 +566,8 @@ def build_post_task(change_link: str) -> str:
     # the poster posts it verbatim and never submits. A HUMAN submits it.
     return (
         _preamble
-        + "  1. Read data/results/<id>.json and take its `github_review_payload` "
+        + "  1. Read " + (result_path or "data/results/<id>.json")
+        + " and take its `github_review_payload` "
         "object (fields: body, comments[], optional commit_id). It was assembled "
         "AND redacted in Python — use it EXACTLY as given; do NOT rebuild it. Parse "
         "<owner>/<repo>/<number> from the PR URL.\n"
@@ -565,7 +589,8 @@ def build_post_task(change_link: str) -> str:
         "call any submit/approve/dismiss endpoint, and MUST NOT run `gh pr review` "
         "(that would submit immediately). `gh` uses its own stored auth — never "
         "read, print, or pass any token.\n"
-        "  4. Update data/results/<id>.json: set posted_comments = len(comments) "
+        "  4. Update " + (result_path or "data/results/<id>.json")
+        + ": set posted_comments = len(comments) "
         "plus 1 when `body` is non-empty; set design_comment_posted = true when "
         "`body` is non-empty (else false). Do NOT modify findings, phase1, "
         "pending_comments, or github_review_payload.\n"
@@ -817,7 +842,15 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
     # Without a run_id the record already IS the shared one: publishing is a no-op
     # that also reports False, and treating that as refusal would abort every
     # unscoped post. The guard therefore applies only where a copy was required.
-    if run_id and not results.publish_to_shared(change_id, root, run_id):
+    capability = cur.get("result_capability")
+    dispatch_path = (
+        str(results.dispatch_result_path(change_id, capability, root))
+        if isinstance(capability, str) else None
+    )
+    if run_id and not results.publish_to_shared(
+        change_id, root, run_id,
+        result_capability=capability if isinstance(capability, str) else None,
+    ):
         staged = "could not stage the review record for the poster"
         cur["post_ok"] = False
         cur["post_error"] = staged
@@ -831,7 +864,7 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
     # public same-slug PR. Surface that as a per-change post failure — the
     # record stays on disk for a retry once the host is configured again.
     try:
-        post_prompt = build_post_task(link)
+        post_prompt = build_post_task(link, result_path=dispatch_path)
     except pipeline.adapters.AdapterError as exc:
         refused = f"refusing to post: {exc}"
         cur["post_ok"] = False
@@ -841,7 +874,12 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
                 "design_comment_posted": False, "pending": len(pending),
                 "expected_units": 0, "posted_keys": list(already)}
     spawn = dispatch(post_prompt, timeout)
-    results.adopt_from_shared(change_id, root, run_id)
+    results.adopt_from_shared(
+        change_id,
+        root,
+        run_id,
+        expected_capability=capability if isinstance(capability, str) else None,
+    )
     after = results.read_result(change_id, root, run_id) or {}
     ok = bool(spawn.get("ok", False))
     # The poster writes the count it actually delivered. That write is the ONLY
@@ -1150,6 +1188,11 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         progress(_cid(_link), "queued", {})
 
     concurrency = _resolve_concurrency(concurrency)
+    # Standalone callers still use the legacy shared result directory, where a
+    # worker has no per-dispatch capability to bind its record. Keep that mode
+    # serial; dashboard runs always supply a run id and can use the bounded pool.
+    if not run_id:
+        concurrency = 1
     per_change: list[dict] = []
 
     def _post_pending(change_id: str, link: str) -> dict:
@@ -1158,6 +1201,11 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
 
     def _one(link: str) -> dict:
         change_id = _cid(link)
+        result_capability = secrets.token_urlsafe(32) if run_id else None
+        dispatch_path = (
+            str(results.dispatch_result_path(change_id, result_capability, root))
+            if result_capability else None
+        )
 
         # Cooperative cancellation checkpoint. A change that has not started yet is
         # dropped here rather than paying for a full review the user already
@@ -1210,7 +1258,10 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         # would route the worker at public github.com — reviewing (and later
         # posting about) a same-slug public PR instead of the intended one.
         try:
-            review_prompt = build_review_task(link)
+            task_kwargs = {"result_capability": result_capability}
+            if _accepts_kwarg(build_review_task, "result_path"):
+                task_kwargs["result_path"] = dispatch_path
+            review_prompt = build_review_task(link, **task_kwargs)
         except pipeline.adapters.AdapterError as exc:
             refused = f"refusing to review: {exc}"
             progress(change_id, "failed", {
@@ -1224,7 +1275,10 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
                 "design_block": False, "deep_rounds": 0,
                 "skipped_reason": "review_failed",
             }
-        slot_clear = results.stake_shared(change_id, root)
+        slot_clear = (
+            results.stake_dispatch(change_id, result_capability, root)
+            if result_capability else results.stake_shared(change_id, root)
+        )
         # Keep THIS session (the deep review) resumable: the findings' reasoning
         # is in its context, so it is the only one worth asking about. The
         # gate/follow-up/post sessions are not kept.
@@ -1239,7 +1293,12 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         # move it into this run's private dir before reading. Without this the
         # run's dir stays empty and a completed review reports no findings.
         if slot_clear:
-            results.adopt_from_shared(change_id, root, run_id)
+            results.adopt_from_shared(
+                change_id,
+                root,
+                run_id,
+                expected_capability=result_capability,
+            )
         rev_rec = results.read_result(change_id, root, run_id)
         verdict = str(((rev_rec or {}).get("phase1") or {}).get("gate_verdict", "")).upper()
 
@@ -1301,18 +1360,28 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
             # visible at the path its prompt names, and re-adopted afterwards. A
             # failed publish means the record there is not ours, and the follow-up
             # would adopt whatever replaced it -- skip the turn instead.
-            published = results.publish_to_shared(change_id, root, run_id)
+            published = results.publish_to_shared(
+                change_id, root, run_id, result_capability=result_capability)
             # Same fail-closed contract as the first pass: no confirmed host, no
             # follow-up turn. A failed follow-up keeps the first pass's record.
             try:
-                followup_prompt: str | None = build_review_followup_task(link)
+                followup_kwargs = {"result_capability": result_capability}
+                if _accepts_kwarg(build_review_followup_task, "result_path"):
+                    followup_kwargs["result_path"] = dispatch_path
+                followup_prompt: str | None = build_review_followup_task(
+                    link, **followup_kwargs)
             except pipeline.adapters.AdapterError:
                 followup_prompt = None
             second_pass = (dispatch(followup_prompt, timeout)
                            if followup_prompt and (published or not run_id)
                            else {"ok": False})
             if second_pass.get("ok", False):
-                results.adopt_from_shared(change_id, root, run_id)
+                results.adopt_from_shared(
+                    change_id,
+                    root,
+                    run_id,
+                    expected_capability=result_capability,
+                )
                 rev_rec = results.read_result(change_id, root, run_id) or rev_rec
                 rec["deep_rounds"] = 2
                 rec["deep_reviewed"] = bool((rev_rec or {}).get("deep_reviewed"))
