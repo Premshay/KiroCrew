@@ -236,6 +236,8 @@ export function useWebSocket() {
   const voicePlayingRef = useRef(false)
   const activeAudioRef = useRef<HTMLAudioElement | null>(null)
   const autoSpeakRef = useRef(false)
+  const configuredAutoSpeakRef = useRef(false)
+  const handsFreeAutoSpeakSourcesRef = useRef(new Set<string>())
   // Speech offsets belong to one concrete message. A segment for another slot
   // must not reset the active message, and a new post-tool segment must start
   // from zero even while the previous message remains in the transcript.
@@ -282,6 +284,10 @@ export function useWebSocket() {
       dispatch(setVoiceBusy(busy))
     }
   }, [dispatch])
+
+  const updateAutoSpeak = useCallback(() => {
+    autoSpeakRef.current = configuredAutoSpeakRef.current || handsFreeAutoSpeakSourcesRef.current.size > 0
+  }, [])
 
   const stopVoice = useCallback(() => {
     voiceMutedRef.current = true
@@ -792,8 +798,11 @@ export function useWebSocket() {
       // Forget the last raw slots frame too, so a reconnect whose first frame
       // repeats the last one before it cannot swallow that first frame.
       lastSlotsRawRef.current = null
-      // Cache auto-speak preference
-      api.voiceConfig().then(c => { autoSpeakRef.current = !!c.autoSpeak }).catch(() => {})
+      // Cache the configured preference without overriding a live hands-free conversation.
+      api.voiceConfig().then(c => {
+        configuredAutoSpeakRef.current = !!c.autoSpeak
+        updateAutoSpeak()
+      }).catch(() => {})
       if (wasConnectedRef.current) {
         // Reconnecting after disconnect — re-fetch state instead of
         // reloading the page.  Preserves unsent messages, scroll
@@ -1935,7 +1944,7 @@ export function useWebSocket() {
     }
 
     ws.onerror = () => { /* onclose will fire */ }
-  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, queryClient, stopVoice, updateVoiceBusy, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordRetiredId])
+  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, queryClient, stopVoice, updateVoiceBusy, updateAutoSpeak, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordRetiredId])
 
   /**
    * Force an immediate reconnect: cancels any pending backoff timer, closes
@@ -1974,7 +1983,15 @@ export function useWebSocket() {
     const onVoiceStop = () => stopVoice()
     const onVoiceConfigChanged = (e: Event) => {
       const detail = (e as CustomEvent).detail
-      autoSpeakRef.current = !!detail?.autoSpeak
+      configuredAutoSpeakRef.current = !!detail?.autoSpeak
+      updateAutoSpeak()
+    }
+    const onHandsFreeSpeechChanged = (e: Event) => {
+      const detail = (e as CustomEvent<{ source?: unknown; enabled?: unknown }>).detail
+      if (typeof detail?.source !== 'string') return
+      if (detail.enabled) handsFreeAutoSpeakSourcesRef.current.add(detail.source)
+      else handsFreeAutoSpeakSourcesRef.current.delete(detail.source)
+      updateAutoSpeak()
     }
     const onVoicePlayUrl = (e: Event) => {
       const url = (e as CustomEvent<unknown>).detail
@@ -1982,6 +1999,7 @@ export function useWebSocket() {
     }
     window.addEventListener('voice-stop', onVoiceStop)
     window.addEventListener('voice-config-changed', onVoiceConfigChanged)
+    window.addEventListener('handsfree-speech-changed', onHandsFreeSpeechChanged)
     window.addEventListener('voice-play-url', onVoicePlayUrl)
     // Slot-focus intent signal (resume prefetch). One shared sender for
     // every focus source — Redux activeSlot changes (sidebar, keyboard,
@@ -2030,12 +2048,13 @@ export function useWebSocket() {
       wsRef.current = null
       window.removeEventListener('voice-stop', onVoiceStop)
       window.removeEventListener('voice-config-changed', onVoiceConfigChanged)
+      window.removeEventListener('handsfree-speech-changed', onHandsFreeSpeechChanged)
       window.removeEventListener('voice-play-url', onVoicePlayUrl)
       document.removeEventListener('visibilitychange', onVisibility)
       unsubFocus()
       sendSlotFocusedImpl = () => {}
     }
-  }, [connect, forceReconnect, playVoiceUrl, stopVoice, flushSlotActivity, flushSubagentChunks, flushBufferedThinking])
+  }, [connect, forceReconnect, playVoiceUrl, stopVoice, flushSlotActivity, flushSubagentChunks, flushBufferedThinking, updateAutoSpeak])
 
   /** Subscribe to log events — call with callback on mount, null on unmount. */
   const subscribeLogs = useCallback((cb: LogCallback) => {

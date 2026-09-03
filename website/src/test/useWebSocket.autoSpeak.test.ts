@@ -159,6 +159,38 @@ describe('useWebSocket auto-speak voice pipeline', () => {
     hook.unmount()
   })
 
+  it('speaks an armed hands-free conversation when global auto-speak is off', async () => {
+    vi.mocked(api.voiceConfig).mockResolvedValueOnce({ autoSpeak: false })
+    const { hook, ws } = await mount()
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('handsfree-speech-changed', { detail: { source: 'hands-free-1', enabled: true } }))
+      window.dispatchEvent(new CustomEvent('handsfree-speech-changed', { detail: { source: 'hands-free-2', enabled: false } }))
+      ws.simulateMessage({ type: 'chat_message', data: { slot: 'slot-1', role: 'assistant', content: 'A hands-free reply.', ts: '10.1' } })
+      ws.simulateMessage({ type: 'chat_done', data: { slot: 'slot-1' } })
+    })
+    await act(async () => {})
+
+    expect(api.voiceSynthesize).toHaveBeenCalledWith('slot-1', 'A hands-free reply.', SYNTH_OPTS)
+    hook.unmount()
+  })
+
+  it('returns to silent regular chat when hands-free conversation ends', async () => {
+    vi.mocked(api.voiceConfig).mockResolvedValueOnce({ autoSpeak: false })
+    const { hook, ws } = await mount()
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('handsfree-speech-changed', { detail: { source: 'hands-free-1', enabled: true } }))
+      window.dispatchEvent(new CustomEvent('handsfree-speech-changed', { detail: { source: 'hands-free-1', enabled: false } }))
+      ws.simulateMessage({ type: 'chat_message', data: { slot: 'slot-1', role: 'assistant', content: 'A regular reply.', ts: '10.2' } })
+      ws.simulateMessage({ type: 'chat_done', data: { slot: 'slot-1' } })
+    })
+    await act(async () => {})
+
+    expect(api.voiceSynthesize).not.toHaveBeenCalled()
+    hook.unmount()
+  })
+
   it('plays queued chunks strictly in order, one at a time', async () => {
     const { hook, ws } = await mount()
 

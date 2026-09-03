@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, useId } from 'react'
 import { createPortal } from 'react-dom'
 import { useLocation, useNavigate, useNavigationType, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -935,6 +935,7 @@ const jumpUnavailableNotice = (origin: PendingJumpOrigin): string =>
       : i18nT('pages.chat.pins.message_unavailable')
 
 export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync }: { mode?: string; embedded?: boolean; embedMode?: 'chat' | 'sessions'; popout?: boolean; noUrlSync?: boolean } = {}) {
+  const handsFreeSpeechSource = useId()
   const dispatch = useAppDispatch()
   const moveSlotToFolder = useMoveSlotToFolder()
   const navigate = useNavigate()
@@ -2630,6 +2631,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     window.addEventListener('voice-config-changed', onCfg)
     return () => window.removeEventListener('voice-config-changed', onCfg)
   }, [])
+  const [handsFreeSpeechOn, setHandsFreeSpeechOn] = useState(false)
   // Barge-in: a mic tap while the reply is speaking stops the audio and hands
   // the floor back to the user for the REST OF THIS TURN — the hold must not
   // re-assert while the interrupted turn is still streaming, so the flag
@@ -2637,7 +2639,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const [bargedIn, setBargedIn] = useState(false)
   useEffect(() => { if (!slotRunning && !voiceBusy) setBargedIn(false) }, [slotRunning, voiceBusy])
   useEffect(() => { setBargedIn(false) }, [activeSlot])
-  const convoHold = autoSpeakOn && !bargedIn && (!!slotRunning || voiceBusy)
+  const spokenConversation = autoSpeakOn || handsFreeSpeechOn
+  const convoHold = spokenConversation && !bargedIn && (!!slotRunning || voiceBusy)
   const convoHoldRef = useRef(convoHold)
   convoHoldRef.current = convoHold
   const handsFree = useHandsFreeLoop({
@@ -2657,6 +2660,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     cancelDiscard: cancelVoice,
   })
   handsFreeRef.current = handsFree
+  useEffect(() => {
+    setHandsFreeSpeechOn(handsFree.armed)
+    window.dispatchEvent(new CustomEvent('handsfree-speech-changed', { detail: { source: handsFreeSpeechSource, enabled: handsFree.armed } }))
+    return () => {
+      window.dispatchEvent(new CustomEvent('handsfree-speech-changed', { detail: { source: handsFreeSpeechSource, enabled: false } }))
+    }
+  }, [handsFree.armed, handsFreeSpeechSource])
   // The mic button: in hands-free mode it arms/exits the LOOP instead of a
   // one-shot dictation. Exiting commits the in-flight utterance to the
   // composer — after a manual act nothing may auto-send. While the reply is
