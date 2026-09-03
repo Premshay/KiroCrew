@@ -1104,25 +1104,27 @@ class TestConsolidateGuards(_SageRoutesBase):
         self.assertEqual(resp.status, 409)
         self.assertEqual(_body(resp)["code"], "consolidation_in_progress")
 
-    async def test_a_failing_staged_count_gives_the_claim_back(self):
+    async def test_a_failing_candidate_load_gives_the_claim_back(self):
         with unittest.mock.patch.object(
-                self.mod.learning, "candidate_count", side_effect=OSError("boom")):
+                self.mod.learning, "list_candidate", side_effect=OSError("boom")):
             with self.assertRaises(OSError):
                 await self.mod._handle_consolidate(_Req(method="POST", body={}))
         self.assertNotIn(learning.DEFAULT_NAMESPACE, self.mod._CONSOLIDATING)
 
-    async def test_staged_candidates_start_a_merge_task(self):
-        async def _noop(ns):
+    async def test_staged_candidates_start_a_preview_task(self):
+        async def _noop(ns, candidate_ids, snapshot):
             return None
         with unittest.mock.patch.object(
-                self.mod.learning, "candidate_count", return_value=3), \
+                self.mod.learning, "list_candidate", return_value=[
+                    {"id": "candidate-1", "title": "rule", "guidance": "check it"}
+                ]), \
                 unittest.mock.patch.object(
-                    self.mod, "_consolidate_bg", side_effect=_noop):
+                self.mod, "_consolidate_bg", side_effect=_noop):
             resp = await self.mod._handle_consolidate(_Req(method="POST", body={}))
             await asyncio.sleep(0)
         payload = _body(resp)
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["staged"], 3)
+        self.assertEqual(payload["candidate_ids"], ["candidate-1"])
         self.assertTrue(
             self.mod._CONSOLIDATE_STATE[learning.DEFAULT_NAMESPACE]["running"])
 
