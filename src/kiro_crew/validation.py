@@ -1813,8 +1813,8 @@ _ARTIFACT_KIND_RE = re.compile(r"^(widget|html|markdown|svg|json|text|image|weba
 
 # Model identifiers passed to kiro-cli ``--model`` (AcpRuntime). First char
 # must be alphanumeric so a value can never be parsed as a CLI flag, and the
-# charset covers real model ids (gpt-5.6-sol, claude-sonnet-4.6) only.
-MODEL_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
+# charset covers real model ids, including provider-qualified effort variants.
+MODEL_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._\[\]-]{0,127}$")
 _ARTIFACT_SOURCE_RE = re.compile(r"^(chat|cron|subagent|manual|import)$")
 # Single source of truth: the MCP save/update field cap MUST equal the store's
 # own content cap, else the tool path rejects content the store would accept
