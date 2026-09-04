@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import pytest
 
@@ -289,6 +290,49 @@ def test_worker_progress_and_blocker_events_carry_actor():
     assert view["events"][-1]["kind"] == "blocker"
     with pytest.raises(wi.WorkItemError, match="progress kind"):
         wi.worker_report_progress(worker_key, item["id"], "nope", "chit-chat")
+
+
+def test_worker_mutations_hold_the_store_lock_through_persistence(monkeypatch):
+    item, _ = _launch()
+    run_id = item["assignment"]["worker_run_id"]
+    wi.record_launch_accepted(KEY, run_id)
+    wi.record_launch_delivered(KEY, run_id)
+    worker_key = f"subagent:{run_id}"
+    original_locked = wi._locked
+    original_context = wi._worker_context_unlocked
+    original_write = wi._write_state
+    lock_depth = 0
+
+    @contextmanager
+    def tracked_locked(dir_path):
+        nonlocal lock_depth
+        with original_locked(dir_path):
+            lock_depth += 1
+            try:
+                yield
+            finally:
+                lock_depth -= 1
+
+    def checked_context(*args, **kwargs):
+        assert lock_depth == 1
+        return original_context(*args, **kwargs)
+
+    def checked_write(*args, **kwargs):
+        assert lock_depth == 1
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(wi, "_locked", tracked_locked)
+    monkeypatch.setattr(wi, "_worker_context_unlocked", checked_context)
+    monkeypatch.setattr(wi, "_write_state", checked_write)
+
+    wi.worker_report_progress(worker_key, item["id"], "halfway there", "progress")
+    wi.worker_submit_handoff(
+        worker_key,
+        item["id"],
+        outcome="implementation complete",
+        next_action="review the handoff",
+        verification=["focused tests pass"],
+    )
 
 
 def test_worker_write_after_revocation_is_stale():
