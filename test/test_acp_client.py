@@ -9125,6 +9125,71 @@ class TestDispatchSubagentEvents:
     notifications."""
 
     @pytest.mark.asyncio
+    async def test_dispatch_projects_claude_async_workflow_lifecycle_to_child_cards(self):
+        """Claude ACP async tasks use standard updates, not legacy claudeCode metadata."""
+        from kiro_crew.acp.types import EVENT_SUBAGENT_ACTIVITY, JsonRpcMessage
+
+        client = AcpClient(acp_backend=ACP_BACKEND_CLAUDE)
+        frames = [
+            (
+                "update",
+                JsonRpcMessage(
+                    params={
+                        "update": {
+                            "sessionUpdate": "async_task_spawned",
+                            "asyncTaskId": "workflow-private-id",
+                            "name": "Investigate import latency",
+                            "taskType": "workflow",
+                        }
+                    }
+                ),
+            ),
+            (
+                "update",
+                JsonRpcMessage(
+                    params={
+                        "update": {
+                            "sessionUpdate": "async_task_progress",
+                            "asyncTaskId": "workflow-private-id",
+                            "lastToolName": "Read service implementation",
+                        }
+                    }
+                ),
+            ),
+            (
+                "update",
+                JsonRpcMessage(
+                    params={
+                        "update": {
+                            "sessionUpdate": "async_task_state_update",
+                            "asyncTaskId": "workflow-private-id",
+                            "state": "completed",
+                        }
+                    }
+                ),
+            ),
+            ("complete", JsonRpcMessage(result={"stopReason": "end_turn"})),
+        ]
+
+        async def _fake_loop(req_id, timeout):
+            for frame in frames:
+                yield frame
+
+        client._prompt_loop = _fake_loop  # type: ignore[assignment]
+        events = [event async for event in client._dispatch_events(req_id=1, timeout=1.0)]
+        children = [
+            event.provider_child
+            for event in events
+            if event.kind == EVENT_SUBAGENT_ACTIVITY and event.provider_child
+        ]
+
+        assert [child.phase for child in children] == ["started", "activity", "completed"]
+        assert {child.child_id for child in children} == {"async:workflow-private-id"}
+        assert children[0].label == "Investigate import latency"
+        [progress] = [event for event in events if event.provider_child and event.title]
+        assert progress.title == "Read service implementation"
+
+    @pytest.mark.asyncio
     async def test_dispatch_routes_claude_child_text_to_its_task_card(self):
         """Claude's opted-in nested transcript must not leak into parent text."""
         from kiro_crew.acp.types import (
