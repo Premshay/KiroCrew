@@ -992,7 +992,6 @@ def evaluate_items(
     return results
 
 
-
 # ---------------------------------------------------------------------------
 # Slice 3: launched-subagent assignment, launch receipts, worker surface.
 #
