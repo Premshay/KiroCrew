@@ -1,1 +1,1 @@
-"""App-owned persistence for Design Critique."""
+"""Design Critique backend package."""

@@ -1,303 +1,481 @@
-import { describe, it, expect, beforeEach } from 'vitest'
-import { fireEvent } from '@testing-library/react'
-import { renderWithProviders, createTestStore } from './helpers'
-import ToolCallLine from '../pages/chat/ToolCallLine'
-import { presentToolDiff, isDiffToolMessage, diffCardStartsFolded, DIFF_CARD_FOLD_LINES } from '../pages/chat/toolDiff'
-import type { RootState } from '../store'
-import type { ChatMessage } from '../types'
+import { describe, it, expect, beforeEach } from "vitest";
+import { fireEvent } from "@testing-library/react";
+import { renderWithProviders, createTestStore } from "./helpers";
+import ToolCallLine, { resetOpenedDiffCards } from "../pages/chat/ToolCallLine";
+import {
+  presentToolDiff,
+  isDiffToolMessage,
+  diffCardStartsFolded,
+  DIFF_CARD_FOLD_LINES,
+} from "../pages/chat/toolDiff";
+import type { RootState } from "../store";
+import type { ChatMessage } from "../types";
 
-type ChatState = RootState['chat']
+type ChatState = RootState["chat"];
 
-if (typeof globalThis.ResizeObserver === 'undefined') {
+if (typeof globalThis.ResizeObserver === "undefined") {
   globalThis.ResizeObserver = class {
     observe() {}
     unobserve() {}
     disconnect() {}
-  } as unknown as typeof ResizeObserver
+  } as unknown as typeof ResizeObserver;
 }
 
-beforeEach(() => { localStorage.clear() })
+beforeEach(() => {
+  localStorage.clear();
+  resetOpenedDiffCards();
+});
 
 const UNIFIED_DIFF = [
-  '--- /home/u/proj/src/app.py',
-  '+++ /home/u/proj/src/app.py',
-  '@@ -1,3 +1,3 @@',
-  ' import os',
-  '-x = 1',
-  '+x = 2',
-].join('\n')
+  "--- /home/u/proj/src/app.py",
+  "+++ /home/u/proj/src/app.py",
+  "@@ -1,3 +1,3 @@",
+  " import os",
+  "-x = 1",
+  "+x = 2",
+].join("\n");
 
 function bigDiff(lines: number): string {
-  const body = Array.from({ length: lines }, (_, i) => `+line ${i}`).join('\n')
-  return `--- /dev/null\n+++ /home/u/proj/big.txt\n@@ -0,0 +1,${lines} @@\n${body}`
+  const body = Array.from({ length: lines }, (_, i) => `+line ${i}`).join("\n");
+  return `--- /dev/null\n+++ /home/u/proj/big.txt\n@@ -0,0 +1,${lines} @@\n${body}`;
 }
 
-describe('presentToolDiff', () => {
-  it('promotes an edit-kind unified diff to a full card', () => {
-    expect(presentToolDiff('edit', UNIFIED_DIFF)).toEqual({ mode: 'card', code: UNIFIED_DIFF })
-  })
+describe("presentToolDiff", () => {
+  it("promotes an edit-kind unified diff to a full card", () => {
+    expect(presentToolDiff("edit", UNIFIED_DIFF)).toEqual({
+      mode: "card",
+      code: UNIFIED_DIFF,
+    });
+  });
 
-  it('never promotes a non-edit kind, even when the input looks like a diff', () => {
+  it("never promotes a non-edit kind, even when the input looks like a diff", () => {
     // A shell command's input can contain diff-shaped text (git apply, a
     // heredoc patch) — the kind gate is what keeps it un-promoted.
-    expect(presentToolDiff('execute', UNIFIED_DIFF)).toBeNull()
-    expect(presentToolDiff('read', UNIFIED_DIFF)).toBeNull()
-    expect(presentToolDiff(undefined, UNIFIED_DIFF)).toBeNull()
-    expect(presentToolDiff('', UNIFIED_DIFF)).toBeNull()
-  })
+    expect(presentToolDiff("execute", UNIFIED_DIFF)).toBeNull();
+    expect(presentToolDiff("read", UNIFIED_DIFF)).toBeNull();
+    expect(presentToolDiff(undefined, UNIFIED_DIFF)).toBeNull();
+    expect(presentToolDiff("", UNIFIED_DIFF)).toBeNull();
+  });
 
-  it('rejects edit-kind input that is not a unified diff', () => {
-    expect(presentToolDiff('edit', '{"path": "/a/b", "command": "create"}')).toBeNull()
-    expect(presentToolDiff('edit', '')).toBeNull()
-    expect(presentToolDiff('edit', undefined)).toBeNull()
-  })
+  it("rejects edit-kind input that is not a unified diff", () => {
+    expect(
+      presentToolDiff("edit", '{"path": "/a/b", "command": "create"}'),
+    ).toBeNull();
+    expect(presentToolDiff("edit", "")).toBeNull();
+    expect(presentToolDiff("edit", undefined)).toBeNull();
+  });
 
-  it('a transport-truncated diff is always a summary, flagged truncated', () => {
+  it("a transport-truncated diff is always a summary, flagged truncated", () => {
     // A truncated payload can sit under the card line cap (64 KiB of long
     // lines) while missing most of the change — it must never render as a
     // complete-looking card, and the chip shows a visible truncation note.
-    const cut = `--- /a/big.txt\n+++ /a/big.txt\n@@ -1,9 +1,9 @@\n-old\n+new\n\\ diff truncated`
-    const view = presentToolDiff('edit', cut)
-    expect(view?.mode).toBe('summary')
-    if (view?.mode === 'summary') expect(view.truncated).toBe(true)
+    const cut = `--- /a/big.txt\n+++ /a/big.txt\n@@ -1,9 +1,9 @@\n-old\n+new\n\\ diff truncated`;
+    const view = presentToolDiff("edit", cut);
+    expect(view?.mode).toBe("summary");
+    if (view?.mode === "summary") expect(view.truncated).toBe(true);
     // An intact diff is never flagged.
-    const intact = presentToolDiff('edit', UNIFIED_DIFF)
-    expect(intact?.mode).toBe('card')
-  })
+    const intact = presentToolDiff("edit", UNIFIED_DIFF);
+    expect(intact?.mode).toBe("card");
+  });
 
-  it('degrades an over-cap diff to a summary — never to nothing', () => {
+  it("degrades an over-cap diff to a summary — never to nothing", () => {
     // Under the relaxed prompt the model no longer restates tool edits, so a
     // dropped card would leave a large edit with zero transcript trace.
-    const view = presentToolDiff('edit', bigDiff(410))
-    expect(view?.mode).toBe('summary')
-    if (view?.mode === 'summary') {
-      expect(view.path).toBe('/home/u/proj/big.txt')
-      expect(view.added).toBe(410)
-      expect(view.removed).toBe(0)
+    const view = presentToolDiff("edit", bigDiff(410));
+    expect(view?.mode).toBe("summary");
+    if (view?.mode === "summary") {
+      expect(view.path).toBe("/home/u/proj/big.txt");
+      expect(view.added).toBe(410);
+      expect(view.removed).toBe(0);
     }
     // At or under the cap it stays a full card.
-    expect(presentToolDiff('edit', bigDiff(5))?.mode).toBe('card')
-  })
-})
+    expect(presentToolDiff("edit", bigDiff(5))?.mode).toBe("card");
+  });
+});
 
-describe('isDiffToolMessage', () => {
+describe("isDiffToolMessage", () => {
   const base: ChatMessage = {
-    role: 'tool',
-    content: '🔧 fs_write',
-    cls: '',
-    meta: { tool_call_id: 'tc_1', kind: 'edit', input: UNIFIED_DIFF },
-  }
+    role: "tool",
+    content: "🔧 fs_write",
+    cls: "",
+    meta: { tool_call_id: "tc_1", kind: "edit", input: UNIFIED_DIFF },
+  };
 
-  it('matches a persisted edit-tool message carrying a diff (card or summary)', () => {
-    expect(isDiffToolMessage(base)).toBe(true)
-    expect(isDiffToolMessage({ ...base, meta: { ...base.meta, input: bigDiff(401) } })).toBe(true)
-  })
+  it("matches a persisted edit-tool message carrying a diff (card or summary)", () => {
+    expect(isDiffToolMessage(base)).toBe(true);
+    expect(
+      isDiffToolMessage({
+        ...base,
+        meta: { ...base.meta, input: bigDiff(401) },
+      }),
+    ).toBe(true);
+  });
 
-  it('rejects non-tool roles, hidden tool rows, and rows without meta.kind', () => {
-    expect(isDiffToolMessage({ ...base, role: 'assistant' })).toBe(false)
-    expect(isDiffToolMessage({ ...base, content: '🚫 fs_write' })).toBe(false)
+  it("rejects non-tool roles, hidden tool rows, and rows without meta.kind", () => {
+    expect(isDiffToolMessage({ ...base, role: "assistant" })).toBe(false);
+    expect(isDiffToolMessage({ ...base, content: "🚫 fs_write" })).toBe(false);
     // Rows persisted before meta.kind existed never promote — fail-safe.
-    expect(isDiffToolMessage({ ...base, meta: { tool_call_id: 'tc_1', input: UNIFIED_DIFF } })).toBe(false)
-  })
-})
+    expect(
+      isDiffToolMessage({
+        ...base,
+        meta: { tool_call_id: "tc_1", input: UNIFIED_DIFF },
+      }),
+    ).toBe(false);
+  });
+});
 
-describe('ToolCallLine diff presentation', () => {
+describe("ToolCallLine diff presentation", () => {
   function editMsg(): ChatMessage {
-    return { role: 'tool', content: '🔧 fs_write', cls: '', meta: { tool_call_id: 'tc_d1', purpose: 'Edit app.py' } }
+    return {
+      role: "tool",
+      content: "🔧 fs_write",
+      cls: "",
+      meta: { tool_call_id: "tc_d1", purpose: "Edit app.py" },
+    };
   }
 
-  it('renders a DiffBlock card for an edit tool whose input is a unified diff', () => {
+  it("starts an edit tool's unified diff folded to its chip, and opens on click", () => {
     const store = createTestStore({
       chat: {
         messages: [editMsg()],
-        toolLog: [{ type: 'tool', text: 'fs_write', kind: 'edit', input: UNIFIED_DIFF, tool_call_id: 'tc_d1', output: 'ok', ts: 1 }],
+        toolLog: [
+          {
+            type: "tool",
+            text: "fs_write",
+            kind: "edit",
+            input: UNIFIED_DIFF,
+            tool_call_id: "tc_d1",
+            output: "ok",
+            ts: 1,
+          },
+        ],
         slotRunning: false,
       } as unknown as ChatState,
-    })
-    const { container } = renderWithProviders(<ToolCallLine message={editMsg()} running={false} />, { store })
-    expect(container.querySelector('.diff-block')).toBeTruthy()
-  })
+    });
+    const { container, getByText } = renderWithProviders(
+      <ToolCallLine message={editMsg()} running={false} />,
+      { store },
+    );
+    // Folded by default: a multi-edit turn would otherwise stack a full patch
+    // per file and push the answer off screen.
+    expect(container.querySelector(".diff-block")).toBeNull();
+    // Asserted by testid, not just by text: the card-opening chip and the
+    // details-panel chip look alike, and only the testid tells them apart —
+    // which is what the fold-by-default screenshot harness grabs.
+    expect(
+      container.querySelector('[data-testid="tool-diff-chip"]'),
+    ).toBeTruthy();
+    fireEvent.click(getByText("app.py"));
+    expect(container.querySelector(".diff-block")).toBeTruthy();
+  });
 
-  it('renders a summary chip (not a card) for an over-cap edit diff', () => {
+  it("renders a summary chip (not a card) for an over-cap edit diff", () => {
     const store = createTestStore({
       chat: {
         messages: [editMsg()],
-        toolLog: [{ type: 'tool', text: 'fs_write', kind: 'edit', input: bigDiff(410), tool_call_id: 'tc_d1', output: 'ok', ts: 1 }],
+        toolLog: [
+          {
+            type: "tool",
+            text: "fs_write",
+            kind: "edit",
+            input: bigDiff(410),
+            tool_call_id: "tc_d1",
+            output: "ok",
+            ts: 1,
+          },
+        ],
         slotRunning: false,
       } as unknown as ChatState,
-    })
-    const { container, getByText } = renderWithProviders(<ToolCallLine message={editMsg()} running={false} />, { store })
-    expect(container.querySelector('.diff-block')).toBeNull()
-    expect(getByText('big.txt')).toBeTruthy()
-    expect(getByText('+410')).toBeTruthy()
-  })
+    });
+    const { container, getByText } = renderWithProviders(
+      <ToolCallLine message={editMsg()} running={false} />,
+      { store },
+    );
+    expect(container.querySelector(".diff-block")).toBeNull();
+    expect(getByText("big.txt")).toBeTruthy();
+    expect(getByText("+410")).toBeTruthy();
+    // The summary chip expands the details panel; there is no card for it to
+    // open, so it must NOT claim the card-opening testid.
+    expect(
+      container.querySelector('[data-testid="tool-diff-summary-chip"]'),
+    ).toBeTruthy();
+    expect(
+      container.querySelector('[data-testid="tool-diff-chip"]'),
+    ).toBeNull();
+  });
 
-  it('does not render a card for a shell tool with diff-shaped input', () => {
+  it("does not render a card for a shell tool with diff-shaped input", () => {
     const store = createTestStore({
       chat: {
         messages: [editMsg()],
-        toolLog: [{ type: 'tool', text: 'shell', kind: 'execute', input: UNIFIED_DIFF, tool_call_id: 'tc_d1', output: 'ok', ts: 1 }],
+        toolLog: [
+          {
+            type: "tool",
+            text: "shell",
+            kind: "execute",
+            input: UNIFIED_DIFF,
+            tool_call_id: "tc_d1",
+            output: "ok",
+            ts: 1,
+          },
+        ],
         slotRunning: false,
       } as unknown as ChatState,
-    })
-    const { container } = renderWithProviders(<ToolCallLine message={editMsg()} running={false} />, { store })
-    expect(container.querySelector('.diff-block')).toBeNull()
-  })
+    });
+    const { container } = renderWithProviders(
+      <ToolCallLine message={editMsg()} running={false} />,
+      { store },
+    );
+    expect(container.querySelector(".diff-block")).toBeNull();
+  });
 
-  it('renders the card from persisted meta on a historical row (no toolLog entry)', () => {
+  it("renders the card from persisted meta on a historical row (no toolLog entry)", () => {
     const msg: ChatMessage = {
-      role: 'tool',
-      content: '🔧 fs_write',
-      cls: '',
-      meta: { tool_call_id: 'tc_hist', kind: 'edit', input: UNIFIED_DIFF },
-    }
+      role: "tool",
+      content: "🔧 fs_write",
+      cls: "",
+      meta: { tool_call_id: "tc_hist", kind: "edit", input: UNIFIED_DIFF },
+    };
     const store = createTestStore({
-      chat: { messages: [msg], toolLog: [], slotRunning: false } as unknown as ChatState,
-    })
-    const { container } = renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
-    expect(container.querySelector('.diff-block')).toBeTruthy()
-  })
+      chat: {
+        messages: [msg],
+        toolLog: [],
+        slotRunning: false,
+      } as unknown as ChatState,
+    });
+    const { container, getByText } = renderWithProviders(
+      <ToolCallLine message={msg} running={false} />,
+      { store },
+    );
+    // The promotion is what this asserts, so open the fold and check the patch
+    // came from meta.input rather than a live toolLog entry.
+    fireEvent.click(getByText("app.py"));
+    expect(container.querySelector(".diff-block")).toBeTruthy();
+  });
 
-  it('suppresses the card for a rejected edit — the change was not applied', () => {
+  it("suppresses the card for a rejected edit — the change was not applied", () => {
     // A first-class diff card dominates the pill's small red status icon; a
     // reader scanning history would believe the file changed. The diff stays
     // readable in the expanded details panel.
     const store = createTestStore({
       chat: {
         messages: [editMsg()],
-        toolLog: [{ type: 'tool', text: 'fs_write', kind: 'edit', input: UNIFIED_DIFF, tool_call_id: 'tc_d1', rejected: true, ts: 1 }],
+        toolLog: [
+          {
+            type: "tool",
+            text: "fs_write",
+            kind: "edit",
+            input: UNIFIED_DIFF,
+            tool_call_id: "tc_d1",
+            rejected: true,
+            ts: 1,
+          },
+        ],
         slotRunning: false,
       } as unknown as ChatState,
-    })
-    const { container } = renderWithProviders(<ToolCallLine message={editMsg()} running={false} />, { store })
-    expect(container.querySelector('.diff-block')).toBeNull()
-  })
+    });
+    const { container } = renderWithProviders(
+      <ToolCallLine message={editMsg()} running={false} />,
+      { store },
+    );
+    expect(container.querySelector(".diff-block")).toBeNull();
+  });
 
-  it('the card folds to a chip via its header control and unfolds again', async () => {
+  it("the chip opens the card and its header control folds it back", async () => {
     const store = createTestStore({
       chat: {
         messages: [editMsg()],
-        toolLog: [{ type: 'tool', text: 'fs_write', kind: 'edit', input: UNIFIED_DIFF, tool_call_id: 'tc_d1', output: 'ok', ts: 1 }],
+        toolLog: [
+          {
+            type: "tool",
+            text: "fs_write",
+            kind: "edit",
+            input: UNIFIED_DIFF,
+            tool_call_id: "tc_d1",
+            output: "ok",
+            ts: 1,
+          },
+        ],
         slotRunning: false,
       } as unknown as ChatState,
-    })
-    const { container, getByText, findByLabelText, queryByText } = renderWithProviders(<ToolCallLine message={editMsg()} running={false} />, { store })
+    });
+    const { container, getByText, findByLabelText, queryByText } =
+      renderWithProviders(
+        <ToolCallLine message={editMsg()} running={false} />,
+        { store },
+      );
+    // Folded: the chip is the open handle.
+    expect(container.querySelector(".diff-block")).toBeNull();
+    fireEvent.click(getByText("app.py"));
     // An OPEN card shows no chip — its own header carries the facts.
-    expect(container.querySelector('.diff-block')).toBeTruthy()
-    expect(queryByText('app.py')).toBeNull()
+    expect(container.querySelector(".diff-block")).toBeTruthy();
+    expect(queryByText("app.py")).toBeNull();
     // Pierre's header (and the fold control slotted into it) mounts async.
-    fireEvent.click(await findByLabelText('Hide diff'))
-    expect(container.querySelector('.diff-block')).toBeNull()
-    // Folded: the chip is the re-open handle.
-    fireEvent.click(getByText('app.py'))
-    expect(container.querySelector('.diff-block')).toBeTruthy()
-  })
+    fireEvent.click(await findByLabelText("Hide diff"));
+    expect(container.querySelector(".diff-block")).toBeNull();
+    expect(getByText("app.py")).toBeTruthy();
+  });
 
-  it('a fold survives unmount/remount (virtualized transcript)', async () => {
-    localStorage.setItem('mc-chat-config', JSON.stringify({ collapseAllSteps: false }))
-    const mkStore = () => createTestStore({
-      chat: {
-        messages: [editMsg()],
-        toolLog: [{ type: 'tool', text: 'fs_write', kind: 'edit', input: UNIFIED_DIFF, tool_call_id: 'tc_persist', output: 'ok', ts: 1 }],
-        slotRunning: false,
-      } as unknown as ChatState,
-    })
-    const msg: ChatMessage = { role: 'tool', content: '🔧 fs_write', cls: '', meta: { tool_call_id: 'tc_persist', purpose: 'Edit app.py' } }
-    const first = renderWithProviders(<ToolCallLine message={msg} running={false} />, { store: mkStore() })
-    fireEvent.click(await first.findByLabelText('Hide diff'))
-    expect(first.container.querySelector('.diff-block')).toBeNull()
-    first.unmount()
-    // Remount (what virtualizer recycling does): the fold is remembered.
-    const second = renderWithProviders(<ToolCallLine message={msg} running={false} />, { store: mkStore() })
-    expect(second.container.querySelector('.diff-block')).toBeNull()
-    expect(second.getByText('app.py')).toBeTruthy()
-    // Unfold to leave the module registry clean for other tests.
-    fireEvent.click(second.getByText('app.py'))
-    expect(second.container.querySelector('.diff-block')).toBeTruthy()
-  })
-})
+  it("an expansion survives unmount/remount (virtualized transcript)", () => {
+    localStorage.setItem(
+      "mc-chat-config",
+      JSON.stringify({ collapseAllSteps: false }),
+    );
+    const mkStore = () =>
+      createTestStore({
+        chat: {
+          messages: [editMsg()],
+          toolLog: [
+            {
+              type: "tool",
+              text: "fs_write",
+              kind: "edit",
+              input: UNIFIED_DIFF,
+              tool_call_id: "tc_persist",
+              output: "ok",
+              ts: 1,
+            },
+          ],
+          slotRunning: false,
+        } as unknown as ChatState,
+      });
+    const msg: ChatMessage = {
+      role: "tool",
+      content: "🔧 fs_write",
+      cls: "",
+      meta: { tool_call_id: "tc_persist", purpose: "Edit app.py" },
+    };
+    const first = renderWithProviders(
+      <ToolCallLine message={msg} running={false} />,
+      { store: mkStore() },
+    );
+    fireEvent.click(first.getByText("app.py"));
+    expect(first.container.querySelector(".diff-block")).toBeTruthy();
+    first.unmount();
+    // Remount (what virtualizer recycling does): the expansion is remembered,
+    // so a card being read does not snap shut on scroll.
+    const second = renderWithProviders(
+      <ToolCallLine message={msg} running={false} />,
+      { store: mkStore() },
+    );
+    expect(second.container.querySelector(".diff-block")).toBeTruthy();
+    expect(second.queryByText("app.py")).toBeNull();
+  });
+});
 
-describe('diffCardStartsFolded', () => {
-  it('keeps a short diff open and folds anything longer', () => {
+describe("diffCardStartsFolded", () => {
+  it("keeps a short diff open and folds anything longer", () => {
     // The threshold is about RENDERED height, so every line the card draws
     // counts — hunk header and file headers included.
-    expect(diffCardStartsFolded(UNIFIED_DIFF)).toBe(false)
-    expect(diffCardStartsFolded(bigDiff(DIFF_CARD_FOLD_LINES + 5))).toBe(true)
-  })
+    expect(diffCardStartsFolded(UNIFIED_DIFF)).toBe(false);
+    expect(diffCardStartsFolded(bigDiff(DIFF_CARD_FOLD_LINES + 5))).toBe(true);
+  });
 
-  it('folds one line past the threshold, not at it', () => {
-    const at = bigDiff(DIFF_CARD_FOLD_LINES - 3)   // 3 header lines
-    const over = bigDiff(DIFF_CARD_FOLD_LINES - 2)
-    expect(at.split('\n').length).toBe(DIFF_CARD_FOLD_LINES)
-    expect(diffCardStartsFolded(at)).toBe(false)
-    expect(diffCardStartsFolded(over)).toBe(true)
-  })
-})
+  it("folds one line past the threshold, not at it", () => {
+    const at = bigDiff(DIFF_CARD_FOLD_LINES - 3); // 3 header lines
+    const over = bigDiff(DIFF_CARD_FOLD_LINES - 2);
+    expect(at.split("\n").length).toBe(DIFF_CARD_FOLD_LINES);
+    expect(diffCardStartsFolded(at)).toBe(false);
+    expect(diffCardStartsFolded(over)).toBe(true);
+  });
+});
 
-describe('ToolCallLine diff card default fold', () => {
+describe("ToolCallLine diff card default fold", () => {
   function editRow(id: string): ChatMessage {
-    return { role: 'tool', content: '🔧 fs_write', cls: '', meta: { tool_call_id: id, purpose: 'Edit app.py' } }
+    return {
+      role: "tool",
+      content: "🔧 fs_write",
+      cls: "",
+      meta: { tool_call_id: id, purpose: "Edit app.py" },
+    };
   }
   function storeFor(id: string, input: string) {
     return createTestStore({
       chat: {
         messages: [editRow(id)],
-        toolLog: [{ type: 'tool', text: 'fs_write', kind: 'edit', input, tool_call_id: id, output: 'ok', ts: 1 }],
+        toolLog: [
+          {
+            type: "tool",
+            text: "fs_write",
+            kind: "edit",
+            input,
+            tool_call_id: id,
+            output: "ok",
+            ts: 1,
+          },
+        ],
         slotRunning: false,
       } as unknown as ChatState,
-    })
+    });
   }
 
-  it('starts a long diff folded to its chip', () => {
+  it("starts a long diff folded to its chip", () => {
     const { container, getByText } = renderWithProviders(
-      <ToolCallLine message={editRow('tc_long')} running={false} />,
-      { store: storeFor('tc_long', bigDiff(40)) },
-    )
-    expect(container.querySelector('.diff-block')).toBeNull()
-    expect(getByText('big.txt')).toBeTruthy()
-    expect(getByText('+40')).toBeTruthy()
+      <ToolCallLine message={editRow("tc_long")} running={false} />,
+      { store: storeFor("tc_long", bigDiff(40)) },
+    );
+    expect(container.querySelector(".diff-block")).toBeNull();
+    expect(getByText("big.txt")).toBeTruthy();
+    expect(getByText("+40")).toBeTruthy();
     // One click is the whole cost of reading it.
-    fireEvent.click(getByText('big.txt'))
-    expect(container.querySelector('.diff-block')).toBeTruthy()
-  })
+    fireEvent.click(getByText("big.txt"));
+    expect(container.querySelector(".diff-block")).toBeTruthy();
+  });
 
-  it('leaves a short diff open — a three-line change reads fine in place', () => {
+  it("leaves a short diff open — a three-line change reads fine in place", () => {
     const { container } = renderWithProviders(
-      <ToolCallLine message={editRow('tc_short')} running={false} />,
-      { store: storeFor('tc_short', UNIFIED_DIFF) },
-    )
-    expect(container.querySelector('.diff-block')).toBeTruthy()
-  })
+      <ToolCallLine message={editRow("tc_short")} running={false} />,
+      { store: storeFor("tc_short", UNIFIED_DIFF) },
+    );
+    expect(container.querySelector(".diff-block")).toBeTruthy();
+  });
 
-  it('an opened long card stays open across remount — the reader outranks the default', () => {
+  it("an opened long card stays open across remount — the reader outranks the default", () => {
     // Without a recorded CHOICE (as opposed to a recorded fold) the size rule
     // would re-fold every card the reader deliberately opened, each time the
     // virtualizer recycled its row.
-    const msg = editRow('tc_choice')
-    const first = renderWithProviders(<ToolCallLine message={msg} running={false} />, { store: storeFor('tc_choice', bigDiff(40)) })
-    fireEvent.click(first.getByText('big.txt'))
-    expect(first.container.querySelector('.diff-block')).toBeTruthy()
-    first.unmount()
-    const second = renderWithProviders(<ToolCallLine message={msg} running={false} />, { store: storeFor('tc_choice', bigDiff(40)) })
-    expect(second.container.querySelector('.diff-block')).toBeTruthy()
-  })
+    const msg = editRow("tc_choice");
+    const first = renderWithProviders(
+      <ToolCallLine message={msg} running={false} />,
+      { store: storeFor("tc_choice", bigDiff(40)) },
+    );
+    fireEvent.click(first.getByText("big.txt"));
+    expect(first.container.querySelector(".diff-block")).toBeTruthy();
+    first.unmount();
+    const second = renderWithProviders(
+      <ToolCallLine message={msg} running={false} />,
+      { store: storeFor("tc_choice", bigDiff(40)) },
+    );
+    expect(second.container.querySelector(".diff-block")).toBeTruthy();
+  });
 
-  it('folds a diff that arrives after the row has mounted', () => {
+  it("folds a diff that arrives after the row has mounted", () => {
     // An edit row mounts on tool_call and the diff lands on tool_call_update,
     // so the initial state is computed before there is anything to measure.
     const persisted = (input?: string): ChatMessage => ({
-      role: 'tool', content: '🔧 fs_write', cls: '',
-      meta: { tool_call_id: 'tc_late', kind: 'edit', ...(input ? { input } : {}) },
-    })
+      role: "tool",
+      content: "🔧 fs_write",
+      cls: "",
+      meta: {
+        tool_call_id: "tc_late",
+        kind: "edit",
+        ...(input ? { input } : {}),
+      },
+    });
     const store = createTestStore({
-      chat: { messages: [persisted()], toolLog: [], slotRunning: false } as unknown as ChatState,
-    })
+      chat: {
+        messages: [persisted()],
+        toolLog: [],
+        slotRunning: false,
+      } as unknown as ChatState,
+    });
     const { container, rerender, getByText } = renderWithProviders(
-      <ToolCallLine message={persisted()} running={false} />, { store },
-    )
-    expect(container.querySelector('.diff-block')).toBeNull()
-    rerender(<ToolCallLine message={persisted(bigDiff(40))} running={false} />)
-    expect(container.querySelector('.diff-block')).toBeNull()
-    expect(getByText('big.txt')).toBeTruthy()
-  })
-})
+      <ToolCallLine message={persisted()} running={false} />,
+      { store },
+    );
+    expect(container.querySelector(".diff-block")).toBeNull();
+    rerender(<ToolCallLine message={persisted(bigDiff(40))} running={false} />);
+    expect(container.querySelector(".diff-block")).toBeNull();
+    expect(getByText("big.txt")).toBeTruthy();
+  });
+});

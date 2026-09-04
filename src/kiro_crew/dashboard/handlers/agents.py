@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -55,12 +56,13 @@ from kiro_crew.config.loader import (
     KiroCrewAgentConfig,
     KiroCrewConfig,
     _safe_color,
+    coerce_effort,
     inject_kiro_cli_api_key,
     normalize_agent_model,
-    read_config_for_update,
     resolve_agent_bindings,
     resolve_agent_config_path,
     resolve_effective_model,
+    update_config_locked,
     write_config_atomically,
 )
 from kiro_crew.config.schema import SCHEMA_REGISTRY, config_entry_to_dict
@@ -71,6 +73,7 @@ from kiro_crew.dashboard.chat_utils import (
     SLASH_COMMAND_DESCRIPTIONS,
     _history_key_for,
     is_deprecated_model,
+    run_config_write,
 )
 from kiro_crew.dashboard.handlers._shared import (
     MAX_AGENT_SKILLS,
@@ -85,6 +88,7 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import (
@@ -942,17 +946,29 @@ def _commit_agent_config_locked(
             ", ".join(preserved),
         )
     sanitize(config)
-    # (1) The one fallible READ, and it precedes every write.
+
+    # (1)+(2) config.json, read AND written inside one hold of the
+    # ``<config>.json.lock`` sidecar. The caller's ``_get_config_lock()`` is an
+    # asyncio lock: it serializes this against sibling handlers on this event
+    # loop and nothing else. The ~69 ``update_config_locked`` writers -- the CLI,
+    # the boot refresh, another gateway process -- take the advisory lock
+    # instead, so without this the two families could interleave and whichever
+    # renamed second published a document that never saw the other's change.
     #
-    # Fail closed: writing back a {} baseline would drop every other setting
-    # just to record removedTools (see read_config_for_update).
-    mc_cfg = read_config_for_update(mc_cfg_path)
-    if removed_per_key:
-        mc_cfg["removedTools"] = removed_per_key
-    else:
-        mc_cfg.pop("removedTools", None)
-    # (2) config.json — the snapshot the read above produced, still current.
-    write_config_atomically(mc_cfg_path, mc_cfg)
+    # Still the one fallible READ, and it still precedes every write: with the
+    # default ``on_corrupt="fail"`` an unreadable config raises
+    # :class:`ConfigReadError` out of here before anything durable happens, so
+    # the caller's 500 stays exact. Failing closed is the point -- writing back a
+    # {} baseline would drop every other setting just to record removedTools
+    # (see read_config_for_update).
+    def _record_removed_tools(mc_cfg: dict) -> dict:
+        if removed_per_key:
+            mc_cfg["removedTools"] = removed_per_key
+        else:
+            mc_cfg.pop("removedTools", None)
+        return mc_cfg
+
+    update_config_locked(mc_cfg_path, mutate=_record_removed_tools, stamp_meta=False)
     # (3) agent_model_state.json bookkeeping — after (2), before (4).
     changed = agent_state.lift_and_strip_bookkeeping(config, name)
     # (4) the installed spec, under the caller's bridge-file lock.
@@ -1249,6 +1265,7 @@ async def api_default_agent(request: web.Request) -> web.Response:
                 status=400,
             )
         path = _h.config_path()
+
         # This read-modify-write must hold the SAME in-process lock every other
         # ``config.json`` RMW in the dashboard takes (agent create/update/delete,
         # capability install/uninstall, the agent-config PUT). The event loop no
@@ -1257,24 +1274,36 @@ async def api_default_agent(request: web.Request) -> web.Response:
         # can capture a baseline the worker is about to republish — and the last
         # atomic rename silently reverts the other side's unrelated settings.
         #
-        # Loop-side ``async with`` rather than an offload: the lock is an
-        # asyncio lock (``LoopBoundLock``) acquired exactly this way by every
-        # sibling RMW in this module, and the read and write below are
-        # synchronous with NO await between them, so once the lock is held the
-        # pair is already indivisible — a worker hop would add a cancellation
-        # point where today there is none.
-        async with _get_config_lock():
-            try:
-                data = read_config_for_update(path)
-            except ConfigReadError:
-                # Fail closed: writing back a {} baseline would drop every other setting.
-                logger.exception("Refusing to set default agent: config unreadable")
-                return web.json_response(
-                    {"error": "failed to read config file", "code": "config_unreadable"},
-                    status=500,
-                )
+        # That lock is not sufficient on its own, though: it is an asyncio lock,
+        # so it serializes only same-loop callers. The read-modify-write itself
+        # goes through ``update_config_locked``, which holds the
+        # ``<config>.json.lock`` sidecar across its own read and write and so
+        # also serializes against the CLI, worker threads and other processes.
+        #
+        # ``run_config_write`` is the one async entry point that holds BOTH --
+        # its own docstring says so -- and it is what every other converted
+        # dashboard writer uses. It takes the loop-side lock, dispatches the
+        # synchronous read-modify-write to a worker thread so an unbounded
+        # advisory-flock wait never stalls the gateway, and SHIELDS that worker
+        # in a drain loop so the lock cannot be released with a write still in
+        # flight. Composing those three by hand here would be a third copy of a
+        # helper that already exists, free to drift from it.
+        def _set_default(data: dict) -> dict:
             data["default_agent"] = name
-            write_config_atomically(path, data)
+            return data
+
+        try:
+            await run_config_write(
+                update_config_locked, path, mutate=_set_default, stamp_meta=False
+            )
+        except ConfigReadError:
+            # Fail closed: writing back a {} baseline would drop every other
+            # setting. Nothing durable ran, so this 500 is exact.
+            logger.exception("Refusing to set default agent: config unreadable")
+            return web.json_response(
+                {"error": "failed to read config file", "code": "config_unreadable"},
+                status=500,
+            )
         return web.json_response({"ok": True, "default_agent": name})
     cfg = KiroCrewConfig.load()
     return web.json_response({"default_agent": cfg.default_agent})
@@ -2043,7 +2072,11 @@ async def api_models(request: web.Request) -> web.Response:
         try:
             env = {**os.environ}
             env["PATH"] = augmented_path(env.get("PATH", ""))
-            _resolve_ssh_auth_sock(env)
+            # OFF the loop: the resolver globs /tmp/ssh-*/agent.* and stats
+            # every hit, so its latency scales with the /tmp entry count. Its
+            # sibling wrapper's contract states it must never run on the event
+            # loop, and this endpoint is polled every 8s while degraded.
+            await asyncio.to_thread(_resolve_ssh_auth_sock, env)
             # The Docker entrypoint removes credentials from the long-lived
             # gateway environment.  This fixed-argv child is the official
             # kiro-cli and KIRO_API_KEY is its own model credential, so settle
@@ -2641,7 +2674,13 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     if project_dir:
         try:
             project_names = await asyncio.get_running_loop().run_in_executor(
-                discovery_executor(), project_agent_names, project_dir
+                discovery_executor(),
+                functools.partial(
+                    project_agent_names,
+                    project_dir,
+                    operation="api_kirocrew_agents",
+                    source="dashboard",
+                ),
             )
         except Exception:
             logger.warning("Failed to list project agents for %s", project_dir, exc_info=True)
@@ -2957,6 +2996,14 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
     # filesystem work off the event loop.
     model = await asyncio.to_thread(resolve_effective_model, cfg, agent_name or None)
     bindings = resolve_agent_bindings(cfg, agent_name or None)
+    # Effort resolves through its own chain, served from the SAME resolver the
+    # provider factory calls so the pane cannot disagree with what a session will
+    # actually run at -- including the role-aware default, which a crew bound to a
+    # background worker agent takes instead of the chat default. Keyed on what the
+    # bindings resolved, which is what makes an omitted `agent` answer for the
+    # configured default crew rather than for no crew at all.
+    crew_effort = cfg.crew_pinned_effort(None, bindings.resolved_alias)
+    session_effort = cfg.resolve_session_effort(bindings.kiro_agent, bindings.resolved_alias)
     return web.json_response(
         {
             "model": model,
@@ -2964,8 +3011,84 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
             "kiro_agent": bindings.kiro_agent,
             # Whether the agent itself pins the model, vs inheriting it.
             "pinned": bool(bindings.model),
+            # The effort a new session on this crew starts at, and whether the
+            # crew pinned it or inherited a default. "" means no tier pins one
+            # and the model's own default applies.
+            "reasoning_effort": session_effort,
+            "effort_pinned": bool(crew_effort),
         }
     )
+
+
+def _effort_inputs(crew: KiroCrewAgentConfig | None) -> tuple[str, str] | None:
+    """The crew fields `resolve_session_effort` reads, or ``None`` for no crew.
+
+    Derived from the resolver's inputs rather than enumerated per call site. The
+    chain reads two things off the record -- the pin itself, and the bound
+    ``kiro_agent`` the role default keys on -- and the factory answers from the
+    config it captured, so ANY change to either (including a crew appearing or
+    disappearing) must invalidate that capture. Three rounds of review found the
+    per-condition version incomplete one case at a time (an unpinned crew whose
+    binding makes it a background worker; a re-bound `kiro_agent`); comparing this
+    tuple before and after a write is the invariant those cases are instances of,
+    and a future field the chain starts reading is added here once instead of at
+    every handler.
+    """
+    if crew is None:
+        return None
+    return (crew.kiro_agent, coerce_effort(crew.reasoning_effort))
+
+
+async def _refresh_session_defaults(request: web.Request, crew: str) -> None:
+    """Rebuild the provider factory so a crew's new effort pin reaches new sessions.
+
+    The factory resolves the pin from the config it captured when it was built, so
+    a write alone stays invisible until a restart. That is the same staleness
+    ``api_kirocrew_config_patch`` already handles for ``agent.reasoning_effort``
+    and ``agent.role_efforts.*``, and for the same reason it uses
+    ``refresh_defaults()`` rather than ``reload_provider_factory()``: the factory
+    is rebuilt and the warm pool drained WITHOUT touching live sessions, so an
+    in-flight turn is not killed because a default changed. The pool must drain
+    either way -- a pre-warmed child carries the old effort overlay, and the claim
+    path never re-pushes effort.
+
+    Best-effort: the write is already durable, so a crew save must not fail
+    because the refresh did. A failure costs one gateway lifetime of staleness,
+    which is what the behaviour was before this call existed.
+    """
+    state = request.app.get("state")
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return
+    try:
+        await sessions.refresh_defaults()
+    except Exception:
+        logger.warning(
+            "Could not refresh session defaults after saving crew %r; the pin "
+            "applies from the next gateway start",
+            crew,
+            exc_info=True,
+        )
+
+
+def _crew_effort_rejected(raw: object) -> str | None:
+    """Reason a crew's reasoning-effort pin is unusable, or ``None`` to allow it.
+
+    Rejects rather than coercing, which is the opposite of the config-file load
+    path (:func:`coerce_effort`). The difference is who is watching: a typo in a
+    hand-edited file must not stop the gateway from booting, but a typo sent by
+    the crew form has an author on the other end, and silently storing ``""``
+    would read back as "inherits" and look like the save was lost.
+
+    ``""`` is the inherit sentinel and always allowed -- it is how a pin is
+    cleared.
+    """
+    if not isinstance(raw, str):
+        return "reasoning_effort must be a string"
+    val = raw.strip()
+    if val in EFFORT_VALUES:
+        return None
+    return "reasoning_effort must be one of: " + ", ".join(("(empty)", *EFFORT_LEVELS))
 
 
 def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str | None:
@@ -3107,6 +3230,13 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             {"error": "session_color must be #rrggbb or empty", "code": "invalid_color_hex"},
             status=400,
         )
+    _raw_effort = body.get("reasoning_effort", "")
+    effort_reason = _crew_effort_rejected(_raw_effort)
+    if effort_reason:
+        return web.json_response(
+            {"error": effort_reason, "code": "invalid_reasoning_effort"}, status=400
+        )
+    reasoning_effort = _raw_effort.strip()
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name in cfg.agents:
@@ -3119,12 +3249,19 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             workspace=body.get("workspace", "default"),
             memory_store=body.get("memory_store", "default"),
             model=model,
+            reasoning_effort=reasoning_effort,
             description=body.get("description", ""),
             triggers=body.get("triggers", ""),
             source=body.get("source", "kirocrew"),
             session_color=session_color,
         )
         cfg.save()
+    # A crew APPEARING changes what the effort chain resolves even with no pin of
+    # its own: the factory's captured config does not know the crew, so it cannot
+    # read the binding the role default keys on, and a scheduled or messaging
+    # session naming that crew would take the chat default instead. Creation is
+    # therefore always a change by `_effort_inputs` (None -> a tuple).
+    await _refresh_session_defaults(request, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.create",
@@ -3152,6 +3289,15 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         )
     if "model" in body:
         pending_model = normalize_agent_model(body["model"])
+    # Rejected before the config is even loaded: the check is pure, and every
+    # validation must land before the first field assignment below so a bad value
+    # cannot leave the in-memory record half-updated.
+    if "reasoning_effort" in body:
+        effort_reason = _crew_effort_rejected(body["reasoning_effort"])
+        if effort_reason:
+            return web.json_response(
+                {"error": effort_reason, "code": "invalid_reasoning_effort"}, status=400
+            )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name not in cfg.agents:
@@ -3165,6 +3311,8 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     {"error": model_reason, "code": "invalid_model"}, status=400
                 )
         agent = cfg.agents[name]
+        # Captured BEFORE any mutation: what the effort chain reads today.
+        effort_inputs_before = _effort_inputs(agent)
         changed: list[str] = []
         if "kiro_agent" in body:
             agent.kiro_agent = body["kiro_agent"]
@@ -3181,6 +3329,10 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             # str()-coerced — see the create path for why.
             agent.model = normalize_agent_model(body["model"])
             changed.append("model")
+        if "reasoning_effort" in body:
+            # Already validated above; "" is the inherit sentinel and clears a pin.
+            agent.reasoning_effort = body["reasoning_effort"].strip()
+            changed.append("reasoning_effort")
         if "description" in body:
             agent.description = body["description"]
             changed.append("description")
@@ -3203,7 +3355,16 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         if "source" in body:
             agent.source = body["source"]
             changed.append("source")
+        effort_inputs_after = _effort_inputs(agent)
         cfg.save()
+    # Compared, not merely "the body carried the field": the crew form sends
+    # reasoning_effort on every save (that is what makes clearing a pin possible)
+    # and refresh_defaults drains the warm pool, so refreshing on presence would
+    # cost a cold start on every unrelated crew edit. A re-bound kiro_agent counts
+    # too -- the role default reads it. Outside the config lock, because the
+    # refresh takes the session locks.
+    if effort_inputs_after != effort_inputs_before:
+        await _refresh_session_defaults(request, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.update",
@@ -3232,6 +3393,10 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
             )
         del cfg.agents[name]
         cfg.save()
+    # A crew DISAPPEARING is the other half of the same invariant: the captured
+    # config still holds the record, so a cron or messaging job still naming the
+    # crew would keep resolving its old pin and binding.
+    await _refresh_session_defaults(request, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.delete",

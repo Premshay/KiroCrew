@@ -97,6 +97,10 @@ class DashboardPersistenceCoordinator:
         survive a restart — so "nothing to write" and "the write failed" must
         not collapse into the same silent return.
         """
+        # Keep a provisional endpoint-metadata update out of an unpinned
+        # periodic flush; callers receive a clear non-durable result.
+        if getattr(slot, "_metadata_persist_inflight", 0):
+            return False
         if not owner.conversation_log:
             return False
         if not slot._dirty or not slot.messages:

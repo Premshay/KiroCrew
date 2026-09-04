@@ -442,12 +442,16 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
             "Review this peer channel message and respond only if an action or "
             "acknowledgement is needed.",
         )
+        from kiro_crew.dashboard.session_control import containment_meta
+
+        queue_meta = containment_meta(state, slot)
         if queue_index is None:
             queue(
                 request_text,
                 kind=PEER_CHANNEL_REQUEST_KIND,
                 peer_channel_id=channel.id,
                 peer_message_id=message.id,
+                meta=queue_meta,
             )
         else:
             queue(
@@ -456,6 +460,7 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
                 kind=PEER_CHANNEL_REQUEST_KIND,
                 peer_channel_id=channel.id,
                 peer_message_id=message.id,
+                meta=queue_meta,
             )
         if slot.running or slot._in_stage_execution:
             await save_slot_off_loop(state, slot, force=True, best_effort=False)
