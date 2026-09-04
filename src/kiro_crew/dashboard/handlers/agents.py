@@ -2968,7 +2968,25 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
     )
 
 
-def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str | None:
+def _cached_agent_advertised_ids(request: web.Request, name: str) -> list[str] | None:
+    """Return a fresh target-agent discovery result, when available."""
+    state: DashboardState | None = request.app.get("state")
+    if state is None:
+        return None
+    cached = _model_discovery_cache.get((id(state.sessions), name))
+    if cached is None or time.monotonic() - cached[0] >= _MODEL_DISCOVERY_CACHE_TTL_SECS:
+        return None
+    return advertised_model_ids(cached[1].get("models", []))
+
+
+def _model_pin_rejected(
+    model: str,
+    request: web.Request,
+    provider: str,
+    *,
+    advertised_ids: list[str] | None = None,
+    use_active_advertised_ids: bool = True,
+) -> str | None:
     """Reason a crew's model pin is unusable, or ``None`` to allow it.
 
     An agent's ``model`` is read by kiro-cli when the child starts, so a pin the
@@ -3021,9 +3039,22 @@ def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str 
         )
     # circular import: handlers.core resolves _get_config_lock from this module,
     # so importing it at module scope would close the cycle.
+    from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
     from kiro_crew.dashboard.handlers.core import _validate_role_model
 
-    return _validate_role_model(model, request, provider=provider)
+    if advertised_ids is None and not use_active_advertised_ids:
+        return _model_rejected_reason(model, provider=provider)
+
+    if advertised_ids is None:
+        return _validate_role_model(model, request, provider=provider)
+
+    reason = _model_rejected_reason(model, provider=provider)
+    if reason:
+        return reason
+    if model_is_unusable(model, advertised_ids):
+        usable = ", ".join(advertised_ids[:8]) or "auto"
+        return f"{model!r} is not available on this agent; choose one of: {usable}, or 'auto'."
+    return None
 
 
 async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
@@ -3152,6 +3183,7 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         )
     if "model" in body:
         pending_model = normalize_agent_model(body["model"])
+        target_advertised_ids = _cached_agent_advertised_ids(request, name)
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name not in cfg.agents:
@@ -3159,7 +3191,13 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         if "model" in body:
             # Validated before the write, reusing the config loaded just above so
             # this costs no extra read.
-            model_reason = _model_pin_rejected(pending_model, request, cfg.agent.provider)
+            model_reason = _model_pin_rejected(
+                pending_model,
+                request,
+                cfg.agent.provider,
+                advertised_ids=target_advertised_ids,
+                use_active_advertised_ids=False,
+            )
             if model_reason:
                 return web.json_response(
                     {"error": model_reason, "code": "invalid_model"}, status=400

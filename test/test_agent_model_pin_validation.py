@@ -314,6 +314,33 @@ def seeded_agent():
 
 class TestSavePathRefusesAnUnusablePin:
     @pytest.mark.asyncio
+    async def test_update_uses_the_edited_agents_cached_models_not_another_sessions(
+        self, seeded_agent, monkeypatch
+    ):
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.dashboard.handlers import agents, core
+
+        monkeypatch.setattr(
+            agents,
+            "_cached_agent_advertised_ids",
+            lambda _request, _name: ["gemini-3.8-flash-high"],
+        )
+        monkeypatch.setattr(
+            core,
+            "_active_advertised_ids",
+            lambda _request: ["default", "opus[1m]", "sonnet"],
+        )
+
+        async with TestClient(TestServer(_crud_app())) as client:
+            resp = await client.put(
+                f"/api/agents/{seeded_agent}",
+                json={"model": "gemini-3.8-flash-high"},
+            )
+
+        assert resp.status == 200
+        assert KiroCrewConfig.load().agents[seeded_agent].model == "gemini-3.8-flash-high"
+
+    @pytest.mark.asyncio
     async def test_create_refuses_and_carries_an_error_code(self, seeded_agent):
         from kiro_crew.config.loader import KiroCrewConfig
 
