@@ -6374,8 +6374,13 @@ class AcpClient:
                     label = value
                     break
         if not label:
-            title = update.get("title")
-            label = title if isinstance(title, str) and title.strip() else fallback
+            for key in ("description", "name", "workflowName", "taskType", "title"):
+                value = update.get(key)
+                if isinstance(value, str) and value.strip():
+                    label = value
+                    break
+        if not label:
+            label = fallback
         label = label[:2000]
         label, _ = redact_exfiltration_urls(label)
         label, _ = redact_credentials(label)
@@ -6395,6 +6400,37 @@ class AcpClient:
         update = params.get("update", {})
         if not isinstance(update, dict):
             return None
+        # claude-agent-acp 0.74 publishes dynamic workflows as standard updates
+        # without provider-private metadata, so asyncTaskId is the only join key.
+        # Namespace it to avoid collisions with legacy Task tool-use IDs.
+        kind = update.get("sessionUpdate")
+        if self._is_claude and kind in {
+            "async_task_spawned",
+            "async_task_progress",
+            "async_task_state_update",
+        }:
+            task_id = self._provider_child_id(update.get("asyncTaskId"))
+            if task_id:
+                if kind == "async_task_spawned":
+                    phase = "started"
+                elif kind == "async_task_progress":
+                    phase = "activity"
+                else:
+                    state = str(update.get("state") or "").lower()
+                    if state in {"completed", "complete", "succeeded", "success", "done"}:
+                        phase = "completed"
+                    elif state in {"failed", "error"}:
+                        phase = "failed"
+                    elif state in {"stopped", "cancelled", "canceled", "interrupted"}:
+                        phase = "stopped"
+                    else:
+                        phase = "activity"
+                return ProviderChildActivity(
+                    provider="claude",
+                    child_id=f"async:{task_id}",
+                    phase=phase,
+                    label=self._provider_child_label(update, "Claude workflow"),
+                )
         meta = update.get("_meta")
         if not isinstance(meta, dict):
             return None
@@ -6471,9 +6507,14 @@ class AcpClient:
         params = msg.params or {}
         update = params.get("update", {})
         tool_call_id = update.get("toolCallId") if isinstance(update, dict) else ""
+        title = ""
+        if isinstance(update, dict) and update.get("sessionUpdate") == "async_task_progress":
+            raw_title = update.get("lastToolName") or update.get("summary")
+            title = raw_title if isinstance(raw_title, str) else ""
         return AcpEvent(
             kind=EVENT_SUBAGENT_ACTIVITY,
             text=text,
+            title=title,
             tool_call_id=tool_call_id if isinstance(tool_call_id, str) else "",
             sub_session_id=f"provider:{child.provider}:{child.child_id}",
             provider_child=child,
