@@ -91,6 +91,54 @@ describe('Code Review Sage namespace scope', () => {
       .toHaveTextContent('github.com/acme/service')
   })
 
+  it('recognizes a saved repository binding when its pinned label has mixed case', async () => {
+    settings.mockResolvedValue(response({
+      settings: {
+        model: null,
+        effort: 'high',
+        active_namespaces: ['default'],
+        namespace_bindings: {
+          default: {
+            scope: 'repository',
+            repository: {
+              provider: 'github', host: 'github.com', owner: 'atlogit', repository: 'atlomy-atlas',
+            },
+          },
+        },
+        max_concurrent: 3,
+      },
+      namespaces: ['default'],
+      pinned_repos: [{ owner: 'Atlogit', repo: 'Atlomy-Atlas' }],
+    }))
+    mount()
+
+    expect(await screen.findByRole('combobox', { name: 'Repository for default' }))
+      .toHaveTextContent('github.com/atlogit/atlomy-atlas')
+  })
+
+  it('accepts a mixed-case pinned repository selection', async () => {
+    settings.mockResolvedValue(response({
+      pinned_repos: [{ owner: 'Atlogit', repo: 'Atlomy-Atlas' }],
+    }))
+    mount()
+    await screen.findByTestId('sage-namespace-scope-default')
+
+    await chooseScope('service-rules', /one repository/i)
+    fireEvent.click(screen.getByRole('combobox', { name: 'Repository for service-rules' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'github.com/atlogit/atlomy-atlas' }))
+
+    await waitFor(() => expect(putSettings).toHaveBeenCalledWith({
+      namespace_bindings: {
+        'service-rules': {
+          scope: 'repository',
+          repository: {
+            provider: 'github', host: 'github.com', owner: 'Atlogit', repository: 'Atlomy-Atlas',
+          },
+        },
+      },
+    }))
+  })
+
   it('writes an explicit global binding without touching the other namespaces', async () => {
     settings.mockResolvedValue(response({
       settings: {

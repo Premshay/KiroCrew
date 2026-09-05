@@ -21,6 +21,9 @@ import { i18nT } from '../../../i18n/t'
 
 const SCOPE_OPTIONS: ScopeChoice[] = ['global', 'repository']
 
+const repositoryOption = (repo: PinnedRepo) =>
+  `github.com/${repo.owner.toLowerCase()}/${repo.repo.toLowerCase()}`
+
 const SELECT_CLASS =
   'text-[12.5px] px-2 py-1 rounded-md bg-bg-elevated text-text border border-border '
   + 'outline-none focus:border-accent cursor-pointer'
@@ -44,7 +47,7 @@ export default function NamespaceScopePanel({
   const [editing, setEditing] = useState<Record<string, boolean>>({})
   const active = new Set(activeNamespaces)
   const unscopedActive = namespaces.filter((name) => active.has(name) && !bindings[name])
-  const repositoryOptions = pinnedRepos.map((repo) => `github.com/${repo.owner}/${repo.repo}`)
+  const repositoryOptions = pinnedRepos.map(repositoryOption)
 
   const write = (name: string, binding: NamespaceBinding | null) => {
     const next = { ...bindings }
@@ -63,7 +66,7 @@ export default function NamespaceScopePanel({
   }
 
   const chooseRepository = (name: string, value: string) => {
-    const repo = pinnedRepos.find((item) => `github.com/${item.owner}/${item.repo}` === value)
+    const repo = pinnedRepos.find((item) => repositoryOption(item) === value)
     if (!repo) return
     setEditing(({ [name]: _closed, ...rest }) => rest)
     write(name, {
