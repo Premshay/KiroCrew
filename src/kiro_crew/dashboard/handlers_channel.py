@@ -484,7 +484,16 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
 
 async def api_channel_post(request: web.Request) -> web.Response:
     ch, body = await _get_channel_body(request)
-    content = body.get("content", "").strip()[:10000]
+    raw_content = body.get("content", "")
+    if not isinstance(raw_content, str):
+        return web.json_response(
+            {
+                "error": "content must be a string",
+                "code": "channel_message_content_type_invalid",
+            },
+            status=400,
+        )
+    content = raw_content.strip()[:10000]
     if not content:
         return web.json_response({"error": "content required"}, status=400)
     # Validate mentions. Membership is a dict lookup, so an unhashable value
@@ -493,15 +502,21 @@ async def api_channel_post(request: web.Request) -> web.Response:
     if raw_mention is not None:
         if isinstance(raw_mention, list):
             if not all(isinstance(name, str) for name in raw_mention):
-                return _agent_field_error(
-                    "mention entries must be strings",
-                    "channel_message_mention_type_invalid",
+                return web.json_response(
+                    {
+                        "error": "mention entries must be strings",
+                        "code": "channel_message_mention_type_invalid",
+                    },
+                    status=400,
                 )
             raw_mention = [name for name in raw_mention if name in ch.members]
         elif not isinstance(raw_mention, str):
-            return _agent_field_error(
-                "mention must be a string or an array of strings",
-                "channel_message_mention_type_invalid",
+            return web.json_response(
+                {
+                    "error": "mention must be a string or an array of strings",
+                    "code": "channel_message_mention_type_invalid",
+                },
+                status=400,
             )
         elif raw_mention not in ch.members:
             raw_mention = None
@@ -509,9 +524,12 @@ async def api_channel_post(request: web.Request) -> web.Response:
     thread_id = body.get("thread_id")
     if thread_id is not None:
         if not isinstance(thread_id, str):
-            return _agent_field_error(
-                "thread_id must be a string",
-                "channel_message_thread_id_type_invalid",
+            return web.json_response(
+                {
+                    "error": "thread_id must be a string",
+                    "code": "channel_message_thread_id_type_invalid",
+                },
+                status=400,
             )
     if thread_id and thread_id not in ch._msg_index:
         thread_id = None
