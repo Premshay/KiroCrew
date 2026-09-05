@@ -11143,15 +11143,17 @@ class TestModelEntitlementPreflight:
 
     @pytest.mark.asyncio
     async def test_startup_still_applies_a_usable_model(self):
-        client = self._client(["claude-sonnet-4.6", "claude-opus-4.8"], "claude-opus-4.8")
+        client = self._client(["gpt-5.6-terra", "gpt-6-astra"], "gpt-6-astra")
+        client._resolved_model_id = "gpt-5.6-terra"
         sent = []
         client._send_request = _record(sent)
 
         await client._apply_startup_model()
 
         assert len(sent) == 1
-        assert sent[0][1]["modelId"] == "claude-opus-4.8"
-        assert client._model == "claude-opus-4.8"
+        assert sent[0][1]["modelId"] == "gpt-6-astra"
+        assert client._model == "gpt-6-astra"
+        assert client._resolved_model_id == "gpt-6-astra"
 
     @pytest.mark.asyncio
     async def test_startup_leaves_claude_backend_alone(self):

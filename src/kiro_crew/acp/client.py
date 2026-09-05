@@ -3073,6 +3073,9 @@ class AcpClient:
                 METHOD_SET_MODEL,
                 {"sessionId": self._session_id, "modelId": self._model},
             )
+        # session/new reports the backend default before an explicit override.
+        # Keep turn attribution aligned with the requested model after dispatching it.
+        self._resolved_model_id = self._model
         logger.info("ACP model: %s", self._model)
 
     async def new_conversation(self) -> None:
