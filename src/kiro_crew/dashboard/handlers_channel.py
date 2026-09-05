@@ -81,15 +81,32 @@ def _mgr(request: web.Request) -> ChannelManager:
     return mgr
 
 
+async def _json_object(request: web.Request) -> dict:
+    """Parse a JSON request body and require a top-level object."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise web.HTTPBadRequest(
+            text='{"error":"invalid JSON","code":"invalid_json"}',
+            content_type="application/json",
+        )
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(
+            text=(
+                '{"error":"request body must be a JSON object",'
+                '"code":"body_not_object"}'
+            ),
+            content_type="application/json",
+        )
+    return body
+
+
 async def _get_channel_body(request: web.Request):
     """Get channel + parsed JSON body, or raise web.HTTPException."""
     ch = _mgr(request).get(request.match_info["id"])
     if not ch:
         raise web.HTTPNotFound(text='{"error":"not found"}', content_type="application/json")
-    try:
-        body = await request.json()
-    except Exception:
-        raise web.HTTPBadRequest(text='{"error":"invalid JSON"}', content_type="application/json")
+    body = await _json_object(request)
     return ch, body
 
 
@@ -161,19 +178,30 @@ async def api_channel_get(request: web.Request) -> web.Response:
 
 
 async def api_channel_create(request: web.Request) -> web.Response:
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    topic = body.get("topic", "").strip()[:500]
+    body = await _json_object(request)
+    raw_topic = body.get("topic", "")
+    if not isinstance(raw_topic, str):
+        return web.json_response(
+            {"error": "topic must be a string", "code": "channel_topic_type_invalid"},
+            status=400,
+        )
+    topic = raw_topic.strip()[:500]
     if not topic:
-        return web.json_response({"error": "topic required"}, status=400)
+        return web.json_response(
+            {"error": "topic required", "code": "channel_topic_required"}, status=400
+        )
     session_only = body.get("session_only", False)
     if not isinstance(session_only, bool):
         return web.json_response(
             {"error": "session_only must be a boolean", "code": "invalid_session_only"}, status=400
         )
+
     agents_def = body.get("agents", [])
+    if not isinstance(agents_def, list):
+        return web.json_response(
+            {"error": "agents must be an array", "code": "channel_agents_type_invalid"},
+            status=400,
+        )
     if session_only and agents_def:
         return web.json_response(
             {
@@ -182,11 +210,57 @@ async def api_channel_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    # Local import mirrors the sibling agent-mutation handlers below; the
+    # module-level import was narrowed when channel agents moved out of the
+    # import surface.
+    from kiro_crew.channel import ApprovalPolicy
+
+    valid_policies = {policy.value for policy in ApprovalPolicy}
+    for agent_def in agents_def:
+        if not isinstance(agent_def, dict):
+            return web.json_response(
+                {
+                    "error": "each agent must be an object",
+                    "code": "channel_agent_type_invalid",
+                },
+                status=400,
+            )
+        for field in ("role", "agent", "task"):
+            if field in agent_def and not isinstance(agent_def[field], str):
+                return web.json_response(
+                    {
+                        "error": f"agent {field} must be a string",
+                        "code": "channel_agent_field_type_invalid",
+                    },
+                    status=400,
+                )
+        if "is_orchestrator" in agent_def and not isinstance(
+            agent_def["is_orchestrator"], bool
+        ):
+            return web.json_response(
+                {
+                    "error": "agent is_orchestrator must be a boolean",
+                    "code": "channel_agent_orchestrator_type_invalid",
+                },
+                status=400,
+            )
+        approval = agent_def.get("approval", "writes")
+        if not isinstance(approval, str) or approval not in valid_policies:
+            return web.json_response(
+                {
+                    "error": "invalid agent approval policy",
+                    "code": "channel_agent_approval_invalid",
+                },
+                status=400,
+            )
 
     ch = _mgr(request).create(topic)
     if not ch:
         return web.json_response(
-            {"error": "Channel limit reached. Close an existing channel first."},
+            {
+                "error": "Channel limit reached. Close an existing channel first.",
+                "code": "channel_limit_reached",
+            },
             status=429,
         )
 
@@ -368,12 +442,16 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
             "Review this peer channel message and respond only if an action or "
             "acknowledgement is needed.",
         )
+        from kiro_crew.dashboard.session_control import containment_meta
+
+        queue_meta = containment_meta(state, slot)
         if queue_index is None:
             queue(
                 request_text,
                 kind=PEER_CHANNEL_REQUEST_KIND,
                 peer_channel_id=channel.id,
                 peer_message_id=message.id,
+                meta=queue_meta,
             )
         else:
             queue(
@@ -382,10 +460,15 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
                 kind=PEER_CHANNEL_REQUEST_KIND,
                 peer_channel_id=channel.id,
                 peer_message_id=message.id,
+                meta=queue_meta,
             )
         if slot.running or slot._in_stage_execution:
             await save_slot_off_loop(state, slot, force=True, best_effort=False)
             state.push_slots_update()
+            if message.delivery == "interrupt" and not slot._in_stage_execution:
+                from kiro_crew.dashboard.chat_handlers import preempt_slot_for_channel_interrupt
+
+                return await preempt_slot_for_channel_interrupt(state, slot)
             return "queued"
 
     if message.msg_type == "mention" and not slot.running and not slot._in_stage_execution:
@@ -401,18 +484,53 @@ async def deliver_attached_channel_message(state, channel, member, message) -> s
 
 async def api_channel_post(request: web.Request) -> web.Response:
     ch, body = await _get_channel_body(request)
-    content = body.get("content", "").strip()[:10000]
+    raw_content = body.get("content", "")
+    if not isinstance(raw_content, str):
+        return web.json_response(
+            {
+                "error": "content must be a string",
+                "code": "channel_message_content_type_invalid",
+            },
+            status=400,
+        )
+    content = raw_content.strip()[:10000]
     if not content:
         return web.json_response({"error": "content required"}, status=400)
-    # Validate mentions
+    # Validate mentions. Membership is a dict lookup, so an unhashable value
+    # here raises TypeError rather than simply failing to match.
     raw_mention = body.get("mention")
-    if raw_mention:
+    if raw_mention is not None:
         if isinstance(raw_mention, list):
-            raw_mention = [m for m in raw_mention if m in ch.members]
+            if not all(isinstance(name, str) for name in raw_mention):
+                return web.json_response(
+                    {
+                        "error": "mention entries must be strings",
+                        "code": "channel_message_mention_type_invalid",
+                    },
+                    status=400,
+                )
+            raw_mention = [name for name in raw_mention if name in ch.members]
+        elif not isinstance(raw_mention, str):
+            return web.json_response(
+                {
+                    "error": "mention must be a string or an array of strings",
+                    "code": "channel_message_mention_type_invalid",
+                },
+                status=400,
+            )
         elif raw_mention not in ch.members:
             raw_mention = None
     # Validate thread_id
     thread_id = body.get("thread_id")
+    if thread_id is not None:
+        if not isinstance(thread_id, str):
+            return web.json_response(
+                {
+                    "error": "thread_id must be a string",
+                    "code": "channel_message_thread_id_type_invalid",
+                },
+                status=400,
+            )
     if thread_id and thread_id not in ch._msg_index:
         thread_id = None
     msg = await ch.post(
@@ -432,12 +550,37 @@ async def api_channel_post(request: web.Request) -> web.Response:
 async def api_channel_add_agent(request: web.Request) -> web.Response:
     ch, body = await _get_channel_body(request)
 
+    role = body.get("role", "Agent")
+    agent_name = body.get("agent", "")
+    task = body.get("task", ch.topic)
+    is_orchestrator = body.get("is_orchestrator", False)
+    approval = body.get("approval", "writes")
+    for value, code in (
+        (role, "channel_agent_role_type_invalid"),
+        (agent_name, "channel_agent_name_type_invalid"),
+        (task, "channel_agent_task_type_invalid"),
+    ):
+        if not isinstance(value, str):
+            return web.json_response({"error": "invalid field", "code": code}, status=400)
+    if not isinstance(is_orchestrator, bool):
+        return web.json_response(
+            {"error": "is_orchestrator must be boolean", "code": "channel_agent_orchestrator_type_invalid"},
+            status=400,
+        )
+    from kiro_crew.channel import ApprovalPolicy
+
+    if not isinstance(approval, str) or approval not in {policy.value for policy in ApprovalPolicy}:
+        return web.json_response(
+            {"error": "invalid approval policy", "code": "channel_agent_approval_invalid"},
+            status=400,
+        )
+
     agent = ch.add_agent(
-        role=body.get("role", "Agent")[:100],
-        agent_name=body.get("agent", ""),
-        task=body.get("task", ch.topic),
-        is_orchestrator=body.get("is_orchestrator", False),
-        approval_policy=body.get("approval", "writes"),
+        role=role[:100],
+        agent_name=agent_name,
+        task=task,
+        is_orchestrator=is_orchestrator,
+        approval_policy=approval,
     )
     if not agent:
         return web.json_response(
@@ -456,21 +599,40 @@ async def api_channel_update_agent(request: web.Request) -> web.Response:
     if not agent:
         return web.json_response({"error": "agent not found"}, status=404)
 
+    coordinator = body.get("coordinator")
+    if coordinator is not None and (not isinstance(coordinator, bool) or coordinator is not True):
+        return web.json_response(
+            {"error": "coordinator must be true", "code": "channel_agent_coordinator_invalid"},
+            status=400,
+        )
+
+    from kiro_crew.channel import ApprovalPolicy, ListenMode
+
+    approval = body.get("approval")
+    if approval is not None and (
+        not isinstance(approval, str) or approval not in {policy.value for policy in ApprovalPolicy}
+    ):
+        return web.json_response(
+            {"error": "invalid approval policy", "code": "channel_agent_approval_invalid"},
+            status=400,
+        )
+    listen = body.get("listen")
+    if listen is not None and (
+        not isinstance(listen, str) or listen not in {mode.value for mode in ListenMode}
+    ):
+        return web.json_response(
+            {"error": "invalid listen mode", "code": "channel_agent_listen_invalid"},
+            status=400,
+        )
+
     if "approval" in body:
-        from kiro_crew.channel import ApprovalPolicy
-
-        try:
-            agent.approval_policy = ApprovalPolicy(body["approval"])
-        except ValueError:
-            pass
+        agent.approval_policy = ApprovalPolicy(approval)
     if "listen" in body:
-        from kiro_crew.channel import ListenMode
-
-        try:
-            agent.listen_mode = ListenMode(body["listen"])
-        except ValueError:
-            pass
-    ch._save()
+        agent.listen_mode = ListenMode(listen)
+    if coordinator:
+        ch.set_coordinator(agent.id)
+    else:
+        ch._save()
     return web.json_response({"ok": True, "agent": agent.to_dict()})
 
 
@@ -508,10 +670,7 @@ async def api_channel_approve_agent(request: web.Request) -> web.Response:
     agent = ch.members.get(request.match_info["aid"])
     if not agent:
         return web.json_response({"error": "agent not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body = await _json_object(request)
     action = body.get("action", "rejected")  # approved|rejected|trust
     if action not in ("approved", "rejected", "trust"):
         return web.json_response({"error": "invalid action"}, status=400)
@@ -527,6 +686,41 @@ async def api_channel_approve_agent(request: web.Request) -> web.Response:
 
 
 # ── Context Management ──
+
+
+async def clear_agent_context(state: "DashboardState", agent) -> bool:
+    """Reset one channel worker's LLM session, preserving channel configuration.
+
+    This is the per-worker "Clear context" lifecycle in one place so every
+    surface that offers it runs the same semantics: the worker's ACP session is
+    torn down, while its membership, task, listen mode, and the channel's shared
+    message buffer are untouched, so its next message cold-starts on fresh
+    context. Returns ``False`` for a member that owns no session to reset.
+
+    Tearing the session down ends whatever turn it was running; it is neither a
+    cooperative stop nor a dismissal -- ``Channel.remove_agent`` drops the
+    membership row and leaves the session running. Any surface offering this
+    must keep those three distinct.
+    """
+    if not agent.session_key:
+        return False
+    await state.sessions.reset(agent.session_key)
+    return True
+
+
+def broadcast_context_cleared(
+    channel, scope: str, agent_id: str | None, cleared: list[str]
+) -> None:
+    """Tell other clients their buffered view of this channel is stale."""
+    channel._broadcast(
+        "channel_context_cleared",
+        {
+            "channel_id": channel.id,
+            "scope": scope,
+            "agent_id": agent_id,
+            "cleared": cleared,
+        },
+    )
 
 
 async def api_channel_clear_context(request: web.Request) -> web.Response:
@@ -566,8 +760,8 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
 
     try:
-        body = await request.json()
-    except Exception:
+        body = await _json_object(request)
+    except web.HTTPBadRequest:
         sel().log_api_access(
             caller="dashboard", operation="channel.clear_context",
             outcome="denied", source="dashboard", resources=ch.id,
@@ -602,13 +796,11 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
                 resources=f"{ch.id}:{agent_id}",
             )
             return web.json_response({"error": "agent not found"}, status=404)
-        if agent.session_key:
-            await state.sessions.reset(agent.session_key)
+        if await clear_agent_context(state, agent):
             cleared.append(agent.role or agent.id)
     else:
         for agent in ch.members.values():
-            if agent.session_key:
-                await state.sessions.reset(agent.session_key)
+            if await clear_agent_context(state, agent):
                 cleared.append(agent.role or agent.id)
         ch.messages.clear()
         ch._msg_index.clear()
@@ -622,14 +814,6 @@ async def api_channel_clear_context(request: web.Request) -> web.Response:
     )
 
     # Notify other clients (multi-tab UX) so their stale message buffers refresh.
-    ch._broadcast(
-        "channel_context_cleared",
-        {
-            "channel_id": ch.id,
-            "scope": scope,
-            "agent_id": agent_id if scope == "agent" else None,
-            "cleared": cleared,
-        },
-    )
+    broadcast_context_cleared(ch, scope, agent_id if scope == "agent" else None, cleared)
 
     return web.json_response({"ok": True, "cleared": cleared})

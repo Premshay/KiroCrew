@@ -158,8 +158,31 @@ def _actual_type_name(value: object) -> str:
 #:   the loader's comprehension and would inject ``/etc`` as an allowed
 #:   relocate root, where the repaired default ``[]`` means home-only.
 #:
-#: Exact-match only: this is a per-path judgment, not a subtree rule.
-_FAIL_CLOSED_PATHS = frozenset({"publish", "publish.allowed_destinations"})
+#: * ``dashboard`` (the section) and ``dashboard.tailscale``: same open
+#:   direction, one narrowing deeper. ``dashboard.tailscale.allowed_logins``
+#:   is the ONLY restriction on which tailnet peer may authenticate, and its
+#:   default is the empty list — which the loader turns into
+#:   ``trust_identity = False``, i.e. **no login restriction at all**. So
+#:   repairing either enclosing object dropped the operator's allowlist and
+#:   admitted every tailnet peer holding a token, where before only an
+#:   allowlisted login was admitted. Note the deeper
+#:   ``dashboard.tailscale.allowed_logins`` itself needs no entry: at three
+#:   segments it is already past ``_apply_field_default``'s depth cap, so a
+#:   malformed list value is kept today.
+#:
+#: Exact-match only: this is a per-path judgment, not a subtree rule. The
+#: registry is only half of a fix — a preserved value changes nothing unless
+#: the loader RECORDS the degradation and a gate reads
+#: ``KiroCrewConfig.degraded_sections``. Both halves exist for every path
+#: listed here; adding a path without them just keeps evidence nobody reads.
+_FAIL_CLOSED_PATHS = frozenset(
+    {
+        "publish",
+        "publish.allowed_destinations",
+        "dashboard",
+        "dashboard.tailscale",
+    }
+)
 
 
 def _apply_field_default(data: dict, dot_path: str) -> bool:
@@ -319,7 +342,11 @@ def validate_config_data(data: dict) -> dict:
     # circular import: schema.py imports KiroCrewConfig from config.loader, which
     # re-exports this module — importing schema at module level here would close
     # a config.loader -> validation -> schema -> loader cycle at import time.
-    from kiro_crew.config.loader import CONFIG_RESERVED_TOP_KEYS
+    from kiro_crew.config.loader import (
+        CONFIG_RESERVED_TOP_KEYS,
+        _validated_stt_model,
+        _validated_stt_provider,
+    )
     from kiro_crew.config.schema import JSON_SCHEMA, SCHEMA_REGISTRY
 
     # 1. Detect unrecognized top-level keys. The schema registry models only the
@@ -356,6 +383,22 @@ def validate_config_data(data: dict) -> dict:
     agent = data.get("agent")
     if isinstance(agent, dict) and isinstance(agent.get("log_level"), str):
         agent["log_level"] = agent["log_level"].upper()
+
+    # 3a. Resolve the STT provider and model through the loader's own degradation
+    # rules before the enum check can discard them. Both fields accept values that
+    # are deliberately absent from their enum (a retired provider, and a model name
+    # the catalog maps onto a current entry), and the loader answers each with a
+    # specific warning and a specific replacement. An enum violation instead
+    # deletes the key, so the parse site would fall back to the plain default and
+    # the operator would be told only that a value was rejected. Normalizing here
+    # makes the resolved value and the log identical whether or not ``jsonschema``
+    # is installed, which is the whole point: this function is a no-op without it.
+    stt = data.get("stt")
+    if isinstance(stt, dict):
+        if "provider" in stt:
+            stt["provider"] = _validated_stt_provider(stt["provider"])
+        if "model" in stt:
+            stt["model"] = _validated_stt_model(stt["model"])
 
     # 4. Preserve numeric values written by older config writers.
     _coerce_legacy_numeric_values(data, JSON_SCHEMA)

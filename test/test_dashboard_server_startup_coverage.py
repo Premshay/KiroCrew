@@ -382,7 +382,9 @@ class TestStartDashboardWiring:
         The ``Host`` barrier must run OUTSIDE the audit middleware: aiohttp runs
         middlewares outermost-first, and a rebinding attempt refused inside the
         audit layer would 403 without ever being recorded (which is why
-        ``_audit_denied`` exists at all).
+        ``_audit_denied`` exists at all). The deny-audit boundary must in turn
+        run outside the ``Host`` barrier: that is what makes the recording
+        positional rather than dependent on every deny site calling the helper.
         """
         async with _dashboard(tmp_path, monkeypatch) as (runner, _state, _spies):
             names = [getattr(mw, "__name__", type(mw).__name__) for mw in runner.app.middlewares]
@@ -390,6 +392,8 @@ class TestStartDashboardWiring:
         assert "host_validation_middleware" in names
         assert "sel_audit_middleware" in names
         assert names.index("host_validation_middleware") < names.index("sel_audit_middleware")
+        assert "deny_audit_middleware" in names, "the pre-audit deny boundary is not installed"
+        assert names.index("deny_audit_middleware") < names.index("host_validation_middleware")
 
     @pytest.mark.asyncio
     async def test_a_disallowed_host_is_refused_by_the_real_chain(
@@ -527,3 +531,71 @@ class TestStartDashboardWiring:
         await _cancel_stray_tasks()
 
         provider.stop.assert_awaited()
+
+    @staticmethod
+    def _tunnel_enabled_context(monkeypatch) -> None:
+        """Force the enable gate open so the tunnel setup call is reached.
+
+        Driven through the context provider rather than by writing
+        ``tunnel.enabled`` into the config, because ``start_dashboard`` ORs the
+        two and the provider arm needs no config-cache handling.
+        """
+        monkeypatch.setattr(
+            srv,
+            "current_context",
+            lambda: SimpleNamespace(
+                tunnel=SimpleNamespace(stop=AsyncMock(), enabled=lambda: True),
+                telemetry=SimpleNamespace(record_event=lambda *_a, **_k: None),
+                dashboard=SimpleNamespace(start_services=AsyncMock(), stop_services=AsyncMock()),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_tunnel_reaches_the_tunnel_gate(self, tmp_path: Path, monkeypatch) -> None:
+        """A ``--no-tunnel`` process must not get a tunnel manager on its state.
+
+        Driven end to end through the REAL ``setup_tunnel`` with the enable gate
+        forced open and token auth irrelevant, because the boot-flag refusal is
+        checked ahead of both. The flag is read from process state rather than
+        passed down here -- ``slack.allowlist`` opens a second door that never
+        reaches this function, so a parameter would have guarded only this one.
+        """
+        from kiro_crew.tunnel import set_publish_disabled
+
+        self._tunnel_enabled_context(monkeypatch)
+        set_publish_disabled(True)
+        try:
+            runner, state, _spies = await _start_dashboard(tmp_path, monkeypatch)
+            try:
+                assert state.tunnel_manager is None
+            finally:
+                await runner.cleanup()
+                await _cancel_stray_tasks()
+        finally:
+            set_publish_disabled(False)
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_gateway_still_asks_for_its_tunnel(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Without the flag the gate is asked exactly as before, so a normal
+        install's remote access cannot be taken away by this change.
+
+        Asserted at the call rather than on the returned state: ``setup_tunnel``
+        also returns None for an unrelated reason (no token auth in this harness),
+        so a state-only assertion would pass even if the tunnel were never
+        attempted at all.
+        """
+        from kiro_crew.tunnel import set_publish_disabled
+
+        self._tunnel_enabled_context(monkeypatch)
+        set_publish_disabled(False)
+        spy = AsyncMock(return_value=None)
+        monkeypatch.setattr(srv, "setup_tunnel", spy)
+
+        runner, _state, _spies = await _start_dashboard(tmp_path, monkeypatch)
+        try:
+            spy.assert_awaited_once()
+        finally:
+            await runner.cleanup()
+            await _cancel_stray_tasks()

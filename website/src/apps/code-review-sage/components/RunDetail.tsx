@@ -11,6 +11,7 @@ import type { Run } from '../lib/types'
 import EmptyState from './EmptyState'
 import ReportView from './ReportView'
 import RunProgress from './RunProgress'
+import RuleProvenance from './RuleProvenance'
 import PostCommentsButton from './PostCommentsButton'
 import FailureNotice from './FailureNotice'
 import RunStatusPill from './RunStatusPill'
@@ -124,6 +125,8 @@ export default function RunDetail({ run }: { run: Run }) {
           onCancel={() => cancelRun(run.run_id)}
           cancelling={cancelling || !!run.cancel_requested_at}
         />
+
+        <RuleProvenance run={run} />
 
         {reportError ? (
           <div className="text-[12.5px] text-danger">{reportError.message}</div>

@@ -15,8 +15,13 @@ export interface MenuGeometry {
   /** True when the menu opens ABOVE the anchor (the common case — chat input
    *  at the viewport bottom). Drives the bottom-up reversal. */
   above: boolean
-  /** CSS `top` for the fixed-position portal. */
+  /** CSS `top` for the fixed-position portal, for the opens-BELOW case. */
   top: number
+  /** CSS `bottom` for the opens-ABOVE case: pins the menu's bottom edge 4px
+   *  above the anchor so it grows UPWARD. Placing by `top` there would trust
+   *  `count * rowH` as the real height, and a zero-row menu whose copy wraps
+   *  past one line is taller than that — the surplus lands on the composer. */
+  bottom: number
   /** CSS `left` for the portal (anchor's left edge). */
   left: number
   /** Anchor width — callers clamp their own max (e.g. Math.min(width, 420)). */
@@ -27,16 +32,23 @@ export interface MenuGeometry {
 /**
  * Compute where an anchored picker opens and its portal position.
  * `count` is the number of rows; `rowH` the per-row height estimate (px).
- * The menu opens above the input when there's room, else below.
+ * `extraH` budgets non-row chrome (e.g. a pinned footer) into the height.
+ *
+ * The estimate chooses the SIDE only. An opens-above menu is then placed by
+ * `bottom`, so its real rendered height — which the estimate cannot know for
+ * a wrapping zero-row announcement — can never overhang the composer.
  */
-export function menuGeometry(anchor: HTMLElement, count: number, rowH: number): MenuGeometry {
+export function menuGeometry(
+  anchor: HTMLElement, count: number, rowH: number, extraH = 0,
+): MenuGeometry {
   const rect = anchor.getBoundingClientRect()
-  const menuH = Math.min((count || 1) * rowH + 8, MENU_MAX_HEIGHT)
+  const menuH = Math.min((count || 1) * rowH + 8 + extraH, MENU_MAX_HEIGHT)
   const aboveTop = rect.top - menuH - 4
   const above = aboveTop > 0
   return {
     above,
     top: above ? aboveTop : rect.bottom + 4,
+    bottom: Math.max(window.innerHeight - rect.top + 4, 0),
     left: rect.left,
     width: rect.width,
     maxHeight: MENU_MAX_HEIGHT,

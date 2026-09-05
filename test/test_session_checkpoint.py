@@ -189,6 +189,7 @@ class TestCheckpointDirectiveDispatch:
 
     def test_acknowledges_maintenance_through_the_strict_internal_route(self, monkeypatch) -> None:
         post = MagicMock(return_value={"ok": True, "maintenance": {"ready": True}})
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:consumer")
         monkeypatch.setattr(mcp_core, "_post", post)
 
         result = mcp_core._call_tool_inner("maintenance_acknowledge", {})

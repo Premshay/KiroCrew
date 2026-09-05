@@ -75,6 +75,29 @@ describe('active vs non-active chat-frame applier parity', () => {
     expect((bg.slotMessages[SLOT] ?? []).some((m) => m.role === 'thinking')).toBe(false)
   })
 
+  it('finalizes a stale foreground stream before durable between-turn work (both paths)', () => {
+    const stale = { role: 'streaming' as const, content: 'the completed prior reply', cls: 'msg msg-a' }
+    const idleFrames: Array<Parameters<typeof sseChatMessage>[0]> = [
+      { slot: SLOT, role: 'tool', content: '🔧 inspect', meta: { between_turn: true, tool_call_id: 'idle-tool' } },
+      { slot: SLOT, role: 'assistant', content: 'the durable idle reply', meta: { between_turn: true, mid: 'idle-reply' } },
+    ]
+
+    let active = { ...init(), activeSlot: SLOT, messages: [{ role: 'user' as const, content: 'prior request', cls: '' }, stale] }
+    for (const frame of idleFrames) active = reducer(active, sseChatMessage(frame))
+
+    let bg = { ...init(), activeSlot: OTHER, slotMessages: { [SLOT]: [{ role: 'user' as const, content: 'prior request', cls: '' }, stale] } }
+    for (const frame of idleFrames) bg = reducer(bg, sseChatMessage(frame))
+
+    const expected = [
+      { role: 'user', content: 'prior request' },
+      { role: 'assistant', content: 'the completed prior reply' },
+      { role: 'tool', content: '🔧 inspect' },
+      { role: 'assistant', content: 'the durable idle reply' },
+    ]
+    expect(shape(active.messages)).toEqual(expected)
+    expect(shape(bg.slotMessages[SLOT] ?? [])).toEqual(expected)
+  })
+
   it('warmSlotCache reconciles a background pane to canonical history and idles its run state', () => {
     // A non-active pane accrued an optimistic user bubble + streamed content.
     let bg = { ...init(), activeSlot: OTHER }

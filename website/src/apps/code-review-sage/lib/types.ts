@@ -4,20 +4,10 @@
 // requests, with its own private results + report. Several can be live at once.
 
 /** Terminal + live states a run can be in (backend ``run["status"]``). */
-export type RunStatus =
-  | 'running'
-  | 'done'
-  | 'error'
-  | 'cancelled'
-  | 'interrupted'
+export type RunStatus = 'running' | 'done' | 'error' | 'cancelled' | 'interrupted'
 
 /** Per-change phase the driver reports as it works (``run.progress[change_id]``). */
-export type ChangePhase =
-  | 'queued'
-  | 'reviewing'
-  | 'done'
-  | 'failed'
-  | 'cancelled'
+export type ChangePhase = 'queued' | 'reviewing' | 'done' | 'failed' | 'cancelled'
 
 /** What the reviewer is doing right now, relayed from its tool stream. The only
  * real evidence of forward motion inside a single multi-minute worker turn. */
@@ -34,6 +24,12 @@ export interface RunProgressEntry {
   posted?: number
   expected?: number
   error?: string
+  /** The failure cause as a stable backend token (`skipped_reason`), carried
+   *  BESIDE `error` rather than instead of it. `error` is prose, so keying a
+   *  translation off it alone means a backend rewording silently drops the card
+   *  to untranslated pass-through. Absent on runs recorded before the backend
+   *  carried it, and on non-failure phases. */
+  reason?: string
   coverage?: string
 }
 
@@ -81,6 +77,10 @@ export interface Run {
   summary?: RunSummary
   report_slug?: string | null
   error?: string
+  /** The run-level failure cause as a stable backend token, beside `error`.
+   *  Named to mirror `RunProgressEntry.reason` so the token resolves through the
+   *  same per-change-then-run precedence the prose already uses. */
+  reason?: string
   force?: boolean
   skipped_inflight?: number
   /** Set once this run's findings have been published to the pull request. */
@@ -94,6 +94,16 @@ export interface Run {
   posted_review_ids?: Record<string, string>
   posting?: boolean
   post_error?: string | null
+  /** The frozen rule resolution per change URL, written when the run was created.
+   *  Absent on runs recorded before namespaces could be scoped. */
+  rule_resolutions?: Record<string, RuleResolution>
+  runtime?: {
+    engine: string
+    provider: string
+    agent: string
+    resolved_model: string | null
+    model_resolution: 'reported' | 'unavailable'
+  }
 }
 
 export interface PoolStats {
@@ -109,6 +119,12 @@ export interface ReviewerInfo {
   model?: string | null
   effort?: string
   agent?: string
+  engine?: string
+  provider?: string
+  model_source?: 'config' | 'agent-default'
+  model_override_supported?: boolean
+  effort_override_supported?: boolean
+  models?: string[]
 }
 
 export interface RunsResponse {
@@ -263,12 +279,69 @@ export interface RepoPrsResponse {
   count: number
 }
 
+// --- Namespace scope + rule provenance ---------------------------------------
+
+/** The canonical repository a namespace can be bound to. `provider` is the only
+ *  closed set today ("github"); `host` carries GitHub Enterprise installs. */
+export interface RepositorySource {
+  provider: string
+  host: string
+  owner: string
+  repository: string
+}
+
+/** Where one namespace's learned rules apply. A namespace with NO binding is
+ *  neither of these: it is a legacy active namespace, still applied everywhere
+ *  for compatibility and reported as a migration warning. */
+export type NamespaceBinding =
+  { scope: 'global' } | { scope: 'repository'; repository: RepositorySource }
+
+/** Why a namespace was included in, or left out of, one review's ruleset. Widened
+ *  with `string` because the backend owns the vocabulary and an unknown reason
+ *  must render as unknown rather than crash the pane. */
+export type RuleInclusionReason =
+  | 'legacy_active_namespace'
+  | 'explicit_global_binding'
+  | 'repository_binding_match'
+  | 'repository_binding_mismatch'
+  | 'source_identity_unavailable'
+  | 'namespace_missing'
+
+export interface NamespaceResolution {
+  namespace: string
+  included: boolean
+  reason: RuleInclusionReason | string
+  binding?: NamespaceBinding
+}
+
+export interface EffectiveRule {
+  namespace: string
+  rule_id: string
+  pattern: LearnedPattern
+  reason: RuleInclusionReason | string
+  /** SAGE-1 learning-record ids backing this rule, when a sidecar was exported. */
+  sidecar_record_ids?: string[]
+}
+
+/** The namespace/rule set frozen for ONE change before its reviewer started. The
+ *  review already ran against exactly this, so every surface showing it is
+ *  read-only. */
+export interface RuleResolution {
+  source_identity: RepositorySource | null
+  namespaces: NamespaceResolution[]
+  effective_namespaces: string[]
+  effective_rules: EffectiveRule[]
+  warnings: string[]
+}
+
 // --- Settings + learning -----------------------------------------------------
 
 export interface Settings {
   model: string | null
   effort: string
   active_namespaces: string[]
+  /** Keyed by namespace name. A namespace absent from this map has no binding. */
+  namespace_bindings: Record<string, NamespaceBinding>
   max_concurrent: number
 }
 
@@ -277,6 +350,7 @@ export interface SettingsResponse {
   models: string[]
   efforts: string[]
   namespaces: string[]
+  pinned_repos: PinnedRepo[]
   reviewer?: ReviewerInfo | null
   max_concurrent_max: number
 }
@@ -287,10 +361,19 @@ export interface LearnedPattern {
   scope: string
   impact: string
   guidance: string
+  /** Present for governed sidecar records and on-demand legacy adoption rows. */
+  record_id?: string
+  lifecycle?: 'active' | 'pinned' | 'archived'
+  legacy?: boolean
 }
 
 export interface NamespacesResponse {
-  namespaces: { name: string; patterns: number; candidate: number; active: boolean }[]
+  namespaces: {
+    name: string
+    patterns: number
+    candidate: number
+    active: boolean
+  }[]
   active: string[]
 }
 
@@ -302,15 +385,89 @@ export interface AddRepoResponse {
   /** Set when a PULL REQUEST url was pasted: its repo was pinned and this is the
    *  pull request itself, so the caller can open it. */
   pull_request?: {
-    owner: string; repo: string; number: number; url: string; change_id: string
+    owner: string
+    repo: string
+    number: number
+    url: string
+    change_id: string
   }
 }
 
-export interface ConsolidateResponse {
+export interface ConsolidationPreviewRequest {
   ok: boolean
+  code: string
   namespace: string
-  staged: number
+  candidate_ids: string[]
   running: boolean
+}
+
+export interface ConsolidationPreviewState {
+  preview_id: string
+  namespace: string
+  status: string
+  expired: boolean
+  stale: boolean
+  stale_reasons: string[]
+  expires_at_epoch: number
+}
+
+export interface ConsolidationPreviewSummary {
+  preview_id: string
+  namespace: string
+  created_at: string
+  selected_candidate_ids: string[]
+  state: ConsolidationPreviewState
+}
+
+export interface ConsolidationPreviewListResponse {
+  code: string
+  namespace: string
+  previews: ConsolidationPreviewSummary[]
+}
+
+export interface ConsolidationPreviewDecision {
+  candidate_id: string
+  action: 'promote' | 'merge' | 'archive' | 'retain' | string
+  reason_code: string
+}
+
+export interface ConsolidationBudgetImpact {
+  governed: boolean
+  archived_record_ids: string[]
+  selection: {
+    usage: Record<string, { rules: number; tokens: number }>
+    budgets: Record<string, { max_rules: number; max_tokens: number }>
+  } | null
+}
+
+/** Snapshot-bound, server-owned proposal. String unions remain open because a
+ * newer gateway must degrade to a safe, localized unavailable action rather
+ * than make its preview impossible to inspect. */
+export interface ConsolidationPreview {
+  preview_id: string
+  namespace: string
+  status: string
+  selected_candidate_ids: string[]
+  proposed_ruleset_markdown: string
+  per_candidate_decisions: ConsolidationPreviewDecision[]
+  budget_impact: ConsolidationBudgetImpact
+  state: ConsolidationPreviewState
+}
+
+export interface ConsolidationPreviewDetailResponse {
+  code: string
+  preview: ConsolidationPreview
+}
+
+export interface ConsolidationPreviewApplyResponse {
+  ok: boolean
+  code: string
+  preview_id?: string
+  namespace?: string
+  consumed_candidate_ids?: string[]
+  retained_candidate_ids?: string[]
+  budget_impact?: ConsolidationBudgetImpact
+  state?: ConsolidationPreviewState
 }
 
 export interface LearningsResponse {

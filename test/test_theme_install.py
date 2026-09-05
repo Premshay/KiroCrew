@@ -26,17 +26,21 @@ structure/security logic lives, so no aiohttp app is needed. Covers:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew.dashboard.handlers.themes import (
     _atomic_write_theme_json,
     _clone_github,
     _copy_installed_theme,
 )
 from kiro_crew.dashboard.theme_validate import (
+    _THEME_LOADER_ICONS,
+    _THEME_LOADER_ICONS_MAX,
     _THEME_MAX_FONTS,
     _THEME_OVERLAY_DEFAULT_POSITION,
     _THEME_OVERLAY_DEFAULT_ZINDEX,
@@ -233,6 +237,47 @@ class TestValidateThemeDir:
         summary, err = _validate_theme_dir(_make_theme(tmp_path / "ok", level=2))
         assert err is None, err
         assert summary is not None and summary["level"] == 2
+
+    def test_level_one_loader_icons_are_accepted_and_described(self, tmp_path: Path) -> None:
+        d = _make_theme(tmp_path, level=1)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        manifest["loaderIcons"] = ["star", "sparkles", "moon", "cloud"]
+        _write(d / "theme.json", manifest)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert err is None, err
+        assert summary is not None
+        descriptor = _theme_asset_descriptor(d, manifest, 1)
+        assert descriptor["loaderIcons"] == manifest["loaderIcons"]
+
+    @pytest.mark.parametrize(
+        ("level", "icons", "message"),
+        [
+            (0, ["star", "sparkles", "moon", "cloud"], "requires level 1"),
+            (1, None, "must be an array"),
+            (1, "star", "must be an array"),
+            (1, ["star", "moon", "cloud"], "must contain"),
+            (1, ["star", "sparkles", "moon", "unknown"], "unknown symbol"),
+            (1, ["star", "sparkles", "moon", "star"], "must be unique"),
+        ],
+    )
+    def test_invalid_loader_icons_are_rejected(
+        self, tmp_path: Path, level: int, icons: object, message: str
+    ) -> None:
+        d = _make_theme(tmp_path, level=level)
+        manifest = json.loads((d / "theme.json").read_text("utf-8"))
+        manifest["loaderIcons"] = icons
+        _write(d / "theme.json", manifest)
+        summary, err = _validate_theme_dir(d, installing=True)
+        assert summary is None
+        assert err is not None and message in err
+
+    def test_backend_loader_icon_allowlist_matches_frontend(self) -> None:
+        frontend = (
+            Path(__file__).parents[1] / "website" / "src" / "themeLoaderIcons.ts"
+        ).read_text("utf-8")
+        declared = set(re.findall(r"^  ([a-z]+): [A-Z]", frontend, re.MULTILINE))
+        assert declared == _THEME_LOADER_ICONS
+        assert _THEME_LOADER_ICONS_MAX == len(declared)
 
     def test_l2_overlay_asset_rejected(self, tmp_path: Path) -> None:
         d = _make_theme(tmp_path)  # declares level 0 but ships an overlay
@@ -977,6 +1022,7 @@ class TestFullL2Fixture:
         assert info["chars"] == len(text)
         assert info["text"] == text
 
+    @requires_symlinks
     def test_descriptor_rejects_symlinked_persona(self, tmp_path: Path) -> None:
         # TOCTOU symlink-swap: persona.md replaced by a symlink to a file outside
         # the theme dir must NOT be read. The nolink chokepoint (O_NOFOLLOW +
@@ -1681,98 +1727,6 @@ class TestServingReadNolink:
             pytest.skip("symlinks unsupported on this platform")
         # The swap happened AFTER resolution; the nolink read must refuse it.
         assert _read_theme_bytes_nolink("mypack", target) is None
-
-
-class TestWindowsGate:
-    """Arbiter item 4: the pack routes traverse hooks' POSIX-only
-    O_NOFOLLOW + fd-real-path chokepoint (no Windows impl), so they honestly
-    501 on Windows instead of 500-ing. The flag is monkeypatched True here;
-    on this (POSIX) host it defaults False, so the rest of the suite exercises
-    the normal path. The editor custom-record CRUD paths are NOT gated."""
-
-    @staticmethod
-    def _req(**match_info: object) -> object:
-        import types
-
-        async def _json() -> dict:
-            return {"source": {"type": "local", "path": "/tmp/does-not-matter"}}
-
-        r = types.SimpleNamespace(match_info=match_info)
-        r.json = _json  # type: ignore[attr-defined]
-        return r
-
-    def test_install_501_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import asyncio
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        resp = asyncio.run(th_mod.api_themes_install(self._req()))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-        assert b"KiroCrew#311" in resp.body
-
-    @pytest.mark.parametrize(
-        "handler,match_info",
-        [
-            ("api_theme_asset", {"slug": "wintheme", "path": "branding/logo.svg"}),
-            ("api_theme_overlay", {"slug": "wintheme", "id": "scanner"}),
-            ("api_theme_topbar", {"slug": "wintheme", "mode": "dark"}),
-        ],
-    )
-    def test_serving_routes_501_on_windows(
-        self, monkeypatch: pytest.MonkeyPatch, handler: str, match_info: dict
-    ) -> None:
-        import asyncio
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        resp = asyncio.run(getattr(th_mod, handler)(self._req(**match_info)))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-
-    def test_delete_installed_dir_501_on_windows(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import asyncio
-        import types
-
-        import kiro_crew.dashboard.theme_validate as tv_mod
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        monkeypatch.setattr(tv_mod, "config_dir", lambda: tmp_path)
-        slug = "wintheme"
-        d = tv_mod._installed_theme_dir(slug)
-        d.mkdir(parents=True)
-        (d / "theme.json").write_text(
-            '{"name": "W", "level": 0, "formatVersion": 1}', encoding="utf-8"
-        )
-        monkeypatch.setattr(th_mod, "_THEMES_WIN_UNSUPPORTED", True)
-        req = types.SimpleNamespace(method="DELETE", match_info={"slug": slug})
-        resp = asyncio.run(th_mod.api_theme_detail(req))
-        assert resp.status == 501
-        assert b"not yet supported on Windows" in resp.body
-        # The gate short-circuits before any rmtree — the dir is untouched.
-        assert d.is_dir()
-
-    def test_flag_false_does_not_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # With the flag False (the POSIX default), install is NOT short-circuited:
-        # it proceeds to parse the body, so invalid JSON yields the normal 400.
-        import asyncio
-        import types
-
-        from kiro_crew.dashboard.handlers import themes as th_mod
-
-        assert th_mod._THEMES_WIN_UNSUPPORTED is False  # POSIX host default
-
-        async def _bad_json() -> dict:
-            raise ValueError("no body")
-
-        req = types.SimpleNamespace(match_info={})
-        req.json = _bad_json  # type: ignore[attr-defined]
-        resp = asyncio.run(th_mod.api_themes_install(req))
-        assert resp.status == 400
 
 
 class TestCssParserCorpus:

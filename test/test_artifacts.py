@@ -20,6 +20,7 @@ from kiro_crew.artifacts import (
     ArtifactValidationError,
     _infer_kind,
     detect_editor_kind,
+    has_unthemed_hardcoded_colors,
     slugify,
 )
 
@@ -33,6 +34,55 @@ def store(tmp_path: Path) -> ArtifactStore:
 
 
 # ── slugify ─────────────────────────────────────────────────────────────────
+
+
+class TestHasUnthemedHardcodedColors:
+    # Direct unit tests for the shared theme-contrast detector — the ONE
+    # place the verdict is computed (the gateway handlers stamp it on
+    # responses; MCP + CLI relay it).
+
+    def test_fires_on_hardcoded_hex(self) -> None:
+        assert has_unthemed_hardcoded_colors("widget", '<div style="color:#111">x</div>')
+
+    def test_fires_on_rgb_function(self) -> None:
+        assert has_unthemed_hardcoded_colors(
+            "html", "<style>body{background:rgb(255,255,255)}</style>"
+        )
+
+    def test_fires_on_uppercase_color_function(self) -> None:
+        # CSS functions are case-insensitive: RGB(...) is as hardcoded as
+        # rgb(...). Locks the IGNORECASE flag.
+        assert has_unthemed_hardcoded_colors("widget", '<div style="color:RGB(1,2,3)">x</div>')
+
+    def test_silent_on_href_fragment_links(self) -> None:
+        # href="#abc" is a fragment link, not a color — including the
+        # whitespace-spaced form (href = "#abc"), which is valid HTML a
+        # fixed-width lookbehind could not exempt. Locks the strip-based
+        # href exclusion.
+        assert not has_unthemed_hardcoded_colors(
+            "widget", '<a href="#abc">jump</a> <a href = "#facade">also</a>'
+        )
+
+    def test_silent_when_theme_vars_present(self) -> None:
+        # The recommended fallback form carries a hex literal AND a
+        # var(--…) reference — theme-aware content must not flag.
+        assert not has_unthemed_hardcoded_colors(
+            "widget", '<div style="color:var(--text,#111);background:var(--bg,#fff)">x</div>'
+        )
+
+    def test_silent_for_non_iframe_kinds(self) -> None:
+        # markdown/text/json/svg render natively (no injected theme
+        # defaults to clash with) — the lint is widget/html only.
+        assert not has_unthemed_hardcoded_colors("markdown", "color: #ff0000")
+
+    def test_silent_on_empty_content(self) -> None:
+        assert not has_unthemed_hardcoded_colors("widget", "")
+
+    def test_hex_shaped_id_selector_at_value_position_is_accepted_noise(self) -> None:
+        # Documented residual: a whitespace-preceded hex-shaped id selector
+        # can fire, because whitespace must stay in the prefix class or true
+        # positives like "border: 1px solid #ccc" are lost. Soft warning only.
+        assert has_unthemed_hardcoded_colors("widget", "<style>border: 1px solid #ccc</style>")
 
 
 class TestSlugify:
@@ -512,6 +562,53 @@ class TestSecurity:
         monkeypatch.setattr(art_mod, "is_sensitive_path", _selective)
         with pytest.raises(ArtifactError):
             store.update("x", content="v3", snapshot=True)
+
+
+class TestSharedLockAcrossInstances:
+    """#2492: two ``ArtifactStore`` instances pointed at the same root must
+    serialize against EACH OTHER, not just against themselves.
+
+    ``__init__`` used to hand out a fresh ``threading.Lock()`` per instance —
+    correct for a single long-lived store, but any code constructing its own
+    ``ArtifactStore()`` against the shared default root (rather than going
+    through :func:`get_default_store`) got an unserialized lock: a concurrent
+    write from that second instance was never mutually exclusive with the
+    singleton's own reads/writes on the same slug, exactly the class of race
+    that can make ``get()`` (no version) observe content mid-write.
+    """
+
+    def test_two_instances_on_the_same_root_share_one_lock(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifacts"
+        a = ArtifactStore(root=root)
+        b = ArtifactStore(root=root)
+        assert a._lock is b._lock
+
+    def test_instances_on_different_roots_do_not_share_a_lock(self, tmp_path: Path) -> None:
+        a = ArtifactStore(root=tmp_path / "artifacts-a")
+        b = ArtifactStore(root=tmp_path / "artifacts-b")
+        assert a._lock is not b._lock
+
+    def test_a_write_through_a_second_instance_is_visible_to_the_first(
+        self, tmp_path: Path
+    ) -> None:
+        """Not just the same lock OBJECT -- an update from a second instance
+        must actually be observable (and mutually exclusive) through the
+        first, which is what the shared lock is for."""
+        root = tmp_path / "artifacts"
+        a = ArtifactStore(root=root)
+        a.create(name="x", content="v1", kind="text")
+        b = ArtifactStore(root=root)
+        b.update("x", content="v2")
+        assert a.get("x").content == "v2"
+
+    def test_resolved_symlinked_root_shares_the_same_lock(self, tmp_path: Path) -> None:
+        real = tmp_path / "real-artifacts"
+        real.mkdir()
+        link = tmp_path / "linked-artifacts"
+        link.symlink_to(real)
+        a = ArtifactStore(root=real)
+        b = ArtifactStore(root=link)
+        assert a._lock is b._lock
 
 
 # ── Tolerant load / persistence ─────────────────────────────────────────────

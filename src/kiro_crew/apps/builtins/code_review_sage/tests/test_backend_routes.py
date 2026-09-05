@@ -42,8 +42,8 @@ from sage_lib.review_driver import _all_delivered  # noqa: E402
 async def _noop_save() -> None:
     """Stand-in for ``routes._save_runs``, which is a coroutine.
 
-    The registry write is offloaded to a worker thread because its owner-only
-    lockdown spawns ``icacls`` on Windows, so a plain ``lambda: None`` stub is
+    The registry write is offloaded to a worker thread because it is blocking
+    file IO (see ``_write_runs``), so a plain ``lambda: None`` stub is
     not awaitable and the patched call site would raise instead of no-op.
     """
 
@@ -146,9 +146,10 @@ class TestRunsPersistence(unittest.TestCase):
         self.assertIn("e5", runs.read_text(encoding="utf-8"))
 
     def test_the_lockdown_never_runs_on_the_event_loop(self):
-        """The owner-only lockdown spawns ``icacls`` on Windows, so persisting the
-        registry must not block the single gateway loop -- a freeze there stalls
-        every chat turn and the liveness heartbeat, not just this write.
+        """Persisting the registry is blocking file IO (the owner-only lockdown
+        itself is now in-process — ``platform_compat``), and it must not run on
+        the single gateway loop -- a stall there delays every chat turn and the
+        liveness heartbeat, not just this write.
 
         Asserted structurally rather than by timing, so it holds regardless of how
         fast the syscall happens to be on this host. The thread is RECORDED and
@@ -171,8 +172,8 @@ class TestRunsPersistence(unittest.TestCase):
         self.assertIn("write", seen, "_write_runs was never reached")
         self.assertNotEqual(
             seen["write"], seen["loop"],
-            "_write_runs ran on the event-loop thread; the icacls spawn inside it "
-            "would freeze the gateway")
+            "_write_runs ran on the event-loop thread; the blocking file IO inside "
+            "it would stall the gateway")
 
 
 class TestRecordReviewedDelivery(unittest.TestCase):
@@ -569,8 +570,9 @@ class TestSettingsModelValidation(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_known_model_accepted(self):
-        known = self.mod._KNOWN_MODELS[0]
-        review = self.mod._write_review_section({"model": known})
+        known = "runtime-only-model"
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=[known]):
+            review = self.mod._write_review_section({"model": known})
         self.assertEqual(review["model"], known)
 
     def test_unknown_model_rejected(self):
@@ -580,9 +582,104 @@ class TestSettingsModelValidation(unittest.TestCase):
             self.mod._write_review_section({"model": "evil-model-9000"})
 
     def test_empty_model_clears_override(self):
-        self.mod._write_review_section({"model": self.mod._KNOWN_MODELS[0]})
-        review = self.mod._write_review_section({"model": None})
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["runtime-only-model"]):
+            self.mod._write_review_section({"model": "runtime-only-model"})
+            review = self.mod._write_review_section({"model": None})
         self.assertIsNone(review["model"])
+
+    def test_repository_binding_must_reference_a_pinned_sage_repo(self):
+        binding = {
+            "namespace_bindings": {
+                "default": {
+                    "scope": "repository",
+                    "repository": {
+                        "provider": "github",
+                        "host": "github.com",
+                        "owner": "acme",
+                        "repository": "service",
+                    },
+                }
+            }
+        }
+        with unittest.mock.patch.object(self.mod.discovery, "read_repos", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "pinned Sage repositories"):
+                self.mod._write_review_section(binding)
+        with unittest.mock.patch.object(
+            self.mod.discovery, "read_repos", return_value=[{"owner": "acme", "repo": "service"}]
+        ):
+            review = self.mod._write_review_section(binding)
+        self.assertEqual(review["namespace_bindings"], binding["namespace_bindings"])
+
+    def test_concurrent_settings_patches_preserve_both_updates(self):
+        entered = threading.Event()
+        release = threading.Event()
+        real_valid = self.mod._valid_model
+
+        def delayed_valid(model: str) -> bool:
+            entered.set()
+            self.assertTrue(release.wait(timeout=2))
+            return real_valid(model)
+
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["runtime-only-model"]), \
+                unittest.mock.patch.object(self.mod, "_valid_model", side_effect=delayed_valid):
+            first = threading.Thread(
+                target=self.mod._write_review_section,
+                args=({"model": "runtime-only-model"},),
+            )
+            second = threading.Thread(
+                target=self.mod._write_review_section,
+                args=({"effort": "low"},),
+            )
+            first.start()
+            self.assertTrue(entered.wait(timeout=2))
+            second.start()
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        review = self.mod._load_review_section()
+        self.assertEqual(review["model"], "runtime-only-model")
+        self.assertEqual(review["effort"], "low")
+
+
+class TestConsolidationWorkerFailures(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+        store.ensure_layout()
+        self.mod._CONSOLIDATE_STATE.clear()
+
+    def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_consolidation_worker_error_is_logged_but_not_returned_to_clients(self):
+        class Pool:
+            async def begin_batch(self):
+                return None
+
+            async def end_batch(self):
+                return None
+
+        with (
+            unittest.mock.patch.object(self.mod.review_pool, "get_pool", return_value=Pool()),
+            unittest.mock.patch.object(
+                self.mod.review_pool,
+                "make_sync_dispatch",
+                return_value=lambda _task: {"ok": False, "error": "spawn /private/token failed"},
+            ),
+        ):
+            asyncio.run(self.mod._consolidate_bg("default", [], []))
+
+        state = self.mod._CONSOLIDATE_STATE["default"]
+        self.assertEqual(state["code"], "worker_failed")
+        self.assertEqual(state["error_code"], "worker_failed")
+        self.assertNotIn("/private/token", state["error"])
 
 
 class TestLearningsEndpoint(unittest.IsolatedAsyncioTestCase):
@@ -632,6 +729,26 @@ class TestLearningsEndpoint(unittest.IsolatedAsyncioTestCase):
         data = json.loads(resp.body)
         self.assertEqual(data["patterns"], [])
         self.assertEqual(data["candidate"], [])
+
+    async def test_archive_action_adopts_legacy_markdown_and_removes_it_from_context(self):
+        pattern = self.learning._normalize_pattern(
+            {"title": "Legacy rule", "scope": "common", "guidance": "Keep it explicit."}
+        )
+        self.learning.common_file().write_text("# Rules\n\n" + self.learning.render_pattern(pattern))
+        record_id = self.learning.list_rule_entries()[0]["record_id"]
+
+        class _Req:
+            match_info = {"action": "archive"}
+
+            async def json(self):
+                return {"namespace": "default", "record_id": record_id}
+
+        with unittest.mock.patch("kiro_crew.sel.sel"):
+            resp = await self.mod._handle_learning_rule_lifecycle(_Req())
+        data = json.loads(resp.body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["record"]["lifecycle"], "archived")
+        self.assertEqual(self.learning.list_patterns_for_review(), [])
 
 
 if __name__ == "__main__":
@@ -2543,8 +2660,8 @@ class TestNoRowFieldIsExemptFromRedaction(unittest.TestCase):
         return report.__file__
 
 
-class TestWholeRunsSerialize:
-    """A second run's body must not start while the first is still reviewing."""
+class TestIndependentRunsUseTheBoundedPool:
+    """Different claimed changes may review concurrently with bound results."""
 
     @pytest.mark.asyncio
     async def test_run_bodies_do_not_overlap(self, monkeypatch, tmp_path):
@@ -2582,22 +2699,17 @@ class TestWholeRunsSerialize:
 
         monkeypatch.setattr(mod.review_pool, "get_pool", lambda: _Pool())
         monkeypatch.setattr(mod.review_pool, "make_sync_dispatch",
-                            lambda loop, pool: (lambda *a, **k: {"ok": True}))
+                            lambda loop, pool, **_kw: (lambda *a, **k: {"ok": True}))
 
         runs = [{"run_id": f"run-{i}"} for i in range(3)]
         await asyncio.gather(*(mod._run_review_bg(r, [f"https://x/pull/{i}"])
                                for i, r in enumerate(runs)))
 
-        assert not overlapped, "two run bodies were inside run_review at once"
+        assert overlapped, "independent run bodies should share the bounded pool"
 
 
-class TestReviewersSerialize:
-    """Reviewers inside one run are serialized.
-
-    Workers share the staging directory and each has file tools, so two live at
-    once lets one write another change's record between that slot being cleared
-    and its own worker writing -- findings attributed to the wrong pull request.
-    """
+class TestReviewersUsePoolConcurrency:
+    """Run-scoped reviewers use the pool after capability-bound adoption."""
 
     @pytest.mark.asyncio
     async def test_one_reviewer_at_a_time(self, monkeypatch, tmp_path):
@@ -2626,14 +2738,14 @@ class TestReviewersSerialize:
 
         monkeypatch.setattr(mod.review_pool, "get_pool", lambda: _Pool())
         monkeypatch.setattr(mod.review_pool, "make_sync_dispatch",
-                            lambda loop, pool: (lambda *a, **k: {"ok": True}))
+                            lambda loop, pool, **_kw: (lambda *a, **k: {"ok": True}))
 
         runs = [{"run_id": f"run-{i}"} for i in range(3)]
         await asyncio.gather(*(mod._run_review_bg(r, [f"https://x/pull/{i}"])
                                for i, r in enumerate(runs)))
 
         assert seen.get("concurrency") == 1, (
-            "the backend must ask for one reviewer at a time; got "
+            "the backend must serialize result attribution; got "
             f"{seen.get('concurrency')!r}")
 
 
@@ -2938,3 +3050,128 @@ class TestFollowupRunLiveAndReentry(unittest.IsolatedAsyncioTestCase):
         data = json.loads((await self.mod._handle_chat_get(
             _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
         self.assertTrue(data["resumable"])
+
+
+class TestFailureStringMapping(unittest.TestCase):
+    """Each skipped_reason renders a DISTINCT, cause-naming sentence.
+
+    "The reviewer found nothing" and "the reviewer never ran" collapsing into one
+    message is the ambiguity that made these failures untriageable — a reader
+    must be able to tell the causes apart from the run-level error alone.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        self.addCleanup(self._restore_home)
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+
+    def _restore_home(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+
+    def _mapped(self, reason: str) -> str:
+        return self.mod._first_change_error(
+            {"per_change": [{"skipped_reason": reason}]})
+
+    def test_every_reason_maps_to_its_own_sentence(self):
+        reasons = ("no_review_recorded", "review_record_incomplete",
+                   "runtime_unavailable", "review_failed")
+        rendered = {reason: self._mapped(reason) for reason in reasons}
+        for reason, text in rendered.items():
+            self.assertNotEqual(text, reason,
+                                f"{reason} passed through unmapped")
+            self.assertTrue(text, f"{reason} rendered empty")
+        self.assertEqual(len(set(rendered.values())), len(reasons),
+                         f"reasons share a sentence: {rendered}")
+
+    def test_never_ran_and_found_nothing_read_apart(self):
+        never_ran = self._mapped("runtime_unavailable")
+        found_nothing = self._mapped("no_review_recorded")
+        self.assertIn("never ran", never_ran)
+        self.assertNotIn("never ran", found_nothing)
+
+    def test_specific_error_text_outranks_the_reason_mapping(self):
+        # A record carrying the preflight's own message (which names the missing
+        # runtime) surfaces that message verbatim rather than the generic map.
+        out = self.mod._first_change_error({"per_change": [{
+            "deep_error": "the reviewer cannot run: no kiro-cli executable was "
+                          "found on this host",
+            "skipped_reason": "runtime_unavailable",
+        }]})
+        self.assertIn("kiro-cli", out)
+
+
+class TestRuntimePreflightWiring(unittest.IsolatedAsyncioTestCase):
+    """The review path checks the runtime BEFORE spawning anything.
+
+    On a host that cannot spawn a reviewer, the run must fail fast with an error
+    naming the missing runtime — the batch is never opened, no session is
+    dispatched, and every change's progress carries the discriminated reason —
+    instead of "completing" and reporting an untriageable "no result record".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        self.addCleanup(self._restore_home)
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+        self.mod._RUNS = []
+
+    def _restore_home(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+
+    async def test_failing_preflight_fails_the_run_without_spawning(self):
+        batch_calls: list[str] = []
+
+        class _FakePool:
+            async def begin_batch(self):
+                batch_calls.append("begin")
+
+            async def end_batch(self):
+                batch_calls.append("end")
+
+        def _refuse_dispatch(loop, pool, **kw):
+            def dispatch(task, timeout=0, **kwargs):
+                raise AssertionError("a session was dispatched despite a "
+                                     "failed runtime preflight")
+            return dispatch
+
+        async def _noop_async(*a, **k):
+            return None
+
+        url = "https://github.com/kirodotdev/KiroCrew/pull/33"
+        run: dict = {"run_id": "rp1", "status": "running", "changes": [url],
+                     "change_ids": [_rd.change_id_for(url)], "progress": {}}
+        self.mod._RUNS = [run]
+        with unittest.mock.patch.object(
+                self.mod.review_pool, "runtime_preflight",
+                lambda: "the reviewer cannot run: no kiro-cli executable was "
+                        "found on this host"), \
+                unittest.mock.patch.object(
+                    self.mod.review_pool, "get_pool", lambda: _FakePool()), \
+                unittest.mock.patch.object(
+                    self.mod.review_pool, "make_sync_dispatch",
+                    _refuse_dispatch), \
+                unittest.mock.patch.object(self.mod, "_save_runs", _noop_async), \
+                unittest.mock.patch.object(
+                    self.mod, "_notify_finished", _noop_async):
+            await self.mod._run_review_bg(run, [url])
+
+        self.assertEqual(batch_calls, [])            # runtime never spawned
+        self.assertEqual(run["status"], "error")
+        self.assertIn("kiro-cli", run["error"])
+        entry = run["progress"][_rd.change_id_for(url)]
+        self.assertEqual(entry["phase"], "failed")
+        self.assertIn("kiro-cli", entry["error"])
+        recs = run["summary"]["per_change"]
+        self.assertEqual(recs[0]["skipped_reason"], "runtime_unavailable")

@@ -34,6 +34,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: src/kiro_crew/__init__.py
+          persist-credentials: false
 
       - name: Compute version
         id: stamp
@@ -117,20 +118,22 @@ jobs:
           echo "Nightly (semver): ${BASE}-nightly.${STAMP_DATE}t${STAMP_TIME}"
           echo "Wheel (PEP 440):  ${BASE}.dev${STAMP_FULL}"
 
-  dependency-vulnerability-gate:
-    name: Production Dependency Vulnerability Gate
-    uses: ./.github/workflows/dependency-vulnerability.yml
+  # The production dependency audit (dependency-vulnerability.yml) is NOT a
+  # nightly gate: it reaches the npm registry, whose slow hours failed the
+  # nightly for hours at a stretch and blocked every build behind it. It runs
+  # before tagged releases only (release.yml), where a vulnerable dependency
+  # would actually ship.
 
   build-wheel:
     name: Build Wheel
-    needs: [version, dependency-vulnerability-gate]
+    needs: [version]
     uses: ./.github/workflows/build-wheel.yml
     with:
       wheel_version: ${{ needs.version.outputs.wheel_version }}
 
   build-desktop:
     name: Build Desktop
-    needs: [version, dependency-vulnerability-gate]
+    needs: [version]
     uses: ./.github/workflows/build-desktop.yml
     with:
       version: ${{ needs.version.outputs.nightly_version }}
@@ -143,7 +146,7 @@ jobs:
   # sign-and-notarize via this caller's result.
   build-windows:
     name: Build Windows Desktop
-    needs: [version, dependency-vulnerability-gate]
+    needs: [version]
     permissions:
       contents: read
       id-token: write
@@ -152,7 +155,11 @@ jobs:
       version: ${{ needs.version.outputs.nightly_version }}
       soft_fail: true
       use_prod_environment: true
-    secrets: inherit
+    # Explicit passthrough, not `secrets: inherit`: the callee declares
+    # the secret it consumes, so this hands over that one and nothing
+    # else. Pinned by test_workflow_permissions.py.
+    secrets:
+      AWS_WINDOWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_WINDOWS_SIGNING_ROLE_ARN }}
 
   # ── CLI channel publish ───────────────────────────────────────────────
   # Publishes the built wheel to the nightly CLI channel (cli/ + latest-cli.json).
@@ -171,7 +178,11 @@ jobs:
       channel: nightly
       version: ${{ needs.version.outputs.nightly_version }}
       wheel_artifact: cli-wheel
-    secrets: inherit
+    # Explicit passthrough, not `secrets: inherit`: the callee declares
+    # the secret it consumes, so this hands over that one and nothing
+    # else. Pinned by test_workflow_permissions.py.
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
 
   # ── Linux desktop publish ─────────────────────────────────────────────
   # Publishes the built AppImages to the distribution CDN (versioned key +
@@ -374,7 +385,14 @@ jobs:
       contents: read
       attestations: write
     uses: ./.github/workflows/sign-and-notarize.yml
-    secrets: inherit
+    # Explicit passthrough, not `secrets: inherit`: the callee declares
+    # the secrets it consumes, so this hands over those and nothing
+    # else. Pinned by test_workflow_permissions.py.
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+      AWS_SIGNING_BUCKET: ${{ secrets.AWS_SIGNING_BUCKET }}
+      AWS_SIGNER_ACCESS_ROLE_ARN: ${{ secrets.AWS_SIGNER_ACCESS_ROLE_ARN }}
+      CDSIGNER_API_ENDPOINT: ${{ secrets.CDSIGNER_API_ENDPOINT }}
     with:
       channel: nightly
       version: ${{ needs.version.outputs.nightly_version }}

@@ -95,6 +95,12 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.taskrunner import TaskRunner
 from kiro_crew.vector_memory import VectorMemoryStore
 
+# NOTE: wheel_engine is imported lazily inside _update_wheel(), not here — it
+# pulls the manifest-verify / crypto path, and `kirocrew gateway` imports this
+# module on the boot path before the dashboard socket binds
+# (no-new-work-on-gateway-boot-path).
+
+
 # Loopback address used for the CLI's OWN requests to the gateway. Deliberately
 # the literal IPv4 address, never the name ``localhost``: on a dual-stack host
 # ``localhost`` may resolve to ``::1`` first, so a different local user who binds
@@ -311,6 +317,67 @@ def _logout(port: int) -> None:
         sys.exit(1)
 
 
+_SHUTDOWN_RESPONSE_MAX_BYTES = 4096
+
+
+def _request_gateway_shutdown(port: int) -> bool:
+    """Request graceful shutdown through the gateway's self-authenticating API.
+
+    This is the safe fallback when the platform listener lookup is available but
+    returns no pid. The request targets a fixed IPv4 loopback URL and presents
+    the per-generation local secret; the handler independently requires both
+    loopback origin and a constant-time secret match before setting the same
+    shutdown event as SIGTERM.
+
+    A stale secret cannot authorize another gateway generation, and no process
+    identity is guessed or signaled on this path. Any missing credential,
+    refusal, malformed response, or transport failure returns ``False`` so the
+    caller retains the existing no-target diagnostic.
+    """
+    secret = run_marker.read_secret(port)
+    if not secret:
+        return False
+    request = urllib.request.Request(
+        f"http://{_CLI_LOOPBACK}:{port}/api/shutdown",
+        method="POST",
+        headers={"X-Local-Secret": secret, "Content-Type": "application/json"},
+        data=b"{}",
+    )
+    try:
+        with loopback_urlopen(request, timeout=5) as response:
+            if int(response.status) != 200:
+                return False
+            raw = response.read(_SHUTDOWN_RESPONSE_MAX_BYTES + 1)
+            if len(raw) > _SHUTDOWN_RESPONSE_MAX_BYTES:
+                return False
+            payload = json.loads(raw)
+    except (
+        http.client.HTTPException,
+        OSError,
+        RecursionError,
+        UnicodeError,
+        ValueError,
+        urllib.error.URLError,
+    ):
+        return False
+    return bool(isinstance(payload, dict) and payload.get("ok") and payload.get("shutting_down"))
+
+
+def _report_authenticated_shutdown(port: int) -> bool:
+    """Request, audit, and report an authenticated graceful shutdown."""
+    if not _request_gateway_shutdown(port):
+        return False
+    sel().log_api_access(
+        caller="cli",
+        operation="gateway_stop",
+        outcome="allowed",
+        source="cli",
+        resources=f"port={port} via=api reason=listener_lookup_empty",
+    )
+    print(f"✅ Requested graceful shutdown from gateway on port {port}.")
+    return True
+
+
 def _stop(cli_port: int | None = None) -> None:
     """Stop a running KiroCrew gateway.
 
@@ -374,6 +441,8 @@ def _stop(cli_port: int | None = None) -> None:
                     f"port {port}. Install {_tool} and retry."
                 )
             sys.exit(1)
+        if _report_authenticated_shutdown(port):
+            return
         sel().log_api_access(
             caller="cli",
             operation="gateway_stop",
@@ -819,7 +888,12 @@ def _restart(cli_port: int | None = None) -> None:
 
     1. If a systemd/launchd service is active AND the caller did not
        explicitly request a specific port, ask the platform to restart
-       it (``systemctl restart`` / ``launchctl unload + load``).
+       it (``systemctl restart`` / ``launchctl kickstart -k``). When the
+       service manager REFUSES that restart while the unit is still active
+       (system-scope unit, unprivileged caller / polkit denial), fail loudly
+       naming the privileged command the operator must run — never fall
+       through to the listener path, which cannot see a service gateway
+       bound to a unix socket and would misreport the outcome.
     2. Otherwise, SIGTERM the foreground gateway via the existing
        lsof+SIGTERM path used by ``kirocrew stop``, then spawn a
        detached replacement and **verify it is serving** before reporting
@@ -833,17 +907,47 @@ def _restart(cli_port: int | None = None) -> None:
     short-circuiting through it would target the wrong gateway.
     """
     port = resolve_client_port(cli_port)
-    if cli_port is None and service_controller.restart_service():
-        sel().log_api_access(
-            caller="cli",
-            operation="gateway_restart",
-            outcome="allowed",
-            source="cli",
-            resources=f"port={port} via=service",
-        )
-        print("✅ Restarted kirocrew service.")
-        _print_token_url(port)
-        return
+    if cli_port is None:
+        if service_controller.restart_service():
+            sel().log_api_access(
+                caller="cli",
+                operation="gateway_restart",
+                outcome="allowed",
+                source="cli",
+                resources=f"port={port} via=service",
+            )
+            print("✅ Restarted kirocrew service.")
+            _print_token_url(port)
+            return
+        if service_controller.is_service_active():
+            # The service manager refused the restart while the unit is active
+            # RIGHT NOW — the system-scope unit needs root/polkit privileges
+            # this process does not have ("Interactive authentication
+            # required"). Falling through to the listener path would be worse
+            # than failing: on a unix-socket deployment nothing listens on TCP,
+            # so the fallback finds nothing to stop, spawns a competitor the
+            # KIROCREW_HOME lock refuses, and the original gateway keeps
+            # running while the command's outcome reads like a restart. Name
+            # the privileged command the operator must run instead. The
+            # active-check runs AFTER the refused restart so a service that
+            # merely stopped in between still falls through below.
+            hint = service_controller.manual_restart_hint()
+            sel().log_api_access(
+                caller="cli",
+                operation="gateway_restart",
+                outcome="denied",
+                source="cli",
+                resources=f"port={port} via=service reason=service_restart_denied",
+            )
+            print(
+                "❌ A kirocrew service is installed and running, but the service "
+                "manager refused to restart it.\n"
+                "   This process lacks the privileges the service's scope "
+                "requires — the gateway was NOT restarted.\n"
+                "   Run the restart yourself:\n"
+                f"       {hint}"
+            )
+            sys.exit(1)
 
     # No service active — bounce the foreground gateway and detach a fresh one.
     # Reuse _stop() for the SIGTERM path so behavior stays in sync if _stop
@@ -872,6 +976,7 @@ def _restart(cli_port: int | None = None) -> None:
     prior_marker_pid = run_marker.read_pid(port)
     listeners = platform_compat.find_listening_pids(port)
     incumbents = [p for p in listeners if _is_kirocrew_process(p)]
+    wait_for_incumbents = False
     if listeners or not platform_compat.listening_pid_tool_available():
         # TOCTOU: the gateway can exit between the check above and _stop()'s own
         # lookup. _stop() raises SystemExit(1) when it finds nothing — for restart
@@ -882,7 +987,24 @@ def _restart(cli_port: int | None = None) -> None:
             _stop(cli_port)
         except SystemExit:
             pass
+        wait_for_incumbents = True
+    elif _report_authenticated_shutdown(port):
+        sel().log_api_access(
+            caller="cli",
+            operation="gateway_restart",
+            outcome="denied",
+            source="cli",
+            resources=f"port={port} reason=shutdown_ack_listener_lookup_blind",
+        )
+        print(
+            f"❌ Gateway accepted graceful shutdown on port {port}, but listener PID "
+            "lookup is unavailable. Not starting a replacement because safe lock "
+            "release cannot be proven.\n   Wait for shutdown to finish, then run: "
+            "kirocrew restart"
+        )
+        sys.exit(1)
 
+    if wait_for_incumbents:
         alive = _wait_for_pids_exit(incumbents, _RESTART_STOP_TIMEOUT)
         if alive:
             # Refuse rather than spawn a replacement that the lock would reject.
@@ -1351,6 +1473,11 @@ def _update_wheel(layout) -> None:
         release_channel,
         wheel_update_command,
     )
+    from kiro_crew.platform.wheel_engine import (
+        WheelUpdateError,
+        apply_wheel_update,
+        running_from_managed_venv,
+    )
 
     channel = release_channel()
     feed_base, artifact_base = cdn_bases()
@@ -1431,6 +1558,52 @@ def _update_wheel(layout) -> None:
         print("\n✅ Already on the latest version!")
         return
 
+    # The managed-venv shape takes the shadow path: the new version is built
+    # into a fresh sibling tree while this install keeps working, verified,
+    # then promoted atomically. The running gateway is never overwritten in
+    # place — its restart picks the new tree up through the stable link. Every
+    # other shape (pipx, a bare venv the operator manages) keeps the
+    # installer re-run, whose behavior is owned by cli.sh.
+    if running_from_managed_venv():
+        print("\n  🔄 Building the new version beside the current one…")
+        try:
+            promoted = apply_wheel_update(
+                channel=channel,
+                feed_base=feed_base,
+                artifact_base=artifact_base,
+                expected_version=remote_version,
+                progress=lambda msg: print(f"     {msg}"),
+            )
+        except (WheelUpdateError, OSError) as e:
+            # The engine wraps its own I/O failures in WheelUpdateError, but
+            # staging-filesystem errors raised outside those conversion sites
+            # (a full or unwritable disk at mkdir/tempdir time) surface as raw
+            # OSError — both take the same operator-facing failure path
+            # instead of a traceback.
+            # Failure text can quote the URL it tried, and the fallback
+            # installer command embeds the CDN base — either may carry
+            # credentials (a token-bearing KIROCREW_CDN_BASE), and this
+            # print lands in terminal history/scrollback. Same redaction
+            # pair the dashboard update surface applies before showing
+            # failure text.
+            from kiro_crew.security import (
+                redact_credentials,
+                redact_exfiltration_urls,
+            )
+
+            msg, _ = redact_credentials(str(e))
+            msg, _ = redact_exfiltration_urls(msg)
+            fallback, _ = redact_credentials(wheel_update_command(channel))
+            print(f"\n  ❌ {msg}")
+            print("  The current install was not modified. To update by")
+            print("  re-running the installer instead:")
+            print(f"    {fallback}")
+            sys.exit(1)
+        print(f"\n✅ Kiro Crew {remote_version} installed at {promoted}")
+        print("\n  Restart the gateway to switch to it:")
+        print("    kirocrew restart")
+        return
+
     # Run the installer
     cmd = wheel_update_command(channel)
     print("\n  🔄 Running installer…")
@@ -1467,6 +1640,67 @@ def _update_wheel(layout) -> None:
     print(f"\n✅ Kiro Crew updated to {remote_version}!")
     print("\n  Restart the gateway to use the new version:")
     print("    kirocrew restart")
+
+
+def _update_approve() -> None:
+    """Approve a pending in-app update armed from the dashboard (RFC OQ7).
+
+    The proof of host identity is READING THE NONCE FILE: it lives in the data
+    home with owner-only permissions, so presenting its nonce back to the
+    gateway demonstrates filesystem access as the gateway's own user — the
+    step a remote dashboard bearer cannot perform. The gateway then runs the
+    shadow apply itself and restarts; progress lands on the dashboard's
+    update overlay.
+    """
+    from kiro_crew.platform.update_stepup import read_pending
+
+    print("👻 Approving the pending in-app update…\n")
+    pending = read_pending()
+    if pending is None:
+        print("❌ No armed update request (it may have expired).")
+        print("   Arm one from the dashboard's About panel first, then re-run this.")
+        sys.exit(1)
+    print(f"  📦 v{pending.version} ({pending.channel} channel), expires in {pending.expires_in}s")
+
+    port = resolve_client_port(None)
+    url = f"http://127.0.0.1:{port}/api/update/approve"
+    payload = json.dumps({"nonce": pending.nonce}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    # The local secret authenticates this CLI to a token-auth-enabled gateway.
+    # X-Internal-Secret is the header the middleware's internal-route branch
+    # validates (X-Local-Secret is a different, route-specific mechanism used
+    # by /api/token/local). Reading the secret is itself host-local evidence,
+    # the same class as the nonce file. An absent secret still works on a
+    # default loopback install where no token auth runs.
+    secret = read_local_secret(port)
+    if secret:
+        headers["X-Internal-Secret"] = secret
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    # Prefer the gateway's unix socket: it kernel-verifies the caller
+    # (SO_PEERCRED), so the approval works on a token-auth-enabled install
+    # without this CLI ever holding a dashboard token. TCP loopback is the
+    # fallback for hosts without the socket.
+    try:
+        from kiro_crew.dashboard.urls import dashboard_socket_path
+
+        socket_path: str | None = str(dashboard_socket_path(port))
+    except Exception:
+        socket_path = None
+    try:
+        with loopback_urlopen(req, timeout=15, unix_socket_path=socket_path) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("error", "")
+        except Exception:
+            detail = ""
+        print(f"❌ Gateway refused the approval (HTTP {e.code})" + (f": {detail}" if detail else ""))
+        sys.exit(1)
+    except (urllib.error.URLError, OSError):
+        print("❌ Gateway is not running — start it, or update directly with: kirocrew update")
+        sys.exit(1)
+    print(f"\n✅ Approved. The gateway is applying v{body.get('version', pending.version)}")
+    print("   and will restart itself; watch progress in the dashboard.")
 
 
 def _status(args: argparse.Namespace) -> None:
@@ -1536,6 +1770,7 @@ async def _gateway(
     *,
     no_dashboard: bool = False,
     no_crons: bool = False,
+    no_tunnel: bool = False,
     no_open: bool = False,
     port_override: str | None = None,
     json_ready: bool = False,
@@ -1595,6 +1830,7 @@ async def _gateway(
         cfg,
         no_dashboard=no_dashboard,
         no_crons=no_crons,
+        no_tunnel=no_tunnel,
         no_open=no_open,
         port_override=port_override,
         json_ready=json_ready,
@@ -1632,8 +1868,9 @@ async def _run_task(args: argparse.Namespace) -> None:
         embedding_dim=cfg.memory.embedding_dim,
         decay_rates=cfg.memory.decay_rates or None,
     )
-    # CALLER CONTRACT (vector_memory.py): async callers offload init() — the
-    # Windows path shells out to icacls and would freeze the loop for seconds.
+    # CALLER CONTRACT (vector_memory.py): async callers offload init() — it is
+    # blocking file IO end to end (sqlite connect, migrations, lockdown pass)
+    # and would stall the loop.
     await asyncio.to_thread(vector_memory.init)
     # Embeddings are always-on: wire the factory; bind embed_fn when the model
     # is already present. Deliberately NO download kick here — `kirocrew run`

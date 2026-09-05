@@ -13,6 +13,7 @@ from chat_test_helpers import _make_ready_kiro_prerequisite
 
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat import _run_chat
+from kiro_crew.dashboard.handlers.sessions import api_approval_resolve
 from kiro_crew.dashboard.state import (
     REFUSAL_RECOVERY_PREFIX,
     DashboardState,
@@ -25,6 +26,8 @@ from kiro_crew.hooks import HOOK_EVENT_PRE_TOOL_USE, ToolHookResult
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
+    EVENT_TEXT_CHUNK,
+    EVENT_THINKING_CHUNK,
     LLMEvent,
 )
 
@@ -529,6 +532,81 @@ class TestApprovalModes:
         ), msgs
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,result_kwargs",
+        [
+            # asyncio.TimeoutError branch of run_script_hook: no exit_code is set,
+            # so the dataclass default (-1) stands and `error` carries the reason.
+            (
+                "timeout",
+                {"exit_code": -1, "error": "Timed out after 3s", "stderr": "", "stdout": ""},
+            ),
+            # Generic exception branch: same shape, exception text on `error`.
+            (
+                "crash",
+                {"exit_code": -1, "error": "boom", "stderr": "", "stdout": ""},
+            ),
+            # /bin/sh could not exec the hook command at all.
+            (
+                "missing binary",
+                {"exit_code": 127, "error": "", "stderr": "", "stdout": ""},
+            ),
+        ],
+    )
+    async def test_auto_approve_blocked_when_pretooluse_hook_delivers_no_verdict(
+        self, tmp_path, label, result_kwargs
+    ):
+        """A PreToolUse hook that cannot render a verdict must fail CLOSED.
+
+        Timeout, crash, and missing-binary all leave an exit code that is neither
+        0 nor 2. Treating those as "no opinion" means slowing, breaking, or
+        deleting a deny hook silently disables the policy it enforces, so the
+        auto-approve path must reject the tool instead of proceeding.
+        """
+        cb = _context_builder(ToolHookResult.auto_approve())
+        hook_store = _make_hook_store()
+        hook_store.fire = AsyncMock(
+            return_value=[MagicMock(hook_name="policy-gate", **result_kwargs)]
+        )
+        state, client = _make_state(tmp_path, context_builder=cb, hook_store=hook_store)
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        client.reject_tool.assert_called_once()
+        client.approve_tool.assert_not_called()
+        msgs = _tool_messages(slot)
+        assert any(
+            "hook blocked" in m.get("content", "").lower() for m in msgs
+        ), (label, msgs)
+
+    @pytest.mark.asyncio
+    async def test_auto_approve_allowed_when_pretooluse_hook_exits_zero(self, tmp_path):
+        """Exit 0 is a delivered "allow" verdict and must still approve.
+
+        Pins the fail-closed branch to non-0/2 exits only, so a healthy hook that
+        approves silently is not caught by it.
+        """
+        cb = _context_builder(ToolHookResult.auto_approve())
+        hook_store = _make_hook_store()
+        hook_store.fire = AsyncMock(
+            return_value=[
+                MagicMock(exit_code=0, stdout="", stderr="", error="", hook_name="policy-gate")
+            ]
+        )
+        state, client = _make_state(tmp_path, context_builder=cb, hook_store=hook_store)
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        client.approve_tool.assert_called_once()
+        client.reject_tool.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_auto_approve_deny_by_default_on_unexpected_hook_output(self, tmp_path):
         """Non-list/None hook return must reject the tool (deny-by-default)."""
         cb = _context_builder(ToolHookResult.auto_approve())
@@ -780,6 +858,238 @@ class TestBatchRejection:
         assert slot._batch_rejected is False
 
 
+class TestDenialCascadeLifetime:
+    """The batch-rejection suppression must not outlive the group it belongs to.
+
+    Issue #7681: ``_batch_rejected`` was only cleared in the turn runner's
+    ``finally``, so it lived for the whole TURN. A user who denied one call had
+    every later call in that turn auto-denied without ever being shown a card —
+    breaking deny → discuss → agent revises → agent retries, and reporting the
+    phantom denial to the model as "User denied tool execution".
+    """
+
+    @pytest.mark.parametrize("resume_kind", [EVENT_TEXT_CHUNK, EVENT_THINKING_CHUNK])
+    @pytest.mark.asyncio
+    async def test_later_sequential_call_is_evaluated_independently(
+        self, tmp_path, resume_kind
+    ):
+        """Call N+1 gets its own prompt once the model resumed after N was denied."""
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        denied = _permission_event(title="tool_a")
+        denied.request_id = "req-1"
+        denied.tool_call_id = "tc-1"
+        # Model-authored output between the two calls: the denied group is over
+        # and req-2 is a NEW decision, not a remaining member of that group.
+        resumed = LLMEvent(kind=resume_kind, text="Understood - trying a different edit.")
+        revised = _permission_event(title="tool_b")
+        revised.request_id = "req-2"
+        revised.tool_call_id = "tc-2"
+        _set_stream(client, [denied, resumed, revised, _complete_event()])
+
+        async def _answer_both() -> None:
+            await _answer_approval(slot, "req-1", "rejected")
+            await _answer_approval(slot, "req-2", "approved")
+
+        answerer = asyncio.get_event_loop().create_task(_answer_both())
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+        await _drain(answerer)
+
+        # The denial itself still denies.
+        client.reject_tool.assert_any_call("req-1")
+        # The revised call was PROMPTED and could be approved — never swallowed.
+        client.approve_tool.assert_any_call("req-2")
+        assert ("req-2",) not in [c.args for c in client.reject_tool.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_same_group_still_cascades_after_the_fix(self, tmp_path):
+        """No model output between the calls → the remaining member stays denied.
+
+        Pins the blast-radius reduction as a LIFETIME change only: suppression
+        of the group the user actually refused is preserved.
+        """
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        evt1 = _permission_event(title="tool_a")
+        evt1.request_id = "req-1"
+        evt1.tool_call_id = "tc-1"
+        evt2 = _permission_event(title="tool_b")
+        evt2.request_id = "req-2"
+        evt2.tool_call_id = "tc-2"
+        _set_stream(client, [evt1, evt2, _complete_event()])
+
+        async def _reject_first() -> None:
+            await _answer_approval(slot, "req-1", "rejected")
+
+        rejecter = asyncio.get_event_loop().create_task(_reject_first())
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+        await _drain(rejecter)
+
+        client.reject_tool.assert_any_call("req-1")
+        client.reject_tool.assert_any_call("req-2")
+        client.approve_tool.assert_not_called()
+
+
+class TestDenyOnce:
+    """Verify 'rejected_once' denies a single tool without cascading."""
+
+    @pytest.mark.asyncio
+    async def test_deny_once_rejects_tool_but_does_not_cascade(self, tmp_path):
+        """reject_once rejects the first tool but lets the second get its own prompt."""
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        evt1 = _permission_event(title="tool_a")
+        evt1.request_id = "req-1"
+        evt1.tool_call_id = "tc-1"
+        evt2 = _permission_event(title="tool_b")
+        evt2.request_id = "req-2"
+        evt2.tool_call_id = "tc-2"
+        _set_stream(client, [evt1, evt2, _complete_event()])
+
+        async def _answer_both() -> None:
+            await _answer_approval(slot, "req-1", "rejected_once")
+            await _answer_approval(slot, "req-2", "approved")
+
+        answerer = asyncio.get_event_loop().create_task(_answer_both())
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+        await _drain(answerer)
+
+        # First tool rejected, second approved
+        client.reject_tool.assert_any_call("req-1")
+        client.approve_tool.assert_any_call("req-2")
+        # Batch rejection flag must NOT be set
+        assert slot._batch_rejected is False
+
+    @pytest.mark.asyncio
+    async def test_decision_override_reaches_slot_future(self, tmp_path):
+        """``rejected_once=True`` is what the slot future receives, not "rejected"."""
+        state, _ = _make_state(tmp_path)
+        slot = _make_slot()
+        state._slots[slot.key] = slot
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        slot._approval_futures["req-once"] = fut
+
+        assert state.resolve_approval("req-once", False, rejected_once=True) is True
+        assert fut.result() == "rejected_once"
+
+    @pytest.mark.asyncio
+    async def test_both_audit_event_types_agree_on_the_denial(self, tmp_path):
+        """The `approval_decision` event records the token too, not just `rejected`.
+
+        `log_tool_invocation` already distinguishes the two denials on the tool
+        event. If this second event type flattened both to "rejected", the audit
+        trail would distinguish them in one place and not the other, which
+        distinguishes nothing.
+        """
+        state, _ = _make_state(tmp_path)
+        slot = _make_slot()
+        state._slots[slot.key] = slot
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        slot._approval_futures["req-audit"] = fut
+
+        with patch("kiro_crew.dashboard.state.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            state.resolve_approval("req-audit", False, rejected_once=True)
+            outcomes = [
+                c.kwargs.get("outcome")
+                for c in mock_sel.return_value.log_tool_invocation.call_args_list
+                if c.kwargs.get("tool_name") == "approval_decision"
+            ]
+        assert outcomes == ["rejected_once"]
+
+    @pytest.mark.asyncio
+    async def test_state_level_override_drop_is_logged_not_silent(self, tmp_path):
+        """A state-level future cannot carry the token, so the drop must be audible.
+
+        State futures take priority by design (id-collision safety), and they
+        hold a bool — so an override addressed at one is discarded. Harmless
+        today (a background approval has no batch to cascade to), but silence is
+        what makes the next decision token repeat the discovery.
+        """
+        state, _ = _make_state(tmp_path)
+        slot = _make_slot()
+        state._slots[slot.key] = slot
+
+        loop = asyncio.get_running_loop()
+        state_fut: asyncio.Future[bool] = loop.create_future()
+        state._approval_futures["req-bg"] = state_fut
+
+        with patch.object(state, "_log") as log:
+            assert (
+                state.resolve_approval("req-bg", False, rejected_once=True) is True
+            )
+        assert state_fut.result() is False
+        assert log.warning.called
+        assert "rejected_once" in repr(log.warning.call_args)
+
+    @pytest.mark.asyncio
+    async def test_api_reject_once_maps_to_decision_override(self):
+        """The HTTP seam: ``reject_once`` is a valid action and sets the flag.
+
+        Pinned at the handler, not in redux: a frontend-only test passes even when
+        the action never reaches ``resolve_approval``, leaving Deny once wired to
+        the plain batch reject in production.
+        """
+        state = MagicMock()
+        state.resolve_approval.return_value = True
+
+        async def _call(action: str):
+            request = MagicMock()
+            request.app = {"state": state}
+            request.match_info = {"id": "req-9", "action": action}
+            return await api_approval_resolve(request)
+
+        assert (await _call("reject_once")).status == 200
+        assert state.resolve_approval.call_args.args == ("req-9", False)
+        assert state.resolve_approval.call_args.kwargs["rejected_once"] is True
+
+        # Plain reject must keep the cascading behavior (no override).
+        assert (await _call("reject")).status == 200
+        assert state.resolve_approval.call_args.kwargs["rejected_once"] is False
+
+        # Unknown actions are still refused.
+        assert (await _call("reject_twice")).status == 400
+
+    @pytest.mark.asyncio
+    async def test_deny_once_is_distinguishable_in_the_audit_log(self, tmp_path):
+        """SEL records ``rejected_once``.
+
+        A hard-coded ``"rejected"`` would make a single-tool denial and a
+        whole-batch denial identical in the audit trail, which is the one place
+        the distinction has to survive.
+        """
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        evt = _permission_event(title="tool_a")
+        evt.request_id = "req-1"
+        _set_stream(client, [evt, _complete_event()])
+
+        answerer = asyncio.get_event_loop().create_task(
+            _answer_approval(slot, "req-1", "rejected_once")
+        )
+        with patch("kiro_crew.dashboard.chat_runner.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            with _patch_stats():
+                await _run_chat(state, slot, "hello")
+            await _drain(answerer)
+            outcomes = [
+                c.kwargs.get("outcome")
+                for c in mock_sel.return_value.log_tool_invocation.call_args_list
+                if c.kwargs.get("tool_name") == "tool_a"
+            ]
+        assert outcomes == ["rejected_once"]
+
+
 class TestToolCompletionTracking:
     """Verify tool completion state tracking."""
 
@@ -953,6 +1263,117 @@ class TestRefusalRecovery:
         client.reject_tool.assert_called()
 
     @pytest.mark.asyncio
+    async def test_deny_after_an_answer_injects_awareness_not_a_redo(self, tmp_path):
+        """A denied call followed by a real answer must not ask for a resume.
+
+        The regression this pins: the turn answered the user's question despite
+        the block, then the continuation told it to "continue the task where you
+        left off" — so it answered the same question again, at full turn cost,
+        once per blocked call.
+        """
+        cb = _context_builder(
+            ToolHookResult.deny("Blocked by security policy: git push")
+        )
+        state, client = _make_state(tmp_path, context_builder=cb)
+        slot = _make_slot()
+        client.context_usage_pct = MagicMock(return_value=0.0)
+        client._client = client
+        client.last_prompt_stats = None
+
+        calls = {"n": 0}
+
+        def _stream(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Blocked, then the model answers anyway from what it already had.
+                return _async_iter(
+                    [
+                        _permission_event(),
+                        LLMEvent(kind=EVENT_TEXT_CHUNK, text="Here is the answer."),
+                        _complete_event(),
+                    ]
+                )
+            return _async_iter([_complete_event()])
+
+        client.stream = MagicMock(side_effect=_stream)
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+            if slot.task:
+                await slot.task
+
+        recovery = [
+            m["content"]
+            for m in slot.messages
+            if m.get("role") == "inject"
+            and m.get("content", "").startswith(REFUSAL_RECOVERY_PREFIX)
+        ]
+        assert recovery, "the block reason must still reach the model"
+        body = recovery[-1]
+        # Awareness is kept …
+        assert "security policy: git push" in body.lower()
+        assert "NOT a user action" in body
+        # … the redo instruction is not.
+        assert "continue the task where you left off" not in body
+        assert "Do NOT repeat" in body
+
+    @pytest.mark.asyncio
+    async def test_answer_before_the_block_also_gets_awareness_not_a_redo(self, tmp_path):
+        """The answer-THEN-block ordering must reach the same awareness body.
+
+        The sibling above covers block-then-answer, where the answer is still in
+        ``assistant_text`` at end of turn. Here the model answers FIRST and then
+        calls the blocked tool, and the tool boundary flushes that answer out of
+        ``assistant_text`` — so the end-of-turn buffer is empty even though the
+        user has already read the answer on screen. Keying the body on that buffer
+        alone sent the resume instruction for this ordering, which is the same
+        duplicate answer at full turn cost (GPT round on #8275).
+        """
+        cb = _context_builder(
+            ToolHookResult.deny("Blocked by security policy: git push")
+        )
+        state, client = _make_state(tmp_path, context_builder=cb)
+        slot = _make_slot()
+        client.context_usage_pct = MagicMock(return_value=0.0)
+        client._client = client
+        client.last_prompt_stats = None
+
+        calls = {"n": 0}
+
+        def _stream(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # The answer lands first; the blocked call ends the turn after it.
+                return _async_iter(
+                    [
+                        LLMEvent(kind=EVENT_TEXT_CHUNK, text="Here is the answer."),
+                        _permission_event(),
+                        _complete_event(),
+                    ]
+                )
+            return _async_iter([_complete_event()])
+
+        client.stream = MagicMock(side_effect=_stream)
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+            if slot.task:
+                await slot.task
+
+        recovery = [
+            m["content"]
+            for m in slot.messages
+            if m.get("role") == "inject"
+            and m.get("content", "").startswith(REFUSAL_RECOVERY_PREFIX)
+        ]
+        assert recovery, "the block reason must still reach the model"
+        body = recovery[-1]
+        assert "security policy: git push" in body.lower()
+        assert "NOT a user action" in body
+        assert "continue the task where you left off" not in body
+        assert "Do NOT repeat" in body
+
+    @pytest.mark.asyncio
     async def test_clean_turn_does_not_enqueue_recovery(self, tmp_path):
         """An auto-approved tool with no refusal must not trigger recovery."""
         cb = _context_builder(ToolHookResult.auto_approve())
@@ -1006,6 +1427,43 @@ class TestBuildRefusalRecoveryPrompt:
         # The caller prepends REFUSAL_RECOVERY_PREFIX; the body must not.
         out = build_refusal_recovery_prompt([("bash", "reason")])
         assert REFUSAL_RECOVERY_PREFIX not in out
+
+    def test_answered_turn_gets_awareness_body_not_a_continuation(self):
+        """A turn that already answered must not be told to resume the task.
+
+        Same reasons, same remediation — but "continue the task where you left
+        off" is what made the model re-answer a question the user had already
+        read, once per blocked call.
+        """
+        out = build_refusal_recovery_prompt(
+            [("bash", "command accesses sensitive credential path")], answered=True
+        )
+        # The reason still reaches the model: on a backend without mid-turn steer
+        # this turn is the only channel for it.
+        assert "bash" in out
+        assert "sensitive credential path" in out
+        assert "NOT a user action" in out
+        # …but the premise flips from "ended the turn early" to awareness-only.
+        assert "ended the turn early" not in out
+        assert "this note is for awareness" in out
+        assert "continue the task where you left off" not in out
+        assert "Do NOT repeat" in out
+
+    def test_unanswered_turn_keeps_the_continuation_body(self):
+        out = build_refusal_recovery_prompt([("bash", "reason")], answered=False)
+        assert "ended the turn early" in out
+        assert "continue the task where you left off" in out
+        assert "this note is for awareness" not in out
+
+    def test_answered_keeps_per_class_remediation(self):
+        # The awareness variant drops the resume instruction, not the guidance:
+        # "how to do this properly" is the awareness the user is owed.
+        reason = "Blocked by security policy: cat ~/.aws/credentials"
+        assert build_refusal_recovery_prompt(
+            [("Running: cat creds", reason)], answered=True
+        ).count("How to do this properly:") == build_refusal_recovery_prompt(
+            [("Running: cat creds", reason)]
+        ).count("How to do this properly:")
 
 
 class TestPendingProjectReset:
@@ -1495,7 +1953,20 @@ class TestDenyRowTitleRedaction:
         state, client = _make_state(tmp_path)
         slot = _make_slot()
         slot._trust_reads = True
-        with patch("kiro_crew.dashboard.chat_runner.sel") as mock_sel:
+        # The name-grant check is stubbed to "no refusal" so this test keeps
+        # measuring what its name claims -- that the trust-reads DENY row and its
+        # SEL record are redacted -- rather than the host's PATH semantics. It
+        # reaches the tier with `ls`, which resolves to a trusted system program on
+        # POSIX but does not exist on Windows, where the check therefore declines
+        # the tier outright, the request falls through to the interactive card, and
+        # the `trust_reads` deny asserted below never happens. Patching the ONE
+        # off-loop entry point every tier goes through is the same seam
+        # `test_chat_runner_coverage.py` uses; the check itself is covered directly
+        # in `test/test_name_grant.py`.
+        _no_refusal = patch.object(
+            chat_runner, "_name_grant_refusal_off_loop", new=AsyncMock(return_value=None)
+        )
+        with patch("kiro_crew.dashboard.chat_runner.sel") as mock_sel, _no_refusal:
             audit = MagicMock()
             mock_sel.return_value = audit
             await _drive_deny_turn(

@@ -60,8 +60,18 @@ from kiro_crew.apps.manager import (
     set_app_provenance,
     update_app,
 )
-from kiro_crew.apps.manifest import AppManifest
-from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
+from kiro_crew.apps.manifest import (
+    RESERVED_APP_NAME_CODE,
+    AppManifest,
+    app_name_error,
+    is_reserved_app_name,
+)
+from kiro_crew.sandbox import (
+    cgroup_scope_argv,
+    create_subprocess_limited,
+    wrap_argv,
+    wrap_argv_async,
+)
 from kiro_crew.sel import sel
 
 try:
@@ -1530,7 +1540,9 @@ async def _fetch_app_manifest(
                 git_url,
                 tmp_root,
             ]
-            sandboxed_cmd, _cleanup = wrap_argv(clone_cmd, mode=sandbox_mode)
+            sandboxed_cmd, _cleanup = await wrap_argv_async(
+                clone_cmd, mode=sandbox_mode, _prepare=wrap_argv
+            )
             sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             transport_env = _git_transport_env(credential_target, git_url, clone_env)
             proc = await create_subprocess_limited(
@@ -2204,6 +2216,7 @@ async def _resolve_manifest(entry: dict[str, Any]) -> dict[str, Any]:
 # manifest says otherwise. Install-status and trust fields are also absent —
 # ``_enrich_with_install_status`` and ``_apply_trust_fields`` run after this
 # and stamp them server-side.
+
 _REGISTRY_ROW_KEYS: frozenset[str] = frozenset(
     {
         "name",
@@ -2224,6 +2237,12 @@ _REGISTRY_ROW_KEYS: frozenset[str] = frozenset(
         "detectInstalled",
         "managed",
         "featured",
+        # GitHub star count baked into the row by the publisher (git-type
+        # third-party apps only). Reader: the frontend App Store list/detail
+        # display. Display-only — ``_apply_trust_fields`` sanitizes it to a
+        # non-negative int on EVERY row (the allowlist is not the only exit:
+        # a failed manifest fetch passes the row through unchanged).
+        "stargazersCount",
         "_registry",
         "_index_author",
     }
@@ -2521,12 +2540,33 @@ def _apply_trust_fields(
         if isinstance(registry_name, str):
             entry["_registry"] = _strip_git_target_userinfo(registry_name)
 
+        # ``stargazersCount`` is a trust cue, so it follows the ``featured``
+        # precedent below: only the publisher's bake step may mint it, and an
+        # external index can never self-report one (a fabricated ``★ 50K`` on
+        # a hostile git app would render identically to a signed-catalog
+        # count — a false trust cue is worse than none). The shape check
+        # still runs on EVERY row because this function is the only boundary
+        # every row crosses (``_resolve_manifest`` returns the row unchanged
+        # when the manifest fetch fails, so the allowlist projection is not a
+        # guaranteed exit). ``bool`` is excluded (it IS an int subclass), and
+        # the JS safe-integer bound is a layout guard: Python accepts a
+        # 309-digit int that JavaScript renders as hundreds of digits.
+        stars = entry.get("stargazersCount")
+        if (
+            not isinstance(stars, int)
+            or isinstance(stars, bool)
+            or stars < 0
+            or stars > official_catalog._STARS_MAX
+        ):
+            entry.pop("stargazersCount", None)
+
         index_author = entry.pop("_index_author", None)
         folded_author = _fold_author(index_author)
         if entry.get("_registry"):
             entry["provenance"] = "external"
             entry["verified"] = False
             entry.pop("featured", None)
+            entry.pop("stargazersCount", None)
             # ``origin`` is trust-adjacent (``"builtin"`` reads as first-party
             # to every consumer), and on an external row it can arrive from
             # untrusted content: an index may publish the key itself, and it
@@ -2907,8 +2947,8 @@ async def _fetch_external_registry_index(
                 git_url,
                 tmp_root,
             ]
-            sandboxed_cmd, _ = wrap_argv(
-                clone_cmd, mode=_context_clone_sandbox_mode(git_url)
+            sandboxed_cmd, _ = await wrap_argv_async(
+                clone_cmd, mode=_context_clone_sandbox_mode(git_url), _prepare=wrap_argv
             )
             sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             proc = await create_subprocess_limited(
@@ -3304,7 +3344,9 @@ async def _detect_installed_probe(
         try:
 
             base_cmd = ["/bin/sh", "-c", detect_cmd]
-            sandboxed_cmd, _cleanup = wrap_argv(base_cmd, mode="strict")
+            sandboxed_cmd, _cleanup = await wrap_argv_async(
+                base_cmd, mode="strict", _prepare=wrap_argv
+            )
             sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             proc = await create_subprocess_limited(
                 *sandboxed_cmd,
@@ -4312,9 +4354,10 @@ async def _clone_origin_url(dest: Path) -> str | None:
     """
     if not (dest / ".git").is_dir():
         return None
-    origin_cmd, _cleanup = wrap_argv(
+    origin_cmd, _cleanup = await wrap_argv_async(
         ["git", "remote", "get-url", "origin"],
         mode="strict",  # credential-free read; ~/.ssh stays hidden
+        _prepare=wrap_argv,
     )
     origin_cmd = cgroup_scope_argv(origin_cmd)
     try:
@@ -4568,7 +4611,9 @@ async def _git_fetch_ref(
         timeout: int,
         network: bool = False,
     ) -> tuple[int, str]:
-        sandboxed, _cleanup = wrap_argv(argv, mode=sandbox_mode)
+        sandboxed, _cleanup = await wrap_argv_async(
+            argv, mode=sandbox_mode, _prepare=wrap_argv
+        )
         sandboxed = cgroup_scope_argv(sandboxed)
         process_env = (
             _git_transport_env(credential_target, git_url, clone_env) if network else clone_env
@@ -5202,9 +5247,10 @@ async def _git_clone_or_pull(
             # the fresh-clone path below — the cgroup DoS ceiling is the outermost
             # layer but must not replace the wrap_argv sandbox on this
             # agent-influenced git spawn.
-            pull_cmd, _cleanup = wrap_argv(
+            pull_cmd, _cleanup = await wrap_argv_async(
                 ["git", "pull", "--ff-only", git_url, branch],
                 mode=sandbox_mode,
+                _prepare=wrap_argv,
             )
             pull_cmd = cgroup_scope_argv(pull_cmd)
             pull_env = _git_transport_env(credential_target, git_url, clone_env)
@@ -5298,7 +5344,9 @@ async def _git_clone_or_pull(
             git_url,
             str(dest),
         ]
-        sandboxed_cmd, _cleanup = wrap_argv(clone_cmd, mode=sandbox_mode)
+        sandboxed_cmd, _cleanup = await wrap_argv_async(
+            clone_cmd, mode=sandbox_mode, _prepare=wrap_argv
+        )
         sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
         transport_env = _git_transport_env(credential_target, git_url, clone_env)
 
@@ -5661,7 +5709,7 @@ async def _unpoison_rejected_checkout(
         return
 
     async def _run_git(argv: list[str]) -> int:
-        cmd, _cleanup = wrap_argv(argv, mode="standard")
+        cmd, _cleanup = await wrap_argv_async(argv, mode="standard", _prepare=wrap_argv)
         cmd = cgroup_scope_argv(cmd)
         proc = await create_subprocess_limited(
             *cmd,
@@ -6096,7 +6144,9 @@ async def _run_app_build(
 
     for cmd in build_cmds:
         log_lines.append(f"Running {' '.join(cmd)} in {build_dir}...")
-        sandboxed_cmd, _cleanup = wrap_argv(cmd, mode="standard")
+        sandboxed_cmd, _cleanup = await wrap_argv_async(
+            cmd, mode="standard", _prepare=wrap_argv
+        )
         sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
         proc = await create_subprocess_limited(
             *sandboxed_cmd,
@@ -6263,6 +6313,27 @@ async def install_from_registry(
     # An already-installed app that carries provenance may only be re-installed
     # (updated) from the source it came from; fresh installs and legacy records
     # keep the historical bare-name lookup. Blocking reads → off the loop.
+    # Reject an inadmissible name BEFORE the registry lookup and any
+    # clone/build/onInstall work. The manifest/self-registration gates repeat
+    # this check, but for a self-managed app they only fire at runtime
+    # self-registration — without this early refusal the install would clone,
+    # build, and run onInstall, then report success while leaving an
+    # unregisterable checkout behind. Name admissibility is independent of
+    # registry contents, so this precedes _resolve_install_entry.
+    name_error = app_name_error(name)
+    if name_error:
+        outcome_early: dict[str, Any] = {
+            "ok": False,
+            "name": name,
+            "error": name_error,
+            "log": "",
+        }
+        # `code` only for the reserved-name refusals — same contract as the
+        # register_external_app path (is_reserved_app_name gates the code there).
+        if is_reserved_app_name(name):
+            outcome_early["code"] = RESERVED_APP_NAME_CODE
+        return outcome_early
+
     entry, pin_error = await asyncio.to_thread(_resolve_install_entry, name)
     if pin_error:
         try:
@@ -6561,7 +6632,9 @@ async def install_from_registry(
         try:
 
             base_cmd = ["/bin/sh", "-c", detect_cmd]
-            sandboxed_cmd, _cleanup = wrap_argv(base_cmd, mode="strict")
+            sandboxed_cmd, _cleanup = await wrap_argv_async(
+                base_cmd, mode="strict", _prepare=wrap_argv
+            )
             sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             proc = await create_subprocess_limited(
                 *sandboxed_cmd,
@@ -6822,7 +6895,9 @@ async def install_from_registry(
             safe_script = f"set -euo pipefail\n{install_script}"
 
             base_cmd = ["/bin/bash", "-c", safe_script]
-            sandboxed_cmd, _cleanup = wrap_argv(base_cmd, mode="standard")
+            sandboxed_cmd, _cleanup = await wrap_argv_async(
+                base_cmd, mode="standard", _prepare=wrap_argv
+            )
             sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             proc = await create_subprocess_limited(
                 *sandboxed_cmd,

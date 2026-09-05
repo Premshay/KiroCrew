@@ -50,6 +50,9 @@ vi.mock('../api/client', () => ({
 }))
 
 vi.mock('../apps/code-review-sage/api', () => ({
+  SageApiError: class SageApiError extends Error {
+    code = ''
+  },
   sageApi: {
     runs: vi.fn(),
     run: vi.fn(),

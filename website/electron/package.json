@@ -1,6 +1,6 @@
 {
   "name": "kirocrew-desktop",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Kiro Crew \u2014 AI agent desktop app",
   "homepage": "https://github.com/kirodotdev/KiroCrew",
   "desktopName": "kirocrew-desktop.desktop",
@@ -23,7 +23,7 @@
     "electron-builder": "26.15.3"
   },
   "overrides": {
-    "fast-uri": "3.1.5",
+    "fast-uri": "3.1.7",
     "js-yaml": "4.3.1"
   },
   "build": {
@@ -131,6 +131,9 @@
     },
     "files": [
       "main.js",
+      "gateway-supervisor.js",
+      "window-lifecycle.js",
+      "ipc-registrar.js",
       "app-menu.js",
       "windows-menu-model.js",
       "windows-titlebar.js",
@@ -159,6 +162,7 @@
       "home-dir.js",
       "local-token.js",
       "local-gateway.js",
+      "wsl-detection.js",
       "mochi-session-token.js",
       "window-state.js",
       "linux-frame.js",
@@ -167,7 +171,9 @@
       "gateway-recovery.js",
       "renderer-recovery.js",
       "native-logging.js",
-    "pierre-perf-log.js",
+      "disable-gpu.js",
+      "memory-watch-log.js",
+      "cage-trace.js",
       "pyspy-dump.js",
       "perf-metrics.js",
       "host-config.js",

@@ -75,6 +75,37 @@ def _take_pocket_replay_job(job_id: str) -> _PocketReplayJob | None:
     return job if job and job.expires_at > now else None
 
 
+# Synthesized audio is read and written WHOLE, and its size scales with the
+# length of the reply being spoken — a Piper clip is uncompressed WAV, so a
+# minute of speech is megabytes. AUTOSDE `no-blocking-call-on-event-loop` names
+# "large synchronous file IO" as something that must not run on the gateway's
+# single loop, where it stalls every other session — and the heartbeat — for the
+# duration of the transfer. These two helpers hold the blocking halves; every
+# caller reaches them through `asyncio.to_thread`, the same seam this module
+# already uses for `resolve_polly_cli`.
+
+
+def _spill_chunk(mp3_bytes: bytes) -> str:
+    """Write one synthesized chunk to a temp file and return its path.
+
+    Blocking by design — call it through ``asyncio.to_thread``. ``os.close`` on
+    the ``mkstemp`` descriptor is in here for the same reason the write is: the
+    same AUTOSDE rule names it, and splitting the pair would leave a bare
+    descriptor owned by neither side.
+    """
+    fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
+    with open(chunk_path, "wb") as f:
+        f.write(mp3_bytes)
+    return chunk_path
+
+
+def _read_audio(path: str) -> bytes:
+    """Read a synthesized clip whole. Blocking — call it through ``to_thread``."""
+    with open(path, "rb") as f:
+        return f.read()
+
+
 async def api_voice_config(request: web.Request) -> web.Response:
     """GET/PUT /api/voice/config — read or update voice settings."""
     if request.method == "GET":
@@ -86,7 +117,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 "engine": _vc.default_engine,
                 "rate": _vc.default_rate,
                 "pitch": _vc.default_pitch,
-                "autoSpeak": _vc.global_enabled,
+                "autoSpeak": _vc.auto_speak,
                 "aws_profile": _vc.aws_profile,
                 "region": _vc.region,
                 "piper_binary": _vc.piper_binary,
@@ -124,7 +155,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
     if "enabled" in body:
         _vc.global_enabled = bool(body["enabled"])
     if "autoSpeak" in body:
-        _vc.global_enabled = bool(body["autoSpeak"])
+        _vc.auto_speak = bool(body["autoSpeak"])
     if "aws_profile" in body:
         _vc.aws_profile = str(body["aws_profile"]).strip()
     if "region" in body:
@@ -155,6 +186,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
         vr.update(
             {
                 "enabled": _vc.global_enabled,
+                "auto_speak": _vc.auto_speak,
                 "provider": _vc.provider,
                 "voice_id": _vc.default_voice,
                 "engine": _vc.default_engine,
@@ -225,11 +257,7 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
             region=_vc.region,
         ):
             # Save chunk for stitching
-
-            fd, chunk_path = tempfile.mkstemp(suffix=".mp3")
-            os.close(fd)
-            with open(chunk_path, "wb") as f:
-                f.write(mp3_bytes)
+            chunk_path = await asyncio.to_thread(_spill_chunk, mp3_bytes)
             chunk_paths.append(chunk_path)
 
             # Broadcast to dashboard for immediate playback
@@ -247,8 +275,7 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
         if chunk_paths:
             final_path = await stitch_mp3s(chunk_paths)
             if final_path:
-                with open(final_path, "rb") as f:
-                    final_bytes = f.read()
+                final_bytes = await asyncio.to_thread(_read_audio, final_path)
                 state.broadcast_ws(
                     "voice_complete",
                     {
@@ -303,8 +330,8 @@ async def _synthesize_nonstreaming(
             msg = "Piper TTS unavailable — check the piper binary and model path in Voice settings."
             state.broadcast_ws("voice_error", {"slot": slot_key, "error": msg})
             return web.json_response({"ok": False, "error": msg}, status=502)
-        with open(audio_path, "rb") as f:
-            audio_b64 = base64.b64encode(f.read()).decode()
+        audio_bytes = await asyncio.to_thread(_read_audio, audio_path)
+        audio_b64 = base64.b64encode(audio_bytes).decode()
         audio_mime = "audio/wav" if audio_path.lower().endswith(".wav") else "audio/mpeg"
         state.broadcast_ws(
             "voice_chunk",

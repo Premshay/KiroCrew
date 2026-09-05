@@ -191,6 +191,47 @@ def pooled_session_servers(
     return out
 
 
+def explicit_session_servers(
+    overlay_dir: str | Path | None,
+    agent: str | None,
+    allowed_names: set[str] | frozenset[str],
+    channel_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return explicitly allowed agent MCP entries for a Claude ACP session.
+
+    Claude Code otherwise discovers the operator's whole user-level MCP
+    registry.  That is useful for an interactive CLI, but it means every
+    KiroCrew session starts every user-configured server.  An operator can opt
+    into an explicit profile instead: the selected entries come from the
+    KiroCrew agent overlay, so broker stubs still pool and ordinary entries
+    retain their declared environment.
+
+    An empty allowlist is deliberately not a profile.  Callers must preserve
+    the provider's existing discovery behaviour in that case.
+    """
+    if not overlay_dir or not agent or not allowed_names:
+        return []
+    spec = _load_overlay_for_agent(Path(overlay_dir), agent)
+    if not isinstance(spec, dict):
+        return []
+    servers = spec.get("mcpServers")
+    if not isinstance(servers, dict):
+        return []
+    wanted = frozenset(str(name) for name in allowed_names)
+    out: list[dict[str, Any]] = []
+    for name, entry in sorted(servers.items()):
+        if str(name) not in wanted or not isinstance(entry, dict):
+            continue
+        # A disabled server is an operator's explicit veto.  Do not let an
+        # allowlist silently re-enable it merely because it is named here.
+        if entry.get("disabled") is True:
+            continue
+        shaped = _acp_server_entry(str(name), entry, channel_id)
+        if shaped is not None:
+            out.append(shaped)
+    return out
+
+
 def injection_server_names(
     overlay_dir: str | Path | None,
     agent: str | None,

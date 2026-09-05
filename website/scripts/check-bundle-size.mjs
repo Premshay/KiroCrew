@@ -42,8 +42,14 @@ export const CHUNK_BUDGETS = {
   // little with every translated string, which is expected and fine; what this
   // ceiling catches is a NEW library or surface landing in the catalog chunk.
   // The built-in App Store guidance adds one use-case and one configuration
-  // string for each of 23 apps across all 12 shipped catalogs.
-  all: 9750 * KB, // measured 9278 KB after built-in App Store guidance
+  // string for each of 23 apps across all 12 shipped catalogs. The Dev Fleet
+  // closed-PR prune group and the expanded Disconnect guidance are the largest
+  // recent catalog increments included in this measurement; Dev Fleet's
+  // per-pod system readout then adds its own strings across the same 12
+  // catalogs on top of that baseline. The Drive gallery's keys across 13
+  // catalogs ride inside the headroom that measurement already left, so this
+  // branch does not move the ceiling.
+  all: 10490 * KB, // measured 9985 KB before the pod-system catalog keys (~5% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
@@ -51,7 +57,11 @@ export const CHUNK_BUDGETS = {
   // `t()` no longer pull the other twelve catalogs in behind them. Sized for the
   // English catalog plus headroom; a jump here means a non-English catalog, or a
   // library, reached the runtime module.
-  t: 700 * KB, // measured 641 KB
+  // Re-measured 2026-08-27 at 702 KB: the previous `measured 641 KB` note was
+  // ~60 KB stale, which left main sitting a few hundred bytes under its own
+  // ceiling, so any PR adding an English string tripped this gate rather than
+  // the new library or surface it exists to catch.
+  t: 740 * KB, // measured 702 KB
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor
@@ -83,6 +93,34 @@ export const CHUNK_BUDGETS = {
   // -- re-measure and replace this entry (and remove this stale one, which the
   // gate reports as unused).
   'chunk-KEIR6QF5': 680 * KB, // measured 647 KB (mermaid 11.16.1)
+
+  // Excalidraw whiteboard (@excalidraw/excalidraw 0.18.1), reached ONLY through
+  // SketchDialog's lazy `import()` when the composer's sketch pad opens — none
+  // of these three chunks is statically imported or modulepreloaded (the entry
+  // graph is unchanged; verified by grepping the built App chunk and
+  // dist/index.html). Their sizes are the vendor's, not ours, and change only
+  // with an Excalidraw upgrade — re-measure and rename these entries then, the
+  // same maintenance contract as the mermaid entry above.
+  //
+  // `prod` is Excalidraw's main module (named after its dist/prod/index.js);
+  // the two hash-named chunks are its font-subsetting payload for PNG/SVG
+  // export (the large one is embedded font data) plus internals shared with
+  // the subsetting worker. Canvas DISPLAY fonts are separate emitted assets
+  // (dist/vendor/excalidraw/fonts/**, ~14MB, self-hosted by vite.config's
+  // excalidrawFontsPlugin with EXCALIDRAW_ASSET_PATH pointed at them) — they
+  // are not JS chunks, so this gate never sees them; without that plugin the
+  // library fetches them from a third-party CDN at text-tool time.
+  //
+  // UPGRADE RITUAL — an Excalidraw bump moves THREE things in lockstep, and a
+  // partial move fails at runtime, not build time: (1) the exact version in
+  // package.json dependencies, (2) the scoped Radix/nanoid overrides beside it
+  // (stale pins re-split the layer stack — the #6358 guard in
+  // AgentSelector.dialog.test.tsx goes red), and (3) these hash-named chunk
+  // entries (re-measure with an analyze build; stale names fail this gate's
+  // matched-no-chunk warning).
+  prod: 560 * KB, // measured 534 KB (@excalidraw/excalidraw 0.18.1)
+  'chunk-EIO257PC': 1830 * KB, // measured 1744 KB (excalidraw 0.18.1 embedded font data, worker-loaded)
+  'chunk-K2UTITRG': 550 * KB, // measured 522 KB (excalidraw 0.18.1 font-subsetting internals)
 
   // Graph/network visualization stack (vis-network, sigma, graphology,
   // cytoscape) -- one deliberate `manualChunks` bucket, see vite.config.ts.

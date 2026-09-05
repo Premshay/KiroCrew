@@ -345,6 +345,14 @@ export default [
               // real copy ('Preview (', 'Rotate the image') is still reported.
               String.raw`^(?:(?:translate|translateX|translateY|rotate|scale|scaleX|scaleY|matrix)\(|px|deg|[-\d.%,\s()])+$`,
 
+              // A region-qualified BCP-47 language tag (`zh-CN`, `pt-PT`). These are
+              // protocol identifiers handed to libraries that ship their own
+              // translations (Excalidraw's `langCode`, Intl APIs), never rendered
+              // copy — translating one would break the lookup it exists to perform.
+              // FULL-STRING and region-qualified on purpose: a bare two-letter word
+              // (`is`, `to`, `it`) stays reportable prose.
+              String.raw`^[a-z]{2}-[A-Z]{2}$`,
+
               // A URL query built from an already-encoded value, e.g.
               // `${PATH}?id=${encodeURIComponent(x)}`. A request path is a server
               // contract; translating it would 404. Full-string for the same reason as
@@ -555,6 +563,15 @@ export default [
               // a closed DOM set cannot match prose — no English phrase is
               // `AltRight` — and a new key code has to be added here on purpose.
               '^(?:Alt|Control|Meta|Shift)(?:Left|Right)$',
+              // The TWO provider-CLI LOGIN COMMANDS the pull-request panel offers
+              // as copyable recovery text (`pullRequestErrorDetails` returns one
+              // verbatim and the panel renders it in a <code> block). A command
+              // typed into a terminal is a wire string: translating it breaks
+              // it. Enumerated rather than shaped, like the key codes above — a
+              // "lowercase words" shape would exempt exactly the prose this
+              // config fights hardest, and this is a closed two-member set that
+              // grows only when a new provider CLI is wired in on purpose.
+              '^(?:gh|glab) auth login$',
               // A `mc:`-NAMESPACED BROWSER-STORAGE KEY, e.g.
               // `mc:notif:activeKinds:v2`, `mc:notif:seenChannels`. The dashboard
               // namespaces every localStorage key it owns under `mc:`, and such
@@ -625,6 +642,9 @@ export default [
               // above — it would start releasing real copy the moment a label
               // interpolated a placeholder.
               String.raw`^(?:\{owner\}(?:/_git)?/\{repo\}|\{owner\}|\{repo\}|_workitems)$`,
+              // The autolink href template's substitution placeholder, consumed by
+              // `expand()`; a translated token would stop every match expanding.
+              String.raw`^\{match\}$`,
               // A FILE-PICKER `accept` EXTENSION LIST, e.g.
               // `,.txt,.md,.json,.har,.yaml` — the comma-joined dot-extension
               // string handed to `<input type="file" accept=…>`. These live at
@@ -828,6 +848,21 @@ export default [
               // in another module inherits this. Both names exist in exactly one
               // module today (`src/utils/popoutController.ts`).
               '^log(Debug|Warn)$',
+              // `contributedCommands.ts`'s single console shim. A refused command
+              // contribution has to say WHY on the console or it is invisible, and
+              // the reason names the manifest field that failed (`missing title`,
+              // `argument.kind must be one of url, text`) addressed to
+              // whoever authored the app.json. Same class as `^console\.\w+$` and
+              // `\berrors\.push$` above: exempt when it is a throw or a direct
+              // console call, so treating it as copy only because a one-line wrapper
+              // adds the message prefix would be an artifact of the sink.
+              //
+              // A CALLEE exemption, not a whole-file one, for the reason the ones
+              // above give -- and the name is deliberately long and specific rather
+              // than a generic `warnSkip`, so a future helper elsewhere cannot
+              // inherit this by accident. One definition exists today, in
+              // `src/apps/command-bar/contributedCommands.ts`, which renders nothing.
+              '^warnContributionSkipped$',
               // Validator diagnostics, for parity with `Error` above. A rejected input's
               // reason names the FIELD that failed (`Missing or invalid "meta" field`,
               // `Invalid meta.format: "…" (expected "svg", "lottie", or "sprite")`) and
@@ -855,7 +890,10 @@ export default [
               // fixed vocabulary (`message_sent`, `tool_call`, `approval_required`), read
               // by the behaviour state machine, never rendered.
               '^report[A-Z]\\w*$', '^pickFile$',
-              'querySelector(All)?', 'getElementById', 'createElement',
+              // `closest` takes the same CSS-selector contract as querySelector:
+              // its argument is an attribute/type selector walked up the tree,
+              // never rendered copy.
+              'querySelector(All)?', 'closest', 'getElementById', 'createElement',
               'addEventListener', 'removeEventListener', 'matchMedia',
               // WebGL/DOM capability lookups take registry identifiers
               // (`WEBGL_lose_context`), which are mixed-case and so escape the

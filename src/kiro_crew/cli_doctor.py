@@ -18,10 +18,15 @@ import urllib.request
 from pathlib import Path
 
 from kiro_crew import __version__ as _mc_version
-from kiro_crew import agent_state, dep_sync, diagnostics, platform_compat, sandbox
+from kiro_crew import agent as _agent
+from kiro_crew import agent_state, dep_sync, diagnostics, platform_compat, sandbox, stt
 from kiro_crew._bootstrap import _source_checkout_root
-from kiro_crew.acp import kas_assets, kas_auth
 from kiro_crew.acp.client import KIRO_CLI_BIN
+from kiro_crew.acp.kas_transport import (
+    KAS_RELAY_ENGINE,
+    KAS_RELAY_ENGINE_FLAG,
+    build_kas_argv,
+)
 from kiro_crew.acp.types import ACP_BACKEND_KAS
 from kiro_crew.agent import AGENT_FILENAME
 from kiro_crew.agent_discovery import (
@@ -29,6 +34,7 @@ from kiro_crew.agent_discovery import (
     project_agent_files,
     project_agent_name,
 )
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config import KiroCrewConfig
@@ -49,6 +55,7 @@ from kiro_crew.config.paths import (
 )
 from kiro_crew.config.superseded_defaults import render_doctor_section
 from kiro_crew.constants import MIN_NODE_MAJOR
+from kiro_crew.cron import unhealthy_jobs_from_disk
 from kiro_crew.dashboard.crash_dump_store import (
     dump_age_seconds,
     dump_first_stack_lines,
@@ -60,6 +67,7 @@ from kiro_crew.dashboard.origin import (
     machine_hostname,
     parse_dashboard_url,
 )
+from kiro_crew.deny_guidance import credential_vendor_server_ids
 from kiro_crew.discord import install_url, intent_probe
 from kiro_crew.doctor_deadpath import doctor_dead_paths
 from kiro_crew.embeddings import (
@@ -72,7 +80,8 @@ from kiro_crew.embeddings import (
     resolve_custom_model,
     verify_vendored_libs,
 )
-from kiro_crew.kiro_cli import mcp_governance_may_apply
+from kiro_crew.extras import install_hint
+from kiro_crew.kiro_cli import mcp_governance_may_apply, resolve_kiro_cli
 from kiro_crew.mcp_cleanup import ALWAYS_ON_BIN_MCP_SERVERS as _ALWAYS_ON_MCPS
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS as _MANAGED_MCPS
 from kiro_crew.mcp_cleanup import OPT_IN_BIN_MCP_SERVERS as _OPT_IN_MCPS
@@ -80,9 +89,14 @@ from kiro_crew.mcp_discovery import McpServerInfo, probe_server
 from kiro_crew.model_registry import acp_id_correction
 from kiro_crew.platform import (
     PlatformCompositionError,
+)
+from kiro_crew.platform import context as platform_context
+from kiro_crew.platform import (
     current_context,
     safe_context_call,
 )
+from kiro_crew.platform.capability_bound import bind_capability_manager
+from kiro_crew.platform.defaults import DefaultCapabilityManager
 from kiro_crew.platform.governance import CU_MCP_SERVER, may_skip_gate_now
 from kiro_crew.sandbox import warm_backend
 from kiro_crew.security import is_sensitive_path
@@ -93,7 +107,7 @@ from kiro_crew.service import controller as service_controller
 from kiro_crew.service import linux as service_linux
 from kiro_crew.session_pid_sig import signing_health
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
-from kiro_crew.transcribe import _find_parakeet_mlx, _find_whisper, ensure_ffmpeg_in_path
+from kiro_crew.transcribe import _find_ffmpeg, availability_detail, ensure_ffmpeg_in_path
 from kiro_crew.validation import _AGENT_NAME_RE
 
 logger = logging.getLogger(__name__)
@@ -163,7 +177,7 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
         checks here would be a second, weaker copy of a reader that already
         exists.
         """
-        data = _read_agent_spec(path)
+        data = _read_agent_spec(path, operation="doctor", source="cli")
         if data is None:
             # An ABSENT spec is not a fault -- a clean install has none, and the
             # resolver simply falls through to the bundled default. Only a file
@@ -349,10 +363,10 @@ def _os_fix_hint(mac: str, linux: str, windows: str | None = None) -> str:
     return linux
 
 
-# KiroCrew's agent backend is kiro-cli (the sole public ACP backend). The
-# claude-agent-acp binary below is only the dormant protocol seam an internal
-# companion re-registers (see acp/client.py) — report it, when present, as that
-# optional seam rather than as a user-facing backend.
+# kiro-cli is the DEFAULT agent backend; the claude-agent-acp binary below belongs
+# to Claude Code, which is also selectable. Doctor reports it as an optional
+# backend, and the verdict comes from ``agent_sdk.probe_backend`` so doctor and the
+# dashboard cannot give different answers.
 _CLAUDE_ACP_BIN = "claude-agent-acp"
 
 # Managed servers doctor must NEVER add to ``allowedTools``.
@@ -415,7 +429,7 @@ def _agent_spec_model_problems(
     """
     # The retained claude_code seam accepts its own registered wire ids. The
     # correction below is specifically an ACP/kiro-cli spelling audit.
-    if provider == "claude_code":
+    if is_claude_code(provider):
         return []
 
     problems: list[tuple[str, str, str]] = []
@@ -438,7 +452,7 @@ def _agent_spec_model_problems(
             *((path, False) for path in global_specs),
             *((path, True) for path in project_specs),
         ):
-            data = _read_agent_spec(path)
+            data = _read_agent_spec(path, operation="doctor", source="cli")
             if data is None:
                 return None
             model = normalize_agent_model(data.get("model"))
@@ -475,17 +489,85 @@ def _format_model_pin_problem(name: str, pin: str, correction: str) -> tuple[str
     )
 
 
-def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
+def _spec_gate_closed(name: str) -> bool:
+    """Whether *name*'s spec-emission gate reports CLOSED right now.
+
+    Spec emission consults each managed server's ``spec_gate``
+    (``agent._MANAGED_MCP_SERVERS``): a closed gate means the ``mcpServers``
+    entry is deliberately omitted from every emitted spec — and retracted from
+    an existing one on refresh — so on such a host the entry's absence is the
+    HEALTHY state, not a broken install. Doctor's static checks must consult
+    the same predicate or the two sides drift apart, producing the unfixable
+    "missing from mcpServers (re-run `kirocrew setup`)" loop on every host
+    where the gate is closed (#6548). Resolving the gate through the registry
+    keeps them pinned together: a future server gaining a gate needs no edit
+    here, and a server without one reports open, exactly as emission treats it.
+
+    The ``except`` covers gate-CONTRACT failures only — a registry entry that
+    is not a dict, or a gate callable that raises past its own handling. For
+    those, the fail direction is deliberately the OPPOSITE of emission's
+    ``agent._gated_off_servers()``: there, a gate that raises is treated as
+    closed, because the open position hands out a backend the operator may not
+    want running; here it reports NOT closed, because "closed" is what
+    silences the missing-entry error. Each side fails toward its own safe
+    state. Note the scope honestly: the shipped computer-use gate catches its
+    own internal errors and ANSWERS ``False`` (its documented fail-closed
+    posture — an unreadable keystone must never hand out the desktop), so an
+    unreadable keystone is indistinguishable from policy-closed through the
+    boolean, by the gate's own design. That answer is still the
+    emission-CONSISTENT one to report: in that state the entry genuinely is
+    omitted from every emitted spec, so the ℹ️ line describes what the system
+    actually does, even when the underlying cause is a broken enable-state
+    read rather than a decision.
+
+    Never loads a native driver: the computer-use gate reads only the enable
+    keystone and platform flags (see ``agent._computer_use_spec_gate``), which
+    is what makes it safe to evaluate on doctor's diagnostic path.
+    """
+    try:
+        spec = _agent._MANAGED_MCP_SERVERS.get(name) or {}
+        gate = spec.get("spec_gate")
+        if gate is None:
+            return False
+        return not gate()
+    except Exception:
+        logger.debug("spec gate for %s unreadable; doctor treats it as open", name, exc_info=True)
+        return False
+
+
+def _doctor_gated_off_mcps() -> frozenset[str]:
+    """Doctor's per-run snapshot of managed servers whose spec gate is closed.
+
+    Evaluated ONCE per doctor run and threaded into both MCP sections, for the
+    same reason ``agent._gated_off_servers()`` snapshots once per rebuild: the
+    reads are cheap, agreeing is the point. A keystone flip landing between
+    the `MCP Tools` and `MCP Governance` sections would otherwise produce a
+    self-contradicting report — one saying "gated off by design", the other
+    "markers missing — re-run `kirocrew setup --agent-only`". Not reused from
+    ``_gated_off_servers()`` itself because the two snapshots fail in opposite
+    directions on an unreadable gate (see :func:`_spec_gate_closed`).
+    """
+    return frozenset(name for name in _MANAGED_MCPS if _spec_gate_closed(name))
+
+
+def _doctor_mcp_tools(
+    agent_path: Path, issues: list[str], *, gated_off: "frozenset[str] | None" = None
+) -> None:
     """Render the `MCP Tools` section of `kirocrew doctor`.
 
     Two passes scoped to the managed servers (`kirocrew-core`,
     `kirocrew-cron`, `kirocrew-computer`):
 
-    1. Static sanity check of the agent config: each server must be present
-       in ``mcpServers`` and ``tools``. Missing ``tools`` entries — and
-       ``allowedTools`` entries for every server outside
-       :data:`_NO_BLANKET_ALLOW_MCPS` — are auto-appended and the file is
-       rewritten atomically. A missing ``mcpServers`` entry cannot be
+    1. Static coherence check of the agent config: each always-on server whose
+       ``spec_gate`` is open — or that has no gate — must be present in
+       ``mcpServers`` and ``tools``. A gated-off server (feature disabled, or
+       no driver for this platform) is deliberately absent from every emitted
+       spec, so its absence is reported as informational, never as an issue —
+       and a stale entry left from when the gate was open is neither mounted
+       into ``tools`` nor probed (see :func:`_spec_gate_closed`). Missing
+       ``tools`` entries — and ``allowedTools`` entries for every server
+       outside :data:`_NO_BLANKET_ALLOW_MCPS` — are auto-appended and the file
+       is rewritten atomically. A missing ``mcpServers`` entry cannot be
        auto-added because the command path is install-specific.
     2. Live handshake probe via :func:`mcp_discovery.probe_server`. Reports
        per-server status with tool count on success, and on failure shows
@@ -515,8 +597,11 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
     config_changed = False
 
     probe_targets = []
+    if gated_off is None:
+        gated_off = _doctor_gated_off_mcps()
     for name in _MANAGED_MCPS:
         ref = f"@{name}"
+        gate_closed = name in gated_off
         if name not in mcps:
             # An opt-in set is granted per agent, so its absence from THIS spec is
             # the normal state, not a broken install. Say nothing and probe
@@ -532,6 +617,27 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
                         "— add the server entry, or drop the ref"
                     )
                 continue
+            if gate_closed:
+                # Spec emission consults this same gate and deliberately omits
+                # the entry, so absence is the healthy state here — the hard
+                # error below would be unfixable ("re-run setup" writes the
+                # same gated spec back). Informational, never an issue. A stale
+                # `@ref` in ``tools`` is NOT the opt-in "half a grant" warning:
+                # emission deliberately leaves the ref alone when it retracts
+                # the entry (a dangling ref mounts nothing, and dropping it
+                # would destroy a grant the user may have narrowed by hand), so
+                # ref-present-entry-absent is the designed steady state on a
+                # gated-off host and advising "add the server entry" would
+                # defeat the gate. No governance-ceiling revoke is needed on
+                # this path either: with no ``mcpServers`` entry kiro-cli has
+                # nothing to launch, so a leftover ``allowedTools`` ref cannot
+                # auto-approve anything — the stale-ENTRY branch below is the
+                # one window where a grant is live, and the revoke runs there.
+                print(
+                    f"  {ref}: ℹ️  gated off on this host (feature disabled or "
+                    "no driver for this platform) — absent from mcpServers by design"
+                )
+                continue
             print(f"  {ref}: ❌ missing from mcpServers (re-run `kirocrew setup`)")
             issues.append(f"{ref} config")
             continue
@@ -545,7 +651,21 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
             if name not in _OPT_IN_MCPS:
                 issues.append(f"{ref} config")
             continue
-        if ref not in tools and name not in _OPT_IN_MCPS:
+        if gate_closed:
+            # A stale entry from before the gate closed (feature turned off, or
+            # a config copied from a host that has a driver). The next config
+            # refresh retracts it; until then doctor must not deepen the hole:
+            # no mounting the ref (kiro-cli would spawn a backend emission
+            # decided against), no minting `allowedTools`, no probe (nothing
+            # SHOULD launch). The governance-ceiling revoke below still runs —
+            # the entry is live in this spec until the retraction, so an
+            # auto-approve exemption would be real for exactly that window.
+            print(
+                f"  {ref}: ℹ️  gated off on this host (feature disabled or no "
+                "driver for this platform) — stale mcpServers entry is "
+                "retracted on the next `kirocrew setup` or gateway start"
+            )
+        elif ref not in tools and name not in _OPT_IN_MCPS:
             # Mounting an opt-in server IS granting it: the `@` ref is what makes
             # kiro-cli load it. Doctor repairs a broken always-on mount, but it
             # must never hand an agent a set the user did not assign.
@@ -601,13 +721,20 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
             # enabled still prompts on every call — say it once, here, so
             # `kirocrew doctor` explains it.
             print(f"  {ref}: 🔒 auto-approve withheld by security policy — calls will prompt")
-        elif ref not in allowed and name not in _NO_BLANKET_ALLOW_MCPS:
+        elif ref not in allowed and name not in _NO_BLANKET_ALLOW_MCPS and not gate_closed:
             # Computer use is never blanket-allowed here: see _NO_BLANKET_ALLOW_MCPS.
             # A pre-existing user-made grant is left alone (doctor never REMOVES a
-            # decision the user owns); doctor simply never mints one.
+            # decision the user owns); doctor simply never mints one. A gated-off
+            # server never gets one minted either: granting auto-approve to a
+            # server emission has decided against is the wrong direction.
             allowed.append(ref)
             config_changed = True
 
+        if gate_closed:
+            # Nothing should launch: no emitted spec defines this server, so a
+            # handshake probe would spawn a backend for a capability that is off
+            # or has no driver here — and report its result either way.
+            continue
         spec = mcps[name]
         probe_targets.append(
             McpServerInfo(
@@ -682,7 +809,9 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
 # Non-secret rows kiro-cli writes when the signed-in identity came from IAM
 # Identity Center. Presence is the signal; the values (a start URL and a region)
 # are never read into a message, and no token key is touched.
-def _doctor_mcp_governance(agent_path: Path, issues: list[str]) -> None:
+def _doctor_mcp_governance(
+    agent_path: Path, issues: list[str], *, gated_off: "frozenset[str] | None" = None
+) -> None:
     """Render the `MCP Governance` section of `kirocrew doctor`.
 
     Speaks up in two situations: governance can reach this identity (Identity
@@ -704,11 +833,14 @@ def _doctor_mcp_governance(agent_path: Path, issues: list[str]) -> None:
         logger.debug("config load failed in governance check", exc_info=True)
         declared = False
 
-    try:
-        spec = json.loads(agent_path.read_text(encoding="utf-8"))
-        servers = spec.get("mcpServers") or {}
-    except Exception:
-        servers = {}
+    # Same hardened reader as this file's other spec reads: the agents dir is
+    # user-writable, so an oversized or sensitively-symlinked spec is refused
+    # (and audited) rather than parsed. No try/except: the reader's contract is
+    # return-``None``-never-raise, which the five sibling sites migrated
+    # alongside this one also rely on bare. ``None`` degrades to no declared
+    # servers, exactly as the blanket ``except`` here used to.
+    spec = _read_agent_spec(agent_path, operation="doctor", source="cli")
+    servers = (spec or {}).get("mcpServers") or {}
     if not isinstance(servers, dict):
         # `or {}` only replaces a FALSY value, so a string or list here survives
         # and the membership walk below would raise, aborting the whole doctor
@@ -720,10 +852,20 @@ def _doctor_mcp_governance(agent_path: Path, issues: list[str]) -> None:
     # would report every governed install as half-marked; dropping the always-on
     # ones from the denominator would make a spec that declares NOTHING — a
     # malformed or emptied ``mcpServers`` — read as fully marked, which is the
-    # exact failure this section exists to catch.
-    expected = list(_ALWAYS_ON_MCPS) + [
-        name for name in _OPT_IN_MCPS if isinstance(servers.get(name), dict)
-    ]
+    # exact failure this section exists to catch. One exception, same rule as
+    # the MCP Tools section above: an always-on server whose spec gate is
+    # closed is deliberately absent from every emitted spec, so demanding a
+    # registry marker for it would re-create the unfixable "re-run setup" loop
+    # (#6548). A STALE entry still counts while it exists — kiro-cli drops an
+    # unmarked entry at session assembly, so the marker matters for exactly as
+    # long as the entry does.
+    if gated_off is None:
+        gated_off = _doctor_gated_off_mcps()
+    expected = [
+        name
+        for name in _ALWAYS_ON_MCPS
+        if isinstance(servers.get(name), dict) or name not in gated_off
+    ] + [name for name in _OPT_IN_MCPS if isinstance(servers.get(name), dict)]
     marked = sorted(
         name
         for name in expected
@@ -850,6 +992,72 @@ def _doctor_data_home() -> None:
         f"  legacy:      ⏹ {legacy} present but not the data home — safe to "
         f"delete once you have confirmed it holds nothing you need"
     )
+
+
+def _doctor_managed_service_policy(issues: list[str]) -> None:
+    """Surface installed service definitions that predate launch-class policy."""
+    state = service_controller.installed_service_has_managed_marker()
+    if state is None:
+        return
+    print("\nManaged Service")
+    if state:
+        print("  watchdog:    ✅ managed-service policy marker installed")
+        return
+    print("  watchdog:    ⚠️  installed definition predates managed-service defaults")
+    print("               Fix: run `kirocrew service install` once, then restart the service")
+    issues.append("managed service definition is outdated")
+
+
+def _doctor_claude_backend() -> None:
+    """Report Claude Code as an optional agent backend, installed or not.
+
+    Its own function, not an inline block, so a test can exercise the reporting
+    without running the whole doctor -- the full ``_doctor()`` shells out to
+    ``kiro-cli whoami`` and probes the host, and a test must not reach an
+    operator's real installation to check three print statements.
+
+    Claude Code needs TWO binaries and the probe names whichever is absent, so a
+    half-install does not read as a total one. Never a hard failure: it is an
+    optional backend and kiro-cli is the floor. The verdict comes from
+    ``agent_sdk.probe_backend`` -- the same owner ``GET /api/acp-backends`` uses --
+    so doctor and the dashboard cannot give different answers.
+    """
+    try:
+        from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+        from kiro_crew.agent_sdk import INSTALLED, MISSING, probe_backend
+
+        claude_state = probe_backend(ACP_BACKEND_CLAUDE)
+    except Exception:
+        claude_state = None
+    if claude_state is None:
+        print("  claude-acp:  ⚠️  could not check")
+    elif claude_state.installed == INSTALLED:
+        # The probe resolves the adapter through the spawn's own resolver, which honours
+        # CLAUDE_AGENT_ACP_BIN, a vendored node_modules and a mise shim -- none of which
+        # a plain PATH lookup sees. So `which` is best-effort here and its miss must not
+        # print as a location: naming the path only when we actually have one beats
+        # printing "✅ None" for a working install.
+        #
+        # Says "installed", NOT "selectable": this branch reads the INSTALL probe, and
+        # whether the deployment may select the backend is a separate answer that
+        # ``apply_selectable_denials`` can say no to. Calling an install "selectable"
+        # would print the opposite of the truth on a policy-denied deployment.
+        where = shutil.which(_CLAUDE_ACP_BIN)
+        if where:
+            print(f"  claude-acp:  ✅ {where} (Claude Code installed)")
+        else:
+            print("  claude-acp:  ✅ resolved off PATH (Claude Code installed)")
+    elif claude_state.installed == MISSING:
+        missing = ", ".join(claude_state.missing_components) or "components"
+        print(f"  claude-acp:  ⏭  {missing} not found (optional agent backend)")
+        if claude_state.install_command:
+            print(f"               {claude_state.install_command}")
+    else:
+        # UNKNOWN: the check itself failed. Reporting that as "not found" would send
+        # someone to install what they may already have -- the exact collapse the
+        # probe's three-valued verdict exists to prevent, and which the dashboard
+        # also refuses to make.
+        print("  claude-acp:  ⚠️  could not check")
 
 
 def _doctor_path_launcher() -> None:
@@ -1003,24 +1211,54 @@ def _process_apparmor_confinement() -> str:
     return ""
 
 
-def _service_unit_applies_profile(unit_path: Path, profile_name: str) -> bool:
-    """True when the installed systemd unit transitions the service into the profile.
+def _service_profile_applies(profile_path: Path, profile_name: str) -> bool:
+    """True when the installed profile is ATTACHED to the launcher script this
+    host currently resolves (#3463).
 
-    The unit is rendered with ``AppArmorProfile=-<name>`` (the leading dash keeps
-    the unit startable while the profile is temporarily unloaded); the dashless
-    form is accepted too so a hand-edited unit still counts.
+    Before #3463 this asked a different question — whether the systemd unit
+    carried an ``AppArmorProfile=<name>`` directive — because that directive
+    was the mechanism that confined the service. It no longer is: the profile
+    is now attached BY PATH to ``kirocrew_bin()`` (the same path ``ExecStart``
+    uses), and installing the directive alongside a path attachment was found
+    to make the directive silently win, defeating the attachment. So
+    ``kirocrew service install`` no longer writes it, and this check follows —
+    it reads the profile's own attachment clause and compares it against the
+    CURRENTLY resolved launcher path, the same comparison
+    ``apparmor.launcher_status()`` already makes for the AppImage case.
+
+    A moved or reinstalled launcher (a venv rebuilt at a new path, a symlink
+    re-pointed) makes this False until ``kirocrew service install`` re-renders
+    the profile against the new path — the same staleness
+    ``kirocrew sandbox status`` already reports for the launcher profile.
     """
+    attached = apparmor.installed_attachment(profile_path, profile_name)
+    if attached is None:
+        return False
     try:
-        text = unit_path.read_text(encoding="utf-8")
+        current = str(Path(service_linux.kirocrew_bin()).resolve(strict=True))
     except OSError:
         return False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("AppArmorProfile="):
-            value = stripped.split("=", 1)[1].strip().lstrip("-")
-            if value == profile_name:
-                return True
-    return False
+    if attached != current:
+        return False
+    # A unit that still carries ``AppArmorProfile=`` — a hand-edited unit, a
+    # systemd drop-in, an install older than #3463 — silently WINS over the
+    # kernel's path attachment (the finding that retired the directive), so an
+    # attachment that matches is not enough: the service would run under the
+    # directive's semantics, i.e. the very bug #3463 fixed, while a shell
+    # launch through the same path probes green. Best-effort read — an
+    # unreadable unit (or none installed) proves nothing and must not flip a
+    # verified attachment to "broken".
+    try:
+        # errors="replace" for the same reason as installed_attachment(): a
+        # unit with undecodable bytes must not crash the verdict —
+        # UnicodeDecodeError is a ValueError, outside the OSError guard.
+        unit_text = service_linux.UNIT_PATH.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    for line in unit_text.splitlines():
+        if line.strip().startswith("AppArmorProfile="):
+            return False
+    return True
 
 
 def _doctor_sandbox_apparmor(reason: str, issues: list[str]) -> None:
@@ -1029,12 +1267,17 @@ def _doctor_sandbox_apparmor(reason: str, issues: list[str]) -> None:
     Three honest verdicts, decided from real signals rather than the happy path:
 
     * profile absent → broken, with the install command;
-    * profile installed but nothing applies it, or the probe failed even though
-      THIS process is confined by the profile → broken, with the repair command;
-    * profile installed, the service unit applies it, and this process is
-      unconfined → the probe's failure says nothing about the service, so the
-      verdict is "cannot be verified from this shell" plus how to verify — NOT
-      a claim that the sandbox works, and NOT counted as an issue.
+    * profile installed but not ATTACHED to the launcher script this host
+      currently resolves (#3463 — this used to check the systemd unit for an
+      ``AppArmorProfile=`` directive; that directive is retired, and checking
+      it now would silently fail closed against a correctly-installed,
+      correctly-attached profile), or the probe failed even though THIS
+      process is confined by the profile → broken, with the repair command;
+    * profile installed and attached to the resolved launcher script, and this
+      process is unconfined → the probe's failure says nothing about the
+      service, so the verdict is "cannot be verified from this shell" plus how
+      to verify — NOT a claim that the sandbox works, and NOT counted as an
+      issue.
     """
     if not apparmor.PROFILE_PATH.is_file():
         print(f"  backend:     ❌ none — {reason}")
@@ -1060,38 +1303,50 @@ def _doctor_sandbox_apparmor(reason: str, issues: list[str]) -> None:
         issues.append("sandbox: probe failed under the AppArmor profile")
         return
 
-    if not _service_unit_applies_profile(service_linux.UNIT_PATH, apparmor.PROFILE_NAME):
+    if not _service_profile_applies(apparmor.PROFILE_PATH, apparmor.PROFILE_NAME):
         print(f"  backend:     ❌ none — {reason}")
         _print_wrapped(
-            f"The {apparmor.PROFILE_NAME} AppArmor profile is installed, but no systemd "
-            f"unit applies it, so nothing on this host runs confined by it. Run "
-            f"`kirocrew service install` to (re)install the gateway service with the "
-            f"profile applied."
+            f"The {apparmor.PROFILE_NAME} AppArmor profile is installed, but it is not "
+            f"attached to the kirocrew launcher script this host currently resolves — "
+            f"or the systemd unit still carries the retired `AppArmorProfile=` "
+            f"directive, which silently overrides a path attachment (#3463). Either "
+            f"way nothing on this host runs confined by it. Run `kirocrew service "
+            f"install` to re-render both the profile and the unit."
         )
-        issues.append("sandbox: AppArmor profile installed but not applied")
+        issues.append("sandbox: AppArmor profile installed but not attached")
         return
 
     # Unverifiable from here — deliberately NOT an issue, and deliberately NOT a
     # success claim either.
     print("  backend:     ⏭  cannot be verified from this shell")
     _print_wrapped(
-        f"The {apparmor.PROFILE_NAME} AppArmor profile is installed and the gateway "
-        f"service unit is configured to run under it, but this shell is unconfined "
-        f"and aa_change_onexec() into a named profile is not permitted for an "
-        f"unconfined user — so this probe cannot succeed here no matter how healthy "
-        f"the service's sandbox is. To verify the sandbox in the confined context "
+        f"The {apparmor.PROFILE_NAME} AppArmor profile is installed and attached to "
+        f"the kirocrew launcher script this host resolves, but this process was not "
+        f"invoked through that exact path (or this shell is otherwise unconfined) — "
+        f"so this probe cannot confirm the service's confinement from here no matter "
+        f"how healthy it actually is. To verify the sandbox in the confined context "
         f"the service uses, run:"
     )
-    # The interpreter path is quoted for the shell: the recipe is meant to be
-    # pasted, so an install path containing spaces or shell metacharacters must
-    # arrive as one argument, not execute.
-    quoted_python = shlex.quote(sys.executable)
-    print(f"{_INDENT}  sudo systemd-run --pipe --unit=kirocrew-sandbox-test \\")
-    print(f"{_INDENT}    --property=AppArmorProfile=-{apparmor.PROFILE_NAME} \\")
-    print(f"{_INDENT}    --uid=$(id -u) --gid=$(id -g) \\")
-    print(f'{_INDENT}    {quoted_python} -c "import kiro_crew.sandbox as sb; \\')
-    print(f'{_INDENT}      sb.reset_backend(); print(sb.detect_backend())"')
-    _print_wrapped("A healthy sandbox prints: namespace")
+    # The recipe execs the ATTACHED LAUNCHER PATH: a path-attached profile is
+    # applied by the kernel at execve() of that exact file, and the sandbox
+    # probe (a fork with no subsequent exec) inherits the confinement — the
+    # same chain the service's ExecStart uses. The retired
+    # ``systemd-run --property=AppArmorProfile=`` form must NOT come back here:
+    # the directive labels only the unit's own top-level process, so a probe
+    # under it stayed unconfined — the very bug this mechanism replaced (#3463).
+    # The path is quoted for the shell: the recipe is meant to be pasted, so an
+    # install path containing spaces or shell metacharacters must arrive as one
+    # argument, not execute.
+    try:
+        launcher = str(Path(service_linux.kirocrew_bin()).resolve(strict=True))
+    except OSError:
+        launcher = service_linux.kirocrew_bin()
+    print(f"{_INDENT}  {shlex.quote(launcher)} doctor")
+    _print_wrapped(
+        "and read its Sandbox section: launched through the attached path, the "
+        "probe itself runs confined, so a healthy sandbox reports its backend "
+        "as: namespace"
+    )
 
 
 def _doctor_sandbox(issues: list[str]) -> None:
@@ -1579,6 +1834,100 @@ def _doctor_cli_installer_residue(issues: list[str]) -> None:
     issues.append("kiro-cli installer residue in temp")
 
 
+# ── cron job health ───────────────────────────────────────────────────────────
+# The dashboard already surfaces a failing job per-row (an `err` badge on
+# `last_status === 'error'`, with `last_error` on hover), and the gateway
+# re-alerts on a still-failing job hourly. Both of those run INSIDE the
+# gateway, so neither can speak when the gateway is the thing that is wedged.
+# Doctor is a separate process the user runs by hand, which is why the scan
+# reads `crons.json` off disk rather than asking the gateway's HTTP API: a check
+# whose purpose is to survive a down gateway must not depend on one.
+#
+# It also covers a gap the dashboard has by construction: the status badge is
+# rendered under an `enabled` guard, so a job that auto-paused shows only
+# "paused" and its error state is not displayed at all.
+#
+# The scan itself lives in `cron.unhealthy_jobs_from_disk` so the pause-state
+# predicates keep the single owner `cron.py` declares for them; this module owns
+# only the presentation.
+#
+# Read-only, like the rest of doctor: an auto-paused job has failed
+# `_AUTO_PAUSE_THRESHOLD` times in a row and is usually paused for a good
+# reason, so silently resuming it during a diagnostic would hide the very
+# problem the user ran doctor to find. The remediation is a `Fix:` hint naming
+# a cron verb that already exists.
+_CRON_REPORT_CAP = 5
+
+
+def _format_job_labels(entries: list[tuple[str, str]]) -> str:
+    """Render ``(id, name)`` *entries* capped at :data:`_CRON_REPORT_CAP`.
+
+    Beyond the cap the remainder is summarised as ``+N more``: a user with dozens
+    of crons must not get a wall of text out of a diagnostic.
+
+    Both fields go through :func:`_safe_display`. A job name is free text that an
+    app or a hand-edit of the store can supply, so a name carrying OSC/ANSI
+    controls must not be able to act on the terminal or spoof the surrounding
+    diagnostic lines — the same reason the effective-model section escapes the
+    values it reads off disk.
+    """
+    labels = [f"{_safe_display(name)} ({_safe_display(job_id)})" for job_id, name in entries]
+    if len(labels) <= _CRON_REPORT_CAP:
+        return ", ".join(labels)
+    shown = ", ".join(labels[:_CRON_REPORT_CAP])
+    return f"{shown}, +{len(labels) - _CRON_REPORT_CAP} more"
+
+
+def _doctor_cron_health(issues: list[str]) -> None:
+    """Report cron jobs that auto-paused or last ran with an error.
+
+    Silent on a healthy store — and on a fresh install with no ``crons.json`` at
+    all — so a normal doctor run gains no noise. Speaks only when there is
+    something the user can act on.
+
+    A store that EXISTS but cannot be read is one of those things, and is
+    reported even though the scan returns nothing: the scheduler can load no
+    jobs from it, so every job has stopped. Staying silent there would hand
+    back a clean bill of health in precisely the state this check exists to
+    surface. The runtime readers keep degrading quietly; only this diagnostic
+    speaks up.
+    """
+    auto_paused, errored, loadable = unhealthy_jobs_from_disk()
+    if not auto_paused and not errored:
+        # The flag rides the scan's own read, so `crons.json` is opened ONCE per
+        # doctor run. False means the store is present and the scheduler can
+        # load nothing from it; a missing store and an honestly empty one both
+        # report True and stay silent.
+        if not loadable:
+            print("\nCron Jobs")
+            print("  store:       ⚠️  `crons.json` exists but could not be read")
+            print("               No jobs can be loaded from it, so every scheduled")
+            print("               job has stopped. The scheduler logs the parse error")
+            print("               on startup.")
+            print("               Fix: restore it from a snapshot (`kirocrew restore`)")
+            print("               or move it aside to start with an empty schedule.")
+            issues.append("cron store unreadable")
+        return
+
+    print("\nCron Jobs")
+    if auto_paused:
+        print(f"  auto-paused: ⚠️  {len(auto_paused)} job(s) paused after repeated failures")
+        print(f"               {_format_job_labels(auto_paused)}")
+        print("               A job auto-pauses after consecutive failures and stays")
+        print("               paused across restarts. Check why it failed before")
+        print("               resuming it — the pause is usually load-bearing.")
+        print("               Fix: `kirocrew cron resume <id>` once the cause is fixed.")
+        issues.append(f"{len(auto_paused)} cron job(s) auto-paused")
+    if errored:
+        print(f"  errored:     ⚠️  {len(errored)} job(s) last ran with an error")
+        print(f"               {_format_job_labels(errored)}")
+        print("               If it has a repeating schedule, the next run may recover")
+        print("               on its own; a one-shot job has no next run.")
+        print("               Fix: `kirocrew cron trigger <id>` to retry now. The recorded")
+        print("               error text is shown on the dashboard's Schedule page.")
+        issues.append(f"{len(errored)} cron job(s) last ran with an error")
+
+
 def _doctor_model_url_reachable(issues: list[str]) -> None:
     """Light HTTPS-reachability probe of the resolved embedding-model URL.
 
@@ -1607,6 +1956,228 @@ def _doctor_model_url_reachable(issues: list[str]) -> None:
         print(f"  model url:   ❌ unreachable ({exc}) {safe}")
         print("               Check network connectivity; the background download will")
         print("               keep retrying with backoff on every gateway boot.")
+
+
+#: Ceiling on each ``aws configure`` probe in the Credentials section. Doctor is
+#: interactive, and an AWS CLI that stalls on a network-backed credential source
+#: must cost a bounded pause rather than hanging the whole run.
+_AWS_PROBE_TIMEOUT_SECS = 10
+
+#: Where an operator can actually READ the packaged blocked-commands doc.
+#: Deliberately a GitHub URL rather than a dashboard page or a repo-relative
+#: path: the dashboard has no Docs surface (packaged docs are reached as GitHub
+#: links, the base `TipCard` uses), and `src/kiro_crew/...` does not exist on a
+#: host that installed the wheel. A pointer an operator cannot follow costs more
+#: trust than no pointer, and this line prints on every run where ~/.aws exists.
+_BLOCKED_COMMANDS_DOC_URL = (
+    "https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/docs/blocked-commands.md"
+)
+
+
+def _aws_probe_env() -> dict[str, str]:
+    """Child environment for the ``aws configure`` probes.
+
+    Drops the two variables that relocate the CLI's files. This section decides
+    WHETHER to report from ``~/.aws`` existence but asks the CLI for the profile
+    NAMES, and a subprocess inherits the environment — so with
+    ``AWS_CONFIG_FILE`` / ``AWS_SHARED_CREDENTIALS_FILE`` set, the two halves
+    describe DIFFERENT files. That is not hypothetical: the agent sandbox points
+    both at a per-session directory, so ``doctor`` run from such a shell reported
+    a profile that is absent from the operator's own config while its own probe
+    said that config file does not exist. Dropping them makes the CLI resolve the
+    same default locations the existence probe checks, so the halves cannot
+    disagree. Everything else is inherited — ``PATH`` still has to work.
+    """
+    env = dict(os.environ)
+    for relocator in ("AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"):
+        env.pop(relocator, None)
+    return env
+
+
+def _aws_profile_names() -> list[str] | None:
+    """Profiles as the SANCTIONED path reports them. ``None`` = could not ask.
+
+    Deliberately NOT a parse of ``~/.aws/config``. That file sits inside a
+    directory ``security._SENSITIVE_HOME_DIRS`` fences from the agent, and
+    ``kirocrew doctor`` is reachable from a tool call — so opening it here would
+    hand back through a diagnostic exactly what the floor refuses directly,
+    which is the "just use a different reader" move this whole feature exists to
+    talk the agent out of. ``aws configure list-profiles`` is the command the
+    remediation text names and ``test_deny_guidance`` pins as allowed, so the
+    report now comes through the same door the guidance points at.
+
+    ``None`` rather than ``[]`` when the CLI is absent or fails, because "cannot
+    ask" and "asked, and there are none" are different things to tell an
+    operator.
+
+    Resolved through ``trusted_system_bin`` rather than ``PATH``: a gateway's
+    ``PATH`` can lead with a directory the agent itself can write (a worktree
+    venv's ``bin``), and this runs when an OPERATOR types ``kirocrew doctor`` —
+    outside the agent's sandbox. A miss degrades to the same "cannot ask" answer
+    as an absent CLI, which is the honest reading either way.
+    """
+    aws_bin = platform_compat.trusted_system_bin("aws")
+    if not aws_bin:
+        return None
+    try:
+        proc = subprocess.run(
+            [aws_bin, "configure", "list-profiles"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_AWS_PROBE_TIMEOUT_SECS,
+            env=_aws_probe_env(),
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    names: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        name = line.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _aws_auto_refreshes() -> bool:
+    """Whether the profile the agent will ACTUALLY use auto-refreshes.
+
+    Asked of the CLI rather than by looking for the string ``credential_process``
+    somewhere in the config file — that substring test answered "yes" when the
+    key belonged to any other profile, so the effective-profile question is both
+    more accurate and reachable without a fenced read. One invocation, resolving
+    the same default profile the agent's own AWS calls will resolve.
+
+    Resolved through ``trusted_system_bin`` for the same reason as the profile
+    probe: this runs under an operator's ``kirocrew doctor``, and a ``PATH`` that
+    leads with an agent-writable directory would let a planted shim answer.
+    """
+    aws_bin = platform_compat.trusted_system_bin("aws")
+    if not aws_bin:
+        return False
+    try:
+        proc = subprocess.run(
+            [aws_bin, "configure", "get", "credential_process"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_AWS_PROBE_TIMEOUT_SECS,
+            env=_aws_probe_env(),
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0 and bool((proc.stdout or "").strip())
+
+
+def _credential_vendor_line() -> str:
+    """The edition's credential-vending MCP servers, or "" when there are none.
+
+    Phrased for the OPERATOR, not reused from the agent's refusal hint: that hint
+    tells its reader to prefer the vendor and says it supersedes "the guidance
+    above", neither of which is true for a human reading a terminal. Only the
+    server ids are shared with the refusal path.
+
+    Runs the capability-manager lookup on its own event loop because ``doctor`` is
+    synchronous. Degrades to "" on any failure — including an already-running loop
+    — since the absence of this line is indistinguishable from the public
+    edition's normal state and must never fail the run.
+    """
+    try:
+        manager = platform_context.safe_context_call(
+            lambda: platform_context.current_context().capability_manager,
+            fallback_factory=lambda: bind_capability_manager(DefaultCapabilityManager()),
+            log_message=None,
+        )
+        if not manager.available():
+            return ""
+        ids = credential_vendor_server_ids(asyncio.run(manager.list_mcp()))
+        if not ids:
+            return ""
+        listed = ", ".join(_safe_display(name) for name in ids)
+        return (
+            f"agents mint credentials through {listed} rather than reading these "
+            "files, so the files being unreadable to them is expected, not a fault."
+        )
+    except Exception:
+        return ""
+
+
+def _doctor_credentials(issues: list[str]) -> None:
+    """Report the AWS / credential posture the agent will actually see.
+
+    Exists because "my agent cannot reach AWS" had no self-service answer: the
+    agent is allowed to run AWS CLI calls but not to read credential files, so a
+    refused read looks identical to having no credentials at all, and nothing on
+    either side of that told the operator which one they had.
+
+    Advisory only, like the pod-session-bus and memory-pressure probes: ``issues``
+    is doctor's exit-code channel, and an unconfigured AWS profile is not a Kiro
+    Crew fault. Reporting it is right; failing on it would make ``doctor`` red on
+    every host that simply does not use AWS.
+
+    No secret value is read or printed, and nothing under ``~/.aws`` is OPENED:
+    the two files are probed for existence, and the profile set and refresh
+    posture come from ``aws configure``, the sanctioned path the guidance itself
+    names. A diagnostic that parsed the fenced file would be the "different
+    reader" this feature talks the agent out of looking for.
+    """
+    del issues  # advisory-only diagnostic; keeps the call-site signature uniform
+    print("\nCredentials")
+    aws_dir = Path.home() / ".aws"
+    has_config = (aws_dir / "config").is_file()
+    has_creds = (aws_dir / "credentials").is_file()
+    if not has_config and not has_creds:
+        print("  aws:         ⏹ no ~/.aws config — agents can still run AWS CLI calls")
+        _print_wrapped(
+            "once you configure one: the SDK resolves credentials itself, so the agent "
+            "never needs to read the files. If you use AWS, run `aws configure sso` or "
+            "`aws configure` in your own terminal."
+        )
+    else:
+        profiles = _aws_profile_names()
+        if profiles:
+            shown = ", ".join(_safe_display(name) for name in profiles[:6])
+            extra = f" (+{len(profiles) - 6} more)" if len(profiles) > 6 else ""
+            print(f"  profiles:    ✅ {shown}{extra}")
+        elif profiles is None:
+            # No aws CLI to ask, and the config file is not ours to read — so the
+            # honest report is that the files exist and the profile set is unknown.
+            print("  profiles:    ℹ️  ~/.aws present; install the AWS CLI to list profiles")
+        elif has_creds:
+            print("  profiles:    ✅ default (from ~/.aws/credentials)")
+        else:
+            print("  profiles:    ⚠️  ~/.aws present but `aws configure` lists no profile")
+        # credential_process is the setup worth calling out: it vends short-lived
+        # credentials on demand, so the agent's AWS calls keep working across a
+        # token expiry without anyone re-running a login.
+        if _aws_auto_refreshes():
+            print("  refresh:     ✅ credential_process configured (auto-refreshing)")
+        else:
+            print("  refresh:     ⏹ no credential_process — credentials may expire mid-task")
+    vendor = _credential_vendor_line()
+    if vendor:
+        print("  vending MCP: ✅ available")
+        _print_wrapped(vendor)
+    print("  note:        ℹ️  agents cannot READ credential files; AWS CLI calls are allowed")
+    if has_config or has_creds:
+        # Only true once something IS configured. On a host with nothing set up the
+        # missing setup is the real answer, and steering the operator away from it
+        # would contradict the "no ~/.aws config" line printed above.
+        _print_wrapped(
+            "So if an agent reports that AWS is unavailable, it most likely hit the "
+            "credential-file block rather than a missing setup — see:"
+        )
+        # Printed OUTSIDE the wrapper on purpose. `_print_wrapped` breaks on width
+        # and split this URL across two lines at its hyphen, which an operator
+        # cannot copy back out intact — a broken link is barely better than the
+        # dead pointer this replaced.
+        print(f"    {_BLOCKED_COMMANDS_DOC_URL}")
+    else:
+        _print_wrapped(
+            "With nothing configured, an agent reporting no AWS access is reporting "
+            "the truth — configure a profile first, then re-run this check."
+        )
 
 
 def _doctor_headless_auth(issues: list[str]) -> None:
@@ -1655,18 +2226,39 @@ def _doctor_headless_auth(issues: list[str]) -> None:
         print(f"{_INDENT}{line.strip()}" if line.strip() else "")
 
 
-def _kas_version_label(script: "Path") -> str:
-    """Derive the extracted-bundle version label from the KAS script path.
+#: Bare flag name (no leading dashes) used to tell "this kiro-cli predates engine
+#: selection" apart from "it offers engines but not ours". Derived from the
+#: transport constant so the two can never drift.
+_KAS_ENGINE_FLAG_NAME = KAS_RELAY_ENGINE_FLAG.lstrip("-")
 
-    Bundles live at ``{data_dir}/kas/{version}/.../acp-server.js`` (see
-    :mod:`kiro_crew.acp.kas_assets`), so the version is the path component whose
-    parent directory is named ``kas``. Returns ``"unknown"`` for an unexpected
-    layout rather than raising — this is a diagnostic, not a gate.
+
+def _kas_relay_help(binary: str) -> str | None:
+    """``acp --help`` text for this kiro-cli, or ``None`` when the probe FAILED.
+
+    Read from help output because there is no machine-readable capability surface
+    for the engine selector. ``None`` means only one thing — the probe could not
+    run (spawn error, timeout) — so the caller reports genuinely-unknown as
+    unknown. Help text that RAN and simply lacks the engine selector is returned
+    as-is, not as ``None``: a kiro-cli too old to offer ``--agent-engine`` cannot
+    serve KAS at all, and reporting that as "unknown" would let a broken
+    configuration pass the readiness check and fail later at spawn instead.
+
+    Local binary, argv list, no shell, no credential involved.
     """
-    for parent in script.parents:
-        if parent.parent is not None and parent.parent.name == "kas":
-            return parent.name
-    return "unknown"
+    try:
+        proc = subprocess.run(  # noqa: S603 - argv list, no shell, local binary
+            [binary, "acp", "--help"],
+            capture_output=True,
+            timeout=15,
+            check=False,
+            # Pinned UTF-8 rather than bare text=True: help output is decoded
+            # here, and a platform-locale decode could mangle the flag name this
+            # probe searches for and report a supported kiro-cli as unreadable.
+            **UTF8_TEXT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return f"{proc.stdout}\n{proc.stderr}"
 
 
 def _doctor_kas(issues: list[str]) -> None:
@@ -1674,10 +2266,12 @@ def _doctor_kas(issues: list[str]) -> None:
 
     KAS is opt-in (``agent.acp_backend = "kas"``); when it is not selected this
     is silent so a kiro-cli / Claude Code install sees no KAS noise. When it IS
-    selected, KAS runs from kiro-cli's extracted bundle and obtains its token
-    from kiro-cli, so this surfaces the two things that make a selected KAS
-    backend fail at session-create time: missing assets and an unobtainable
-    token. The token probe prints only the expiry, never the token bytes.
+    selected, KAS is served by kiro-cli's own ACP relay (see
+    :mod:`kiro_crew.acp.kas_transport`), so the thing that makes a selected KAS
+    backend fail at session-create time is a kiro-cli whose ``acp`` subcommand
+    cannot select the KAS engine. Credentials are deliberately NOT probed here:
+    the relay resolves tokens from kiro-cli's own store, so the kiro-cli
+    sign-in check already reported above is the same signal.
     """
     # Positive backend test (not ``!= ACP_BACKEND_KAS``): an inequality would
     # silently capture every harness added later — see the harness-parity gate.
@@ -1686,37 +2280,41 @@ def _doctor_kas(issues: list[str]) -> None:
 
 
 def _report_kas_backend(issues: list[str]) -> None:
-    """Print the KAS diagnostic block (assets + bundle version + token probe).
+    """Print the KAS diagnostic block (relay binary + engine support).
 
     Split from :func:`_doctor_kas` so the backend-selection check there stays a
     positive ``== ACP_BACKEND_KAS`` rather than an early-return on inequality.
     """
     print("\nKAS backend")
-    node = kas_assets.find_kas_node()
-    script = kas_assets.find_kas_server_script()
-    print(f"  node:        {'✅ ' + str(node) if node else '❌ not found'}")
-    if script:
-        print(f"  bundle:      ✅ {_kas_version_label(script)}")
-    else:
-        print("  bundle:      ❌ KAS server script not found")
-    if not (node and script):
-        print("               Fix: install kiro-cli and run it once so it unpacks its")
-        print("               KAS bundle (or set KIROCREW_KAS_NODE / KIROCREW_KAS_SCRIPT).")
-        issues.append("KAS backend selected but assets missing")
+    binary = resolve_kiro_cli()
+    if not binary:
+        print(f"  relay:       ❌ {KIRO_CLI_BIN} not found")
+        print("               Fix: install kiro-cli; it serves KAS over its acp relay.")
+        issues.append("KAS backend selected but kiro-cli is not installed")
+        return
 
-    # Token status — a bounded live probe through kiro-cli. Advisory: an
-    # unobtainable token is usually a transient login state, not a broken
-    # install, so it warns rather than failing the doctor run.
-    try:
-        resp = asyncio.run(kas_auth.resolve_kas_access_token(timeout=8.0))
-    except kas_auth.KasAuthCallbackError as exc:
-        print(f"  token:       ⚠️  not obtainable: {exc}")
-        print("               Fix: sign in with `kiro-cli login`.")
-    except Exception as exc:  # noqa: BLE001 - diagnostic must never abort the run
-        print(f"  token:       ⚠️  probe error: {exc}")
+    print(f"  relay:       ✅ {' '.join(build_kas_argv(binary))}")
+    help_text = _kas_relay_help(binary)
+    if help_text is None:
+        # The probe itself failed, so nothing is known either way. Advisory: a
+        # diagnostic must not invent a verdict it could not establish.
+        print("  engine:      ⚠️  could not read `acp --help`; engine support unknown")
+        return
+    # Two distinct failures, both definite: the flag is absent entirely (a
+    # kiro-cli predating engine selection) or it is present without this engine.
+    if f"--{_KAS_ENGINE_FLAG_NAME}" not in help_text:
+        print(f"  engine:      ❌ this kiro-cli has no --{_KAS_ENGINE_FLAG_NAME} flag")
+        print("               Fix: update kiro-cli, or switch agent.acp_backend to kiro.")
+        issues.append(
+            f"kiro-cli is too old to select the KAS engine (no --{_KAS_ENGINE_FLAG_NAME})"
+        )
+    elif KAS_RELAY_ENGINE in help_text:
+        print(f"  engine:      ✅ {KAS_RELAY_ENGINE} supported")
     else:
-        expires = resp.get("expiresAt")
-        print(f"  token:       ✅ obtained via kiro-cli (expires {expires})")
+        print(f"  engine:      ❌ this kiro-cli does not offer engine {KAS_RELAY_ENGINE}")
+        print("               Fix: update kiro-cli, or switch agent.acp_backend to kiro.")
+        issues.append(f"kiro-cli does not support the KAS engine ({KAS_RELAY_ENGINE})")
+    print("  token:       ➖ owned by kiro-cli (see the sign-in check above)")
 
 
 def _doctor_agents_janitor(issues: list[str], sweep_backups: bool) -> None:
@@ -2127,9 +2725,11 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Dependencies ──
     print("Dependencies")
-    # kiro-cli is THE agent backend for the public build. claude-agent-acp is
-    # only the dormant protocol seam (re-registered by an internal companion),
-    # so report it as optional and report kiro-cli as the backend.
+    # kiro-cli is the DEFAULT agent backend and the floor every deployment keeps.
+    # Claude Code is selectable too (``BASELINE_SELECTABLE_BACKENDS``), so it is
+    # reported as a real optional backend -- present or absent -- rather than only
+    # when it happens to be installed. The verdict comes from the same owner the
+    # dashboard asks, so doctor and the panel cannot disagree.
     kiro = shutil.which(KIRO_CLI_BIN)
     if kiro:
         print(f"  kiro-cli:    ✅ {kiro}")
@@ -2149,12 +2749,10 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  kiro login:  ⚠️  could not check")
         _doctor_headless_auth(issues)
     else:
-        print("  kiro-cli:    ⏭  not found (the agent backend)")
+        print("  kiro-cli:    ⏭  not found (the default agent backend)")
         print("               Install kiro-cli per its docs, then: kiro-cli login")
 
-    claude_acp = shutil.which(_CLAUDE_ACP_BIN)
-    if claude_acp:
-        print(f"  claude-acp:  ✅ {claude_acp} (dormant seam — not used by the public core)")
+    _doctor_claude_backend()
 
     git = shutil.which("git")
     if git:
@@ -2304,11 +2902,20 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Stored defaults a release has since changed (#5244) ──
     render_doctor_section(issues)
 
+    # ── Installed services must carry the launch-class marker (#6651) ──
+    _doctor_managed_service_policy(issues)
+
     # ── Data Home (+ leftover legacy home) ──
     _doctor_data_home()
     _doctor_path_launcher()
     _doctor_trust_root()
     _doctor_strict_identity(cfg)
+
+    # ── Credentials (AWS / credential-vending MCP) ──
+    # After identity, before the agent-facing sections: this is the answer to
+    # "the agent says it cannot reach AWS", which is a credential-posture
+    # question rather than an agent one.
+    _doctor_credentials(issues)
 
     # ── Agents dir janitor (orphaned atomic-write temps + stale backups) ──
     _doctor_agents_janitor(issues, cfg.agent.sweep_agents_backups)
@@ -2330,6 +2937,11 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── kiro-cli installer residue (silent unless residue is on disk) ──
     _doctor_cli_installer_residue(issues)
 
+    # ── Cron job health (silent unless a job auto-paused or errored) ──
+    # Reads crons.json off disk, not the gateway API: the gateway's own
+    # per-job badge and hourly failure re-alert cannot report a wedged gateway.
+    _doctor_cron_health(issues)
+
     # ── Agent Spec Paths (dead command/args/env paths) ──
     # Own module + single call so a sibling sweep wiring into doctor rebases
     # trivially. Walks EVERY spec in the agents dir (not just kirocrew.json),
@@ -2347,10 +2959,14 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── MCP Tools ──
     print("\nMCP Tools")
     if agent_path.exists():
-        _doctor_mcp_tools(agent_path, issues)
+        # One gate snapshot for both sections, so a keystone flip landing
+        # between them cannot make the report contradict itself (see
+        # _doctor_gated_off_mcps).
+        gated_off = _doctor_gated_off_mcps()
+        _doctor_mcp_tools(agent_path, issues, gated_off=gated_off)
         # After the probe, deliberately: the probe reporting green is the exact
         # condition this section exists to explain.
-        _doctor_mcp_governance(agent_path, issues)
+        _doctor_mcp_governance(agent_path, issues, gated_off=gated_off)
 
     # ── Python Runtime ──
     print("\nRuntime")
@@ -2499,58 +3115,65 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Speech-to-Text (optional) ──
     print("\nSpeech-to-Text")
     stt_active = cfg.stt.enabled
-    needs_whisper = stt_active and cfg.stt.provider == "whisper"
-    needs_ffmpeg = stt_active  # both providers use ffmpeg
 
     if not stt_active:
-        print("  status:      ⏹ disabled (enable from dashboard → Overview → Slack)")
+        print("  status:      ⏹ disabled (enable from dashboard → Settings → Speech-to-Text)")
     else:
         print(f"  provider:    ✅ {cfg.stt.provider}")
 
-    # STT ships enabled-by-default, but neither whisper nor ffmpeg is on a stock
-    # Windows box and neither is a KiroCrew dependency there. Reporting them as
-    # hard issues makes `kirocrew doctor` exit 1 on a healthy first install, so
-    # the guide's `kirocrew doctor && kirocrew gateway` never launches the
-    # gateway. On Windows treat them as non-fatal notes; POSIX keeps failing so
-    # a real STT setup gap is still surfaced.
+    # Source installs may omit the optional voice extra. Preserve Windows's
+    # historical non-fatal report for that case so an enabled-by-default feature
+    # cannot block gateway startup; desktop releases gate both native components
+    # at build time and should never reach the missing branches.
     stt_fatal = not platform_compat.IS_WINDOWS
     stt_mark = "❌" if stt_fatal else "⚠️ "
 
-    whisper_bin = _find_whisper(cfg.stt.whisper_path)
-    if whisper_bin:
-        print(f"  whisper:     ✅ {whisper_bin}")
-    elif needs_whisper:
-        mark = stt_mark
-        print(f"  whisper:     {mark} not found")
-        print(
-            "               Fix: "
-            + _os_fix_hint(
-                "brew install openai-whisper",
-                "pipx install openai-whisper  (or pip install --user openai-whisper)",
-                windows="pip install openai-whisper",
+    if stt_active and cfg.stt.provider == "local":
+        engine = availability_detail(cfg.stt)
+        if engine.ok:
+            print("  engine:      ✅ local recogniser loadable (whisper.cpp, in-process)")
+        else:
+            print(f"  engine:      {stt_mark} {engine.detail}")
+            if stt_fatal:
+                issues.append(f"speech recogniser ({engine.code})")
+        # The weights are fetched on first use, so "not downloaded" is the normal
+        # first-run state and never an issue. Naming the size is the useful part,
+        # because that transfer is what a first dictation waits on.
+        model = stt.resolve_model(cfg.stt.model)
+        if stt.is_present(model):
+            print(f"  model:       ✅ {model.name} at {stt.models_dir() / model.filename}")
+        else:
+            print(
+                f"  model:       ⏹ {model.name} not downloaded yet "
+                f"({model.size_bytes // 1_000_000} MB, fetched on first use)"
             )
-        )
-        if stt_fatal:
-            issues.append("whisper")
-    else:
-        print("  whisper:     ⏭  not installed (not needed)")
 
     ensure_ffmpeg_in_path()
-    ffmpeg_bin = shutil.which("ffmpeg")
+    # The same resolver the transcode path uses, so what doctor REPORTS is what would
+    # actually be exec'd. A bare `which` here reported a PATH-chosen ffmpeg that
+    # `_find_ffmpeg` would decline, which is the more misleading of the two failures.
+    ffmpeg_bin = _find_ffmpeg()
     if ffmpeg_bin:
-        print(f"  ffmpeg:      ✅ {ffmpeg_bin}")
-    elif needs_ffmpeg:
-        mark = stt_mark
-        print(f"  ffmpeg:      {mark} not found")
-        print(
-            "               Fix: "
-            + _os_fix_hint(
-                "brew install ffmpeg",
-                "drop a static ffmpeg build into ~/.local/bin "
-                "(not in AL2023 repos; KiroCrew auto-detects it)",
-                windows="winget install Gyan.FFmpeg",
+        # The resolved path can contain a username or a credential-bearing mount
+        # name. Doctor only needs to confirm the exact resolver found a decoder.
+        print("  ffmpeg:      ✅ available")
+    elif stt_active:
+        # A prerequisite of every provider, not of one of them: a Slack voice memo
+        # arrives as ogg/Opus and the dashboard records webm, so the only input
+        # that reaches a recogniser without ffmpeg is a 16 kHz mono WAV.
+        print(f"  ffmpeg:      {stt_mark} not found")
+        if platform_compat.is_bundled_interpreter():
+            print("               Fix: reinstall Kiro Crew (the bundled audio decoder is missing)")
+        else:
+            print(
+                "               Fix: "
+                + _os_fix_hint(
+                    "brew install ffmpeg",
+                    "drop a static ffmpeg build into ~/.local/bin "
+                    "(not in AL2023 repos; Kiro Crew auto-detects it)",
+                    windows="winget install Gyan.FFmpeg",
+                )
             )
-        )
         if stt_fatal:
             issues.append("ffmpeg")
     else:
@@ -2566,7 +3189,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  transcribe:  ✅ amazon_transcribe importable (optional)")
         except ImportError:
             print("  transcribe:  ⏹ optional cloud STT not installed")
-            print("               Install: pip install 'kirocrew[voice]'")
+            print(f"               Install: {install_hint('voice-aws')}")
 
         try:
             import boto3  # noqa: F401
@@ -2574,20 +3197,25 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  boto3:       ✅ importable (optional)")
         except ImportError:
             print("  boto3:       ⏹ optional AWS SDK not installed")
-            print("               Install: pip install 'kirocrew[voice]'")
+            print(f"               Install: {install_hint('voice-aws')}")
 
-    # Parakeet (NVIDIA Parakeet via parakeet-mlx) is Apple-Silicon-only and, like
-    # mlx_whisper, installed out-of-band — so report its CLI the same way.
-    if stt_active and cfg.stt.provider == "parakeet":
-        parakeet_bin = _find_parakeet_mlx()
-        if parakeet_bin:
-            print(f"  parakeet:    ✅ {parakeet_bin}")
+    # Apple's on-device speech is a host capability rather than an install, so the
+    # only useful thing to print is the reason it cannot run. Reaching a not-ok
+    # state here means the operator selected a provider this machine does not
+    # support, which is a real configuration fault and not a first-run state.
+    #
+    # Deliberately fatal on EVERY platform, so it does not take the Windows
+    # downgrade above. That carve-out exists for prerequisites a user can simply
+    # install; this is a provider that cannot be made to work on the host at all,
+    # and reporting it as a note would have `kirocrew doctor` exit 0 on a
+    # configuration that can only ever fail at the first recording.
+    if stt_active and cfg.stt.provider == "apple":
+        apple = availability_detail(cfg.stt)
+        if apple.ok:
+            print("  apple:       ✅ on-device SpeechAnalyzer available")
         else:
-            mark = stt_mark
-            print(f"  parakeet:    {mark} parakeet-mlx not found")
-            print("               Fix: pipx install parakeet-mlx  (Apple Silicon only)")
-            if stt_fatal:
-                issues.append("parakeet-mlx")
+            print(f"  apple:       ❌ {apple.detail}")
+            issues.append(f"apple speech ({apple.code})")
 
     # ── Slack (optional) ──
     print("\nSlack Integration")

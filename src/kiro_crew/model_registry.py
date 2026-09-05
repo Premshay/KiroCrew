@@ -34,8 +34,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+from kiro_crew.atomic_write import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -228,8 +231,18 @@ def persist_kiro_windows() -> None:
 
     Separated from :func:`refresh_kiro_windows` so an async caller can offload
     ONLY this filesystem step to an executor while keeping the in-memory update
-    synchronous. Atomic (tmp + ``os.replace``); a persist failure is logged, not
-    raised — the in-memory cache is authoritative for this process either way.
+    synchronous. Atomic via the shared :func:`kiro_crew.atomic_write.atomic_write`
+    helper; a persist failure is logged, not raised — the in-memory cache is
+    authoritative for this process either way.
+
+    The helper replaces a hand-rolled temp-write-and-rename whose temp name was
+    derived from the destination (``model_windows.json.tmp``), so two processes
+    persisting the cache raced on one filename, and which missed the helper's
+    bounded retry for the Windows rename window. Durability and permission
+    semantics are unchanged: no ``fsync`` (best-effort by contract, per the note
+    above) and no explicit ``mode``, so the sidecar still lands at the umask
+    default. The helper creates the parent directory itself and raises ``OSError``
+    on failure — the same class the ``except`` below already absorbed.
 
     Thread-safety: this runs on an executor thread while ``refresh_kiro_windows``
     mutates ``_KIRO_WINDOWS`` on the event-loop thread. Snapshot with ``dict(...)``
@@ -240,13 +253,237 @@ def persist_kiro_windows() -> None:
     try:
         snapshot = dict(_KIRO_WINDOWS)  # atomic under the GIL; safe vs. concurrent mutation
         path = _kiro_windows_cache_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f)
-        tmp.replace(path)
+        atomic_write(path, json.dumps(snapshot))
     except OSError:  # pragma: no cover - disk full / perms
         logger.debug("Could not persist kiro window cache", exc_info=True)
+
+
+# ── Provider advertised-model cache (the authoritative per-provider id list) ──
+# The same principle as the kiro-window cache above, applied one level up: the
+# committed registry is a hand-maintained fallback and drifts from what a
+# provider actually serves, so the provider's OWN advertised model list is the
+# ground truth. kiro-cli advertises via ``chat --list-models``; claude-agent-acp
+# advertises its versioned list in the ``session/new`` response
+# (``AcpClient._capture_available_models``). This cache records those advertised
+# provider ids per provider so the consumers that used to read the static
+# ``available_models(provider)`` allowlist can read what the provider served
+# instead — chiefly the claude_code ``settings.local.json`` ``availableModels``
+# seed, which unlocks a model's real window and previously carried only the
+# registry's Anthropic ids (so a served-but-unlisted model, e.g. a new Opus,
+# collapsed to the base window).
+#
+# Runtime state, not committed data (like ``_KIRO_WINDOWS`` / session_map). A
+# corrupt/missing cache degrades silently to the registry allowlist and can
+# never brick import.
+_ADVERTISED_MODELS: dict[str, list[str]] = {}
+
+# Inference-profile prefixes stripped when folding an advertised provider id to
+# a comparison key. Longest-first so ``global.anthropic.`` wins over a bare
+# ``anthropic.`` that is a suffix of it.
+_PROVIDER_ID_PREFIXES: tuple[str, ...] = (
+    "global.anthropic.",
+    "us.anthropic.",
+    "eu.anthropic.",
+    "apac.anthropic.",
+    "anthropic.",
+)
+
+
+def _advertised_models_cache_path() -> Path:
+    """Path to the persisted advertised-model sidecar under the data home.
+
+    Resolved lazily (not at import), for the same reasons as
+    :func:`_kiro_windows_cache_path`: honour ``KIROCREW_HOME`` / test overrides
+    and never let home resolution break module import.
+    """
+    from kiro_crew.config.paths import config_dir
+
+    return config_dir() / "provider_models.json"
+
+
+def _load_advertised_models() -> None:
+    """Load the persisted advertised-model cache into ``_ADVERTISED_MODELS``.
+
+    Called once at import. A missing file is normal (first run); a corrupt file
+    is logged and ignored (degrade to the registry allowlist), never raised.
+    """
+    try:
+        path = _advertised_models_cache_path()
+        if not path.is_file():
+            return
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for provider, ids in data.items():
+                if isinstance(provider, str) and isinstance(ids, list):
+                    clean = [i for i in ids if isinstance(i, str) and i.strip()]
+                    if clean:
+                        _ADVERTISED_MODELS[provider] = clean
+    except (OSError, ValueError, TypeError):  # pragma: no cover - corrupt/absent cache
+        logger.debug("advertised-model cache unreadable; using registry allowlist", exc_info=True)
+
+
+_load_advertised_models()
+
+
+def refresh_advertised_models(provider: str, ids: Sequence[str]) -> bool:
+    """Ingest a provider's advertised model ids into the cache.
+
+    In-memory only (cheap, non-blocking) so it is safe to call from an async
+    handler and the cache is immediately consistent for callers on the same
+    tick. Returns ``True`` when the cache changed (a persist is warranted): the
+    async caller should then offload :func:`persist_advertised_models` to an
+    executor rather than block the event loop on disk I/O.
+
+    An empty ``ids`` is a no-op (a backend that advertised nothing must not wipe
+    a good cached list from a prior session) and returns ``False``. The stored
+    list is deduped preserving order.
+    """
+    clean: list[str] = []
+    seen: set[str] = set()
+    for i in ids:
+        if isinstance(i, str) and i.strip() and i not in seen:
+            seen.add(i)
+            clean.append(i)
+    if not clean:
+        return False
+    if _ADVERTISED_MODELS.get(provider) == clean:
+        return False
+    _ADVERTISED_MODELS[provider] = clean
+    return True
+
+
+def persist_advertised_models() -> None:
+    """Write the in-memory advertised-model cache to disk (best-effort, blocking).
+
+    Separated from :func:`refresh_advertised_models` so an async caller can
+    offload ONLY the filesystem step to an executor while keeping the in-memory
+    update synchronous. Atomic via :func:`kiro_crew.atomic_write.atomic_write`; a
+    persist failure is logged, not raised. Snapshot with ``dict(...)`` before
+    serializing so a concurrent refresh on the event-loop thread cannot raise
+    ``RuntimeError: dictionary changed size during iteration`` — mirrors
+    :func:`persist_kiro_windows`.
+    """
+    try:
+        snapshot = {p: list(v) for p, v in dict(_ADVERTISED_MODELS).items()}
+        path = _advertised_models_cache_path()
+        atomic_write(path, json.dumps(snapshot))
+    except OSError:  # pragma: no cover - disk full / perms
+        logger.debug("Could not persist advertised-model cache", exc_info=True)
+
+
+def advertised_models(provider: str) -> list[str]:
+    """The provider ids ``provider`` last advertised, or ``[]`` on a cold cache."""
+    return list(_ADVERTISED_MODELS.get(provider, ()))
+
+
+def _normalize_advertised_key(provider_id: str) -> str:
+    """Reduce a provider id to a spelling-agnostic comparison key.
+
+    Strips a leading inference-profile prefix and a trailing ``[1m]`` / ``-1m``
+    window marker, unifies ``.``/``-`` separators, and lowercases — so the
+    versioned id a backend advertises (``global.anthropic.claude-opus-5[1m]``)
+    and the bare id a caller may hold (``claude-opus-5``) fold to the same key
+    (``claude-opus-5``). Used only to match a stored id against the advertised
+    set; never persisted or sent on the wire.
+    """
+    s = provider_id.strip().lower()
+    for pfx in _PROVIDER_ID_PREFIXES:
+        if s.startswith(pfx):
+            s = s[len(pfx) :]
+            break
+    s = s.replace("[1m]", "")
+    s = re.sub(r"[-.]1m$", "", s)
+    s = s.replace(".", "-")
+    return s.strip("-")
+
+
+def _is_1m_id(model_id: str) -> bool:
+    """True if ``model_id`` names a 1M-window variant (``[1m]`` suffix or a
+    standalone ``1m`` token)."""
+    low = model_id.lower()
+    return "[1m]" in low or _has_1m_token(low)
+
+
+def _dedup_window_siblings(ids: Sequence[str]) -> list[str]:
+    """Drop a base-window id when a 1M-window sibling with the same base is present.
+
+    claude-agent-acp reads the ``[1m]`` suffix as a context-window MODIFIER on one
+    base model, not a distinct model, and merges ``availableModels``
+    union+dedup by base name. Seeding BOTH
+    ``global.anthropic.claude-opus-4-8[1m]`` (1M) and its 200K sibling
+    ``global.anthropic.claude-opus-4-8`` therefore lets the adapter's dedup pick
+    the base spelling and serve 200K for an Opus 4.8 pick. When two ids share a
+    normalized base key, keep only the 1M one; otherwise preserve order and drop
+    exact duplicates. Order-preserving, so ``available_models``' default-first head
+    (the 1M flagship) survives.
+    """
+    has_1m = {_normalize_advertised_key(m) for m in ids if _is_1m_id(m)}
+    out: list[str] = []
+    seen: set[str] = set()
+    for mid in ids:
+        key = _normalize_advertised_key(mid)
+        if key and not _is_1m_id(mid) and key in has_1m:
+            continue  # a 1M sibling supersedes this base-window spelling
+        if mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+    return out
+
+
+def seed_available_models(provider: str) -> list[str]:
+    """The ``availableModels`` allowlist to seed for ``provider``.
+
+    Provider-first: the ids ``provider`` actually advertised (cached from a live
+    session) when the cache is warm, so the seed reflects what the account is
+    served rather than the static Anthropic-only registry. Falls back to
+    :func:`available_models` on a cold cache (first-ever session, before any
+    ``session/new`` has been captured) — the static registry list, which is then
+    window-deduplicated below just like the warm list.
+
+    The result is passed through :func:`_dedup_window_siblings` so a base-window
+    id never rides alongside its 1M sibling: seeding both is what lets the adapter
+    collapse a versioned pick (e.g. Opus 4.8 ``[1m]``) back to 200K. Applied to
+    the advertised list too, since a backend can advertise both spellings.
+    """
+    cached = advertised_models(provider)
+    base = cached if cached else available_models(provider)
+    return _dedup_window_siblings(base)
+
+
+def resolve_wire_model_id(model_id: str, provider: str) -> str:
+    """Fold a stored provider-model id onto the spelling ``provider`` advertised.
+
+    An id the static registry does not carry (a newly-served model) reaches this
+    module as a bare passthrough from :func:`to_provider_id`; sent as-is it can
+    collapse to the base window because it never matches the versioned id in the
+    seeded ``availableModels``. When the provider advertised a matching id, this
+    returns that id instead, so the wire value and the seed agree on one exact
+    spelling.
+
+    Returns ``model_id`` UNCHANGED when it is empty / the ``auto`` sentinel, when
+    the provider advertised nothing (cold cache), when it is already an
+    advertised id, or when no advertised id shares its normalized key — i.e. it
+    only ever tightens a bare id onto an advertised versioned one, never rewrites
+    an id the provider does not serve. When several advertised ids match, a 1M
+    window variant wins over a base one.
+    """
+    if not model_id or model_id == "auto":
+        return model_id
+    adv = advertised_models(provider)
+    if not adv or model_id in adv:
+        return model_id
+    want = _normalize_advertised_key(model_id)
+    if not want:
+        return model_id
+    matches = [a for a in adv if _normalize_advertised_key(a) == want]
+    if not matches:
+        return model_id
+    matches.sort(
+        key=lambda a: (0 if ("[1m]" in a.lower() or _has_1m_token(a.lower())) else 1, len(a))
+    )
+    return matches[0]
 
 
 # ── Precomputed indices (built once; the registry is immutable after import) ──
@@ -595,6 +832,53 @@ def is_canonical_key(name: str) -> bool:
     Auto sentinel check for it separately.
     """
     return name in _REGISTRY
+
+
+# Region/vendor routing prefix a Bedrock inference-profile id carries
+# (``global.anthropic.claude-opus-4-8[1m]``, ``us.anthropic.…``). A
+# provider-prefixed id is not itself a registry key/alias, so :func:`canonical_key`
+# peels this and retries the lookup. Same shape the frontend shares via
+# ``fmtTurnModel`` (chat/AssistantMessage.tsx) and ``canonicalKey``
+# (providers/modelRegistry.ts).
+_ROUTING_PREFIX_RE = re.compile(
+    r"^(?:(?:us|eu|apac|global)\.)?(?:anthropic|amazon|openai|bedrock)\."
+)
+
+
+def canonical_key(name: str) -> str | None:
+    """Canonical registry key for ``name``, resolved provider-aware, or ``None``.
+
+    Resolution order is the acp (kiro-cli) index FIRST, then ``claude_code`` --
+    the SAME order :func:`_registry_window` uses, and for the same reason: the
+    ``claude_code`` index deliberately aliases kiro's distinct models onto one
+    canonical for claude-agent-acp dropdown dedup (``claude-haiku-4.5`` /
+    ``claude-sonnet-4.5`` / ``claude-sonnet-4`` -> ``sonnet-4.6-1m``;
+    ``claude-opus-4.6`` -> ``opus-4.8-1m``), while kiro -- the fork's shipping
+    harness -- serves each as a DISTINCT real model with its own acp-index
+    canonical entry. Resolving the acp view first keeps those apart.
+
+    Accepts a canonical key (resolves to itself), a registry alias, or a
+    per-provider id -- with or without a region/vendor routing prefix
+    (``us.anthropic.…``, ``global.anthropic.…``) -- and returns ``None`` for
+    anything the registry does not list. A provider-prefixed id is not itself a
+    registry key/alias, so the prefix is peeled and the lookup retried (the "fold
+    a provider/partition prefix" half of #5339). This is the single "which
+    registry model is this id?" fold shared by ``_normalize_model_key``
+    (dashboard/handlers/agents.py) and the frontend ``canonicalKey``
+    (providers/modelRegistry.ts) -- the peel lives HERE so any backend caller of
+    this documented fold gets both #5339 halves, not just the dashboard handler.
+    """
+    for provider in ("acp", "claude_code"):
+        key = _resolve_canonical(name, provider)
+        if key is not None:
+            return key
+    stripped = _ROUTING_PREFIX_RE.sub("", name)
+    if stripped != name:
+        for provider in ("acp", "claude_code"):
+            key = _resolve_canonical(stripped, provider)
+            if key is not None:
+                return key
+    return None
 
 
 def canonicalize_for_provider(stored_model: str, provider: str) -> str:

@@ -11,6 +11,8 @@ import { useRef, useCallback, useEffect, useMemo, type ReactNode } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { ArrowUp, Loader2 } from 'lucide-react'
 import ChatMessageList from './ChatMessageList'
+import { useChatScrollFollow } from './useChatScrollFollow'
+import { JumpToBottomButton } from './ChatScrollChrome'
 import FollowUpBar from '../components/FollowUpBar'
 import { deriveFollowUpOptions } from './protocol'
 import { useComposerDraft } from './useComposerDraft'
@@ -59,6 +61,11 @@ export interface ChatEmbedProps {
   aboveComposer?: ReactNode
 }
 
+/** Stable empty transcript. A fresh `[]` fallback would be a new identity on every
+ *  render, so `deriveFollowUpOptions` below would re-run (and hand FollowUpBar a new
+ *  options array) on every render of an embed whose poll has not answered yet. */
+const EMPTY_MESSAGES: ChatMessage[] = []
+
 /** Minimal shape of the chat-slot payload consumed by this embed. */
 interface ChatSlotData {
   messages?: ChatMessage[]
@@ -69,11 +76,17 @@ interface ChatSlotData {
 function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSend, aboveComposer }: ChatEmbedProps) {
   const api = useAppApi()
   const endRef = useRef<HTMLDivElement>(null)
-  const scrollerRef = useRef<HTMLDivElement>(null)
   const lastHashRef = useRef('')
-  // When startAtBottom is on, we stick the scroller to the bottom until the
-  // user scrolls up past the threshold; scrolling back down re-pins.
-  const pinnedRef = useRef(true)
+  // startAtBottom mode delegates stick-to-bottom follow to the shared hook
+  // (same FollowController semantics as ChatPane and the main chat): RO-driven
+  // re-pin on growth AND collapse, released only by a genuine user scroll up.
+  // `enabled` is the explicit mode switch — refs stay attached in both modes,
+  // and a disabled hook is fully inert (no mount pin, no ResizeObserver), so a
+  // top-anchored embed is never yanked by a resize. Non-startAtBottom embeds
+  // keep their own contract below — a deliberate smooth scroll to each NEW
+  // MESSAGE regardless of position.
+  const follow = useChatScrollFollow({ resetKey: slotKey, enabled: !!startAtBottom })
+  const scrollerRef = follow.scrollerRef
 
   const { data: slotData, refetch } = useQuery({
     queryKey: ['app-sdk-embed', slotKey],
@@ -84,14 +97,37 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
     },
   })
 
-  const messages = slotData?.messages ?? []
+  const messages = slotData?.messages ?? EMPTY_MESSAGES
   const running = slotData?.running ?? false
   const title = slotData?.title ?? ''
 
   /** Derived from the same helper the main chat and side panel use, so "options only
    *  after the answer settles" and "a later user message clears them" behave identically
    *  here too — an agent's follow-up choices should never be silently dropped just
-   *  because the surface embedding them is thinner. */
+   *  because the surface embedding them is thinner.
+   *
+   *  `followUpIsPlan` is DELIBERATELY dropped here (#6057): this embed is not a
+   *  plan-capable host, so a plan-shaped chip stays on the composer-draft path
+   *  instead of dispatching POST /api/chat/slots/{slot}/plan-action. Why that is
+   *  a recorded exclusion rather than a live mis-dispatch:
+   *  - The slot-detail payload this embed polls carries no `mode` field, so the
+   *    embed structurally lacks the orchestrator-mode gate the dispatch path
+   *    requires (ChatPane/ChatPage read the slot record's mode before
+   *    dispatching; there is no equivalent source here).
+   *  - Exposure is narrow: `api_chat_slot_detail` runs
+   *    `_deny_cross_app_slot_access`, so an app-token embed 404s on any foreign
+   *    or unscoped slot. That proves "not another surface's slot", not "never a
+   *    plan-bearing slot" — an app could create and embed its own
+   *    orchestrator-mode slot, which is exactly why the missing mode field
+   *    above, not the ownership guard, carries the exclusion.
+   *  - On hosts that DO dispatch, the `isPlanAction` allowlist keeps
+   *    non-protocol plan-shaped labels on the composer path; this file never
+   *    consults it because it never dispatches.
+   *  SideChat makes the same exclusion, silently — it also destructures only
+   *  `followUpOptions`, with no record there. If dashboard-token embeds ever
+   *  need working plan chips, the parity option is wiring `usePlanActionMutation`
+   *  plus a mode source into this file — a product decision, not an oversight.
+   *  Pinned by the plan-exclusion test in src/test/ChatEmbed.test.tsx. */
   const { followUpOptions } = useMemo(
     () => deriveFollowUpOptions(messages, running),
     [messages, running]
@@ -103,31 +139,16 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
   const { draft, setDraft, picked, toggleOption, composition, submitOnEnter } =
     useComposerDraft({ followUpOptions })
 
-  // Track whether the user is parked at the bottom (startAtBottom mode only).
-  useEffect(() => {
-    if (!startAtBottom) return
-    const el = scrollerRef.current
-    if (!el) return
-    const onScroll = () => {
-      pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
-    }
-    el.addEventListener('scroll', onScroll, { passive: true })
-    return () => el.removeEventListener('scroll', onScroll)
-  }, [startAtBottom, slotKey])
-
-  // Auto-scroll when new messages arrive.
+  // startAtBottom follow is owned by useChatScrollFollow (attached below).
+  // Non-startAtBottom embeds keep the message-arrival smooth scroll: it fires
+  // on NEW MESSAGES only (not on content growth) and deliberately scrolls
+  // regardless of position — a top-anchored embed announcing each reply.
   const msgHash = messages.length + ':' + (messages[messages.length - 1]?.content?.length || 0)
   useEffect(() => {
+    if (startAtBottom) return
     if (msgHash === lastHashRef.current) return
     lastHashRef.current = msgHash
-    if (startAtBottom) {
-      // Instant jump on first paint + stick-to-bottom while streaming, unless
-      // the user has scrolled up to read (pin released).
-      const el = scrollerRef.current
-      if (el && pinnedRef.current) el.scrollTop = el.scrollHeight
-    } else {
-      endRef.current?.scrollIntoView({ behavior: 'smooth' })
-    }
+    endRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [msgHash, startAtBottom])
 
   const sendMutation = useMutation({
@@ -193,6 +214,32 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
     [approveMutation],
   )
 
+  // Batch resolver (Req 4.1-4.4): apply one decision to every pending approval
+  // in a group. Each id goes through the SAME slot-scoped approve endpoint the
+  // single path uses (POST /api/chat/slots/{slot}/approve with request_id) —
+  // Task 4 mandates the slot-scoped path for batches, never the bare id-scoped
+  // one-shot resolve (which matches slot futures by bare id with no session
+  // check). Uses allSettled, NOT a fail-fast loop: a call whose verdict changed
+  // between surfacing and resume (Req 4.3-4.4) is surfaced as an excluded
+  // rejection instead of aborting the batch with earlier ids already approved.
+  // Rejects (so the row rolls back) only if EVERY call failed; a partial
+  // success settles as resolved and refetch reconciles the still-pending rows.
+  const approveBatch = useCallback(
+    async (approvalIds: string[], decision: string) => {
+      const results = await Promise.allSettled(
+        approvalIds.map(id => api.post(`/api/chat/slots/${encodeURIComponent(slotKey)}/approve`, {
+          action: decision,
+          request_id: id,
+        })),
+      )
+      void refetch()
+      const rejected = results.filter(r => r.status === 'rejected')
+      if (rejected.length === approvalIds.length) throw (rejected[0] as PromiseRejectedResult).reason
+      return results
+    },
+    [api, slotKey, refetch],
+  )
+
   return (
     <div className={`flex flex-col h-full min-h-0 overflow-hidden ${frameless ? '' : 'border border-border rounded-lg bg-bg'}`}>
       {!frameless && (
@@ -204,16 +251,24 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
         </div>
       )}
 
-      <div ref={scrollerRef} className="flex-1 overflow-y-auto py-4 min-h-0">
+      <div ref={scrollerRef} onScroll={follow.onScroll} className="flex-1 overflow-y-auto py-4 min-h-0">
+        <div ref={follow.contentRef}>
         {messages.length === 0 && !running && (
           <div className="text-center text-muted text-[13px] py-10">{i18nT('appSdk.chatEmbed.session_ready_type_a_message_to_start')}</div>
         )}
         {/* canTrust: this embed's approve routes through the slot approve
             endpoint (above), which records standing trust — the one mount
             allowed to offer the tier (#5434). */}
-        <ChatMessageList messages={messages} running={running} onApprove={approve} canTrust />
+        <ChatMessageList messages={messages} running={running} onApprove={approve} onApproveBatch={approveBatch} canTrust />
         <div ref={endRef} />
+        </div>
       </div>
+
+      {startAtBottom && (
+        <div className="relative">
+          <JumpToBottomButton visible={!follow.isAtBottom && messages.length > 0} onClick={follow.scrollToBottom} />
+        </div>
+      )}
 
       {aboveComposer && <div className="shrink-0">{aboveComposer}</div>}
 

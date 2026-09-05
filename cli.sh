@@ -12,7 +12,7 @@
 # venv). No unsigned/checksum-only fallback exists. Unlike install.sh (which
 # builds from a git clone), this pulls the published wheel.
 #
-# Python: uses the system interpreter (>=3.10) when one exists; otherwise — or
+# Python: uses the system interpreter (>=3.12) when one exists; otherwise — or
 # always, with --managed-python — provisions a python-build-standalone CPython
 # via a SHA-256-pinned uv into a user-owned directory. No package manager, no
 # sudo, works on old-glibc distros (CentOS 7).
@@ -171,11 +171,12 @@ else err "need sha256sum or shasum to verify the download"; fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-# KiroCrew needs Python >=3.10 at runtime (contextlib.aclosing, etc.) even
-# though older published wheels' METADATA claimed >=3.9 -- pip would install
-# fine on 3.9 and then crash on first run. Prefer the newest interpreter the
-# project builds and tests on (3.12 is the CI target); 3.13 is untested and
-# only a last resort before bare python3, which itself only counts if >=3.10.
+# Kiro Crew needs Python >=3.12 at runtime -- that is what every release
+# artifact bundles and the only version CI tests, and older published wheels'
+# METADATA claimed a lower floor, so pip would install fine and then crash on
+# first run. Prefer the exact interpreter the project builds and tests on
+# (3.12); 3.13 is untested and only a last resort before bare python3, which
+# itself only counts if >=3.12.
 # A version-manager shim (mise, pyenv, asdf) can wedge instead of answering --
 # notably when HOME does not hold the config the shim expects -- and an
 # unbounded probe then hangs the whole install on its FIRST candidate,
@@ -194,13 +195,13 @@ _py_usable() {
   if [ -n "$_PY_PROBE_TIMEOUT" ]; then
     # Unquoted on purpose: expands to two words, or to nothing when unavailable.
     # shellcheck disable=SC2086
-    $_PY_PROBE_TIMEOUT "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null
+    $_PY_PROBE_TIMEOUT "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null
     return $?
   fi
   # No `timeout` binary (stock macOS): emulate the same 5s bound with a POSIX
   # watchdog, so a wedged version-manager shim still fails over to the next
   # candidate instead of hanging the install on its first probe.
-  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' >/dev/null 2>&1 &
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,12) else 1)' >/dev/null 2>&1 &
   _py_pid=$!
   (
     # On TERM from the fast-exit path below, kill our own in-flight `sleep`
@@ -230,7 +231,7 @@ _py_usable() {
 
 # Resolve the newest supported interpreter into PY (left empty if none found).
 _resolve_python() {
-  for _c in python3.12 python3.11 python3.10 python3.13 python3; do
+  for _c in python3.12 python3.13 python3; do
     if _py_usable "$_c"; then PY="$_c"; return 0; fi
   done
   return 1
@@ -324,15 +325,15 @@ fi
 if [ "$MANAGED_PYTHON" = "1" ]; then
   echo "managed-python: skipping system interpreters."
   _provision_python_via_uv \
-    || err "could not provision a managed Python via uv. Check the network connection, or install Python >=3.10 yourself and re-run without --managed-python."
+    || err "could not provision a managed Python via uv. Check the network connection, or install Python >=3.12 yourself and re-run without --managed-python."
 else
   _resolve_python || true
   if [ -z "$PY" ]; then
-    echo "No system Python >=3.10 found; provisioning one via uv ..."
+    echo "No system Python >=3.12 found; provisioning one via uv ..."
     _provision_python_via_uv || true
   fi
 fi
-[ -n "$PY" ] || err "Python >=3.10 is required and could not be found or provisioned. Install Python 3.10+ yourself (your distro's packages, or https://www.python.org/downloads/), then re-run."
+[ -n "$PY" ] || err "Python >=3.12 is required and could not be found or provisioned. Install Python 3.12+ yourself (your distro's packages, or https://www.python.org/downloads/), then re-run."
 
 # Materialize and self-check the embedded trust root. The key id is the SHA-256
 # fingerprint of SubjectPublicKeyInfo DER, so an accidental edit to either
@@ -381,6 +382,10 @@ expected = {
     "algorithm", "channel", "key_id", "pub_date", "python_requires",
     "schema", "sha256", "signature", "version", "wheel_url",
 }
+# Signed-but-optional: a breaking release adds a fleet floor. The signature
+# still covers it (it stays in the canonical payload below), so the set check
+# tolerates exactly this key and nothing else.
+optional = {"min_version"}
 
 def no_duplicates(pairs):
     value = {}
@@ -395,7 +400,9 @@ try:
     if len(raw) > 65536:
         raise ValueError("oversized manifest")
     manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=no_duplicates)
-    if not isinstance(manifest, dict) or set(manifest) != expected:
+    if not isinstance(manifest, dict):
+        raise ValueError("unexpected fields")
+    if not expected <= set(manifest) or set(manifest) - expected - optional:
         raise ValueError("unexpected fields")
     if not all(isinstance(value, str) and value for value in manifest.values()):
         raise ValueError("invalid field type")
@@ -446,8 +453,9 @@ expected_fields = {
     "algorithm", "channel", "key_id", "pub_date", "python_requires",
     "schema", "sha256", "version", "wheel_url",
 }
+optional_fields = {"min_version"}
 try:
-    if set(payload) != expected_fields:
+    if not expected_fields <= set(payload) or set(payload) - expected_fields - optional_fields:
         raise ValueError
     if payload["channel"] != expected_channel:
         raise ValueError
@@ -455,6 +463,12 @@ try:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+]{0,127}", version) is None:
         raise ValueError
     if pinned_version and version != pinned_version:
+        raise ValueError
+    # The floor is metadata for RUNNING installs; this installer always
+    # installs the signed version itself, so format is all it checks.
+    if "min_version" in payload and re.fullmatch(
+        r"[0-9]+(?:\.[0-9]+)*", payload["min_version"]
+    ) is None:
         raise ValueError
     if re.fullmatch(r"[0-9a-f]{64}", payload["sha256"]) is None:
         raise ValueError
@@ -542,6 +556,41 @@ else
   "$PY" -m venv "$VENV"
   "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
   "$VENV/bin/pip" install --quiet "$WHL"
+  # Keep the stable launch path (`${VENV}-current`) naming the tree that holds
+  # the LAST-INSTALLED version. The gateway's shadow-venv updater
+  # (kiro_crew/platform/wheel_engine.py) promotes this same symlink to a fresh
+  # versioned tree; a later re-run of this installer writes into the fixed
+  # $VENV again, so without this repoint the stable link would keep naming the
+  # older versioned tree and a gateway restart would resurrect it. Replaced
+  # atomically (sibling symlink + rename) via the interpreter because POSIX
+  # `mv` onto a symlink-to-directory moves INTO the target and `ln -sfn` has
+  # an unlink/create window. A real directory at the stable name is corrupt
+  # state and is left alone — the updater refuses it too, so nothing consumes
+  # it. Failure is non-fatal: the stable link is an optimization layer, and
+  # the direct launcher symlink below keeps working without it.
+  _VENV_CURRENT="${VENV%/}-current"
+  if [ -L "$_VENV_CURRENT" ] || [ ! -e "$_VENV_CURRENT" ]; then
+    "$PY" -c 'import os,sys
+target, link = os.path.abspath(sys.argv[1]), sys.argv[2]
+tmp = f"{link}.{os.getpid()}.new"
+try:
+    # PID reuse can leave a stale tmp from a killed installer at this exact
+    # name; without removing it first os.symlink raises EEXIST, os.replace is
+    # skipped, and the restart stays pinned to the old version. Mirrors the
+    # pre-unlink the wheel-engine promote/launcher paths already do.
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    os.symlink(target, tmp)
+    os.replace(tmp, link)
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+' "$VENV" "$_VENV_CURRENT" || echo "WARNING: could not update $_VENV_CURRENT; continuing." >&2
+  fi
   mkdir -p "$HOME/.local/bin"
   ln -sf "$VENV/bin/kirocrew" "$HOME/.local/bin/kirocrew"
   BIN="$HOME/.local/bin"

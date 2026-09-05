@@ -11,6 +11,7 @@ import re
 import threading
 import time
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import TYPE_CHECKING
 from kiro_crew import model_registry
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.cron import get_local_tz
@@ -273,6 +275,44 @@ def _neutralize_structural_markers(text: str) -> str:
     return _apply_marker_spans(text, _structural_marker_spans(text))
 
 
+def _post_compaction_checkpoint_context(checkpoint: Mapping[str, object] | None) -> str:
+    """Format the current session's latest durable checkpoint for one restore turn."""
+    if checkpoint is None:
+        return ""
+
+    def _text(name: str) -> str:
+        value = checkpoint.get(name)
+        return value.strip() if isinstance(value, str) else ""
+
+    summary = _text("summary")
+    if not summary:
+        return ""
+
+    lines = [
+        (
+            "This is the latest checkpoint saved by this same session before compaction. "
+            "Treat it as background state, not a new request."
+        ),
+        f"Summary: {summary}",
+    ]
+    if goal := _text("goal"):
+        lines.append(f"Goal: {goal}")
+    raw_items = checkpoint.get("main_items")
+    if isinstance(raw_items, list):
+        items = [item.strip() for item in raw_items if isinstance(item, str) and item.strip()]
+        if items:
+            lines.append("Current work:")
+            lines.extend(f"- {item}" for item in items)
+    raw_trail = checkpoint.get("trail")
+    if isinstance(raw_trail, list):
+        milestones = [item.strip() for item in raw_trail if isinstance(item, str) and item.strip()]
+        if milestones:
+            lines.append(f"Latest milestone: {milestones[-1]}")
+    if next_action := _text("next_action"):
+        lines.append(f"Next action: {next_action}")
+    return "\n".join(lines)
+
+
 # kiro-cli task_executor slices strings at fixed byte offsets (e.g. 4096).
 # Multi-byte UTF-8 chars straddling the boundary cause a Rust panic:
 #   "byte index 4096 is not a char boundary; it is inside '—'"
@@ -311,6 +351,38 @@ _MULTIBYTE_TABLE = str.maketrans(
 # skills+steering pushed the total over. Independent caps (per the design) are
 # what make usage-ranked top-K meaningful; the cost is a larger startup
 # context (the sum), NOT a smaller memory budget.
+def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None) -> bool:
+    """Whether the configured member backend can mount the dispatch tools.
+
+    The member operating-mode block teaches ``session_*`` tools that arrive as
+    a per-session mount — a capability only wire-capable backends have. When
+    ``agent.member_acp_backend`` resolves outside that set (governance refusal,
+    unknown value degrading to kiro), the tools are simply not mounted, and
+    injecting instructions for tools the session does not hold would send the
+    member chasing refusals. Fail-safe both ways: on any resolution error the
+    block is withheld, which degrades to plain chat rather than to a lie.
+
+    ``cfg`` lets a caller that already loaded the config share the handle —
+    the context builder calls this once per member turn, so a second disk
+    read would be pure waste.
+    """
+    try:
+        from kiro_crew.acp_backends import (
+            ACP_BACKENDS_MEMBER_DISPATCH,
+            resolve_selected_backend,
+        )
+
+        if cfg is None:
+            from kiro_crew.config import KiroCrewConfig
+
+            cfg = KiroCrewConfig.load()
+        backend = resolve_selected_backend(cfg.agent.member_acp_backend)
+        return backend in ACP_BACKENDS_MEMBER_DISPATCH
+    except Exception:
+        logger.debug("member backend capability check failed", exc_info=True)
+        return False
+
+
 def _budget(fraction: float) -> int:
     """A section char cap as a percentage of the budget base."""
     return int(_CONTEXT_BUDGET_BASE * fraction)
@@ -944,6 +1016,43 @@ _UI_LANGUAGE_CATALOGS = frozenset(
 )
 
 
+def normalize_ui_language_tag(value: object, *, source: str = "language") -> str:
+    """Admit an arbitrary value as a usable UI language tag, or return ``""``.
+
+    The single gate a BCP-47 tag passes to become a *usable* UI language,
+    whatever its provenance: the persisted ``dashboard.language`` (see
+    :func:`ui_language_tag`) or a value handed over by a caller — e.g. a
+    request-scoped hint carrying the language a browser already resolved for
+    itself, which is the only way the backend can learn an implicitly chosen
+    language at all. Both clear the identical bar deliberately: the frontend
+    admits a language through exactly one gate, and a second, laxer copy here
+    would let the two disagree about what the active language is (#1130).
+
+    Rejected as ``""``: a non-string, a blank, a value that is not tag-shaped
+    (``_UI_LANGUAGE_TAG_RE``), and a shape-valid tag naming no shipped catalog
+    (``_UI_LANGUAGE_CATALOGS``) — the last because steering a model to a
+    language the chrome around it cannot render puts two languages on one
+    screen. ``""`` therefore always means "no usable language", never "English";
+    callers must treat it as unknown.
+
+    ``source`` labels the provenance in the debug line only — it never changes
+    the verdict.
+    """
+    if not isinstance(value, str):
+        return ""
+    tag = value.strip()
+    if not tag or not _UI_LANGUAGE_TAG_RE.match(tag):
+        return ""
+    if tag not in _UI_LANGUAGE_CATALOGS:
+        # Debug, not warning: this fires on every context build for as long as
+        # the value stays persisted, and the UI itself already degraded to
+        # auto-detect — but without a line here an operator cannot distinguish
+        # "not configured" from "rejected" when the steer is absent.
+        logger.debug("%s %r names no shipped catalog; not steering", source, tag)
+        return ""
+    return tag
+
+
 def ui_language_tag(cfg: "KiroCrewConfig") -> str:
     """Return ``dashboard.language`` as a validated, *shipped* tag, or ``""``.
 
@@ -968,22 +1077,12 @@ def ui_language_tag(cfg: "KiroCrewConfig") -> str:
     ``""`` means "the backend does not know" — nothing was chosen (the
     "follow the browser" sentinel, resolved in the SPA's ``resolveLanguage()``),
     the stored value is not tag-shaped, or it names no shipped catalog. Callers
-    must treat it as unknown rather than as English.
+    must treat it as unknown rather than as English. A caller that CAN learn an
+    unconfigured browser's resolved language (a request-scoped hint) validates it
+    through the same :func:`normalize_ui_language_tag` gate this delegates to,
+    so config and hint can never disagree about what counts as usable.
     """
-    lang = cfg.dashboard.language
-    if not isinstance(lang, str):
-        return ""
-    lang = lang.strip()
-    if not lang or not _UI_LANGUAGE_TAG_RE.match(lang):
-        return ""
-    if lang not in _UI_LANGUAGE_CATALOGS:
-        # Debug, not warning: this fires on every context build for as long as
-        # the value stays persisted, and the UI itself already degraded to
-        # auto-detect — but without a line here an operator cannot distinguish
-        # "not configured" from "rejected" when the steer is absent.
-        logger.debug("dashboard.language %r names no shipped catalog; not steering", lang)
-        return ""
-    return lang
+    return normalize_ui_language_tag(cfg.dashboard.language, source="dashboard.language")
 
 
 def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
@@ -1041,6 +1140,27 @@ def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
     )
 
 
+def steering_target_admissible(resolved: Path, base: Path | None = None) -> bool:
+    """Admission gate for a steering document's RESOLVED path.
+
+    The session loader (:func:`_load_steering_resources`) admits a glob hit —
+    symlinks included, since ``Path.resolve()`` follows them — when the target
+    stays under the trust base, is a regular file, and is not a sensitive
+    location. *base* defaults to ``$HOME``, the loader's own anchor; the
+    dashboard's steering listing admits a leaf symlink through this same
+    predicate with the source's LINK trust base (``$HOME`` for ``user``, the
+    steering root itself for ``workspace``), so a repository-committed link
+    can never read outside the root it ships in, and the ``user`` case cannot
+    disagree with what the loader injects.
+    """
+    base_resolved = str((base or Path.home()).resolve()) + os.sep
+    return (
+        str(resolved).startswith(base_resolved)
+        and resolved.is_file()
+        and not is_sensitive_path(str(resolved))
+    )
+
+
 def _load_steering_resources() -> str:
     """Load steering files from the agent config's resources array.
 
@@ -1053,24 +1173,33 @@ def _load_steering_resources() -> str:
         cfg_path = kiro_agents_dir() / "kirocrew.json"
         if not cfg_path.exists():
             return ""
-        cfg = json.loads(safe_read_file(str(cfg_path)))
+        # The agents dir is user-writable and shared with other tools, so the
+        # spec goes through the hardened agent-spec reader. ``safe_read_file``
+        # screened the resolved target but read it with an unbounded
+        # ``fh.read()`` -- the size cap guards ``safe_read_file_bytes``, the
+        # other helper -- and emitted no SEL event, so an oversized spec was
+        # still read whole here and a refusal was never audited. Every outcome
+        # the blanket ``except`` below used to absorb (PermissionError on a
+        # sensitive target, AttributeError on non-object JSON) now arrives as
+        # ``None`` and returns the same empty string, without the read.
+        from kiro_crew.agent_discovery import _read_agent_spec
+
+        cfg = _read_agent_spec(
+            cfg_path,
+            operation="steering_resources",
+            source="unknown",
+        )
+        if cfg is None:
+            return ""
         resources = cfg.get("resources", [])
         parts: list[str] = []
-        home_resolved = str(Path.home().resolve()) + os.sep
         for res in resources:
             if not isinstance(res, str) or not res.startswith("file://"):
                 continue
             raw_pattern = res.removeprefix("file://")
             base = Path.home()
             for p in sorted(base.glob(raw_pattern)):
-                resolved = p.resolve()
-                if not str(resolved).startswith(home_resolved):
-                    continue
-                if (
-                    resolved.is_file()
-                    and p.suffix == ".md"
-                    and not is_sensitive_path(str(resolved))
-                ):
+                if p.suffix == ".md" and steering_target_admissible(p.resolve()):
                     try:
                         parts.append(safe_read_file(str(p)))
                     except PermissionError:
@@ -1137,6 +1266,17 @@ _CRITICAL_RULES_TAIL = (
     '"Yes, delete it"). Never phrase a label in your own voice or as your own '
     'next action ("I\'ll merge it", "Let me show the diff", "I can rebase '
     'first"), and never phrase it as a question back to the user.\n'
+    "Every option must be SELF-CONTAINED: each rendered chip carries its own "
+    "send control, so the user can send any single option alone, and ONLY that "
+    "option's text is sent -- none of its siblings come with it. Never write "
+    'an option that only makes sense combined with another one ("Build the '
+    'widget" | "Include the stop button too" -- sent alone, the second names '
+    "no action). Fold the shared base action into each label instead "
+    '("Build the widget with the stop button included").\n'
+    "Keep each option label SHORT -- aim for at most 8 words. The chip row "
+    "renders each label on a single line, so a long label displays cut off; "
+    "put supporting detail in the message body before the [OPTIONS:] line and "
+    "keep the label itself to the bare instruction.\n"
     "[END CRITICAL RULES]\n\n"
 )
 # The dashboard variant is the module's canonical block: tests and the
@@ -1791,7 +1931,11 @@ class ContextBuilder:
             self._bot_name = bot_name
         else:
             cfg = KiroCrewConfig.load()
-            self._bot_name = "KiroCrew" if cfg.agent.provider == "claude_code" else "Kiro"
+            provider = cfg.agent.provider
+            # The joined spelling is the {bot_name} value the prompt
+            # substitutes, not prose about the product: respelling it would
+            # change what the model is told to answer to.
+            self._bot_name = "KiroCrew" if is_claude_code(provider) else "Kiro"  # brand-ok
         # Register default memory in the workspace cache
         _memory_stores["default"] = self.memory
 
@@ -1852,17 +1996,20 @@ class ContextBuilder:
                 'or any content that fails the test: "would the reader be '
                 'stuck without this line?"\n'
                 "- Code blocks and commands are the answer — never cut them.\n"
-                "- Never compress for brevity: security warnings, "
-                "irreversible-action confirmations, and ordered multi-step "
-                "instructions where a dropped step causes a mistake. Those "
-                "stay complete, and code, commands, paths, identifiers and "
-                "error strings stay verbatim.\n"
+                "- Stakes change what you must not omit, never the length: "
+                "security warnings and irreversible-action confirmations "
+                "always appear, each as one line naming the call, the risk, "
+                "and whether it can be undone; the mechanism and the failure "
+                "modes are not required. Ordered multi-step instructions "
+                "where a dropped step causes a mistake stay complete, and "
+                "code, commands, paths, identifiers and error strings stay "
+                "verbatim.\n"
                 "- When the user ASKS for something long (design doc, tutorial, "
                 "full implementation), ignore these constraints and deliver "
                 "what was asked.\n"
                 "- Required output formats are sacred and never cut: "
                 "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
-                "URLs, security warnings, and any format the rendering surface "
+                "URLs, and any format the rendering surface "
                 "needs. These go in their required position regardless of "
                 "brevity.\n"
                 "- Preserve the user's language."
@@ -1890,9 +2037,13 @@ class ContextBuilder:
                 "verbatim and complete. Brevity is for prose, never correctness.\n"
                 "- Preserve the user's language; compress the style, not the "
                 "content.\n\n"
-                "Ignore concise mode and keep full detail for: security warnings, "
-                "irreversible-action confirmations, and multi-step instructions "
-                "where order or omissions could cause a mistake."
+                "Stakes change what concise mode must not omit, never how "
+                "long it may run: security warnings and irreversible-action "
+                "confirmations always appear, each as one line naming the "
+                "call, the risk, and whether it can be undone; the mechanism "
+                "and the failure modes are not required. Likewise, multi-step "
+                "instructions where order or omissions could cause a mistake "
+                "stay complete."
             )
         elif verbosity == "answer_only":
             verbosity_block = (
@@ -1910,27 +2061,70 @@ class ContextBuilder:
                 "are about to do, what you just did, rationale, alternatives "
                 "you rejected, caveats, trade-offs, unprompted next steps, and "
                 "closing offers to help.\n"
-                "- A change, a command, or a value IS the answer. Show it and "
-                "stop; do not narrate it.\n"
+                "- Whatever the user needs in order to know or to act IS the "
+                "answer — a change, a command, a value, a verdict. Lead with "
+                "it and stop; do not narrate it. The work that produced it — "
+                "the evidence, the search, the options you weighed — is "
+                "explanation, so it is opt-in like the rest. Naming your "
+                "findings is not naming the answer: if the user has to derive "
+                "it from what you found, you have not answered.\n"
                 "- One exception to stopping: when that command or change "
                 "destroys, overwrites or rewrites something, the undo path "
                 "rides along with it in the same reply — how to get it back, "
                 "or plainly that you cannot. One clause is enough. A "
                 "destructive one-liner handed over with no undo path is not a "
                 "terse answer, it is a trap.\n"
-                "- Plain words, short sentences. Brevity is not enough — a "
-                "short reply can still be dense and unreadable. Drop jargon "
-                "that dresses up a simple point, hedges, and repetition; a "
-                "technical term stays only when it IS the fact, not when it is "
-                "decoration.\n"
+                "- Plain words, short sentences, and the point at the front of "
+                "each one. Plain does not mean childish — write for a capable "
+                "reader in a hurry, not for a five-year-old. Brevity is not "
+                "enough: a short reply can still be dense and unreadable. Put "
+                "what the user must know in the first few words and stop; do "
+                "not make them assemble it across clauses chained with here, "
+                "then, but, so that or which means, and do not frame a fact as "
+                "a correction of something they never said (“this is not X, "
+                "it's Y” — just say Y). Drop jargon that dresses up a simple "
+                "point, hedges, and repetition; a technical term stays only "
+                "when it IS the fact, not when it is decoration. If a sentence "
+                "has to be read twice to find the point, rewrite it.\n"
                 "- Answer the question that was asked and nothing adjacent. "
                 "Take a position instead of listing options.\n"
+                "- Stopping or deviating is still an answer, not a case to "
+                "argue. LEAD WITH THE ACTION you recommend, as one plain "
+                "imperative sentence — not with what you found, not with "
+                "the situation. Then at most two sentences of the state that "
+                "makes that action necessary, and stop. What led there — "
+                "what you found, what it collides with, why the old plan no "
+                "longer fits, why your call is right — is explanation, "
+                "and stays opt-in like the rest. Justifying a deviation feels "
+                "mandatory; it is not, and the derivation buries the one thing "
+                "the user has to decide.\n"
                 "- Code, commands, paths, identifiers, error strings and file "
                 "contents stay verbatim and complete — this mode cuts prose, "
-                "never payload.\n"
-                "- The moment the user asks why, asks you to explain, or asks "
-                "for a doc, review, walkthrough or deep dive, this mode is off "
-                "for that reply: give the full detail they asked for.\n\n"
+                "never payload. Payload is what the user asked for or has to "
+                "act on. Material you quote to prove a point is evidence, not "
+                "payload, and evidence is opt-in: leave it out and offer it.\n"
+                "- One sentence per thing you are telling them. The verdict is "
+                "a sentence; each recommendation is a sentence; each item in a "
+                "list is a sentence. This bounds each item, not the reply, so "
+                "a procedure that genuinely needs seven steps gets seven "
+                "one-sentence steps — but a reply that has grown sections, "
+                "numbered findings or bullets with sub-bullets is a report, "
+                "and the answer is buried inside it.\n"
+                "- Verify against the real thing, then answer without showing "
+                "the work. Reading the code, the log or the document is what "
+                "keeps you from being wrong; a file path, a line number, a "
+                "quoted function or a count of the steps you took only shows "
+                "that you read it. Say what the thing does, not where you "
+                "found it, and hand the reference over when the user asks to "
+                "check it.\n"
+                "- A request for the reason is not a request for a document. "
+                "When the user asks why, or asks you to explain something, the "
+                "reason turns ON and every length rule stays in force: a few "
+                "plain sentences, one per point, and nothing adjacent to what "
+                "they asked. Only an explicit request for depth — a doc, a "
+                "review, a walkthrough, a deep dive, in detail, everything — "
+                "lifts the bound, and for that reply this mode is off: give "
+                "the full detail they asked for.\n\n"
                 "Explaining in full, unasked, is the rare exception — not a "
                 "lane you look for. The default, even for judgement calls, is "
                 'the terse answer plus a one-line offer (e.g. "say why for '
@@ -2067,7 +2261,7 @@ class ContextBuilder:
         deployment's effective window), leaving that path byte-for-byte
         unchanged.
 
-        All providers — including ``provider_type="claude_code"`` — receive the
+        All providers — including Claude Code — receive the
         same injected context (critical rules, thread history, memory, skills,
         lessons); steering files are the one exception (see below). This keeps
         Claude Code at parity with kiro so dashboard/Slack UI contracts (diff
@@ -2076,7 +2270,7 @@ class ContextBuilder:
 
         *provider_type* is consumed again for the steering gate only: the
         steering block below is injected solely on the CC backend
-        (``provider_type == "claude_code"``). kiro-cli loads an agent's
+        (``is_claude_code(provider_type)``). kiro-cli loads an agent's
         ``resources`` natively when spawned with ``--agent`` (acp/client.py
         ``_spawn``), so re-injecting steering on the ACP/kiro backend would
         duplicate what kiro already loaded; the CC backend (claude-agent-acp)
@@ -2100,7 +2294,7 @@ class ContextBuilder:
         and hooks are injected for all agents.
         """
         is_custom = agent and agent != "kirocrew"
-        is_cc = provider_type == "claude_code"
+        is_cc = is_claude_code(provider_type)
         caps = _resolve_caps(model_window)
         parts: list[str] = []
 
@@ -2198,12 +2392,50 @@ class ContextBuilder:
                 f"or the task requires it.\n\n"
             )
 
+        # Crew-member operating mode — injected only for a member's pinned DM
+        # session (mode carries the slot's mode; "member" slots are born only
+        # through the members thread route). The member is a CONTROLLER: its
+        # DM thread stays the identity/management loop while real work runs in
+        # worker sessions it dispatches and patrols. The session_* tools this
+        # block names arrive as a per-session mount of the dashboard
+        # session-control server (members.member_dispatch_session_server), and
+        # the server authorizes member callers automatically
+        # (dashboard/session_control.py), bounded to sessions the member
+        # created itself — so the instructions hold with zero configuration.
+        #
+        # circular import: members' module graph is heavy and this file
+        # sits below it in the layering (the same cycle-break
+        # chat_persistence uses for the members module).
+        from kiro_crew.members import DM_SLOT_MODE as _member_mode
+
+        # User-profile / skills config, loaded once and ALSO consulted by the
+        # member capability gate below — one read per context build.
+        _cfg = KiroCrewConfig.load()
+
+        if mode == _member_mode and _member_backend_can_dispatch(_cfg):
+            parts.append(
+                f"[CREW MEMBER OPERATING MODE]\n"
+                f'You are the crew member "{agent_label}". This pinned conversation is '
+                f"your DM thread with the user — your identity, your inbox, and your "
+                f"ledger. Keep it for decisions, reports, and escalations; do NOT run "
+                f"long or heavy work inline here.\n"
+                f"When real work arrives (a task to implement, an investigation to "
+                f"run), DISPATCH it: open a worker session with session_create, seed "
+                f"it with a self-contained brief via session_send (the worker has "
+                f"none of this thread's context), then PATROL your workers with "
+                f"session_read_message on a monitor_start loop — you own noticing a "
+                f"worker that stalled or died, restarting it, or escalating. Stop a "
+                f"runaway with session_stop. You can only control sessions you "
+                f"created.\n"
+                f"Report outcomes back in this thread when work completes or needs "
+                f"a decision only the user can make.\n\n"
+            )
+
         # User profile — onboarding answers (role + technical comfort).
         # Injected for ALL agents like date/agent identity: it describes the
         # person, not the project or workspace. Empty (no block at all) when
-        # the user skipped the questions. The load below is mtime-cached and
-        # shared with the skills lazy-load gate further down.
-        _cfg = KiroCrewConfig.load()
+        # the user skipped the questions. Uses the ``_cfg`` loaded above the
+        # member block, shared with the skills lazy-load gate further down.
 
         # UI language — a rendering contract like [RUNTIME] above, not a
         # communication-style hint: it tells the model which language the
@@ -2582,6 +2814,7 @@ class ContextBuilder:
         user_text_range: tuple[int, int] | None = None,
         user_span_out: list[int] | None = None,
         needs_reinjection: bool = False,
+        post_compaction_checkpoint: Mapping[str, object] | None = None,
         context_groups: frozenset[str] | None = None,
         include_session_history: bool = True,
     ) -> tuple[str, HookResult]:
@@ -2616,13 +2849,24 @@ class ContextBuilder:
         # Set together with the user's text part when user_text_range is given.
         _user_bounds: tuple[int, int] | None = None
         _user_part_index: int | None = None
-        is_cc = provider_type == "claude_code"
+        is_cc = is_claude_code(provider_type)
 
         # Session context on first message only
         if is_new_session:
+            # Resumed sessions (ACP ``session/load`` restored the full native
+            # transcript) already carry the original session-start injection —
+            # agent prompt, memory, lessons, and skills are all preserved in
+            # the restored history. Re-injecting the full session context on
+            # every idle-expire → resume cycle stacks ~40K duplicate tokens
+            # into the same window and accelerates compaction. Inject only the
+            # minimal header (fresh date/time + identity) plus a resume marker
+            # so the model knows where the full context lives.
+            slim_resume = resumed and not minimal_context
             # Agent prompt goes BEFORE session context wrapper
             # so the LLM treats it as its identity, not background info.
-            if is_cc:
+            if slim_resume:
+                agent_prompt = ""
+            elif is_cc:
                 # CC gets the SAME KiroCrew persona prompt as kiro — including
                 # the Output Format rules (diff blocks, image embeds, OPTIONS)
                 # which are dashboard UI contracts, not kiro-specific. Only the
@@ -2663,7 +2907,7 @@ class ContextBuilder:
                 mode=mode,
                 blocks_reads=blocks_reads,
                 provider_type=provider_type,
-                minimal_context=minimal_context,
+                minimal_context=minimal_context or slim_resume,
                 runtime_source=runtime_source,
                 exclude_last_n=exclude_last_n,
                 model_window=model_window,
@@ -2697,7 +2941,27 @@ class ContextBuilder:
                     )
                 else:
                     session_ctx = _neutralize_structural_markers(session_ctx)
-                if minimal_context:
+                if slim_resume:
+                    # Re-anchor the critical rules (dashboard/Slack UI
+                    # contracts: diff blocks, [OPTIONS:] buttons, absolute
+                    # paths). They were injected at the original session start
+                    # but sit deep in — and may be compacted out of — the
+                    # restored transcript; at ~1.5K chars they are cheap
+                    # insurance against output-format drift. Same variant
+                    # selection and per-agent opt-out gate as session start.
+                    _resume_rules = (
+                        _critical_rules_for(session_key, runtime_source)
+                        if _agent_includes_crew_context(agent)
+                        else ""
+                    )
+                    parts.append(
+                        "[SESSION RESUMED — the full session context (agent "
+                        "system prompt, memory, lessons, skills) was injected "
+                        "at the original session start and is preserved in the "
+                        "restored conversation history above. Refreshed rules "
+                        "and date/identity follow.]\n" + _resume_rules + session_ctx
+                    )
+                elif minimal_context:
                     parts.append(session_ctx)
                 else:
                     parts.append(
@@ -2781,6 +3045,12 @@ class ContextBuilder:
                         + _neutralize_structural_markers(skills_ctx)
                         + "\n[END REINJECTED]\n\n"
                     )
+            if checkpoint_ctx := _post_compaction_checkpoint_context(post_compaction_checkpoint):
+                parts.append(
+                    "[REINJECTED AFTER COMPACTION — latest session checkpoint]\n"
+                    + _neutralize_structural_markers(checkpoint_ctx)
+                    + "\n[END REINJECTED]\n\n"
+                )
 
         # Channel history — inject on every message for group channel context
         ch_ctx: str | None = None
@@ -3131,7 +3401,9 @@ class ContextBuilder:
                 "as the very last line — exactly once, nothing after it. "
                 "Users can select multiple options before submitting. Label each choice "
                 'in the user\'s voice as an instruction to you — "Merge it now", not '
-                '"I\'ll merge it".)'
+                '"I\'ll merge it". Make each choice self-contained — any single one can '
+                "be sent alone, so never write a choice that merely modifies a sibling "
+                '("Include the stop button too"); fold the base action into it.)'
             )
             # Situational nudges for tools that may otherwise never surface with
             # MCP Tool Search. Gated on having a dashboard tab open, because
@@ -3141,17 +3413,19 @@ class ContextBuilder:
             # wants none of the Crew's dashboard-tool nudges (it drives its own
             # UI through its MCP tools), so honor that here too, not just for
             # _CRITICAL_RULES.
-            # ask_question is a MID-turn blocking decision; [OPTIONS:] remains
-            # the cheaper END-turn choice mechanism on every interactive surface.
+            # ask_question posts a NON-BLOCKING card and the agent ends its turn:
+            # what blocks is the DECISION, not the tool call. [OPTIONS:] remains
+            # the cheaper choice mechanism on every interactive surface.
             if has_dashboard_surface(session_key or "") and _agent_includes_crew_context(agent):
                 parts.append(
-                    "\n\n(If you need the user's answer to a blocking question BEFORE "
-                    "you can continue the current turn, use the ask_question tool — it "
-                    "pauses and returns the answer as the tool result. Use it SPARINGLY: "
-                    "only when you genuinely cannot proceed without the answer. When you "
-                    "are ENDING your turn, use the final [OPTIONS:] line instead. Never "
-                    "interrupt the user for a non-blocking choice, and never ask what you "
-                    "can reasonably decide or discover yourself.)"
+                    "\n\n(If a decision is genuinely needed before the work can "
+                    "continue, use the ask_question tool to put it to the user as a card, "
+                    "then END YOUR TURN: the tool does not block, and the answer arrives "
+                    "as the user's next message rather than as the tool's result. Use it "
+                    "SPARINGLY: only when you cannot proceed without the answer. When you "
+                    "are ending your turn anyway, use the final [OPTIONS:] line instead. "
+                    "Never interrupt the user for a non-blocking choice, and never ask "
+                    "what you can reasonably decide or discover yourself.)"
                 )
                 # A follow-up card is distinct from both: it offers concrete NEXT
                 # tasks after work is done, optionally handing one to a worktree.

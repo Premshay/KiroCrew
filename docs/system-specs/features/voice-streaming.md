@@ -1,87 +1,106 @@
-# Voice Streaming — Design Document
+# Voice Streaming
 
 ## Overview
 
-Real-time text-to-speech for dashboard chat responses. **Piper** is local and
-offline, **Amazon Polly** is cloud, and a locally configured **Pocket** runtime
-supplies compact on-demand replay. Polly auto-speak starts as soon as the first
-sentence finishes streaming. Pocket starts a manual replay from the first
-progressively encoded Ogg Opus bytes. Sending a new message interrupts playback
-immediately.
+Dashboard text-to-speech has three providers: local Piper, a locally configured
+Pocket runtime, and Amazon Polly. `voice_reply.DEFAULT_PROVIDER` selects Piper
+unless configuration selects a valid provider.
+`chat_voice.api_voice_synthesize()` sends Piper output as one WAV chunk and
+streams Polly sentence chunks as MP3; the browser queues either form for
+sequential playback. Polly auto-speak starts as soon as the first sentence
+finishes streaming; Pocket starts a manual replay from the first progressively
+encoded Ogg Opus bytes. Sending a new message interrupts playback immediately.
 
-## Architecture
+## Components
 
-```
-Polly:  chat_chunk (WS) → sentence detection (frontend) → POST /api/voice/synthesize
-    → Polly TTS (per sentence) → voice_chunk (WS) → Audio playback (browser)
-Piper:  POST /api/voice/synthesize → synthesize_speech() one WAV
-    → single voice_chunk + voice_complete (WS) → Audio playback (browser)
-Pocket replay: speaker click → POST /api/voice/replay → one-time GET URL
-    → Pocket shim --stream → Ogg Opus response → Audio playback (browser)
-```
+| Component | Code | Responsibility |
+|---|---|---|
+| Dashboard routes | `dashboard.routes.sessions.register()` | Registers the synthesis, replay, configuration, and Polly voice-catalogue endpoints. |
+| Voice endpoints | `dashboard.chat_voice.api_voice_config()`, `api_voice_synthesize()`, `api_voice_replay()`, and `api_voice_voices()` | Read and persist configuration, synthesize dashboard speech, mint the Pocket replay URL, and return the Polly catalogue. |
+| Provider implementation | `voice_reply.synthesize_speech()`, `streaming_voice_reply()`, `stream_pocket_speech()`, and `stitch_mp3s()` | Redacts text, selects a provider, creates audio, streams Pocket Ogg Opus through the local compatibility executable, and joins completed Polly chunks. |
+| Sentence cutter | `website/src/hooks/sentenceCutter.ts` | Pure boundary logic: where the next speakable span ends (see Dashboard auto-speak). |
+| Streaming playback | `website/src/hooks/useWebSocket.ts` | Feeds streamed text through the cutter, serializes synthesis requests, queues audio, and handles interruption. |
+| Turn-taking hold | `website/src/hooks/useHandsFreeLoop.ts` and `website/src/pages/ChatPage.tsx` | Hands-free conversation mode: the mic stays closed while the reply speaks, with barge-in on a mic tap. |
+| Turn latency marks | `website/src/utils/voiceTurnMetrics.ts` | Debug-level per-turn spans: end-of-speech to first token and to first audio. |
+| Settings | `website/src/pages/settings/VoicePanel.tsx` | Updates auto-speak, provider, Polly, Pocket, and Piper settings; fetches the Polly catalogue only while Polly is selected. |
+| Slack reply | `slack.handler.handle_message()` and `_safe_voice_reply()` | Starts a background provider-aware voice reply when thread, global, or voice-input settings allow it. |
 
-### Components
+## Dashboard auto-speak
 
-| Component | File | Role |
-|-----------|------|------|
-| Sentence cutter | `website/src/hooks/sentenceCutter.ts` | Pure boundary logic: where the next speakable span ends (see Streaming Auto-Speak Flow) |
-| Sentence detector | `website/src/hooks/useWebSocket.ts` | Feeds streamed text through the cutter on each chunk flush |
-| Playback queue | `website/src/hooks/useWebSocket.ts` | Queues and plays audio chunks sequentially |
-| Turn-taking hold | `website/src/hooks/useHandsFreeLoop.ts` + `website/src/pages/ChatPage.tsx` | Hands-free conversation mode: mic stays closed while the reply speaks; barge-in on mic tap (see Hands-Free Conversation Turn-Taking) |
-| Turn latency marks | `website/src/utils/voiceTurnMetrics.ts` | Debug-level per-turn spans: end-of-speech → first token / first audio |
-| Synthesize endpoint | `src/kiro_crew/dashboard/chat_voice.py` | `POST /api/voice/synthesize` — Polly: splits text into sentences + broadcasts chunks; Piper: `_synthesize_nonstreaming()` emits one clip (re-exported via `chat.py`) |
-| Replay endpoint | `src/kiro_crew/dashboard/chat_voice.py` | Pocket-only `POST /api/voice/replay` mints a short-lived, single-use URL; its GET streams Ogg Opus directly to the browser without WebSocket audio payloads |
-| Voice config endpoint | `src/kiro_crew/dashboard/chat_voice.py` | `GET/PUT /api/voice/config` — read/update voice settings incl. `provider` + `piper_*` (re-exported via `chat.py`) |
-| TTS synthesis | `src/kiro_crew/voice_reply.py` | `synthesize_speech()` dispatches Polly and local file synthesis; `stream_pocket_speech()` streams Pocket Ogg Opus replay through the local compatibility executable |
-| Settings UI | `website/src/pages/settings/VoicePanel.tsx` | Provider selector + auto-speak toggle; Pocket exposes its runtime voice, Piper exposes model/binary/speed, and Polly exposes voice/engine/speed/profile/region |
+`useWebSocket` buffers `chat_chunk` text and, after it updates the Redux
+streaming message, scans the active slot for completed sentence boundaries. It
+submits only text beyond `voiceProgressRef.spokenLen` through
+`enqueueVoiceSynthesis()`. The progress record is keyed by slot and message
+identity: this prevents an old segment or a background slot from replaying text
+or resetting the active response.
 
-## Streaming Auto-Speak Flow
+`sentenceCutter.ts` owns the boundary rule. It cuts on terminal punctuation
+(`[.!?]` followed by whitespace or end-of-text) only, and never cuts on a
+guarded terminal: abbreviations (`e.g.`, `Dr.`), bare list enumerators (`1.`,
+`a.` opening a line), and any terminal inside an unbalanced ``` fence — code is
+held whole for the completion pass, whose server-side strip sees the balanced
+fence and speaks its placeholder. A span shorter than `MIN_TTS_CHARS` (10) is
+not spoken.
 
-1. User sends a message; `voiceProgressRef` clears its prior message identity
-2. Backend streams `chat_chunk` events via WebSocket
-3. Frontend accumulates text in a `streaming` message in Redux
-4. On each chunk flush, `sentenceCutter.ts` scans for sentence boundaries:
-   terminal punctuation (`[.!?]` followed by whitespace or end-of-text) only,
-   with guarded terminals that never cut — abbreviations (`e.g.`, `Dr.`),
-   bare list enumerators (`1.`, `a.` opening a line), and any terminal inside
-   an unbalanced ``` fence (code is held whole for the completion pass, whose
-   server-side strip sees the balanced fence and speaks its placeholder)
-5. New complete sentences (≥ `MIN_TTS_CHARS`, 10 chars) are sent to `POST /api/voice/synthesize`
-6. Backend calls Polly per sentence, broadcasts `voice_chunk` (base64 MP3) via WS
-7. Frontend decodes chunks into blob URLs, queues them, plays sequentially
-8. On `chat_segment` or `chat_done`, any remaining unspoken tail text is synthesized before finalization
-9. `voice_complete` event carries the stitched full MP3 for replay
+`flushVoiceTail()` handles the remaining eligible text at `chat_segment` and
+`chat_done`. It marks the message consumed even when the tail does not meet the
+speech floor, so a later completion event cannot retry it. The floor and
+boundary rule are implemented in `useWebSocket.ts`; they are not duplicated
+here.
 
-## Interrupt Mechanism
+`enqueueVoiceSynthesis()` appends each request to `synthChainRef`. This keeps
+requests in source order even if a provider finishes them out of order, which is
+load-bearing because the playback queue cannot reconstruct the intended
+sentence order after receiving audio.
 
-Sending a new message while voice is playing — or tapping the mic during a
-hands-free reply (barge-in) — triggers an interrupt:
+For Polly, `api_voice_synthesize()` iterates
+`voice_reply.streaming_voice_reply()`, broadcasts each `voice_chunk`, then
+uses `stitch_mp3s()` to broadcast `voice_complete`. For Piper,
+`_synthesize_nonstreaming()` broadcasts one WAV `voice_chunk` and one
+`voice_complete`. `useWebSocket` decodes `voice_chunk` audio into blob URLs and
+plays the queue one item at a time. `voice_complete` also updates the Redux
+`voiceAudio` field; `UseWebSocketCoverage.test.tsx` covers that state update.
 
-1. `ChatPage.tsx` dispatches a `voice-stop` DOM event (on send, and on the
-   barge-in mic tap)
-2. `useWebSocket` listens for `voice-stop` and calls `stopVoice()`
-3. `stopVoice()` aborts every in-flight `POST /api/voice/synthesize` via an
-   `AbortController` (one per speaking span), pauses the active `Audio`
-   element, clears the queue, and sets `voiceMutedRef = true`
-4. Incoming `voice_chunk` events from the old response are dropped while muted
-5. `chat_done` for the old response skips remaining-text synthesis when muted
-6. When a new response message identity is observed, `voiceMutedRef` resets to `false`
+## Interruption
 
-The DOM event pattern avoids prop drilling between `ChatPage` (where send lives) and `useWebSocket` (where audio state lives, called from `App.tsx`).
+`ChatPage` dispatches `voice-stop` when it sends a message, and its Speak
+handler dispatches the same event while audio is playing. `useWebSocket` maps
+the event to `stopVoice()`, which pauses the active audio element, revokes
+queued blob URLs, clears the queue, and sets `voiceMutedRef`.
 
-## Hands-Free Conversation Turn-Taking
+`ChatPage` also dispatches `voice-stop` on the barge-in mic tap during a
+hands-free reply. `stopVoice()` additionally aborts every in-flight
+`POST /api/voice/synthesize` through an `AbortController` (`synthAbortRef`, one
+per speaking span), so an interrupt cancels work that has not yet produced
+audio rather than only silencing what already has.
+
+## Manual replay
+
+The Speak button appears on hover over assistant messages of at least 50
+characters. It first asks `api.voiceReplay(slot, content)` for a provider-aware
+playback path: Pocket returns a one-time Ogg Opus URL the browser plays as it
+grows, while Piper and Polly fall back to `api.voiceSynthesize(slot, content)`.
+Manual replay works independently of auto-speak.
+
+While muted, `voice_chunk` frames are discarded and the `chat_segment`/
+`chat_done` tail paths do not synthesize more text. `voiceProgressFor()` clears
+the muted state only when it sees a different message identity. This identity
+boundary is load-bearing: it prevents late audio from an interrupted response
+from being played as though it belonged to the next response.
+
+## Hands-free conversation turn-taking
 
 With hands-free dictation armed AND auto-speak on, the loop runs fast
 turn-taking (half-duplex — never listening while speaking):
 
 - **Hold.** `chat.voiceBusy` is true while the TTS pipeline is active
-  end-to-end: a synthesis POST in flight, chunks queued, or audio playing.
-  `ChatPage` passes `hold = autoSpeak && (slotRunning || voiceBusy)` into
-  `useHandsFreeLoop`, whose re-arm cycle will not open the mic while held. A
-  capture already in progress is never interrupted by a hold arriving
-  mid-utterance. `voiceBusy` (not `voicePlaying`) is the hold signal because
-  playing goes false in the gap between requesting a sentence's synthesis and
-  its audio arriving.
+  end-to-end: a synthesis POST in flight (`synthInFlightRef`), chunks queued, or
+  audio playing. `ChatPage` passes `hold = autoSpeak && (slotRunning ||
+  voiceBusy)` into `useHandsFreeLoop`, whose re-arm cycle will not open the mic
+  while held. A capture already in progress is never interrupted by a hold
+  arriving mid-utterance. `voiceBusy` (not `voicePlaying`) is the hold signal
+  because playing goes false in the gap between requesting a sentence's
+  synthesis and its audio arriving.
 - **Re-arm.** When the turn ends and the audio queue drains, the hold drops
   and the ordinary re-arm cycle (400 ms delay) reopens the mic.
 - **Barge-in.** While the reply speaks, the mic button is the interrupt: the
@@ -98,167 +117,69 @@ turn-taking (half-duplex — never listening while speaking):
 
 With auto-speak off, hands-free keeps its dictate-anytime behavior — no hold.
 
-## Voice Configuration
+## Configuration and API
 
-Stored in `~/.kiro/crew/config.json` under `voice_reply`:
+Configuration is stored under `voice_reply` in the Crew configuration file.
+`slack.handler.load_voice_reply_config()` loads the live `_VoiceConfig`, and
+`api_voice_config()` merges a partial update back into that section rather than
+replacing it. The merge preserves voice settings owned by other channels.
 
-| Setting | Default | Range |
-|---------|---------|-------|
-| `provider` | piper | `piper` (local), `pocket` (local streamed replay), or `polly` (AWS). Invalid values fall back to `polly` on load |
-| `voice_id` | Ruth | Any Polly voice ID; Pocket uses the supplied local `michael` voice |
-| `engine` | generative | generative, neural, long-form, standard (Polly only) |
-| `rate` | 100% | 50%–200% (Polly only) |
-| `pitch` | +0% | -20% to +20% (Polly only) |
-| `enabled` | true | Controls auto-speak and Slack voice replies |
-| `aws_profile` | _(empty)_ | AWS CLI profile name for Polly calls. Empty = use default credentials |
-| `region` | _(empty)_ | AWS region for Polly. Empty = use CLI default |
-| `piper_model` | _(empty)_ | Path to a Piper `.onnx` voice model. Required for Piper and the current Pocket compatibility executable |
-| `piper_binary` | _(empty)_ | Path to the Piper executable. Pocket currently uses a Piper-compatible local bridge |
-| `piper_model_config` | _(empty)_ | Optional `.onnx.json` config (auto-detected next to the model if empty) |
-| `piper_length_scale` | 1.0 | Piper speed (lower = faster); coerced finite/positive by `validate_length_scale()` |
+| Setting | Meaning |
+|---|---|
+| `provider` | Validated by `voice_reply.synthesis_settings()` and `slack.handler.load_voice_reply_config()`; invalid values fall back to `voice_reply.DEFAULT_PROVIDER`. |
+| `enabled` | Enables global Slack voice replies. |
+| `auto_speak` | Enables dashboard auto-speak; `api_voice_config()` exposes it as `autoSpeak`. |
+| `voice_id`, `engine`, `rate`, `pitch` | Polly synthesis settings, also usable as request overrides for the dashboard synthesis endpoint. |
+| `aws_profile`, `region` | Passed to the AWS CLI by the Polly provider. |
+| `piper_binary`, `piper_model`, `piper_model_config`, `piper_length_scale` | Piper executable, model, optional model configuration, and validated speed setting. `validate_length_scale()` rejects invalid or non-positive values. |
+| `provider` — Pocket | `pocket` is a locally supplied runtime reached through a Piper-compatible bridge, so it reuses `piper_binary` / `piper_model` and speaks the supplied local `michael` voice. It needs no AWS credential. |
 
-### AWS Authentication
+`dashboard.routes.sessions.register()` registers:
 
-Voice synthesis calls `aws polly synthesize-speech` via the AWS CLI. Credentials
-are resolved in standard AWS CLI order (env vars, default profile, instance role,
-etc.). To use a specific profile, set `aws_profile` in the config:
+* `GET` and `PUT /api/voice/config`
+* `POST /api/voice/synthesize`
+* `POST /api/voice/replay` — `{ slot, text }`; returns either `legacy` or a
+  one-time Pocket Ogg Opus URL
+* `GET /api/voice/replay/{job_id}` — streams that single-use Pocket replay; it
+  expires after two minutes
+* `GET /api/voice/voices`
 
-```json
-{
-  "voice_reply": {
-    "enabled": true,
-    "aws_profile": "my-profile",
-    "region": "us-east-1"
-  }
-}
-```
+`api_voice_voices()` caches a successful Polly catalogue in process, sorts it by
+language code and name, and does not cache the empty result produced when the
+AWS CLI is unavailable. It checks that Polly is the active provider and that
+`aws_consent.refuse_and_log()` grants consent before it invokes
+`aws polly describe-voices`. Those gates keep a direct API request from
+silently using ambient AWS credentials for a provider the operator did not
+select or authorize.
 
-### Sandbox requirement
+## Provider safety
 
-Both synthesis paths spawn a subprocess (`aws polly synthesize-speech` /
-`piper`), and both route it through `sandbox.wrap_argv(mode="standard")` because
-the argv carries LLM-derived text. `wrap_argv` **fail-closes** where the host
-offers no OS sandbox backend — every Windows host, and Linux without user
-namespaces — so on those hosts synthesis returns `None` until the operator sets
-`agent.sandbox_allow_unsandboxed_exec` in `config.json`.
+`voice_reply.synthesize_speech()` redacts credentials and suspicious URLs before
+provider selection. `text_to_ssml()` and `strip_markdown()` then produce
+speakable text. `strip_markdown()` replaces fenced code, diff blocks, widgets,
+tables, path-like inline code, and links with spoken placeholders or labels and
+removes option markers, emoji, formatting markers, and diff hunk headers. The
+thresholds and pattern details remain in `voice_reply.strip_markdown()`.
 
-That refusal arrives as the typed `SandboxUnavailableError` and is caught ahead
-of the generic handler in both `_synthesize_polly` and `_synthesize_piper`. The
-generic handler logs "Polly synthesis error" / "piper synthesis error" with a
-stack trace, which misreads as an AWS-credential or piper-model fault and sends
-the operator to the wrong place.
+`_synthesize_polly()` calls `aws_consent.refuse_and_log()` before resolving or
+spawning the AWS CLI. It returns no audio when consent is absent, which lets its
+callers retain their text response rather than spending through an unattended
+path.
 
-Both handlers log `exc.kind` plus **`str(exc)`** — the remedy prose the sandbox
-layer selected — and never compose their own remedy text. Only `kind ==
-"no_backend"` names the `agent.sandbox_allow_unsandboxed_exec` opt-in;
-`"transient"` means momentary resource pressure where the caller must *not*
-advise disabling the sandbox, and `"foreign_sandbox"` means this host's sandbox
-works and the fix is a kiro-cli setting. A hardcoded remedy would give the wrong
-instruction for two of the three kinds.
+`_synthesize_polly()` and `_synthesize_piper()` run their commands through
+`wrap_argv_async(..., _prepare=wrap_argv)` and catch
+`SandboxUnavailableError` separately from provider failures. They log the
+sandbox error kind and its own message. The distinction is load-bearing because
+only the sandbox layer can distinguish a missing backend from transient
+pressure or an existing outer sandbox, and therefore provides the applicable
+remedy.
 
-### API
+## Slack voice replies
 
-- `GET /api/voice/config` — returns current settings + `autoSpeak` flag
-- `PUT /api/voice/config` — update settings (partial patch), persists to config.json
-- `POST /api/voice/synthesize` — `{ slot, text, voice?, engine?, rate?, pitch? }`
-- `POST /api/voice/replay` — `{ slot, text }`; returns either `legacy` or a one-time Pocket Ogg Opus URL
-- `GET /api/voice/replay/{job_id}` — streams the single-use Pocket replay URL; it expires after two minutes
-- `GET /api/voice/voices` — list available Polly voices via `aws polly
-  describe-voices` (respects `aws_profile`/`region`), cached in-process for 1
-  hour. Each entry: `{ id, name, language, languageCode, gender, engines }`,
-  sorted by `languageCode` then `name`. If the `aws` CLI is not resolvable on
-  the gateway's PATH (it is optional — the default Piper provider doesn't
-  need it), the endpoint returns `{ "voices": [] }` with a 200 instead of
-  erroring; the empty result is not cached, so the list recovers once `aws`
-  becomes available
-
-## Content Filtering for Speech
-
-`strip_markdown()` in `voice_reply.py` transforms response text into natural
-speakable content. Non-speakable elements are replaced with brief spoken
-placeholders so listeners know content exists without hearing raw syntax.
-
-| Content Type | Handling |
-|-------------|----------|
-| Fenced code blocks | Replaced with "(code block)" |
-| Diff blocks | Replaced with "(diff block)" |
-| `<mcwidget>` blocks | Replaced with "(widget)" |
-| Residual HTML/XML tags | Stripped (after Slack-link handling) |
-| Markdown tables | Replaced with "(table with N rows)" |
-| Long inline code (>30 chars or paths) | Replaced with "(file path)" |
-| Short inline code (≤30 chars, no `/`) | Kept as spoken text |
-| Bare URLs | Replaced with "(link)" |
-| Slack URLs `<url\|label>` | Kept label only |
-| Markdown links `[label](url)` | Kept label only |
-| `[OPTIONS: ...]` lines | Stripped silently |
-| Unicode emoji | Stripped silently |
-| Slack shortcodes (`:emoji:`) | Stripped silently |
-| Bold/italic/strikethrough markers | Stripped (text kept) |
-| Diff hunk headers (`@@`) | Stripped |
-
-## Segment Handling (Tool Call Boundaries)
-
-When the assistant calls a tool mid-response, the backend emits a `chat_segment`
-event that finalizes the current streaming message and starts a new one.
-
-The frontend keys `voiceProgressRef` by `{slot, messageId}`. Before
-`chat_segment` finalizes the current streaming message, it synthesizes any
-unspoken tail of at least 10 characters and marks that message consumed. The
-next segment receives a new message identity and therefore starts at offset 0.
-This also prevents a background slot's segment event from resetting speech
-progress for the active slot.
-
-## Synthesize Serialization
-
-Synthesize calls are chained via a promise (`synthChainRef`) to prevent
-out-of-order audio. Each `voiceSynthesize` call waits for the previous one to
-complete before firing. This guarantees `voice_chunk` events arrive in sentence
-order regardless of per-sentence Polly synthesis time. The chain resets on new
-user messages.
-
-## WebSocket Events
-
-| Event | Direction | Payload |
-|-------|-----------|---------|
-| `voice_chunk` | server → client | `{ slot, index, sentence, audio }` (base64 MP3) |
-| `voice_complete` | server → client | `{ slot, audio, chunks }` (stitched MP3) |
-
-## Slack Voice Reply
-
-Separate from dashboard streaming. Uses `!voice` commands in Slack threads:
-
-- `!voice on/off` — toggle voice replies per thread
-- `!voice <name>` — switch Polly voice (e.g., `!voice Matthew`)
-- `!voice engine <type>` — change engine
-- `!voice speed <percent>` — adjust speed
-- `!voice pitch <percent>` — adjust pitch
-
-Handler integration in `src/kiro_crew/slack/handler.py` with fire-and-forget
-async pipeline: markdown strip → SSML → Polly → Slack file upload.
-
-## Frontend State
-
-| Ref | Type | Purpose |
-|-----|------|---------|
-| `voiceQueueRef` | `string[]` | Blob URLs queued for playback |
-| `voicePlayingRef` | `boolean` | True while an Audio element is playing |
-| `activeAudioRef` | `HTMLAudioElement` | Currently playing audio (for pause on interrupt) |
-| `autoSpeakRef` | `boolean` | Cached auto-speak preference from server |
-| `voiceProgressRef` | `{ slot, messageId, spokenLen }` | Message-scoped character offset already sent to TTS |
-| `voiceMutedRef` | `boolean` | Suppresses incoming voice chunks after interrupt |
-| `synthChainRef` | `Promise` | Serializes synthesize calls to prevent out-of-order audio |
-| `synthInFlightRef` | `number` | In-flight synthesize POST count (feeds `voiceBusy`) |
-| `synthAbortRef` | `AbortController` | Aborts in-flight synthesis on interrupt/barge-in |
-
-Redux state in `chatSlice`:
-- `voicePlaying: boolean` — drives UI indicators
-- `voiceBusy: boolean` — pipeline active end-to-end (synthesis in flight, queued, or playing); the hands-free hold signal
-- `voiceAudio: string | null` — base64 stitched MP3 for replay via 🔊 button
-
-## Manual Replay
-
-The 🔊 Speak button appears on hover over assistant messages ≥50 chars.
-Clicking it first asks `api.voiceReplay(slot, content)` for a provider-aware
-playback path. Pocket returns a one-time Ogg Opus URL and the browser plays it
-as it grows; Piper and Polly retain `api.voiceSynthesize(slot, content)` as the
-legacy fallback. Manual replay works independently of auto-speak.
+`slack.handler` accepts `!voice` thread commands for enabling and disabling a
+thread, toggling global replies, and choosing a voice, engine, speed, or pitch.
+`handle_message()` starts `_safe_voice_reply()` as a background task when a
+thread or global setting enables replies, or when voice-input reply settings
+allow a transcribed voice message to receive audio. `_safe_voice_reply()` calls
+the provider-aware `voice_reply.voice_reply()` path, so Slack replies follow
+the selected provider rather than assuming Polly.

@@ -11,7 +11,7 @@ import {
   type InstalledApp,
   type RegistryApp,
 } from '../components/appstore/types'
-import { pickFeatured } from '../pages/AppsPage'
+import { pickFeatured } from '../pages/apps/useAppsData'
 
 const app = (over: Partial<RegistryApp>): RegistryApp => ({
   name: 'x', displayName: 'X', description: '', version: '1.0.0',
@@ -293,6 +293,23 @@ describe('normalizeRegistryApp', () => {
   it('drops non-string tag members but keeps valid ones', () => {
     const out = normalizeRegistryApp({ name: 'x', tags: ['github', 7, null, 'git'] } as unknown as RegistryApp)
     expect(out.tags).toEqual(['github', 'git'])
+  })
+
+  it('keeps a safe non-negative integer stargazersCount', () => {
+    expect(normalizeRegistryApp({ name: 'x', stargazersCount: 1234 } as RegistryApp).stargazersCount).toBe(1234)
+    expect(normalizeRegistryApp({ name: 'x', stargazersCount: 0 } as RegistryApp).stargazersCount).toBe(0)
+    expect(normalizeRegistryApp({ name: 'x', stargazersCount: 9007199254740991 } as RegistryApp).stargazersCount).toBe(9007199254740991)
+  })
+
+  it('drops a malformed stargazersCount instead of coercing it', () => {
+    // External indexes are user-supplied JSON and an older gateway does not
+    // sanitize this field server-side, so the query boundary must. 1e308 is
+    // finite but compact-formats into hundreds of digits — Number.isSafeInteger
+    // is the gate, not Number.isFinite.
+    for (const bad of [-1, '1234', NaN, Infinity, 1e308, 3.5, null, [], {}]) {
+      const out = normalizeRegistryApp({ name: 'x', stargazersCount: bad } as unknown as RegistryApp)
+      expect(out.stargazersCount, `stargazersCount=${String(bad)}`).toBeUndefined()
+    }
   })
 })
 

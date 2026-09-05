@@ -1,14 +1,16 @@
 """Session control: letting one chat session observe and interrupt another.
 
-Three operations — create a session, stop its turn, read its transcript — plus the
-authorization that decides whether a caller may address a target at all. The
-operations are deliberately thin: they reuse the same creation, stop and history
-paths the dashboard itself uses, so a controlled session behaves exactly like one
-a human is typing into.
+Four operations — create a session, stop its turn, close (archive) it, and read
+its transcript — plus the authorization that decides whether a caller may address
+a target at all. The operations are deliberately thin: they reuse the same
+creation, stop, close and history paths the dashboard itself uses, so a controlled
+session behaves exactly like one a human is typing into.
 
 **One verb here writes into another session's conversation: ``session_send``.**
 Reading returns a transcript tail; stopping cancels an in-flight turn the way the
-Stop button does; creating opens an empty session in the user's sidebar; sending
+Stop button does; closing archives the session the way the tab ✕ does (the
+conversation is saved to history and can be reopened — closing is not deletion);
+creating opens an empty session in the user's sidebar; sending
 delivers a message the target runs as its next turn, redacted through
 ``sanitize_outbound`` and prefixed with a ``[sent by session … via session_send]``
 envelope so it can never render as something the person typed. An IDLE target runs
@@ -21,9 +23,10 @@ that did not hold at admission. A human-typed queued message shares the same
 window and the same re-check.
 
 Authorization is deny-by-default and checked in one place
-(:func:`authorize_target`) for the two operations that take a target, so a guard
-cannot be present on one verb and missing on another. ``session_create`` has no
-target; it checks the caller's own eligibility with the same refusals.
+(:func:`authorize_target`) for the three operations that take a target — stop,
+close and read — so a guard cannot be present on one verb and missing on another.
+``session_create`` has no target; it checks the caller's own eligibility with the
+same refusals.
 """
 
 from __future__ import annotations
@@ -40,9 +43,17 @@ from kiro_crew.config.loader import (
     resolve_agent_bindings,
 )
 from kiro_crew.dashboard.chat_delivery import sanitize_outbound
+from kiro_crew.dashboard.chat_folders import _unhide_folder
 from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES as _PERSISTENCE_TRANSIENT_ROLES
 from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
-from kiro_crew.dashboard.state import MAX_LIVE_SLOTS, SlotOrigin
+from kiro_crew.dashboard.create_rate_limit import SESSION_CREATE, allow_create
+from kiro_crew.dashboard.state import (
+    MAX_LIVE_SLOTS,
+    MAX_SLOTS_PER_CREATOR,
+    SlotOrigin,
+    _safe_folder_tree,
+)
+from kiro_crew.dashboard.stop_retry import allow_escalation
 from kiro_crew.history import metadata_now_iso, transcript_stem
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
@@ -70,6 +81,26 @@ MAX_READ_CONTENT_CHARS = 4000
 # conversations unattended. Notifications are the supported path for those
 # (``send_message``), not session control.
 UNATTENDED_SLOT_PREFIXES = ("cron-", "workflow-")
+
+
+def _member_caller(caller_key: str) -> bool:
+    """Whether *caller_key* is a crew member's pinned DM slot.
+
+    A member DM session dispatches its real work into worker sessions it
+    creates and patrols — that is the member operating model, not an optional
+    capability — so the surface authorizes it WITHOUT the global
+    ``agent.session_control`` opt-in. What bounds it instead is ownership:
+    :func:`authorize_target` restricts a member caller to slots it created
+    itself, so the automatic grant never reaches the user's own sessions.
+
+    Spelled through the members module's own prefix constant (imported
+    lazily — members imports validation which sits below this module in the
+    layering) rather than a restated literal, so the two cannot drift.
+    """
+    from kiro_crew.members import DM_SLOT_KEY_PREFIX
+
+    return caller_key.startswith(DM_SLOT_KEY_PREFIX)
+
 
 # Roles a read must not count, taken from the persistence layer's own list rather
 # than restated here: those are exactly the rows rehydration DROPS, so any cursor
@@ -588,6 +619,7 @@ async def create_session(
     caller_session_key: str,
     title: str = "",
     agent: str = "",
+    folder_id: str = "",
 ) -> dict[str, Any]:
     """Open a new session in the caller's workspace, persisted at birth.
 
@@ -601,16 +633,37 @@ async def create_session(
     there is no target yet), and the child inherits the caller's workspace. Both
     matter because a caller refusal missing here, or a workspace not inherited,
     would hand back a session outside the boundary the other verbs enforce.
+
+    ``folder_id`` files the slot as part of creation (#6118): it is assigned in
+    the same synchronous window that configures the slot, the whole
+    allocation-to-persist span runs under ``suspend_slots_push`` so the slot's
+    first broadcast frame already shows it filed, and the placement rides in the
+    persist-at-birth metadata so it survives a restart. An unknown folder
+    refuses the whole create -- nothing exists yet, so refusal loses nothing,
+    matching the move path's posture -- and existence is confirmed READ-ONLY
+    under the folder-store lock (``read_folders``) before the allocation; the
+    Model-B un-hide runs only after the filing has landed, so a refused create
+    leaves no folder-tree mutation behind. Authorization needs no new path: the
+    folder tree cannot be reshaped from here (the id must already exist), and
+    every caller class the move path's app-ownership rule exists to stop is
+    already refused above it -- an app-scoped caller cannot create a session at
+    all (`app_scoped_caller`).
     """
-    if not session_control_enabled():
-        raise SessionControlError(
-            "session control is disabled in config (agent.session_control)",
-            code="session_control_disabled",
-        )
     caller_key = caller_slot_key(state, caller_session_key)
     if not caller_key:
         raise SessionControlError(
             "caller session could not be identified", code="caller_unidentified"
+        )
+    # The caller is resolved BEFORE the config gate so a member DM session —
+    # for which dispatching work into workers is the operating model, not an
+    # opt-in — passes without `agent.session_control`. Every other caller
+    # still needs the switch. The member's automatic grant is bounded by
+    # ownership in `authorize_target`, not here: creation makes the caller
+    # the owner by construction.
+    if not session_control_enabled() and not _member_caller(caller_key):
+        raise SessionControlError(
+            "session control is disabled in config (agent.session_control)",
+            code="session_control_disabled",
         )
     if caller_key.startswith(UNATTENDED_SLOT_PREFIXES):
         raise SessionControlError(
@@ -731,10 +784,28 @@ async def create_session(
     # can see and take over the work. SYSTEM-origin slots fall outside the
     # `slots:user` WS scope, which would hide it from the sidebar.
 
+    if folder_id:
+        # Confirmed under the folder-store lock -- the only place existence
+        # cannot go stale against a concurrent delete (see `read_folders`) --
+        # and READ-ONLY on purpose: the Model-B un-hide is a durable mutation,
+        # and it runs only after the filing actually lands (below, after the
+        # persist), so a create the re-gate refuses leaves no folder-tree state
+        # behind. Placed BEFORE the re-gate so the last suspension this
+        # coroutine takes is here: after the re-gate nothing suspends until the
+        # slot is fully configured, so the folder confirmed here cannot be
+        # deleted before the assignment lands (folder mutations run on this
+        # loop).
+        def _exists(folders: list[dict[str, Any]]) -> bool:
+            return any(str(f.get("id") or "") == folder_id for f in _safe_folder_tree(folders))
+
+        if not await state.read_folders(_exists):
+            raise SessionControlError("folder not found", code="folder_not_found")
+
     # Re-resolved and re-gated HERE, adjacent to the allocation, because every
-    # decision above was made before this coroutine suspended -- twice, for the
-    # project directory and the config load -- and the inputs to those decisions are
-    # live state that can flip inside either window.
+    # decision above was made before this coroutine suspended -- for the
+    # project directory, the config load, and the folder confirmation -- and the
+    # inputs to those decisions are live state that can flip inside any of those
+    # windows.
     #
     # Re-reading the slot TABLE is the part that matters most: closing the caller's
     # tab removes its slot, and a Python reference to the removed object stays
@@ -766,10 +837,35 @@ async def create_session(
             code="caller_workspace_changed",
         )
     _refuse_ineligible_creator(state, live_caller)
+    # The RATE guard, ahead of the capacity ceilings below. Those bound how many
+    # sessions can exist; this bounds how fast one caller may open them, which is
+    # the property an auto-approved verb loses -- a waived prompt leaves a loop
+    # nothing to push back on. Deliberately the control that needs no durable
+    # state: a lifetime quota means nothing across a restart unless every
+    # rehydrate path carries its attribution, while a five-minute window buys a
+    # restart one window rather than a clean slate.
+    if not allow_create(SESSION_CREATE, caller_key):
+        raise SessionControlError(
+            "too many sessions created recently; retry shortly",
+            code="create_rate_limited",
+            status=429,
+        )
     if state.live_slot_count() >= MAX_LIVE_SLOTS:
         raise SessionControlError(
             f"slot cap reached ({MAX_LIVE_SLOTS})",
             code="slot_cap_reached",
+            status=429,
+        )
+    # Then the per-creator sub-ceiling. The global cap above bounds the TOTAL but
+    # not the distribution, so without this one caller can hold all 500 and the
+    # person's own next chat tab gets the 429 -- the resource is bounded, but not
+    # from anyone else's point of view. This is the bound that makes the verb safe
+    # to auto-approve: the worst case of an automated creator looping on it is its
+    # own 50 slots, not everyone's 500.
+    if state.creator_slot_count(caller_key) >= MAX_SLOTS_PER_CREATOR:
+        raise SessionControlError(
+            f"per-caller slot cap reached ({MAX_SLOTS_PER_CREATOR})",
+            code="creator_slot_cap_reached",
             status=429,
         )
 
@@ -777,77 +873,146 @@ async def create_session(
     # the same reason: it decides which workspace actually EXECUTES the turn, so it
     # must never be observable as empty. Everything after this point is synchronous
     # until the slot is fully configured.
-    slot = state.get_or_create_slot(
-        None, agent=agent_name, workspace=workspace, origin=SlotOrigin.USER
-    )
-    # cwd must follow the workspace too, or file search and project-scoped agents
-    # resolve against a directory the slot does not claim -- the same
-    # authorization-vs-execution split as the agent binding, one layer down.
-    if not slot.project:
-        slot.project = project_dir
-    if title.strip():
-        slot.title = sanitize_outbound(title.strip())[:200]
-        slot._titled = True
-    # Persist at birth. `save_slot_off_loop` cannot do this: the save it wraps
-    # returns early on an empty message window -- before its `force` check -- so a
-    # freshly created session, which has no messages by definition, would write
-    # nothing at all. The tool would then hand back a session that does not survive
-    # a restart.
     #
-    # Awaited, and a failure RETRACTS the slot rather than merely propagating: an
-    # unpersisted slot stays in the table, usable in memory and addressable by its
-    # creator, then vanishes on restart. Reporting the failure while leaving that
-    # behind is the worse of the two outcomes, because the caller sees an error and
-    # the session exists anyway. Same retraction the fork path uses on a failed
-    # build.
-    try:
-        await asyncio.to_thread(
-            log.update_metadata,
-            slot_history_key(slot),
-            {
-                "_type": "metadata",
-                # The slot's OWN durable identity, and its origin, both of which
-                # the normal save path writes -- but a slot created here may never
-                # reach that path: `_save_slot_to_history` returns early on an
-                # empty message window, so for a session that is created and then
-                # sits idle THIS dict is the only record on disk. Omitting `origin`
-                # is silently destructive on the next restart: rehydrate falls back
-                # to the fail-closed empty sentinel, so a session opened as USER
-                # comes back unattributed and `slots:user` subscribers stop seeing
-                # it. Checked field-by-field against the save path; these are the
-                # only fields a slot carries at birth that it does not already
-                # write.
-                "tab_id": slot._tab_id,
-                "origin": slot._origin,
-                "created_at": metadata_now_iso(),
-                "workspace": slot.workspace,
-                "agent": slot.agent or "",
-                "project": slot.project or "",
-                "title": slot.title or "",
-                "memory_mode": getattr(slot, "memory_mode", "persistent"),
-            },
+    # The whole allocation-to-persist span runs under `suspend_slots_push`:
+    # `get_or_create_slot` broadcasts on a leading edge, so without the suspend an
+    # idle gateway serializes and sends the new slot BEFORE `folder_id` is
+    # assigned -- every client (and any app on `slots:user`) would render the
+    # session at the top level for a frame, the observable unfiled state #6118
+    # exists to remove. It also covers the persist and its failure retraction, so
+    # a slot whose birth write fails is never broadcast at all. Same pattern the
+    # move path uses ("file the slot before the coalesced broadcast").
+    with state.suspend_slots_push():
+        slot = state.get_or_create_slot(
+            None, agent=agent_name, workspace=workspace, origin=SlotOrigin.USER
         )
-    except Exception:
-        # Retract, but never at the cost of work already in flight. The slot is
-        # addressable from the moment `get_or_create_slot` publishes it, which is
-        # before this await, so a turn can have started on it while the write was
-        # in the worker thread. Popping the slot then would leave that turn running
-        # with nothing pointing at it -- unreachable, unstoppable, and invisible to
-        # the stop verb. A phantom session that vanishes on the next restart is the
-        # lesser harm, so liveness wins over tidiness and the slot stays.
-        if not slot.running and not slot.messages:
-            state._slots.pop(slot.key, None)
+        # Attribute the slot to the caller that asked for it, which is what makes the
+        # per-creator ceiling above countable. Written here, inside the synchronous
+        # window that follows the mint, so no suspension point separates the cap test
+        # from this write -- otherwise two concurrent creates could both pass a ceiling
+        # that one of them had already filled. Only this entry point sets it: a
+        # person's own tab and a fork reach `get_or_create_slot` directly and stay
+        # unattributed, so ordinary human use never consumes an automated caller's
+        # share.
+        slot._created_by = caller_key
+        # cwd must follow the workspace too, or file search and project-scoped agents
+        # resolve against a directory the slot does not claim -- the same
+        # authorization-vs-execution split as the agent binding, one layer down.
+        if not slot.project:
+            slot.project = project_dir
+        if folder_id:
+            # Filed inside the same synchronous window that configures the slot, so
+            # the session is never observable unfiled -- the atomicity #6118 exists
+            # for. Existence was confirmed under the store lock above, and folder
+            # mutations run on this loop, so the folder cannot have been deleted
+            # between that check and this assignment. No `_folder_changed` flag: the
+            # slot's first turn carries the armed first-turn breadcrumb injection
+            # (`is_new` in chat_runner), so the [FOLDER] line reaches the model
+            # without it.
+            slot.folder_id = folder_id
+        if title.strip():
+            slot.title = sanitize_outbound(title.strip())[:200]
+            slot._titled = True
+        # Persist at birth. `save_slot_off_loop` cannot do this: the save it wraps
+        # returns early on an empty message window -- a full save has nothing to
+        # write -- so a freshly created session, which has no messages by
+        # definition, would write nothing at all. The tool would then hand back a
+        # session that does not survive a restart.
+        #
+        # Awaited, and a failure RETRACTS the slot rather than merely propagating: an
+        # unpersisted slot stays in the table, usable in memory and addressable by its
+        # creator, then vanishes on restart. Reporting the failure while leaving that
+        # behind is the worse of the two outcomes, because the caller sees an error and
+        # the session exists anyway. Same retraction the fork path uses on a failed
+        # build.
+        try:
+            await asyncio.to_thread(
+                log.update_metadata,
+                slot_history_key(slot),
+                {
+                    "_type": "metadata",
+                    # The slot's OWN durable identity, and its origin, both of which
+                    # the normal save path writes -- but a slot created here may never
+                    # reach that path: `_save_slot_to_history` runs a full save only
+                    # when the window has messages, so for a session that is created
+                    # and then sits idle THIS dict is the only record on disk.
+                    # Omitting `origin` is silently destructive on the next restart:
+                    # rehydrate falls back to the fail-closed empty sentinel, so a
+                    # session opened as USER comes back unattributed and `slots:user`
+                    # subscribers stop seeing it. Checked field-by-field against the
+                    # save path; these are the only fields a slot carries at birth
+                    # that it does not already write.
+                    "tab_id": slot._tab_id,
+                    "origin": slot._origin,
+                    "created_at": metadata_now_iso(),
+                    "workspace": slot.workspace,
+                    "agent": slot.agent or "",
+                    "project": slot.project or "",
+                    "title": slot.title or "",
+                    "memory_mode": getattr(slot, "memory_mode", "persistent"),
+                    # Only when filed, mirroring the normal save path, which omits
+                    # `folder_id` from the metadata line when empty. Without this
+                    # the filing would not survive a restart: for an idle newborn
+                    # THIS dict is the only record of the placement on disk.
+                    **({"folder_id": slot.folder_id} if slot.folder_id else {}),
+                    # Creator attribution, only when this entry point set it. The
+                    # member ownership boundary in `authorize_target` reads it, so
+                    # losing it on restart would strand every worker a member
+                    # dispatched — controllable in memory, orphaned after reboot.
+                    **({"created_by": slot._created_by} if slot._created_by else {}),
+                },
+            )
+        except Exception:
+            # Retract, but never at the cost of work already in flight. The slot is
+            # addressable from the moment `get_or_create_slot` publishes it, which is
+            # before this await, so a turn can have started on it while the write was
+            # in the worker thread. Popping the slot then would leave that turn running
+            # with nothing pointing at it -- unreachable, unstoppable, and invisible to
+            # the stop verb. A phantom session that vanishes on the next restart is the
+            # lesser harm, so liveness wins over tidiness and the slot stays.
+            if not slot.running and not slot.messages:
+                state._slots.pop(slot.key, None)
+            state.push_slots_update()
+            raise
+        if slot.folder_id:
+            # Model-B un-hide, applied only NOW that the filing has actually
+            # landed -- running it any earlier persists `hidden = False` for a
+            # create a later gate can still refuse, durably reversing a choice
+            # the user made for a call that failed. The move path holds the same
+            # order (assign, confirm, then un-hide). If the folder was deleted
+            # while the persist was in the worker thread, the delete's own sweep
+            # already unfiled this slot (it is published), so the guard reads
+            # the fresh value and skips; the metadata line can then briefly
+            # carry a dangling folder_id, the same accepted residual a move
+            # racing a delete leaves, and readers fall back to "(unfiled)".
+            #
+            # Best-effort: the create is already COMMITTED (slot published,
+            # persisted at birth), so a folder-store write failure here must not
+            # propagate -- the request would report failure for a session that
+            # exists, and the caller's retry would create a duplicate. A folder
+            # left hidden with a session inside is the recoverable lesser harm.
+            try:
+                await _unhide_folder(state, slot.folder_id)
+            except Exception:
+                logger.warning(
+                    "create_session: filing committed for %s but un-hiding folder %s failed",
+                    slot.key,
+                    slot.folder_id,
+                    exc_info=True,
+                )
         state.push_slots_update()
-        raise
-    state.push_slots_update()
     _audit(
         caller_session_key=caller_key,
         operation="create",
         slot_key=slot.key,
         outcome="allowed",
-        detail={"agent": slot.agent or ""},
+        detail={"agent": slot.agent or "", "folder_id": slot.folder_id or ""},
     )
-    return {"ok": True, "target": slot.key, "title": slot.title or slot.key}
+    return {
+        "ok": True,
+        "target": slot.key,
+        "title": slot.title or slot.key,
+    }
 
 
 def authorize_target(
@@ -856,12 +1021,21 @@ def authorize_target(
     caller_session_key: str,
     target: str,
     operation: str,
+    skip_enabled_check: bool = False,
 ) -> "_ChatSlot":
     """Resolve *target* and decide whether *caller* may act on it.
 
     Deny-by-default: every refusal raises :class:`SessionControlError` and is
     recorded in the SEL, so an attempt to reach a session that is out of bounds
     is visible after the fact even though nothing happened.
+
+    ``skip_enabled_check`` omits ONLY the ``session_control_enabled()`` config
+    read. It exists for a re-check that must run SYNCHRONOUSLY with no event-loop
+    suspension (``close_target``'s point-of-no-return callback): the feature was
+    already confirmed enabled when the operation was first authorized, whether
+    session control got switched off mid-operation is not a containment boundary,
+    and the config read is the one part of this function that can touch the disk
+    on a cache miss. Every containment and identity refusal still runs.
     """
 
     def deny(reason: str, code: str, status: int = 403) -> SessionControlError:
@@ -897,18 +1071,21 @@ def authorize_target(
         )
         return SessionControlError(reason, status=status, code=code)
 
-    if not session_control_enabled():
-        raise deny(
-            "session control is disabled in config (agent.session_control)",
-            "session_control_disabled",
-        )
-
     caller_key = caller_slot_key(state, caller_session_key)
     if not caller_key:
         # Without a resolved caller the self-target guard is blind, and a session
         # that can reach every peer while being unidentifiable is exactly the
         # shape this surface must not have.
         raise deny("caller session could not be identified", "caller_unidentified")
+    # Resolved before the config gate: a member DM session is authorized
+    # WITHOUT `agent.session_control` — dispatching and patrolling workers is
+    # its operating model — and is bounded instead by the ownership check
+    # below, which restricts it to slots it created itself.
+    if not skip_enabled_check and not session_control_enabled() and not _member_caller(caller_key):
+        raise deny(
+            "session control is disabled in config (agent.session_control)",
+            "session_control_disabled",
+        )
     if caller_key.startswith(UNATTENDED_SLOT_PREFIXES):
         raise deny(
             "unattended sessions (scheduled runs) cannot control other sessions",
@@ -1008,6 +1185,16 @@ def authorize_target(
         # Workspaces are the memory boundary; reaching across one would let a
         # session act on work it cannot see.
         raise deny("target session belongs to a different workspace", "workspace_mismatch")
+    if _member_caller(caller_key) and getattr(slot, "_created_by", "") != caller_key:
+        # The member's automatic authorization reaches ONLY the workers it
+        # created itself (`created_by` is written at birth and rehydrated on
+        # restart). Always enforced for member callers — even when the global
+        # switch is on — so a member's reach never silently widens to the
+        # user's own sessions because of an unrelated opt-in.
+        raise deny(
+            "a crew member can only control worker sessions it created itself",
+            "not_creator",
+        )
 
     return slot
 
@@ -1029,8 +1216,8 @@ def _audit(
 
     Dispatched OFF the loop when one is running, mirroring
     ``update_metadata_off_loop``. ``log_tool_invocation`` only enqueues, but the
-    FIRST ``sel()`` of a process CONSTRUCTS the log -- trust-dir creation, key
-    validation, and on Windows an ``icacls`` subprocess -- and this can genuinely
+    FIRST ``sel()`` of a process CONSTRUCTS the log -- trust-dir creation and
+    key validation, blocking file IO -- and this can genuinely
     be that first call: ``sel_audit_middleware`` logs AFTER ``await handler(...)``,
     so on a fresh gateway the first authenticated request constructs the log
     inside whatever handler runs first. Offloading here covers every call site
@@ -1061,8 +1248,8 @@ def _sel_off_loop(write: "Callable[[], None]", what: str) -> None:
     to be found separately, having been missed while the other two were fixed.
 
     Two failure modes, both handled: a loop-blocking construct (a ``sel()`` that
-    creates the trust dir, validates keys, and on Windows shells out to
-    ``icacls``), and a construct that RAISES, which unguarded turns a 403 into a
+    creates the trust dir and validates keys — blocking file IO), and a construct
+    that RAISES, which unguarded turns a 403 into a
     500 -- losing the refusal in order to report it. An audit that cannot be
     written must never change what the caller is told.
     """
@@ -1093,18 +1280,29 @@ async def stop_target(
 ) -> dict[str, Any]:
     """Stop *target*'s in-flight turn, via the same path as the Stop button.
 
-    A first call cancels cooperatively; calling again while that is pending
-    escalates to a hard kill. The escalation is decided by the target's own stop
-    state, not by anything the caller can ask for -- which is why there is no
-    force flag: `stop_slot_turn` escalates on a second press regardless of one,
-    so advertising it would promise a hard kill a first call cannot deliver.
+    A stop cancels cooperatively. The button escalates to a hard kill when a
+    second press lands while the first is still pending; this verb deliberately
+    does not do that for a repeat it cannot tell apart from a RETRY, because a
+    client that got no response inside its request timeout re-sends the same
+    request, and the kill path discards the target's queue and pending steers. So
+    within ``stop_retry.WINDOW_SECS`` of this caller's first stop of this target, a
+    repeat returns the existing "stop already in progress" no-op instead. A stop
+    arriving after that window still escalates, so a genuine second decision keeps
+    the capability — only a blind retry cannot reach it (issue #5074).
+
+    Withholding the escalation never costs the caller the stop it asked for: a
+    repeat that finds the target running again soft-stops it as a first call would.
+
+    Still no force flag: escalation is decided by the target's own stop state and
+    the window above, never by anything the caller can ask for, so advertising one
+    would promise a hard kill a first call cannot deliver.
     """
     # Prewarmed BEFORE `authorize_target`, and that ordering is load-bearing.
     # `stop_slot_turn`'s IDLE branch logs to the SEL with no await before it, so on
     # a fresh gateway a first `session_stop` against an idle slot would CONSTRUCT
-    # the log on the loop -- trust-dir creation, key validation, and on Windows an
-    # `icacls` subprocess. Constructing it off-loop first makes that call a cheap
-    # cache hit. Per-request, not a boot step: prewarming at startup is what
+    # the log on the loop -- trust-dir creation and key validation, blocking file
+    # IO. Constructing it off-loop first makes that call a cheap cache hit.
+    # Per-request, not a boot step: prewarming at startup is what
     # `no-new-work-on-gateway-boot-path` forbids, and a background task would only
     # narrow the race rather than close it.
     #
@@ -1137,20 +1335,145 @@ async def stop_target(
         target=target,
         operation="stop",
     )
+    # Both calls below are SYNCHRONOUS, which is what lets them sit here at all:
+    # the rule the comment above states is that nothing may SUSPEND between the
+    # gate and the act, and neither of these does.
+    #
+    # `caller_slot_key` repeats the slot walk `authorize_target` just did rather
+    # than changing what that function returns for all three verbs. The walk is
+    # bounded by `MAX_LIVE_SLOTS` and touches no filesystem, and with no
+    # suspension between them the two resolutions cannot disagree — a rebind
+    # landing in that window is impossible, not merely unlikely.
+    caller_key = caller_slot_key(state, caller_session_key)
+    may_escalate = allow_escalation(caller_key, slot.key)
     # Deferred: ``chat_handlers`` imports ``dashboard.chat`` transitively, which
     # reaches back into the gateway at import time — a module-scope import here
     # closes that cycle through ``handlers.session_control`` -> ``server``.
     from kiro_crew.dashboard.chat_handlers import stop_slot_turn
 
-    result = await stop_slot_turn(state, slot, source="session_control")
+    result = await stop_slot_turn(state, slot, source="session_control", escalate=may_escalate)
     _audit(
         caller_session_key=caller_session_key,
         operation="stop",
         slot_key=slot.key,
         outcome="allowed",
-        detail={"result": result.get("info", "stopping")},
+        detail={
+            "result": result.get("info", "stopping"),
+            # Recorded on the ALLOWED line, not only inside `stop_slot_turn`'s
+            # own audit: this is the layer that made the retry judgement, so the
+            # session-control trail has to show it was made.
+            "escalation_withheld": not may_escalate,
+        },
     )
     return {"ok": True, "target": slot.key, **result}
+
+
+async def close_target(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    target: str,
+) -> dict[str, Any]:
+    """Close *target*, the same archival the tab ✕ performs.
+
+    Non-destructive: the conversation is saved to history and can be reopened
+    later — closing dismisses the LIVE tab, it does not delete the transcript.
+    An in-flight turn is cancelled first (its work is discarded), so this is a
+    strictly heavier act than :func:`stop_target`; the description tells the
+    caller to read the session before closing it.
+
+    Reuses the dashboard's own close path (:func:`chat_handlers.close_slot`), so
+    a controlled close and a human ✕ share the identical nudge-retirement and
+    app-notification ordering that keeps a dismissed tab from being resurrected.
+    Its three failure modes surface as their own ``SessionControlError`` codes
+    rather than a generic 500, so a caller can tell "the app refused the
+    dismissal" from "history could not be saved".
+    """
+    # Same prewarm ordering as `stop_target`, for the same reasons: the SEL write
+    # inside `authorize_target`'s deny path must be a cache hit, and the config
+    # warm must be the LAST suspension before the synchronous gate.
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:  # noqa: BLE001 - a prewarm failure must not fail the close
+        logger.warning("session-control SEL prewarm failed", exc_info=True)
+    await prewarm_enabled_check()
+
+    slot = authorize_target(
+        state,
+        caller_session_key=caller_session_key,
+        target=target,
+        operation="close",
+    )
+    slot_key = slot.key
+    # Deferred for the same import cycle `stop_target` documents.
+    from kiro_crew.dashboard.chat_handlers import SlotCloseError, close_slot
+
+    def _reassert_closeable() -> None:
+        # Re-run the SAME target gate at close_slot's point of no return —
+        # SYNCHRONOUSLY, so there is NO event-loop suspension between it and the
+        # pop and nothing can change between the final authorization and the
+        # archival. The initial gate above ran before close_slot's awaits
+        # (nudge-loop retirement takes the AutoNudge lock; the app hook awaits
+        # external work), and a target that was unmirrored/unlinked then can gain
+        # a channel mirror or link in that window — archiving a now-channel-backed
+        # session the caller was never allowed to reach.
+        #
+        # `skip_enabled_check=True` omits the ONE part of authorize_target that
+        # can touch the disk (`session_control_enabled()`'s config read): the
+        # feature was already confirmed enabled above, whether it was switched off
+        # mid-close is not a containment boundary, and skipping it is what lets
+        # this run with no await — an async prewarm-then-check would put an await
+        # back before the pop and reopen the very window this closes. Every
+        # containment and identity refusal still runs.
+        try:
+            live = authorize_target(
+                state,
+                caller_session_key=caller_session_key,
+                target=slot_key,
+                operation="close",
+                skip_enabled_check=True,
+            )
+        except SessionControlError as exc:
+            # A stale-authorization refusal (mirrored/linked/workspace/caller-gone)
+            # becomes a SlotCloseError carrying that same status, so it round-trips
+            # to the caller as the specific 403 rather than a generic close failure.
+            raise SlotCloseError(exc.message, code=exc.code, status=exc.status) from exc
+        if live is not slot:
+            # The key was re-minted onto a DIFFERENT session while close_slot
+            # awaited (a concurrent close+reopen). authorize_target resolves by
+            # key, so it would authorize the replacement — but close_slot pops
+            # `name` and tears down / saves the ORIGINAL slot it holds. Comparing
+            # identity (not mere presence) is the same guard `create_session` uses
+            # for its re-minted-key window; abort so the replacement lives.
+            raise SlotCloseError(
+                "the target session was replaced during the close",
+                code="target_replaced",
+                status=409,
+            )
+
+    try:
+        await close_slot(state, slot, slot_key, pre_pop_check=_reassert_closeable)
+    except SlotCloseError as exc:
+        # The close path already rolled back every partial step and logged the
+        # cause; re-raise it as the surface's own error so the caller sees the
+        # specific reason (nudge/app/history) rather than a bare failure. Audited
+        # as a denied operation so the trail shows the close was attempted and did
+        # not take.
+        _audit(
+            caller_session_key=caller_session_key,
+            operation="close",
+            slot_key=slot_key,
+            outcome="denied",
+            detail={"code": exc.code},
+        )
+        raise SessionControlError(exc.message, status=exc.status, code=exc.code) from exc
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="close",
+        slot_key=slot_key,
+        outcome="allowed",
+    )
+    return {"ok": True, "target": slot_key}
 
 
 #: Cap on one delivered message. Aliased to ``validation.MAX_LONG_STRING`` rather
@@ -1282,12 +1605,22 @@ def read_messages(
 
     # Indexes are ABSOLUTE positions in the session, not offsets into the live
     # window. A slot keeps only the most recent ``_MAX_SLOT_MESSAGES`` in memory
-    # and credits each trimmed row to ``_disk_older_count``, so window length
+    # and credits each trimmed row to a frozen-prefix counter, so window length
     # stops growing once trimming starts. A cursor derived from that length
     # would freeze at the cap and never see another reply; adding the
     # frozen-prefix count makes it monotonic for the session's whole life.
     raw_window = list(slot.messages)
-    base = int(getattr(slot, "_disk_older_count", 0) or 0)
+    # The DURABLE frozen-prefix counter, never ``_disk_older_count``: that one
+    # counts every trimmed row, transient ones included, while the positions
+    # below are built over the durable rows the filter keeps. Basing on the
+    # all-rows counter shifted every position as soon as a transient row was
+    # trimmed, and a ``since`` read then served a durable message the caller
+    # already had. ``_disk_older_durable_count`` counts exactly the rows the
+    # ``TRANSIENT_ROLES`` filter below would have kept, so the two spaces agree
+    # for the session's whole life. Defensive ``getattr`` matches how the
+    # existing code reads ``_disk_older_count``: a slot restored by an older
+    # build simply has no trimmed prefix yet.
+    base = int(getattr(slot, "_disk_older_durable_count", 0) or 0)
     # Stop the cursor before the streaming tail (see ``TRANSIENT_ROLES``): those
     # rows are deleted when the segment flushes, so a cursor past them would sit
     # beyond the list that replaces them and never return the finished reply.
@@ -1297,40 +1630,28 @@ def read_messages(
     if since is not None:
         if since < 0:
             raise SessionControlError("since must be >= 0", code="invalid_since")
-        if base:
-            # ``_disk_older_count`` counts every trimmed row, transient ones
-            # included (persistence writes them and only skips them when reading
-            # back), while the positions above are built over DURABLE rows only.
-            # The two agree until a transient row is trimmed into the frozen
-            # prefix — then `base` advances with no durable row behind it, every
-            # position shifts, and a `since` read serves a durable message the
-            # caller already had.
-            #
-            # An exact cursor needs a durable-only prefix count, which does not
-            # exist yet and cannot be added from here: ``_disk_older_count`` has a
-            # contract with the save model (it is the frozen prefix saves must not
-            # rewrite) and is read by backfill, rewind and channel slots. So this
-            # refuses loudly instead of quietly duplicating. Tail reads (no
-            # ``since``) still work, and the window is 10,000 rows, so only a very
-            # long-lived session reaches this at all. Tracked for the real fix.
+        if since < base:
+            # The cursor points into the trimmed prefix: those rows exist only
+            # on disk now, and this read serves the in-memory window. Starting
+            # at ``base`` instead would silently skip every row in
+            # ``[since, base)`` — a poller that lagged a whole window behind
+            # would lose messages with nothing in the response saying so. The
+            # refusal is loud and the tail-read fallback recovers, exactly like
+            # the past-the-end case below.
             raise SessionControlError(
-                "this session is long enough that older messages have been "
-                "trimmed, and cursor positions are no longer exact — read without "
-                "`since` to get the latest messages",
+                "this session is long enough that the messages at your cursor "
+                "have been trimmed from memory — read without `since` to get "
+                "the latest messages",
                 status=409,
                 code="cursor_unavailable",
             )
-        # `base` is 0 from here on — the guard above refused every trimmed
-        # session — so the absolute position and the window offset coincide.
-        #
         # A cursor PAST the end is the remaining inexact case, and it is not the
         # same as a stale one: rewind and regenerate shrink a transcript, so
         # `total` can move backwards under a caller that is still holding the old
         # position. Clamping it to `total` would start the read at the end and
         # silently skip every replacement row written below the old cursor, with
-        # nothing in the response saying so. That is the failure the trimmed-session
-        # guard above refuses loudly rather than answer approximately, so this
-        # refuses the same way. Reads without `since` are unaffected.
+        # nothing in the response saying so. So this refuses loudly rather than
+        # answer approximately. Reads without `since` are unaffected.
         if since > total:
             raise SessionControlError(
                 "this session is shorter than your cursor — it was rewound or "
@@ -1340,13 +1661,16 @@ def read_messages(
                 code="cursor_unavailable",
             )
         start = since
-        offset = start
+        # Positions are absolute; the window slice below is offset-relative, so
+        # subtract the durable prefix that is no longer in memory.
+        offset = start - base
     else:
-        # A tail read is still served on a trimmed session (only `since` reads are
-        # refused), so the two spaces come apart here: slice the in-memory window
-        # by OFFSET, but report the index in ABSOLUTE terms so the number still
-        # means "position in the session". Conflating them returned an empty
-        # window, because `total` counts the frozen prefix the list does not hold.
+        # A tail read never refuses (only a `since` below the trimmed prefix or
+        # past the end is), and the two spaces come apart here: slice the
+        # in-memory window by OFFSET, but report the index in ABSOLUTE terms so
+        # the number still means "position in the session". Conflating them
+        # returned an empty window, because `total` counts the frozen prefix
+        # the list does not hold.
         offset = max(0, durable_end - limit)
         start = base + offset
     window = messages[offset:][:limit]
@@ -1399,13 +1723,11 @@ def read_messages(
         # `total` stays in the response as the backlog depth — the difference
         # from `next_since` is how far behind the caller still is.
         #
-        # Omitted once rows have been trimmed, because positions stop being exact
-        # there (see the `cursor_unavailable` refusal above). Handing back a
-        # cursor that the next call would reject is worse than saying it is gone,
-        # so its ABSENCE is the signal: a caller with no `next_since` falls back
-        # to tail reads. No separate flag says the same thing -- two encodings of
-        # one fact can disagree, and the reader already has to handle the absent
-        # key.
-        **({"next_since": start + len(out)} if not base else {}),
+        # Returned on trimmed sessions too: positions are based on the
+        # durable-only prefix counter, so they stay exact after rows age into
+        # the frozen prefix. The refusals above cover the cases that genuinely
+        # cannot be exact (a cursor under the trimmed prefix, or past the end of
+        # a rewound transcript).
+        "next_since": start + len(out),
         "messages": out,
     }

@@ -25,7 +25,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from '../hooks/useTheme'
-import chatReducer from '../store/chatSlice'
+import chatReducer, { startLocalTurn } from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 
@@ -40,6 +40,7 @@ vi.mock('../api/client', () => ({
     chatSlots: vi.fn().mockResolvedValue([]),
     chatSlotDetail: vi.fn().mockResolvedValue({ messages: [], running: false, has_more: false, total: 0 }),
     sendChat: (...a: unknown[]) => sendChat(...a),
+    steerChat: vi.fn(),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
     models: vi.fn().mockResolvedValue([]),
     agents: vi.fn().mockResolvedValue([]),
@@ -164,6 +165,25 @@ describe('send() confirms its own optimistic bubble from the response', { timeou
     // either way, and when it does queue, its own `queue_push` card owns the
     // message. Either way this bubble is not a delivered row.
     expect(userRow(store)?.meta?.optimistic).toBe(true)
+  })
+
+  it('renders an immediate send after a stale busy state is accepted', async () => {
+    // A gateway restart can leave the client believing its old turn still
+    // runs. The composer therefore skips the optimistic row, but the restarted
+    // gateway accepts this as a fresh immediate turn and suppresses its normal
+    // user echo. The response must restore the missing visible prompt now.
+    sendChat.mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) })
+    // A backend without live steer support, or a user who chose Queue, still
+    // submits through send(). This is the path whose stale busy flag hid the
+    // prompt after restart.
+    localStorage.setItem('mc-busy-send-mode', 'queue')
+    const store = makeStore()
+    await renderPage(store)
+    store.dispatch(startLocalTurn('slot-a'))
+    await sendText('accepted after restart')
+
+    await waitFor(() => expect(userRow(store)?.content).toBe('accepted after restart'))
+    expect(userRow(store)?.meta?.optimistic).toBeUndefined()
   })
 
   it('leaves an unreadable 2xx receipt SILENT — pending bubble, no error row (#4217)', async () => {

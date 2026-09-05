@@ -77,6 +77,73 @@ code_review_sage/
 App-local runtime data lives under `~/.kiro/crew/apps/code-review-sage/data/`
 (honors `KIROCREW_HOME`; created on first use, never committed).
 
+The active and candidate markdown files remain the review-compatible source of
+truth. An explicit `sage_lib/learning.py export-records` command can add their
+entries to a versioned `learning-records.v1.json` sidecar for future governance.
+It never runs at startup or while reading rules, never rewrites markdown, retains
+valid sidecar records on repeat exports, and snapshots an existing sidecar before
+changing it. `rollback-records-export` restores that sidecar snapshot only.
+
+Namespace applicability is configured under `review.namespace_bindings` in the
+app's `config.json`. An active namespace without a binding remains globally
+applicable for compatibility and is reported as a migration warning. Mark a
+deliberately global namespace explicitly, or bind it to one canonical review
+source identity:
+
+```json
+{
+  "review": {
+    "active_namespaces": ["default", "service-rules"],
+    "namespace_bindings": {
+      "default": {"scope": "global"},
+      "service-rules": {
+        "scope": "repository",
+        "repository": {
+          "provider": "github",
+          "host": "github.com",
+          "owner": "acme",
+          "repository": "service"
+        }
+      }
+    }
+  }
+}
+```
+
+The review run stores its frozen source identity and effective rules, including
+the namespace and inclusion reason for every pattern. This is the backend API
+seam for a later settings and provenance UI; it does not migrate sidecars or
+change learning consolidation.
+
+When a namespace has a populated `learning-records.v1.json` sidecar, that
+sidecar governs its prompt context. Records move explicitly among `candidate`,
+`active`, `archived`, and `pinned`: a candidate needs two independent
+review/change signals before it can become active, while an operator may pin it
+directly. Repeating the same review or change never increases recurrence.
+`review.active_context` bounds governed context with separate global and
+repository `{max_rules, max_tokens}` budgets (defaults: 20/4000 and 12/2400).
+Selection is deterministic: pinned records, then recurrence, recency, scope,
+and id. Unpinned active overflow is archived rather than deleted. Invalid
+lifecycle data or budgets fail closed for governed namespaces. Missing or empty
+sidecars keep the markdown-only compatibility behavior above.
+
+Individual active and pinned rules are archived instead of deleted. The archive
+record keeps its origin and recurrence provenance, is excluded from review
+context, and has an explicit restore control. Archiving a markdown-only rule
+first adopts that namespace into its sidecar on the operator's action; startup
+and normal reads never migrate legacy markdown.
+
+Consolidation is a two-step, namespace-local backend contract. `POST
+/learnings/consolidate` asks a worker for a machine-readable proposal and stores a
+versioned preview artifact; it never changes the live ruleset, sidecar, or candidates.
+The preview records candidate and active generations, the selected ids, per-candidate
+`promote`/`merge`/`archive`/`retain` decisions, and budget impact. Read-only preview
+list/detail APIs expose expiry and stale state. `POST
+/learnings/consolidation-previews/apply` requires `preview_id` and `confirm: true`;
+it rejects expired, stale, or already-applied previews with machine-readable codes.
+Apply rechecks snapshots, restores on a write failure, consumes only the snapshotted
+decisions, and keeps unselected or concurrently staged candidates.
+
 ## Enable
 
 Code Review Sage is a built-in app (listed in `kiro_crew.apps.builtins`). Enable

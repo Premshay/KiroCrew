@@ -16,6 +16,7 @@ format on top.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,45 @@ logger = logging.getLogger(__name__)
 STEER_STEERED = "steered"
 STEER_REQUEUED = "requeued"
 STEER_UNAVAILABLE = "unavailable"
+
+# Upper bound on a client-minted ``meta.sendId`` accepted into the steer path.
+# Client mints are ~17 chars; the bound exists because the value is raw client
+# input that gets persisted into slot history and broadcast to every tab.
+SEND_ID_MAX_LEN = 128
+
+# The accepted send-id alphabet. Client mints are ``s-<base36>-<base36>``; the
+# allowlist is deliberately a little wider (URL-safe id charset) so a future
+# client id shape does not silently lose reconciliation, while still excluding
+# every separator a structured secret needs (``/ + = .`` — base64 padding, JWT
+# dots, path-shaped tokens).
+_SEND_ID_RE = re.compile(rf"^[A-Za-z0-9_-]{{1,{SEND_ID_MAX_LEN}}}$")
+
+
+def normalize_send_id(value: object) -> str | None:
+    """Return *value* when it is a usable client send-correlation id, else None.
+
+    Deny-by-default over raw client input, in two gates:
+
+    1. Shape: a non-empty string in the id alphabet within ``SEND_ID_MAX_LEN``.
+    2. Content: the canonical credential scan (``redact_credentials``) finds
+       nothing. The alphabet alone cannot exclude bare alphanumeric key shapes
+       (an AWS access-key id, a ``ghp_`` token), and this value is persisted
+       into slot history and broadcast on ``steer_push`` WITHOUT the outbound
+       redaction the message text goes through — so anything the scanner would
+       redact is refused outright here instead.
+
+    A failing value is treated as ABSENT (the old-client shape), never
+    truncated or redacted-in-place — a rewritten id would silently mismatch the
+    client's copy and defeat the reconciliation it exists for. Lives here, with
+    the sink that persists and broadcasts the value, so every caller inherits
+    both gates.
+    """
+    if not isinstance(value, str) or not _SEND_ID_RE.fullmatch(value):
+        return None
+    cleaned, _warnings = redact_credentials(value)
+    if cleaned != value:
+        return None
+    return value
 
 
 def sanitize_outbound(text: str) -> str:
@@ -107,13 +147,30 @@ async def steer_into_running_turn(
     state: "DashboardState",
     slot: "_ChatSlot",
     message: str,
+    *,
+    send_id: str | None = None,
 ) -> str:
     """Inject *message* into the slot's RUNNING turn; return a ``STEER_*`` outcome.
 
     Requires a live, steer-capable inner ACP client that the turn published on
-    the slot. Fire-and-forget by design: the inline steer card materializes when
-    kiro-cli echoes ``steering_consumed``.
+    the slot. Fire-and-forget by design: this never awaits the backend's answer,
+    because the running turn's read loop is the sole consumer of that stream.
+    Settlement therefore arrives out of band, and which signal carries it is the
+    backend's business — kiro-cli echoes ``steering_consumed``; claude-agent-acp
+    answers the steer request itself, which the client turns into the same echo.
+    Either way an UNSETTLED steer is requeued as a visible card when the turn
+    ends, so no path here loses the text.
+
+    ``send_id`` is the client-minted correlation id from the send's meta (the
+    same ``sendId`` convention the plain send path persists). When present it is
+    stamped onto the persisted steer row AND the ``steer_push`` broadcast, so the
+    client can reconcile its optimistic bubble — and resolve the bubble's
+    accepted-vs-new-turn ambiguity — by id identity instead of text. Optional
+    and additive: a send without one keeps the exact prior row/payload shape.
+    Normalized at entry (``normalize_send_id``) so the type/length bound holds
+    for every caller, not just the current one.
     """
+    send_id = normalize_send_id(send_id)
     client = getattr(slot, "_acp_client", None)
     if client is None or not getattr(client, "supports_steer", False):
         return STEER_UNAVAILABLE
@@ -167,6 +224,18 @@ async def steer_into_running_turn(
     # through a merge.
     delivery_id = uuid.uuid4().hex
     slot._steer_delivery_ids[message] = delivery_id
+    # Recorded HERE, next to the delivery id, because the requeue is what needs it
+    # and the requeue runs in the TURN's teardown -- another coroutine, which never
+    # sees this call's arguments. The three `STEER_REQUEUED` returns below cannot
+    # do this themselves: two of them have no queue entry to write to at the moment
+    # they run (one returns before the teardown has requeued anything, the other
+    # after the drain already wrote the row), so the only common writer is
+    # `_requeue_unconsumed_steers`. Normalized value, not the raw argument -- the
+    # entry meta is persisted with the queue and reaches the row, so it must clear
+    # the same gate the row stamp does. Absent id stores nothing, which keeps the
+    # requeued entry's meta byte-identical to its pre-#6751 shape.
+    if send_id:
+        slot._steer_send_ids[message] = send_id
     slot._pending_steers.append(message)
     try:
         steered = await client.steer(message)
@@ -189,6 +258,7 @@ async def steer_into_running_turn(
         # writing a second one. Checked first: it is the one signal that survives
         # every intermediate transition, including a merged row.
         slot._steer_delivery_ids.pop(message, None)
+        slot._steer_send_ids.pop(message, None)
         logger.info(
             "steer for slot %s was requeued and drained during the RPC; row already " "persisted",
             slot.key,
@@ -207,6 +277,7 @@ async def steer_into_running_turn(
             # plain remove and not an index dance over possible duplicates.
             slot._pending_steers.remove(message)
             slot._steer_delivery_ids.pop(message, None)
+            slot._steer_send_ids.pop(message, None)
             return STEER_UNAVAILABLE
         if stopped:
             # Still registered means the teardown has not run yet and will
@@ -280,6 +351,10 @@ async def steer_into_running_turn(
     # deliberately keep theirs because `chat_runner`'s drain still has to match it,
     # and that entry is bounded by the queue.
     slot._steer_delivery_ids.pop(message, None)
+    # Same lockstep, same reason: this delivery stamps `sendId` onto its own row a
+    # few lines below, so nothing will read the map entry again and leaving it
+    # would hold a full message string for the slot's lifetime.
+    slot._steer_send_ids.pop(message, None)
 
     ts = datetime.now(timezone.utc).isoformat()
     # Cut the in-flight text segment at the steer boundary BEFORE persisting the
@@ -296,17 +371,25 @@ async def steer_into_running_turn(
 
     sanitized = sanitize_outbound(message)
     meta: dict[str, Any] = {"steer": True}
+    if send_id:
+        # Persist the client correlation id alongside the steer flag: the
+        # transcript page is what mergePreservedThinking reads to resolve an
+        # optimistic bubble by id (accepted steer vs raced new turn, #6075).
+        meta["sendId"] = send_id
     # Store the sanitized form — raw content must never reach an external
     # surface — so the steer survives a page reload via the dirty-flush cycle.
     slot.append("user", sanitized, "msg msg-u", ts=ts, meta=meta)
-    state.broadcast_ws(
-        "steer_push",
-        {
-            "slot": slot.key,
-            "content": _redact_for_display(sanitized),
-            "ts": ts,
-        },
-    )
+    push_payload: dict[str, Any] = {
+        "slot": slot.key,
+        "content": _redact_for_display(sanitized),
+        "ts": ts,
+    }
+    if send_id:
+        # Echoed back so the initiating tab reconciles its optimistic bubble by
+        # id; omitted when absent so the payload shape is unchanged for sends
+        # that never minted one.
+        push_payload["sendId"] = send_id
+    state.broadcast_ws("steer_push", push_payload)
     return STEER_STEERED
 
 

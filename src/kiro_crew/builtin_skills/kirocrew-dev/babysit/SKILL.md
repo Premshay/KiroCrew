@@ -183,10 +183,12 @@ not write it off as flakiness.
 - User is waiting and total time < 30 min → `wait` + poll, no loop.
 - "Babysit / monitor / keep checking" in THIS conversation, in a phase where
   you ACT most cycles (fixing findings, pushing revisions) → `monitor_start`.
-- **Pure-watch phase of a PR babysit** — waiting on CI or reviewers, nothing
-  to do until a signal → arm the **`pr_watch` script cron** (below). Zero
-  tokens per quiet cycle; it wakes THIS session with one agent turn only when
-  something unexpected happens.
+- **Pure-watch phase of a PR babysit** — waiting on CI or reviewers, nothing to
+  do until a signal → still `monitor_start`, and name the pull request in the
+  instruction. A loop naming one public GitHub pull request is gated by default:
+  quiet cycles cost no agent turn, and it wakes only on a real change. The
+  `pr_watch` script cron (below) is now only for what that cannot reach --
+  an enterprise host, or detection with no owning loop.
 - Reacting to review feedback or CI on a PR → `monitor_start` or in-turn
   `wait`+poll for the active-fix phase. **Never an agent (LLM) cron, never
   HEARTBEAT.md** (see below). The `pr_watch` script cron is fine: it is the
@@ -198,20 +200,41 @@ not write it off as flakiness.
   `script` cron at roughly a 5-minute interval.
 - External system will call back → `register_hook`.
 
-### Watch mode — zero-token PR polling with `pr_watch.py`
+### Watch mode — a manual cron for what the default gate cannot reach
 
-A babysit spends most of its life waiting: CI runs for ten minutes, reviewers
-take longer, and every `monitor_start` cycle that discovers "nothing changed"
-still pays a full agent turn on the session's whole context. Watch mode moves
-the *detection* to a script cron and keeps the *judgment* in this session:
+**Read this first: you probably do not need this section.** A `monitor_start`
+loop whose instruction names ONE public GitHub pull request is already gated --
+it observes that pull request each interval with one bounded `gh` call and
+re-injects your message only when it actually changed, so a cycle where nothing
+changed costs no agent turn. That is the default, on every arming surface, with
+no steps to take. Use it, and skip to the end of this section.
+
+Watch mode is the manual version, and only three situations still need it:
+
+- the pull request is on an **enterprise host** -- the gate pins public GitHub,
+  because choosing a host from data is not something a watch message may do;
+- there is **no owning loop** to gate: you want detection without a babysit
+  session, e.g. a fire-and-forget notification;
+- you need the cron's own knobs -- `known_reds` to suppress failures inherited
+  from the base branch, `note` to carry text into the wake, `wake_on_green`.
+
+If none of those apply, arming this cron gives you a second watcher on the same
+pull request, and the two will wake you separately for the same event.
 
 ```
 script cron (zero tokens, every ~5 min)
   ├─ nothing changed / checks still running     → silent, no delivery
   ├─ merged / closed                            → final message, cron removes itself
   └─ unexpected state                           → ONE agent turn in THIS session
-       (CONFLICTING · new failing check not in known_reds · all green)
+       (CONFLICTING · new failing check not in known_reds · all green
+        · a comment or review someone else posted)
 ```
+
+**Why the interval can be small.** A tick of this cron costs one bounded `gh`
+call and no tokens at all, so the interval is limited by API politeness rather
+than by spend -- 60s is reasonable, and 300s is a default rather than a floor.
+An UNGATED `monitor_start` cycle, by contrast, costs a full agent turn on the
+session's whole context, which is what forces its interval up.
 
 Arm it **from the session that owns the babysit** — the cron captures that
 session as its wake target; armed anywhere else, the wake lands in the wrong
@@ -220,8 +243,9 @@ skill asset there first (re-copy on every arm — it keeps the copy current
 with skill updates):
 
 ```
-cp ~/.kiro/crew/skills/kirocrew-dev/babysit/scripts/pr_watch.py \
-   ~/.kiro/crew/crons/pr_watch.py
+CREW_HOME="${KIROCREW_HOME:-$HOME/.kiro/crew}"
+cp "$CREW_HOME/skills/kirocrew-dev/babysit/scripts/pr_watch.py" \
+   "$CREW_HOME/crons/pr_watch.py"
 
 cron_add(
   name="pr-watch #1234",
@@ -233,6 +257,12 @@ cron_add(
             "note": "worktree ~/oss/wt-foo, branch fix/foo"}'
 )
 ```
+
+The `cp` runs in your shell, so it has to resolve `KIROCREW_HOME` -- an install
+that moved its data home has no `~/.kiro/crew/skills` at all and a hardcoded
+path fails with `No such file or directory`. The `script=` value is different:
+the gateway resolves it against its OWN config directory (and forces the
+`crons/` root), so the conventional spelling there is correct as written.
 
 - `known_reds` — check names that are red on the BASE branch (inherited
   breakage). The watch never wakes for them and treats "everything else
@@ -260,9 +290,30 @@ cron_add(
 - Wakes are deduplicated **per head SHA**: one wake per conflict, per new red
   check name, per all-green. A force-push resets the memory, so the next
   anomaly on the new head wakes again. Quiet ticks deliver nothing at all.
-- The watch reads only PR state and the check rollup. It does NOT read
-  reviewer comment bodies — verdict text, marker freshness, and rebuttals are
-  the woken agent's job, exactly as in a manual cycle.
+- A conversation signal older than five hours is never treated as new. That bound
+  is a constant in the script, deliberately not a cron parameter: the probe keeps
+  no memory of its own, so without it arming a watch on a PR with forty comments
+  would report all forty on the first tick — and as a knob it had no caller while
+  its one real constraint (stay under the kernel's six-hour re-alert window) is
+  now asserted in code rather than merely documented. The value sits close to that
+  ceiling on purpose: too large costs one coalesced arm-time wake, while too small
+  costs a silent permanent MISS whenever the watch stops ticking for longer than
+  the horizon (laptop asleep, gateway down, cron auto-paused). Those two prices are
+  not equal, so the horizon is pushed as high as the kernel allows.
+- The watch reads PR state, the check rollup, AND the conversation: comments and
+  submitted reviews. It reports **that**
+  something was said -- who, and when -- and never quotes the body. Reading the
+  text, judging whether it is a real finding, and deciding what to do stay the
+  woken agent's job, done with this session's trust rather than a cron script's.
+  This is what closes the gap `monitor_start` used to cover: a comment moves no
+  check, and on this repository a reviewer lane can report success while its
+  comment body carries findings, so a rollup-only watch would sit quiet on a
+  green PR nobody had read.
+- Conversation signals are deduplicated per comment/review id and **survive a
+  force-push**, because a comment belongs to the pull request rather than to the
+  commit under review. Check-derived signals still reset per head. Your own
+  comments are ignored, or the watch would wake you to read the disposition you
+  just posted.
 - Merged or closed → the cron delivers a final message and removes itself.
   If you finish the babysit early, remove it yourself (`cron_remove`).
 - Typical composition: drive the active-fix phase with `monitor_start`; when
@@ -392,10 +443,17 @@ byte-for-byte instead of by eyeballing a diff of human text.
 
 Its `advisory` half is what you read when checking the exit conditions below:
 `unresolved_threads` (`null` there is the same "could not establish" as a `?`),
-`findings` per reviewer, and `stale_reviewers` / `blocking_reviewers`. Nothing
-else is emitted — ambient PR state (mergeable, merge state, review decision,
-check totals) stays in the prose above, which is where those conditions already
-read it, so there is no second copy to keep in sync.
+`findings` per reviewer, `stale_reviewers` / `blocking_reviewers`, and
+`elided_stamp_reviewers` — lanes whose freshness stamp MANGLED the head SHA
+(the workflows have the model retype it, so a lane can drop the middle and
+splice the head's prefix to its suffix). The gate verifies such a stamp against
+the current head and accepts it, which is why it is not a stale reviewer; the
+list exists so the emitter defect is still visible. Report it ONCE per head as
+a lane-quality note — it never blocks, and re-running that workflow usually
+produces a clean stamp. Nothing else is emitted — ambient PR state (mergeable,
+merge state, review decision, check totals) stays in the prose above, which is
+where those conditions already read it, so there is no second copy to keep in
+sync.
 
 Drive the cycle off the **exit code**, not off prose: `10` → report nothing and
 wait for the next cycle; `20` → drill in with `pr_findings.py` and act; `2` →

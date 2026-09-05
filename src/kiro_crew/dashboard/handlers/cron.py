@@ -16,7 +16,7 @@ from aiohttp import web
 
 from kiro_crew import model_registry
 from kiro_crew.config.loader import config_dir
-from kiro_crew.cron import CronStoreBusy, is_valid_timezone
+from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, is_valid_timezone
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.dashboard.cron_inject import (
     hydrate_slot_from_history,
@@ -52,6 +52,7 @@ from ._shared import (
     _is_restricted_session,
     _probe_persisted_session,
     _redact_memory_field,
+    read_bounded_json,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,56 @@ logger = logging.getLogger(__name__)
 # should retry rather than treat it as a hard failure. See CronService mutators.
 _CRON_BUSY_STATUS = 409
 _CRON_BUSY_BODY = {"error": "cron store busy, please retry", "retryable": True}
+
+# Byte ceiling for a cron create/update body. The message field is bounded at
+# MAX_CRON_MESSAGE characters, and one character costs at most 12 bytes on the
+# wire: a client may send it JSON-escaped, and an astral character escapes to a
+# \uXXXX\uXXXX surrogate pair (12 bytes), wider than raw UTF-8's 4-byte max. So
+# this bounds the largest message the field validator will accept; the 64 KB of
+# headroom covers the remaining short fields. Explicit rather than the shared
+# default because a maximal multibyte message legitimately exceeds 64 KB.
+_MAX_CRON_BODY_BYTES = 12 * MAX_CRON_MESSAGE + 64 * 1024
+
+# Returned when the store cannot be WRITTEN because the last read of it failed
+# (CronStoreUnreadable). 409 for the same reason as busy above -- the request
+# conflicts with the current state of the resource -- but explicitly
+# `retryable: False`: an unreadable file does not heal on its own, so a client
+# that retries on busy must NOT retry on this. The exception already carries the
+# one action that resolves it (move the file aside), so its message is surfaced
+# verbatim rather than restated.
+#
+# The status and the code are written as LITERALS at the json_response call
+# rather than hoisted into module constants, because `test_error_code_contract`
+# buckets a computed `status=` as `dynamic_status` and caps that bucket
+# deliberately -- a named constant is indistinguishable, to a static scan, from
+# computing the status to evade the gate. Literals make this response decidable:
+# it scores `compliant` instead of consuming cap.
+
+
+def _cron_unreadable_response(exc: CronStoreUnreadable) -> web.Response:
+    """Translate a refused write into a structured, non-retryable 409."""
+    return web.json_response(
+        {"error": str(exc), "code": "cron_store_unreadable", "retryable": False},
+        status=409,
+    )
+
+
+def _invalid_path_id_response(value: str, name: str) -> web.Response | None:
+    """Guard a URL path id (job_id/run_id/folder_id) for non-empty, bounded length.
+
+    Returns a 400 ``invalid_<name>`` response when ``value`` is empty or longer
+    than ``MAX_SHORT_STRING``, else ``None``. This is the single validator the
+    cron routes apply to every path-param id — the job/run routes and both
+    cron-folder routes — so a malformed id is rejected before any lock
+    acquisition, thread dispatch, or state lookup (the asymmetric-perimeter gap
+    #5789/#5808 closed). These ids are server-minted, so an over-long value only
+    arrives from a malformed/hostile client.
+    """
+    if not value or len(value) > MAX_SHORT_STRING:
+        return web.json_response(
+            {"error": f"invalid {name} format", "code": f"invalid_{name}"}, status=400
+        )
+    return None
 
 
 def _sel():
@@ -189,12 +240,13 @@ async def _resolve_and_supersede(
 async def api_crons_create(request: web.Request) -> web.Response:
     """POST /api/crons — create a cron job."""
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    if not isinstance(body, dict):
-        return web.json_response({"error": "request body must be a JSON object"}, status=400)
+    # Per-route cap: the body carries the job's full agent message/prompt text,
+    # whose field bound (MAX_CRON_MESSAGE chars) can exceed the shared 64 KB
+    # default in multibyte UTF-8 -- _MAX_CRON_BODY_BYTES sizes the ceiling to it.
+    body, body_err = await read_bounded_json(request, max_bytes=_MAX_CRON_BODY_BYTES)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     # Type-validate every string field BEFORE calling string methods on it.
     # A JSON array/dict/int in these fields would otherwise raise AttributeError
     # (.strip() on a non-str) -> HTTP 500. validate_string_field enforces
@@ -285,6 +337,8 @@ async def api_crons_create(request: web.Request) -> web.Response:
             job = await state.crons.add_job_async(name, message, every_secs=every, **add_kwargs)
         except CronStoreBusy:
             return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+        except CronStoreUnreadable as exc:
+            return _cron_unreadable_response(exc)
     elif cron_expr:
         try:
             job = await state.crons.add_job_async(
@@ -292,6 +346,8 @@ async def api_crons_create(request: web.Request) -> web.Response:
             )
         except CronStoreBusy:
             return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+        except CronStoreUnreadable as exc:
+            return _cron_unreadable_response(exc)
     else:
         return web.json_response({"error": "schedule, every, or cron required"}, status=400)
     state.push_refresh("crons")
@@ -302,12 +358,16 @@ async def api_cron_delete(request: web.Request) -> web.Response:
     """DELETE /api/crons/{id} — remove a cron job."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     try:
         ok = await state.crons.remove_job_async(
             job_id, actor="dashboard", source="api_cron_delete"
         )
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+    except CronStoreUnreadable as exc:
+        return _cron_unreadable_response(exc)
     if ok:
         await state.crons.get_history().delete_job_history(job_id)
         state.push_refresh("crons")
@@ -330,12 +390,11 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
     single ``crons`` refresh is pushed after the batch instead of one per id.
     """
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    if not isinstance(body, dict):
-        return web.json_response({"error": "request body must be a JSON object"}, status=400)
+    # Default cap: the body is a bounded list of short job ids.
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     ids = body.get("ids")
     if not isinstance(ids, list) or not ids:
         return web.json_response({"error": "ids must be a non-empty array"}, status=400)
@@ -390,10 +449,18 @@ async def api_cron_update(request: web.Request) -> web.Response:
     """PATCH /api/crons/{id} — update a cron job (partial)."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
+    # Per-route cap: a partial update can carry the job's full agent
+    # message/prompt text, whose field bound (MAX_CRON_MESSAGE chars) can
+    # exceed the shared 64 KB default in multibyte UTF-8. The helper also owns
+    # the non-object 400: a syntactically valid scalar or array parses fine
+    # and then has no .get, so the field reads below would raise
+    # AttributeError and surface as a 500.
+    body, body_err = await read_bounded_json(request, max_bytes=_MAX_CRON_BODY_BYTES)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     kwargs: dict[str, Any] = {}
     for key in (
         "name",
@@ -492,6 +559,8 @@ async def api_cron_update(request: web.Request) -> web.Response:
         job = await state.crons.update_job_async(job_id, **kwargs)
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+    except CronStoreUnreadable as exc:
+        return _cron_unreadable_response(exc)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     if not job:
@@ -504,6 +573,8 @@ async def api_cron_run(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/run — trigger immediate execution."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     # Freshness-guaranteed lookup: this endpoint is handed a job id minted by
     # ANOTHER process (`kirocrew cron add`, the MCP cron_add tool), which writes
     # crons.json directly. The cache-only `list_jobs()` would not see that job
@@ -541,6 +612,8 @@ async def api_cron_cancel(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/cancel — cancel a running execution."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     jobs = state.crons.list_jobs(include_disabled=True)
     job = next((j for j in jobs if j.id == job_id), None)
     if not job:
@@ -557,6 +630,8 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/to-chat — open last result in a chat session."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     slot_name = f"cron-{job_id}"
     jobs = state.crons.list_jobs(include_disabled=True)
     job = next((j for j in jobs if j.id == job_id), None)
@@ -565,7 +640,12 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
             await asyncio.to_thread(state.conversation_log.read_messages, f"cron:{job.id}")
             if state.conversation_log else []
         )
-        inject_cron_result_to_dashboard(state, job, job.last_result or "", history=history)
+        # Re-surfacing a stored result, not delivering a fresh run: the prompt
+        # that produced it is not recoverable from live config -- see
+        # inject_cron_result_to_dashboard's ``include_prompt``.
+        inject_cron_result_to_dashboard(
+            state, job, job.last_result or "", history=history, include_prompt=False
+        )
     else:
         # Job deleted (one-shot with delete_after_run). Create slot from history or notification.
         session_key = f"cron:{job_id}"
@@ -605,15 +685,22 @@ async def api_cron_enable(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/enable — toggle enable/disable."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
+    # Default cap: the body is a single flag. allow_absent keeps the
+    # missing-body-means-defaults contract; a body that is PRESENT but
+    # malformed is a 400; only an absent body defaults.
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     enabled = body.get("enabled", True)
     try:
         ok = await state.crons.enable_job_async(job_id, enabled=enabled)
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+    except CronStoreUnreadable as exc:
+        return _cron_unreadable_response(exc)
     if ok:
         state.push_refresh("crons")
     return web.json_response({"ok": ok})
@@ -623,16 +710,22 @@ async def api_cron_ack(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/ack — acknowledge a cron notification."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
+    # Default cap: the body is a short summary + notification ts. allow_absent
+    # keeps the missing-body-means-defaults contract; see api_cron_enable.
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     summary = body.get("summary", "acknowledged")
     notification_ts = body.get("ts", "")
     try:
         ok = await state.crons.ack_job_async(job_id, summary)
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
+    except CronStoreUnreadable as exc:
+        return _cron_unreadable_response(exc)
     if notification_ts:
         await state.ack_notification(notification_ts)
     return web.json_response({"ok": ok})
@@ -642,6 +735,8 @@ async def api_cron_history(request: web.Request) -> web.Response:
     """GET /api/crons/{id}/history — paginated execution history (no trace)."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     try:
         limit = int(request.query.get("limit", "20"))
     except (ValueError, TypeError):
@@ -662,7 +757,11 @@ async def api_cron_history_detail(request: web.Request) -> web.Response:
     """GET /api/crons/{id}/history/{run_id} — full run detail with trace."""
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     run_id = request.match_info["run_id"]
+    if (_e := _invalid_path_id_response(run_id, "run_id")) is not None:
+        return _e
     detail = await state.crons.get_history().get_run_detail(job_id, run_id)
     if not detail:
         return web.json_response({"error": "run not found"}, status=404)
@@ -770,6 +869,8 @@ async def api_cron_script_source(request: web.Request) -> web.Response:
     """
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
     # Freshness-guaranteed lookup, same rationale as api_cron_run: the job may
     # have been minted by another process and not yet be in the cache snapshot.
     job = await state.crons.get_job_async(job_id)
@@ -1012,12 +1113,11 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     from kiro_crew.learn import Lesson  # noqa: F811
 
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    if not isinstance(body, dict):
-        return web.json_response({"error": "request body must be a JSON object"}, status=400)
+    # Default cap: lesson fields are short strings (MAX_SHORT_STRING-bounded).
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     # Block lesson writes from restricted (incognito/temporary/guest) sessions.
     sk = request.headers.get("X-Session-Key", "")
     refusal = await _recognize_session(
@@ -1215,10 +1315,11 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "Memory writes are not allowed in this session mode."}, status=403
         )
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    # Default cap: the body is a rule substring plus scope/workspace selectors.
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     rule_sub = body.get("rule", "").strip()
     if not rule_sub:
         return web.json_response({"error": "rule substring required"}, status=400)
@@ -1338,18 +1439,24 @@ def _get_cron_folders_lock() -> LoopBoundLock:
 async def api_cron_folders(request: web.Request) -> web.Response:
     """GET /api/cron-folders — list all cron folders."""
     state: DashboardState = request.app["state"]
-    # Bare list, matching the chat-folders precedent (api_chat_folders).
-    return web.json_response(state._cron_folders)
+    # Serialize a shallow snapshot, not the live list: rename_cron_folder
+    # mutates a folder dict's "name" in place, so encoding state._cron_folders
+    # by reference could interleave with a concurrent rename and surface a torn
+    # or stale name. Copying each dict gives the encoder a stable read. This
+    # mirrors the chat-folders GET (api_chat_folders), which likewise does not
+    # return the live list — it builds a fresh list off-thread.
+    return web.json_response([dict(f) for f in state._cron_folders])
 
 
 async def api_cron_folders_create(request: web.Request) -> web.Response:
     """POST /api/cron-folders — create a new cron folder."""
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    if not isinstance(body, dict) or not isinstance(body.get("name"), str):
+    # Default cap: the body is a single short folder name.
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
+    if not isinstance(body.get("name"), str):
         return web.json_response(
             {"error": "name must be a string", "code": "name_required"}, status=400
         )
@@ -1376,15 +1483,14 @@ async def api_cron_folders_update(request: web.Request) -> web.Response:
     """PATCH /api/cron-folders/{folder_id} — rename a cron folder."""
     state: DashboardState = request.app["state"]
     folder_id = request.match_info["folder_id"]
-    if not folder_id or len(folder_id) > MAX_SHORT_STRING:
-        return web.json_response(
-            {"error": "invalid folder_id format", "code": "invalid_folder_id"}, status=400
-        )
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    if not isinstance(body, dict) or not isinstance(body.get("name"), str):
+    if (_e := _invalid_path_id_response(folder_id, "folder_id")) is not None:
+        return _e
+    # Default cap: the body is a single short folder name.
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
+    if not isinstance(body.get("name"), str):
         return web.json_response(
             {"error": "name must be a string", "code": "name_required"}, status=400
         )
@@ -1414,10 +1520,8 @@ async def api_cron_folders_delete(request: web.Request) -> web.Response:
     """DELETE /api/cron-folders/{folder_id} — delete folder and clear assignments."""
     state: DashboardState = request.app["state"]
     folder_id = request.match_info["folder_id"]
-    if not folder_id or len(folder_id) > MAX_SHORT_STRING:
-        return web.json_response(
-            {"error": "invalid folder_id format", "code": "invalid_folder_id"}, status=400
-        )
+    if (_e := _invalid_path_id_response(folder_id, "folder_id")) is not None:
+        return _e
     async with _get_cron_folders_lock():
         try:
             found = await asyncio.to_thread(state.delete_cron_folder, folder_id)

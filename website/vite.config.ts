@@ -24,6 +24,7 @@ import {
   parseBrandingConfig,
   applyBrandingToHtml,
   SHELL_OVERLAY_ALLOWLIST,
+  verifyOverlayBytes,
 } from './scripts/lib/editionShell.mjs'
 
 /** Shape produced by parseBrandingConfig (editionShell.mjs is untyped .mjs). */
@@ -133,6 +134,15 @@ function vendorRuntimePlugin(): Plugin {
         const hit = RUNTIMES.find((r) => r.servePath === url)
         if (!hit) return next()
         res.setHeader('Content-Type', 'text/javascript; charset=utf-8')
+        // The consumers of these two files are sandboxed srcdoc iframes — null
+        // origin — whose <script> tags load with crossorigin="anonymous", which
+        // makes this header MANDATORY (without it the load hard-fails at the
+        // CORS layer and dev-mode widgets/sketches render unstyled). Vite's own
+        // cors default cannot supply it: since Vite 6.2 the default is a
+        // localhost-origin allowlist that `Origin: null` does not match. Scoped
+        // to exactly these two public runtime files, mirroring the gateway's
+        // /vendor/-only grant in production.
+        res.setHeader('Access-Control-Allow-Origin', '*')
         res.end(readFileSync(hit.src))
       })
     },
@@ -155,6 +165,55 @@ function vendorRuntimePlugin(): Plugin {
  * `vite build` only (not dev server). The public/ directory is copied
  * verbatim by Vite so `define` replacements don't apply to it.
  */
+/**
+ * Self-host Excalidraw's canvas fonts. Without `window.EXCALIDRAW_ASSET_PATH`
+ * the library resolves its lazily-loaded text-tool fonts (Excalifont, Xiaolai,
+ * …) against a third-party CDN (esm.sh) — verified by a network probe against
+ * a live pod — which breaks air-gapped dashboards and violates the same
+ * no-network rule that `lib/excalidrawScene.ts` documents for the read-only
+ * renderer. SketchDialog sets the asset path to `/vendor/excalidraw/`; this
+ * plugin makes that path real: build emits every font file from the npm
+ * package into `dist/vendor/excalidraw/fonts/**`, and the dev server serves
+ * the same files straight from node_modules.
+ */
+function excalidrawFontsPlugin(): Plugin {
+  const FONTS_ROOT = path.resolve(__dirname, 'node_modules/@excalidraw/excalidraw/dist/prod/fonts')
+  const SERVE_PREFIX = '/vendor/excalidraw/fonts/'
+  const listFonts = (): string[] => {
+    const out: string[] = []
+    for (const family of readdirSync(FONTS_ROOT)) {
+      for (const file of readdirSync(path.join(FONTS_ROOT, family))) {
+        out.push(`${family}/${file}`)
+      }
+    }
+    return out
+  }
+  return {
+    name: 'kirocrew-excalidraw-fonts',
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const url = (req.url || '').split('?')[0]
+        if (!url.startsWith(SERVE_PREFIX)) return next()
+        const rel = decodeURIComponent(url.slice(SERVE_PREFIX.length))
+        // Path-traversal guard: the joined path must stay under FONTS_ROOT.
+        const abs = path.resolve(FONTS_ROOT, rel)
+        if (!abs.startsWith(FONTS_ROOT + path.sep) || !existsSync(abs)) return next()
+        res.setHeader('Content-Type', 'font/woff2')
+        res.end(readFileSync(abs))
+      })
+    },
+    generateBundle() {
+      for (const rel of listFonts()) {
+        this.emitFile({
+          type: 'asset',
+          fileName: `vendor/excalidraw/fonts/${rel}`,
+          source: readFileSync(path.join(FONTS_ROOT, rel)),
+        })
+      }
+    },
+  }
+}
+
 function swVersionPlugin(): Plugin {
   return {
     name: 'kirocrew-sw-version',
@@ -338,6 +397,26 @@ function editionExtensionPlugin(): Plugin {
         })
       }
     },
+    // Enforce the emitFile-over-publicDir precedence generateBundle relies on.
+    // The overlay above assumes an emitted asset with a pinned fileName wins
+    // over the same-named publicDir copy; that is empirical (Vite 8 / Rolldown),
+    // not a documented bundler contract. writeBundle runs AFTER the bundle is
+    // written to disk, so it sees what actually landed: byte-compare each
+    // overlaid dist file against its edition source and fail loud on a mismatch
+    // or a missing file. A future bundler upgrade that flips the precedence
+    // would silently ship stock icons/manifest on a green build — and edition
+    // builds run downstream, outside this repo's CI, so this check is the only
+    // thing that would catch it. No-op for stock builds (overlayFiles is empty).
+    writeBundle(options) {
+      if (overlayFiles.length === 0) return
+      verifyOverlayBytes({
+        distDir: options.dir ?? path.resolve('dist'),
+        editionPublicDir: path.join(path.dirname(editionEntry as string), 'public'),
+        overlayFiles,
+        readFile: readFileSync,
+        join: path.join,
+      })
+    },
     config() {
       if (editionDir) {
         // Let vite's dev server serve/resolve files from outside the project
@@ -476,7 +555,7 @@ function appWindowUrls(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
+  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -587,7 +666,14 @@ export default defineConfig({
     // 3 is both the fastest and cheaper in memory than 4; peak single-fork RSS
     // was ~1.0-1.4 GB against the 3072 MB per-fork heap ceiling below.
     maxWorkers: 3,
-    execArgv: ['--max-old-space-size=3072'],
+    // Node 25 enables its process-global experimental Web Storage in forks but
+    // gives those workers no persistence path, emitting one
+    // "--localstorage-file ... without a valid path" warning per test file.
+    // happy-dom supplies the window-scoped Storage this suite actually tests,
+    // and setup.ts replaces it with a deterministic in-memory implementation,
+    // so disable the unrelated Node global instead of sharing a disk file
+    // across concurrent workers.
+    execArgv: ['--max-old-space-size=3072', '--no-experimental-webstorage'],
     // Default 5s is too tight for tests that ``await import(...)`` inside the
     // body: under a full concurrent forks run the collect phase can starve the
     // dynamic import past 5s and it times out. 15s gives headroom for
@@ -741,6 +827,17 @@ export default defineConfig({
           // remark/rehype/unified pipeline).
           if (/[\\/]node_modules[\\/](katex|highlight\.js|lowlight|refractor|react-markdown|remark-[^\\/]+|rehype-[^\\/]+|mdast-[^\\/]+|hast-[^\\/]+|micromark[^\\/]*|unified|unist-[^\\/]+)[\\/]/.test(id)) {
             return 'vendor-markdown'
+          }
+          // The YAML document parser, reached only by the skill editor's
+          // frontmatter round-trip (`SkillForm.tsx`). Bucketed like every other
+          // vendor library here because the App chunk is meant to hold FIRST-PARTY
+          // code -- its budget comment in scripts/check-bundle-size.mjs says as
+          // much -- and it is the ceiling that ordinary feature PRs trip. Measured
+          // 93.7 KB raw / 29 KB gzip, far under the gate's 500 KB default, so it
+          // needs no CHUNK_BUDGETS entry of its own. The leading separator keeps
+          // this off `js-yaml`, which is mermaid's and belongs in mermaid's chunk.
+          if (/[\\/]node_modules[\\/]yaml[\\/]/.test(id)) {
+            return 'vendor-yaml'
           }
         },
       },

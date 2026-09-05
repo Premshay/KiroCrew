@@ -1214,6 +1214,24 @@ describe('ChatInput', () => {
   })
 
   describe('stop button', () => {
+    it('remounts Send as Stop when a turn starts', () => {
+      // A send may synchronously mark its slot busy.  These controls occupy
+      // the same position but must never reuse a DOM node or click handler: a
+      // late browser event on the old Send node must not become a Stop request.
+      const onStop = vi.fn()
+      const { rerender } = renderWithProviders(
+        <ChatInput {...defaultProps} value="start" onStop={onStop} />,
+      )
+      const send = screen.getByRole('button', { name: 'Send' })
+
+      rerender(<ChatInput {...defaultProps} isRunning onStop={onStop} />)
+
+      const stop = screen.getByTestId('stop-button-armed')
+      expect(stop).not.toBe(send)
+      expect(stop).toHaveAttribute('type', 'button')
+      expect(onStop).not.toHaveBeenCalled()
+    })
+
     it('shows armed Stop button while running, click calls onStop', () => {
       const onStop = vi.fn()
       renderWithProviders(<ChatInput {...defaultProps} isRunning onStop={onStop} />)
@@ -1731,5 +1749,55 @@ describe('ChatInput undo/redo: paste content', () => {
     fireEvent.change(ta, { target: { value: '' } })
     undo(ta)
     expect(ta.value).toBe('hello world')
+  })
+})
+
+// Expanding a collapsed-paste token in the composer differs by pointer class:
+// mouse needs a double-click (select-then-expand); touch expands on one tap,
+// because two discrete taps never coalesce into a detail>=2 click, so the
+// double-click path is unreachable under a finger.
+describe('ChatInput composer paste-token expand', () => {
+  function PasteHarness({ initial, initialBlocks }: { initial: string; initialBlocks: PasteBlock[] }) {
+    const [v, setV] = React.useState(initial)
+    const [blocks, setBlocks] = React.useState<PasteBlock[]>(initialBlocks)
+    return (
+      <ChatInput
+        {...defaultProps}
+        value={v}
+        onChange={setV}
+        pasteBlocks={blocks}
+        onPasteBlocksChange={setBlocks}
+      />
+    )
+  }
+
+  const block: PasteBlock = { id: 'p1', seq: 1, lines: 40, content: 'TRACEBACK: boom\n...40 lines...' }
+  const token = '[ Paste #1 · 40 lines ]'
+
+  it('expands the token on a single tap on a touch device (detail=1)', () => {
+    touchEnv.touch = true
+    renderWithProviders(<PasteHarness initial={token} initialBlocks={[block]} />)
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    ta.setSelectionRange(2, 2) // caret inside the token
+    fireEvent.click(ta, { detail: 1 }) // a tap is a single click, never detail>=2
+    expect(ta.value).toBe(block.content) // expanded inline on one tap
+  })
+
+  it('does NOT expand on a single mouse click (detail=1) — mouse selects first', () => {
+    touchEnv.touch = false
+    renderWithProviders(<PasteHarness initial={token} initialBlocks={[block]} />)
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    ta.setSelectionRange(2, 2)
+    fireEvent.click(ta, { detail: 1 })
+    expect(ta.value).toBe(token) // still collapsed — a second click is needed
+  })
+
+  it('expands on a mouse double-click (detail=2)', () => {
+    touchEnv.touch = false
+    renderWithProviders(<PasteHarness initial={token} initialBlocks={[block]} />)
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    ta.setSelectionRange(2, 2)
+    fireEvent.click(ta, { detail: 2 })
+    expect(ta.value).toBe(block.content) // expanded inline
   })
 })

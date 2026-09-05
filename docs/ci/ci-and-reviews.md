@@ -55,6 +55,37 @@ Out-of-band lanes that never gate a PR:
   builds two real app bundles and performs an actual update swap, because the
   Electron unit suite stops at the `autoUpdater` handoff and never proves a real
   bundle is replaced on disk and relaunches.
+- **The ratchet verdict `main` otherwise never gets:** `main-ratchet-audit.yml`
+  re-runs only the cheap ratchet, ceiling and baseline gates on every push to
+  `main`. Two things make a push to `main` unable to answer for them in `ci.yml`:
+  GitHub keeps one *pending* run per concurrency group, so on a busy `main` each
+  run is evicted before its slower lanes report and a commit's checks end up
+  `cancelled` rather than `failure` — which is not a red X, so `main` looks green
+  while drift accumulates; and the lint lanes are surface-gated, so a
+  backend-only merge *skips* the eslint ceiling outright. This lane's group is
+  keyed on the SHA so no push can supersede an earlier push's audit, it runs both
+  surfaces unconditionally, and it reconciles one `ratchet-audit`-labeled tracking
+  issue — opened on drift, commented on each further drifting push, closed on the
+  next all-green one. Because per-SHA groups let audits for different commits
+  finish out of order, only a run whose commit is still `main`'s head writes to
+  that shared issue: a slow green audit would otherwise close the live drift
+  record a newer push just opened. An unreadable head resolves toward keeping
+  drift visible in both directions — still recorded on drift, still not closed on
+  green. Every gate step runs on `!cancelled()` rather than the default
+  `success()`, so one drifting ratchet does not skip the rest and reduce the
+  verdict to whichever gate is listed first; and the set of gate scripts is
+  pinned equal to `ci.yml`'s `backend-lint`, because a gate *added* there and not
+  mirrored here would never be measured on `main` at all. Two further details are
+  load-bearing. It sets
+  `RATCHET_SCOPE_WHOLE_TREE`, because the four diff-scoped gates
+  (`scripts/ratchet_scope.py`) would otherwise resolve an EMPTY diff on a push to
+  the branch they measure against and pass by judging nothing; and it *reads* the
+  eslint ceiling out of `ci.yml` rather than transcribing it, because a second
+  copy would keep granting the old budget after a burn-down and report green on a
+  tree the PR gate reds. It deliberately does not touch `ci.yml`'s concurrency or
+  add a second full run: full serialization or a merge queue is a runner-budget
+  call, and `test-durations.yml` already pays for a full suite on `main`.
+  Contributor-facing half: [CONTRIBUTING.md](../../CONTRIBUTING.md).
 - **Maintenance:** `ship-report.yml` (a scheduled Slack summary),
   `cleanup-temp-screenshots.yml` (prunes the ephemeral `temp-screenshots/` dir,
   see [its README](../../temp-screenshots/README.md); safe because PR bodies
@@ -74,11 +105,46 @@ Out-of-band lanes that never gate a PR:
   button, not a CI comment), `pr-merge-conflict-label.yml` and `fork-pr-label.yml`
   (both mirror a fact GitHub does not surface in the `/pulls` list onto a label), and
   `add-contributor.yml` (a daily cron, plus manual dispatch, adds each merged
-  PR's author to the README Contributors block via
+  PR's author AND the reporters of the issues that PR closed to the README
+  Contributors block via
   `scripts/update_contributors.py`; because the default branch is protected it
   opens a rolling PR rather than committing directly, like `test-durations.yml`.
   A login in `.github/contributors-optout.txt` is never added, which keeps the
   README's removal promise enforceable against the full-rebuild collector).
+  One paginated GraphQL sweep over `pullRequests(states: MERGED)` drives it,
+  reading each node's `author` and its `closingIssuesReferences` authors. The
+  reporter side is deliberately keyed on that link rather than on listing
+  `/issues`: the connection is populated only when a PR declares it closes the
+  issue, and only merged PRs are scanned, so an entry is evidence the report
+  changed the product — which keeps duplicates, invalid reports and
+  credit-farming issues out. It undercounts by design (a fix that omitted the
+  closing keyword is invisible), and the remedy is the manual `--login` path, not
+  loosening the rule. Dedup is two-layered: `sort -u` over the union, because
+  someone can be both a PR author and a reporter, then the script's own README
+  scan. The same block also holds contributors whose contribution left neither
+  trace — a review, a translation, a private security report — added with
+  `scripts/update_contributors.py --login`. Those entries survive every later run
+  because the collector only ever inserts and never rewrites an existing line;
+  that preservation is what makes one shared list workable instead of a second
+  table.
+
+  Note that opening that rolling PR is best-effort. This repository leaves
+  "Allow GitHub Actions to create and approve pull requests" off — one switch
+  covers creating AND approving, and `main`'s merge gate is a required review — so
+  `gh pr create` with `GITHUB_TOKEN` is refused with `GitHub Actions is not
+  permitted to create or approve pull requests`. It only bites after the previous
+  rolling PR merged and its branch was deleted; while the PR is open, pushing to
+  the branch is enough. The push happens first either way, so a refusal is a
+  handoff, not a loss: the job stays green and files/updates one issue titled
+  "Add Contributor needs a human to open the contributors PR" carrying the compare
+  link. The same limitation applies to every workflow here that opens a PR
+  (`test-durations.yml`, `cleanup-temp-screenshots.yml`, `memory-benchmark.yml`),
+  which carry the same guard in a lighter form: they emit a `::notice::` with the
+  compare link and exit 0 rather than filing an issue, because their branches are
+  regenerated on the next scheduled run and so do not need a durable tracker. Any
+  create failure that is NOT that refusal still fails the job in all four.
+  `test/test_workflow_pr_create_handoff.py` holds them in step and fails a new
+  `gh pr create` step that skips the guard.
 
 ## `ci.yml`: correctness
 
@@ -88,15 +154,16 @@ Every job here is blocking.
 |---|---|
 | `scrub-lint` | `scripts/scrub-lint.sh --no-history`. Fails on any internal marker in this public tree, so a sync cannot reintroduce a coupling |
 | `vendor-manifest` | `scripts/verify_vendor_manifest.py`. Hashes every file under `src/kiro_crew/_vendor` against the committed `scripts/vendor_manifest.sha256` — the tree is excluded from semgrep and the AI reviewers' diff, so this checksum is its only content review. Always-on (not behind the `changes` path filter) |
-| `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink — and `scripts/check_subprocess_encoding.py` (self-test first) — no text-mode subprocess call without an explicit `encoding=`, `**UTF8_TEXT`, or a `# subprocess-encoding: locale` marker, outside `.github/subprocess-encoding-baseline.txt`, which can only shrink |
+| `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink — and `scripts/check_subprocess_encoding.py` (self-test first) — no text-mode subprocess call without an explicit `encoding=`, `**UTF8_TEXT`, or a `# subprocess-encoding: locale` marker, outside `.github/subprocess-encoding-baseline.txt`, which can only shrink — and `scripts/check_sync_io_in_async.py` (self-test first) — no blocking db / subprocess / http / `time.sleep` call inside an `async def` under `src/`, outside `.github/sync-io-in-async-baseline.txt`, which can only shrink. A stall past `dashboard.loop_stall_exit_after_secs` (25s) makes the watchdog kill the gateway and drop every in-flight turn (#3057, #1572); the escape is an offload (`await asyncio.to_thread(...)`, or a named lane from `src/kiro_crew/executors.py`) or a `# on-loop-io-ok: <why it cannot block>` marker whose reason is mandatory. All four baselined gates in this job read their diff scope from the one shared resolver in `scripts/ratchet_scope.py`, so they cannot disagree about which lines a change added; the env-base gates (`check_brand_name.py`, `check_harness_parity.py`, `check_focus_cue.py`) share the same diff parsing through its explicit-base entry points while keeping their `*_BASE_REF` base semantics |
 | `harness-parity` | `scripts/check_harness_parity.py`, self-test first. Fails on a newly added line that expresses "this is the Kiro harness" as the absence of another one — a shape that fails toward the permissive answer, so nothing else goes red. Diff-scoped; the whole-tree backlog is a non-failing report |
+| `feature-map` | `scripts/check_feature_map.py`, self-test first. Fails when a file is ADDED or DELETED under `website/src/pages/` or `src/kiro_crew/dashboard/handlers/`, or a `<Route>` entry arrives or leaves `website/src/App.tsx`, while `docs/feature-map/README.md` stays untouched. The blocking root AUTOSDE rule `feature-map-correctness` is the semantic half: it verifies changed rows against the code, rejects unrelated or cosmetic map churn, and checks that the map's net diff matches the PR's stated scope. Structural on purpose: an edit to an existing page changes a feature's behavior, which the map does not describe, so an edit-only diff never fires — a gate demanding a map review on every UI fix produces a map nobody reads. Fails OPEN on an unreadable diff, unlike the gates above: this one guards a documentation habit, not an invariant a bad line carries into `main` forever |
 | `loop-bound-locks` | `scripts/check_loop_bound_locks.py`, self-test first. Fails on any module-global `asyncio.Lock()`/`Event()`/`Queue()` declaration — those bind to the import-time (or first-use) event loop and raise `RuntimeError` when acquired from another loop (Python 3.10+). #4800 converted the tree to `kiro_crew.loop_lock.LoopBoundLock`; whole-tree, since the backlog is zero |
 | `backend-test` | 2 Python versions x 4 duration-balanced pytest-split shards (8 jobs), `-n auto` within each. Coverage only on 3.12 (3.10 passes `--no-cov` for a trace-free run) |
 | `backend-test-windows` | windows-latest, 4 shards, `--no-cov`, 180s per-test timeout. The backend supports Windows natively via `platform_compat`, and nothing else in CI holds that line |
 | `backend-test-macos` | macos-14, deliberately SCOPED (gateway, socketsec, platform-compat, pod and MCP-apps suites via a glob). A full macOS run needs its own exclusion burn-down first, and a job that is red on arrival trains people to ignore it |
 | `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs all eleven sandbox-dependent suites. The shards collect the same files — nothing is deselected — but there the sandbox-guarded tests skip, so this is the only lane where those 85 assertions (the `~/.kiro/crew` keystone among them) actually execute |
 | `coverage-combine` then `coverage-gate` | Combines the 3.12 shard data, then enforces the project line-rate floors, plus a per-file floor with a shrink-only baseline (all floors live in the job's `env:` block) |
-| `frontend-lint` | `tsc -b`, `eslint --max-warnings <measured count>`, `jscpd`, and `npm run i18n:check` |
+| `frontend-lint` | `tsc -b`, `eslint` under a hard-zero warning ceiling, `jscpd`, and `npm run i18n:check` |
 | `electron-test` | The Electron shell's own node:test suite (`website/electron`) |
 | `frontend-test` | `vitest run --coverage` |
 | `cfn-lint` | Lints the artifact-deploy templates with a pinned `cfn-lint` |
@@ -136,11 +203,16 @@ Details worth knowing:
   places. Per-file enforcement is skipped for a lane whose suite ran as a
   coverage-free subset, because subset rates are not comparable to a baseline
   recorded on the full suite.
-- **`eslint --max-warnings <n>` is a ratchet baseline, and `<n>` is the measured
-  count.** Burn it down, never raise it, and never leave it above what
-  `npx eslint src/` reports: the difference is a budget new warnings land inside
-  without anyone seeing them. `test_eslint_warning_ceiling.py` keeps the number in one place so a
-  burn-down cannot leave a stale copy behind.
+- **`eslint src/ --max-warnings 0` is a hard ceiling, not a stored baseline.**
+  The tree carries no warnings, so any warning a change introduces fails this
+  job. Never lift the ceiling to admit one: a ceiling above the measured count is
+  a budget new warnings land inside without anyone seeing them, and a warning
+  admitted that way is indistinguishable from the rest. Fix it, or suppress that
+  one line with `// eslint-disable-next-line <rule> -- <why the code is correct>`,
+  which is reviewable in the diff where a lifted ceiling is not.
+  `test_eslint_warning_ceiling.py` pins the zero and pins that `ci.yml` declares
+  exactly one ceiling, so it cannot be lifted quietly — and because the value is
+  fixed rather than measured, naming it here cannot go stale.
 - **The i18n gates split into three tiers,** and only two can fail: diff-scoped
   zero-tolerance checks (a user-visible literal on a line this branch wrote, a
   file holding more than it did at the base, new English key shape, changed catalog
@@ -214,10 +286,16 @@ of the AUTOSDE rules; the semantic half is delegated to the line reviewers.
   community packs plus `semgrep/`, with `--error`. The fixtures are listed in
   `.semgrepignore` so the deliberately vulnerable fixture code is never read by
   the scan. Blocking.
-- **`dep-audit`** calls the reusable `dependency-vulnerability.yml`, which runs
+- The production dependency audit (`dependency-vulnerability.yml`, which runs
   `scripts/check_npm_audit.py` over every lockfile-backed Node project and fails
-  closed on **high or critical production** vulnerabilities. Time-boxed exceptions
-  live in `.vulnerability-exceptions.json`.
+  closed on **high or critical production** vulnerabilities) is **not** a PR
+  job, nor a nightly one. It reaches the npm registry, whose slow hours made it
+  the one red X on otherwise-green PRs and then failed nightlies for hours at a
+  stretch; it runs before every release build instead, where a vulnerable
+  dependency would actually ship. Time-boxed exceptions live in
+  `.vulnerability-exceptions.json`, and a registry stall or connection fault is
+  retried inside one shared time budget before it fails (see the
+  transient-failure contract in the security spec).
 - **`pr-hygiene`** enforces a Conventional-Commits PR title (it becomes the
   squash-merge message) and at most two commits (`git rev-list --count <= 2`).
   One commit stays the norm; the second is there so a mechanical follow-up (a
@@ -362,7 +440,12 @@ thing: *does this block the merge*, **never confidence**. There is no
 workflows — the diff-is-not-evidence clause, the coverage/finding/fix bars, the
 output contract, and the falsification-pass mandate and verdict framing — live in
 shared `.github/review-prompts/gpt-*.md` files rather than as two inline copies,
-so the lanes cannot drift apart on them (#5852). The same-repo lane stages them
+so the lanes cannot drift apart on them (#5852). The same-repo lane's remaining
+inline chunks (its system rules, repo context, and round-convergence sections)
+moved into that directory too (#3697), so its whole prompt is now assembled by
+splicing staged prompt files in a fixed order — which is also what lets the
+prepare-pr skill's `local_review.py` mirror the contract by reading the same
+files instead of scraping shell heredocs. The same-repo lane stages them
 from the PR's **base** commit like the Opus lanes; unlike those lanes it falls
 back to the checked-out copy (with a warning) when a block is absent on the base,
 because a hard gate cannot afford a no-verdict pass and, on a same-repo PR, the
@@ -421,10 +504,22 @@ check on that pairing mis-fires whenever the model quotes prior text.
 
 ### Security posture of the reviewer jobs
 
-- Explicit fork guards (`head.repo.full_name == github.repository`), so the job
-  **skips** on a fork rather than failing an unsatisfiable credential step. GitHub
-  treats a skipped required check as satisfied, which is why fork coverage needs
-  the separate `fork-*` pipeline below.
+- Explicit fork guards (`head.repo.full_name == github.repository`) on **every
+  step**, so on a fork the job starts and then does nothing rather than failing an
+  unsatisfiable credential step. The guard is per-step and not job-level because
+  GitHub never evaluates a **skipped** job's `name:` -- while it was job-level,
+  every fork PR published the raw name expression as its check name. Fork coverage
+  still comes from the separate `fork-*` pipeline below.
+- **The job name is conditional on the head repository**, so a fork PR gets
+  `<check> (same-repo lane, not applicable to forks)` instead of the protected
+  name. Same-repo PRs keep the exact protected name. Without this, both lanes
+  publish one name and GitHub resolves a required status check to the **newest**
+  check-run of that name: a `pull_request` event firing after the fork lane
+  posted its verdict (a reopen, or an `edited` title/body on `codex-review.yml`)
+  would make the same-repo lane's own run the newest one and satisfy the
+  gate on a review that never ran. `pr-readiness.yml` was never fooled by this
+  -- it collapses every check-run of the name and treats "no completed run" as
+  pending -- so the rename closes the branch-protection half of the gate.
 - `persist-credentials: false` on checkout, so `actions/checkout` never writes the
   token into `.git/config` where a reviewer reading untrusted PR content could find
   it.
@@ -525,6 +620,40 @@ commit status plus one `readiness:` label**.
   passed for it.
 - **Labels:** `readiness: checking` (pending), `readiness: action required` (a
   blocker), `readiness: passed`. Exactly one is ever present.
+- **It also enforces the disposition rule.** Besides scoring lanes, readiness runs
+  `pr_status.py --disposition-gate` (checked out from the default branch, never
+  from the PR head — this workflow is `pull_request_target` and holds write
+  tokens) and folds each violation of the one-lane / one-rationale-per-finding
+  rule into its blocking list. That is the only enforcement point that binds a
+  writer who never runs the prepare-pr loop, which is what a blanket
+  single-rationale record used to escape through (#6658). The rule keeps ONE
+  implementation: the readiness step calls the same script the local gate does
+  rather than re-reading the marker grammar in shell. A record set it cannot read
+  is `pending`, never red — a transient comments-API failure must not fail the
+  required status — and a record whose author the collaborators permission API
+  does not confirm as a writer is ignored, exactly as `codex-review.yml`'s
+  adjudication ledger ignores it, so the gate never blocks on a record that holds
+  no downgrade power. One consequence to know: readiness has **no
+  `issue_comment` trigger**, so correcting the offending comment fires nothing by
+  itself. `pr-readiness-sweep.yml` mode 5 covers that — it treats a disposition
+  record whose `updated_at` is newer than the verdict as evidence the verdict is
+  stale, and re-fires the recompute within ~15 minutes. Deleting the record with
+  no replacement leaves nothing observable and waits for a push or a manual
+  dispatch. The comparison is not race-free and is not claimed to be: the gate
+  reads the comments early in the readiness job while the status is published at
+  the end, so a record created in between is missed by that run and also looks
+  older than the verdict to the sweep. What bounds that residual is the harm
+  model, not the detection -- a violating record's only power is letting the
+  adjudication ledger downgrade a REPEATED finding on a later review round, and a
+  later review round takes a push, which recomputes readiness and catches the
+  violation.
+- **Unapproved fork runs remain blocking but are attributed separately.** GitHub
+  reports a fork workflow held behind *Approve and run* as `action_required`
+  even though it has not executed. Readiness keeps the failure status and
+  `readiness: action required` label, but lists those lanes under **Awaiting
+  maintainer approval** instead of **Blocking**. It does not call them pending:
+  only a maintainer can clear the condition, while pending statuses are eligible
+  for automatic self-healing.
 
 Two subtleties:
 
@@ -621,7 +750,10 @@ privileged from the default branch (stage 2), gated on
 named exactly like its same-repo twin (`Opus 4.8 Review`, `GPT 5.6 Review`,
 `Design Review`, `UX Review`), so branch protection is satisfied on either path, and
 it opens that check-run as early as possible keyed to `head_sha` so a job that dies
-still leaves a fail-closed result.
+still leaves a fail-closed result. On a fork PR this lane is the **only** publisher
+of that name -- the same-repo twin renames itself (see the reviewer-job security
+posture above) -- so the protected status can only be reported by a review that
+actually ran.
 
 Nothing the fork controls can influence these reviews:
 

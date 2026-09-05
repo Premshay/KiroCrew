@@ -59,6 +59,7 @@ from uuid import uuid4
 # binding.
 from kiro_crew import agent as _agent
 from kiro_crew.acp.client import AcpClient
+from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.agent_files import AGENT_FILENAME, OWNED_KIRO_AGENT_FILES
 from kiro_crew.config.loader import data_home
 from kiro_crew.loop_lock import LoopBoundLock
@@ -104,6 +105,14 @@ class MintState(TypedDict, total=False):
     agent: str  # ephemeral spec name
     spec_path: str  # the exact file this flow wrote, and the only one it deletes
     pid: int  # sweep-protected for as long as the process is held
+    # Set only by the warm table (:mod:`kiro_crew.connections.warm`). A shared row
+    # owns no ``client``: its URL was minted on a process it shares with every
+    # other card, so redeemability is judged by generation AND activation liveness
+    # instead. Declared here because the table itself is shared, and a row type
+    # that cannot describe half its rows pushes every read through a cast.
+    shared: bool
+    generation: int  # the shared process that holds this row's PKCE verifier
+    activation: int  # the session that owns this row's loopback listener
 
 
 _mints: dict[str, MintState] = {}
@@ -351,11 +360,30 @@ def _write_mint_agent_spec(slug: str) -> tuple[str, str]:
     this provider's challenge, all of it on the path the card waits on.
 
     Falls back to the main agent name when ``slug`` has no entry in the main spec
-    yet, so a mint never ends up with FEWER servers than it needs.
+    yet, so a mint never ends up with FEWER servers than it needs. A main spec
+    that exists but is REFUSED by the hardened reader raises ``OSError`` instead:
+    the fallback would hand the refused file to the spawned child to reload.
     """
     agents_dir = _agent.kiro_agents_dir_path()
     alias = mcp_server_alias(slug)
-    entry = (_agent._load_json(agents_dir / AGENT_FILENAME).get("mcpServers") or {}).get(alias)
+    # Hardened reader (#6736). A REFUSED main spec (oversize, sensitive symlink,
+    # non-object) must NOT reach the main-agent fallback: that fallback spawns
+    # ``kiro-cli --agent kirocrew``, and the child would reload the very file the
+    # gateway just refused to read -- uncapped and unguarded. Raising instead
+    # lands in the mint flow's failure path (retryable ``failed`` row, holdings
+    # disposed, no child spawned). The fallback below stays reserved for what it
+    # always meant: the file or the alias entry being genuinely absent.
+    spec = _read_agent_spec(
+        agents_dir / AGENT_FILENAME,
+        operation="connections_mint",
+        source="dashboard",
+    )
+    if spec is None:
+        if (agents_dir / AGENT_FILENAME).exists():
+            logger.warning("Main agent spec unusable; refusing to mint for %r", alias)
+            raise OSError("main agent spec unusable")
+        spec = {}
+    entry = (spec.get("mcpServers") or {}).get(alias)
     if not isinstance(entry, dict):
         logger.debug("No %r entry in the main agent spec; minting with %r", alias, _MAIN_AGENT_NAME)
         return _MAIN_AGENT_NAME, ""
@@ -494,8 +522,8 @@ def _log_mint_outcome(slug: str, outcome: str, detail: str) -> None:
 
     Blocking on FIRST use: the append itself is queued to SEL's writer thread, but
     the first ``sel()`` of a process constructs the log -- trust-dir creation, key
-    validation, a backward scan of the existing log, and on Windows an ``icacls``
-    subprocess. Async callers go through ``asyncio.to_thread``.
+    validation, a backward scan of the existing log, and on Windows the owner-only
+    DACL on the key file. Async callers go through ``asyncio.to_thread``.
     """
     sel().log_api_access(
         caller="dashboard",
@@ -580,6 +608,9 @@ async def _claim_mint_pid_when_spawned(client: Any, holdings: MintState) -> None
         await asyncio.sleep(_MINT_PID_CLAIM_POLL_SECONDS)
 
 
+_MINT_URL_REJECTION_ATTEMPTS = 2
+
+
 async def start_oauth_mint(
     slug: str,
     mcp_url: str,
@@ -589,7 +620,8 @@ async def start_oauth_mint(
     """Mint ``slug``'s approval URL on a dedicated promptless session.
 
     Fire-and-forget. Never raises: failures are recorded in the mint table and
-    surface on the card as a coarse reason code.
+    surface on the card as a coarse reason code. A URL rejected by the credential
+    guard gets one fresh process and OAuth state before rejection becomes terminal.
 
     ``token``/``prior`` come from :func:`reserve_mint_row` when a caller already
     made the row visible; without them this installs its own row.
@@ -629,51 +661,64 @@ async def start_oauth_mint(
     # Accumulates what this flow owns, so every exit path releases all of it.
     holdings: MintState = {}
     try:
-        acp_client_cls = _acp_client_factory()
-        # One server, not all of them: see _write_mint_agent_spec.
-        agent_name, spec_path = await asyncio.to_thread(_write_mint_agent_spec, slug)
-        holdings["agent"] = agent_name
-        holdings["spec_path"] = spec_path
         # Off the loop: resolving the data home creates it when a KIROCREW_HOME
         # override is in play, so this is a write and not merely a path join.
         mint_work_dir = await asyncio.to_thread(data_home)
-        client = acp_client_cls(
-            work_dir=mint_work_dir / "connections" / "mint",
-            model="auto",
-            agent=agent_name,
-            sandbox_mode="auto",
-            session_key=f"connections-mint-{slug}",
-        )
-        holdings["client"] = client
-        # session/new with NO prompt: MCP init is eager, so the challenge
-        # buffered during init is available right after ready.
-        #
-        # The PID claim races readiness on purpose. The child is spawned partway
-        # THROUGH ensure_ready, and nothing claims it as a session, so the orphan
-        # sweep reaps it once it ages past the spawn grace. Waiting for readiness
-        # would leave that whole initialization window -- up to the readiness
-        # timeout -- open to the sweep killing a mint that is still starting.
-        claim = asyncio.get_running_loop().create_task(
-            _claim_mint_pid_when_spawned(client, holdings)
-        )
-        try:
-            await asyncio.wait_for(client.ensure_ready(), timeout=_MINT_READY_TIMEOUT_SECONDS)
-        finally:
-            claim.cancel()
-            # Covers the fast path, where readiness beat the poller's first tick,
-            # AND the failure path, so a spawned child is always released.
-            _claim_mint_pid(client, holdings)
-
         oauth_url = ""
-        for req in client.pop_pending_oauth_requests():
-            if req.get("serverName") == slug and req.get("oauthUrl"):
-                oauth_url = str(req["oauthUrl"])
+        for attempt in range(_MINT_URL_REJECTION_ATTEMPTS):
+            acp_client_cls = _acp_client_factory()
+            # One server, not all of them: see _write_mint_agent_spec.
+            agent_name, spec_path = await asyncio.to_thread(_write_mint_agent_spec, slug)
+            holdings["agent"] = agent_name
+            holdings["spec_path"] = spec_path
+            client = acp_client_cls(
+                work_dir=mint_work_dir / "connections" / "mint",
+                model="auto",
+                agent=agent_name,
+                sandbox_mode="auto",
+                session_key=f"connections-mint-{slug}",
+            )
+            holdings["client"] = client
+            # session/new with NO prompt: MCP init is eager, so the challenge
+            # buffered during init is available right after ready.
+            #
+            # The PID claim races readiness on purpose. The child is spawned partway
+            # THROUGH ensure_ready, and nothing claims it as a session, so the orphan
+            # sweep reaps it once it ages past the spawn grace. Waiting for readiness
+            # would leave that whole initialization window -- up to the readiness
+            # timeout -- open to the sweep killing a mint that is still starting.
+            claim = asyncio.get_running_loop().create_task(
+                _claim_mint_pid_when_spawned(client, holdings)
+            )
+            try:
+                await asyncio.wait_for(client.ensure_ready(), timeout=_MINT_READY_TIMEOUT_SECONDS)
+            finally:
+                claim.cancel()
+                # Covers the fast path, where readiness beat the poller's first tick,
+                # AND the failure path, so a spawned child is always released.
+                _claim_mint_pid(client, holdings)
+
+            oauth_url = ""
+            for req in client.pop_pending_oauth_requests():
+                if req.get("serverName") == slug and req.get("oauthUrl"):
+                    oauth_url = str(req["oauthUrl"])
+                    break
+            credential_bearing = (
+                await asyncio.to_thread(oauth_url_contains_credential, oauth_url)
+                if oauth_url
+                else False
+            )
+            if not credential_bearing:
                 break
-        if oauth_url and oauth_url_contains_credential(oauth_url):
+
             # The same predicate the chat consent path applies before surfacing a
             # banner. The value is never logged or recorded.
             logger.warning("OAuth mint for %r produced a URL with a credential pattern", slug)
             await _dispose_mint(holdings)
+            holdings = {}
+            if attempt + 1 < _MINT_URL_REJECTION_ATTEMPTS:
+                continue
+
             async with _mints_lock:
                 if _mints.get(slug, {}).get("token") == my_token:
                     _mints[slug] = {
@@ -776,7 +821,19 @@ def _mint_holder_alive(entry: MintState) -> bool:
     The PKCE verifier and the loopback listener both live in the minting process,
     so a dead process means a URL no paste can complete. Asked of a row that
     already holds a URL; a row still ``minting`` has nothing stamped yet.
+
+    ABSTAINS on a row carrying a ``generation``. That row was minted on the SHARED
+    process (:mod:`kiro_crew.connections.warm`) and owns no ``client`` by design, so
+    the ``client is None`` branch below would answer for it -- and answering is the
+    bug, because False here is a VERDICT, not a shrug: :func:`expire_dead_holder`
+    acts on it, so the first mint-state poll on a warm slug withdrew a URL whose
+    process and session were both alive. Warm rows are judged by generation AND
+    activation liveness at the warm table's own chokepoint
+    (``warm.expire_dead_mints``, called on the status path and by the reaper), which
+    is the only reader that can see the registry those stamps name.
     """
+    if entry.get("generation"):
+        return True
     client = entry.get("client")
     if client is None:
         return False
@@ -800,7 +857,17 @@ def _agent_spec_entry_missing(slug: str) -> bool:
     through ``asyncio.to_thread``.
     """
     agents_dir = _agent.kiro_agents_dir_path()
-    servers = _agent._load_json(agents_dir / AGENT_FILENAME).get("mcpServers") or {}
+    # Hardened reader (#6736): a refused main spec reads as absent, so the entry
+    # counts as missing -- the same degrade-as-absent direction as before.
+    spec = (
+        _read_agent_spec(
+            agents_dir / AGENT_FILENAME,
+            operation="connections_mint",
+            source="dashboard",
+        )
+        or {}
+    )
+    servers = spec.get("mcpServers") or {}
     return mcp_server_alias(slug) not in servers
 
 
@@ -839,7 +906,21 @@ def pending_mint_for(slug: str) -> MintState | None:
     token = str(entry.get("token") or "")
     state = entry.get("state", "minting")
     view: MintState = {"state": state, "token": token}
-    if entry.get("oauth_url") and state == "waiting":
+    if entry.get("shared"):
+        # UNCLAIMED: a premint the warm table holds for whoever clicks Connect next,
+        # not a flow any caller started. Reported rather than hidden because this one
+        # view feeds two readers with different needs: the status classifier must
+        # refuse to read it as user consent (see ``status._classify``), while the
+        # mint-state poll must still tell it apart from ``idle``, which its own
+        # contract defines as "no mint exists for the provider". Filtering the row out
+        # would answer the second reader with that lie -- on exactly the slug a card
+        # has just adopted.
+        view["shared"] = True
+    if entry.get("oauth_url") and state == "waiting" and not entry.get("shared"):
+        # The consent URL completes a MACHINE-WIDE grant, so it is served only to
+        # the caller whose click owns the row. An unclaimed premint's view says a
+        # row exists and nothing more; the URL surfaces only after adoption rotates
+        # the token and clears ``shared`` (see ``warm.adopt_shared_mint``).
         view["oauth_url"] = entry["oauth_url"]
     if entry.get("reason"):
         view["reason"] = entry["reason"]

@@ -292,6 +292,32 @@ def github_review_key(owner: str, repo: str, number: str | int,
     return f"{h}/{str(owner).lower()}/{str(repo).lower()}#{number}"
 
 
+def repository_source_identity(
+    provider: str, host: str, owner: str, repository: str
+) -> dict[str, str]:
+    """Return the canonical repository identity used for review-rule bindings."""
+    if provider != "github":
+        raise AdapterParseError(f"unsupported review provider: {provider!r}")
+    canonical = canonical_host(host)
+    owner = str(owner or "").strip().lower()
+    repository = str(repository or "").strip().removesuffix(".git").lower()
+    segment = re.compile(r"^[A-Za-z0-9._-]+$")
+    if not canonical or not (segment.fullmatch(owner) and segment.fullmatch(repository)):
+        raise AdapterParseError("invalid repository source identity")
+    return {
+        "provider": provider,
+        "host": canonical,
+        "owner": owner,
+        "repository": repository,
+    }
+
+
+def source_identity_for_pr_link(link: str, *, config: dict | None = None) -> dict[str, str]:
+    """Resolve a canonical repository identity before a review worker is started."""
+    host, owner, repository, _number = github_pr_ref(link, config=config)
+    return repository_source_identity("github", host, owner, repository)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

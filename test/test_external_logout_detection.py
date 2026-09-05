@@ -20,6 +20,23 @@ from kiro_crew import kiro_prerequisite as kp
 from kiro_crew.session import _MAX_CONCURRENT_COLD_STARTS as _MAX_COLD_STARTS_FOR_TEST
 
 
+@pytest.fixture(autouse=True)
+def _private_sel_root_per_test(sel_private_root):
+    """Every test in this module gets its OWN SEL root (issue #7029).
+
+    ``identity_fingerprint`` is audit-or-deny: it returns "absent" unless a
+    CRITICAL SEL event lands first. On the event-loop thread the chain-lock
+    acquire is a single non-blocking attempt that refuses rather than stall the
+    loop -- correct product behaviour -- so on the worker's SHARED SEL root an
+    async test asserting a NON-EMPTY fingerprint is racing writers it never
+    created (another test still flushing, another xdist worker on the same
+    path). It then reads "" and fails on a property it never meant to test.
+    ``sel_private_root`` removes the concurrent writer: a fresh per-test,
+    per-worker directory nothing else writes.
+    """
+    yield
+
+
 def _write_store(
     path: Path,
     *,
@@ -993,6 +1010,23 @@ class TestLatchNarrowingPolicy:
         async def retire_kiro_identity_sessions(self):
             self.calls += 1
             return ([], self._complete)
+
+    @pytest.mark.asyncio
+    async def test_hung_identity_read_does_not_strand_the_turn(self, monkeypatch) -> None:
+        """Identity reconciliation is protective work, never an admission gate."""
+
+        from kiro_crew.dashboard import chat_runner
+
+        class _HungService:
+            async def identity_changed_since_sessions(self):
+                await asyncio.Event().wait()
+
+        sessions = self._Sessions()
+        monkeypatch.setattr(chat_runner, "_IDENTITY_RECONCILE_READ_TIMEOUT_SECS", 0.01)
+
+        await chat_runner._retire_sessions_on_identity_change(self._State(_HungService(), sessions))
+
+        assert sessions.calls == 0
 
     @pytest.mark.asyncio
     async def test_a_switch_to_a_valid_account_does_not_narrow_readiness(

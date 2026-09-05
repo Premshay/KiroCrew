@@ -21,6 +21,8 @@ function isToday(epochSecs: number): boolean {
 }
 import SortableHeader from '../../components/SortableHeader'
 import { connectionProviderForServer } from '../connections/registry'
+import McpRowSignIn from './McpRowSignIn'
+import { useConnectionsUiEnabled } from '../../hooks/useConnectionsUi'
 
 import { i18nT } from '../../i18n/t'
 async function fetchServers(): Promise<McpServer[]> {
@@ -189,6 +191,14 @@ function mcpStatusVariant(status: string, auth: McpAuthState): 'ok' | 'err' | 'w
  * done, and an always-visible cell in a dense table pays for every sentence.
  */
 function mcpStatusHint(status: string, serverName: string, auth: McpAuthState): string | undefined {
+  // "Online" is the gateway's OWN probe result: it started the server in the
+  // gateway process, under the gateway's client identity. It says nothing about
+  // whether any particular agent session mounted it, and reading it as if it did
+  // is a documented divergence (a server can probe fine and still fail in a
+  // session, and the reverse). The badge cannot carry that caveat in two words,
+  // so it carries it here rather than leaving the reader to assume the stronger
+  // claim.
+  if (status === 'ok') return i18nT('pages.overview.mcpTab.online_help')
   if (status !== 'needs_auth') return undefined
   if (auth === 'sign_in_required') return i18nT('pages.overview.mcpTab.sign_in_required_next')
   if (auth === 'signed_in') return i18nT('pages.overview.mcpTab.signed_in_help', { provider: serverName })
@@ -202,6 +212,12 @@ interface McpTabProps {
 export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
   const provider = useProvider()
   const queryClient = useQueryClient()
+  // The in-place sign-in reuses the Connections mint engine, which is launch-held
+  // behind the `connections_ui` flag (the gallery it belongs to is not yet
+  // released). When the flag is off, a managed row falls through to the SAME chat
+  // guidance a non-registry row shows — chat stays the only authorize prompt while
+  // the gallery is closed (see useConnectionsUi docstring).
+  const connectionsUi = useConnectionsUiEnabled()
   const [mcpFilter, setMcpFilter] = useState('')
   // Multi-provider server browser (Add Server button) — discovery lives in
   // the modal so the installed config stays the page's primary content.
@@ -376,6 +392,17 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
     },
     onError: () => {
       refetch()
+    },
+  })
+
+  // Release is a REFETCH, not an optimistic edit: the badge has to disappear
+  // because the server actually came back, and the same request rebuilt the
+  // agent config. Painting the row clean locally would claim a remount the
+  // backend may have failed to perform (it answers 500 in that case).
+  const resetFailures = useMutation({
+    mutationFn: (name: string) => api.mcpResetProbeFailures(name),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
     },
   })
 
@@ -556,12 +583,57 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                       {i18nT('pages.overview.mcpTab.declared')}
                     </Badge>
                   ) : (
-                    <Badge variant={mcpStatusVariant(s.status, mcpAuthState(s))} title={mcpStatusHint(s.status, s.name, mcpAuthState(s))}>
-                      {mcpStatusLabel(s.status, mcpAuthState(s))}
-                    </Badge>
+                    /* The needs_auth hint is the only default-reachable
+                       explanation of the OAuth probe limitation, so it cannot
+                       live in `title` alone: a native tooltip is hover-only and
+                       so unreachable by keyboard, touch, and AT (#3626). For
+                       needs_auth the badge carries no `title` — InfoTip is the
+                       sole, focusable and tappable affordance for the hint, so
+                       pointer and AT users get the same one path to it rather
+                       than a native tooltip duplicating (and outrunning) it.
+                       Every other status keeps its `title` hint (today that is
+                       only 'ok', whose host-check caveat mcpStatusHint returns;
+                       the rest get undefined and thus no attribute). */
+                    <span className="inline-flex items-center gap-1.5">
+                      <Badge
+                        variant={mcpStatusVariant(s.status, mcpAuthState(s))}
+                        title={s.status === 'needs_auth' ? undefined : mcpStatusHint(s.status, s.name, mcpAuthState(s))}
+                      >
+                        {mcpStatusLabel(s.status, mcpAuthState(s))}
+                      </Badge>
+                      {s.status === 'needs_auth' && (
+                        <InfoTip text={mcpStatusHint(s.status, s.name, mcpAuthState(s)) || ''} placement="top" />
+                      )}
+                    </span>
                   )}
-                  {!!s.probedAt && (
-                    /* nowrap: the column is narrow enough that "Last probed: 7:47 PM"
+                  {s.probeFailing && (
+                    /* A SECOND badge rather than a replacement status: the probe
+                       status is still the true reading ("error"), and the error
+                       detail below it is keyed on that. This says what was DONE
+                       about it, which is a different fact.
+
+                       The release control sits HERE, next to the badge, not in
+                       the row's action cell. Two reasons, and the design one is
+                       the stronger: a badge that explains a state and the button
+                       that undoes that state belong adjacent. The other is the
+                       `max-two-buttons-per-row` cap -- Edit JSON and Uninstall
+                       already fill the action cell, and a third control there
+                       would need an overflow menu this table does not have. */
+                    <div className="mt-0.5 flex items-center gap-1.5">
+                      <Badge variant="err" title={i18nT('pages.overview.mcpTab.probe_failing_help', { failures: s.probeFailures ?? 0 })}>
+                        {i18nT('pages.overview.mcpTab.probe_failing')}
+                      </Badge>
+                      <button
+                        className="whitespace-nowrap text-[11px] text-accent hover:text-accent-hover cursor-pointer transition-colors disabled:cursor-not-allowed disabled:text-muted"
+                        onClick={() => resetFailures.mutate(s.name)}
+                        disabled={resetFailures.isPending}
+                        title={i18nT('pages.overview.mcpTab.reset_failures_help')}
+                      >
+                        {i18nT('pages.overview.mcpTab.reset_failures')}
+                      </button>
+                    </div>
+                  )}
+                  {!!s.probedAt && (                    /* nowrap: the column is narrow enough that "Last probed: 7:47 PM"
                        wraps to three lines and triples every row's height.
                        The title carries the FULL date+time, so the hover earns
                        its place instead of restating the visible label. */
@@ -588,26 +660,34 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                       )}
                     </span>
                   ) : mcpAuthState(s) === 'sign_in_required' ? (
-                    /* Prose in the wide column rather than an Authorize control: the sign-in
-                       prompt is raised by Kiro CLI during a session's MCP bring-up, which
-                       happens on a turn, and nothing the dashboard can call from this panel
-                       starts one — so a button here would claim an action it cannot perform.
-                       Navigating to chat IS something the panel can do, so that step is a
-                       link. The user starts a new session there because an existing session
-                       keeps the server set it started with. This column already carries the
-                       other explanation a row can need, and has the width for a sentence.
-                       The closure step stays VISIBLE, in one clause: a `title` reaches
-                       neither a keyboard nor a touch user, and the panel serves from the
-                       probe cache for the whole TTL — so someone returning from a
-                       completed sign-in meets a row still reading "Sign-in required" and
-                       concludes it failed. The badge's title carries the longer form,
-                       naming the control and the state the row lands in. */
-                    <span className="text-warn text-[12px]">
-                      <Trans
-                        i18nKey="pages.overview.mcpTab.sign_in_required_help"
-                        components={{ chatLink: <Link to="/chat" className="underline hover:text-accent transition-colors" /> }}
-                      />
-                    </span>
+                    /* Two paths, split on whether the row resolves to a curated
+                       Connections provider (`managedProvider`, computed at row top)
+                       AND the Connections UI is unlocked (`connectionsUi`).
+
+                       RESOLVABLE + FLAG ON: the panel now CAN start the sign-in in
+                       place — it reuses the SAME headless mint engine the Connections
+                       cards drive (mint → poll for the approval URL → authorize →
+                       paste-back relay). Minting is fenced to registry providers
+                       only; arbitrary URLs are never minted (parked maintainer
+                       decision #4286).
+
+                       EITHER FALSE (non-registry row, OR the gallery still held
+                       behind `connections_ui`): unchanged chat guidance. Nothing the
+                       dashboard can call starts a sign-in for a user-added/self-hosted
+                       server, and while the flag is closed the mint engine is not a
+                       released surface either — so the cell stays a sentence that
+                       routes the user to chat (a link, because navigating IS something
+                       the panel can do) and names the probe step that repaints the row. */
+                    managedProvider && connectionsUi ? (
+                      <McpRowSignIn slug={managedProvider.slug} serverName={s.name} />
+                    ) : (
+                      <span className="text-warn text-[12px]">
+                        <Trans
+                          i18nKey="pages.overview.mcpTab.sign_in_required_help"
+                          components={{ chatLink: <Link to="/chat" className="underline hover:text-accent transition-colors" /> }}
+                        />
+                      </span>
+                    )
                   ) : s.tools?.length ? (<div>
                     <button className="flex items-center gap-1 text-[12px] text-accent hover:text-accent-hover cursor-pointer transition-colors mb-1" onClick={() => setExpandedTools(prev => { const next = new Set(prev); if (next.has(s.name)) next.delete(s.name); else next.add(s.name); return next })}>{s.tools.length} {i18nT('pages.overview.mcpTab.tools_2')}{!expandedTools.has(s.name) && (s.disabledTools?.length || 0) > 0 && <span className="text-muted ml-1">{i18nT('pages.overview.mcpTab.off_count', { count: s.disabledTools!.length })}</span>}<ChevronRight size={14} className={`transition-transform duration-200 ${expandedTools.has(s.name) ? 'rotate-90' : ''}`} /></button>
                     <AnimatePresence>{expandedTools.has(s.name) && <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden"><div className="space-y-0.5">{s.tools.map(t => {

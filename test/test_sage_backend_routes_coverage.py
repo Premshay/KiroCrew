@@ -169,6 +169,151 @@ class TestFirstChangeError(_SageRoutesBase):
         self.assertEqual(self.mod._first_change_error(summary), "gh exited 128")
 
 
+class TestFirstChangeFailureToken(_SageRoutesBase):
+    """The token half of ``_first_change_failure``.
+
+    ``_first_change_error`` maps the reason token to English, so the token is
+    gone by the time the run is serialized and the dashboard has to recognize
+    causes by their wording. These pin the token being carried BESIDE the
+    sentence.
+    """
+
+    def test_token_accompanies_the_humanized_sentence(self):
+        summary = {"per_change": [{"skipped_reason": "no_review_recorded"}]}
+        sentence, token = self.mod._first_change_failure(summary)
+        self.assertEqual(
+            sentence, "the reviewer finished but wrote no findings record")
+        self.assertEqual(token, "no_review_recorded")
+
+    def test_token_comes_from_the_SAME_record_as_the_sentence(self):
+        # The trap a second independent scan for the token would fall into: the
+        # sentence is built from record 1's `deep_error`, and record 1 kept no
+        # reason. A scan that just looked for the first `skipped_reason` anywhere
+        # would return record 2's token and label record 1's failure with it.
+        summary = {"per_change": [
+            {"deep_error": "gh exited 128"},
+            {"skipped_reason": "review_record_incomplete"},
+        ]}
+        sentence, token = self.mod._first_change_failure(summary)
+        self.assertEqual(sentence, "gh exited 128")
+        self.assertEqual(token, "")
+
+    def test_prose_record_that_also_carries_a_token_reports_both(self):
+        # The common real shape: the driver writes the spawn's prose into
+        # `deep_error` AND the token into `skipped_reason` on one record.
+        summary = {"per_change": [{
+            "deep_error": "the reviewer cannot run: no kiro-cli executable was found",
+            "skipped_reason": "runtime_unavailable",
+        }]}
+        sentence, token = self.mod._first_change_failure(summary)
+        self.assertEqual(
+            sentence, "the reviewer cannot run: no kiro-cli executable was found")
+        self.assertEqual(token, "runtime_unavailable")
+
+    def test_empty_summary_yields_no_token(self):
+        self.assertEqual(self.mod._first_change_failure({}), ("", ""))
+        self.assertEqual(self.mod._first_change_failure({"per_change": []}), ("", ""))
+
+
+class TestRunPayloadCarriesReasonToken(_SageRoutesBase):
+    """The run RECORD the dashboard reads must name its failure cause as a token.
+
+    ``_first_change_failure`` having the token is not the fix on its own -- the
+    token has to survive into ``run``, which is what gets serialized to
+    ``/runs``. This drives the real background job with the driver, pool and
+    persistence stubbed, so the assertions are about the record the job leaves
+    behind rather than about a helper's return value.
+    """
+
+    def _drive(self, summary: dict) -> dict:
+        """Run ``_run_review_bg`` against a stub driver returning ``summary``."""
+        run: dict = {"run_id": "r1", "changes": ["https://x/pull/1"],
+                     "change_ids": ["c1"], "status": "running"}
+
+        class _Pool:
+            async def begin_batch(self):
+                return None
+
+            async def end_batch(self):
+                return None
+
+        patches = {
+            "_claim_changes_under_lock": lambda r, c: c,
+            "_collect_delivered": lambda r, s: None,
+            "_record_reviewed": lambda r: None,
+            "_release_claims": lambda r: None,
+        }
+        with contextlib.ExitStack() as stack:
+            for name, fn in patches.items():
+                stack.enter_context(
+                    unittest.mock.patch.object(self.mod, name, fn))
+            stack.enter_context(unittest.mock.patch.object(
+                self.mod, "_save_runs", unittest.mock.AsyncMock()))
+            stack.enter_context(unittest.mock.patch.object(
+                self.mod, "_notify_finished", unittest.mock.AsyncMock()))
+            stack.enter_context(unittest.mock.patch.object(
+                self.mod.review_pool, "runtime_preflight", lambda: ""))
+            stack.enter_context(unittest.mock.patch.object(
+                self.mod.review_pool, "get_pool", lambda: _Pool()))
+            stack.enter_context(unittest.mock.patch.object(
+                self.mod.review_pool, "make_sync_dispatch", lambda loop, pool, **_kw: None))
+            stack.enter_context(unittest.mock.patch.object(
+                self.mod.review_driver, "run_review",
+                lambda *a, **k: summary))
+            asyncio.run(self.mod._run_review_bg(run, list(run["changes"])))
+        return run
+
+    def _nothing_recorded(self, reason: str) -> dict:
+        """A run whose one change failed with ``reason``: ok, but nothing recorded."""
+        return {"ok": True, "changes": 1, "cancelled": 0,
+                "result_records": 0, "deep_reviewed": 0,
+                "per_change": [{"skipped_reason": reason}]}
+
+    def test_error_run_names_its_cause_as_a_token_beside_the_sentence(self):
+        run = self._drive(self._nothing_recorded("review_record_incomplete"))
+        self.assertEqual(run["status"], "error")
+        # The sentence stays exactly where it was -- the token is carried BESIDE
+        # it, so nothing that reads the payload today changes.
+        self.assertEqual(
+            run["error"],
+            "the reviewer wrote a findings record but never completed the review")
+        # `.get`, not `[...]`: a missing key must fail this as an ASSERTION
+        # comparing None against the token, not as a KeyError -- an exception
+        # would also be raised by a harness that never reached this code at all.
+        self.assertEqual(run.get("reason"), "review_record_incomplete")
+
+    def test_token_is_set_on_the_summary_level_error_branch_too(self):
+        # `ok: False` takes the other error branch, which overwrites `error` from
+        # the summary. The token describes the same `per_change` records, so it
+        # must be present here as well -- this is the preflight-failure shape.
+        run = self._drive({
+            "ok": False, "error": "the reviewer cannot run: no kiro-cli executable",
+            "changes": 1, "cancelled": 0, "result_records": 0, "deep_reviewed": 0,
+            "per_change": [{"deep_error": "the reviewer cannot run: no kiro-cli "
+                                          "executable",
+                            "skipped_reason": "runtime_unavailable"}],
+        })
+        self.assertEqual(run["status"], "error")
+        self.assertEqual(run.get("reason"), "runtime_unavailable")
+
+    def test_a_successful_run_carries_no_reason(self):
+        run = self._drive({"ok": True, "changes": 1, "cancelled": 0,
+                           "result_records": 1, "deep_reviewed": 1,
+                           "per_change": [{}]})
+        self.assertEqual(run["status"], "done")
+        self.assertNotIn("reason", run)
+
+    def test_reason_is_absent_not_blank_when_no_record_carried_one(self):
+        # A reader must not have to tell an empty-string token apart from a
+        # missing one; only the key's absence means "this run has no token".
+        run = self._drive({"ok": True, "changes": 1, "cancelled": 0,
+                           "result_records": 0, "deep_reviewed": 0,
+                           "per_change": [{"deep_error": "gh exited 128"}]})
+        self.assertEqual(run["status"], "error")
+        self.assertEqual(run["error"], "gh exited 128")
+        self.assertNotIn("reason", run)
+
+
 class TestRunHeadline(_SageRoutesBase):
     def test_repo_run_counts_prs(self):
         self.assertEqual(
@@ -505,7 +650,7 @@ class TestReviewSectionIO(_SageRoutesBase):
 
     def test_write_seeds_the_layout_when_config_is_missing(self):
         self._cfg_path().unlink()
-        with unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", ["opus-4.8"]):
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
             review = self.mod._write_review_section({"model": "opus-4.8"})
         self.assertEqual(review["model"], "opus-4.8")
         self.assertTrue(self._cfg_path().is_file())
@@ -530,9 +675,11 @@ class TestReviewSectionIO(_SageRoutesBase):
         self.assertIsNone(review["model"])
         review = self.mod._write_review_section({"model": None})
         self.assertIsNone(review["model"])
+        review = self.mod._write_review_section({"model": "auto"})
+        self.assertIsNone(review["model"])
 
     def test_unknown_model_is_rejected(self):
-        with unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", ["opus-4.8"]):
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
             with self.assertRaises(ValueError):
                 self.mod._write_review_section({"model": "sneaky[1m]"})
 
@@ -583,14 +730,14 @@ class TestValidModel(_SageRoutesBase):
                 self.assertFalse(self.mod._valid_model(bad))
 
     def test_registry_membership_is_required_when_known(self):
-        with unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", ["opus-4.8"]):
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
             self.assertTrue(self.mod._valid_model("opus-4.8"))
             self.assertFalse(self.mod._valid_model("sonnet-9"))
             self.assertEqual(self.mod._known_models(), ["opus-4.8"])
 
-    def test_any_safe_token_passes_when_the_registry_is_unavailable(self):
-        with unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", []):
-            self.assertTrue(self.mod._valid_model("some.model_id-1"))
+    def test_no_model_is_accepted_when_the_runtime_snapshot_is_unavailable(self):
+        with unittest.mock.patch.object(self.mod, "_known_models", return_value=[]):
+            self.assertFalse(self.mod._valid_model("some.model_id-1"))
 
 
 # ── review settings: the HTTP handler ──
@@ -606,8 +753,7 @@ class TestSettingsHandler(_SageRoutesBase):
         self.assertIn("settings", payload)
         self.assertIn("reviewer", payload)
         self.assertEqual(payload["namespaces"], ["default"])
-        self.assertEqual(payload["efforts"],
-                         list(self.mod.review_pool.VALID_EFFORTS))
+        self.assertEqual(payload["efforts"], [])
         self.assertEqual(payload["max_concurrent_max"],
                          self.mod.review_pool.MAX_CONCURRENT_CEIL)
         self.assertEqual(payload["settings"]["active_namespaces"], ["default"])
@@ -626,7 +772,7 @@ class TestSettingsHandler(_SageRoutesBase):
 
     async def test_put_persists_the_patch_and_audits_success(self):
         with self._patch_audit() as sel, \
-                unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", ["opus-4.8"]):
+                unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
             resp = await self.mod._handle_settings(_Req(
                 method="PUT",
                 body={"model": "opus-4.8", "effort": "high", "max_concurrent": 4}))
@@ -654,7 +800,7 @@ class TestSettingsHandler(_SageRoutesBase):
 
     async def test_put_rejects_an_invalid_model_and_audits_the_denial(self):
         with self._patch_audit() as sel, \
-                unittest.mock.patch.object(self.mod, "_KNOWN_MODELS", ["opus-4.8"]):
+                unittest.mock.patch.object(self.mod, "_known_models", return_value=["opus-4.8"]):
             resp = await self.mod._handle_settings(
                 _Req(method="PUT", body={"model": "evil[1m]"}))
         self.assertEqual(resp.status, 400)
@@ -1103,25 +1249,27 @@ class TestConsolidateGuards(_SageRoutesBase):
         self.assertEqual(resp.status, 409)
         self.assertEqual(_body(resp)["code"], "consolidation_in_progress")
 
-    async def test_a_failing_staged_count_gives_the_claim_back(self):
+    async def test_a_failing_candidate_load_gives_the_claim_back(self):
         with unittest.mock.patch.object(
-                self.mod.learning, "candidate_count", side_effect=OSError("boom")):
+                self.mod.learning, "list_candidate", side_effect=OSError("boom")):
             with self.assertRaises(OSError):
                 await self.mod._handle_consolidate(_Req(method="POST", body={}))
         self.assertNotIn(learning.DEFAULT_NAMESPACE, self.mod._CONSOLIDATING)
 
-    async def test_staged_candidates_start_a_merge_task(self):
-        async def _noop(ns):
+    async def test_staged_candidates_start_a_preview_task(self):
+        async def _noop(ns, candidate_ids, snapshot):
             return None
         with unittest.mock.patch.object(
-                self.mod.learning, "candidate_count", return_value=3), \
+                self.mod.learning, "list_candidate", return_value=[
+                    {"id": "candidate-1", "title": "rule", "guidance": "check it"}
+                ]), \
                 unittest.mock.patch.object(
-                    self.mod, "_consolidate_bg", side_effect=_noop):
+                self.mod, "_consolidate_bg", side_effect=_noop):
             resp = await self.mod._handle_consolidate(_Req(method="POST", body={}))
             await asyncio.sleep(0)
         payload = _body(resp)
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["staged"], 3)
+        self.assertEqual(payload["candidate_ids"], ["candidate-1"])
         self.assertTrue(
             self.mod._CONSOLIDATE_STATE[learning.DEFAULT_NAMESPACE]["running"])
 

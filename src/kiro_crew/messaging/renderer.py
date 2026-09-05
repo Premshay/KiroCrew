@@ -29,6 +29,7 @@ kept choices for the card as well as the body — rather than
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -184,6 +185,21 @@ def display_safe_for(text: str, capabilities: TransportCapabilities) -> str:
     return safe.replace("@", "@\u200b").replace("<!", "<\u200b!")
 
 
+def session_provenance_tag(session_key: str) -> str:
+    """A short, stable, non-reversible tag for the session that posted a widget.
+
+    Option buttons can outlive the conversation that rendered them. The tag lets
+    a dispatcher compare the posting session with the conversation's current
+    target before model-authored choice text enters a turn. A digest keeps the
+    internal key out of client-visible callback data; it is deterministic so the
+    check survives a gateway restart. This is an equality gate, not an authority
+    token: forging it grants no capability beyond typing the same text.
+    """
+    if not session_key:
+        return ""
+    return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:12]
+
+
 def new_approval_nonce() -> str:
     """A per-prompt token that makes a STALE widget's press unusable.
 
@@ -206,8 +222,9 @@ def _default_redactor(text: str) -> str:
     """The same pair ``TurnDriver`` streams provider text through.
 
     Module scope on purpose: ``security`` is a pure-regex module with no vendor
-    dependencies, and ``messaging.driver`` already imports it from here, so this
-    adds no import-time cost and nothing that could touch an event loop.
+    dependencies -- the same module ``messaging.driver`` imports directly for its
+    own stream redaction -- so this adds no import-time cost and nothing that
+    could touch an event loop.
     """
     out, _ = redact_exfiltration_urls(text or "")
     out, _ = redact_credentials(out)
@@ -234,6 +251,44 @@ def display_safe(text: str) -> str:
     """
     safe, _ = redact_for_display(text or "", _default_redactor)
     return safe.replace("@", "@\u200b").replace("<!", "<\u200b!")
+
+
+def credential_redaction_notice(count: int) -> str:
+    """The notice a channel sends after delivering text redaction rewrote.
+
+    Lives beside :func:`display_safe` because it is the other half of the same
+    outbound contract: that function guarantees the credential does not reach the
+    channel, and this one tells the reader it happened. Shared across channels so
+    one sentence cannot drift into per-channel spellings that each have to be
+    reviewed for leaked bytes.
+
+    ``count`` is the number of redaction placeholders standing in the text that
+    actually shipped, so the wording matches what the reader can see above the
+    notice. It carries NO secret bytes: by the time it is built a tag has already
+    replaced them, and only the count is used.
+
+    Says "a redaction placeholder" rather than naming a specific tag, because the
+    redactor emits more than one (``security.CREDENTIAL_REDACTION_TAGS``) and
+    naming one would print a marker the reader cannot find whenever the
+    substitution came from a different pass.
+
+    Plain text with no markup and no emoji, so one string is correct on every
+    channel: Slack renders mrkdwn, iMessage renders nothing. "The message above"
+    holds for both, because every caller sends this as its own message BELOW the
+    answer rather than appending to it.
+
+    The second sentence is deliberately blunt: a redacted command is not a working
+    command. Saying only "a credential was removed" still leaves the reader
+    pasting text that cannot run, which is the reported failure -- an opaque
+    downstream error far from the real cause.
+    """
+    subject = "A credential" if count == 1 else f"{count} credentials"
+    verb = "was" if count == 1 else "were"
+    return (
+        f"Security notice: {subject} in the message above {verb} replaced with a "
+        "redaction placeholder. Any command shown will not work if you paste it "
+        "as-is; supply the secret yourself on the machine where you run it."
+    )
 
 
 def _choice_display_safe(text: str, capabilities: TransportCapabilities | None) -> str:
@@ -302,8 +357,8 @@ def apply_options_cap(
     Returns ``(body, kept_choices)``: the first ``max_buttons`` choices are kept
     for the widget and the remainder is appended to ``body`` as a numbered text
     list, numbering continued after the widget slots, rather than dropped — so
-    the user still learns those choices exist. A list that fits is a
-    byte-identical pass-through.
+    the user still learns those choices exist. A list that fits leaves ``body``
+    byte-identical; the kept choices are still redacted (see below).
 
     ``max_buttons <= 0`` needs no branch of its own: :func:`cap_choices` keeps
     nothing and overflows everything, so a button-less channel is the
@@ -313,14 +368,13 @@ def apply_options_cap(
     offered.
 
     **The KEPT choices are redacted, not just the overflow.** A choice label is
-    LLM-authored text rendered into a channel, exactly like the overflow list, and
-    the overflow was the only half that ran through :func:`display_safe`. So a
-    markup-split credential inside a label rendered intact on the button -- and again
-    in the press echo, which quotes the label back -- while the same string in the
-    overflow list was redacted. On a forum Topic that is every allow-listed
-    participant. Slack redacts at this same point (``slack/format.py``'s
-    ``_redact_choices``); this closes the gap for every widget channel at once
-    rather than per renderer, so a channel added later cannot miss it.
+    LLM-authored text rendered into a channel, exactly like the overflow list, so
+    redacting only the overflow half would leave a markup-split credential intact
+    on the button -- and again in the press echo, which quotes the label back. On a
+    forum Topic that is every allow-listed participant. Slack redacts at this same
+    point (``slack/format.py``'s ``_redact_choices``); doing it here covers every
+    widget channel at once rather than per renderer, so a channel added later
+    cannot miss it.
 
     Both halves go through :func:`display_safe_for` rather than :func:`display_safe`,
     so the mention defang honours ``capabilities.mention_grammars`` -- which this
@@ -335,7 +389,12 @@ def apply_options_cap(
     if not overflow:
         return body, kept
     lines = format_overflow(overflow, start=len(kept), capabilities=capabilities)
-    sep = "" if not body else ("\n" if body.endswith("\n") else "\n\n")
+    if not body:
+        sep = ""
+    elif body.endswith("\n"):
+        sep = "\n"
+    else:
+        sep = "\n\n"
     return f"{body}{sep}{lines}", kept
 
 
@@ -343,11 +402,10 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
     """Split a trailing ``[OPTIONS:]`` marker off *text* into ``(body, choices)``.
 
     The ONE parse of that marker. Widget-capable renderers need both halves and
-    :func:`render_options_as_text` returns only the body, so before this existed
-    every channel carried the same eight lines: search the shared trailer regex,
-    ``rstrip`` the body, split the group on ``|``, drop the blanks, and decide what
-    to do with an unfinished marker. Six copies of it, three of them (Discord,
-    Telegram, Teams) identical down to the comment -- and a parse duplicated per
+    :func:`render_options_as_text` returns only the body, so both reach the marker
+    through here rather than every caller repeating the same steps: search the
+    shared trailer regex, ``rstrip`` the body, split the group on ``|``, drop the
+    blanks, and decide what to do with an unfinished marker. A parse duplicated per
     channel is a parse that drifts per channel, silently, because each copy looks
     right in isolation.
 

@@ -67,4 +67,18 @@ describe('useAvailableModels — selectable crew', () => {
     await waitFor(() => expect(result.current.map(model => model.name)).toEqual(['auto', 'claude-sonnet-5']))
     expect(mocks.discover).toHaveBeenCalledWith('crew-claude-atlas')
   })
+
+  it('does not fall back to the generic catalog for an unresolved crew', async () => {
+    const { result } = renderHook(
+      () => useAvailableModels({
+        agent: { name: 'unresolved', runtime_policy: { model: 'managed' } },
+        fallback: 'none',
+      }),
+      { wrapper: queryWrapper },
+    )
+
+    expect(result.current).toEqual([])
+    expect(mocks.discover).not.toHaveBeenCalled()
+    expect(mocks.generic).not.toHaveBeenCalled()
+  })
 })

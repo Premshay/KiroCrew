@@ -37,7 +37,12 @@ from snowballstemmer import stemmer as _snowball_stemmer
 # int constants, imported rather than duplicated so the two cannot drift. Safe
 # direction: ``embeddings`` reaches the store only through a Protocol, so it does
 # not import this module and there is no cycle.
-from kiro_crew.embeddings import PRIORITY_BULK, PRIORITY_INTERACTIVE, PRIORITY_NORMAL
+from kiro_crew.embeddings import (
+    PRIORITY_BULK,
+    PRIORITY_INTERACTIVE,
+    PRIORITY_NORMAL,
+    bulk_pace_delay,
+)
 
 try:
     import pysqlite3 as sqlite3
@@ -61,7 +66,7 @@ from kiro_crew.project_scope import (
     project_scope_satisfied,
     scope_is_admissible,
 )
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import redact_and_truncate
 from kiro_crew.validation import ALLOWED_LESSON_CATEGORIES, normalize_lesson_category
 
 # Consolidation caps live in vector_memory_constants (a light module with no
@@ -240,6 +245,18 @@ _EPISODIC_LONG_TEXT_CHARS = 300  # texts longer than this get a relaxed threshol
 _EPISODIC_LONG_TEXT_THRESHOLD = 0.42  # relaxed threshold for long entries
 _EPISODIC_TEXT_MIN = 10
 _EPISODIC_TEXT_MAX = 2000
+#: Codepoint ranges of scripts that spend enough meaning per character for a
+#: TWO-character token to be an ordinary whole word: kana, Han (+ extension A
+#: and the compatibility block) and Hangul syllables. Latin is deliberately
+#: absent -- a two-letter English token is a function word ("to", "in", "is"),
+#: and those are exactly what the keyword floor below exists to drop.
+_DENSE_SCRIPT_RANGES = (
+    (0x3040, 0x30FF),  # Hiragana + Katakana
+    (0x3400, 0x4DBF),  # CJK Unified Ideographs Extension A
+    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
+    (0xAC00, 0xD7A3),  # Hangul syllables
+    (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
+)
 # Episodic recency decay: score factor exp(-rate * days_old), per day. The
 # built-in rate applies when memory.decay_rates configures nothing else; the
 # reserved "default" key in that mapping replaces it for untagged/unmatched
@@ -733,9 +750,7 @@ def _sanitize_decay_rates(raw: Mapping[str, object] | None) -> dict[str, float]:
     if not raw:
         return out
     if not isinstance(raw, Mapping):
-        logger.warning(
-            "memory.decay_rates ignored: expected a mapping, got %r", type(raw).__name__
-        )
+        logger.warning("memory.decay_rates ignored: expected a mapping, got %r", type(raw).__name__)
         return out
     for key, val in raw.items():
         if not isinstance(key, str) or not key.strip():
@@ -757,6 +772,30 @@ def _sanitize_decay_rates(raw: Mapping[str, object] | None) -> dict[str, float]:
         # the clamp itself never overflows.
         out[key.strip().lower()] = float(min(max(val, _DECAY_RATE_MIN), _DECAY_RATE_MAX))
     return out
+
+
+def _is_selective_keyword(word: str) -> bool:
+    """Whether *word* is selective enough to spend a ``LIKE '%word%'`` scan on.
+
+    The episodic keyword fallback matches by plain substring, so the only thing
+    a term has to earn is selectivity. Counting characters is a fine proxy for
+    that in Latin script -- a one- or two-character token there is a function
+    word, and ``LIKE '%to%'`` matches nearly every row -- but it is the wrong
+    proxy for the scripts in :data:`_DENSE_SCRIPT_RANGES`, where two characters
+    is an ordinary word (``模型`` "model", ``会議`` "meeting", ``회의``
+    "meeting") and the substring is highly selective. Applying the Latin floor
+    to them emptied the term list, and an empty term list makes the fallback
+    return nothing at all rather than merely ranking differently.
+
+    A single character stays refused in every script: one Han character (``的``,
+    ``人``) is as unselective as an English stopword, so admitting it would
+    trade this recall bug for a precision one.
+    """
+    if len(word) > 2:
+        return True
+    return len(word) == 2 and any(
+        any(lo <= ord(ch) <= hi for lo, hi in _DENSE_SCRIPT_RANGES) for ch in word
+    )
 
 
 # ── Store ──
@@ -882,11 +921,11 @@ class VectorMemoryStore:
         just created.
 
         Missing files are skipped BY AN EXISTENCE CHECK, not by catching the failure:
-        on Windows ``restrict_to_owner`` shells out, so a missing path raises plain
-        ``OSError`` (icacls exits non-zero) rather than ``FileNotFoundError``, which
-        only ever comes from the POSIX ``os.chmod``. Catching alone would spawn up to
-        five futile ``icacls`` processes on a clean init and log a false "may be
-        readable by other users" warning for each, twice per init. The race between
+        on Windows ``restrict_to_owner`` raises plain ``OSError`` for a missing path
+        (the in-process DACL write's failure is translated to ``OSError``) rather
+        than ``FileNotFoundError``, which only ever comes from the POSIX
+        ``os.chmod``. Catching alone would log a false "may be readable by other
+        users" warning for each missing file, twice per init. The race between
         the check and the call is benign: a file that appears in between is created by
         SQLite or FAISS inside the already-tightened directory, so it inherits
         owner-only access on both platforms and the next init covers it regardless.
@@ -915,7 +954,7 @@ class VectorMemoryStore:
         # pass below repairs what already EXISTS, which a tightened parent cannot do:
         # Windows grants *Bypass Traverse Checking* to Everyone by default, so a
         # pre-lockdown file stays reachable through it. Full reasoning -- the sidecar
-        # file set, the every-init rationale, the Windows icacls cost, the fail-soft
+        # file set, the every-init rationale, the Windows lockdown cost, the fail-soft
         # contract -- lives in docs/guides/windows-install.md, "The memory store".
         #
         # SCOPE: with the default `db_path` this directory IS the data home
@@ -971,10 +1010,13 @@ class VectorMemoryStore:
         # no-op on Windows. Cost, file set and fail-soft contract:
         # docs/guides/windows-install.md, "The memory store".
         #
-        # CALLER CONTRACT: an async caller must offload this. The Windows path shells
-        # out to icacls, so calling ``init()`` directly on an event loop freezes it
-        # for seconds. All async callers now offload: ``eval.runner``,
-        # ``slack.gateway`` and ``cli_server._run_task`` via ``asyncio.to_thread``
+        # CALLER CONTRACT: an async caller must offload this. ``init()`` is
+        # blocking end to end — the sqlite connect, the schema migrations, and
+        # this lockdown pass (in-process on Windows since the advapi32
+        # conversion, but still filesystem work that can stall on a slow
+        # volume) — so calling it directly on an event loop stalls every task.
+        # All async callers now offload: ``eval.runner``, ``slack.gateway`` and
+        # ``cli_server._run_task`` via ``asyncio.to_thread``
         # (#5389); ``dashboard/handlers/memory.py``'s standalone fallback routes
         # through ``_get_vector_store_async``, which offloads the init-bearing
         # path (#5221).
@@ -1086,7 +1128,11 @@ class VectorMemoryStore:
         # Every stored byte is therefore either raw-measured or bounded by a
         # constant (the enum member and the key envelope).
         size_basis = vj
-        if key.startswith("lesson.") and isinstance(value, dict) and _lesson_fields(value) is not None:
+        if (
+            key.startswith("lesson.")
+            and isinstance(value, dict)
+            and _lesson_fields(value) is not None
+        ):
             cat = value.get("category")
             raw_negative = value.get("negative")
             raw_scope = value.get("repo_scope")
@@ -1386,9 +1432,7 @@ class VectorMemoryStore:
                                     exc_info=True,
                                 )
                     else:
-                        logger.debug(
-                            "Dropping a semantic embedding produced in a previous space"
-                        )
+                        logger.debug("Dropping a semantic embedding produced in a previous space")
 
         # 9. Retire conflicting episodic entries that reference the old value
         # (called outside the lock — _retire_stale_episodic does a blocking embed
@@ -1779,8 +1823,7 @@ class VectorMemoryStore:
             # is surfaced verbatim on the dashboard (/api/memory/events -> get_events).
             # Scrub exfiltration URLs + credentials before persisting the audit
             # snippet so poisoned text can't smuggle secrets onto that surface.
-            safe_snippet, _ = redact_exfiltration_urls(text[:200])
-            safe_snippet, _ = redact_credentials(safe_snippet)
+            safe_snippet = redact_and_truncate(text, 200)
             self._log_event(
                 SemanticRejectCode.INJECTION.value,
                 "episodic",
@@ -2614,9 +2657,7 @@ class VectorMemoryStore:
                             # Swap landed after this blob was embedded. Leave the row
                             # NULL for the post-activation backfill rather than
                             # persisting a vector from the previous space.
-                            logger.debug(
-                                "Dropping a lazy lesson backfill from a previous space"
-                            )
+                            logger.debug("Dropping a lazy lesson backfill from a previous space")
                             continue
                         self.db.execute(
                             "UPDATE semantic_memory SET embedding = ? WHERE key = ?", (blob, bk)
@@ -2839,9 +2880,7 @@ class VectorMemoryStore:
                     )
                     if existing_emb:
                         row_blob = struct.pack(f"{len(existing_emb)}f", *existing_emb)
-                        pending_backfills.append(
-                            (row_blob, existing["key"], backfill_generation)
-                        )
+                        pending_backfills.append((row_blob, existing["key"], backfill_generation))
                     backfills_done += 1
                 if row_blob is not None:
                     sim = similarity({"embedding": row_blob})
@@ -3037,6 +3076,21 @@ class VectorMemoryStore:
         else:
             rows = self._fetch_all_locked(sql)
         return [dict(r) for r in rows]
+
+    def count_lessons(self) -> int:
+        """Return the number of live lessons without materializing them.
+
+        ``get_lessons()`` returns full row dicts (including embedding blobs);
+        callers that only need the COUNT (the status paths poll it every few
+        seconds per client) must not pull every lesson row into memory just to
+        ``len()`` it. Same predicate and ``_db_lock`` serialization as
+        ``get_lessons``, so it is safe from executor threads and the loop
+        alike and always agrees with ``len(get_lessons())``.
+        """
+        rows = self._fetch_all_locked(
+            "SELECT COUNT(*) AS n FROM semantic_memory WHERE is_deleted = 0 AND key LIKE 'lesson.%'"
+        )
+        return int(rows[0]["n"]) if rows else 0
 
     def delete_lesson(self, rule_substring: str) -> bool:
         """Delete lessons whose value contains rule_substring."""
@@ -3259,6 +3313,50 @@ class VectorMemoryStore:
             return ("pref.general", match.group(1).strip())
         return None
 
+    def _embed_bulk_row(self, text: str, *, pace: bool) -> "list[float] | None":
+        """Embed one row of a corpus sweep, then optionally pace the loop.
+
+        The sweeps below are the longest-running CPU work the gateway does
+        unattended — a migrated memory of a few thousand rows is tens of minutes
+        of continuous inference — and to a user that is indistinguishable from a
+        runaway process. ``memory.embedding_bulk_duty`` spreads the same total
+        work over more wall time by idling between rows (see
+        :func:`kiro_crew.embeddings.bulk_pace_delay`).
+
+        The sleep is HERE, on the sweep's own thread, and holds neither the DB
+        lock nor the model: an interactive embed arriving mid-pause is served
+        immediately. It also deliberately covers a row that failed to embed —
+        the delay is derived from measured elapsed time, so a no-op returns 0.0
+        and only real work is paced.
+
+        The pause falls between this row's inference and its write, which is what
+        makes it safe to interrupt: a sweep killed mid-pause leaves the row's
+        ``embedding`` NULL and the next sweep re-embeds it, exactly as it already
+        does for every row it never reached.
+
+        *pace* is False for a sweep a human explicitly asked for and is watching
+        a progress bar on; slowing that down would be paying the cost with none
+        of the benefit, since the load is expected in that case.
+
+        *pace* therefore also selects the scheduling class, because attendance —
+        not corpus size — is what both dials are really keyed on. An unattended
+        sweep embeds at ``PRIORITY_BULK``, which is what gives it the reduced
+        ``memory.embedding_bulk_threads`` pool; an attended one embeds at
+        ``PRIORITY_NORMAL`` and so keeps the full interactive pool. Without this,
+        ``pace=False`` would switch off the idling but leave the sweep on one
+        thread, making the very path this PR declares "full speed" ~3x slower
+        than before pacing existed.
+        """
+        priority = PRIORITY_BULK if pace else PRIORITY_NORMAL
+        if not pace:
+            return self._try_embed(text, priority)
+        started = time.monotonic()
+        vec = self._try_embed(text, priority)
+        delay = bulk_pace_delay(time.monotonic() - started)
+        if delay > 0:
+            time.sleep(delay)
+        return vec
+
     def _try_embed(self, text: str, priority: int = PRIORITY_NORMAL) -> list[float] | None:
         """Embed text using embed_fn if available.
 
@@ -3415,9 +3513,7 @@ class VectorMemoryStore:
         """
         return self._read_meta(_EMBED_SIG_KEY)
 
-    def reconcile_embedding_space(
-        self, signature: str, *, clear_when_unknown: bool = False
-    ) -> int:
+    def reconcile_embedding_space(self, signature: str, *, clear_when_unknown: bool = False) -> int:
         """Discard embeddings produced by a DIFFERENT model. Returns rows invalidated.
 
         Stored vectors are only comparable to each other when they came from the
@@ -3499,9 +3595,7 @@ class VectorMemoryStore:
                     # where unlink fails while another process holds the index
                     # mapped.
                     stale_removal_failed = True
-                    logger.warning(
-                        "Could not remove stale FAISS file %s", stale, exc_info=True
-                    )
+                    logger.warning("Could not remove stale FAISS file %s", stale, exc_info=True)
         invalidated = max(0, episodic) + max(0, semantic)
         if stale_removal_failed:
             # Deliberately do NOT stamp the signature. Stamping would mark the
@@ -3564,7 +3658,7 @@ class VectorMemoryStore:
         return any(self._fetch_one_locked(sql) is not None for sql in probes)
 
     def backfill_missing_embeddings(
-        self, progress: "Callable[[int, int], None] | None" = None
+        self, progress: "Callable[[int, int], None] | None" = None, *, pace: bool = True
     ) -> int:
         """Compute embeddings for episodic rows that have none, then rebuild FAISS.
 
@@ -3597,6 +3691,16 @@ class VectorMemoryStore:
         already falls back to ``_sqlite_vector_search`` (a stdlib cosine scan
         over these blobs), so the stored vectors are useful either way; the
         index rebuild below is simply skipped when faiss is absent.
+
+        *pace* (default on) idles between rows so the sweep targets
+        ``memory.embedding_bulk_duty`` of wall time — the same total CPU work
+        spread thinner, which is what keeps an unattended post-migration sweep
+        from pinning several cores for tens of minutes. It is a target rather
+        than a ceiling: a single row whose inference is slow enough to ask for
+        more than :data:`~kiro_crew.embeddings._MAX_BULK_PACE_SLEEP` of idle is
+        capped there, so that row runs at a higher effective duty. Pass
+        ``pace=False`` for a sweep a human explicitly asked for and is waiting
+        on.
         """
         if self.embed_fn is None:
             return 0
@@ -3604,18 +3708,17 @@ class VectorMemoryStore:
         # compared directly, never indexed), and they must be rebuilt even when
         # there is not a single NULL episodic row — which is exactly the state
         # after reconcile_embedding_space() on a memory that holds only lessons.
-        self._backfill_lesson_embeddings(progress)
+        self._backfill_lesson_embeddings(progress, pace=pace)
         # Same for non-lesson semantic KV rows: struct-packed, no numpy, no
         # FAISS — get_semantic_context ranks them straight from the stored blob.
         # No progress callback: the (done,total) stream belongs to the episodic
         # loop below, and a second denominator would make the dashboard bar
         # jump backward when both row types need re-embedding.
-        self._backfill_semantic_kv_embeddings()
+        self._backfill_semantic_kv_embeddings(pace=pace)
         if not _HAS_NUMPY:
             return 0
         rows = self._fetch_all_locked(
-            "SELECT id, text FROM episodic_memories "
-            "WHERE is_deleted = 0 AND embedding IS NULL"
+            "SELECT id, text FROM episodic_memories " "WHERE is_deleted = 0 AND embedding IS NULL"
         )
         if not rows:
             return 0
@@ -3626,7 +3729,14 @@ class VectorMemoryStore:
             # spin, and this loop can run for minutes on a large corpus.
             progress(0, total)
         for row in rows:
-            vec = self._try_embed(row["text"], PRIORITY_BULK)
+            # Sampled BEFORE the embed, re-checked under the lock, matching
+            # _backfill_semantic_kv_embeddings: a model swap landing across the
+            # embed must not commit a vector from the old space (reconcile has
+            # already swept past this row, so nothing would ever clear it). The
+            # window existed before pacing but was sub-second; idling between
+            # rows widens it to seconds, which makes the guard load-bearing.
+            backfill_generation = self._space_generation
+            vec = self._embed_bulk_row(row["text"], pace=pace)
             if not vec:
                 if progress is not None:
                     progress(embedded, total)
@@ -3652,8 +3762,22 @@ class VectorMemoryStore:
                 arr = arr / norm
             blob = arr.tobytes()
             with self._db_lock:
+                if backfill_generation != self._space_generation:
+                    logger.debug("Dropping an episodic backfill from a previous space")
+                    if progress is not None:
+                        progress(embedded, total)
+                    continue
+                # `embedding IS NULL` keeps this merge-only: a concurrent writer
+                # that has already filled this row's vector (in the current
+                # space) must not be overwritten by our older computation.
+                # `is_deleted = 0` keeps a vector off a row tombstoned during the
+                # pause. No text guard is needed here, unlike the semantic
+                # sweeps: `episodic_memories.text` is never rewritten in place
+                # (rows are tombstoned instead), so `id` pins the text we
+                # embedded.
                 self.db.execute(
-                    "UPDATE episodic_memories SET embedding = ? WHERE id = ?",
+                    "UPDATE episodic_memories SET embedding = ? "
+                    "WHERE id = ? AND embedding IS NULL AND is_deleted = 0",
                     (blob, row["id"]),
                 )
                 self.db.commit()
@@ -3669,7 +3793,7 @@ class VectorMemoryStore:
         return embedded
 
     def _backfill_lesson_embeddings(
-        self, progress: "Callable[[int, int], None] | None" = None
+        self, progress: "Callable[[int, int], None] | None" = None, *, pace: bool = True
     ) -> int:
         """Embed lesson rows whose vector is NULL. Returns the count embedded.
 
@@ -3715,16 +3839,33 @@ class VectorMemoryStore:
             if not text:
                 logger.debug("Skipping lesson %s with no renderable text", row["key"])
                 continue
-            vec = self._try_embed(text, PRIORITY_BULK)
+            # Same guard as the episodic and semantic-KV sweeps: sampled before
+            # the embed, re-checked under the lock, so a model swap landing
+            # across the (now paced) embed cannot commit an old-space vector.
+            lesson_generation = self._space_generation
+            vec = self._embed_bulk_row(text, pace=pace)
             if not vec:
                 continue
             # Stored un-normalized to match write_lesson(): _cosine_sim()
             # normalizes both operands itself.
             blob = struct.pack(f"{len(vec)}f", *vec)
             with self._db_lock:
+                if lesson_generation != self._space_generation:
+                    logger.debug("Dropping a lesson backfill from a previous space")
+                    continue
+                # Same three-part guard as _backfill_semantic_kv_embeddings, for
+                # the same reason: `embedding IS NULL` alone matches a row whose
+                # value was REWRITTEN during the (paced) embed — the write path
+                # clears the vector when the rule text changes — so the old
+                # rule's vector would be stamped onto the new rule and rank it by
+                # text it no longer holds. `value_json` pins the row we embedded,
+                # and `is_deleted = 0` keeps a vector off a row tombstoned in the
+                # same window.
                 self.db.execute(
-                    "UPDATE semantic_memory SET embedding = ? WHERE key = ?",
-                    (blob, row["key"]),
+                    "UPDATE semantic_memory SET embedding = ? "
+                    "WHERE key = ? AND value_json = ? AND embedding IS NULL "
+                    "AND is_deleted = 0",
+                    (blob, row["key"], row["value_json"]),
                 )
                 self.db.commit()
             embedded += 1
@@ -3735,7 +3876,7 @@ class VectorMemoryStore:
         return embedded
 
     def _backfill_semantic_kv_embeddings(
-        self, progress: "Callable[[int, int], None] | None" = None
+        self, progress: "Callable[[int, int], None] | None" = None, *, pace: bool = True
     ) -> int:
         """Embed non-lesson semantic rows whose vector is NULL. Returns the count.
 
@@ -3770,7 +3911,7 @@ class VectorMemoryStore:
             # landing across the embed must not commit a vector from the old
             # space (reconcile has already swept past this row).
             backfill_generation = self._space_generation
-            vec = self._try_embed(f"{row['key']} {row['value_json']}", PRIORITY_BULK)
+            vec = self._embed_bulk_row(f"{row['key']} {row['value_json']}", pace=pace)
             if not vec:
                 if progress is not None:
                     progress(embedded, total)
@@ -3783,9 +3924,13 @@ class VectorMemoryStore:
                 # value_json guard: a concurrent re-write of this key already
                 # cleared-and-refilled its own vector; stamping the OLD value's
                 # vector over it would rank the row by text it no longer holds.
+                # `is_deleted = 0` is the third leg, added when pacing widened
+                # this window: a row tombstoned during the pause must not come
+                # back carrying a vector.
                 self.db.execute(
                     "UPDATE semantic_memory SET embedding = ? "
-                    "WHERE key = ? AND value_json = ? AND embedding IS NULL",
+                    "WHERE key = ? AND value_json = ? AND embedding IS NULL "
+                    "AND is_deleted = 0",
                     (blob, row["key"], row["value_json"]),
                 )
                 self.db.commit()
@@ -3981,7 +4126,7 @@ class VectorMemoryStore:
         self, query: str, limit: int, tag_filter: list[str] | None = None
     ) -> list[dict]:
         """Simple LIKE-based text + tags search fallback for episodic memories."""
-        words = [w for w in query.strip().split()[:5] if len(w) > 2]
+        words = [w for w in query.strip().split()[:5] if _is_selective_keyword(w)]
         if not words:
             return []
         conditions = " OR ".join(["text LIKE ?" for _ in words] + ["tags LIKE ?" for _ in words])

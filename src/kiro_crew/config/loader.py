@@ -21,17 +21,27 @@ import shutil
 import stat as _stat
 import threading
 import uuid
-from collections.abc import Callable, Iterable, MutableMapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit as _urlsplit
 
-from kiro_crew import __version__, model_registry, platform_compat
+from kiro_crew import __version__, model_registry, platform_compat, windows_acl
+
+# Leaf module (stdlib only) owning "which ACP backend can this build serve": the
+# registry an edition extends at boot. Importable at module scope precisely because
+# it does NOT reach ``kiro_crew.acp`` — the package init (client + runtime) imports
+# this module, which is the cycle the old ``acp.types`` import had to defer for.
+#
+# The one gate stays where the pre-registry code already gated — inside
+# ``_normalize_acp_backend`` on the way out of config.json. Only what it reads
+# changed: the registry, instead of a frozen literal.
+from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, resolve_selected_backend
 
 # Leaf module (stdlib + platform_compat only) — no import cycle with config.
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, on_event_loop
 
 # Computer-use defaults/ceilings come from the feature's constants module rather
 # than being re-spelled here (AGENTS.md: no hardcoded values in business logic).
@@ -76,6 +86,7 @@ from kiro_crew.config.paths import (  # noqa: F401, kiro_agents_dir
     ensure_data_home,
     kiro_agents_dir,
 )
+from kiro_crew.config.sections import coerce_effort
 
 # Superseded-default reporting (#5244). Leaf module: stdlib only, so importing it
 # here creates no cycle.
@@ -118,7 +129,28 @@ from kiro_crew.instances.constants import MINT_TIMEOUT_FLOOR_SECS as _MINT_TIMEO
 from kiro_crew.instances.constants import (
     RECOVER_BACKOFF_MAX_CEILING_SECS as _RECOVER_BACKOFF_CEILING,
 )
+from kiro_crew.instances.constants import WARM_SET_CAP_AUTO as _WARM_SET_CAP_AUTO
 from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
+
+# The speech-to-text defaults and the model catalog come from the package that
+# owns them, so the model menu this schema advertises cannot name a model that
+# cannot be downloaded, and a tuning knob cannot document a default the session
+# does not use. No cycle: the only config dependency anywhere under
+# ``kiro_crew.stt`` is the leaf ``config.paths``, never this module.
+from kiro_crew.stt.limits import DEFAULT_IDLE_EVICT_SECS as _STT_DEFAULT_IDLE_EVICT_SECS
+from kiro_crew.stt.limits import DEFAULT_PARTIAL_INTERVAL_MS as _STT_DEFAULT_PARTIAL_INTERVAL_MS
+from kiro_crew.stt.limits import DEFAULT_SILENCE_MS as _STT_DEFAULT_SILENCE_MS
+from kiro_crew.stt.limits import DEFAULT_TIMEOUT_SECS as _STT_DEFAULT_TIMEOUT_SECS
+from kiro_crew.stt.limits import MAX_IDLE_EVICT_SECS as _STT_IDLE_EVICT_SECS_MAX
+from kiro_crew.stt.limits import MAX_INTERVAL_MS as _STT_INTERVAL_MS_MAX
+from kiro_crew.stt.limits import MAX_TIMEOUT_SECS as _STT_MAX_TIMEOUT_SECS
+from kiro_crew.stt.limits import MIN_IDLE_EVICT_SECS as _STT_IDLE_EVICT_SECS_MIN
+from kiro_crew.stt.limits import MIN_PARTIAL_INTERVAL_MS as _STT_MIN_PARTIAL_INTERVAL_MS
+from kiro_crew.stt.limits import MIN_SILENCE_MS as _STT_MIN_SILENCE_MS
+from kiro_crew.stt.limits import MIN_TIMEOUT_SECS as _STT_MIN_TIMEOUT_SECS
+from kiro_crew.stt.models import CATALOG as _STT_CATALOG
+from kiro_crew.stt.models import DEFAULT_MODEL as _STT_DEFAULT_MODEL
+from kiro_crew.stt.models import resolve as _resolve_stt_model
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +205,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "taskrunner",
         "orchestrator",
         "watchdog",
+        "resource_limits",
         "messaging",
         "cron_history",
         "knowledge",
@@ -184,6 +217,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "timezone",
         "auto_update",
         "registries",
+        "connections_ui",
     }
 )
 
@@ -484,10 +518,33 @@ def _safe_int(value: object, default: int, lo: int | None = None, hi: int | None
     return result
 
 
-def _safe_nonnegative_int(value: object, default: int) -> int:
-    """Convert a legacy integer value and reject negative results."""
+def _safe_nonnegative_int(value: object, default: int, hi: int | None = None) -> int:
+    """Convert a legacy integer value and reject negative results.
+
+    *hi* caps the result. Deliberately a ceiling only, with no matching floor
+    argument: a negative value still returns *default* rather than clamping up to
+    0, because 0 is MEANINGFUL for the budgets this guards (a zero chunk budget
+    turns that sweep off). Clamping -1 to 0 would silently disable a sweep the
+    operator never asked to disable, where returning the default keeps it running.
+    The ceiling has no such ambiguity, and it is where the exposure was: an absurd
+    hand-edited budget loaded verbatim and became real scheduled work.
+    """
     result = _safe_int(value, default)
-    return result if result >= 0 else default
+    if result < 0:
+        return default
+    return result if hi is None else min(hi, result)
+
+
+def _port_or_unset(value: object) -> int:
+    """A TCP port, or 0 (unset) when the value is malformed or out of range.
+
+    Deliberately NOT the clamp convention used for bounded knobs: a clamped
+    port is as wrong as a malformed one — a tunnel that forwards 8080 does not
+    forward 65535 either — so anything outside 1..65535 falls back to unset
+    (ephemeral) rather than becoming a live pin the operator never named.
+    """
+    result = _safe_int(value, 0)
+    return result if 0 < result <= 65535 else 0
 
 
 #: Bounds of a context-threshold percentage, and the single statement of the range.
@@ -610,6 +667,24 @@ def _safe_float(
     if hi is not None and result > hi:
         result = hi
     return result
+
+
+_COLOR_HEX_RE = _re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _safe_color(value: object) -> str:
+    """Return a valid lowercase ``#rrggbb`` hex color, or ``""`` on junk.
+
+    config.json is hand-editable, so a non-string or malformed value must
+    collapse to empty (no agent color) rather than crash the load or propagate
+    to an inline CSS style attribute.
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    v = value.strip().lower()
+    if _COLOR_HEX_RE.match(v):
+        return v
+    return ""
 
 
 def _session_work_dir(session_key: str | None) -> Path:
@@ -992,17 +1067,33 @@ def write_config_atomically(path: Path, data: dict, *, fsync: bool = False) -> N
     ``atomic_write``'s ``mode`` routes through ``fchmod_safe``, which applies the
     mode on POSIX and is a documented no-op on Windows.
 
-    **This deliberately does NOT call ``platform_compat.restrict_to_owner``.**
-    That helper shells out to ``icacls`` on Windows (``subprocess.run``, 10s
-    timeout), and this function is called from ``async`` request handlers and from
-    ``KiroCrewConfig.save()`` — so invoking it here would put a blocking subprocess
-    on the gateway's asyncio event loop, freezing every task including the liveness
-    heartbeat (the ``no-blocking-call-on-event-loop`` rule; the repo offloads that
-    helper via ``asyncio.to_thread`` everywhere else for exactly this reason).
-    Omitting it is no worse than the truncate-then-write this replaced, which
-    applied no DACL either, while ``mode`` still tightens the POSIX case and new
-    files are created ``0600``. A caller that needs a hard owner-only guarantee on
-    Windows must offload ``restrict_to_owner`` itself, off the loop.
+    **Windows gets a real owner-only DACL, not just the inert mode.** This used
+    to deliberately skip ``platform_compat.restrict_to_owner`` because that helper
+    shelled out to ``icacls`` — a blocking subprocess this function could not
+    afford, being called from ``async`` request handlers and from
+    ``KiroCrewConfig.save()``. That constraint no longer exists: the lockdown is
+    applied in-process through ``advapi32`` (measured at 0.24 ms, against 313 ms
+    for the subprocess it replaced), so it is safe on the event loop and the
+    reason to omit it is gone. Since ``config.json`` can carry inline provider
+    tokens and API keys, applying it is the correct default rather than a duty
+    pushed onto each caller.
+
+    The two guarantees do not collide, because they apply on different platforms:
+    mode preservation is a POSIX concept (Windows has no bits to preserve), and
+    the DACL is a Windows concept. Hence the platform branch below rather than
+    passing both to ``atomic_write``, which refuses ``restrict_to_owner=True``
+    alongside a wider explicit ``mode``.
+
+    **On a network-homed data home the DACL turns on the CALLER, not the volume.**
+    The in-process lockdown costs 0.24 ms on a local volume but is bounded only by
+    SMB on a UNC or mapped-drive path, which a write running inline on the event
+    loop cannot afford. That is a fact about the calling thread, so it is asked as
+    one, via :func:`kiro_crew.atomic_write.on_event_loop`. A caller that has
+    offloaded this write -- ``dashboard/chat_utils.run_config_write``, any
+    ``asyncio.to_thread`` wrapper, and every CLI and startup path, which have no
+    loop at all -- blocks only its own thread and therefore gets the owner-only
+    DACL on **any** volume. Only a write still inline on the loop falls back to
+    classifying the volume and skipping when it is remote.
 
     **Symlinks are followed, not replaced.** ``os.replace`` renames over the link
     itself, turning a symlinked ``config.json`` into a regular file and orphaning
@@ -1017,12 +1108,86 @@ def write_config_atomically(path: Path, data: dict, *, fsync: bool = False) -> N
             path = path.resolve()
     except OSError:
         pass
+    # Decide the Windows lockdown HERE, before the stat and the mkdir below and
+    # before anything atomic_write does -- every one of those is a round-trip on a
+    # network-homed data home. A DACL write to a UNC or mapped-drive path is an
+    # unbounded SMB round-trip, so when it cannot be afforded it has to be ruled
+    # out before the work starts rather than part way through.
+    #
+    # But whether it can be afforded is a question about the CALLING THREAD, not
+    # about the volume. The volume was only ever a proxy: this function is
+    # synchronous and async dashboard handlers reach it inline, where an unbounded
+    # wait stalls the one loop the whole gateway shares. Off the loop there is
+    # nothing to stall -- a worker started by ``run_config_write`` /
+    # ``asyncio.to_thread``, a CLI invocation, a startup path all block only
+    # themselves -- so the same predicate ``atomic_write`` already gates its own
+    # unbounded-on-Windows step on decides here too, and a network-homed data home
+    # gets the DACL whenever its caller has offloaded the write.
+    #
+    # This sits just AFTER the symlink resolve rather than at the very top of the
+    # function, and deliberately: a config symlinked into a dotfiles repo (which
+    # the docstring above calls a normal setup) can point at a DIFFERENT volume
+    # than the link, so classifying before resolving would classify the wrong one.
+    # The resolve is two stats; the earliest CORRECT point is here.
+    lock_down = platform_compat.IS_POSIX
+    if not platform_compat.IS_POSIX:
+        if not on_event_loop():
+            # Nothing to stall, so the volume does not decide -- and is not even
+            # classified, because its answer could only weaken the outcome.
+            lock_down = True
+        else:
+            try:
+                lock_down = windows_acl.volume_is_local(path)
+            except Exception:
+                # A descriptor API that cannot be loaded cannot tell us the volume
+                # is local, and the lockdown would have failed on this host anyway.
+                lock_down = False
+            if not lock_down:
+                logger.warning(
+                    "config write: %s is on a non-local volume and this write is "
+                    "running on the event loop, so the owner-only DACL was "
+                    "SKIPPED to avoid stalling the loop on SMB; the file may be "
+                    "readable by other local users. Offloading the write "
+                    "(dashboard/chat_utils.run_config_write) applies the DACL "
+                    "here too",
+                    path,
+                )
     try:
         mode = _stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
     except OSError:
         mode = 0o600
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(path, json.dumps(data, indent=2) + "\n", fsync=fsync, mode=mode)
+    payload = json.dumps(data, indent=2) + "\n"
+    if platform_compat.IS_POSIX:
+        atomic_write(path, payload, fsync=fsync, mode=mode)
+    elif lock_down:
+        # Windows: the mode bits above are inert (fchmod_safe is a documented
+        # no-op), so there is nothing to preserve and no conflict with
+        # restrict_to_owner's implied 0600. Taking the lockdown here rather than
+        # leaving it to callers also closes the window a post-write lockdown
+        # would leave: atomic_write applies the DACL to the temp file BEFORE any
+        # content reaches it, so an inline credential never exists in a file
+        # readable by other local accounts.
+        #
+        # restrict_on_error="warn", not the default "raise": config.json must not
+        # become unwritable because a DACL could not be applied. Same trade-off
+        # sel.py and dashboard/refresh_tokens.py already take, and strictly
+        # better than the previous behavior, which applied no DACL at all.
+        atomic_write(
+            path,
+            payload,
+            fsync=fsync,
+            restrict_to_owner=True,
+            restrict_on_error="warn",
+        )
+    else:
+        # Reached only by a write still INLINE ON THE LOOP whose volume is not
+        # local: exactly the write this branch did before the lockdown was added,
+        # so such a data home is no worse off than before. The residual is real and
+        # declared -- the file keeps the ACL it inherits from its parent -- but it
+        # is now per CALLER rather than per platform: offloading a caller moves it
+        # to the branch above and it gets the DACL with no change needed here.
+        atomic_write(path, payload, fsync=fsync, mode=mode)
 
 
 def update_config_locked(
@@ -1372,15 +1537,24 @@ def inject_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str
 
 
 def strip_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
-    """Remove kiro-cli's model credential from a foreign child's environment.
+    """Remove kiro-cli's model credential from a child that does not consume it.
 
-    Counterpart to :func:`inject_kiro_cli_api_key` for the non-kiro-cli ACP
-    backends (the dormant Claude seam, KAS): the credential is kiro-cli's
-    alone, and it is deliberately NOT in ``sandbox._AGENT_DENIED_ENV_KEYS``, so
-    without this an inherited copy in the raw ``os.environ`` snapshot would
-    ride into a foreign agent process. Matches the platform env-key convention
-    (exact on POSIX, case-folded on Windows) so a differently-cased Windows
-    spelling cannot slip past. Mutates *env* in place and returns it.
+    Counterpart to :func:`inject_kiro_cli_api_key` for every ACP backend other
+    than kiro (Claude Code, and KAS): the credential authenticates
+    kiro-cli's OWN v2 agent loop, and it is deliberately NOT in
+    ``sandbox._AGENT_DENIED_ENV_KEYS``, so without this an inherited copy in the
+    raw ``os.environ`` snapshot would ride into an agent process that has no use
+    for it.
+
+    "Foreign process" is no longer the right framing for KAS: Crew reaches it
+    through kiro-cli's ACP relay, so the child IS a kiro-cli. The strip still
+    applies because the v3 engine resolves its tokens from kiro-cli's OIDC store
+    (``--auth-method cli``) and never reads this variable — the test is what the
+    child's engine consumes, not which binary it is.
+
+    Matches the platform env-key convention (exact on POSIX, case-folded on
+    Windows) so a differently-cased Windows spelling cannot slip past. Mutates
+    *env* in place and returns it.
     """
     matched = [k for k in env if platform_compat.env_key_allowed(k, _KIRO_API_KEY_ONLY)]
     for k in matched:
@@ -1550,13 +1724,36 @@ class AgentConfig:
             "and kirocrew-computer in the registry by those exact names.",
         ),
     )
+    mcp_quarantine_after_failures: int = field(
+        default=3,
+        metadata=_meta(
+            "Failing-Probe Threshold",
+            "Consecutive failed probes before an MCP server is reported as "
+            "persistently failing on its dashboard row. A probe verdict is "
+            "otherwise forgotten between rounds, so a server that failed once on a "
+            "cold cache looked identical to one that has failed forty times. "
+            "Counts only 'error' and 'timeout': a server asking for OAuth sign-in "
+            "is working correctly and is never counted, and one success clears the "
+            "count. This is a health reading only -- the server stays mounted, and "
+            "the dashboard offers a one-click count reset. 0 turns it off.",
+        ),
+    )
     acp_backend: str = field(
         default="",
         metadata=_meta(
             "ACP Backend",
             "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent. "
             "KAS runs chat but has no native subagent progress reporting yet.",
-            enum=["", "kas"],
+            # Deliberately NO ``enum``. A literal here was frozen at import and fed
+            # two import-time structures (``JSON_SCHEMA`` and ``SCHEMA_REGISTRY``),
+            # both strictly earlier than an edition registering a backend at boot.
+            # That made the enum actively harmful rather than merely stale —
+            # ``validate_config_data`` DELETES an out-of-enum value before the
+            # loader ever sees it, so a registered backend was stripped from
+            # config.json on the way in. ``resolve_selected_backend`` is now the
+            # single gate (it logs the reason it degrades), and
+            # ``GET /api/config/schema`` supplies the live values the dashboard
+            # renders. See harness-parity H4.
         ),
     )
     default_agent: str = field(
@@ -2303,6 +2500,34 @@ class MemoryConfig:
             "Clamped to the machine's core count.",
         ),
     )
+    embedding_bulk_threads: int = field(
+        default=1,
+        metadata=_meta(
+            "Embedding Threads (bulk)",
+            "CPU threads for BACKGROUND corpus embedding — the re-embed sweep that "
+            "gives imported memories semantic reach, plus imports and consolidation — "
+            "as opposed to a query you are waiting on. Defaults to 1: nothing waits on "
+            "this work (those rows are keyword-searchable meanwhile), so it is tuned to "
+            "stay invisible rather than finish early. Raise it to get through a large "
+            "backlog sooner; interactive search keeps its own pool either way. 0 means "
+            "inherit Embedding Threads. Clamped to the machine's core count.",
+        ),
+    )
+    embedding_bulk_duty: float = field(
+        default=0.2,
+        metadata=_meta(
+            "Embedding Duty Cycle (bulk)",
+            "Fraction of wall time a background embedding sweep targets for computing. "
+            "At the default 0.2 it idles four times as long as it works, so a sweep "
+            "over a freshly imported memory costs about a fifth of one core instead of "
+            "several — the same total work, spread thin enough that fans never react. "
+            "The sweep resumes across restarts, so it need not finish in one session. "
+            "A target rather than a ceiling: one unusually slow row is capped at a "
+            "30-second pause and so runs hotter than the configured share. 1.0 runs "
+            "flat out. Clamped to [0.05, 1.0]; a sweep a user explicitly starts from "
+            "Settings is never paced.",
+        ),
+    )
     embed_model_url: str = field(
         default="",
         metadata=_meta(
@@ -2715,7 +2940,20 @@ class SlackConfig:
         default_factory=set,
         metadata=_meta(
             "Trusted Bot IDs",
-            "Bot IDs allowed to bypass the bot filter for multi-node mesh communication.",
+            "Bot IDs allowed to bypass the bot filter for multi-node mesh communication. "
+            "The gateway's own bot ID is never trusted, even if listed "
+            "(it would reply to itself in a loop).",
+            tags=["slack"],
+        ),
+    )
+    trusted_bot_turn_limit: int = field(
+        default=5,
+        metadata=_meta(
+            "Trusted Bot Turn Limit",
+            "Maximum consecutive turns a thread may run on trusted-bot messages "
+            "before a human message is required (loop guard for mutually trusted "
+            "gateways). A message from an allowed human resets the count. "
+            "Minimum 1; values below 1 are treated as 1.",
             tags=["slack"],
         ),
     )
@@ -2862,8 +3100,8 @@ class TailscaleConfig:
             "Explicit opt-in, never inferred, and requires a non-empty "
             "allowed_logins — enabling it with an empty allowlist is refused at "
             "load. Every failure to verify a peer falls back to the ordinary "
-            "token path. POSIX only. Takes effect on the next gateway "
-            "start (the trust settings are read once at startup).",
+            "token path. Takes effect on the next gateway start (the trust "
+            "settings are read once at startup).",
         ),
     )
     allowed_logins: list[str] = field(
@@ -2902,7 +3140,65 @@ class TailscaleConfig:
     )
 
 
-def _tailscale_config_from(raw: object) -> TailscaleConfig:
+#: ``degraded_sections`` key for "the operator wrote a tailnet identity policy
+#: this load could not read". Its own key rather than reusing ``"dashboard"``
+#: so the tailnet gate denies on exactly the narrowing it enforces, and an
+#: unrelated malformed ``dashboard`` value does not.
+DEGRADED_TAILSCALE = "dashboard.tailscale"
+
+
+def tailnet_identity_unknown(sections: frozenset[str]) -> bool:
+    """Whether *sections* means the tailnet login allowlist could not be read.
+
+    Three shapes lose it, at three depths: an unreadable config FILE, an
+    unreadable ``dashboard`` section, and an unreadable ``dashboard.tailscale``
+    value. All three resolve ``allowed_logins`` to the empty list, which the
+    loader turns into ``trust_identity = False`` — i.e. no login restriction —
+    so the gate has to treat them alike.
+
+    Lives here, beside the keys it names, because BOTH server startup surfaces
+    ask it. Asking twice in two places is how the tailnet feature shipped a
+    drift bug before (see ``governed_tailnet_trust``).
+    """
+    return bool(sections & {DEGRADED_WHOLE_CONFIG, "dashboard", DEGRADED_TAILSCALE})
+
+
+def tailnet_effective_allowed_logins(
+    sections: frozenset[str], allowed_logins: list[str] | tuple[str, ...]
+) -> tuple[str, ...]:
+    """The parsed allowlist reduced to what is safe to ENFORCE from *sections*.
+
+    Degradation comes in two severities and only one of them invalidates the
+    value that was parsed:
+
+    * A whole config FILE could not be read (:data:`DEGRADED_WHOLE_CONFIG`).
+      ``config.local.json`` is deep-merged OVER ``config.json``, and an overlay
+      may exist precisely to NARROW the base -- so a lost overlay leaves the
+      base's wider list standing and every login the operator removed is
+      admitted again. The parsed list is not the effective policy, it is a
+      stale one, so nothing may be enforced from it: the allowlist is empty and
+      every peer is denied, matching how the publish gate treats an unreadable
+      file.
+    * A section or field inside a file that WAS read (``dashboard``,
+      :data:`DEGRADED_TAILSCALE`). Whatever parsed is literally what the
+      operator wrote in a file this load could see, so it is kept: access
+      narrows to the entries that survived, and the administrator whose own
+      login parsed fine is not locked out mid-repair.
+
+    Both cases still enforce -- see :func:`tailnet_identity_unknown`. This
+    decides only WHOSE logins may satisfy that enforcement.
+    """
+    if DEGRADED_WHOLE_CONFIG in sections:
+        return ()
+    return tuple(allowed_logins)
+
+
+def _tailscale_config_from(
+    raw: object,
+    degraded: set[str] | None = None,
+    *,
+    key_present: bool = False,
+) -> TailscaleConfig:
     """Build the validated :class:`TailscaleConfig` (RFC §3/§3.1 load rules).
 
     Two rules, both narrowing-only so a typo can never widen access:
@@ -2913,11 +3209,126 @@ def _tailscale_config_from(raw: object) -> TailscaleConfig:
       shared corporate tailnet would hand the dashboard to all of them.
     * An unrecognised ``pin_scope`` falls back to ``"node"`` (the narrower
       scope) with a logged warning — never to ``"login"``.
+
+    Both rules resolve to a *narrower* value, which is right for an operator
+    typo and wrong for a value that was LOST: ``allowed_logins`` is the only
+    restriction on which tailnet peer may authenticate, so losing it resolves
+    to "identity trust off", i.e. no login restriction at all. Absent is
+    genuinely unconfigured; MALFORMED is the operator having asked for a
+    restriction this load cannot read, and it is recorded in *degraded* under
+    :data:`DEGRADED_TAILSCALE` so the gate can deny instead of admitting every
+    tailnet peer (the shape that reopened the publish allowlist, #4057).
+
+    ``key_present`` separates the two states a bare value cannot: a MISSING
+    ``tailscale`` key and one written as JSON ``null`` both arrive here as
+    ``None``. Only the second is the operator having written something, so only
+    it degrades -- reading ``None`` alone as malformed would deny every install
+    that simply has no tailscale section. Callers that do not know pass nothing
+    and get the absent reading, which is what the direct-value tests rely on.
     """
+    if (key_present and raw is None) or (raw is not None and not isinstance(raw, dict)):
+        # Reached only because "dashboard.tailscale" is a fail-closed path in
+        # config/validation.py; without that entry the malformed value is
+        # repaired to the default before this runs and there is nothing to see.
+        # An explicit null counts: the operator had to write the key to produce
+        # it, which is the absent-versus-malformed line this whole fix turns on.
+        if degraded is not None:
+            degraded.add(DEGRADED_TAILSCALE)
+        _OBSERVED_DEGRADED_SECTIONS.add(DEGRADED_TAILSCALE)
+        logger.warning(
+            "config: 'dashboard.tailscale' is not a JSON object (got %s) — the "
+            "tailnet login allowlist is unknown, so tailnet peers are DENIED "
+            "until the file is fixed and the gateway restarted",
+            type(raw).__name__,
+        )
     data = _safe_dict(raw)
     enabled = _safe_bool(data.get("enabled"), False)
     trust_identity = _safe_bool(data.get("trust_identity"), False)
+    if "trust_identity" in data and not isinstance(data.get("trust_identity"), bool):
+        # The same class as the allowlist itself, one field over, and the field
+        # is the restriction's own ON switch -- so it is the most permissive
+        # default in the section. ``_safe_bool`` returns the default for
+        # anything non-boolean, and that default is False, so `"true"` (a
+        # quoted boolean, the commonest hand-edit slip) or `1` reads as "the
+        # operator never asked for identity trust" and the perfectly valid
+        # allowlist beside it stops being enforced.
+        #
+        # Recording it enforces the allowlist AS WRITTEN rather than denying
+        # everyone: the entries parsed from a readable file are kept, so the
+        # operator's own login still works and every peer they did not name is
+        # refused. That is the closest honest reading of a config whose intent
+        # to enable was garbled but whose list of who to admit was not.
+        if degraded is not None:
+            degraded.add(DEGRADED_TAILSCALE)
+        _OBSERVED_DEGRADED_SECTIONS.add(DEGRADED_TAILSCALE)
+        logger.warning(
+            "config: 'dashboard.tailscale.trust_identity' is not a boolean (got "
+            "%s) — it is the switch for the tailnet login allowlist, so the "
+            "allowlist is enforced as written and every peer it does not name "
+            "is DENIED until the file is fixed and the gateway restarted",
+            type(data.get("trust_identity")).__name__,
+        )
     raw_logins = data.get("allowed_logins")
+    # The allowlist is only ever CONSULTED when identity trust is on, so a
+    # malformed value in it loses nothing when the operator cleanly said off (or
+    # never said on). Recording a degradation there would turn a typo in an
+    # inert field into a forwarded-tailnet lockout, against a config that -- read
+    # correctly -- permits those peers. A malformed FLAG is different: intent is
+    # unknown, so the allowlist has to be treated as live.
+    #
+    # Presence is tested with ``in`` rather than ``is not None`` throughout: a
+    # key written as JSON null is the operator having written something
+    # unusable, not having left it out, and only the second is consent.
+    _allowlist_is_live = trust_identity or (
+        "trust_identity" in data and not isinstance(data.get("trust_identity"), bool)
+    )
+    if _allowlist_is_live and "allowed_logins" in data and not isinstance(raw_logins, list):
+        # Same class one level down, and reachable WITHOUT a registry entry:
+        # a three-segment path is past _apply_field_default's depth cap, so the
+        # malformed value survives validation already. Recorded rather than
+        # merely logged, because the log line below only fires when
+        # trust_identity happens to be readable AND true — a config whose
+        # trust_identity was lost in the same edit would say nothing at all.
+        if degraded is not None:
+            degraded.add(DEGRADED_TAILSCALE)
+        _OBSERVED_DEGRADED_SECTIONS.add(DEGRADED_TAILSCALE)
+        logger.warning(
+            "config: 'dashboard.tailscale.allowed_logins' is not a list (got "
+            "%s) — the tailnet login allowlist is unknown, so tailnet peers "
+            "are DENIED until the file is fixed and the gateway restarted",
+            type(raw_logins).__name__,
+        )
+    elif (
+        _allowlist_is_live
+        and isinstance(raw_logins, list)
+        and any(not (isinstance(entry, str) and entry.strip()) for entry in raw_logins)
+    ):
+        # A LIST whose entries are not usable logins, e.g. [1] or ["a@b", None].
+        # The comprehension below silently drops them, so an all-invalid
+        # narrowing parses to [] — indistinguishable from "no restriction
+        # configured", which is the exact silent widening this fix exists to
+        # stop, and the same entry-level shape publish.allowed_destinations
+        # already handles. An EMPTY list is NOT this case: that is a readable,
+        # if mistaken, statement, and the trust_identity rule below already
+        # refuses it with its own error.
+        #
+        # Unlike publish, the surviving entries are KEPT rather than zeroed.
+        # The publish gate denies one whole action, so a partial allowlist
+        # there has nowhere safe to land; this gate decides per peer, so
+        # keeping the parseable logins narrows access to exactly what the
+        # operator demonstrably wrote, while the degradation record still
+        # denies every peer they did not name. Zeroing would instead lock out
+        # the administrator whose own login parsed fine — a self-inflicted
+        # outage in the middle of a config repair.
+        if degraded is not None:
+            degraded.add(DEGRADED_TAILSCALE)
+        _OBSERVED_DEGRADED_SECTIONS.add(DEGRADED_TAILSCALE)
+        logger.warning(
+            "config: 'dashboard.tailscale.allowed_logins' carries entr(y/ies) "
+            "that are not non-empty strings — the tailnet login allowlist is "
+            "not what was written, so any peer it does not name is DENIED "
+            "until the file is fixed and the gateway restarted",
+        )
     allowed_logins = [
         entry.strip()
         for entry in (raw_logins if isinstance(raw_logins, list) else [])
@@ -2974,6 +3385,33 @@ class JiraAuthEntry:
     )
 
 
+# dashboard.loop_stall_exit_after_secs -- event-loop silence tolerated before
+# the gateway dumps all thread stacks and hard-exits. ``None`` is the
+# serializable "automatic" sentinel: launch class selects the desktop or
+# managed-service default without an unrelated config save pinning either one.
+LOOP_STALL_EXIT_AFTER_MIN = 10
+LOOP_STALL_EXIT_AFTER_MAX = 300
+LOOP_STALL_EXIT_AFTER_DEFAULT = 25
+LOOP_STALL_EXIT_AFTER_MANAGED_DEFAULT = 90
+_MANAGED_SERVICE_ENV = "KIROCREW_SERVICE_MANAGED"
+
+# dashboard.chat_entry_cache_max_entries / chat_entry_cache_max_bytes -- bounds
+# on the persisted-message entry memo in ``dashboard/chat_persistence.py``. The
+# right entry count is host-dependent: the cache's working set is roughly
+# ``active_slots x window_size``, so a gateway with many concurrent chat slots
+# overflows the entry bound while the byte bound still has headroom, and the LRU
+# then evicts each slot's window just before its next save (a zero-hit cliff,
+# every save re-paying redaction plus key derivation). The defaults match the
+# previous hardcoded values; raising the entry bound on a many-slot host is the
+# operator's call, with the byte ceiling still bounding memory.
+CHAT_ENTRY_CACHE_ENTRIES_MIN = 256
+CHAT_ENTRY_CACHE_ENTRIES_MAX = 262144
+CHAT_ENTRY_CACHE_ENTRIES_DEFAULT = 4096
+CHAT_ENTRY_CACHE_BYTES_MIN = 4 * 1024 * 1024
+CHAT_ENTRY_CACHE_BYTES_MAX = 512 * 1024 * 1024
+CHAT_ENTRY_CACHE_BYTES_DEFAULT = 32 * 1024 * 1024
+
+
 @dataclass
 class DashboardConfig:
     url: str = field(
@@ -3011,6 +3449,30 @@ class DashboardConfig:
             "whether or not the gateway is still running. Either way `kirocrew "
             "logout` ends the session immediately, and the session stays pinned "
             "to the peer it was established from.",
+        ),
+    )
+    qr_session_persist_across_restart: bool = field(
+        default=False,
+        metadata=_meta(
+            "Phone Sign-In Survives A Gateway Restart",
+            'REQUIRES BOTH: "Phone Sign-In Lasts Until Restart" must also be ON, '
+            "and tailnet identity trust must be configured "
+            "(`dashboard.tailscale.trust_identity` with a non-empty "
+            "`allowed_logins`). Without either one this setting is ignored and a "
+            "warning naming the missing prerequisite is logged. Note the first "
+            'requirement is NOT a contradiction: "Lasts Until Restart" is what '
+            "issues the renewable credential, and this setting then removes the "
+            "restart bound from it -- turning that one OFF instead leaves a "
+            "session that expires on a fixed clock, with nothing to renew. "
+            "What it does: let a scanned phone stay signed in across gateway "
+            "restarts, so one scan lasts until the refresh credential's own "
+            "30-day lifetime lapses. OFF by default because a restart is "
+            "otherwise a hard sign-out that needs no recorded state. The "
+            "identity requirement is not optional bookkeeping: behind "
+            "`tailscale serve` every request reaches the gateway from 127.0.0.1, "
+            "so without a daemon-verified peer identity the session is a bearer "
+            "credential any tailnet peer could replay, and outliving the process "
+            "is exactly what makes that matter.",
         ),
     )
     restore_window_minutes: int = field(
@@ -3058,18 +3520,45 @@ class DashboardConfig:
             "Seconds to wait for MCP server handshake during probe (5-120).",
         ),
     )
-    loop_stall_exit_after_secs: int = field(
-        default=25,
+    loop_stall_exit_after_secs: int | None = field(
+        default=None,
         metadata=_meta(
             "Loop-stall Hard-exit Budget (secs)",
             "Seconds the gateway's event loop may go silent before it dumps all "
-            "thread stacks and exits so systemd can restart it. Raise it on a "
-            "host that does heavy subprocess work (long builds, test suites, "
-            "many child reaps), which can wedge the loop briefly without being "
-            "genuinely dead. Clamped to 10s..300s. Note the desktop app's "
+            "thread stacks and exits. Leave unset for the automatic default: "
+            "25 seconds for desktop/foreground launches and 90 seconds for a "
+            "managed systemd/launchd service. An explicit value overrides both. "
+            "Raise it on a host that does heavy subprocess work (long builds, "
+            "test suites, many child reaps), which can wedge the loop briefly "
+            "without being genuinely dead. Clamped to 10s..300s. The desktop app's "
             "liveness probe kills at roughly 20s independently, so a value "
             "above that only takes effect for a headless gateway — the desktop "
             "probe wins first and the stack dump is lost.",
+        ),
+    )
+    chat_entry_cache_max_entries: int = field(
+        default=CHAT_ENTRY_CACHE_ENTRIES_DEFAULT,
+        metadata=_meta(
+            "Chat Entry Cache Max Entries",
+            "Maximum number of persisted-message entries the chat save path "
+            "memoises. The cache's working set is roughly the number of active "
+            "chat slots times their window size, so the right bound is "
+            "host-dependent: a gateway with many concurrent slots overflows "
+            "this bound while the byte ceiling still has headroom, and the "
+            "cache hit rate collapses to zero (every save re-pays redaction). "
+            "Raise it on a many-slot host. Clamped to 256..262144. Read once "
+            "at first use; a change takes effect on the next gateway restart.",
+        ),
+    )
+    chat_entry_cache_max_bytes: int = field(
+        default=CHAT_ENTRY_CACHE_BYTES_DEFAULT,
+        metadata=_meta(
+            "Chat Entry Cache Max Bytes",
+            "Memory ceiling in bytes for the chat save path's persisted-message "
+            "entry memo. Evicted alongside the entry-count bound; raise it "
+            "together with the entry bound when a many-slot host needs a "
+            "larger cache. Clamped to 4 MiB..512 MiB. Read once at first use; "
+            "a change takes effect on the next gateway restart.",
         ),
     )
     cautious_boot: bool = field(
@@ -3102,6 +3591,20 @@ class DashboardConfig:
             "(desktop app only). When off, the agent browses via playwright-cli.",
         ),
     )
+    browser_view_port: int = field(
+        default=0,
+        metadata=_meta(
+            "Browser Live-View Port",
+            "Pin the browser live-view server (playwright-cli show) to this "
+            "loopback port. 0 (the default) picks a fresh OS-assigned ephemeral "
+            "port on every start. Set a fixed port when the dashboard is viewed "
+            "remotely through an SSH tunnel that forwards a fixed set of ports, "
+            "so the Browser panel can always reach the view. The server binds "
+            "loopback-only either way. A value outside 1-65535 is treated as "
+            "unset. A changed pin applies the next time the view server "
+            "(re)starts; an already-running server keeps its current port.",
+        ),
+    )
     verbosity: str = field(
         default="default",
         metadata=_meta(
@@ -3117,9 +3620,9 @@ class DashboardConfig:
             "consequential enough (security, exposure, data loss, spend, "
             "anything hard to undo) that they cannot choose correctly without "
             "the reasoning, or as the undo path that rides along with a "
-            "destructive command. Every level preserves full detail "
-            "for security warnings, irreversible-action confirmations, and "
-            "ordered multi-step instructions.",
+            "destructive command. At every level security warnings and "
+            "irreversible-action confirmations always appear but stay brief, "
+            "and ordered multi-step instructions stay complete.",
             enum=["default", "concise", "ultra", "answer_only"],
         ),
     )
@@ -3210,6 +3713,22 @@ class DashboardConfig:
             "Expand the chat's right side panel to its Git tab each time a session "
             "starts in a project directory that is a git repository. The Git tab "
             "itself is always created either way, so it is one click away.",
+        ),
+    )
+    # Default TRUE: the chip strip shipped unconditionally before this switch
+    # existed, so a config that never mentions the key must render exactly what
+    # it rendered before.
+    session_card_source_links: bool = field(
+        default=True,
+        metadata=_meta(
+            "PR and issue chips on session cards",
+            "Show a chip on a session's sidebar card for each pull request, merge "
+            "request and issue mentioned anywhere in that session's transcript. "
+            "Turning this off reclaims a row per card on the densest surface in "
+            "the app, keeps numbers from unrelated work off screen while sharing "
+            "it, and stops the periodic credentialed provider calls that keep "
+            "those chips' CI and merge status fresh. The in-session Resources and "
+            "Changes panels are unaffected.",
         ),
     )
     terminal: dict = field(
@@ -3520,6 +4039,18 @@ class KiroCrewAgentConfig:
             "Per-agent override for watchdog.tool_stall_hard_cap_secs on sessions "
             "running this agent. 0 inherits the global cap (default 1h). Applies "
             "ONLY to UNKNOWN verdicts — a WORKING session is never acted on.",
+        ),
+    )
+    session_color: str = field(
+        default="",
+        metadata=_meta(
+            "Session Color",
+            "Default session color for sessions created by this agent. Accepts "
+            "a CSS hex color string (#rrggbb, lowercase). Applied at render time "
+            "to any session this agent started that has no color of its own, so "
+            "editing it re-tints those sessions live. A color set on the session "
+            "itself (a manual pick or the dashboard default-color policy) always "
+            "takes precedence. Empty means no agent color.",
         ),
     )
     telegram_account: str = field(
@@ -4114,15 +4645,63 @@ _DEFAULT_CHAT_TURN_TIMEOUT_SECS = int(
 # flush against the ceiling satisfies neither.
 APPROVAL_TURN_MARGIN_SECS = 60
 
-# dashboard.loop_stall_exit_after_secs — event-loop silence tolerated before the
-# gateway dumps all thread stacks and hard-exits for systemd to restart. The
-# floor keeps a stall from being declared faster than ordinary GC/IO pauses; the
-# ceiling keeps a wedged gateway from sitting unrecoverable for minutes. Above
-# ~20s the desktop app's own liveness probe kills first and the dump is lost,
-# which is a documented trade-off rather than a bound (a headless gateway has no
-# such probe), so it is not enforced here.
-LOOP_STALL_EXIT_AFTER_MIN = 10
-LOOP_STALL_EXIT_AFTER_MAX = 300
+
+def resolve_loop_stall_exit_after(
+    dashboard_data: Mapping[str, object] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    """Resolve the launch-class default while preserving explicit config.
+
+    The distinction between an absent key and an explicit value exists only at
+    config load. Managed services widen the absent-key default; every explicit
+    operator value, including 25 seconds, is retained.
+    """
+    data = dashboard_data or {}
+    if data.get("loop_stall_exit_after_secs") is not None:
+        return _safe_int(
+            data.get("loop_stall_exit_after_secs"),
+            LOOP_STALL_EXIT_AFTER_DEFAULT,
+            LOOP_STALL_EXIT_AFTER_MIN,
+            LOOP_STALL_EXIT_AFTER_MAX,
+        )
+    source = os.environ if environ is None else environ
+    # The generated service definition is the sole launch-class authority.
+    # Inferring from systemd metadata is ambiguous because descendants inherit
+    # INVOCATION_ID; old definitions are reported by ``kirocrew doctor`` with
+    # the one-time regeneration command instead.
+    managed = source.get(_MANAGED_SERVICE_ENV) == "1"
+    return LOOP_STALL_EXIT_AFTER_MANAGED_DEFAULT if managed else LOOP_STALL_EXIT_AFTER_DEFAULT
+
+
+def consume_managed_service_launch_environment(
+    environ: MutableMapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Remove and return the one-shot managed-service launch marker.
+
+    The generated service definition sets this marker for the gateway itself.
+    Consuming it before the dashboard starts app backends or child terminals
+    prevents those descendants from being misclassified as managed services.
+    """
+    source = os.environ if environ is None else environ
+    value = source.pop(_MANAGED_SERVICE_ENV, None)
+    return {} if value is None else {_MANAGED_SERVICE_ENV: value}
+
+
+def load_loop_stall_exit_after(
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    """Load the effective watchdog budget through the canonical config loader.
+
+    The dataclass keeps an absent/null value as ``None`` rather than
+    materializing a launch-specific number, so an unrelated ``save()`` cannot
+    turn the managed 90-second default into an explicit desktop 25 seconds (or
+    leak 90 seconds into a later desktop launch). The normal validated,
+    overlay-aware loader remains the single config reader.
+    """
+    configured = KiroCrewConfig.load().dashboard.loop_stall_exit_after_secs
+    dashboard_data = {} if configured is None else {"loop_stall_exit_after_secs": configured}
+    return resolve_loop_stall_exit_after(dashboard_data, environ)
+
 
 # agent.max_subagents fixed-pin floor. 0 is the "auto-size" sentinel; any other
 # (explicit) value must be >= this floor. A pin of 1 or 2 would silently DISABLE
@@ -4145,6 +4724,53 @@ MAX_SUBAGENTS_FIXED_FLOOR = 3
 # read instead.
 AUTOCOMPACT_PCT_MIN = 5.0
 AUTOCOMPACT_PCT_MAX = 90.0
+
+# ── Load/write bound parity ────────────────────────────────────────────────────
+# Ranges for bounded numeric fields whose LOAD path previously applied no bounds
+# at all, while `_EDITABLE_CONFIG` rejected the same values at write time. A
+# hand-edited config.json goes nowhere near the dashboard API, so every one of
+# these loaded verbatim -- the same asymmetry #4688 and #4734 closed for the
+# security-relevant knobs.
+#
+# Defined HERE and imported by `_EDITABLE_CONFIG` rather than spelled twice, so
+# the write gate and the load clamp cannot drift. Three fields already clamped on
+# load but duplicated their literals across the two files; those now read from
+# these names too, which is the "two-literal drift" half of the same problem.
+#
+# Bounds are the ones the write path already declared. This change does not
+# re-litigate any range; it makes the load path honour what the API promised.
+COMPLETION_KEEP_CHARS_MIN = 0
+# Mirrors ``context_management.RESULT_FILE_MAX_BYTES`` (500 KB) rather than importing
+# it: ``context_management`` does ``from kiro_crew.config.loader import config_dir``, so
+# importing it here is a genuine circular import, not a style preference. The value is
+# therefore spelled in both places and pinned equal by
+# ``test_the_completion_keep_ceiling_matches_its_owner`` -- a test can import both
+# without the cycle, which is the only place the two spellings can be held together.
+COMPLETION_KEEP_CHARS_MAX = 512_000
+MCP_PROBE_TIMEOUT_MIN = 5
+MCP_PROBE_TIMEOUT_MAX = 120
+RECENT_TINT_COUNT_MIN = 0
+RECENT_TINT_COUNT_MAX = 10
+SESSION_TIMEOUT_MIN = 0
+SESSION_TIMEOUT_MAX = 86400
+POOL_TTL_SECS_MIN = 0
+POOL_TTL_SECS_MAX = 7200
+SOFT_STOP_BUDGET_MIN = 0.5
+SOFT_STOP_BUDGET_MAX = 60.0
+EXTRACTION_POOL_SIZE_MIN = 1
+EXTRACTION_POOL_SIZE_MAX = 10
+# knowledge.* budgets. These share a floor of 0, but 0 is MEANINGFUL for several
+# of them (a zero budget disables that sweep), so the floor is deliberately not
+# enforced by clamping a negative up to 0 -- see `_safe_nonnegative_int`, which
+# keeps returning the default for a negative value. Only the missing CEILING is
+# added here, which is where the actual exposure was: an absurd hand-edited
+# budget was loaded verbatim and became real work.
+AUTO_INGEST_CHUNK_BUDGET_MAX = 10000
+FOLDER_INGEST_CHUNK_BUDGET_MAX = 10000
+DEDUP_EVERY_N_SWEEPS_MAX = 288
+SWEEP_CHUNK_BUDGET_MAX = 50000
+KNOWLEDGE_MAX_SOURCES_MAX = 1000
+EMBED_RATE_LIMIT_MAX = 10000
 
 # (section, key, min, max) for each bounded field clamped at load time. The
 # mins match the runtime floors: subagent_auto_max has a floor of 3
@@ -4175,6 +4801,18 @@ _SECURITY_BOUNDED_FIELDS: tuple[tuple[str, str, int, int], ...] = (
         "loop_stall_exit_after_secs",
         LOOP_STALL_EXIT_AFTER_MIN,
         LOOP_STALL_EXIT_AFTER_MAX,
+    ),
+    (
+        "dashboard",
+        "chat_entry_cache_max_entries",
+        CHAT_ENTRY_CACHE_ENTRIES_MIN,
+        CHAT_ENTRY_CACHE_ENTRIES_MAX,
+    ),
+    (
+        "dashboard",
+        "chat_entry_cache_max_bytes",
+        CHAT_ENTRY_CACHE_BYTES_MIN,
+        CHAT_ENTRY_CACHE_BYTES_MAX,
     ),
     ("session", "pool_size", 0, POOL_SIZE_MAX),
 )
@@ -4363,15 +5001,19 @@ def _config_fingerprint() -> tuple:
     return tuple(sig)
 
 
-def _cached_validated_data() -> dict | None:
+def _cached_validated_data(fp: tuple | None = None) -> dict | None:
     """Return a deep copy of the cached validated config dict, or None on miss.
 
-    Thin wrapper over the :class:`~kiro_crew.config.validation.ConfigCache`:
-    the fingerprint is computed here (``_config_fingerprint`` stays in this
-    module because it reads ``config_path()``/``config_local_path()``, which the
-    test suite patches as ``kiro_crew.config.loader.config_path``).
+    Thin wrapper over the :class:`~kiro_crew.config.validation.ConfigCache`.
+    ``_config_fingerprint`` stays in this module because it reads
+    ``config_path()``/``config_local_path()``, which the test suite patches as
+    ``kiro_crew.config.loader.config_path``.
+
+    Pass *fp* when the caller has already computed the fingerprint, so one load
+    costs a single stat pass instead of one per consumer of it. Omitting it
+    stats, which suits a caller that has no fingerprint in hand.
     """
-    return _CONFIG_CACHE.get(_config_fingerprint())
+    return _CONFIG_CACHE.get(fp if fp is not None else _config_fingerprint())
 
 
 def _store_validated_data(data: dict, fp: tuple) -> None:
@@ -4431,16 +5073,94 @@ class ChannelConfig:
         )
 
 
-_VALID_STT_PROVIDERS = ("whisper", "mlx", "apple", "parakeet", "transcribe")
+#: The provider an unusable ``stt.provider`` degrades to, and the default. It is
+#: the only one with no precondition: recognition runs in this process on every
+#: supported OS, with no account, no platform floor, and no separate install.
+STT_PROVIDER_LOCAL = "local"
+
+#: Batch recogniser owned by the operator's service environment. Unlike the
+#: bundled local recogniser, it does not expose a model catalogue or a streaming
+#: protocol to the dashboard.
+STT_PROVIDER_BRIDGE = "bridge"
+
+#: The recognisers a user can select. ``local`` runs whisper.cpp in-process,
+#: ``apple`` uses macOS 26+ on-device recognition, and ``transcribe`` sends audio
+#: to AWS Transcribe (billed, and gated on the AWS consent prompt). All three
+#: produce partial results, so streaming is not a per-provider capability.
+_VALID_STT_PROVIDERS = (STT_PROVIDER_LOCAL, STT_PROVIDER_BRIDGE, "apple", "transcribe")
+
+#: Providers a stored config may still name. Each of these needed an out-of-band
+#: install the user had to perform themselves (a whisper CLI on ``PATH``, or an
+#: ``mlx``/``faster-whisper`` wheel), which is precisely the cost the resident
+#: local engine removes, so a stored value degrades to ``local`` instead of
+#: leaving voice input pointing at something that is no longer dispatchable.
+_RETIRED_STT_PROVIDERS = ("whisper", "mlx", "parakeet", "faster")
+
+#: Model names accepted for ``stt.model``, derived from the catalog that owns the
+#: download and its sha256 pin rather than restated here. Restating it is how the
+#: advertised menu comes to offer a model that cannot be fetched.
+_VALID_STT_MODELS = tuple(m.name for m in _STT_CATALOG)
+
+
 _VALID_CHANNEL_PREFIXES = ("C", "D", "G")
 
 
-def _validated_stt_provider(value: str) -> str:
-    """Return *value* if recognised, else warn and default to whisper."""
+# Provider values already warned about in this process. The gateway loads config
+# repeatedly, so an unusable stored provider is per-install information, not
+# per-load: without this the retirement notice repeats several times a second for
+# the whole session, which is how it was reported. Keyed on ``repr`` rather than
+# the value itself because this arrives from ``config.json`` and may be
+# unhashable (a list or dict), which must not raise on the degrade path. Exposed
+# for tests to reset.
+_WARNED_STT_PROVIDERS: set[str] = set()
+
+
+def _validated_stt_provider(value: object) -> str:
+    """Return *value* if it is selectable, else degrade to ``local`` with a reason.
+
+    Degrades and logs; never raises. This value arrives from ``config.json``, so
+    an unusable one must leave voice input working the way
+    :func:`_normalize_acp_backend` degrades an unusable persisted backend, rather
+    than failing the load that read it.
+    """
     if value in _VALID_STT_PROVIDERS:
-        return value
-    logger.warning("Unknown STT provider '%s', falling back to whisper", value)
-    return "whisper"
+        return str(value)
+    seen = repr(value)
+    if seen in _WARNED_STT_PROVIDERS:
+        return STT_PROVIDER_LOCAL
+    _WARNED_STT_PROVIDERS.add(seen)
+    if value in _RETIRED_STT_PROVIDERS:
+        logger.warning(
+            "STT provider %r is retired; using %r instead. It needed a separate "
+            "out-of-band install, which the bundled local engine removes while "
+            "recognising the same speech.",
+            value,
+            STT_PROVIDER_LOCAL,
+        )
+    else:
+        logger.warning(
+            "Unknown STT provider %r; using %r instead. Selectable providers: %s",
+            value,
+            STT_PROVIDER_LOCAL,
+            ", ".join(_VALID_STT_PROVIDERS),
+        )
+    return STT_PROVIDER_LOCAL
+
+
+def _validated_stt_model(value: object) -> str:
+    """Return the catalog name *value* selects, falling back to the default.
+
+    Canonicalized here rather than passed through, so every consumer sees a name
+    that names a real catalog entry: the model becomes a filename under the
+    models directory, and an arbitrary string must not reach a path. ``resolve``
+    also maps the names older configuration used onto their current entries, so a
+    stored ``turbo`` keeps the model it asked for instead of silently moving to
+    the default.
+    """
+    if not isinstance(value, str) or not value:
+        logger.warning("Non-string STT model %r; using %r", value, _STT_DEFAULT_MODEL)
+        return _STT_DEFAULT_MODEL
+    return _resolve_stt_model(value).name
 
 
 _VALID_COMPLETION_KEEP = ("head", "tail", "both")
@@ -4540,38 +5260,18 @@ def _normalize_jail(value: object) -> str:
 
 
 def _normalize_acp_backend(value: object) -> str:
-    """Coerce a persisted ``agent.acp_backend`` to a selectable backend.
+    """Coerce a persisted ``agent.acp_backend`` to a backend this build can serve.
 
-    Anything not selectable — an unknown value, or a backend the code understands
-    but cannot yet serve a session with — normalizes to the default (kiro-cli)
-    with a warning rather than propagating: ``AcpProvider`` rejects an unknown
-    backend by raising, and a value that is merely incomplete would instead fail
-    on the operator's first message. Both must degrade to the working default at
-    startup, with the reason in the log.
+    Delegates to :func:`kiro_crew.acp_backends.resolve_selected_backend`, which owns
+    the selectable registry, so the load path, the dashboard PATCH allowlist and the
+    schema endpoint cannot disagree about which harnesses exist.
 
-    The import is deferred because it cannot be done at module scope: reaching
-    ``kiro_crew.acp.types`` executes the ``kiro_crew.acp`` package init, which
-    imports the ACP client and runtime, which import this module — and this
-    module is imported first by the gateway and desktop entrypoints.
+    The import is at module scope rather than deferred: ``acp_backends`` is a leaf
+    that imports nothing from ``kiro_crew.acp``, so it does not reproduce the
+    package-init cycle (``kiro_crew.acp.__init__`` -> client + runtime -> this
+    module) that the old local import of ``acp.types`` existed to dodge.
     """
-    from kiro_crew.acp.types import (
-        ACP_BACKEND_KIRO,
-        ACP_BACKENDS_KNOWN,
-        ACP_BACKENDS_SELECTABLE,
-    )
-
-    if isinstance(value, str) and value in ACP_BACKENDS_SELECTABLE:
-        return value
-    if value not in (None, ""):
-        known_but_unusable = isinstance(value, str) and value in ACP_BACKENDS_KNOWN
-        logger.warning(
-            "Ignoring agent.acp_backend %r (%s); using the default backend. "
-            "Selectable values: %s",
-            value,
-            "not usable yet" if known_but_unusable else "unknown",
-            ", ".join(repr(b) for b in sorted(ACP_BACKENDS_SELECTABLE)),
-        )
-    return ACP_BACKEND_KIRO
+    return resolve_selected_backend(value)
 
 
 def _validate_activation(value: str) -> str:
@@ -4729,44 +5429,125 @@ class ResolvedBindings:
     # mismatch. An alias key round-trips to itself.
     resolved_alias: str = ""
 
+    def same_dispatch_binding(self, other: "ResolvedBindings") -> bool:
+        """Whether two resolutions name the SAME dispatch target.
+
+        Owned here, next to the field set, so a future dispatch-relevant
+        binding field forces the identity question at the layer that defines
+        it rather than silently widening a permission check that enumerated
+        fields by hand (the dashboard's slot agent-conflict guard uses this to
+        decide whether two different NAMES may share a slot). Compares every
+        field that changes what answers a turn — the kiro agent, workspace,
+        memory store, and model — and deliberately not ``resolved_alias``
+        (two names resolving to one alias's target ARE the same binding) or
+        ``requested_resolved``/``effective_memory_config`` (the former is
+        request metadata the caller checks separately; the latter is derived
+        from ``memory_store_name`` plus global config shared by both sides).
+        """
+        return (
+            self.kiro_agent == other.kiro_agent
+            and self.workspace_dir == other.workspace_dir
+            and self.memory_store_name == other.memory_store_name
+            and self.model == other.model
+        )
+
 
 @dataclass
 class SttConfig:
-    """Speech-to-text configuration (opt-in, disabled by default)."""
+    """Speech-to-text configuration.
+
+    Enabled by default. Recognition runs on this machine through the bundled
+    engine, so having voice input available costs one model download the first
+    time it is used and nothing after that.
+    """
 
     enabled: bool = field(
         default=True,
-        metadata=_meta("Enabled", "Enable voice memo transcription."),
+        metadata=_meta("Enabled", "Turn spoken input into text you can send."),
     )
     provider: str = field(
-        default="whisper",
-        metadata=_meta("Provider", "STT provider.", enum=list(_VALID_STT_PROVIDERS)),
-    )
-    whisper_path: str = field(
-        default="",
-        metadata=_meta("Whisper Path", "Path to whisper binary (auto-detected if empty)."),
+        default=STT_PROVIDER_LOCAL,
+        metadata=_meta(
+            "Provider",
+            "Where speech is recognised. `local` runs on this machine and needs no "
+            "account (it downloads one model the first time you dictate), `bridge` "
+            "uses an operator-configured batch recogniser, `apple` uses the on-device "
+            "recogniser built into macOS 26 and later, and `transcribe` sends your "
+            "audio to AWS Transcribe, which bills your AWS account.",
+            enum=list(_VALID_STT_PROVIDERS),
+        ),
     )
     model: str = field(
-        default="turbo",
-        metadata=_meta("Model", "Whisper model size.", enum=["turbo"]),
-    )
-    mlx_model: str = field(
-        default="mlx-community/whisper-large-v3-turbo",
+        default=_STT_DEFAULT_MODEL,
         metadata=_meta(
-            "MLX Model",
-            "Hugging Face repo for the mlx_whisper model (mlx provider only).",
+            "Model",
+            "Which speech model the local provider downloads and runs. Bigger is "
+            "more accurate and a longer first-time download: `tiny` on a machine "
+            "short of memory, `base` for everyone, `small` when accents or jargon "
+            "are being misheard, `large-v3-turbo` for the best accuracy available.",
+            enum=list(_VALID_STT_MODELS),
         ),
     )
-    parakeet_model: str = field(
-        default="mlx-community/parakeet-tdt-0.6b-v3",
+    language_code: str = field(
+        default="en-US",
         metadata=_meta(
-            "Parakeet Model",
-            "Hugging Face repo for the parakeet-mlx model (parakeet provider only).",
+            "Language Code", "Language for speech recognition (e.g. en-US, fr-FR, es-ES)."
         ),
     )
-    device: str = field(
-        default="cpu",
-        metadata=_meta("Device", "Computation device.", enum=["cpu", "cuda"]),
+    streaming: bool = field(
+        default=True,
+        metadata=_meta(
+            "Streaming",
+            "Show words in the message box while you are still speaking rather than "
+            "only once you stop. Every provider supports it; turning it off spends "
+            "less CPU on the local provider and fewer API calls on `transcribe`.",
+        ),
+    )
+    silence_ms: int = field(
+        default=_STT_DEFAULT_SILENCE_MS,
+        metadata=_meta(
+            "End-of-phrase silence",
+            "How long a pause has to last, in milliseconds, before what you said is "
+            "treated as a finished phrase. Raise it if you are being cut off "
+            "mid-sentence; lower it if the text lags behind you.",
+        ),
+    )
+    partial_interval_ms: int = field(
+        default=_STT_DEFAULT_PARTIAL_INTERVAL_MS,
+        metadata=_meta(
+            "Live update interval",
+            "How often the live transcript is refreshed while you speak, in "
+            "milliseconds. Lower feels more immediate and costs a little more CPU "
+            "per second of speech; higher is steadier to read.",
+        ),
+    )
+    idle_evict_secs: int = field(
+        default=_STT_DEFAULT_IDLE_EVICT_SECS,
+        metadata=_meta(
+            "Release model after",
+            "How long the local model stays loaded in memory after your last "
+            "recording, in seconds. It holds roughly 150 MB at the default model, "
+            "and reloading it takes a fraction of a second, so lower this on a "
+            "machine short of memory. 0 releases it as soon as you stop speaking.",
+        ),
+    )
+    endpointing: bool = field(
+        default=False,
+        metadata=_meta(
+            "Semantic endpointing",
+            "While dictating, run a fast background model on each finished phrase to "
+            "detect when you have asked a complete question, then send it without "
+            "you pressing anything. Needs streaming; off by default.",
+        ),
+    )
+    dictation_panel: bool = field(
+        default=True,
+        metadata=_meta(
+            "Dictation Panel",
+            "Show the animated dictation panel while recording instead of the thin status bar. "
+            "Ignored when the browser lacks WebGL2 or the OS requests reduced motion — both "
+            "fall back to the status bar.",
+        ),
     )
     timeout_secs: int = field(
         default=300,
@@ -4779,41 +5560,6 @@ class SttConfig:
     transcribe_profile: str = field(
         default="",
         metadata=_meta("Transcribe Profile", "AWS profile for Transcribe API."),
-    )
-    language_code: str = field(
-        default="en-US",
-        metadata=_meta(
-            "Language Code", "Language for speech recognition (e.g. en-US, fr-FR, es-ES)."
-        ),
-    )
-    streaming: bool = field(
-        default=False,
-        metadata=_meta(
-            "Streaming",
-            "Stream partial transcripts live to the dashboard input. Supported by the "
-            "streaming providers only: `transcribe` (AWS, cloud) and `apple` "
-            "(on-device, macOS 26+). The whisper/mlx CLIs have no partial-result "
-            "channel.",
-        ),
-    )
-    endpointing: bool = field(
-        default=False,
-        metadata=_meta(
-            "Semantic endpointing",
-            "While streaming dictation, run a fast background model on each stable "
-            "transcript segment to detect when you have finished a complete request, "
-            "then auto-submit. Streaming providers only (transcribe, apple); "
-            "off by default.",
-        ),
-    )
-    dictation_panel: bool = field(
-        default=True,
-        metadata=_meta(
-            "Dictation Panel",
-            "Show the animated dictation panel while recording instead of the thin status bar. "
-            "Ignored when the browser lacks WebGL2 or the OS requests reduced motion — both "
-            "fall back to the status bar.",
-        ),
     )
 
 
@@ -4996,6 +5742,26 @@ class McpGatewayConfig:
             "(mcp_gateway.enabled). Managed from MCP Management.",
         ),
     )
+    shared_readonly_servers: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Shared Read-only Servers",
+            "Subset of Routed Servers allowed to share one backend across agents and "
+            "workspaces. Use only stateless, credential-free, read-only services such "
+            "as a documentation index. Entries with declared environment or "
+            "auto-approved tools stay session-scoped. Empty by default.",
+        ),
+    )
+    claude_session_servers: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Claude Session Servers",
+            "Optional explicit MCP profile for Claude ACP sessions. A non-empty "
+            "list suppresses user-level MCP discovery for those sessions and "
+            "injects only named, enabled servers from the selected KiroCrew "
+            "agent spec. Empty preserves normal Claude Code behaviour.",
+        ),
+    )
     poolable_servers: list[str] = field(
         default_factory=list,
         metadata=_meta(
@@ -5134,7 +5900,12 @@ class InstancesConfig:
             "Max number of remote instances kept warm (iframe mounted + tunnel live) "
             "at once. Least-recently-used instances beyond this are evicted and "
             "reconnected on demand. Bounds memory/socket use (each warm instance is a "
-            "full dashboard SPA).",
+            "full dashboard SPA). 0 (the default) is automatic: the cap follows how "
+            "many crews are currently connected, so a crew you connected is never "
+            "evicted -- eviction cold-boots the pane and reads as a disconnect, so a "
+            "fixed cap below the connected count makes tab switching look like a "
+            "connection flap. Automatic is bounded by an internal ceiling; an explicit "
+            "value is honoured exactly, including one below the connected count.",
         ),
     )
     tunnel_base_port: int = field(
@@ -5213,9 +5984,16 @@ class InstancesConfig:
     )
 
     def __post_init__(self) -> None:
-        if self.warm_set_cap < 1:
-            logger.warning("instances.warm_set_cap %d < 1, using 1", self.warm_set_cap)
-            object.__setattr__(self, "warm_set_cap", 1)
+        if self.warm_set_cap < 0:
+            # 0 is meaningful here (automatic -- track the connected count), so
+            # only a negative value is a misconfiguration, and it falls back to
+            # automatic rather than to 1: a caller who wrote a nonsense number
+            # wanted "enough", not the tightest possible cap.
+            logger.warning(
+                "instances.warm_set_cap %d < 0, using 0 (automatic: track the connected count)",
+                self.warm_set_cap,
+            )
+            object.__setattr__(self, "warm_set_cap", _WARM_SET_CAP_AUTO)
         if not (1 <= self.tunnel_base_port <= 65535):
             logger.warning(
                 "instances.tunnel_base_port %d out of range [1, 65535], using %d",
@@ -5349,8 +6127,12 @@ class WatchdogConfig:
             "for long builds and MCP tools on macOS, where the liveness oracle "
             "degrades (no /proc) and cannot distinguish a live build from a stall, "
             "while still landing inside the turn's own ceiling "
-            "(agent.chat_turn_timeout_secs) so recovery is reachable. A window at or "
-            "past that ceiling is clamped at load with a warning.",
+            "(agent.chat_turn_timeout_secs) so recovery is reachable. Enforcement is "
+            "at handle construction, not config load: a window past the headroom "
+            "fraction of the transport's per-prompt timeout is clamped with a "
+            "warning, while one that merely exceeds agent.chat_turn_timeout_secs is "
+            "warned about but left as set, because the same handle also serves "
+            "callers that pass a larger prompt timeout (review and cron turns).",
         ),
     )
     tool_stall_hard_cap_secs: float = field(
@@ -5359,8 +6141,10 @@ class WatchdogConfig:
             "Hard cap (s)",
             "Absolute ceiling for UNKNOWN-verdict forbearance (e.g. the extended "
             "probably-thinking window). Applies ONLY to UNKNOWN verdicts — never "
-            "to a WORKING session. Default 1h, bounded by the turn ceiling like "
-            "the suspect window.",
+            "to a WORKING session, which is deferred before this cap is consulted "
+            "and is therefore bounded only by the turn's own ceiling. Default 1h, "
+            "clamped against the transport's per-prompt timeout like the suspect "
+            "window.",
         ),
     )
     model_silent_probe_secs: float = field(
@@ -5381,6 +6165,246 @@ class WatchdogConfig:
             "deltas in the liveness oracle.",
         ),
     )
+
+
+# Keys whose out-of-domain value has already been reported, so a knob read once
+# per spawn warns once per process instead of once per agent launch. Same shape
+# as ``_OBSERVED_DEGRADED_SECTIONS``; exposed for tests to reset.
+_WARNED_RESOURCE_LIMIT_KEYS: set[str] = set()
+
+
+def _limit_int(value: object, key: str, *, lo: int, hi: int | None = None) -> int | None:
+    """Coerce one ``resource_limits`` value, or ``None`` when it is out of domain.
+
+    ``None`` means "no usable value here" and is deliberately NOT a number: each
+    mechanism's fallback is its own documented default (``_RLIMIT_DEFAULTS`` for
+    the rlimit path, ``_CGROUP_DEFAULT_*`` for the cgroup paths), and those must
+    stay where they are rather than being copied into this dataclass as a third
+    default set.
+
+    The coercion rules, and why each one is what it is:
+
+    - ``bool`` is not a number here. ``True`` would otherwise coerce to ``1`` and
+      set a one-process / one-MB ceiling, which kills the child it limits.
+    - A non-integral float TRUNCATES toward zero (``512.5`` -> ``512``), matching
+      what every pre-existing reader did, so tightening the parse cannot loosen
+      an operator's ceiling.
+    - EXCEPT when it truncates to ``0``, either sign: ``0.5`` is not a request to
+      disable the limit, but ``int(0.5)`` is exactly the value that means
+      "disabled" on the rlimit path and "use the default" on the cgroup path.
+      That silent reinterpretation is the trap in #3474, so it is refused.
+    - NaN and +/-Infinity are refused before ``int()`` sees them. ``json.loads``
+      accepts both literals, and ``int(inf)`` raises ``OverflowError`` --
+      uncaught on the rlimit path, which turned a typo into a failure of every
+      spawn.
+    - Out of range REFUSES rather than clamps, and is checked on the value AS
+      WRITTEN rather than on the truncated result. A clamp would silently move a
+      confinement ceiling away from the number the operator can read in their own
+      file; checking after truncation would let a value below the floor land back
+      inside it (``int(-0.5) == 0`` passes a ``>= 0`` floor and then reads as
+      "leave inherited", removing the ceiling entirely).
+
+    Every refusal is logged once per key per process: the value is security
+    relevant, so an operator must not have to infer it was dropped.
+    """
+
+    def _refuse(reason: str) -> None:
+        if key in _WARNED_RESOURCE_LIMIT_KEYS:
+            return
+        _WARNED_RESOURCE_LIMIT_KEYS.add(key)
+        logger.warning(
+            "config: resource_limits.%s = %r %s — ignoring it and using the "
+            "documented default for that mechanism",
+            key,
+            value,
+            reason,
+        )
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _refuse("is not a number")
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        _refuse("is not a finite number")
+        return None
+    # Range-check the value AS WRITTEN, before any truncation. Checking the
+    # truncated result instead lets a value BELOW the floor land back inside it:
+    # ``int(-0.5) == 0`` satisfies a ``>= 0`` floor and then reads as this
+    # block's "leave inherited" sentinel, REMOVING the ceiling the operator was
+    # trying to set.
+    if value < lo or (hi is not None and value > hi):
+        _refuse(f"is outside the accepted range [{lo}, {hi if hi is not None else 'unbounded'}]")
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        # A fraction that truncates to zero is refused whatever its sign. Zero
+        # is meaningful to every consumer of this block -- "leave inherited",
+        # "use the default", "disabled" -- so truncating would silently swap the
+        # operator's request for one of those.
+        if int(value) == 0:
+            _refuse("is a fraction that would truncate to 0, which means something else")
+            return None
+        logger.debug("config: resource_limits.%s = %r truncated to %d", key, value, int(value))
+    return int(value)
+
+
+@dataclass
+class ResourceLimitsConfig:
+    """Kernel confinement ceilings for spawned agent processes.
+
+    THREE mechanisms read this one block, and a key shared between two of them
+    does NOT mean the same thing on both. That is the whole reason this section
+    has a schema (#3474): every consumer used to parse the raw dict itself, so
+    the incompatible domains were written down nowhere and drifted apart.
+
+    - ``POSIX rlimits`` (``security.apply_resource_limits``, via ``preexec_fn``
+      or the exec shim's ``--rlimits=``). Here ``0`` is a MEANINGFUL, documented
+      value: "leave the inherited limit unchanged". Absent falls back to
+      ``security._RLIMIT_DEFAULTS``.
+    - ``cgroup v2 scope`` (``sandbox.cgroup_scope_argv``, ``TasksMax`` /
+      ``MemoryMax`` / ``CPUWeight`` on a transient ``systemd-run --user
+      --scope``). Here ``0`` is ILLEGAL -- systemd rejects the property and the
+      scope never starts -- so ``0``, absent, or anything out of domain falls
+      back to the module default and the ceiling is never left unset. The one
+      exception is ``max_cpu_percent``, which is opt-in: unset emits no
+      ``CPUQuota`` property at all.
+    - ``pytest-xdist worker cap`` (``resource_status``), where ``xdist_auto_cap``
+      carries its own three-way sentinel.
+
+    Every field is ``int | None``, and ``None`` means "not configured" -- kept
+    distinct from ``0`` precisely because ``0`` is a real value on the rlimit
+    path. Values are coerced by :func:`_limit_int`, the ONLY parse site for this
+    block; a second one is a defect, and ``test_resource_limits_schema.py``
+    fails if one appears.
+    """
+
+    max_open_files: int | None = field(
+        default=None,
+        metadata=_meta(
+            "Max open files",
+            "RLIMIT_NOFILE: open file descriptors per spawned process. Caps fd "
+            "leaks. 0 leaves the inherited limit unchanged; unset uses the "
+            "built-in default (1024). Not used by the cgroup path.",
+            nullable=True,
+        ),
+    )
+    max_processes: int | None = field(
+        default=None,
+        metadata=_meta(
+            "Max processes",
+            "READ BY TWO MECHANISMS with different meanings for 0. As "
+            "RLIMIT_NPROC it caps processes for the child's real UID, and 0 "
+            "leaves the inherited limit unchanged (the default -- see the "
+            "per-UID caveat in security._RLIMIT_DEFAULTS). As the cgroup "
+            "TasksMax it counts TASKS (threads) in the scope, where 0 is "
+            "rejected by systemd, so 0 or unset means the module default.",
+            nullable=True,
+        ),
+    )
+    max_memory_mb: int | None = field(
+        default=None,
+        metadata=_meta(
+            "Max memory (MB)",
+            "READ BY TWO MECHANISMS with different meanings for 0. As RLIMIT_AS "
+            "it caps virtual address space, and 0 leaves the inherited limit "
+            "unchanged (the default -- Node/V8 reserve huge VSZ, see the caveat "
+            "in security._RLIMIT_DEFAULTS). As the cgroup MemoryMax it is the "
+            "per-scope resident ceiling, where 0 is rejected by systemd, so 0 "
+            "or unset means the host-proportional module default.",
+            nullable=True,
+        ),
+    )
+    max_cpu_seconds: int | None = field(
+        default=None,
+        metadata=_meta(
+            "Max CPU seconds",
+            "RLIMIT_CPU: CPU-seconds per spawned process. 0 leaves the "
+            "inherited limit unchanged (the default). Not used by the cgroup "
+            "path, which throttles with CPUWeight/CPUQuota instead of killing.",
+            nullable=True,
+        ),
+    )
+    cpu_weight: int | None = field(
+        default=None,
+        metadata=_meta(
+            "CPU weight",
+            "cgroup CPUWeight for the agent scope: relative CPU share under "
+            "contention, not a cap. Accepted range 1-10000; unset or out of "
+            "range uses the module default. Emitted only when the cpu "
+            "controller is delegated to the user manager.",
+            nullable=True,
+        ),
+    )
+    max_cpu_percent: int | None = field(
+        default=None,
+        metadata=_meta(
+            "Max CPU percent",
+            "cgroup CPUQuota: a HARD CPU cap, opt-in. Unset or 0 emits no "
+            "CPUQuota property at all, because a hard cap slows legitimate "
+            "builds. May exceed 100 on a multi-core host (150 = 1.5 cores).",
+            nullable=True,
+        ),
+    )
+    max_total_memory_mb: int | None = field(
+        default=None,
+        metadata=_meta(
+            "Max total memory (MB)",
+            "cgroup MemoryMax for the whole agents SLICE -- how much every "
+            "agent tree may claim together, independent of the per-scope "
+            "ceiling. 0 or unset uses the host-proportional module default; "
+            "the aggregate ceiling is never left unset.",
+            nullable=True,
+        ),
+    )
+    max_total_processes: int | None = field(
+        default=None,
+        metadata=_meta(
+            "Max total processes",
+            "cgroup TasksMax for the whole agents SLICE, counting tasks "
+            "(threads) across every agent tree. 0 or unset uses the module "
+            "default; the aggregate ceiling is never left unset.",
+            nullable=True,
+        ),
+    )
+    xdist_auto_cap: int | None = field(
+        default=None,
+        metadata=_meta(
+            "pytest-xdist worker cap",
+            "Ceiling for auto-computed pytest-xdist worker counts. -1 (the "
+            "default) computes it from available memory, 0 disables the "
+            "injection entirely and defers to xdist, and N > 0 pins a fixed "
+            "cap.",
+            nullable=True,
+        ),
+    )
+
+    @classmethod
+    def from_raw(cls, section: object) -> "ResourceLimitsConfig":
+        """Build from a raw ``resource_limits`` dict -- the ONE parse site.
+
+        Accepts whatever ``json.loads`` produced, including ``None`` and a
+        non-dict, because the callers are spawn-path readers that must never
+        raise: a malformed config has to degrade to defaults, not stop the agent
+        from starting. Consumers keep their own interpretation of ``0`` and of
+        ``None``; this method only decides what is a usable integer.
+        """
+        if not isinstance(section, dict):
+            return cls()
+        return cls(
+            max_open_files=_limit_int(section.get("max_open_files"), "max_open_files", lo=0),
+            max_processes=_limit_int(section.get("max_processes"), "max_processes", lo=0),
+            max_memory_mb=_limit_int(section.get("max_memory_mb"), "max_memory_mb", lo=0),
+            max_cpu_seconds=_limit_int(section.get("max_cpu_seconds"), "max_cpu_seconds", lo=0),
+            cpu_weight=_limit_int(section.get("cpu_weight"), "cpu_weight", lo=1, hi=10000),
+            max_cpu_percent=_limit_int(section.get("max_cpu_percent"), "max_cpu_percent", lo=0),
+            max_total_memory_mb=_limit_int(
+                section.get("max_total_memory_mb"), "max_total_memory_mb", lo=0
+            ),
+            max_total_processes=_limit_int(
+                section.get("max_total_processes"), "max_total_processes", lo=0
+            ),
+            xdist_auto_cap=_limit_int(section.get("xdist_auto_cap"), "xdist_auto_cap", lo=-1),
+        )
 
 
 @dataclass
@@ -5539,6 +6563,18 @@ class FeishuConfig:
         metadata=_meta(
             "Hard Context Threshold %",
             "Force a compaction when context reaches this so the window never overflows.",
+            tags=["feishu"],
+        ),
+    )
+    session_folder: str = field(
+        default="",
+        metadata=_meta(
+            "Session Folder",
+            "Optional sidebar folder for sessions that start on this channel. "
+            "Empty (the default) leaves them unfiled; any other value is the "
+            "folder name, created when these settings are saved and marked with "
+            "the channel's brand mark. A configured folder that no longer exists "
+            "leaves conversations unfiled until the next save recreates it.",
             tags=["feishu"],
         ),
     )
@@ -6710,6 +7746,15 @@ class KiroCrewConfig:
         default_factory=WatchdogConfig,
         metadata=_meta("Watchdog", "ACP per-session watchdog / liveness-oracle windows."),
     )
+    resource_limits: ResourceLimitsConfig = field(
+        default_factory=ResourceLimitsConfig,
+        metadata=_meta(
+            "Resource Limits",
+            "Kernel confinement ceilings for spawned agents (POSIX rlimits and "
+            "cgroup v2 scope properties). Shared keys mean different things to "
+            "the two mechanisms -- see the per-field help.",
+        ),
+    )
 
     slack: SlackConfig = field(
         default_factory=SlackConfig,
@@ -6827,6 +7872,28 @@ class KiroCrewConfig:
         default=True,
         metadata=_meta("Auto Update", "Enable automatic update checks."),
     )
+    #: Opt-in for the Connections gallery, which is merged but held for a later
+    #: release. A real field rather than an unmodelled top-level key because the
+    #: browser is the consumer: the frontend reads this flag live off ``GET
+    #: /api/config/kirocrew`` (``useConnectionsUi.ts``), and that response drops
+    #: every key the core does not model — ``_masked_config_dict`` cannot tell
+    #: whether an unmodelled value is a secret, so it strips them all rather
+    #: than leak one. Being schema-known is therefore what makes the flag
+    #: reachable at all; it also stops ``validation`` reporting the operator's
+    #: own documented setting as an "unrecognized top-level key".
+    #:
+    #: Parsed through ``_safe_bool`` and defaulting False: a value Kiro Crew
+    #: cannot read must mean "keep the held surface hidden", never the reverse
+    #: (same posture as ``computer_use.cursor_motion``). The frontend predicate
+    #: is a strict ``=== true``, so coercing e.g. the string ``"true"`` would
+    #: only make the two ends disagree about what was configured.
+    connections_ui: bool = field(
+        default=False,
+        metadata=_meta(
+            "Connections UI",
+            "Show the Connections gallery (held for a later release).",
+        ),
+    )
     #: Top-level sections that were PRESENT on disk but not a JSON object, and
     #: were therefore coerced to defaults by :meth:`load`.
     #:
@@ -6920,7 +7987,11 @@ class KiroCrewConfig:
         The overlay is applied at load time but NOT persisted back by
         ``save()`` — only the base config is written to ``config.json``.
         """
-        cfg = cls._load_resolved()
+        # The ordering ticket comes back from the resolve step, drawn BEFORE the
+        # read, so a concurrent newer load cannot be overwritten by this one
+        # finishing later (see publish_autocompact_pct) and this method adds no
+        # filesystem I/O of its own on the event loop.
+        cfg, _autocompact_ticket = cls._load_resolved()
         # Push the MCP search-path setting to its consumer. It is PUSHED rather
         # than read there because kiro_crew.env.mcp_search_path is reached from
         # the event loop by every MCP probe and by the agent-config resolver, so
@@ -6938,15 +8009,50 @@ class KiroCrewConfig:
             # A publish failure must never make the config unloadable; the
             # search path simply keeps its previous (or empty) contribution.
             logger.warning("Publishing mcp.extra_path_dirs failed: %s", e)
+        # Publish the alias table for the same reason and in the same place: the
+        # display-side resolver (:func:`resolve_effective_agent`) runs on the
+        # event loop for every slots frame, so it must never reach for
+        # config.json itself. Here rather than in _load_resolved so EVERY return
+        # path publishes -- including the degraded-defaults path, which must
+        # overwrite a richer previous snapshot rather than leave the resolver
+        # honoring aliases that no longer load.
+        try:
+            publish_agent_alias_snapshot(cfg)
+        except Exception as e:  # pragma: no cover - defensive
+            # A publish failure must never make the config unloadable; the
+            # resolver simply keeps reporting no divergence.
+            logger.warning("Publishing agent alias snapshot failed: %s", e)
+        # Same placement and same reason again: the compaction gate reads this
+        # after every turn on the event loop, and publishing on EVERY return path
+        # is what lets a CLI write reach a gateway that is already running.
+        try:
+            publish_autocompact_pct(cfg, _autocompact_ticket)
+        except Exception as e:  # pragma: no cover - defensive
+            # A publish failure must never make the config unloadable; the gate
+            # keeps using the threshold it already had.
+            logger.warning("Publishing autocompact threshold failed: %s", e)
+        try:
+            publish_config_timezone(cfg, _autocompact_ticket)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Publishing config timezone failed: %s", e)
         return cfg
 
     @classmethod
-    def _load_resolved(cls) -> KiroCrewConfig:
+    def _load_resolved(cls) -> tuple[KiroCrewConfig, int]:
         """Resolve the config from disk (or defaults). See :meth:`load`.
 
         Split out so :meth:`load` owns the post-resolution publication on every
         return path; this method may return from more than one place.
+
+        Returns the config PLUS the ordering ticket drawn before the read, which
+        is what lets :meth:`load` publish the compaction threshold in the correct
+        order relative to a concurrent load without any filesystem I/O of its own
+        on the event loop.
         """
+        # Drawn BEFORE any read below, so it records when this load began
+        # observing the files rather than when it finished. See
+        # next_config_load_ticket and publish_autocompact_pct.
+        ticket = next_config_load_ticket()
         path = config_path()
 
         # Hot-path cache: reuse the validated, merged dict when neither config
@@ -6954,16 +8060,22 @@ class KiroCrewConfig:
         # _deep_merge + the full jsonschema.validate. A deep copy is returned so
         # in-place mutation by callers (and the write-back migration below) can
         # never corrupt the cached original.
-        cached_data = _cached_validated_data()
+        #
+        # ONE stat pass serves both consumers of it below: the cache lookup and
+        # the pre-read TOCTOU fingerprint. load() runs on the event loop, so a
+        # second pass would be filesystem I/O there for information already in
+        # hand.
+        fp = _config_fingerprint()
+        cached_data = _cached_validated_data(fp)
         if cached_data is not None:
             data = cached_data
         else:
-            # Capture the fingerprint BEFORE reading so a write landing during
-            # the read is detected: we cache under this pre-read fp, which won't
-            # match the post-write on-disk stat, so the next load() re-reads
-            # instead of serving the content we read mid-write (read->store
-            # TOCTOU). _store_validated_data documents this contract.
-            pre_read_fp = _config_fingerprint()
+            # fp was captured BEFORE reading, so a write landing during the read
+            # is detected: we cache under it, it won't match the post-write
+            # on-disk stat, and the next load() re-reads instead of serving
+            # content read mid-write (read->store TOCTOU).
+            # _store_validated_data documents this contract.
+            pre_read_fp = fp
             data = {}
             loaded_base = False
             config_source_unreadable = False
@@ -7052,10 +8164,25 @@ class KiroCrewConfig:
                     memory_store="default",
                 )
                 cfg.default_agent = "default"
-                return cfg
+                return cfg, ticket
 
             # Preserve fail-closed security semantics before advisory schema
             # validation can replace malformed input with a missing-field default.
+            # Normalize resource_limits FIRST, for exactly that reason. Its
+            # fields are declared ``int | None``, so jsonschema reads a
+            # hand-edited ``512.5`` as a type violation and
+            # ``_apply_field_default`` POPS the key -- deleting a ceiling the
+            # parse rule would have accepted, since it truncates. That deletion
+            # is not neutral: the rlimit path's fallback for a missing value is
+            # ``0``, which means "leave inherited", so a 512 MB ceiling becomes
+            # NO ceiling, and ``to_dict`` then persists ``null`` over what the
+            # operator wrote. Normalizing here means validation sees the same
+            # integers ``from_raw`` would produce; it is idempotent, so the
+            # section build below agrees by construction.
+            if isinstance(data.get("resource_limits"), dict):
+                data["resource_limits"] = asdict(
+                    ResourceLimitsConfig.from_raw(data["resource_limits"])
+                )
             # Validate against JSON Schema (advisory — never fatal)
             _validate_config_data(data)
             # Clamp security-relevant resource-limit knobs to their API ceilings
@@ -7150,6 +8277,7 @@ class KiroCrewConfig:
         telemetry_data = _coerced_section(data, "telemetry", _degraded)
         orchestrator_data = _coerced_section(data, "orchestrator", _degraded)
         watchdog_data = _coerced_section(data, "watchdog", _degraded)
+        resource_limits_data = _coerced_section(data, "resource_limits", _degraded)
 
         # Parse agents section into dict[str, KiroCrewAgentConfig]
         raw_agents = data.get("agents", {})
@@ -7193,6 +8321,7 @@ class KiroCrewConfig:
                             entry.get("watchdog_tool_stall_hard_cap_secs", 0.0), 0.0, lo=0.0
                         ),
                         telegram_account=entry.get("telegram_account", ""),
+                        session_color=_safe_color(entry.get("session_color", "")),
                     )
 
         # Migrate workspaces from flat or structured format
@@ -7244,6 +8373,9 @@ class KiroCrewConfig:
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", "acp"),
                 mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
+                mcp_quarantine_after_failures=_safe_int(
+                    agent_data.get("mcp_quarantine_after_failures", 3), 3
+                ),
                 acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
                 default_agent=agent_data.get("default_agent", ""),
                 sweep_agents_backups=_safe_bool(
@@ -7362,7 +8494,10 @@ class KiroCrewConfig:
                     agent_data.get("completion_keep", "head")
                 ),
                 completion_keep_chars=_safe_int(
-                    agent_data.get("completion_keep_chars", 3000), 3000
+                    agent_data.get("completion_keep_chars", 3000),
+                    3000,
+                    COMPLETION_KEEP_CHARS_MIN,
+                    COMPLETION_KEEP_CHARS_MAX,
                 ),
                 subagent_result_ttl_secs=_safe_int(
                     agent_data.get("subagent_result_ttl_secs", 3600), 3600
@@ -7384,11 +8519,27 @@ class KiroCrewConfig:
                 max_channels=agent_data.get("max_channels", 1),
                 max_channel_agents=agent_data.get("max_channel_agents", 3),
                 soft_stop_budget_secs=max(
-                    0.5, min(60.0, _safe_float(agent_data.get("soft_stop_budget_secs", 10.0), 10.0))
+                    SOFT_STOP_BUDGET_MIN,
+                    min(
+                        SOFT_STOP_BUDGET_MAX,
+                        _safe_float(agent_data.get("soft_stop_budget_secs", 10.0), 10.0),
+                    ),
                 ),
             ),
             session=SessionConfig(
-                timeout_secs=session_data.get("timeout_secs", DEFAULT_SESSION_TIMEOUT),
+                # The only field in this group whose site had no `_safe_int` at all, so
+                # it is added here for consistency -- but NOT because the type was
+                # unhandled. Verified: on the base revision a hand-edited `"abc"` or
+                # `true` already loaded as the 3600 default, because
+                # `_validate_config_data` runs over the raw dict before section
+                # extraction and owns type handling. What was missing for this field, as
+                # for the other ten, is the RANGE: an int of 999999999 loaded verbatim.
+                timeout_secs=_safe_int(
+                    session_data.get("timeout_secs", DEFAULT_SESSION_TIMEOUT),
+                    DEFAULT_SESSION_TIMEOUT,
+                    SESSION_TIMEOUT_MIN,
+                    SESSION_TIMEOUT_MAX,
+                ),
                 empty_response_auto_continue=bool(
                     session_data.get("empty_response_auto_continue", True)
                 ),
@@ -7405,7 +8556,12 @@ class KiroCrewConfig:
                     POOL_SIZE_MAX,
                 ),
                 pool_agent=str(session_data.get("pool_agent", "")),
-                pool_ttl_secs=_safe_int(session_data.get("pool_ttl_secs", 1800), 1800),
+                pool_ttl_secs=_safe_int(
+                    session_data.get("pool_ttl_secs", 1800),
+                    1800,
+                    POOL_TTL_SECS_MIN,
+                    POOL_TTL_SECS_MAX,
+                ),
                 eager_spawn=bool(session_data.get("eager_spawn", True)),
                 archive_retention_days=_archive_retention_days(session_data),
                 watchdog_rss_max_mb=_safe_int(session_data.get("watchdog_rss_max_mb", 0), 0),
@@ -7459,6 +8615,7 @@ class KiroCrewConfig:
                     watchdog_data.get("wellness_sample_secs", 3.0), 3.0
                 ),
             ),
+            resource_limits=ResourceLimitsConfig.from_raw(resource_limits_data),
             telemetry=TelemetryConfig(
                 enabled=bool(telemetry_data.get("enabled", False)),
                 local_dir=str(telemetry_data.get("local_dir", "")),
@@ -7479,6 +8636,15 @@ class KiroCrewConfig:
                 ),
                 embedding_dim=memory_data.get("embedding_dim", 1024),
                 embedding_threads=_safe_int(memory_data.get("embedding_threads", 4), 4, 1, 256),
+                # 0 is the documented "inherit embedding_threads" sentinel, so the
+                # floor is 0 rather than 1 — clamping it to 1 would erase a
+                # deliberate opt-in to the interactive pool.
+                embedding_bulk_threads=_safe_int(
+                    memory_data.get("embedding_bulk_threads", 1), 1, 0, 256
+                ),
+                embedding_bulk_duty=_safe_float(
+                    memory_data.get("embedding_bulk_duty", 0.2), 0.2, 0.05, 1.0
+                ),
                 embed_model_url=memory_data.get("embed_model_url", ""),
                 embed_model_path=memory_data.get("embed_model_path", ""),
                 embed_model_id=memory_data.get("embed_model_id", ""),
@@ -7529,13 +8695,19 @@ class KiroCrewConfig:
                     knowledge_data.get("auto_register_project_docs", False)
                 ),
                 auto_ingest_chunk_budget=_safe_nonnegative_int(
-                    knowledge_data.get("auto_ingest_chunk_budget", 150), 150
+                    knowledge_data.get("auto_ingest_chunk_budget", 150),
+                    150,
+                    AUTO_INGEST_CHUNK_BUDGET_MAX,
                 ),
                 folder_ingest_chunk_budget=_safe_nonnegative_int(
-                    knowledge_data.get("folder_ingest_chunk_budget", 300), 300
+                    knowledge_data.get("folder_ingest_chunk_budget", 300),
+                    300,
+                    FOLDER_INGEST_CHUNK_BUDGET_MAX,
                 ),
                 dedup_every_n_sweeps=_safe_nonnegative_int(
-                    knowledge_data.get("dedup_every_n_sweeps", 12), 12
+                    knowledge_data.get("dedup_every_n_sweeps", 12),
+                    12,
+                    DEDUP_EVERY_N_SWEEPS_MAX,
                 ),
                 doc_ingest_hosts=[
                     str(h)
@@ -7547,17 +8719,22 @@ class KiroCrewConfig:
                     knowledge_data.get("auto_discover_dirname", "knowledge-docs")
                 ).strip()[:128],
                 sweep_chunk_budget=_safe_nonnegative_int(
-                    knowledge_data.get("sweep_chunk_budget", 500), 500
+                    knowledge_data.get("sweep_chunk_budget", 500),
+                    500,
+                    SWEEP_CHUNK_BUDGET_MAX,
                 ),
-                max_sources=_safe_nonnegative_int(knowledge_data.get("max_sources", 50), 50),
+                max_sources=_safe_nonnegative_int(
+                    knowledge_data.get("max_sources", 50), 50, KNOWLEDGE_MAX_SOURCES_MAX
+                ),
                 embed_rate_limit=_safe_nonnegative_int(
-                    knowledge_data.get("embed_rate_limit", 120), 120
+                    knowledge_data.get("embed_rate_limit", 120), 120, EMBED_RATE_LIMIT_MAX
                 ),
                 extraction_model=str(knowledge_data.get("extraction_model", "")).strip(),
                 extraction_pool_size=max(
-                    1,
+                    EXTRACTION_POOL_SIZE_MIN,
                     min(
-                        10, _safe_nonnegative_int(knowledge_data.get("extraction_pool_size", 3), 3)
+                        EXTRACTION_POOL_SIZE_MAX,
+                        _safe_nonnegative_int(knowledge_data.get("extraction_pool_size", 3), 3),
                     ),
                 ),
             ),
@@ -7688,6 +8865,9 @@ class KiroCrewConfig:
                 trusted_bot_ids={
                     b for b in _safe_list(slack_data.get("trusted_bot_ids")) if isinstance(b, str)
                 },
+                trusted_bot_turn_limit=_safe_int(
+                    slack_data.get("trusted_bot_turn_limit", 5), 5, lo=1
+                ),
                 allowed_enterprise_ids=[
                     e
                     for e in slack_data.get("allowed_enterprise_ids", [])
@@ -7741,13 +8921,21 @@ class KiroCrewConfig:
                 allowed_group_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_group_ids")),
                 soft_threshold_pct=_safe_int(feishu_data.get("soft_threshold_pct", 80), 80),
                 hard_threshold_pct=_safe_int(feishu_data.get("hard_threshold_pct", 95), 95),
+                session_folder=_coerce_session_folder(feishu_data.get("session_folder")),
             ),
             dashboard=DashboardConfig(
                 url=dashboard_data.get("url", ""),
-                tailscale=_tailscale_config_from(dashboard_data.get("tailscale")),
+                tailscale=_tailscale_config_from(
+                    dashboard_data.get("tailscale"),
+                    _degraded,
+                    key_present="tailscale" in dashboard_data,
+                ),
                 restore_sessions=dashboard_data.get("restore_sessions", False),
                 qr_session_until_restart=_safe_bool(
                     dashboard_data.get("qr_session_until_restart"), True
+                ),
+                qr_session_persist_across_restart=_safe_bool(
+                    dashboard_data.get("qr_session_persist_across_restart"), False
                 ),
                 restore_window_minutes=dashboard_data.get("restore_window_minutes", 30),
                 surface_channel_sessions=dashboard_data.get("surface_channel_sessions", True),
@@ -7755,13 +8943,36 @@ class KiroCrewConfig:
                 avatar=dashboard_data.get("avatar", ""),
                 merge_queued_messages=dashboard_data.get("merge_queued_messages", False),
                 mcp_probe_timeout_secs=_safe_int(
-                    dashboard_data.get("mcp_probe_timeout_secs", 15), 15
+                    dashboard_data.get("mcp_probe_timeout_secs", 15),
+                    15,
+                    MCP_PROBE_TIMEOUT_MIN,
+                    MCP_PROBE_TIMEOUT_MAX,
                 ),
-                loop_stall_exit_after_secs=_safe_int(
-                    dashboard_data.get("loop_stall_exit_after_secs", 25),
-                    25,
-                    LOOP_STALL_EXIT_AFTER_MIN,
-                    LOOP_STALL_EXIT_AFTER_MAX,
+                loop_stall_exit_after_secs=(
+                    None
+                    if dashboard_data.get("loop_stall_exit_after_secs") is None
+                    else _safe_int(
+                        dashboard_data.get("loop_stall_exit_after_secs"),
+                        LOOP_STALL_EXIT_AFTER_DEFAULT,
+                        LOOP_STALL_EXIT_AFTER_MIN,
+                        LOOP_STALL_EXIT_AFTER_MAX,
+                    )
+                ),
+                chat_entry_cache_max_entries=_safe_int(
+                    dashboard_data.get(
+                        "chat_entry_cache_max_entries", CHAT_ENTRY_CACHE_ENTRIES_DEFAULT
+                    ),
+                    CHAT_ENTRY_CACHE_ENTRIES_DEFAULT,
+                    CHAT_ENTRY_CACHE_ENTRIES_MIN,
+                    CHAT_ENTRY_CACHE_ENTRIES_MAX,
+                ),
+                chat_entry_cache_max_bytes=_safe_int(
+                    dashboard_data.get(
+                        "chat_entry_cache_max_bytes", CHAT_ENTRY_CACHE_BYTES_DEFAULT
+                    ),
+                    CHAT_ENTRY_CACHE_BYTES_DEFAULT,
+                    CHAT_ENTRY_CACHE_BYTES_MIN,
+                    CHAT_ENTRY_CACHE_BYTES_MAX,
                 ),
                 cautious_boot=_safe_bool(dashboard_data.get("cautious_boot"), True),
                 auto_open_browser=dashboard_data.get("auto_open_browser", True),
@@ -7770,8 +8981,12 @@ class KiroCrewConfig:
                 session_grid=dashboard_data.get("session_grid", False),
                 mcp_app_panel=dashboard_data.get("mcp_app_panel", False),
                 auto_open_git_panel=_safe_bool(dashboard_data.get("auto_open_git_panel"), False),
+                session_card_source_links=_safe_bool(
+                    dashboard_data.get("session_card_source_links"), True
+                ),
                 widget_density=dashboard_data.get("widget_density", "more"),
                 use_builtin_browser=_safe_bool(dashboard_data.get("use_builtin_browser"), True),
+                browser_view_port=_port_or_unset(dashboard_data.get("browser_view_port", 0)),
                 verbosity=dashboard_data.get("verbosity", "default"),
                 link_previews=_safe_bool(dashboard_data.get("link_previews"), False),
                 usage_text_scrape_enabled=_safe_bool(
@@ -7784,7 +8999,12 @@ class KiroCrewConfig:
                 sso_login_flags=str(dashboard_data.get("sso_login_flags", "")),
                 theme_color=dashboard_data.get("theme_color", ""),
                 language=str(dashboard_data.get("language", "")),
-                recent_tint_count=_safe_int(dashboard_data.get("recent_tint_count", 0), 0),
+                recent_tint_count=_safe_int(
+                    dashboard_data.get("recent_tint_count", 0),
+                    0,
+                    RECENT_TINT_COUNT_MIN,
+                    RECENT_TINT_COUNT_MAX,
+                ),
                 update_nudge=(
                     dashboard_data.get("update_nudge", {})
                     if isinstance(dashboard_data.get("update_nudge"), dict)
@@ -7846,23 +9066,45 @@ class KiroCrewConfig:
             default_workspace=data.get("default_workspace", "default"),
             memory_stores=memory_stores,
             default_memory_store=default_memory_store_val,
+            # Every default below restates its dataclass default, and the two must
+            # stay equal: the branch above returns bare dataclass defaults when
+            # neither config file exists, so a disagreement gives one field two
+            # different defaults depending on whether a config.json is present, and
+            # the schema, the docs and the doctor can only describe one of them.
             stt=SttConfig(
-                enabled=stt_data.get("enabled", False),
-                provider=_validated_stt_provider(stt_data.get("provider", "whisper")),
-                whisper_path=stt_data.get("whisper_path", ""),
-                # Default "turbo" — faster and recommended for most users
-                # (809M vs 74M, but much better latency).
-                model=stt_data.get("model", "turbo"),
-                mlx_model=stt_data.get("mlx_model", "mlx-community/whisper-large-v3-turbo"),
-                parakeet_model=stt_data.get("parakeet_model", "mlx-community/parakeet-tdt-0.6b-v3"),
-                device=stt_data.get("device", "cpu"),
-                timeout_secs=stt_data.get("timeout_secs", 300),
-                transcribe_region=stt_data.get("transcribe_region", "us-east-1"),
-                transcribe_profile=stt_data.get("transcribe_profile", ""),
+                enabled=_safe_bool(stt_data.get("enabled"), True),
+                provider=_validated_stt_provider(stt_data.get("provider", STT_PROVIDER_LOCAL)),
+                model=_validated_stt_model(stt_data.get("model", _STT_DEFAULT_MODEL)),
                 language_code=stt_data.get("language_code", "en-US"),
-                streaming=stt_data.get("streaming", False),
+                streaming=_safe_bool(stt_data.get("streaming"), True),
+                silence_ms=_safe_int(
+                    stt_data.get("silence_ms"),
+                    _STT_DEFAULT_SILENCE_MS,
+                    lo=_STT_MIN_SILENCE_MS,
+                    hi=_STT_INTERVAL_MS_MAX,
+                ),
+                partial_interval_ms=_safe_int(
+                    stt_data.get("partial_interval_ms"),
+                    _STT_DEFAULT_PARTIAL_INTERVAL_MS,
+                    lo=_STT_MIN_PARTIAL_INTERVAL_MS,
+                    hi=_STT_INTERVAL_MS_MAX,
+                ),
+                idle_evict_secs=_safe_int(
+                    stt_data.get("idle_evict_secs"),
+                    _STT_DEFAULT_IDLE_EVICT_SECS,
+                    lo=_STT_IDLE_EVICT_SECS_MIN,
+                    hi=_STT_IDLE_EVICT_SECS_MAX,
+                ),
                 endpointing=_safe_bool(stt_data.get("endpointing"), False),
                 dictation_panel=_safe_bool(stt_data.get("dictation_panel"), True),
+                timeout_secs=_safe_int(
+                    stt_data.get("timeout_secs"),
+                    _STT_DEFAULT_TIMEOUT_SECS,
+                    lo=_STT_MIN_TIMEOUT_SECS,
+                    hi=_STT_MAX_TIMEOUT_SECS,
+                ),
+                transcribe_region=stt_data.get("transcribe_region", "us-east-1"),
+                transcribe_profile=stt_data.get("transcribe_profile", ""),
             ),
             # Every numeric knob is clamped to the same ceiling the MCP tool
             # schemas enforce, so a hand-edited config.json cannot ask for an
@@ -7933,6 +9175,7 @@ class KiroCrewConfig:
                 cursor_motion=_safe_bool(computer_use_data.get("cursor_motion", False), False),
             ),
             auto_update=data.get("auto_update", True),
+            connections_ui=_safe_bool(data.get("connections_ui", False), False),
             _degraded_sections=frozenset(_degraded | _OBSERVED_DEGRADED_SECTIONS),
             timezone=data.get("timezone", ""),
             snapshot_dir=data.get("snapshot_dir", ""),
@@ -8004,6 +9247,16 @@ class KiroCrewConfig:
                     s for s in mcp_gateway_data.get("poolable_servers", []) if isinstance(s, str)
                 ],
                 stub_servers=_resolve_stub_servers(mcp_gateway_data),
+                shared_readonly_servers=[
+                    s.strip()
+                    for s in mcp_gateway_data.get("shared_readonly_servers", [])
+                    if isinstance(s, str) and s.strip()
+                ],
+                claude_session_servers=[
+                    s.strip()
+                    for s in mcp_gateway_data.get("claude_session_servers", [])
+                    if isinstance(s, str) and s.strip()
+                ],
                 # Hand-editable list of env NAMES; keep only strings and drop
                 # blanks so a stray null or nested object cannot reach the
                 # hashing layer as a key. Not deduplicated here — every consumer
@@ -8187,7 +9440,7 @@ class KiroCrewConfig:
             # Migration write-back is best-effort; never block startup.
             logger.warning("Config write-back failed: %s", e)
 
-        return cfg
+        return cfg, ticket
 
     def to_dict(self) -> dict:
         """Serialize config to the JSON structure used by config.json."""
@@ -8225,6 +9478,7 @@ class KiroCrewConfig:
             "taskrunner": asdict(self.taskrunner),
             "orchestrator": asdict(self.orchestrator),
             "watchdog": asdict(self.watchdog),
+            "resource_limits": asdict(self.resource_limits),
             "messaging": asdict(self.messaging),
             "cron_history": asdict(self.cron_history),
             "knowledge": asdict(self.knowledge),
@@ -8235,6 +9489,13 @@ class KiroCrewConfig:
             "snapshot_dir": self.snapshot_dir,
             "timezone": self.timezone,
             "auto_update": self.auto_update,
+            # Emitted unconditionally, like every other modelled top-level
+            # value: _KNOWN_CONFIG_SECTIONS must equal the key set to_dict()
+            # writes (test_known_sections_equals_emitted_sections), and a key
+            # listed there but not emitted would be excluded from
+            # _extra_sections capture AND dropped here — losing the operator's
+            # opt-in on the first save().
+            "connections_ui": self.connections_ui,
         }
         # External registries (always serialized so save() round-trips the field)
         d["registries"] = [asdict(r) for r in self.registries]
@@ -8279,6 +9540,25 @@ class KiroCrewConfig:
             try:
                 raw_local = json.loads(local_path.read_text(encoding="utf-8"))
                 if isinstance(raw_local, dict):
+                    # Compare CANONICAL values for resource_limits.
+                    # _subtract_overlay recognises an overlay-owned leaf only when
+                    # the emitted value EQUALS the raw overlay value, and this
+                    # section is normalized on load (512.5 -> 512, a refused value
+                    # -> None). A raw comparison therefore stops matching and
+                    # copies an overlay-owned limit into the base file, which is
+                    # the leak the subtraction exists to prevent. Only the keys the
+                    # overlay actually names are canonicalized: feeding the whole
+                    # dataclass would add eight `None` leaves the operator never
+                    # wrote and invite deletions they did not ask for.
+                    rl_overlay = raw_local.get("resource_limits")
+                    if isinstance(rl_overlay, dict):
+                        canonical = asdict(ResourceLimitsConfig.from_raw(rl_overlay))
+                        raw_local = {
+                            **raw_local,
+                            "resource_limits": {
+                                k: canonical[k] for k in rl_overlay if k in canonical
+                            },
+                        }
                     d = _subtract_overlay(d, raw_local)
             except (json.JSONDecodeError, OSError):
                 pass
@@ -8323,6 +9603,65 @@ class KiroCrewConfig:
                 pass
         return DEFAULT_MODEL
 
+    def acp_effective_model(
+        self,
+        agent: str | None,
+        model_override: str | None,
+        global_model: str | None = None,
+    ) -> str:
+        """The model id the ACP factory selects — what its effort gate keys on.
+
+        This IS the factory's selection, extracted so the spawn-side effort
+        verdict (``kiro_crew.subagent._spawn_effective_model``) shares the code
+        instead of mirroring it — a mirror that drifts reports a false
+        ``effort_applied``/``effort_dropped`` receipt, worse than silence.
+
+        Precedence: ``model_override`` (an explicit caller model or the value
+        the session layer resolved) > a named agent's own kiro ``model`` pin
+        (``kirocrew`` itself and the no-agent case use the global directly) >
+        the collapsed global. ``global_model`` lets the factory pass its
+        build-time collapsed ``agent.model``; when omitted it is recomputed
+        the same way (``agent.model``, collapsed through
+        :meth:`_resolve_agent_model` when it is the ``auto`` sentinel).
+
+        The result is translated into the namespace of the backend that will
+        actually be asked to run it: ``to_provider_id(…, "claude_code")`` for
+        the claude backend, ``model_registry.to_acp_id`` otherwise (canonical
+        keys become kiro ids). ``auto`` collapses to ``""`` either way.
+
+        Keying the translation on the backend is what the warm-pool model-switch
+        path already does (``session_allocation``, via ``is_claude_backend``).
+        Hardcoding ``to_acp_id`` here meant a COLD start handed the claude
+        adapter a kiro-namespaced id — which its ``set_config_option`` rejects,
+        and which nothing withheld, because the pre-wire availability guard is
+        deliberately kiro-only (the two backends advertise in different
+        namespaces, so that check cannot be widened — see
+        ``acp.client.model_is_unusable``). A warm claim of the same pinned model
+        translated correctly, so the failure depended on whether a pooled
+        process happened to exist. Not reachable from the default config:
+        ``auto`` pins nothing, and the client skips the send entirely.
+
+        ``to_acp_id``, NOT ``to_provider_id``, is the non-claude choice because
+        kiro serves the registry aliases as distinct real models — see its
+        docstring. ``""`` means nothing is pinned anywhere: the backend resolves
+        the model itself and the effort overlay cannot be keyed.
+        """
+        if global_model is None:
+            global_model = self.agent.model
+            if global_model == DEFAULT_MODEL:
+                global_model = self._resolve_agent_model()
+        if model_override:
+            m: str = model_override
+        elif not agent or agent == "kirocrew":
+            m = global_model
+        else:
+            m = self._resolve_named_agent_model(agent) or global_model
+        if not m:
+            return ""
+        if self.agent.acp_backend == ACP_BACKEND_CLAUDE:
+            return model_registry.to_provider_id(m, "claude_code")
+        return model_registry.to_acp_id(m)
+
     @staticmethod
     def _resolve_named_agent_model(agent: str, agents_dir: Path | None = None) -> str:
         """Return a named agent's own kiro ``model`` field, or ``""`` if none.
@@ -8358,14 +9697,15 @@ class KiroCrewConfig:
             # Enforce restrictive permissions on the credential file. POSIX
             # only: on Windows mode bits are meaningless (a chmod there
             # toggles the read-only attribute and succeeds without narrowing
-            # who can read), and the real owner-only lockdown —
-            # ``platform_compat.restrict_to_owner`` — spawns ``icacls``, a
-            # blocking subprocess this reader must never run: it is called
-            # from async request handlers on the gateway's event loop (the
-            # same constraint ``write_config_atomically`` documents). Windows
-            # enforcement therefore lives where the file is WRITTEN — the
-            # setup wizard and the dashboard credential writers all apply
-            # ``restrict_to_owner`` off the loop at write time.
+            # who can read), and the real owner-only lockdown --
+            # ``platform_compat.restrict_to_owner`` -- is not applied on this
+            # READ path. It no longer spawns a subprocess, so the reason is no
+            # longer cost: it is that a reader has no business rewriting a
+            # descriptor it did not create, and doing so here would apply the
+            # DACL of whichever process happened to read the file next.
+            # Windows enforcement therefore lives where the file is WRITTEN --
+            # the setup wizard and the dashboard credential writers all apply
+            # ``restrict_to_owner`` at write time.
             try:
                 if platform_compat.IS_POSIX and ep.stat().st_mode & 0o077:
                     ep.chmod(0o600)
@@ -8427,7 +9767,7 @@ class KiroCrewConfig:
 
         return creds
 
-    def mcp_gateway_provider_kwargs(self) -> dict[str, str | None]:
+    def mcp_gateway_provider_kwargs(self) -> dict[str, Any]:
         """Return the config-owned MCP gateway values for an ACP provider."""
         gateway = self.mcp_gateway
         if not gateway.enabled:
@@ -8435,6 +9775,7 @@ class KiroCrewConfig:
                 "mcp_gateway_overlay": None,
                 "mcp_gateway_settings_mcp_json": None,
                 "mcp_gateway_socket": None,
+                "mcp_gateway_claude_servers": [],
             }
 
         overlay = gateway.overlay_dir or str(default_overlay_dir())
@@ -8442,6 +9783,7 @@ class KiroCrewConfig:
             "mcp_gateway_overlay": overlay,
             "mcp_gateway_settings_mcp_json": str(Path(overlay).parent / "settings" / "mcp.json"),
             "mcp_gateway_socket": gateway.socket_path or str(default_socket_path()),
+            "mcp_gateway_claude_servers": gateway.claude_session_servers,
         }
 
     def create_provider_factory(self) -> Callable:
@@ -8486,6 +9828,11 @@ class KiroCrewConfig:
             _gw_socket = None
             _gw_settings = None
 
+        # Effort-drop warnings already emitted by this factory, keyed by
+        # (resolved model, level) — see the gate below. Benign under threads:
+        # a lost race duplicates one log line, never drops state.
+        _effort_drop_warned: set[tuple[str, str]] = set()
+
         def _acp(
             session_key: str | None = None,
             agent: str | None = None,
@@ -8519,25 +9866,13 @@ class KiroCrewConfig:
             #      silently falling through to the backend's own choice.
             # "" at the end means nothing is pinned anywhere; AcpClient
             # normalizes "" to DEFAULT_MODEL, same as None.
-            if model_override:
-                m = model_override
-            elif not agent or agent == "kirocrew":
-                m = model
-            else:
-                m = self._resolve_named_agent_model(agent) or model
-            # Translation boundary (mirrors the _claude_code factory): the model
-            # may be a canonical registry key (e.g. "opus-4.8-1m" — the wire /
-            # dropdown value after /api/models canonicalization) OR an already-
-            # resolved kiro id. kiro-cli's session/set_model only accepts its own
-            # advertised ids (bare dotted, e.g. "claude-opus-4.8"), so translate
-            # the canonical key to the "acp" id — otherwise it reaches set_model
-            # and kiro rejects it ("The model 'opus-4.8-1m' is not available").
-            # to_acp_id (NOT to_provider_id) resolves ONLY canonical keys: kiro's
-            # native ids and their aliases (claude-haiku-4.5, claude-sonnet-4.5,
-            # …) are DISTINCT real kiro models and must pass through unchanged,
-            # not get folded to Sonnet the way the claude_code path downgrades
-            # them (the claude backend has no Haiku).
-            m = model_registry.to_acp_id(m) if m else m
+            # Selection + the per-backend id translation live in
+            # acp_effective_model — SHARED with the spawn-side effort verdict
+            # (subagent.py) so the reported outcome cannot drift from what this
+            # gate actually keys on. (Why the translation is keyed on the
+            # backend, and why to_acp_id is the non-claude choice, is documented
+            # on that method.)
+            m = self.acp_effective_model(agent, model_override, global_model=model)
             # Thread the slot's effort into a per-model override so the kiro
             # cli.json overlay is written from it at spawn — without this, a
             # kiro cold start (or the handler's reset-then-respawn) would only
@@ -8555,6 +9890,38 @@ class KiroCrewConfig:
             _eff = reasoning_effort_override or base_effort
             if m and _eff and is_valid_effort(_eff) and model_supports_effort(m):
                 _eff_per_model[m] = _eff
+            elif _eff and is_valid_effort(_eff):
+                # Single-authority drop warning: a valid requested effort is
+                # being dropped because the resolved model is empty or not
+                # effort-capable. Every surface (spawn, dashboard slot, cron)
+                # funnels through this factory, so one log at the gate covers
+                # them all and cannot drift from the decision it reports on.
+                # Reporting-only — the overlay simply stays unwritten, exactly
+                # as before. An unresolved model is named "auto" (it IS the
+                # DEFAULT_MODEL sentinel the backend resolves itself), matching
+                # the spawn-side effort_dropped verdict so one drop event reads
+                # as one event across both surfaces.
+                #
+                # An EXPLICIT override always warns: a caller's own request
+                # being dropped is the event this gate exists to surface, and
+                # a config-default drop must not burn its dedupe key first
+                # (Design review on this PR). Only the static config default
+                # (base_effort with no override) dedupes per (model, level) —
+                # it is one unchanging configuration fact that would otherwise
+                # repeat on every provider construction (warm-pool fills and
+                # recycles included); a config change rebuilds the factory and
+                # re-arms it.
+                _dedupe = not reasoning_effort_override
+                if not _dedupe or (m, _eff) not in _effort_drop_warned:
+                    if _dedupe:
+                        _effort_drop_warned.add((m, _eff))
+                    logger.warning(
+                        "reasoning effort '%s' will not be applied (session %s) — "
+                        "model '%s' does not support effort configuration",
+                        _eff,
+                        session_key or "?",
+                        m or "auto",
+                    )
             return AcpProvider(
                 work_dir=wdir,
                 model=m,
@@ -8572,6 +9939,7 @@ class KiroCrewConfig:
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_settings_mcp_json=_gw_settings,
                 mcp_gateway_socket=_gw_socket,
+                mcp_gateway_claude_servers=_gw.claude_session_servers,
             )
 
         return _acp
@@ -8583,9 +9951,9 @@ def build_provider_factory(cfg: "KiroCrewConfig") -> Callable:
     Routes through ``current_context().providers.create_factory(cfg)`` (the CPP
     ``ProviderRegistry`` extension point) instead of calling
     ``cfg.create_provider_factory()`` directly, so an edition can supply an
-    alternate provider factory (e.g. re-registering an extra ACP backend through
-    the dormant ``ACP_BACKEND_*`` seam).  The ``Default`` ProviderRegistry returns
-    exactly ``cfg.create_provider_factory()``, so the public edition is
+    alternate provider factory (e.g. registering an ACP backend the core does not
+    ship, through the ``ACP_BACKEND_*`` seam).  The ``Default`` ProviderRegistry
+    returns exactly ``cfg.create_provider_factory()``, so the public edition is
     behaviorally identical to calling it directly.
 
     Fail-closed: a :class:`PlatformCompositionError` (a non-standalone host that
@@ -8897,6 +10265,263 @@ def _materialized_kiro_agent(agent_name: str | None, project_dir: str | None = N
     return ""
 
 
+# Snapshot of the Kiro Crew agent ALIAS table as ONE immutable
+# ``(aliases, default_alias, ready)`` triple — the keys of ``config.agents``, the
+# alias a request falls back to, and whether a load has published yet. Refreshed
+# by every successful :meth:`KiroCrewConfig.load`, exactly like
+# ``_MATERIALIZED_AGENTS`` is refreshed by every scan, and for the same reason:
+# the read path (:func:`resolve_effective_agent`, reached from
+# ``_ChatSlot.to_dict`` for every slot of every slots frame) must do ZERO
+# filesystem work, and ``config.agents`` is otherwise only reachable by
+# re-reading and re-validating ``config.json``.
+#
+# One tuple rather than three globals, and no lock, deliberately: publishing is a
+# single rebind of a single name, so a reader either sees the whole previous
+# triple or the whole new one. Three separate globals would need a lock to stop a
+# reader pairing the new alias set with the old fallback name, and that lock would
+# then be acquired once per slot per frame on the event loop. Immutability is what
+# removes the need for it — never mutate the tuple or the frozenset in place.
+#
+# ``ready=False`` reads as "no opinion", not "nothing configured": the resolver
+# reports no divergence rather than guessing, because a wrong "your agent was
+# substituted" marker is worse than none at all.
+_CONFIG_AGENT_ALIAS_SNAPSHOT: tuple[frozenset[str], str, bool] = (frozenset(), "", False)
+
+
+def publish_agent_alias_snapshot(config: "KiroCrewConfig") -> None:
+    """Publish *config*'s alias table for the filesystem-free display resolver.
+
+    Pure in-memory rebind — safe from anywhere, including the event loop. Called
+    from :meth:`KiroCrewConfig.load` so every successful load refreshes it,
+    including the degraded-defaults path (which must OVERWRITE a richer previous
+    snapshot rather than leave a resolver claiming aliases that no longer load).
+    """
+    global _CONFIG_AGENT_ALIAS_SNAPSHOT
+    aliases = frozenset(str(n) for n in config.agents if isinstance(n, str) and n)
+    default_alias = config.default_agent if config.default_agent in config.agents else ""
+    if not default_alias and aliases:
+        # Mirrors resolve_agent_bindings' defensive branch: an unusable
+        # ``default_agent`` is answered by the first configured alias.
+        default_alias = next(iter(config.agents))
+    _CONFIG_AGENT_ALIAS_SNAPSHOT = (aliases, default_alias, True)
+
+
+def agent_alias_snapshot() -> tuple[frozenset[str], str, bool]:
+    """The published alias table as ``(aliases, default_alias, ready)``."""
+    return _CONFIG_AGENT_ALIAS_SNAPSHOT
+
+
+# Snapshot of the auto-compaction threshold, refreshed by every successful
+# :meth:`KiroCrewConfig.load`, for the same reason as the two snapshots above:
+# the read path (``SessionManager._compaction_gate_decision``) runs on the event
+# loop after every turn, so it must never stat/read/validate config.json itself.
+#
+# What this specifically buys, beyond avoiding that I/O: a config write from ANY
+# writer reaches a running gateway. The dashboard PATCH handler and the CLI both
+# end at ``update_config_locked``, and only the handler could notify the manager
+# it had changed something -- so a ``kirocrew config set`` landed on disk while
+# the live threshold kept its startup value until a restart. Publishing on load
+# closes that without either writer having to know which live object holds it.
+#
+# Ordered by a monotonically increasing TICKET drawn before each load's read.
+# Loads run concurrently (prompt assembly, background threads), so without
+# ordering an older load finishing last would republish the value it read before
+# a newer write -- leaving live sessions compacting at an obsolete threshold
+# until something loaded again. The two snapshots above carry the same race; the
+# consequence there is a display marker, which is why only this one is ordered.
+#
+# A ticket rather than the files' newest ``st_mtime_ns``, because this ordering
+# must be monotonic and an mtime is not. Deleting the newer of the two config
+# files LOWERS that maximum, and so does restoring a backup with ``cp -p`` or any
+# other writer that preserves timestamps; each one makes the current state of the
+# filesystem look like an older read, so the publish that should win is dropped
+# and the live gate keeps a threshold the files no longer say. A ticket is
+# independent of the filesystem, so a deletion and a timestamp-preserving restore
+# both order as what they are: the newest read.
+_CONFIG_AUTOCOMPACT_PCT: float = DEFAULT_AUTOCOMPACT_PCT
+_CONFIG_AUTOCOMPACT_TICKET: int = 0
+
+#: Highest ticket handed out by :func:`next_config_load_ticket`. Distinct from the
+#: PUBLISHED ticket above: a load draws one and can still lose the comparison,
+#: which must not move the published mark.
+_CONFIG_AUTOCOMPACT_ISSUED: int = 0
+
+#: Serializes the ticket draw and the compare-and-set in
+#: :func:`publish_autocompact_pct`. Held ONLY on those two write paths, each of
+#: which runs inside ``load()`` and is therefore already doing file I/O and schema
+#: validation -- the lock is free by comparison. The READ path
+#: (:func:`published_autocompact_pct`) never takes it, which is what keeps the
+#: event loop lock-free; that is the objection the alias snapshot above avoids by
+#: publishing one immutable tuple, and it does not apply to a write-side lock.
+#:
+#: Needed because each path is a read followed by a write: without it two
+#: concurrent loads can draw the SAME ticket, or both pass the publish comparison
+#: and let whichever assigns LAST win, so an older read replaces a newer one and
+#: rolls the published ticket backwards with it.
+_CONFIG_AUTOCOMPACT_LOCK = threading.Lock()
+
+
+def next_config_load_ticket() -> int:
+    """Draw the next config-load ordering ticket.
+
+    Call this BEFORE the read whose result will be published, so the ticket
+    records when this load began observing the files. Two loads whose reads
+    interleave are then ordered by ticket rather than by anything on disk: the
+    loser's value is at most microseconds stale and the next load corrects it,
+    where an unordered publish can leave an obsolete threshold in force
+    indefinitely.
+
+    Never returns 0, so 0 means "nothing published yet".
+    """
+    global _CONFIG_AUTOCOMPACT_ISSUED
+    with _CONFIG_AUTOCOMPACT_LOCK:
+        _CONFIG_AUTOCOMPACT_ISSUED += 1
+        return _CONFIG_AUTOCOMPACT_ISSUED
+
+
+def publish_autocompact_pct(config: "KiroCrewConfig", ticket: int | None = None) -> None:
+    """Publish *config*'s compaction threshold for the filesystem-free read path.
+
+    Pure in-memory rebind -- safe from anywhere, including the event loop, and a
+    reader sees either the whole previous value or the whole new one. Called from
+    :meth:`KiroCrewConfig.load` so every successful load refreshes it, including
+    the degraded-defaults path, which must OVERWRITE a previous snapshot rather
+    than leave a stale threshold in force.
+
+    *ticket* orders this publish against concurrent ones. It must come from
+    :func:`next_config_load_ticket`, drawn BEFORE the read that produced *config*;
+    a ticket lower than the one already published is dropped. Omitting it draws a
+    fresh ticket, which therefore always wins -- correct for a caller that has
+    just built the config it is publishing (tests), and wrong for one replaying an
+    earlier read, which must pass the ticket it drew.
+
+    No ticket value is special-cased. "Neither config file exists" is the current
+    truth rather than an older read of the same file, and it arrives here on the
+    degraded-defaults path holding a freshly drawn ticket, so it wins by ordinary
+    comparison. Being able to state that without a carve-out is the reason the
+    ticket is independent of the files: an ordering read off their mtime drops to
+    a lower value when a file is removed, and so cannot express it.
+    """
+    global _CONFIG_AUTOCOMPACT_PCT, _CONFIG_AUTOCOMPACT_TICKET
+    # Drawn OUTSIDE the lock: next_config_load_ticket acquires the same
+    # non-reentrant lock, so drawing it inside the block below would deadlock.
+    if ticket is None:
+        ticket = next_config_load_ticket()
+    # Compare and BOTH assignments under one lock: they are a single
+    # compare-and-set, and splitting them lets two concurrent loads both pass the
+    # comparison and race the writes. See _CONFIG_AUTOCOMPACT_LOCK.
+    with _CONFIG_AUTOCOMPACT_LOCK:
+        if ticket < _CONFIG_AUTOCOMPACT_TICKET:
+            return
+        _CONFIG_AUTOCOMPACT_TICKET = ticket
+        _CONFIG_AUTOCOMPACT_PCT = config.session.autocompact_pct
+
+
+def published_autocompact_pct() -> float:
+    """The published compaction threshold."""
+    return _CONFIG_AUTOCOMPACT_PCT
+
+
+# The scheduler reads this on its event-loop hot path. Publish the value during
+# config load rather than re-reading config.json for every cron calculation.
+_CONFIG_TIMEZONE: str = ""
+_CONFIG_TIMEZONE_TICKET: int = 0
+_CONFIG_TIMEZONE_LOCK = threading.Lock()
+
+
+def publish_config_timezone(config: "KiroCrewConfig", ticket: int | None = None) -> None:
+    """Publish the configured timezone with the same load-order guard as compaction."""
+    global _CONFIG_TIMEZONE, _CONFIG_TIMEZONE_TICKET
+    if ticket is None:
+        ticket = next_config_load_ticket()
+    with _CONFIG_TIMEZONE_LOCK:
+        if ticket < _CONFIG_TIMEZONE_TICKET:
+            return
+        _CONFIG_TIMEZONE_TICKET = ticket
+        _CONFIG_TIMEZONE = config.timezone
+
+
+def published_config_timezone() -> str:
+    """Return the last successfully loaded default timezone, or ``""``."""
+    return _CONFIG_TIMEZONE
+
+
+def resolve_effective_agent(agent_name: str | None, project_dir: str | None = None) -> str:
+    """Name the agent that will actually answer *agent_name*, or ``""``.
+
+    A DISPLAY-side companion to :func:`resolve_agent_bindings`, and deliberately
+    narrower than it. The empty string means **"nothing to report"** — either the
+    requested name is honored, or resolution cannot be settled without touching
+    the filesystem. A non-empty return is a positive claim that a DIFFERENT agent
+    answers this session, which is what the UI renders as a divergence marker.
+
+    Three properties make it safe to call from ``_ChatSlot.to_dict``, which runs
+    on the event loop for every slots frame:
+
+    * **No filesystem access, and no lock.** Only the two in-memory snapshots are
+      read (:func:`agent_alias_snapshot` and ``_MATERIALIZED_AGENTS``) plus the
+      syscall-free project cache. It never scans, stats, or re-reads
+      ``config.json``, so it cannot become a per-frame gateway stall — and because
+      the alias snapshot is one immutable tuple, reading it is a single atomic
+      name load rather than a mutex acquired once per slot per frame.
+    * **Fails closed to "no claim".** A cold alias snapshot, a cold materialized
+      snapshot, or a cold project cache all return ``""``. A false
+      "your agent was substituted" marker is worse than no marker: the user would
+      chase a substitution that never happened, and the honest answer during a
+      boot window is silence.
+    * **Reads nothing back.** The requested name is never rewritten — see the
+      note in ``chat_handlers`` on why storing the resolved name was destructive.
+      This function only describes; the stored binding stays verbatim.
+
+    *project_dir* widens the "honored" set to the session's own ``.kiro`` scope
+    via the cache-only reader, so a project-declared agent is not mislabelled as
+    substituted. A cold cache for that project yields ``""``.
+    """
+    if not agent_name:
+        return ""
+    aliases, default_alias, ready = agent_alias_snapshot()
+    if not ready or not default_alias:
+        return ""
+    if agent_name in aliases:
+        # A Kiro Crew alias resolves to itself (step 1 of resolve_agent_bindings).
+        return ""
+    if not _MATERIALIZED_AGENTS_READY:
+        # Cold snapshot: a materialized kiro agent may well declare this name and
+        # we simply cannot see it yet. Claim nothing.
+        return ""
+    if agent_name in _MATERIALIZED_AGENTS:
+        return ""
+    if project_dir and not _project_scope_excludes(agent_name, project_dir):
+        return ""
+    if default_alias == agent_name:
+        return ""
+    return default_alias
+
+
+def _project_scope_excludes(agent_name: str, project_dir: str) -> bool:
+    """Whether *project_dir* is KNOWN not to declare *agent_name*.
+
+    The conservative half of :func:`_project_declares_agent`: it answers ``True``
+    only from a WARM cache, and makes no syscalls even off the event loop. An
+    uncached project is not evidence of absence, so it answers ``False`` and the
+    caller reports no divergence.
+    """
+    try:
+        # circular import: agent_discovery imports kiro_crew.hooks (the hardened
+        # file-read gate), whose import closure reaches back into
+        # kiro_crew.config.loader — the same cycle documented at length on
+        # :func:`_project_declares_agent`, which defers this identical import for
+        # this identical reason. A module-scope import here would be that cycle.
+        from kiro_crew.agent_discovery import cached_project_agent_names
+
+        names = cached_project_agent_names(project_dir)
+    except Exception:  # noqa: BLE001 — a lookup failure is "no evidence"
+        return False
+    if names is None:
+        return False
+    return agent_name not in names
+
+
 def _read_hardened_agent_spec(path: Path) -> dict | None:
     """Read one agent spec through ``agent_discovery``'s hardened reader.
 
@@ -8912,7 +10537,7 @@ def _read_hardened_agent_spec(path: Path) -> dict | None:
     try:
         from kiro_crew.agent_discovery import _read_agent_spec
 
-        return _read_agent_spec(path)
+        return _read_agent_spec(path, operation="load_config", source="unknown")
     except Exception:
         return None
 

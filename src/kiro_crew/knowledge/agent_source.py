@@ -35,7 +35,7 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
 from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline
-from .store import KnowledgeStore
+from .store import AUTO_ADDED_PROP, KnowledgeStore
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ def ensure_agent_source(store: KnowledgeStore) -> tuple[str, bool]:
             name=AGENT_SOURCE_NAME,
             source_type=AGENT_SOURCE_TYPE,
             uri=AGENT_SOURCE_URI,
-            properties={"sync_status": "active", "auto_added": True},
+            properties={"sync_status": "active", AUTO_ADDED_PROP: True},
         )
         return source_id, True
     except Exception:
@@ -374,7 +374,7 @@ async def _add_agent_document(
             # The duplicate-branch sibling of on_committed, and inside the gate's
             # hop for the same reason: the gate has already committed the delete
             # and the location claim by the time it reports back.
-            on_duplicate=lambda: _record_deduped_state(
+            on_duplicate=lambda _text_hash: _record_deduped_state(
                 store, source_id, slug, content_hash, title),
         )
     finally:

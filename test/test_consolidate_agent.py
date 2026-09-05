@@ -55,9 +55,12 @@ class TestConsolidateAgent:
         from kiro_crew.session import BACKGROUND_KEY
 
         assert _CONSOLIDATE_SESSION_KEY != BACKGROUND_KEY
-        import kiro_crew.history as history
+        # ``history`` re-exports the name, but the ``background_turn`` call that
+        # binds it is in ``history_consolidation`` — read the module that holds
+        # the call site, or the assertion inspects a facade and always passes.
+        import kiro_crew.history_consolidation as history_consolidation
 
-        src = inspect.getsource(history)
+        src = inspect.getsource(history_consolidation)
         assert "session_key=_CONSOLIDATE_SESSION_KEY" in src
 
     def test_consolidation_session_is_bounded(self) -> None:
@@ -70,6 +73,18 @@ class TestConsolidateAgent:
         assert history._CONSOLIDATE_SESSION_KEY == CONSOLIDATE_KEY
 
     def test_consolidate_key_registered_stateless(self) -> None:
+        # The skip-resume decision lives in the allocation service and names the
+        # key through the constants it is handed, so both halves are pinned: the
+        # allocator consults ``consolidate_key``, and the manager binds that slot
+        # to ``CONSOLIDATE_KEY``. Either half alone lets the key resume.
+        from kiro_crew.session_allocation import SessionAllocationService
+
+        assert "constants.consolidate_key" in inspect.getsource(
+            SessionAllocationService.get_or_create
+        )
+
         import kiro_crew.session as session
 
-        assert "CONSOLIDATE_KEY" in inspect.getsource(session.SessionManager.get_or_create)
+        assert "consolidate_key=CONSOLIDATE_KEY" in inspect.getsource(
+            session.SessionManager._allocation_deps
+        )

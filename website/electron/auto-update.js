@@ -103,7 +103,9 @@ const CHECK_COMMAND_MAX_CHARS = 512;
  *
  * Lookup order: the `KIROCREW_EXTERNALLY_MANAGED` env var (a path to a marker
  * file, or any other non-empty value to mark the install managed with no
- * metadata — the test-harness seam, mirroring `KIROCREW_UPDATE_FEED`), then
+ * metadata — the test-harness seam, mirroring `KIROCREW_UPDATE_FEED`, and
+ * honored ONLY on an unpackaged build: in a packaged app one env var in the
+ * launch environment would otherwise name the file whose body we execute), then
  * `<resourcesPath>/EXTERNALLY-MANAGED`. I/O-bearing and fully injectable, like
  * resolveLinuxInstall above.
  *
@@ -119,13 +121,42 @@ const CHECK_COMMAND_MAX_CHARS = 512;
  * self-updating. Entries are `lstat`ed and only regular files are read, so a
  * symlink can never route this startup-path read into a FIFO or device.
  *
+ * INTEGRITY: the metadata is only parsed when neither the marker nor its
+ * directory is OWNED by this euid or writable by group/other (see
+ * canRewriteMarker) — `updateCommand`/`checkCommand` are SHELLED, so a marker
+ * anything running as this user could rewrite is a marker that names arbitrary
+ * code to run. A rewritable marker still means MANAGED, just with no metadata:
+ * the same degenerate shape as an empty body, which leaves the updater off and
+ * nothing to execute. Windows always takes that answer (no POSIX owner to read).
+ *
  * @param {object} [o]
  * @param {object} [o.env=process.env]
  * @param {string} [o.resourcesPath=process.resourcesPath]
+ * @param {boolean} [o.isPackaged]  packaged app? gates the env-var seam off
+ * @param {(p:string)=>boolean} [o.probeMarkerRewritable=canRewriteMarker]
  * @returns {{managedBy:string, updateCommand:string, checkCommand:string}|null} null when not managed
  */
-function readExternallyManaged({ env = process.env, resourcesPath = process.resourcesPath } = {}) {
+function readExternallyManaged({
+  env = process.env,
+  resourcesPath = process.resourcesPath,
+  // Is this a PACKAGED app? Only the env-var seam consults it, and only to
+  // refuse. Resolved lazily so the module still loads outside Electron: a
+  // runtime with no `electron.app` is by definition not the packaged desktop
+  // app, which is exactly when the harness seam is allowed.
+  isPackaged = (() => {
+    try {
+      const electronApp = require("electron").app;
+      return !!(electronApp && electronApp.isPackaged);
+    } catch {
+      return false;
+    }
+  })(),
+  // Marker-integrity probe, injected for the same reason as the other probes in
+  // this module: assertable without a real read-only install directory.
+  probeMarkerRewritable = canRewriteMarker,
+} = {}) {
   let raw = null;
+  let markerPath = "";
   try {
     const fs = require("fs");
     const path = require("path");
@@ -145,20 +176,30 @@ function readExternallyManaged({ env = process.env, resourcesPath = process.reso
         return "";
       }
     };
-    const override = (env && env.KIROCREW_EXTERNALLY_MANAGED) || "";
+    // The env seam is a DEV/TEST affordance. In a packaged app the launch
+    // environment (shell profile, launchd plist, .desktop file) is writable by
+    // the user, so honoring it there would let one env var choose the file whose
+    // body this process shells.
+    const override = (!isPackaged && env && env.KIROCREW_EXTERNALLY_MANAGED) || "";
     if (override) {
       // A value that names a marker file reads it; any other non-empty value
       // (including a dangling path) marks the install managed with no metadata.
+      markerPath = override;
       raw = readMarkerAt(override);
       if (raw === null) raw = "";
     } else {
-      raw = readMarkerAt(path.join(resourcesPath || "", EXTERNALLY_MANAGED_MARKER));
+      markerPath = path.join(resourcesPath || "", EXTERNALLY_MANAGED_MARKER);
+      raw = readMarkerAt(markerPath);
       if (raw === null) return null;
     }
   } catch {
     // fs itself unavailable (non-node runtime): nothing to read, not managed.
     return null;
   }
+  // Integrity gate: a marker this process could rewrite carries no authority,
+  // so it is read as a bare marker (managed, no metadata). Deliberately BEFORE
+  // the parse, so no attacker-chosen string reaches the fields at all.
+  if (raw && probeMarkerRewritable(markerPath)) raw = "";
   let managedBy = "";
   let updateCommand = "";
   let checkCommand = "";
@@ -179,6 +220,73 @@ function readExternallyManaged({ env = process.env, resourcesPath = process.reso
     // Presence alone is the signal; a bare marker means managed, no metadata.
   }
   return { managedBy, updateCommand, checkCommand };
+}
+
+// Can THIS process rewrite the externally-managed marker?
+//
+// The marker's `updateCommand`/`checkCommand` are handed to a shell, so the
+// marker's integrity is the whole boundary between "the packager that owns this
+// install told us how to update" and "anything that can write one file told us
+// what to run". A marker we can rewrite is one a prompt-injected agent shell
+// running as this user can rewrite, so its metadata is refused.
+//
+// The question is OWNERSHIP, not the current mode bits. `access(W_OK)` answers
+// "can I write this right now", and a POSIX owner can always `chmod +w` back —
+// so on exactly the user-owned installs this exists to defend (Homebrew,
+// `pip --user`, ~/Applications) an attacker would plant the marker, `chmod 0400`
+// it, and be handed the trusted verdict. Provenance is what the metadata's
+// authority rests on, so provenance is what is probed:
+//
+//   - a file or directory OWNED by this euid is rewritable (chmod is ours),
+//   - a group- or world-writable one is rewritable by whoever else holds it, and
+//   - one the KERNEL says we can write is rewritable however that was granted.
+//
+// The third arm is not redundant with the second: POSIX mode bits do not model
+// ACLs, so a root-owned 0755 directory carrying a macOS `chmod +a` (or Linux
+// setfacl) entry for this user is writable while every mode bit reads safe.
+// access(W_OK) is the only check that sees that grant.
+//
+// Both the marker and its directory are checked, because either one controls the
+// content: a writable directory allows replacing the file outright, and a file
+// we own is rewritable even inside a directory we do not.
+//
+// Fail-CLOSED — the OPPOSITE direction to isBundleContainerWritable below. There
+// a probe that cannot run must not disable updates; here a marker whose
+// provenance cannot be established must not be executed. The cost of the safe
+// answer is only "no metadata", which is the historical bare-marker behavior.
+// Windows takes that answer UNCONDITIONALLY and by declaration: it has no POSIX
+// owner to read, and `access(W_OK)` there does not model ACLs, so there is no
+// honest verdict to give. A Windows install therefore never honors marker
+// commands; see docs/build/desktop-app.md.
+function canRewriteMarker(markerPath) {
+  try {
+    const fs = require("fs");
+    const path = require("path");
+    // No POSIX ownership to read: declared fail-closed (see note above).
+    if (process.platform === "win32" || typeof process.geteuid !== "function") return true;
+    const euid = process.geteuid();
+    // root owns everything and can chmod anything, so nothing is un-rewritable.
+    if (euid === 0) return true;
+    for (const target of [markerPath, path.dirname(markerPath)]) {
+      let st;
+      try {
+        st = fs.lstatSync(target);
+      } catch {
+        return true; // cannot establish provenance
+      }
+      if (st.uid === euid) return true;          // ours: chmod +w is ours too
+      if ((st.mode & 0o022) !== 0) return true;  // group- or world-writable
+      try {
+        fs.accessSync(target, fs.constants.W_OK);
+        return true;                             // ACL-granted write
+      } catch {
+        // Not writable by any grant the kernel knows about.
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 // Can the AppImage replace itself, i.e. is the directory HOLDING the image
@@ -483,10 +591,9 @@ function buildFeedBase({ base, channel, variant = "" }) {
  * over the top is the supported recovery and is non-destructive: user data lives
  * in the KiroCrew home directory, never inside the app bundle.
  *
- * Computed HERE rather than in the renderer because the renderer has no
- * trustworthy platform: getInfo()'s `platform` field is a display string that
- * main.js does not currently supply, so it reports its "darwin-arm64" default on
- * every OS. osPlatform is the real one.
+ * Computed HERE rather than in the renderer because the display-oriented
+ * getInfo().platform value is not the updater's routing authority. osPlatform
+ * and osArch are the native values used to select a published artifact.
  *
  * Paths are the documented mutable "latest" aliases (max-age=300).
  *
@@ -669,11 +776,12 @@ function classifyError(err) {
  * @param {typeof import("electron").Notification} deps.Notification
  * @param {() => string} deps.getFlavor        - returns "beta" | "stable"
  * @param {() => Promise<void>} deps.stopGateway - graceful, awaitable gateway stop
- * @param {string} [deps.platform]             - display arch, e.g. "darwin-arm64"
  * @param {string} [deps.osPlatform]           - process.platform override (tests)
  * @param {string} [deps.osArch]               - process.arch override (tests). Picks the
  *   per-arch Linux AppImage for the manual-reinstall link; darwin ignores it
  *   (the DMG is universal).
+ * @param {string} [deps.platform]             - display platform override (tests);
+ *   defaults to `${osPlatform}-${osArch}`
  * @param {string} [deps.resourcesPath]        - process.resourcesPath override
  *   (tests). Used only to classify where the bundle runs FROM, so a
  *   translocated / read-only-volume install can be refused an update lane.
@@ -720,9 +828,9 @@ function initAutoUpdate(deps) {
     // without this the user is left in a live app whose dashboard is dead until
     // they relaunch by hand. main.js re-arms recovery and respawns the gateway.
     onInstallFailed = null,
-    platform = "darwin-arm64",
     osPlatform = process.platform,
     osArch = process.arch,
+    platform = `${osPlatform}-${osArch}`,
     resourcesPath = process.resourcesPath,
     probeBundleWritable = isBundleContainerWritable,
     // Linux install shape + its AppImage writability probe, injected for the
@@ -774,6 +882,43 @@ function initAutoUpdate(deps) {
   // back out so the renderer can replay it on mount, which keeps the boot path
   // untouched (the renderer already requests the info payload).
   let lastEmittedState = null;
+  // The version the FOLLOWED channel's feed last reported, and the channel it was
+  // reported FOR. Recorded because promotion never re-stamps: the stable feed's
+  // current release is literally `0.4.1-insider.1`, so `channelForVersion` cannot
+  // tell a promoted-stable install from an insider one, and every surface that
+  // asked the version string "which lane am I on" answered `insider` for the whole
+  // promoted-stable population. The feed's own answer is the only honest input, so
+  // it is kept for the display layer.
+  let laneVersion = null;
+  let laneChannel = null;
+  /**
+   * The lane pair, or UNKNOWN. Reported as unknown unless the recorded version
+   * was read for the channel this install follows RIGHT NOW: a switch makes the
+   * old lane's answer describe a lane nobody is on, and `update:set-channel`
+   * returns `getInfo()` synchronously while its re-check is still in flight, so a
+   * read-time comparison is what closes that window rather than clearing state on
+   * an ordering assumption. Concretely, without it: flip insider -> stable on an
+   * up-to-date insider build while the follow-up check cannot reach the feed
+   * (offline), and a retained `runningAheadOfLane: false` tells the panel these
+   * bytes ARE the stable release — folding the chip to a version that does not
+   * exist and suppressing the prerelease ask, i.e. the very bug this pair exists
+   * to fix. `null` means no usable answer and must never read as "ahead".
+   */
+  function laneSnapshot() {
+    if (!laneVersion || laneChannel !== currentChannel()) {
+      return { laneVersion: "", runningAheadOfLane: null };
+    }
+    return { laneVersion, runningAheadOfLane: isNewerVersion(app.getVersion(), laneVersion) };
+  }
+  /** Record what the lane just answered, attributed to the lane that answered. */
+  function recordLaneVersion(version) {
+    if (!version) return;
+    laneVersion = version;
+    // The channel the FETCH was configured for, not a live read: the preference
+    // can flip while a check is in flight, and attributing that answer to the new
+    // lane is the same mis-pairing `shouldAutoOffer` avoids with `feedChannel`.
+    laneChannel = feedChannel || currentChannel();
+  }
   // Single channel resolver used for the feed AND everything reported to
   // the UI. Read the preference FRESH on every call: configureFeed() runs
   // per check, so a Settings channel switch takes effect on the next check
@@ -797,6 +942,12 @@ function initAutoUpdate(deps) {
       installHandoff: osPlatform === "win32" && !managed
         ? "windows-installer"
         : "automatic-relaunch",
+      // Display inputs for the version chip and the prerelease note (see
+      // laneSnapshot). Carried on every lifecycle payload as well as getInfo()
+      // so a renderer driven by pushes alone never falls back to the
+      // stamp-based guess this pair replaces -- and so a renderer that mounted
+      // before the latest check does not keep rendering that older answer.
+      ...laneSnapshot(),
       ...extra,
     };
     // Remembered even when the push below throws: a renderer that missed the
@@ -826,6 +977,13 @@ function initAutoUpdate(deps) {
       stampedChannel: stamped,
       channelSwitchable: !managed && (stamped === "insider" || stamped === "stable"),
       channelPreference: getChannelPreference() || "",
+      // What the FOLLOWED channel publishes, and whether these bytes are ahead
+      // of it — i.e. that lane never shipped this build, so the install is not
+      // on it. Both come from the feed rather than from `stampedChannel`, which
+      // a promoted stable release makes unusable for the question (its bytes
+      // keep the soaked candidate's insider stamp). "" / null until a check has
+      // completed FOR THE CHANNEL THIS INSTALL FOLLOWS (see laneSnapshot).
+      ...laneSnapshot(),
       // Current auto-download policy, so About renders the toggle from the
       // value the updater will actually act on rather than from its own copy
       // of the store. Read through the same guard as the event path: a
@@ -866,14 +1024,18 @@ function initAutoUpdate(deps) {
     // manager), we discover and apply updates by SHELLING the marker's own
     // commands.
     //
-    // TRUST / HARDENING: the EXTERNALLY-MANAGED marker is an operator/packager
-    // file under <resourcesPath>, and — unlike the Python security_policy pins,
-    // which live in a home dir a prompt-injected agent shell cannot write — it
-    // is NOT a protected trust root; on a user-writable install its directory
-    // may be writable. So we do not lean on the marker's integrity: we HARDEN
-    // EXECUTION instead (see runManagedCommand) — a narrowed system-only PATH so
-    // a planted shim on the user's PATH cannot shadow a command, cwd="/" (never
-    // the app or an inherited dir), a timeout, and bounded retained output. The
+    // TRUST / HARDENING: reaching here means the marker's metadata already
+    // passed the integrity gate in readExternallyManaged — neither the marker nor
+    // its directory is owned by this euid or writable by group/other, so it is a
+    // genuine packager artifact rather than a file a prompt-injected agent shell
+    // could have planted. That gate is
+    // what makes the commands trustworthy at all; the hardening below is about
+    // the ENVIRONMENT they run in, not about the command string (see
+    // runManagedCommand) — a narrowed system-only PATH so a planted shim on the
+    // user's PATH cannot shadow a command, a CONSTRUCTED environment so nothing
+    // the shell reads as code is inherited at all, cwd="/" (never the app or an
+    // inherited dir), a
+    // timeout, and bounded retained output. The
     // command still runs through a shell, so the writer MUST name absolute
     // binaries (a bare name will not resolve under the narrowed PATH); we NEVER
     // interpolate untrusted input. Platform-agnostic: the same path serves
@@ -914,6 +1076,54 @@ function initAutoUpdate(deps) {
             process.env.SystemRoot || "C:\\Windows",
           ].join(";")
         : "/usr/bin:/bin:/usr/sbin:/sbin";
+    // The child's environment is CONSTRUCTED, not filtered.
+    //
+    // `shell: true` means a shell interprets the command, and a shell reads its
+    // environment as code: the loader family (LD_*/DYLD_*), the interpreter
+    // family (PYTHON*, NODE_OPTIONS), the startup files (BASH_ENV, ENV), the
+    // tracing pair (SHELLOPTS plus a command-substituting PS4), word splitting
+    // (IFS), and exported shell FUNCTIONS (BASH_FUNC_* — a function shadows a
+    // command name outright, beating managedPath() rather than evading it).
+    // That namespace is open-ended and differs by shell and by version, so no
+    // denylist over it is provably complete; successive review rounds just find
+    // the next name.
+    //
+    // Naming what the child DOES get inverts that: anything absent from this
+    // list is gone by construction, so every present and future injection
+    // variable is already handled and there is no enumeration to keep current.
+    // The list carries what a packager's own updater plausibly needs — locale,
+    // temp dir, proxy — and nothing a shell or an interpreter treats as code. A
+    // packager needing more sets it inside its own command, which is the one
+    // place that requirement is visible to whoever wrote it.
+    //
+    // HOME is deliberately NOT here. It is not shell-interpreted, but it is a
+    // path an interpreter reads code from: Python derives its user-site
+    // directory from HOME, so a planted ~/.local/lib/pythonX/site-packages/
+    // sitecustomize.py executes on every `python` start. Passing HOME would
+    // re-open the startup-injection class for any marker command that happens to
+    // be a Python program, which is the class this whole construction closes.
+    const MANAGED_ENV_PASSTHROUGH = [
+      "USER", "LOGNAME", "TZ", "TMPDIR",
+      "LANG", "LC_ALL", "LC_CTYPE",
+      "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+      "http_proxy", "https_proxy", "no_proxy",
+    ];
+    // cmd.exe cannot start without these, so the win32 lane mirrors
+    // managedPath()'s win32 branch rather than handing it a shell it cannot run.
+    const MANAGED_ENV_PASSTHROUGH_WIN32 = [
+      "SystemRoot", "SystemDrive", "windir", "COMSPEC",
+      "PATHEXT", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+    ];
+    const managedEnv = () => {
+      const e = { PATH: managedPath() };
+      const keys = process.platform === "win32"
+        ? [...MANAGED_ENV_PASSTHROUGH, ...MANAGED_ENV_PASSTHROUGH_WIN32]
+        : MANAGED_ENV_PASSTHROUGH;
+      for (const k of keys) {
+        if (process.env[k] !== undefined) e[k] = process.env[k];
+      }
+      return e;
+    };
 
     // Run a marker command through the platform shell, resolving to
     // {code, out} (combined stdout+stderr, capped). Never rejects: spawn errors
@@ -957,7 +1167,7 @@ function initAutoUpdate(deps) {
         child = cp.spawn(command, { // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
           shell: true,
           cwd: "/",
-          env: { ...process.env, PATH: managedPath() },
+          env: managedEnv(),
           ...(timeout ? { timeout } : {}),
         });
       } catch (err) {
@@ -1698,6 +1908,11 @@ function initAutoUpdate(deps) {
   autoUpdater.on("update-not-available", () => {
     downloading = false;
     foundVersion = null;
+    // The feed's gate is DIFFERENCE-based (allowDowngrade=true), so "not
+    // available" means the followed lane publishes exactly the running version:
+    // record that, which is what makes the lane pair a definite not-ahead
+    // instead of an unknown for the whole up-to-date population.
+    recordLaneVersion(app.getVersion());
     // Clear the STAGED state too, not just the found state. The feed reporting
     // "no update" while something is staged is exactly the retraction path
     // (a feed repointed to the running version) and the channel-switch-back
@@ -1722,6 +1937,14 @@ function initAutoUpdate(deps) {
   // and the consent paths share one guarded entry point (startDownload).
   autoUpdater.on("update-available", (info) => {
     foundVersion = (info && info.version) || null;
+    // What the followed lane publishes, recorded BEFORE the direction gate
+    // below can null `foundVersion` out. The suppressed case is precisely the
+    // one the display layer needs it for: an insider build whose preference was
+    // flipped to stable reaches here with the stable lane's OLDER release, is
+    // (correctly) not auto-offered, and must still be able to say "stable
+    // publishes 0.4.1; you are running bytes it never shipped" instead of
+    // folding its version to a stable release that does not exist.
+    recordLaneVersion(foundVersion);
     // Direction gate — the fix for the "update to an OLDER version" nag.
     // electron-updater fires this for ANY feed version that DIFFERS from the
     // running one, because allowDowngrade=true — so on a build running ahead of
@@ -1888,6 +2111,7 @@ module.exports = {
   manualDownloadUrl,
   resolveLinuxInstall,
   readExternallyManaged,
+  canRewriteMarker,
   DEFAULT_FEED_BASE,
   DOWNLOAD_BASE,
   SUPPORTED_PLATFORMS,

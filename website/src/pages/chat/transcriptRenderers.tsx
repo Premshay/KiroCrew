@@ -21,7 +21,6 @@
  */
 import ThinkingBlock from './ThinkingBlock'
 import ToolCallLine from './ToolCallLine'
-import StopEventCard from './StopEventCard'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
 import RecoveryCard, { resolveInjectCard } from './RecoveryCard'
 import { ErrorCard } from './ErrorCard'
@@ -30,6 +29,7 @@ import SubagentRunCard, { extractSpawnRunLaunch, isSpawnRunTool } from './Subage
 import WorkflowCompletionCard, { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
 import SubagentCompletionCard from './SubagentCompletionCard'
 import { isSubagentCompletionMessage, type ParsedSubagentCompletion } from './subagentCompletion'
+import { REASONING_ROLES, hasReasoningContent } from './groupDisplayItems'
 import { FileCard } from '../../components/FileCard'
 import type { MessageRenderer, MessageRenderContext } from '../../app-sdk/messageRenderers'
 import type { ChatMessage } from '../../types'
@@ -100,13 +100,6 @@ export function createTranscriptRenderers(
   return [
     // ── Shape-matched rows, ahead of anything keyed only by role ──
     {
-      // Replaces the default's inline danger line with the real card.
-      id: 'stop_event',
-      roles: ['*'],
-      match: m => m.kind === 'stop_event' || m.meta?.kind === 'stop_event',
-      render: (m, ctx) => ctx.row(<StopEventCard message={m} />),
-    },
-    {
       // Replaces the default: same card, but wired to open a folder and the
       // side panel the way the single-chat surface does.
       id: 'subagent_completion',
@@ -172,8 +165,11 @@ export function createTranscriptRenderers(
       // surface renders it. Opting a grouped role out of the group is not an
       // extension point yet — tracked in #2940.
       id: 'thinking_block',
-      roles: ['thinking'],
-      render: (m, ctx) => (m.content ? ctx.row(<ThinkingBlock content={m.content} disclosureKey={ctx.key} />) : null),
+      // Both the role key and the content guard derive from the shared
+      // reasoning predicate (see groupDisplayItems.ts) so this surface can
+      // never drift from ChatPage's renderer or the gate→fold pipeline.
+      roles: [...REASONING_ROLES],
+      render: (m, ctx) => (hasReasoningContent(m) ? ctx.row(<ThinkingBlock content={m.content} disclosureKey={ctx.key} />) : null),
     },
     {
       // Replaces the default's null with the player / download card.

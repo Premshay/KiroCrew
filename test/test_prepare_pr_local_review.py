@@ -76,6 +76,63 @@ def _git(cwd, *args):
     return proc.stdout.strip()
 
 
+def _profile_on_main(root, toml_text):
+    """Commit ``toml_text`` as .prepare-pr.toml on the BASE branch (main).
+
+    Profile resolution is pinned to the base ref, so a profile a test wants
+    honoured must exist there -- a worktree-only or branch-only copy is
+    deliberately ignored."""
+    _git(root, "checkout", "-q", "main")
+    (root / ".prepare-pr.toml").write_text(toml_text, encoding="utf-8")
+    _git(root, "add", ".prepare-pr.toml")
+    _git(root, "commit", "-q", "-m", "profile on base")
+    _git(root, "checkout", "-q", "feature")
+
+
+def test_a_non_prompt_base_snapshot_is_not_mistaken_for_a_prompt_block() -> None:
+    """The extractor must select the prompt loader by PATH, not by position.
+
+    `codex-review.yml` materializes two unrelated things from `$BASE_SHA`: the
+    shared `.github/review-prompts/gpt-*.md` blocks, and the review CLI's own
+    `.github/review-cli/{package.json,package-lock.json}` manifest -- the latter
+    ABOVE the former. An extractor that took "the first `for ... do` loop plus
+    the first `git show "$BASE_SHA:...$var..."`" produced prompt specs named
+    `package.json`, and then every downstream test failed looking for
+    `.github/review-prompts/package.json`. That is what this pins.
+    """
+    specs = local_review.extract_prompt_file_specs(_gpt_text())
+    srcs = [spec.src for spec in specs]
+
+    assert srcs, "the GPT lane does keep base-ref prompt blocks"
+    assert all(src.startswith(".github/review-prompts/") for src in srcs), srcs
+    assert not [src for src in srcs if "review-cli" in src or "package" in src], srcs
+
+
+def test_prompt_extraction_survives_a_leading_unrelated_loop() -> None:
+    """Synthetic form of the same defect, so the guard does not depend on
+    `codex-review.yml` keeping its current step order."""
+    text = """
+          for f in package.json package-lock.json; do
+            git show "$BASE_SHA:.github/review-cli/$f" > "$CLI_DIR/$f" 2>/dev/null || true
+          done
+          for p in alpha beta; do
+            git show "$BASE_SHA:.github/review-prompts/$p.md" > ".review-prompts-gpt/$p.md"
+            cp ".github/review-prompts/$p.md" ".review-prompts-gpt/$p.md"
+          done
+    """
+    specs = local_review.extract_prompt_file_specs(text)
+
+    assert [spec.src for spec in specs] == [
+        ".github/review-prompts/alpha.md",
+        ".github/review-prompts/beta.md",
+    ]
+    # The `cp` bootstrap is still picked up, and still from the prompt directory.
+    assert [spec.worktree_src for spec in specs] == [
+        ".github/review-prompts/alpha.md",
+        ".github/review-prompts/beta.md",
+    ]
+
+
 def _gpt_text():
     return GPT_WORKFLOW.read_text(encoding="utf-8")
 
@@ -110,8 +167,8 @@ def _gpt_prompt(values=None, stage="/tmp/stage"):
     """
     text = _gpt_text()
     scalars = local_review.block_scalars(text)
-    target = local_review._heredoc_target(text)
-    block = local_review._run_block_with(scalars, "cat > {} <<".format(target), "gpt")
+    target = local_review._prompt_target(text)
+    block = local_review._assembly_block(scalars, target, "gpt")
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="gpt-prompt-stage-") as stage_dir:
@@ -198,8 +255,8 @@ def test_gpt_prompt_is_lifted_verbatim_not_paraphrased():
     """Every extracted line must exist in its source, byte for byte.
 
     This is the property the whole script rests on: the local brief is the
-    server's own text - a heredoc line dedented by the YAML block indent, or a
-    line of a shared prompt file spliced in verbatim (#5852).
+    server's own text - since #3697 every line of it is a line of a shared
+    prompt file spliced in verbatim.
     """
     prompt = _gpt_prompt()
     raw = _gpt_text()
@@ -219,18 +276,32 @@ def test_gpt_prompt_is_lifted_verbatim_not_paraphrased():
 def test_gpt_two_passes_and_blocking_budget_come_from_the_workflow():
     text = _gpt_text()
     scalars = local_review.block_scalars(text)
-    block = local_review._run_block_with(scalars, "DISCOVERY PASS", "gpt")
     import tempfile
 
+    # The passes run as separate STEPS so each gets its own Bedrock session, so
+    # each instruction is located in the block that carries it. The lookup has to
+    # see through the prompt-file splices: the falsification instruction lives in
+    # a shared prompt file its step `cat`s in, not inline.
     with tempfile.TemporaryDirectory(prefix="gpt-pass-stage-") as stage_dir:
         _stage_gpt_prompts(text, stage_dir)
-        literals = local_review.prompt_segments(block, stage_dir)
-    discovery = local_review.literals_between(
-        literals, "DISCOVERY PASS", "DISCOVERY PASS", "discovery"
-    )
-    falsification = local_review.literals_between(
-        literals, "FALSIFICATION PASS", "UNTRUSTED EVIDENCE", "falsification"
-    )
+        discovery_block = local_review._run_block_with(
+            scalars, "DISCOVERY PASS", "gpt", stage_dir
+        )
+        pass_block = local_review._run_block_with(
+            scalars, "FALSIFICATION PASS", "gpt", stage_dir
+        )
+        discovery = local_review.literals_between(
+            local_review.prompt_segments(discovery_block, stage_dir),
+            "DISCOVERY PASS",
+            "DISCOVERY PASS",
+            "discovery",
+        )
+        falsification = local_review.literals_between(
+            local_review.prompt_segments(pass_block, stage_dir),
+            "FALSIFICATION PASS",
+            "UNTRUSTED EVIDENCE",
+            "falsification",
+        )
     assert len(discovery) == 1
     assert "candidate generation" in discovery[0]
     assert len(falsification) >= 2
@@ -261,11 +332,14 @@ def test_quoted_literals_drops_shell_plumbing():
 
 
 def test_block_scalars_never_reads_prompt_text_as_structure():
-    """A `name:`-looking line inside a prompt must not rename the owning step."""
+    """A `name:`-looking line inside a run block must not rename the owning step."""
     scalars = local_review.block_scalars(_gpt_text())
     steps = {s.step for s in scalars}
     assert "Write review prompt" in steps
-    assert any(s.key == "run" and "SYSTEM RULES" in s.text for s in scalars)
+    assert any(
+        s.key == "run" and "cat .review-prompts-gpt/gpt-preamble.md" in s.text
+        for s in scalars
+    )
 
 
 def test_opus_contract_comes_from_base_ref_prompt_files():
@@ -287,25 +361,34 @@ def test_opus_wrapper_prompts_extracted_for_every_stage():
         assert "pr.diff" in wrapper.text
 
 
-def test_gpt_lane_is_hybrid_and_opus_lane_has_no_heredoc():
-    """Lane dispatch keys on the heredoc target, so the shapes stay disjoint.
+def test_gpt_lane_is_spliced_and_opus_lane_has_no_prompt_target():
+    """Lane dispatch keys on the prompt-assembly splice, so the shapes stay disjoint.
 
-    Since #5852 the GPT lane is a HYBRID: it still writes a prompt heredoc
-    (which is what dispatch keys on) but also stages shared prompt files that
-    the heredoc splices in. Its specs carry the workflow's cp bootstrap as a
-    worktree fallback; the Opus lane's specs stay fail-closed (no fallback).
+    Since #3697 the GPT lane's prompt is assembled purely from shared prompt
+    files (dispatch keys on the opening ``cat ... >`` splice). Its specs carry
+    the workflow's cp bootstrap as a worktree fallback; the Opus lane's specs
+    stay fail-closed (no fallback).
     """
-    assert local_review._heredoc_target(_gpt_text()) is not None
+    assert local_review._prompt_target(_gpt_text()) is not None
     gpt_specs = local_review.extract_prompt_file_specs(_gpt_text())
     assert [Path(s.src).name for s in gpt_specs] == [
+        "gpt-preamble.md",
         "gpt-diff-not-evidence.md",
+        "gpt-repo-context.md",
         "gpt-review-core.md",
+        "gpt-round-convergence.md",
         "gpt-output-contract.md",
         "gpt-falsification-mandate.md",
         "gpt-falsification-verdict.md",
     ]
+    # gpt-block-adjudication.md is deliberately NOT in this list: it is the
+    # contract for the Opus stage that adjudicates GPT's blocking findings, so
+    # the workflow loads it from the base ref OUTSIDE this loop with no checkout
+    # fallback (a PR-supplied copy could authorize its own clearance). It is
+    # neither spliced into the reviewer prompt nor staged by this extractor.
+    assert "gpt-block-adjudication" not in [Path(s.src).name for s in gpt_specs]
     assert all(s.worktree_src == s.src for s in gpt_specs)
-    assert local_review._heredoc_target(_opus_text()) is None
+    assert local_review._prompt_target(_opus_text()) is None
     opus_specs = local_review.extract_prompt_file_specs(_opus_text())
     assert opus_specs != []
     assert all(s.worktree_src is None for s in opus_specs)
@@ -364,10 +447,20 @@ def test_remap_joins_with_a_forward_slash_on_every_host():
 def test_model_pins_agree_with_the_bundled_profile():
     gpt_scalars = local_review.block_scalars(_gpt_text())
     opus_scalars = local_review.block_scalars(_opus_text())
-    gpt_ci = local_review._extract_ci_model(_gpt_text(), gpt_scalars)
+    gpt_ci = local_review._extract_ci_model(_gpt_text(), gpt_scalars, prefer="cli")
     opus_ci = local_review._extract_ci_model(_opus_text(), opus_scalars)
     assert local_review._model_note(gpt_ci, PROFILE_MODELS["gpt"]["model"]) == []
     assert local_review._model_note(opus_ci, PROFILE_MODELS["opus"]["model"]) == []
+
+
+def test_the_gpt_pin_is_the_reviewers_not_its_adjudicators():
+    """The GPT lane embeds a claude-code-action for the Opus stage that
+    adjudicates its blocking verdict. Reading THAT pin as the reviewer's would
+    make every local brief report drift and claim the GPT lane runs on Opus."""
+    text = _gpt_text()
+    scalars = local_review.block_scalars(text)
+    assert "us.anthropic.claude-opus-4-8" in text
+    assert local_review._extract_ci_model(text, scalars, prefer="cli") == "openai.gpt-5.6-sol"
 
 
 def test_model_drift_is_reported_not_swallowed():
@@ -405,7 +498,7 @@ def test_base_rule_staging_produces_both_files_including_the_fallback(parity_rep
 def test_prompt_file_contracts_are_remapped_like_every_other_lane(parity_repo, tmp_path, no_gh):
     """The base-ref prompt files carry bare `.review-*` references. Nothing is
     written into the worktree, so every lane's contract text must point at the
-    staged twins - not just the heredoc lane."""
+    staged twins - not just the GPT lane."""
     out_dir = tmp_path / "out"
     stage_dir = tmp_path / "stage"
     summary = local_review.assemble(str(parity_repo), "main", str(out_dir), str(stage_dir))
@@ -539,8 +632,8 @@ def test_branch_symlink_cannot_redirect_a_reviewers_contract(parity_repo, tmp_pa
     assert lanes["gpt"]["contract"] == ".github/workflows/{}".format(GPT_WORKFLOW.name)
     # Shape is the first discriminator: the workflow the symlink points at is
     # extracted through the prompt-files path, so a redirected lane could not
-    # report the heredoc shape.
-    assert lanes["gpt"]["shape"] == "heredoc"
+    # report the spliced shape.
+    assert lanes["gpt"]["shape"] == "spliced-files"
 
     def normalise(text, stage_dir, head_sha):
         return text.replace(str(stage_dir), "<STAGE>").replace(head_sha, "<HEAD>")
@@ -558,9 +651,9 @@ def test_cli_exits_40_on_a_contract_that_escapes_the_repo(parity_repo, tmp_path)
     """The escape is refused through the documented exit contract, not a traceback,
     and no brief is written for the offending profile."""
     for bad in ["/etc/passwd", "../../secret.yml", ".github\\workflows\\codex-review.yml"]:
-        (parity_repo / ".prepare-pr.toml").write_text(
+        _profile_on_main(
+            parity_repo,
             "[review]\n[[review.reviewers]]\nname = \"gpt\"\ncontract = {!r}\n".format(bad),
-            encoding="utf-8",
         )
         out_dir = tmp_path / "out-{}".format(abs(hash(bad)))
         proc = subprocess.run(
@@ -629,12 +722,12 @@ def test_a_reviewer_declaring_no_contract_is_skipped_not_failed(parity_repo, tmp
     rubric-only reviewer says it has none - the documented skip. Only a
     non-None non-string is malformed, so the boundary must not slide into
     failing a legitimate mixed profile."""
-    (parity_repo / ".prepare-pr.toml").write_text(
+    _profile_on_main(
+        parity_repo,
         "[review]\n"
         "[[review.reviewers]]\nname = \"gpt\"\n"
         'contract = ".github/workflows/codex-review.yml"\n'
         "[[review.reviewers]]\nname = \"rubric-only\"\nrubric = \"be careful\"\n",
-        encoding="utf-8",
     )
     out_dir = tmp_path / "out"
     summary = local_review.assemble(
@@ -654,9 +747,9 @@ def test_non_string_contract_exits_40_through_the_cli(parity_repo, tmp_path, lit
     A falsy value (``0``, ``false``, ``""``) additionally used to be dropped by
     a truthiness filter, silently reviewing against fewer contracts than the
     profile declared - so it must fail closed here too, not skip."""
-    (parity_repo / ".prepare-pr.toml").write_text(
+    _profile_on_main(
+        parity_repo,
         "[review]\n[[review.reviewers]]\nname = \"gpt\"\ncontract = {}\n".format(literal),
-        encoding="utf-8",
     )
     rc = local_review.main(
         [
@@ -744,11 +837,11 @@ def test_a_string_model_survives_the_type_gate():
 def test_non_string_model_exits_40_through_the_cli(parity_repo, tmp_path, field, literal):
     """The CLI documents EXIT_PARITY for a profile the extractor cannot honour.
     A truthy non-string used to reach ``.lower()`` and exit 1 with a traceback."""
-    (parity_repo / ".prepare-pr.toml").write_text(
+    _profile_on_main(
+        parity_repo,
         "[review]\n[[review.reviewers]]\nname = \"gpt\"\n"
         'contract = ".github/workflows/codex-review.yml"\n'
         "{} = {}\n".format(field, literal),
-        encoding="utf-8",
     )
     rc = local_review.main(
         [
@@ -819,13 +912,13 @@ def test_duplicate_reviewer_names_refuse_before_any_brief_is_written(
     """Two same-named reviewers used to produce two lanes and ONE brief file:
     whichever wrote last handed its contract to both reviewers. Fail closed, and
     leave no half-assembled output behind."""
-    (parity_repo / ".prepare-pr.toml").write_text(
+    _profile_on_main(
+        parity_repo,
         "[review]\n"
         '[[review.reviewers]]\nname = "gpt"\n'
         'contract = ".github/workflows/codex-review.yml"\n'
         '[[review.reviewers]]\nname = "gpt"\n'
         'contract = ".github/workflows/claude-review.yml"\n',
-        encoding="utf-8",
     )
     out_dir = tmp_path / "out"
     with pytest.raises(local_review.ParityError) as exc:
@@ -837,11 +930,11 @@ def test_duplicate_reviewer_names_refuse_before_any_brief_is_written(
 def test_non_string_reviewer_name_exits_40_through_the_cli(parity_repo, tmp_path):
     """The CLI documents EXIT_PARITY for a profile the extractor cannot honour;
     a non-string name must not escape as a traceback and exit 1."""
-    (parity_repo / ".prepare-pr.toml").write_text(
+    _profile_on_main(
+        parity_repo,
         "[review]\n"
         "[[review.reviewers]]\nname = 7\n"
         'contract = ".github/workflows/codex-review.yml"\n',
-        encoding="utf-8",
     )
     rc = local_review.main(
         [
@@ -1082,17 +1175,84 @@ def test_contract_workflow_is_read_from_base_not_from_the_branch(
     assert summary["base_sha"] == _git(parity_repo, "rev-parse", "main")
 
 
+def _fake_origin(root, default="main"):
+    """Give a synthetic repo the remote-tracking refs git's own default-branch
+    record lives in, without a network remote."""
+    for branch in _git(root, "for-each-ref", "--format=%(refname:short)", "refs/heads").split():
+        sha = _git(root, "rev-parse", branch)
+        _git(root, "update-ref", "refs/remotes/origin/{}".format(branch), sha)
+    _git(
+        root,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/{}".format(default),
+    )
+
+
+def test_default_diff_base_honours_the_profiles_base_branch(parity_repo, tmp_path):
+    """With no --base, the review diff must use the base the REST of the skill
+    uses (push_guard.py, ``gh pr create``), which is the profile's
+    ``base_branch``. Resolving the profile itself still happens against git's
+    own remote-default record, so the branch under review cannot steer the
+    reviewer set - but once the profile IS trusted, ignoring its base_branch
+    would review a non-default-base PR against the wrong tree with no error."""
+    _git(parity_repo, "checkout", "-q", "main")
+    _git(parity_repo, "checkout", "-q", "-b", "release")
+    (parity_repo / "release_only.py").write_text("RELEASE = 1\n", encoding="utf-8")
+    _git(parity_repo, "add", "-A")
+    _git(parity_repo, "commit", "-q", "-m", "release-only commit")
+    _git(parity_repo, "checkout", "-q", "feature")
+    _profile_on_main(
+        parity_repo,
+        "[project]\nbase_branch = \"release\"\n"
+        "[review]\n[[review.reviewers]]\nname = \"gpt\"\n"
+        'contract = ".github/workflows/codex-review.yml"\n',
+    )
+    _fake_origin(parity_repo)
+
+    summary = local_review.assemble(
+        str(parity_repo), None, str(tmp_path / "out"), str(tmp_path / "stage")
+    )
+
+    assert summary["base_ref"] == "origin/release"
+    assert summary["base_sha"] == _git(parity_repo, "merge-base", "HEAD", "origin/release")
+
+
+def test_default_diff_base_falls_back_to_the_remote_default_branch(parity_repo, tmp_path):
+    """A profile that declares no base_branch leaves the diff base at git's own
+    remote-default record - never at a hardcoded ``origin/main`` guess."""
+    _git(parity_repo, "checkout", "-q", "main")
+    _git(parity_repo, "branch", "-m", "main", "trunk")
+    _git(parity_repo, "checkout", "-q", "feature")
+    _git(parity_repo, "checkout", "-q", "trunk")
+    (parity_repo / ".prepare-pr.toml").write_text(
+        "[review]\n[[review.reviewers]]\nname = \"gpt\"\n"
+        'contract = ".github/workflows/codex-review.yml"\n',
+        encoding="utf-8",
+    )
+    _git(parity_repo, "add", ".prepare-pr.toml")
+    _git(parity_repo, "commit", "-q", "-m", "profile without a base_branch")
+    _git(parity_repo, "checkout", "-q", "feature")
+    _fake_origin(parity_repo, default="trunk")
+
+    summary = local_review.assemble(
+        str(parity_repo), None, str(tmp_path / "out"), str(tmp_path / "stage")
+    )
+
+    assert summary["base_ref"] == "origin/trunk"
+
+
 def test_contract_absent_at_base_exits_40_through_the_cli(parity_repo, tmp_path):
     """A workflow that exists only on the branch is not authority. Reading it
     would mean the branch supplied its own contract, so the run fails closed
     with the documented parity exit instead."""
-    late = parity_repo / ".github" / "workflows" / "late-review.yml"
-    shutil.copy(GPT_WORKFLOW, late)
-    (parity_repo / ".prepare-pr.toml").write_text(
+    _profile_on_main(
+        parity_repo,
         "[review]\n[[review.reviewers]]\nname = \"gpt\"\n"
         'contract = ".github/workflows/late-review.yml"\n',
-        encoding="utf-8",
     )
+    late = parity_repo / ".github" / "workflows" / "late-review.yml"
+    shutil.copy(GPT_WORKFLOW, late)
     _git(parity_repo, "add", "-A")
     _git(parity_repo, "commit", "-m", "add a reviewer workflow on the branch only")
 
@@ -1150,7 +1310,9 @@ def test_prefetched_diff_matches_git_diff(parity_repo, tmp_path):
 # --------------------------------------------------------------------------
 def _intent_run_block():
     scalars = local_review.block_scalars(_gpt_text())
-    return local_review._run_block_with(scalars, "PR INTENT", "gpt")
+    # "PR INTENT" is inline in the step that echoes it, so the lookup returns
+    # before it ever needs a staging dir to resolve a splice through.
+    return local_review._run_block_with(scalars, "PR INTENT", "gpt", "")
 
 
 def test_intent_framing_is_the_workflow_framing():
@@ -1197,24 +1359,91 @@ def test_intent_media_is_stripped():
 # --------------------------------------------------------------------------
 # Mutation checks - a restructured workflow must fail LOUDLY
 # --------------------------------------------------------------------------
-def test_stripped_heredoc_fails_loudly(tmp_path):
-    """Strip the OPENING prompt heredoc; assembly must raise, never a stub.
+def test_stripped_opening_splice_fails_loudly(tmp_path):
+    """Strip the OPENING ``cat ... >`` splice; assembly must raise, never a stub.
 
-    The mutation regex deliberately matches only ``cat >`` (one ``>``), so the
-    ``cat >>`` continuations and file splices survive - proving the assembler
-    demands the opener specifically rather than accepting any fragment.
+    The mutation removes only the single-``>`` opener, so every ``cat ... >>``
+    append survives - proving the assembler demands the opener specifically
+    rather than accepting any fragment.
     """
     text = _gpt_text()
-    target = local_review._heredoc_target(text)
+    target = local_review._prompt_target(text)
     scalars = local_review.block_scalars(text)
-    block = local_review._run_block_with(scalars, "cat > {} <<".format(target), "gpt")
-    mutated = re.sub(r"cat\s*>\s*\S*prompt\.md\s*<<-?'?EOF'?", "true <<'EOF'", block)
+    block = local_review._assembly_block(scalars, target, "gpt")
+    opener = "cat .review-prompts-gpt/gpt-preamble.md > /tmp/codex-prompt.md"
+    assert opener in block
+    mutated = block.replace(opener, "true")
     _stage_gpt_prompts(text, tmp_path)
     with pytest.raises(local_review.ParityError) as exc:
         local_review.assemble_prompt_document(mutated, target, str(tmp_path))
     message = str(exc.value)
-    assert "no `cat >" in message
+    assert "no `cat" in message
     assert "do NOT fall back" in message
+
+
+def test_every_staged_prompt_file_is_spliced_exactly_once_in_loop_order():
+    """Dropping (or reordering) one `cat` splice must not pass silently.
+
+    The staging loop and the assembly are two lists that must agree: a file
+    staged but never spliced silently loses a block of the contract while the
+    lane still publishes a verdict. Every loop-staged file must therefore have a
+    named consumer, in one of two shapes — a document splice into the prompt
+    target, or a bare `cat` in the step that consumes it (the two falsification
+    files). The adjudication contract is deliberately NOT loop-staged: the
+    workflow loads it from the base ref outside this loop and hands it to the
+    Opus stage, so it never appears in ``extract_prompt_file_specs`` and GPT
+    never reads its own judge.
+    """
+    text = _gpt_text()
+    target = local_review._prompt_target(text)
+    scalars = local_review.block_scalars(text)
+    block = local_review._assembly_block(scalars, target, "gpt")
+    staged = [Path(s.dest).name for s in local_review.extract_prompt_file_specs(text)]
+    spliced = re.findall(
+        r"^\s*cat\s+\.review-prompts-gpt/(\S+)\s*>{1,2}\s*" + re.escape(target) + r"\s*$",
+        block,
+        flags=re.M,
+    )
+    # A bare `cat` splice lives in whichever review step consumes it, and the two
+    # passes are separate steps (each needs its own Bedrock session), so scan
+    # every `run:` block instead of the one the discovery instruction is in.
+    pass_spliced = [
+        m.group("src").rsplit("/", 1)[-1]
+        for scalar in scalars
+        if scalar.key == "run"
+        for m in map(local_review._CAT_BARE_RE.match, scalar.text.splitlines())
+        if m is not None and m.group("src").startswith(".review-prompts-gpt/")
+    ]
+    # The adjudication contract is handed to a LATER stage, from a base-ref load
+    # OUTSIDE this loop, so it must never be loop-staged: a PR-supplied copy
+    # could authorize its own clearance.
+    assert "gpt-block-adjudication.md" not in staged
+    consumed_elsewhere = set(pass_spliced)
+    assert spliced == [name for name in staged if name not in consumed_elsewhere]
+    assert len(set(spliced)) == len(spliced), "a document splice repeats"
+    assert sorted(spliced + pass_spliced) == sorted(staged)
+
+
+def test_spliced_prompt_tracks_the_staged_file_content(tmp_path):
+    """Non-vacuity: the file lane is actually exercised.
+
+    Mutating one staged prompt file's content must change the assembled brief;
+    an assembly that stays identical with the file rewritten would mean the
+    splice path is decorative and the local gate reviews against nothing.
+    """
+    text = _gpt_text()
+    target = local_review._prompt_target(text)
+    scalars = local_review.block_scalars(text)
+    block = local_review._assembly_block(scalars, target, "gpt")
+    _stage_gpt_prompts(text, tmp_path)
+    baseline = local_review.assemble_prompt_document(block, target, str(tmp_path))
+    sentinel = "SENTINEL-3697-PROMPT-MUTATION"
+    assert sentinel not in baseline
+    staged = tmp_path / ".review-prompts-gpt" / "gpt-repo-context.md"
+    staged.write_text(sentinel + "\n", encoding="utf-8")
+    mutated = local_review.assemble_prompt_document(block, target, str(tmp_path))
+    assert sentinel in mutated
+    assert mutated != baseline
 
 
 def test_worktree_bootstrap_source_cannot_escape_the_worktree(tmp_path):
@@ -1247,12 +1476,15 @@ def test_worktree_bootstrap_source_cannot_escape_the_worktree(tmp_path):
     assert "resolves outside the worktree" in str(exc.value)
 
 
-def test_unclosed_heredoc_fails_loudly(tmp_path):
+def test_unstaged_splice_fails_loudly(tmp_path):
+    """A splice naming a file nothing staged means the prompt-file specs and
+    the assembly disagree - the assembler must refuse, never emit a partial
+    contract."""
     with pytest.raises(local_review.ParityError) as exc:
         local_review.assemble_prompt_document(
-            "cat > /tmp/p.md <<'EOF'\nbody\n", "/tmp/p.md", str(tmp_path)
+            "cat .review-prompts-gpt/gpt-preamble.md > /tmp/p.md\n", "/tmp/p.md", str(tmp_path)
         )
-    assert "never closed" in str(exc.value)
+    assert "no such file was staged" in str(exc.value)
 
 
 def test_removed_base_rule_snapshot_fails_loudly():
@@ -1274,7 +1506,7 @@ def test_removed_model_pin_fails_loudly():
 
 def test_missing_run_block_fails_loudly():
     with pytest.raises(local_review.ParityError) as exc:
-        local_review._run_block_with([], "DISCOVERY PASS", "wf.yml")
+        local_review._run_block_with([], "DISCOVERY PASS", "wf.yml", "")
     assert "restructured" in str(exc.value)
 
 
@@ -1283,7 +1515,7 @@ def test_missing_echo_framing_fails_loudly():
         local_review.extract_echo_block("echo hello\n", "PR INTENT", "PR_INTENT_BEGIN")
 
 
-def test_cli_exits_40_when_the_prompt_heredoc_is_gone(parity_repo, tmp_path):
+def test_cli_exits_40_when_the_prompt_assembly_is_gone(parity_repo, tmp_path):
     """End-to-end mutation check: a restructured workflow exits 40, writes no brief.
 
     The restructure is committed on the BASE branch and the feature branch
@@ -1294,7 +1526,10 @@ def test_cli_exits_40_when_the_prompt_heredoc_is_gone(parity_repo, tmp_path):
     _git(parity_repo, "checkout", "main")
     text = workflow.read_text(encoding="utf-8")
     workflow.write_text(
-        text.replace("cat > /tmp/codex-prompt.md <<'EOF'", "true <<'EOF'"), encoding="utf-8"
+        text.replace(
+            "cat .review-prompts-gpt/gpt-preamble.md > /tmp/codex-prompt.md", "true"
+        ),
+        encoding="utf-8",
     )
     _git(parity_repo, "add", "-A")
     _git(parity_repo, "commit", "-m", "restructure the reviewer workflow")
@@ -1333,7 +1568,7 @@ def test_assemble_writes_one_brief_per_reviewer(parity_repo, tmp_path, no_gh):
 
     assert sorted(summary["tasks"]) == ["gpt", "opus"]
     lanes = {lane["name"]: lane for lane in summary["lanes"]}
-    assert lanes["gpt"]["shape"] == "heredoc"
+    assert lanes["gpt"]["shape"] == "spliced-files"
     assert lanes["opus"]["shape"] == "prompt-files"
     gpt_budget = lanes["gpt"]["blocking_budget"]
     assert gpt_budget is None or gpt_budget >= 1

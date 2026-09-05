@@ -698,6 +698,141 @@ class TestHandleReceiveV1:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _handle_receive_v1 drop logging
+# ---------------------------------------------------------------------------
+
+
+class TestHandleReceiveV1DropLogging:
+    """Every silent-drop branch must emit a log line naming the reason.
+
+    Without a log line a dropped inbound message leaves no trace anywhere --
+    nothing in gateway.log, nothing in the SEL audit log -- making a
+    delivered-and-ignored message indistinguishable from a dead WebSocket. Each
+    drop logs at INFO with its reason (and message_id where one is known), so
+    diagnosis is a one-minute read rather than an hours-long elimination.
+    """
+
+    def _make_client(self):
+        from kiro_crew.feishu.client import LarkClient
+
+        received: list[Any] = []
+
+        async def handler(inbound: Any) -> None:
+            received.append(inbound)
+
+        client = LarkClient(app_id="a", app_secret="s", on_message=handler)
+        return client, received
+
+    def test_missing_event_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+
+        class Data:
+            event = None
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(Data())
+
+        assert received == []
+        assert any("no event" in r.message for r in caplog.records)
+
+    def test_missing_message_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+
+        class Event:
+            message = None
+
+        class Data:
+            event = Event()
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(Data())
+
+        assert received == []
+        assert any("no message" in r.message for r in caplog.records)
+
+    def test_missing_message_id_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+        data = _make_event(message_id="")
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        assert any("no message_id" in r.message for r in caplog.records)
+
+    def test_non_text_message_type_logs_type_and_id(self, caplog: Any) -> None:
+        client, received = self._make_client()
+        data = _make_event(message_id="img-1", message_type="image")
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        drop = next((r for r in caplog.records if "unsupported message_type" in r.message), None)
+        assert drop is not None
+        # The offending type and the message_id are both in the rendered line.
+        assert "image" in drop.getMessage()
+        assert "img-1" in drop.getMessage()
+
+    def test_missing_open_id_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+        data = _make_event(message_id="no-sender", open_id="")
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        assert any("open_id" in r.message for r in caplog.records)
+
+    def test_invalid_json_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+        data = _make_event(message_id="bad-json", content="not-json{{{")
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        assert any("not valid JSON" in r.message for r in caplog.records)
+
+    def test_mention_only_body_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+        data = _make_event(
+            message_id="ws-only",
+            content=json.dumps({"text": "@_user_1   "}),
+        )
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        assert any("mention-only" in r.message for r in caplog.records)
+
+    def test_empty_resolved_text_logs(self, caplog: Any, monkeypatch: Any) -> None:
+        """The empty-resolved-text guard also logs its drop.
+
+        Reaching this branch organically is hard -- any non-mention text keeps
+        the resolved text non-empty, and a mention-only body drops one guard
+        earlier. It is a defensive guard, so we drive it directly by forcing
+        ``_resolve_mentions`` to return whitespace for a body that clears the
+        mention-only check.
+        """
+        import kiro_crew.feishu.client as client_mod
+
+        client, received = self._make_client()
+        monkeypatch.setattr(client_mod, "_resolve_mentions", lambda raw, mentions: "   ")
+        data = _make_event(
+            message_id="empty-resolved",
+            content=json.dumps({"text": "real words here"}),
+        )
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        assert any("resolved text is empty" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # Tests: start()
 # ---------------------------------------------------------------------------
 
@@ -721,6 +856,90 @@ class TestStart:
         client._ws_client.stop()
         client._thread.join(timeout=1.0)
         assert not client._thread.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# Tests: health transitions (on_state_change)
+# ---------------------------------------------------------------------------
+
+
+class TestHealthTransitions:
+    """The Settings badge is driven by these transitions, so they are contract.
+
+    Without them a rejected app id/secret leaves the badge reading "connected"
+    forever: lark-oapi exposes no connect event, and the only evidence of a
+    refusal is the receiver thread ending seconds after start().
+    """
+
+    @pytest.mark.asyncio
+    async def test_start_reports_healthy_then_close_reports_down(self) -> None:
+        from kiro_crew.feishu.client import LarkClient
+
+        client = LarkClient(app_id="a", app_secret="s")
+        seen: list[tuple[bool, str]] = []
+        client.on_state_change = lambda ok, why: seen.append((ok, why))
+
+        await client.start()
+        assert seen[0] == (True, "")
+
+        await client.close()
+        client._thread.join(timeout=1.0)
+        # An intentional shutdown is "not connected" with NO reason: nothing
+        # failed, and inventing one would show a false error in Settings.
+        assert seen[-1] == (False, "")
+
+    @pytest.mark.asyncio
+    async def test_receiver_exit_reports_the_reason(self) -> None:
+        """A receiver that returns on its own is the bad-credential signal."""
+        from kiro_crew.feishu.client import LarkClient
+
+        client = LarkClient(app_id="a", app_secret="s")
+        seen: list[tuple[bool, str]] = []
+        client.on_state_change = lambda ok, why: seen.append((ok, why))
+
+        await client.start()
+        # End the receive loop WITHOUT going through client.close(), so
+        # `_closed` stays False — exactly the shape lark produces for a refused
+        # app: ws.start() returns on its own while the channel still believes it
+        # is running. Driving the stub directly keeps this deterministic rather
+        # than racing its internal timeout.
+        client._ws_client.stop()
+        client._thread.join(timeout=5.0)
+        assert not client._thread.is_alive()
+
+        assert seen[0] == (True, "")
+        assert seen[-1][0] is False
+        assert "receiver stopped" in seen[-1][1]
+
+    def test_transitions_are_deduped_but_the_first_always_publishes(self) -> None:
+        from kiro_crew.feishu.client import LarkClient
+
+        client = LarkClient(app_id="a", app_secret="s")
+        seen: list[tuple[bool, str]] = []
+        client.on_state_change = lambda ok, why: seen.append((ok, why))
+
+        client._notify_state(False, "")
+        client._notify_state(False, "")
+        assert seen == [(False, "")], "the first report publishes even if unhealthy"
+
+        client._notify_state(False, "first reason")
+        client._notify_state(False, "first reason")
+        # A repeat must not overwrite the FIRST reason with an identical later
+        # one, and must not spam the observer.
+        assert seen == [(False, ""), (False, "first reason")]
+
+    def test_an_observer_that_raises_cannot_break_the_receiver(self) -> None:
+        from kiro_crew.feishu.client import LarkClient
+
+        client = LarkClient(app_id="a", app_secret="s")
+
+        def _boom(ok: bool, why: str) -> None:
+            raise RuntimeError("observer blew up")
+
+        client.on_state_change = _boom
+        # Swallowed: the badge is a side channel, and losing it must never take
+        # the channel down with it.
+        client._notify_state(True, "")
 
 
 # ---------------------------------------------------------------------------

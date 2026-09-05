@@ -279,6 +279,20 @@ class TestToLlmEventFieldPropagation:
         assert ev.usage.cache_creation_tokens == 33
         assert ev.usage.cache_read_tokens == 44
 
+    @pytest.mark.asyncio
+    async def test_stream_propagates_synthetic_completion_provenance(self):
+        provider = _build_provider(backend=ACP_BACKEND_CLAUDE)
+        src = AcpEvent(
+            kind="complete",
+            stop_reason="end_turn",
+            synthetic_completion=True,
+        )
+        provider._client.stream_events = MagicMock(return_value=_async_iter([src]))
+
+        events = await _drain(provider.stream("hi"))
+
+        assert events[0].synthetic_completion is True
+
 
 class TestToLlmEventFieldParity:
     """Structural guard: every field on AcpEvent must either be explicitly
@@ -295,29 +309,67 @@ class TestToLlmEventFieldParity:
         "todo",
     }
 
+    @staticmethod
+    def _distinguishable(field: "dataclasses.Field") -> object | None:
+        """A value for *field* that its default cannot be mistaken for.
+
+        ``None`` means the field cannot be driven from its declared default
+        (``default_factory`` or required), and the caller skips it.
+        """
+        default = field.default
+        if default is dataclasses.MISSING:
+            return None
+        if isinstance(default, bool):
+            return not default
+        if isinstance(default, str):
+            return "sentinel-" + field.name
+        if isinstance(default, int):
+            return default + 7
+        if isinstance(default, float):
+            return default + 1.5
+        if default is None:
+            return {"sentinel": field.name}
+        return None
+
     def test_all_acp_event_fields_forwarded_or_allowlisted(self):
         """_to_llm_event must forward every AcpEvent field not in the
-        intentionally-dropped allowlist."""
-        all_fields = {f.name for f in dataclasses.fields(AcpEvent)}
-        # Build a source event with kind (required positional)
-        src = AcpEvent(kind="test")
+        intentionally-dropped allowlist.
+
+        Every field is driven to a value its DEFAULT cannot be mistaken for.
+        That is the whole point: an omitted field arrives at the default, so a
+        guard that compares against the default cannot fail for an omission —
+        which is the only bug this exists to catch. The earlier default-valued
+        version passed while ``synthesized`` was being dropped, disarming a
+        dashboard guard on the primary interactive surface.
+        """
+        driven: dict[str, object] = {}
+        undrivable: set[str] = set()
+        for f in dataclasses.fields(AcpEvent):
+            if f.name == "kind":
+                continue
+            value = self._distinguishable(f)
+            if value is None:
+                # default_factory (options, usage) — covered by the dedicated
+                # propagation tests above rather than by this sweep.
+                undrivable.add(f.name)
+                continue
+            driven[f.name] = value
+
+        src = AcpEvent(kind="sentinel-kind", **driven)
         result = AcpProvider._to_llm_event(src)
 
-        forwarded: set[str] = set()
-        for f in dataclasses.fields(AcpEvent):
-            src_val = getattr(src, f.name)
-            out_val = getattr(result, f.name)
-            # If the output matches the source default, it was forwarded
-            # (since we only set kind, all others are at their defaults).
-            if out_val == src_val:
-                forwarded.add(f.name)
-
-        # Verify with non-default values to be certain (kind is always set).
-        missing = all_fields - forwarded - self._INTENTIONALLY_DROPPED
+        dropped = {name for name, value in driven.items() if getattr(result, name) != value}
+        missing = dropped - self._INTENTIONALLY_DROPPED
         assert not missing, (
             f"AcpEvent fields not forwarded by _to_llm_event and not in "
             f"allowlist: {sorted(missing)}. Either add them to _to_llm_event "
             f"or document why in _INTENTIONALLY_DROPPED."
+        )
+        # The allowlist must not outlive the omission it documents.
+        assert self._INTENTIONALLY_DROPPED - undrivable <= dropped, (
+            "allowlisted field(s) are actually forwarded now: "
+            f"{sorted(self._INTENTIONALLY_DROPPED - undrivable - dropped)}. "
+            "Remove them from _INTENTIONALLY_DROPPED."
         )
 
     def test_intentionally_dropped_fields_exist_on_acp_event(self):
@@ -605,7 +657,7 @@ class TestEffortControl:
             )
         )
         # Must not raise.
-        await provider._set_claude_effort("max")
+        await provider._set_effort_config_option("max")
 
     @pytest.mark.asyncio
     async def test_kiro_clear_effort_no_default_returns_false_for_reset(self):
@@ -1153,10 +1205,12 @@ def test_child_fidelity_aware_survives_client_replacement():
 
 
 def test_to_llm_event_preserves_provenance_flags():
-    """`AcpProvider._to_llm_event` reconstructs the event — dropping the two
-    provenance fields would zero them to False and flip child_low_fidelity to
-    True for EVERY child permission event on this surface, making the
-    full-fidelity half of the feature (mode-parity auto-approval) inert."""
+    """`AcpProvider._to_llm_event` reconstructs the event — dropping a
+    provenance field would zero it to False: for the params pair that flips
+    child_low_fidelity to True for EVERY child permission event on this
+    surface (making the full-fidelity half of the feature inert); for
+    mcp_identity_trusted it revokes the verified-identity half
+    (child_mcp_identity_trusted) the unconditional grant paths rely on."""
     from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
     from kiro_crew.providers.acp import AcpProvider
 
@@ -1175,3 +1229,43 @@ def test_to_llm_event_preserves_provenance_flags():
     assert out.raw_params_trusted is True
     assert out.shell_classified is True
     assert out.child_low_fidelity is False
+
+
+def test_to_llm_event_preserves_mcp_identity_trusted():
+    """The identity-provenance flag crosses the provider copy: dropping it
+    from the copy list silently reads False and revokes
+    child_mcp_identity_trusted for every crossing event (the drop-to-False
+    trap the explicit flag was added to guard against — it must fail closed
+    only for genuinely untrusted population, never for a copy)."""
+    from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+    from kiro_crew.providers.acp import AcpProvider
+
+    src = AcpEvent(
+        kind=EVENT_PERMISSION_REQUEST,
+        request_id=11,
+        title="@example-server/get-item",
+        sub_session_id="child-a",
+        shell_classified=True,
+        is_shell=False,
+        mcp_server_name="example-server",
+        tool_name="get-item",
+        mcp_identity_trusted=True,
+    )
+    assert src.child_mcp_identity_trusted is True
+    out = AcpProvider._to_llm_event(src)
+    assert out.mcp_identity_trusted is True
+    assert out.child_mcp_identity_trusted is True
+    assert out.child_unconditional_grant_eligible is True
+    # And the flag is copied, not invented: an untrusted source stays False.
+    src_untrusted = AcpEvent(
+        kind=EVENT_PERMISSION_REQUEST,
+        request_id=12,
+        sub_session_id="child-a",
+        shell_classified=True,
+        is_shell=False,
+        mcp_server_name="example-server",
+        tool_name="get-item",
+    )
+    out_untrusted = AcpProvider._to_llm_event(src_untrusted)
+    assert out_untrusted.mcp_identity_trusted is False
+    assert out_untrusted.child_mcp_identity_trusted is False

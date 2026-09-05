@@ -27,7 +27,7 @@ import {
 } from '../hooks/useWebSocket'
 import { api } from '../api/client'
 import { store as globalStore } from '../store'
-import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard, appendMessage } from '../store/chatSlice'
+import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard } from '../store/chatSlice'
 import { sseSlots } from '../store/dashboardSlice'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import type { ChatSlot } from '../types'
@@ -245,9 +245,13 @@ describe('useWebSocket frame router', () => {
     }
   })
 
-  it('applies the yolo and channel-trust side channels riding a slots frame', () => {
+  it('applies slots-frame side channels without discarding dashboard status', () => {
     const { ws } = mount()
     act(() => {
+      ws.simulateMessage({
+        type: 'dashboard',
+        data: { version: '1.0.0', yolo: false, yolo_duration: 'until_shutdown' },
+      })
       ws.simulateMessage({
         type: 'slots',
         data: [slotFixture(ACTIVE)],
@@ -257,6 +261,7 @@ describe('useWebSocket frame router', () => {
     })
     expect(dash().slots.map(s => s.key)).toEqual([ACTIVE])
     expect(dash().approvalMode).toBe('yolo')
+    expect(dash().status).toMatchObject({ yolo: true, yolo_duration: 'until_shutdown' })
     expect(dash().channelTrusted).toBe(true)
   })
 
@@ -518,6 +523,20 @@ describe('useWebSocket frame router', () => {
     expect(chat().messages.filter(m => m.role === 'queued')).toHaveLength(0)
   })
 
+  it('repairs a missed queue-pop from the successor turn status', () => {
+    const { ws } = mount()
+    act(() => {
+      ws.simulateMessage({ type: 'queue_push', data: { slot: ACTIVE, content: 'now running', ts: '1', queue_id: 'q1' } })
+      ws.simulateMessage({ type: 'queue_push', data: { slot: ACTIVE, content: 'still queued', ts: '2', queue_id: 'q2' } })
+      // The queue_pop frame was lost during reconnect. The following live
+      // status is enough to retire only the prompt the runner consumed.
+      ws.simulateMessage({ type: 'chat_status', data: { slot: ACTIVE, status: 'Thinking…', queue_ids: ['q1'] } })
+    })
+
+    expect(chat().messages.filter(m => m.role === 'queued').map(m => m.meta?.queueId)).toEqual(['q2'])
+    expect(chat().slotStatusDetail[ACTIVE]?.kind).toBe('thinking')
+  })
+
   it('echoes a mid-turn steer into the target transcript', () => {
     const { ws } = mount()
     act(() => {
@@ -660,6 +679,8 @@ describe('useWebSocket frame router', () => {
       ws.simulateMessage({ type: 'subagent_chunk', data: { slot: ACTIVE, id: 'ag-1', text: 'partial ' } })
       ws.simulateMessage({ type: 'subagent_tool', data: { slot: ACTIVE, id: 'ag-1', tool: 'fs_read', tool_count: 2 } })
     })
+    // Subagent chunks are now buffered and flushed per animation frame (PR #5945).
+    act(() => { const pending = rafCbs; rafCbs = []; pending.forEach(cb => cb(0)) })
     expect(chat().subagents['ag-1']?.streaming).toBe('partial ')
     expect(chat().subagents['ag-1']?.lastTool).toBe('fs_read')
 
@@ -1777,4 +1798,3 @@ describe('useWebSocket slots reconcile', () => {
     expect(testStore.getState().chat.slotMessages[BACKGROUND]).toBeDefined()
   })
 })
-

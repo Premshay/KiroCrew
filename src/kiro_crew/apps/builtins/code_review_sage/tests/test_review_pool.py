@@ -9,6 +9,7 @@ import json
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from sage_lib import review_pool as rp
@@ -43,6 +44,11 @@ class FakeHandle:
     def __init__(self, runtime, session_id, script=None, gate=None):
         self._runtime = runtime
         self.session_id = session_id
+        self.served_model = str(runtime.kw.get("model") or "")
+        self.config_options = []
+        self.available_models = [
+            {"modelId": "runtime-only-model", "name": "Runtime Only Model"}
+        ]
         self._script = script or []
         self._gate = gate
         self.approvals: list = []
@@ -72,6 +78,7 @@ class FakeRuntime:
     def __init__(self, agent=None, work_dir=None, sandbox_mode="auto", **kw):
         self.agent = agent
         self.work_dir = work_dir
+        self.kw = kw
         self.spawned = False
         self.killed = False
         self.sessions: dict = {}
@@ -115,7 +122,7 @@ def _install_fake_runtime(test, script=None, gate=None):
     FakeRuntime.instances = []
 
     def factory(agent=None, work_dir=None, sandbox_mode="auto", **kw):
-        r = FakeRuntime(agent=agent, work_dir=work_dir, sandbox_mode=sandbox_mode)
+        r = FakeRuntime(agent=agent, work_dir=work_dir, sandbox_mode=sandbox_mode, **kw)
         r.script = script or []
         r.gate = gate
         return r
@@ -177,6 +184,29 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(FakeRuntime.instances), 1)
         await pool.end_batch()
 
+    async def test_runtime_receives_the_resolved_reviewer_model(self):
+        _install_fake_runtime(self)
+        with unittest.mock.patch.object(rp, "reviewer_info", return_value={
+                "model": "gpt-5.3-codex", "effort": "", "agent": "reviewer"}):
+            pool = ReviewPool(work_dir="/tmp/x")
+            await pool.begin_batch()
+        self.assertEqual(FakeRuntime.instances[0].kw["model"], "gpt-5.3-codex")
+        await pool.end_batch()
+
+    async def test_records_the_backend_reported_session_model(self):
+        _install_fake_runtime(self)
+        resolved: list[dict] = []
+        with unittest.mock.patch.object(rp, "reviewer_info", return_value={
+                "model": "gpt-5.3-codex", "effort": "", "agent": "reviewer"}):
+            pool = ReviewPool(work_dir="/tmp/x")
+            await pool.begin_batch()
+            await pool.send("task", on_resolution=resolved.append)
+        self.assertEqual(resolved, [{
+            "engine": "kiro-cli", "provider": "acp", "agent": pool._agent,
+            "resolved_model": "gpt-5.3-codex", "model_resolution": "reported",
+        }])
+        await pool.end_batch()
+
     async def test_end_batch_kills_runtime_only_when_drained(self):
         _install_fake_runtime(self)
         pool = ReviewPool(work_dir="/tmp/x")
@@ -200,13 +230,15 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
     async def test_session_created_and_destroyed_per_task(self):
         _install_fake_runtime(self, script=[_ev(rp.EVENT_TEXT_CHUNK, text="x")])
         pool = ReviewPool(work_dir="/tmp/x")
-        await pool.begin_batch()
-        await pool.send("task")
-        rt = FakeRuntime.instances[0]
-        # exactly one session was created, and it was destroyed (no leak)
-        self.assertEqual(rt._seq, 1)
-        self.assertEqual(rt._session_queues, {})          # destroyed -> unregistered
-        await pool.end_batch()
+        with unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True):
+            await pool.begin_batch()
+            await pool.send("task")
+            rt = FakeRuntime.instances[0]
+            # exactly one session was created, and it was destroyed (no leak)
+            self.assertEqual(rt._seq, 1)
+            self.assertEqual(rt._session_queues, {})          # destroyed -> unregistered
+            self.assertEqual(rp._runtime_model_snapshot(pool._agent), ["runtime-only-model"])
+            await pool.end_batch()
 
     async def test_standalone_send_lazily_spawns(self):
         # No begin_batch (standalone CLI path) -> acquire() spawns on first send.
@@ -506,3 +538,65 @@ class TestReviewEffort(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRuntimePreflight(unittest.TestCase):
+    """runtime_preflight answers "could a reviewer session actually spawn?"
+
+    "" means yes; anything else names what is missing, so the driver can fail
+    the run fast with a triagable reason instead of completing with nothing
+    written and reporting an undiscriminated "no result record".
+    """
+
+    def test_available_runtime_returns_empty(self):
+        with unittest.mock.patch.object(rp, "AcpRuntime", object()), \
+                unittest.mock.patch.object(rp, "resolve_kiro_cli",
+                                           lambda: "/usr/local/bin/kiro-cli"):
+            self.assertEqual(rp.runtime_preflight(), "")
+
+    def test_missing_cli_names_the_runtime(self):
+        with unittest.mock.patch.object(rp, "AcpRuntime", object()), \
+                unittest.mock.patch.object(rp, "resolve_kiro_cli", lambda: None):
+            msg = rp.runtime_preflight()
+            self.assertIn("kiro-cli", msg)
+
+    def test_unimportable_acp_runtime_is_reported(self):
+        with unittest.mock.patch.object(rp, "AcpRuntime", None):
+            msg = rp.runtime_preflight()
+            self.assertTrue(msg)
+            self.assertIn("runtime", msg.lower())
+
+    def test_check_is_read_only(self):
+        # The preflight runs (off the event loop) before every review run — it
+        # must only LOOK for the executable, never spawn or write anything.
+        calls: list[str] = []
+
+        def _resolver() -> str:
+            calls.append("resolve")
+            return "/bin/kiro-cli"
+
+        with unittest.mock.patch.object(rp, "AcpRuntime", object()), \
+                unittest.mock.patch.object(rp, "resolve_kiro_cli", _resolver):
+            rp.runtime_preflight()
+        self.assertEqual(calls, ["resolve"])
+class TestRuntimeModelSnapshots(unittest.TestCase):
+    def test_reviewer_info_exposes_only_its_own_runtime_snapshot(self):
+        with unittest.mock.patch.object(rp, "_resolve_review_agent", return_value="reviewer"), \
+                unittest.mock.patch.object(rp, "_get_review_settings", return_value={"model": None, "effort": ""}), \
+                unittest.mock.patch.dict(
+                    rp._RUNTIME_MODEL_SNAPSHOTS,
+                    {"reviewer": ("gpt-5.6-sol",), "other": ("claude-opus-5",)},
+                    clear=True,
+                ):
+            info = reviewer_info()
+
+        self.assertEqual(info["models"], ["gpt-5.6-sol"])
+        self.assertTrue(info["model_override_supported"])
+
+    def test_missing_snapshot_suppresses_the_override_catalog(self):
+        with unittest.mock.patch.object(rp, "_resolve_review_agent", return_value="reviewer"), \
+                unittest.mock.patch.dict(rp._RUNTIME_MODEL_SNAPSHOTS, {}, clear=True):
+            info = reviewer_info()
+
+        self.assertEqual(info["models"], [])
+        self.assertFalse(info["model_override_supported"])

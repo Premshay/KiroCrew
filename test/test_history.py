@@ -17,6 +17,7 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.history import (
     _HISTORY_LAG_THRESHOLD,
     _CONSOLIDATION_THRESHOLD,
+    _METADATA_CACHE_MAX,
     _SESSION_KEEP_LINES,
     _SESSION_MAX_BYTES,
     ConsolidationOutcome,
@@ -157,18 +158,6 @@ class TestConversationLog:
         log = ConversationLog(base_dir=tmp_path)
         log.mark_consolidated("nonexistent", 5)  # should not raise
 
-    def test_load_transcript(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path)
-        log.append("t1", "user", "what is 2+2?")
-        log.append("t1", "assistant", "4")
-        transcript = log.load_transcript("t1")
-        assert "User: what is 2+2?" in transcript
-        assert "Assistant: 4" in transcript
-
-    def test_load_transcript_empty(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path)
-        assert log.load_transcript("nonexistent") == ""
-
     def test_safe_key_sanitizes(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
         log.append("thread:with/special chars!", "user", "hi")
@@ -186,9 +175,13 @@ class TestConversationLog:
 
     def test_rotation(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
-        # Need > 200 lines AND > 2MB to trigger rotation
-        content = "x" * 10000
-        for i in range(300):
+        # Rotation needs BOTH gates crossed: more than ``_SESSION_KEEP_LINES``
+        # lines and more than ``_SESSION_MAX_BYTES`` bytes. Derive the row size
+        # from the budget instead of hardcoding a byte total, so raising the cap
+        # cannot leave this test green while no longer reaching rotation at all.
+        rows = _SESSION_KEEP_LINES + 50
+        content = "x" * (_SESSION_MAX_BYTES // rows + 1024)
+        for i in range(rows):
             log.append("t1", "user", f"{content} msg {i}")
         path = tmp_path / "t1.jsonl"
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -203,9 +196,13 @@ class TestConversationLog:
 
     def test_rotation_resets_consolidated(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
-        # Need > 200 lines AND > 2MB to trigger rotation
-        content = "x" * 10000
-        for i in range(250):
+        # Row size derived from the budget for the same reason as
+        # ``test_rotation``: the assertion below only means anything if the
+        # second loop actually re-crosses the byte cap after
+        # ``mark_consolidated``, at whatever the cap is set to.
+        rows = _SESSION_KEEP_LINES + 50
+        content = "x" * (_SESSION_MAX_BYTES // rows + 1024)
+        for i in range(rows):
             log.append("t1", "user", f"{content} msg {i}")
         log.mark_consolidated("t1", 200)
         # Add more to trigger rotation again
@@ -640,9 +637,9 @@ class TestSearchSessions:
 
     def test_matches_content(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
-        log.append("alpha", "user", "discussed CR-1234567 today")
+        log.append("alpha", "user", "discussed TICKET-1234567 today")
         log.append("beta", "user", "unrelated chat")
-        results = log.search_sessions("CR-1234567")
+        results = log.search_sessions("TICKET-1234567")
         keys = [s["key"] for s in results]
         assert keys == ["alpha"]
 
@@ -2395,7 +2392,7 @@ class TestConsolidationToolPolicy:
 
     @pytest.mark.asyncio
     async def test_call_llm_timeout_cancels_and_retires_dedicated_session(self, monkeypatch):
-        import kiro_crew.history as history_mod
+        import kiro_crew.history_consolidation as consolidation_mod
         from kiro_crew.history import _CONSOLIDATE_SESSION_KEY
 
         provider = MagicMock()
@@ -2414,8 +2411,11 @@ class TestConsolidationToolPolicy:
             finally:
                 cancelled.set()
 
-        monkeypatch.setattr(history_mod, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01)
-        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S", 0.01)
+        # These constants are read as module globals of history_consolidation;
+        # kiro_crew.history only re-exports them, so patching the facade binds a
+        # name nothing reads and the turn would run to the real 180s timeout.
+        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_TURN_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_CANCEL_ACK_TIMEOUT_S", 0.01)
         with patch("kiro_crew.history.stream_and_collect_json", side_effect=_stalled_stream):
             result = await consolidator._call_llm("some prompt")
 
@@ -2440,7 +2440,7 @@ class TestConsolidationToolPolicy:
         )
         response = {"content": [{"type": "text", "text": '{"history_entry": "done"}'}]}
 
-        with patch("kiro_crew.history._post_consolidation_request", return_value=response) as post:
+        with patch("kiro_crew.history_consolidation._post_consolidation_request", return_value=response) as post:
             result = await consolidator._call_llm("summarize this")
 
         assert result == {"history_entry": "done"}
@@ -2463,7 +2463,7 @@ class TestConsolidationToolPolicy:
             def read(self) -> bytes:
                 return b'{"content": []}'
 
-        with patch("kiro_crew.history.urllib.request.urlopen", return_value=_Response()) as open_url:
+        with patch("kiro_crew.history_consolidation.urllib.request.urlopen", return_value=_Response()) as open_url:
             history._post_consolidation_request(
                 "http://router.example/v1/messages", "consolidate", "", "summarize", 30
             )
@@ -2484,7 +2484,7 @@ class TestConsolidationToolPolicy:
         )
         refusal = history._ConsolidationLaneUnavailable("fleet_lane_busy", 60.0)
 
-        with patch("kiro_crew.history._post_consolidation_request", side_effect=refusal):
+        with patch("kiro_crew.history_consolidation._post_consolidation_request", side_effect=refusal):
             outcome = await consolidator.consolidate_now("session")
 
         meta = log.get_metadata("session")
@@ -2514,7 +2514,8 @@ class TestConsolidationToolPolicy:
             return {"content": [{"type": "text", "text": '{"history_entry": "done"}'}]}
 
         with patch(
-            "kiro_crew.history._post_consolidation_request", side_effect=blocked_request
+            "kiro_crew.history_consolidation._post_consolidation_request",
+            side_effect=blocked_request,
         ) as post:
             first = asyncio.create_task(consolidator._call_direct_endpoint("first"))
             await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=1)
@@ -2618,7 +2619,7 @@ class TestConsolidationChunkAdmission:
         self, tmp_path, monkeypatch
     ):
         from kiro_crew.memory import MemoryStore
-        import kiro_crew.history as history_mod
+        import kiro_crew.history_consolidation as consolidation_mod
 
         log = ConversationLog(base_dir=tmp_path / "sessions")
         log.init()
@@ -2627,7 +2628,10 @@ class TestConsolidationChunkAdmission:
         key = "dashboard:chunked"
         log.append(key, "user", "first " + "a" * 30)
         log.append(key, "assistant", "second " + "b" * 30)
-        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 80)
+        # Read as a module global of history_consolidation; kiro_crew.history
+        # only re-exports it, so patching the facade leaves the real 64 KiB
+        # budget in force and both messages fit one chunk.
+        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 80)
         consolidator = HistoryConsolidator(log=log, memory=memory)
         prompts: list[str] = []
 
@@ -2654,7 +2658,7 @@ class TestConsolidationChunkAdmission:
     @pytest.mark.asyncio
     async def test_oversized_message_defers_without_advancing_offset(self, tmp_path, monkeypatch):
         from kiro_crew.memory import MemoryStore
-        import kiro_crew.history as history_mod
+        import kiro_crew.history_consolidation as consolidation_mod
 
         log = ConversationLog(base_dir=tmp_path / "sessions")
         log.init()
@@ -2662,7 +2666,10 @@ class TestConsolidationChunkAdmission:
         memory.init()
         key = "dashboard:too-large"
         log.append(key, "user", "x" * 100)
-        monkeypatch.setattr(history_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 50)
+        # See the sibling test: the facade re-export is inert, so patching it
+        # would leave the 100-char message well under the real budget and the
+        # oversized-defer branch would never be reached.
+        monkeypatch.setattr(consolidation_mod, "_CONSOLIDATION_CHUNK_MAX_CHARS", 50)
         consolidator = HistoryConsolidator(log=log, memory=memory)
 
         with patch.object(consolidator, "_call_llm", new_callable=AsyncMock) as llm:
@@ -4300,12 +4307,35 @@ class TestConversationLogCacheBounded:
         assert len(log._msg_cache) <= 4
 
     def test_meta_cache_evicts_beyond_bound(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path, cache_max=3)
+        # Bounds the metadata cache by assigning it directly rather than through a
+        # constructor parameter: the production default deliberately does not follow
+        # ``cache_max`` down, and a kwarg only tests pass is production API surface
+        # with no product consumer. The eviction invariant under test is unchanged.
+        from kiro_crew.history import _LRUCache
+
+        log = ConversationLog(base_dir=tmp_path)
+        log._meta_cache = _LRUCache(3)
         for i in range(10):
             key = f"sess{i}"
             log.append(key, "user", f"hi {i}")
             log.get_metadata(key)  # populate meta cache
         assert len(log._meta_cache) <= 3
+
+    def test_a_small_cache_max_cannot_shrink_the_metadata_cache(self, tmp_path):
+        """``cache_max`` must not drag the metadata cache down with it.
+
+        ``list_sessions`` reads ``_meta_cache`` in one cyclic pass over the whole
+        session directory, so a bound below the corpus size is evicted in exactly
+        the order it will next be read and the hit rate collapses to ~0 — every
+        call re-opens and re-parses the first line of most of the store. The
+        transcript cache still honors the knob.
+        """
+        log = ConversationLog(base_dir=tmp_path, cache_max=8)
+        assert log._msg_cache._maxsize == 8, "the transcript cache still honors cache_max"
+        assert log._meta_cache._maxsize == _METADATA_CACHE_MAX, (
+            "the metadata cache followed cache_max down; list_sessions will thrash "
+            "on any store larger than that knob"
+        )
 
     def test_cache_hit_returns_same_object(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path, cache_max=8)
@@ -4382,7 +4412,7 @@ class TestTailReads:
         log._msg_cache.clear()
         log.recent("t1", max_messages=3)
         # Tail path returned a partial view — the full cache must stay empty
-        # so load_transcript()/search still parse the whole file.
+        # so search still parses the whole file.
         assert "t1" not in log._msg_cache
 
     def test_tail_window_grows_when_insufficient(self, tmp_path):
@@ -4819,6 +4849,89 @@ class TestDeleteSessionSummarySidecar:
         log.append("thread-nosum", "user", "hello")
         assert log.delete_session("thread-nosum") is True
         assert not log._summary_cache_path("thread-nosum").exists()
+
+    def test_delete_session_skip_pinned_protects_pinned_sessions(self, tmp_path):
+        """skip_pinned=True returns None for pinned sessions under the REAL lock.
+
+        Regression test for the layering fix: the pin-check-and-delete invariant
+        now lives in ConversationLog.delete_session rather than in a handler closure.
+        This test exercises the real _locked codepath, NOT a mocked context manager,
+        so a regression that breaks lock reentrancy will actually fail.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-pinned", "user", "important")
+        log.update_metadata("sess-pinned", {"pinned": True})
+        log.append("sess-unpinned", "user", "ephemeral")
+
+        # Pinned session: skip_pinned=True returns None, file survives
+        assert log.delete_session("sess-pinned", skip_pinned=True) is None
+        assert log._path("sess-pinned").exists()
+
+        # Unpinned session: skip_pinned=True returns True, file is deleted
+        assert log.delete_session("sess-unpinned", skip_pinned=True) is True
+        assert not log._path("sess-unpinned").exists()
+
+    def test_delete_session_skip_pinned_skips_unreadable_metadata(self, tmp_path):
+        """skip_pinned=True returns None when get_metadata_status returns unreadable.
+
+        Simulates a Windows indexer/AV hold that makes the metadata transiently
+        unreadable. The session is skipped (not deleted blind) and can be retried.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-transient", "user", "might be locked")
+
+        # Patch get_metadata_status to simulate transient unreadability
+        original = log.get_metadata_status
+
+        def _unreadable(key):
+            if key == "sess-transient":
+                return {}, False  # readable=False
+            return original(key)
+
+        log.get_metadata_status = _unreadable
+
+        # skip_pinned=True returns None, file survives
+        assert log.delete_session("sess-transient", skip_pinned=True) is None
+        assert log._path("sess-transient").exists()
+
+    def test_delete_session_skip_pinned_logs_on_exception(self, tmp_path, caplog):
+        """skip_pinned=True logs and returns None when get_metadata_status raises.
+
+        Corrupt metadata or permanent I/O failure should be diagnosable via logs.
+        """
+        import logging
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-corrupt", "user", "bad metadata")
+
+        # Patch to simulate corrupt metadata raising
+        def _corrupt_meta(key):
+            if key == "sess-corrupt":
+                raise ValueError("corrupt JSON")
+            return log.get_metadata(key), True
+
+        log.get_metadata_status = _corrupt_meta
+
+        with caplog.at_level(logging.WARNING):
+            result = log.delete_session("sess-corrupt", skip_pinned=True)
+
+        assert result is None
+        assert log._path("sess-corrupt").exists()
+        assert "unexpected error reading metadata" in caplog.text
+        assert "sess-corrupt" in caplog.text
+
+    def test_delete_session_skip_pinned_false_deletes_pinned(self, tmp_path):
+        """skip_pinned=False (default) deletes even pinned sessions.
+
+        Ensures the default behavior is unchanged for callers that don't use skip_pinned.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-pinned-force", "user", "pinned but forced")
+        log.update_metadata("sess-pinned-force", {"pinned": True})
+
+        # Without skip_pinned, pinned sessions ARE deleted
+        assert log.delete_session("sess-pinned-force") is True
+        assert not log._path("sess-pinned-force").exists()
 
 
 @pytest.mark.asyncio

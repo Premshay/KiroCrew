@@ -11,6 +11,7 @@ import { i18nT } from '../i18n/t'
 import { copyToClipboard } from '../utils/clipboard'
 import { updateAffordance } from '../utils/updateAffordance'
 import { shouldNudge, snoozeRecord, skipRecord, type UpdateNudgeRecord } from '../utils/updateNudge'
+import { foldStableStamp } from '../utils/displayVersion'
 import type { UpdateState } from '../hooks/useUpdateSubscription'
 
 /**
@@ -59,6 +60,11 @@ function desktopCanDownload(): boolean {
 type Candidate = {
   source: 'desktop' | 'gateway'
   version: string
+  /** What the popup PRINTS — the promoted-stamp fold of `version` on the
+   *  stable channel. `version` itself stays raw: it keys the per-version
+   *  snooze/skip records, and a fold there would make dismissing `0.4.0`
+   *  swallow the next release's `0.4.0rcN` candidate too. */
+  displayVersion: string
   notes?: string
   /** Gateway only: which action the primary slot offers. */
   affordance?: 'apply' | 'command'
@@ -78,8 +84,13 @@ export default function UpdateFoundModal() {
 
   const gwAvailable = useAppSelector(s => s.dashboard.status?.update_available === true)
   const gwVersion = useAppSelector(s => s.dashboard.status?.update_latest_version) || ''
+  // Backend-folded sibling for DISPLAY (clean base on the stable channel).
+  // Raw fallback below covers a gateway that predates the field.
+  const gwVersionDisplay = useAppSelector(s => s.dashboard.status?.update_latest_version_display) || ''
   const gwCanApply = useAppSelector(s => s.dashboard.status?.update_can_apply)
   const gwCommand = useAppSelector(s => s.dashboard.status?.update_command) || ''
+  const gwRequired = useAppSelector(s => s.dashboard.status?.update_required === true)
+  const gwMinVersion = useAppSelector(s => s.dashboard.status?.update_min_version) || ''
 
   // When the user enabled background auto-download, the Electron main process
   // starts the download itself right after `found` — a consent popup whose
@@ -90,7 +101,7 @@ export default function UpdateFoundModal() {
   const { data: bridgeInfo } = useQuery({
     queryKey: ['update-info'],
     queryFn: async () =>
-      (window as unknown as { updateAPI?: { getInfo?: () => Promise<{ autoDownload?: boolean }> } })
+      (window as unknown as { updateAPI?: { getInfo?: () => Promise<{ autoDownload?: boolean; channel?: string | null }> } })
         .updateAPI?.getInfo?.() ?? null,
     enabled: !!desktop && (desktop.state === 'found' || desktop.state === 'available'),
     staleTime: Infinity,
@@ -104,11 +115,21 @@ export default function UpdateFoundModal() {
   // vanishes when an auto-download preference lands.
   let candidate: Candidate | null = null
   if (desktop && (desktop.state === 'found' || desktop.state === 'available') && !desktop.replayed && desktop.version && desktopCanDownload() && bridgeInfo !== undefined && bridgeInfo?.autoDownload !== true) {
-    candidate = { source: 'desktop', version: desktop.version, notes: desktop.notes }
+    // Desktop-reported version never crosses the gateway, so the fold is
+    // computed locally, keyed on the followed channel like the backend's.
+    candidate = {
+      source: 'desktop', version: desktop.version,
+      displayVersion: foldStableStamp(desktop.version, bridgeInfo?.channel),
+      notes: desktop.notes,
+    }
   } else if (gwAvailable && gwVersion) {
     const afford = updateAffordance({ updateAvailable: true, canApply: gwCanApply, command: gwCommand })
     if (afford !== 'none') {
-      candidate = { source: 'gateway', version: gwVersion, affordance: afford, command: gwCommand }
+      candidate = {
+        source: 'gateway', version: gwVersion,
+        displayVersion: gwVersionDisplay || gwVersion,
+        affordance: afford, command: gwCommand,
+      }
     }
   }
 
@@ -134,13 +155,23 @@ export default function UpdateFoundModal() {
   const [applyError, setApplyError] = useState('')
   const [persistError, setPersistError] = useState('')
 
+  // Mandatory update (below the governance pin or the release feed's
+  // breaking-change floor): the modal loses every dismissal affordance —
+  // no X, no Escape, no backdrop click, no snooze/skip — and opens without
+  // waiting for the per-version verdict record, because no verdict can
+  // apply. It never blocks the gateway itself; the enforcement surface is
+  // this prompt staying up.
+  const required = !!candidate && gwRequired
+
   // Waiting for the record before opening is what makes "skip 0.5.0" hold
   // across reloads: opening optimistically would flash the modal at every
   // user who already skipped.
   const open = !!candidate
-    && recordLoaded
-    && !sessionDismissed
-    && shouldNudge(candidate.version, record, Date.now() / 1000)
+    && (required || (
+      recordLoaded
+      && !sessionDismissed
+      && shouldNudge(candidate.version, record, Date.now() / 1000)
+    ))
 
   // Gateway notes are fetched only when the modal actually opens: the status
   // frame deliberately omits the changelog blob, and GET /api/update/check
@@ -213,16 +244,16 @@ export default function UpdateFoundModal() {
       onSettled: () => { persistInFlight.current = false },
     })
   }
-  const dismiss = () => { if (candidate) verdict(snoozeRecord(candidate.version, Date.now() / 1000)) }
-  const skip = () => { if (candidate) verdict(skipRecord(candidate.version)) }
+  const dismiss = () => { if (candidate && !required) verdict(snoozeRecord(candidate.version, Date.now() / 1000)) }
+  const skip = () => { if (candidate && !required) verdict(skipRecord(candidate.version)) }
 
   useEffect(() => {
-    if (!open) return
+    if (!open || required) return
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') dismiss() }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, candidate?.version, restarting])
+  }, [open, required, candidate?.version, restarting])
 
   // Move focus INTO the dialog when it opens: aria-modal hides the background
   // from assistive tech, so focus stranded out there points at content the
@@ -265,7 +296,7 @@ export default function UpdateFoundModal() {
 
   const goToAbout = () => {
     dismiss()
-    navigate('/settings?tab=about')
+    navigate('/settings/about')
   }
 
   return (
@@ -276,7 +307,7 @@ export default function UpdateFoundModal() {
     <div
       className="fixed inset-0 z-50 bg-bg/80 backdrop-blur-sm flex items-center justify-center animate-rise"
       role="presentation"
-      onClick={e => { if (e.target === e.currentTarget) dismiss() }}
+      onClick={e => { if (e.target === e.currentTarget && !required) dismiss() }}
     >
       <div
         ref={dialogRef}
@@ -284,22 +315,30 @@ export default function UpdateFoundModal() {
         className="bg-card border border-border rounded-xl shadow-xl w-[460px] max-w-[90vw] flex flex-col overflow-hidden outline-none"
         role="dialog"
         aria-modal="true"
-        aria-label={i18nT('components.updateFoundModal.update_available')}
+        aria-label={required
+          ? i18nT('components.updateFoundModal.update_required')
+          : i18nT('components.updateFoundModal.update_available')}
       >
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-bg-elevated">
           <div className="flex items-center gap-2">
             <Download className="lucide-inline text-accent" size={16} />
-            <span className="text-sm font-semibold text-text">{i18nT('components.updateFoundModal.update_available')}</span>
+            <span className="text-sm font-semibold text-text">
+              {required
+                ? i18nT('components.updateFoundModal.update_required')
+                : i18nT('components.updateFoundModal.update_available')}
+            </span>
           </div>
-          <button
-            type="button"
-            className="text-muted hover:text-text cursor-pointer bg-transparent border-none disabled:opacity-50"
-            onClick={dismiss}
-            disabled={restarting || persist.isPending}
-            aria-label={i18nT('components.updateFoundModal.dismiss')}
-          >
-            <X size={16} />
-          </button>
+          {!required && (
+            <button
+              type="button"
+              className="text-muted hover:text-text cursor-pointer bg-transparent border-none disabled:opacity-50"
+              onClick={dismiss}
+              disabled={restarting || persist.isPending}
+              aria-label={i18nT('components.updateFoundModal.dismiss')}
+            >
+              <X size={16} />
+            </button>
+          )}
         </div>
 
         <div className="px-4 py-3 text-sm text-text">
@@ -312,10 +351,19 @@ export default function UpdateFoundModal() {
                 letter-named closing tags in values. */}
             <Trans
               i18nKey="components.updateFoundModal.version_is_available"
-              values={{ version: candidate.version }}
+              values={{ version: candidate.displayVersion }}
               components={[<span key="v" className="font-semibold" />]}
             />
           </p>
+          {required && (
+            // Why the modal cannot be dismissed. `update_min_version` is
+            // non-empty whenever `update_required` is true (both authorities
+            // return a floor or return not-required), so the note always
+            // names the floor.
+            <p data-testid="update-required-note" className="mt-2 text-[12px] text-danger">
+              {i18nT('components.updateFoundModal.this_version_is_below_minimum', { version: gwMinVersion })}
+            </p>
+          )}
           {notes && (
             // MarkdownRenderer, matching Settings › About's changelog box:
             // gateway notes come straight from CHANGELOG.md — headers, bold,
@@ -334,8 +382,18 @@ export default function UpdateFoundModal() {
             <code data-testid="update-found-command" className="block mt-2 text-[12px] bg-bg border border-border rounded-md px-2 py-1.5 overflow-x-auto whitespace-nowrap">{candidate.command}</code>
           )}
           {applyError && <p className="mt-2 text-[12px] text-danger">{applyError}</p>}
+          {required && applyError && candidate.affordance === 'apply' && gwCommand && (
+            // Escape hatch for the worst state: a mandatory update whose
+            // in-process apply keeps failing would otherwise strand the user
+            // behind this modal with only a retry button. The installer
+            // command (already on the status frame) is the way out via a
+            // terminal; the modal clears on its own once the gateway
+            // restarts on the new version.
+            <code data-testid="update-required-fallback-command" className="block mt-2 text-[12px] bg-bg border border-border rounded-md px-2 py-1.5 overflow-x-auto whitespace-nowrap">{gwCommand}</code>
+          )}
           {persistError && <p role="alert" className="mt-2 text-[12px] text-danger">{persistError}</p>}
           {restarting && <p className="mt-2 text-[12px] text-muted">{i18nT('components.updateFoundModal.updating_and_restarting')}</p>}
+          {!required && (
           <p className="mt-2 text-[12px] flex items-center gap-3">
             {/* One full-sentence key, not a prefix + link-text pair: the link
                 phrase sits sentence-finally in ja/ko, so a split key cannot be
@@ -359,12 +417,14 @@ export default function UpdateFoundModal() {
               {i18nT('components.updateFoundModal.skip_this_version')}
             </button>
           </p>
+          )}
         </div>
 
         {/* flex-wrap: two localized buttons (de runs long) can exceed a 320px
             footer's content box; wrapping stacks them instead of clipping the
             leading action. */}
         <div className="flex flex-wrap items-center justify-end gap-2 px-4 py-2.5 border-t border-border bg-bg-elevated">
+          {!required && (
           <button
             type="button"
             className="px-3 py-1.5 text-sm rounded-md border border-border text-text hover:border-border-strong bg-transparent cursor-pointer disabled:opacity-50"
@@ -373,6 +433,7 @@ export default function UpdateFoundModal() {
           >
             {i18nT('components.updateFoundModal.remind_me_tomorrow')}
           </button>
+          )}
           {candidate.source === 'gateway' && candidate.affordance === 'command' ? (
             <button
               type="button"

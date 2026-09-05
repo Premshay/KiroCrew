@@ -7,7 +7,9 @@ normalized ``LarkInbound`` frames into the async event loop via
 Outbound: ``send_reply`` wraps the sync lark-oapi REST API in
 ``run_in_executor`` so it never blocks the event loop.
 
-``lark-oapi`` is an OPTIONAL dependency (``pip install "kirocrew[feishu]"``).
+``lark-oapi`` is an OPTIONAL dependency: it ships in the ``feishu`` extra, and
+is installed on its own with ``pip install 'lark-oapi>=1.4,<2'`` (this project
+is not on an index, so ``pip install kirocrew[feishu]`` cannot resolve).
 It is imported lazily inside this module's methods so that every other module
 in the package -- including :mod:`kiro_crew.feishu.transport` and the channel
 roster in :mod:`kiro_crew.channels` -- imports cleanly on a build that does not
@@ -26,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from kiro_crew import extras
 from kiro_crew.messaging.split import split_markdown_safe
 
 logger = logging.getLogger(__name__)
@@ -147,6 +150,13 @@ class LarkClient:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._closed = False
+        #: Health observer ``(connected, reason)``, set by ``maybe_start_feishu``
+        #: so the Settings badge tracks the receiver instead of guessing from
+        #: "the channel was enabled at boot". Assigned after construction to
+        #: avoid a client<->transport cycle; see ``_notify_state``.
+        self.on_state_change: Callable[[bool, str], None] | None = None
+        self._healthy: bool | None = None
+        self._healthy_reason = ""
 
         # Build the sync REST client once; it is thread-safe for outbound calls.
         try:
@@ -163,7 +173,7 @@ class LarkClient:
         except ImportError as exc:
             raise ImportError(
                 "lark-oapi is required for the Feishu channel. "
-                "Install it with: pip install lark-oapi"
+                f"Install it with: {extras.install_hint('feishu')}"
             ) from exc
 
         # Dedicated executor for the blocking REST replies. The default
@@ -235,13 +245,16 @@ class LarkClient:
         """Sync P2ImMessageReceiveV1 handler injected into the WS dispatcher."""
         event = getattr(data, "event", None)
         if event is None:
+            logger.info("Feishu inbound dropped: frame has no event")
             return
         message = getattr(event, "message", None)
         if message is None:
+            logger.info("Feishu inbound dropped: event has no message")
             return
 
         msg_id: str = message.message_id or ""
         if not msg_id:
+            logger.info("Feishu inbound dropped: message has no message_id")
             return
 
         # NOTE: redelivery dedup deliberately does NOT happen here. Everything
@@ -253,19 +266,33 @@ class LarkClient:
         # after authorization instead.
 
         # Only handle plain-text messages for now.
-        if (message.message_type or "") != "text":
+        message_type = message.message_type or ""
+        if message_type != "text":
+            logger.info(
+                "Feishu inbound dropped: unsupported message_type=%r (message_id=%s)",
+                message_type,
+                msg_id,
+            )
             return
 
         sender = getattr(event, "sender", None)
         sid = getattr(sender, "sender_id", None) if sender else None
         open_id: str = (getattr(sid, "open_id", None) or "") if sid else ""
         if not open_id:
+            logger.info(
+                "Feishu inbound dropped: sender has no open_id (message_id=%s)",
+                msg_id,
+            )
             return
 
         try:
             content = json.loads(message.content or "{}")
             raw_text: str = content.get("text", "").strip()
         except Exception:
+            logger.info(
+                "Feishu inbound dropped: message content is not valid JSON (message_id=%s)",
+                msg_id,
+            )
             return
 
         # Feishu sends mentions as opaque placeholders (``@_user_1``) with the
@@ -276,6 +303,11 @@ class LarkClient:
         # which is what keeps a bare "@bot" from driving an empty turn.
         mention_free = _AT_RE.sub("", raw_text).strip()
         if not mention_free:
+            logger.info(
+                "Feishu inbound dropped: message body is mention-only "
+                "(no instruction) (message_id=%s)",
+                msg_id,
+            )
             return
         # NOT ``mention_free``: that deletes every placeholder, which would read
         # "@bot /new @alice" as the bare command "/new" and reset the
@@ -283,6 +315,10 @@ class LarkClient:
         command_body = _command_body(raw_text)
         text = _resolve_mentions(raw_text, getattr(message, "mentions", None)).strip()
         if not text:
+            logger.info(
+                "Feishu inbound dropped: resolved text is empty (message_id=%s)",
+                msg_id,
+            )
             return
 
         inbound = LarkInbound(
@@ -330,21 +366,57 @@ class LarkClient:
             # blocks for the life of the channel. Both exits still get a log
             # line: a RETURN means lark gave up reconnecting, which would
             # otherwise kill the receiver in total silence.
+            #
+            # Both exits also publish an UNHEALTHY transition, from this thread
+            # (``_notify_state`` only calls a plain callback, which assigns two
+            # attributes on DashboardState -- no loop affinity required). Without
+            # it a rejected app id/secret leaves the badge reading "connected"
+            # forever, because the only evidence of refusal is this thread
+            # ending seconds after start().
             try:
                 ws.start()
-            except Exception:
+            except Exception as exc:
                 if not self._closed:
                     logger.exception("Feishu WS loop raised; receiver is down")
+                    self._notify_state(False, f"receiver stopped: {type(exc).__name__}")
                 return
             if not self._closed:
                 logger.error(
                     "Feishu WS loop returned without a close() -- receiver is "
                     "down and will not reconnect; restart the gateway."
                 )
+                self._notify_state(
+                    False,
+                    "receiver stopped (check the app id/secret and that the app "
+                    "has the im:message events subscribed)",
+                )
 
         self._thread = threading.Thread(target=_run, daemon=True, name="feishu-ws")
         self._thread.start()
+        # Healthy on launch, then corrected by _run's exit. start() proves the
+        # thread is up, not that Feishu accepted the app -- but a refused app
+        # ends the thread within seconds, so the badge self-corrects rather than
+        # sitting on an optimistic claim indefinitely.
+        self._notify_state(True, "")
         logger.info("Feishu WebSocket receiver started (app_id=%s)", self._app_id)
+
+    def _notify_state(self, connected: bool, error: str) -> None:
+        """Publish a health transition to the dashboard badge.
+
+        Deduped on the transition (mirrors ``TeamsClient._notify_state``): a
+        repeated identical report must not overwrite the FIRST reason with the
+        same later one. The first call always publishes, because the initial
+        state is unknown rather than healthy.
+        """
+        if self._healthy is connected and error == self._healthy_reason:
+            return
+        self._healthy = connected
+        self._healthy_reason = error
+        if self.on_state_change is not None:
+            try:
+                self.on_state_change(connected, error)
+            except Exception:
+                logger.debug("Feishu on_state_change observer raised", exc_info=True)
 
     async def close(self) -> None:
         """Signal shutdown; the daemon thread exits once the WS closes."""
@@ -364,4 +436,7 @@ class LarkClient:
                 logger.debug("Feishu WS stop failed", exc_info=True)
         # Do not wait: an in-flight REST reply must not hold up shutdown.
         self._executor.shutdown(wait=False)
+        # An intentional shutdown is still "not connected" — with no reason,
+        # because nothing failed.
+        self._notify_state(False, "")
         logger.info("Feishu client closed")

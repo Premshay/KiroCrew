@@ -36,8 +36,12 @@ import json
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Callable, Optional
+
+from kiro_crew import model_registry
+from kiro_crew.acp.client import acp_model_config_options
 
 # The app root holds ``sage_lib/``; put it on sys.path so ``from sage_lib import store``
 # resolves on import (mirrors the sys.path setup in sibling ``review_driver.py``).
@@ -91,9 +95,66 @@ try:  # SEL audit — the runtime layer has no audit_source, so the pool emits i
 except Exception:  # pragma: no cover - standalone / test fallback
     _sel = None  # type: ignore[assignment]
 
+try:  # same resolver the AcpRuntime spawn path uses to locate the agent CLI
+    from kiro_crew.kiro_cli import resolve_kiro_cli
+except Exception:  # pragma: no cover - standalone / test fallback
+    resolve_kiro_cli = None  # type: ignore[assignment]
+
 from sage_lib import followup, store  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+_RUNTIME_MODEL_SNAPSHOTS: dict[str, tuple[str, ...]] = {}
+_RUNTIME_MODEL_SNAPSHOTS_LOCK = threading.Lock()
+
+
+def _record_runtime_model_snapshot(agent: str, handle: object) -> None:
+    """Cache the model ids the reviewer's own ACP session advertised."""
+    configured = acp_model_config_options(getattr(handle, "config_options", []))
+    advertised = configured or getattr(handle, "available_models", [])
+    models: list[str] = []
+    for entry in advertised:
+        model = entry.get("modelId") if isinstance(entry, dict) else None
+        if isinstance(model, str) and model and model not in models:
+            models.append(model)
+    if models:
+        with _RUNTIME_MODEL_SNAPSHOTS_LOCK:
+            _RUNTIME_MODEL_SNAPSHOTS[agent] = tuple(models)
+
+
+def _runtime_model_snapshot(agent: str) -> list[str]:
+    """Return the latest live Sage runtime capability snapshot for this agent."""
+    with _RUNTIME_MODEL_SNAPSHOTS_LOCK:
+        return list(_RUNTIME_MODEL_SNAPSHOTS.get(agent, ()))
+
+
+def runtime_preflight() -> str:
+    """Cheap, read-only check that a reviewer session could actually be spawned.
+
+    Returns ``""`` when the runtime looks usable, else a message naming exactly
+    what is missing. Mirrors what ``_ensure_runtime_locked`` needs to spawn the
+    shared runtime — an importable ``AcpRuntime`` driving a ``kiro-cli``
+    subprocess — using the same resolver (``resolve_kiro_cli``) the runtime's
+    own spawn path goes through, so the answer here matches what a real spawn
+    would find. Without this check a review on a host with no usable agent CLI
+    completes with nothing written and reports an undiscriminated "no result
+    record", which cannot be triaged.
+
+    Deliberately does NOT spawn anything or touch the filesystem beyond the
+    executable lookup. That lookup still stats candidates under every ``PATH``
+    entry, so callers on the gateway event loop MUST offload this to a thread
+    (``asyncio.to_thread``) — one stale network mount in ``PATH`` would
+    otherwise stall the whole loop.
+    """
+    if AcpRuntime is None:
+        return ("the reviewer cannot run: the ACP runtime "
+                "(kiro_crew.acp.runtime) is not importable in this install")
+    if resolve_kiro_cli is not None and resolve_kiro_cli() is None:
+        return ("the reviewer cannot run: no kiro-cli executable was found on "
+                "this host (the reviewer session is driven by kiro-cli — "
+                "install it or add it to PATH)")
+    return ""
 
 
 def _is_abnormal_stop(reason: str) -> bool:
@@ -139,6 +200,12 @@ try:
 except Exception:  # pragma: no cover - defensive (config import cost/cycle)
     _SYSTEM_DEFAULT_MODEL = "auto"
 _DEFAULT_REVIEW_MODEL = _SYSTEM_DEFAULT_MODEL
+
+try:
+    from kiro_crew.effort import effort_settings_key, model_supports_effort
+except Exception:  # pragma: no cover - standalone / test fallback
+    effort_settings_key = lambda _model: "output_config"  # type: ignore[assignment]
+    model_supports_effort = lambda _model: False  # type: ignore[assignment]
 
 # Valid concrete effort levels — sourced from kiro_crew.effort (single source of
 # truth), not a hardcoded list. "" (inherit default) is handled separately.
@@ -244,9 +311,19 @@ def reviewer_info() -> dict:
     thinking effort level (user-configured) applied to both review phases."""
     agent = _resolve_review_agent()
     settings = _get_review_settings()
-    return {"agent": agent, "model": _reviewer_model(agent),
-            "effort": settings.get("effort", _DEFAULT_EFFORT),
-            "model_source": "config" if settings.get("model") else "agent-default"}
+    model = _reviewer_model(agent)
+    models = _runtime_model_snapshot(agent)
+    return {
+        "agent": agent,
+        "engine": "kiro-cli",
+        "provider": "acp",
+        "model": model,
+        "effort": settings.get("effort", _DEFAULT_EFFORT),
+        "model_source": "config" if settings.get("model") else "agent-default",
+        "model_override_supported": bool(models),
+        "effort_override_supported": bool(model_supports_effort(model)),
+        "models": models,
+    }
 
 
 def _write_effort_overlay(work_dir: str, model: str, effort: str = REVIEW_EFFORT) -> None:
@@ -279,16 +356,38 @@ def _write_effort_overlay(work_dir: str, model: str, effort: str = REVIEW_EFFORT
         model_cfg = defaults.get(model)
         if not isinstance(model_cfg, dict):
             model_cfg = {}
-        output_cfg = model_cfg.get("output_config")
+        key = effort_settings_key(model)
+        output_cfg = model_cfg.get(key)
         if not isinstance(output_cfg, dict):
             output_cfg = {}
         output_cfg["effort"] = effort
-        model_cfg["output_config"] = output_cfg
+        model_cfg[key] = output_cfg
         defaults[model] = model_cfg
         existing["chat.modelDefaults"] = defaults
         cli_json.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     except Exception:
         logger.debug("could not write review effort overlay (work_dir=%s)", work_dir, exc_info=True)
+
+
+def _clear_effort_overlay(work_dir: str, model: str) -> None:
+    """Remove a prior Sage effort override when the resolved model cannot use it."""
+    try:
+        cli_json = Path(work_dir) / ".kiro" / "settings" / "cli.json"
+        if not cli_json.exists():
+            return
+        existing = json.loads(cli_json.read_text(encoding="utf-8"))
+        defaults = existing.get("chat.modelDefaults") if isinstance(existing, dict) else None
+        model_cfg = defaults.get(model) if isinstance(defaults, dict) else None
+        if not isinstance(model_cfg, dict):
+            return
+        effort_cfg = model_cfg.get(effort_settings_key(model))
+        if not isinstance(effort_cfg, dict) or "effort" not in effort_cfg:
+            return
+        effort_cfg.pop("effort")
+        cli_json.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    except Exception:
+        logger.debug("could not clear review effort overlay (work_dir=%s)", work_dir,
+                     exc_info=True)
 
 
 class _BatchRuntimeHolder:
@@ -357,14 +456,18 @@ class _BatchRuntimeHolder:
             await self._kill(rt)
         if AcpRuntime is None:
             raise RuntimeError("AcpRuntime unavailable (kiro_crew.acp.runtime not importable)")
+        binding = reviewer_info()
+        model = str(binding.get("model") or "")
         # Effort overlay is read by kiro-cli at each session/new, so it must be on
         # disk before spawn. Keyed on the resolved model (config override -> agent
         # default). Best-effort — a bad overlay never blocks the review.
         if self._work_dir:
             try:
-                _write_effort_overlay(
-                    self._work_dir, _reviewer_model(self._agent),
-                    _get_review_settings().get("effort", _DEFAULT_EFFORT))
+                effort = _get_review_settings().get("effort", _DEFAULT_EFFORT)
+                if effort and model_supports_effort(model):
+                    _write_effort_overlay(self._work_dir, model, effort)
+                else:
+                    _clear_effort_overlay(self._work_dir, model)
             except Exception:
                 logger.debug("could not write review effort overlay", exc_info=True)
         # work_dir + sandbox_mode="auto" mirror the old AcpClient worker: the
@@ -374,6 +477,7 @@ class _BatchRuntimeHolder:
         runtime_kwargs: dict = {
             "work_dir": self._work_dir,
             "sandbox_mode": "auto",
+            "model": model_registry.to_acp_id(model) if model and model != "auto" else None,
         }
         apply_runtime_client_binding(runtime_kwargs, runtime_client_binding(self._agent))
         rt = AcpRuntime(agent=self._agent, **runtime_kwargs)
@@ -464,7 +568,8 @@ class ReviewPool:
 
     async def send(self, task: str, timeout: float = DEFAULT_TASK_TIMEOUT,
                    on_activity: Callable[[str, int], None] | None = None,
-                   keep_session_key: str | None = None) -> str:
+                   keep_session_key: str | None = None,
+                   on_resolution: Callable[[dict], None] | None = None) -> str:
         """Run one review task on its own session of the shared runtime and return
         the final assistant text. Auto-approves every tool permission (the reviewer
         runs the `gh` CLI + shell) and emits a per-tool SEL audit.
@@ -487,6 +592,14 @@ class ReviewPool:
                 # agent=None -> inherit the runtime's agent (spawned with --agent);
                 # cwd=app root so relative prompt paths + the effort overlay resolve.
                 handle = await runtime.create_session(cwd=self._work_dir, agent=None)
+                _record_runtime_model_snapshot(self._agent, handle)
+                if on_resolution is not None:
+                    served = str(getattr(handle, "served_model", "") or "").strip()
+                    on_resolution({
+                        "engine": "kiro-cli", "provider": "acp", "agent": self._agent,
+                        "resolved_model": served or None,
+                        "model_resolution": "reported" if served else "unavailable",
+                    })
                 gen = handle.prompt(task, timeout=timeout)
                 parts: list[str] = []
                 stop_reason = ""
@@ -675,6 +788,7 @@ def make_sync_dispatch(
     loop: asyncio.AbstractEventLoop,
     pool: ReviewPool,
     default_timeout: float = DEFAULT_TASK_TIMEOUT,
+    on_resolution: Callable[[dict], None] | None = None,
 ) -> DispatchFn:
     """Build a synchronous ``(task, timeout) -> {ok, output, error}`` dispatch that
     bridges the threaded review driver to the async ``pool`` running on ``loop``.
@@ -694,7 +808,8 @@ def make_sync_dispatch(
             # guarded and copy-on-write, so that crossing is safe.
             fut = asyncio.run_coroutine_threadsafe(
                 pool.send(task, timeout=timeout, on_activity=on_activity,
-                          keep_session_key=keep_session_key), loop)
+                          keep_session_key=keep_session_key,
+                          on_resolution=on_resolution), loop)
             # Give the bridge a little headroom past the task timeout so the
             # pool's own timeout fires first with a cleaner error.
             out = fut.result(timeout=timeout + 60)

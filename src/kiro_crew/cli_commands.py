@@ -56,7 +56,7 @@ from kiro_crew.config.loader import (
     read_local_secret,
     update_config_locked,
 )
-from kiro_crew.cron import CronSchedule, CronService, format_schedule
+from kiro_crew.cron import CronSchedule, CronService, CronStoreUnreadable, format_schedule
 from kiro_crew.cron_trigger import trigger_cron_job
 from kiro_crew.dashboard import tailnet, tailnet_serve
 from kiro_crew.dashboard.origin import parse_dashboard_url
@@ -222,8 +222,16 @@ def _spawn(args: argparse.Namespace) -> None:
             print("No subagents.")
             return
         for a in agents:
-            status = "✅" if a.get("done") else "⏳"
-            print(f"  {status} {a['id']}  {a.get('task', '')[:60]}")
+            if a.get("done"):
+                status, note = "✅", ""
+            elif a.get("awaiting_approval"):
+                # A run parked on its spawn-approval prompt used to render the
+                # same bare hourglass as one that is executing, so `spawn list`
+                # could not answer "is this working or waiting for me?" (#6484).
+                status, note = "🔐", "  — waiting for spawn approval"
+            else:
+                status, note = "⏳", ""
+            print(f"  {status} {a['id']}  {a.get('task', '')[:60]}{note}")
         return
 
     if action == "run":
@@ -269,6 +277,7 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
     print(f"Spawned subagent {agent_id}, waiting for result...", file=sys.stderr)
     poll_url = f"{base}/api/spawn/{agent_id}"
     secret = _internal_secret(args.port)
+    told_awaiting = False
     while True:
         _time.sleep(2)
         poll_req = urllib.request.Request(poll_url, headers={"X-Internal-Secret": secret})
@@ -278,6 +287,18 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         except Exception:
             print("Error: lost connection to gateway", file=sys.stderr)
             sys.exit(1)
+        # Say WHY the wait is not progressing. A spawn with no parent session
+        # raises its approval prompt unowned, so it appears only on the global
+        # approvals surface -- not in any chat tab -- and this loop would
+        # otherwise sit on "waiting for result..." indefinitely with nothing to
+        # act on (#6484). Announced once, not every 2s poll.
+        if status.get("awaiting_approval") and not told_awaiting:
+            told_awaiting = True
+            print(
+                "Waiting for spawn approval: approve it in the dashboard "
+                "(Approvals) to start this run.",
+                file=sys.stderr,
+            )
         if status.get("done"):
             if status.get("error"):
                 print(f"Error: {status['error']}", file=sys.stderr)
@@ -593,6 +614,49 @@ def _register_app_crons_to_scheduler(app_name: str) -> list[str]:
     return registered
 
 
+def _warn_hooks_need_restart(app_name: str) -> bool:
+    """Say plainly that a running gateway will not pick up this app's backend hooks.
+
+    Everything else a CLI enable writes is re-read by a running gateway:
+    ``enable_app`` writes ``installed.json``, ``register_app`` writes agent and
+    skill files, and ``_register_app_crons_to_scheduler`` writes through the
+    shared cron store that the gateway's timer tick re-syncs by content digest.
+    Backend hooks are the exception -- they are Python modules imported INTO the
+    gateway process, and only the gateway can replace them (``on_app_enable`` ->
+    ``RouteRegistry.register_app_routes`` -> ``load_app_module``, reached by the
+    HTTP enable route and by ``on_gateway_startup``). This process has no handle
+    on that one's ``sys.modules``, so a CLI enable cannot load them.
+
+    Printing only "enabled <app>" reads as though it had. The operator then
+    verifies a hook change against the code the gateway imported earlier and
+    concludes the change did not work -- or that it did, when it never ran
+    (issue #7880).
+
+    Deliberately NOT gated on a live-gateway probe. ``_marker_port`` is the only
+    verified one available here, and it writes its own multi-gateway warning to
+    stderr, which would surface out of context on an app enable. The notice is
+    phrased conditionally instead, so it stays true when no gateway is up.
+
+    Only for apps that declare ``backend.hooks``: there is nothing stale to warn
+    about otherwise. Returns whether the notice was printed.
+    """
+    info = get_app(app_name)
+    manifest = info.get("manifest") if isinstance(info, dict) else None
+    backend = manifest.get("backend") if isinstance(manifest, dict) else None
+    hooks = backend.get("hooks") if isinstance(backend, dict) else None
+    if not isinstance(hooks, dict) or not hooks:
+        return False
+    declared = ", ".join(sorted(str(k) for k in hooks))
+    print(
+        f"  note: this app declares backend hooks ({declared}).\n"
+        "  A gateway that is already running keeps executing the hook code it\n"
+        "  imported earlier; this command cannot replace it. Run `kirocrew\n"
+        "  restart`, or disable and re-enable the app from the dashboard, for\n"
+        "  hook changes to take effect."
+    )
+    return True
+
+
 def _run_app_mcp_server(app_name: str) -> None:
     """Run the named app's stdio MCP server in this process.
 
@@ -676,14 +740,29 @@ def _handle_app(args: argparse.Namespace) -> None:
             if reg.skills:
                 print(f"   Skills registered: {len(reg.skills)}")
             _register_app_crons_to_scheduler(args.name)
+            _warn_hooks_need_restart(args.name)
         else:
             print(f"❌ {result.error}", file=sys.stderr)
             sys.exit(1)
 
     elif action == "disable":
         _cleanup_app_crons_from_scheduler(args.name)
-        deregister_app(args.name)
+        # Flip the authoritative flag BEFORE tearing resources down. A running gateway
+        # is a DIFFERENT process: it watches this app's backend and re-registers its MCP
+        # servers and agents on a health recovery, gated on the enabled flag it reads
+        # from installed.json. Deregistering first leaves a window where that flag still
+        # says enabled and the resources are already gone — and a recovery landing there
+        # puts them back for an app the operator is disabling. The gateway's own disable
+        # path has no such window because it stops the backend first, which ends the
+        # watch; the CLI cannot do that from out here, so it closes the window by
+        # ordering instead.
+        #
+        # If the deregistration below then fails, the app is still correctly marked
+        # disabled and the failure is reported to an operator already at the terminal —
+        # which is the better of the two error shapes, because the alternative is a
+        # silent re-registration nobody sees.
         result = disable_app(args.name)
+        deregister_app(args.name)
         if result.ok:
             print(f"✅ {result.message}")
         else:
@@ -877,6 +956,27 @@ def _agent_reset_model(args: argparse.Namespace) -> None:
 
 
 def _cron(args: argparse.Namespace) -> None:
+    """Dispatch cron subcommands, translating a refused write into an error.
+
+    ``CronService._save`` raises ``CronStoreUnreadable`` rather than silently
+    skipping the write when the last load failed, so every mutating verb here can
+    fail that way. Untranslated it reached the user as a stack trace, which names
+    the raise site but not the one action that fixes it. The exception's own
+    message carries that remediation, so it is surfaced verbatim.
+
+    One wrapper rather than a handler per verb: `add`, `update`, `remove`,
+    `pause`, `resume` and `adopt` all persist through the same ``_save``, so
+    catching at the dispatch boundary covers them without eight duplicated
+    blocks, and any verb added later is covered by construction.
+    """
+    try:
+        _cron_dispatch(args)
+    except CronStoreUnreadable as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _cron_dispatch(args: argparse.Namespace) -> None:
     """Dispatch cron subcommands: list, add, remove, pause, resume."""
 
     svc = CronService(base_dir=config_dir())
@@ -1441,7 +1541,7 @@ def _print_denied_command_summary(*, ids: bool) -> None:
     """Print the built-in denied-command catalog as grouped counts (or, with
     ``--ids``, each category's rule ids).
 
-    The 139 built-in rules are visible and configurable to the USER (Settings
+    The built-in rules are visible and configurable to the USER (Settings
     → Security renders them in category accordions, backed by
     ``GET /api/security/denied-commands``) but were invisible to the AGENT --
     ``policy show`` reported everything except them, so an agent planning a
@@ -1589,8 +1689,127 @@ def _policy(args: argparse.Namespace) -> None:
         for scope in sorted(prof.controls):
             print(f"   • {scope}: {prof.controls[scope]}")
 
+    elif action == "source":
+        _print_policy_source()
+
+    elif action == "fetch":
+        _policy_fetch(force=getattr(args, "force", False))
+
     else:
-        print("Usage: kirocrew policy {show|validate|explain <scope> <item>|profile <name>}")
+        print(
+            "Usage: kirocrew policy {show|validate|explain <scope> <item>|"
+            "profile <name>|source|fetch}"
+        )
+
+
+def _print_policy_source() -> None:
+    """Report whether this host follows a centrally distributed ceiling.
+
+    Prints the source's SCHEME rather than its URL, matching what the dashboard
+    viewer exposes: this command is reachable from a shell the agent may drive, and
+    the endpoint is the fleet's control plane. An operator who needs the URL reads
+    it from the policy file or the environment, out of band.
+    """
+    from kiro_crew.platform.policy_distribution import (
+        POLICY_URL_ENV,
+        distribution_posture,
+        registered_policy_schemes,
+    )
+
+    posture = distribution_posture()
+    if posture.get("error_code"):
+        print(
+            "⚠️  Central policy distribution is misconfigured; see the gateway log "
+            "for the reason and check the 'distribution' block in your policy."
+        )
+        return
+    if not posture.get("configured"):
+        print("Central policy distribution: not configured (this host uses a local policy).")
+        print(
+            f"   Set {POLICY_URL_ENV}, or add a 'distribution' block to the policy, to enable it."
+        )
+        print(f"   Transports available: {', '.join(registered_policy_schemes())}")
+        return
+
+    interval = posture.get("refresh_interval_seconds") or 0
+    print("🌐 Central policy distribution: ACTIVE")
+    print(f"   transport        : {posture.get('source_scheme') or '—'}")
+    print(f"   refresh          : {f'every {interval}s' if interval else 'at boot only'}")
+    print(f"   polling now      : {'yes' if posture.get('refresher_running') else 'no'}")
+    max_age = posture.get("max_cache_age_seconds") or 0
+    print(f"   staleness bound  : {f'{max_age}s' if max_age else 'none'}")
+    print(f"   if unavailable   : {posture.get('on_unavailable')}")
+    if posture.get("cache_present"):
+        print(f"   cached copy      : {posture.get('cache_age_seconds')}s old")
+    else:
+        print("   cached copy      : none (an outage would leave this host with no ceiling)")
+    if posture.get("last_refresh_status"):
+        print(
+            f"   last refresh     : {posture['last_refresh_status']} "
+            f"({posture.get('last_refresh_age_seconds')}s ago)"
+        )
+
+
+def _policy_fetch(*, force: bool) -> None:
+    """Fetch the central policy now, applying it when it is usable.
+
+    Exits non-zero on a refusal or an unreachable source so this is usable as a
+    fleet-verification step in a config-management run: an admin rolling a change
+    needs a check that FAILS on the host that did not take it, not one that prints
+    a warning into a log nobody reads.
+
+    **What it can and cannot claim.** ``refresh_now`` installs the ceiling in the calling
+    process, and this process exits immediately — so a bare "applied" would overclaim: a
+    running gateway is a different process and keeps its own ceiling until its refresher
+    polls. What this command really establishes is that the endpoint serves a document
+    this host accepts, and that the document is now the host's last-known-good. The
+    message says which of those happened and when a running gateway takes it, because a
+    boot-only source (no ``refresh_interval_secs``) has no next cycle to take it on.
+    """
+    from kiro_crew.platform.policy_distribution import (
+        REFRESH_APPLIED,
+        REFRESH_NOT_CONFIGURED,
+        REFRESH_REJECTED,
+        REFRESH_UNCHANGED,
+        effective_refresh_interval,
+        refresh_now,
+    )
+
+    outcome = refresh_now(force=force)
+    if outcome.status == REFRESH_NOT_CONFIGURED:
+        print("Central policy distribution is not configured; nothing to fetch.")
+        return
+    if outcome.status == REFRESH_UNCHANGED:
+        print("✅ The central policy is unchanged; this host is current.")
+        if outcome.detail:
+            print(f"   {outcome.detail}")
+        return
+    if outcome.status == REFRESH_APPLIED:
+        print("✅ Fetched a valid governance ceiling and cached it as this host's own.")
+        if outcome.signature_state:
+            print(f"   provenance: {outcome.signature_state}")
+        interval = effective_refresh_interval()
+        if interval:
+            print(
+                f"   A running gateway adopts it within {interval}s, on its next refresh; "
+                "a newly started one adopts it immediately."
+            )
+        else:
+            print(
+                "   This source is boot-only (no refresh_interval_secs), so a gateway "
+                "already running keeps its current ceiling until it is restarted. Set a "
+                "refresh interval if a push should bind without one."
+            )
+        return
+    # Rejected or unreachable. The running ceiling is untouched either way, which
+    # is worth saying: an operator reading a failure needs to know whether the host
+    # is now ungoverned (it is not).
+    # "was refused", not "refused": the policy is the object of the refusal, not the
+    # thing doing it.
+    label = "was refused" if outcome.status == REFRESH_REJECTED else "could not be reached"
+    print(f"❌ The central policy {label}: {outcome.detail}")
+    print("   The ceiling already in effect is unchanged.")
+    raise SystemExit(1)
 
 
 async def _run_eval(args: argparse.Namespace) -> None:
@@ -1859,6 +2078,39 @@ def _markdown_memory_store() -> MemoryStore:
     return MemoryStore()
 
 
+def _memory_search_history(args: argparse.Namespace) -> None:
+    """Print FTS5 hits from the markdown memory layer.
+
+    Reads the same index the heartbeat and gateway keep current, so this needs
+    no embedder and no vector store — it answers "where did I write this word"
+    against preferences, projects and the dated daily-history files.
+
+    Resolves the store through ``_markdown_memory_store`` for the reason spelled
+    out there: the reader must anchor exactly where the gateway's consolidator
+    writes, or a config that remaps the default workspace searches a tree
+    nothing writes to.
+    """
+    store = _markdown_memory_store()
+    results = store.search(args.query, limit=10)
+    if not results:
+        # An empty index is not the same statement as an absent word, so the two
+        # are reported differently.
+        if not store.index_row_count():
+            print("Memory history index is empty or unavailable; nothing was searched.")
+        else:
+            print("No memory-history matches.")
+        return
+    print("  Daily history / preferences / projects:")
+    for r in results:
+        # Strip terminal control sequences for the same reason the semantic
+        # listing does: memory holds whatever the user pasted into a session.
+        path = _TERMINAL_CTRL_RE.sub("", str(r.get("path", "?")))
+        snippet = _TERMINAL_CTRL_RE.sub("", str(r.get("snippet", ""))).strip()
+        print(f"    {path}")
+        if snippet:
+            print(f"        {snippet}")
+
+
 def _memory_show(args: argparse.Namespace) -> None:
     """Read-only view of the markdown memory layer (preferences/projects/history).
 
@@ -1906,6 +2158,11 @@ def _memory_cmd(args: argparse.Namespace) -> None:
     if action == "show":
         _memory_show(args)
         return
+    # "search --layer history" reads only the markdown FTS index, so don't open
+    # (or create) the vector store for it — same reason as "show" above.
+    if action == "search" and getattr(args, "layer", "all") == "history":
+        _memory_search_history(args)
+        return
     cfg = KiroCrewConfig.load()
     store = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim)
     store.init()
@@ -1931,19 +2188,31 @@ def _memory_cmd(args: argparse.Namespace) -> None:
                 )
 
         elif action == "search":
-            results = store.search_episodic(query_text=args.query, limit=10)
-            if not results:
-                print("No episodic memories found.")
-                return
-            for r in results:
-                tags = (
-                    json.loads(r.get("tags", "[]"))
-                    if isinstance(r.get("tags"), str)
-                    else r.get("tags", [])
-                )
-                print(f"  [{r.get('importance', 0):.1f}] {r['text'][:120]}")
-                if tags:
-                    print(f"        tags: {', '.join(tags)}")
+            layer = getattr(args, "layer", "all")
+            if layer in ("vector", "all"):
+                results = store.search_episodic(query_text=args.query, limit=10)
+                if not results:
+                    print("No episodic memories found.")
+                    # Under "all" the markdown layer is still to come: an empty
+                    # vector result is not an empty answer.
+                    if layer == "vector":
+                        return
+                elif layer == "all":
+                    # Both sections are printed, so both are named. Unlabelled,
+                    # the first block of hits reads as the whole answer. Held
+                    # back under "vector", whose output shape is a promise.
+                    print("  Episodic recall:")
+                for r in results:
+                    tags = (
+                        json.loads(r.get("tags", "[]"))
+                        if isinstance(r.get("tags"), str)
+                        else r.get("tags", [])
+                    )
+                    print(f"  [{r.get('importance', 0):.1f}] {r['text'][:120]}")
+                    if tags:
+                        print(f"        tags: {', '.join(tags)}")
+            if layer == "all":
+                _memory_search_history(args)
 
         elif action == "stats":
             stats = store.memory_stats()
@@ -2125,6 +2394,13 @@ def _artifact(args: argparse.Namespace) -> None:
             "content": _read_content(args),
             "tags": _parse_tags(getattr(args, "tags", None)),
         }
+        # An explicit --slug is forwarded whenever it is not None, INCLUDING the
+        # empty string. "" is a slug the caller named, not a request to derive
+        # one, and the store refuses it; truthy filtering would swallow it and
+        # silently take the derive-and-suffix branch instead.
+        slug_arg = getattr(args, "slug", None)
+        if slug_arg is not None:
+            body["slug"] = slug_arg
         for k in ("kind", "description"):
             v = getattr(args, k, None)
             if v:
@@ -2133,7 +2409,37 @@ def _artifact(args: argparse.Namespace) -> None:
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
-        print(f"Saved: slug={d.get('slug', '?')} version={d.get('version', 1)}")
+        slug = d.get("slug", "?")
+        print(f"Saved: slug={slug} version={d.get('version', 1)}")
+        # Present only when the slug was derived from --name, because that is the
+        # branch where a taken slug resolves by suffixing. That reads as success
+        # (exit 0, "version=1"), which is how a re-save of corrected content ends
+        # up published at a slug nobody looks at while the original keeps serving
+        # the old text. Name the slug that was taken and the verb that versions in
+        # place. An explicit --slug cannot land here: the store refuses it rather
+        # than renaming — 409 when the slug is taken, 400 when it is malformed
+        # (the empty string included) — so both surface on the error path above.
+        taken = d.get("slug_collided_with")
+        if taken:
+            print(
+                f"Warning: slug '{taken}' is already taken, so this created a NEW "
+                f"artifact at '{slug}' rather than a new version of '{taken}'. "
+                f"To version the existing artifact in place, use: "
+                f"kirocrew artifact update {taken}",
+                file=sys.stderr,
+            )
+        # Relayed from the gateway (same pattern as slug_collided_with): the
+        # handler computes the theme-contrast verdict at the convergence
+        # point, so this CLI path -- the one the motivating incident traveled
+        # -- hears it without duplicating the detector. Advisory only.
+        if d.get("theme_contrast_warning"):
+            print(
+                "Warning: content hardcodes colors with no theme variables — it "
+                "will clash in dark/light/custom dashboard themes. Prefer "
+                "var(--text,#111) / var(--bg,#fff) style fallbacks (see the "
+                "widgets skill's theme table).",
+                file=sys.stderr,
+            )
         return
 
     if action == "update":
@@ -2165,6 +2471,17 @@ def _artifact(args: argparse.Namespace) -> None:
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
         print(f"Updated: slug={d.get('slug', slug)} version={d.get('version', '?')}")
+        # Relayed from the gateway (see the save action above) -- the PATCH
+        # path is exactly how the motivating incident's script pushed its
+        # hardcoded-palette page. Advisory only; the update succeeded.
+        if d.get("theme_contrast_warning"):
+            print(
+                "Warning: content hardcodes colors with no theme variables — it "
+                "will clash in dark/light/custom dashboard themes. Prefer "
+                "var(--text,#111) / var(--bg,#fff) style fallbacks (see the "
+                "widgets skill's theme table).",
+                file=sys.stderr,
+            )
         return
 
     if action == "delete":

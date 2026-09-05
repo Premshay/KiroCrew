@@ -33,6 +33,7 @@ from kiro_crew.dashboard.handlers_channel import (
     api_channel_post,
     deliver_attached_channel_message,
 )
+from kiro_crew.dashboard.session_control import containment_meta
 from kiro_crew.dashboard.state import (
     PEER_CHANNEL_REQUEST_KIND,
     PEER_CHANNEL_REQUEST_PREFIX,
@@ -118,6 +119,9 @@ class TestSessionChannelTools:
             }
         )
         monkeypatch.setattr(mcp_core, "_post", post)
+        monkeypatch.setattr(
+            mcp_core, "_resolve_session_key_strict", lambda: "dashboard:crew-codex"
+        )
 
         result = mcp_core._call_tool_inner(
             "session_channel_post",
@@ -194,6 +198,9 @@ class TestSessionChannelTools:
     def test_arms_a_strict_post_restart_verification(self, monkeypatch) -> None:
         post = MagicMock(return_value={"ok": True})
         monkeypatch.setattr(mcp_core, "_post", post)
+        monkeypatch.setattr(
+            mcp_core, "_resolve_session_key_strict", lambda: "dashboard:crew-codex"
+        )
 
         result = mcp_core._call_tool_inner(
             "session_restart_continuation",
@@ -325,6 +332,33 @@ class TestSessionChannelEndpoint:
         assert response.status == 200
         assert body["agent"]["role"] == "Verifier"
         assert body["agent"]["approval_policy"] == "writes"
+        spawned.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_first_attached_session_can_manage_membership(self, monkeypatch, tmp_path) -> None:
+        state, channel, coordinator, _member, _slot = _channel_state(tmp_path)
+        assert coordinator is not None
+        spawned = AsyncMock()
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.sessions._spawn_channel_member", spawned
+        )
+
+        response = await api_session_channel(
+            _request(
+                state,
+                {
+                    "action": "add_agent",
+                    "channel_id": channel.id,
+                    "role": "Verifier",
+                    "agent": "crew-codex",
+                    "task": "Run the focused regression checks.",
+                },
+                session_key=coordinator.session_key,
+            )
+        )
+
+        assert response.status == 200
+        assert json.loads(response.text)["agent"]["role"] == "Verifier"
         spawned.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -853,7 +887,7 @@ class TestAttachedSessionWake:
         assert slot._queue == []
 
     @pytest.mark.asyncio
-    async def test_interrupt_mention_queues_at_head_when_steer_is_unavailable(
+    async def test_interrupt_mention_preempts_when_steer_is_unavailable(
         self, monkeypatch, tmp_path
     ) -> None:
         state = _state(tmp_path)
@@ -862,6 +896,7 @@ class TestAttachedSessionWake:
         slot.task.done.return_value = False
         slot._acp_client = SimpleNamespace(supports_steer=False)
         slot.queue_append("later")
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
         member = SimpleNamespace(session_key="dashboard:crew-codex")
         message = ChannelMessage(
             id="interrupt2",
@@ -878,13 +913,24 @@ class TestAttachedSessionWake:
             state, SimpleNamespace(id="deadbeef"), member, message
         )
 
-        assert outcome == "queued"
+        assert outcome == "interrupted"
+        state.sessions.stop_turn.assert_awaited_once()
+        stop_kwargs = state.sessions.stop_turn.call_args.kwargs
+        assert stop_kwargs["force"] is False
+        assert stop_kwargs["preserve_queue"] is True
+        assert slot._stop_state == "soft_pending"
+        channel_stop_cards = [
+            json.loads(msg["cls"])
+            for msg in slot.messages
+            if msg.get("role") == "system" and msg.get("cls")
+        ]
+        assert channel_stop_cards[-1]["source"] == "channel"
         assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
         assert slot._queue[1]["content"] == "later"
         assert slot.peer_channel_inbox_payload()[0]["message_id"] == "interrupt2"
 
     @pytest.mark.asyncio
-    async def test_interrupt_mention_queues_at_head_after_expected_steer_failure(
+    async def test_interrupt_mention_preempts_after_expected_steer_failure(
         self, monkeypatch, tmp_path
     ) -> None:
         state = _state(tmp_path)
@@ -905,12 +951,15 @@ class TestAttachedSessionWake:
             content="Do not rely on the old premise.",
         )
         monkeypatch.setattr("kiro_crew.dashboard.chat_persistence.save_slot_off_loop", AsyncMock())
+        state.sessions.stop_turn = AsyncMock(return_value="soft")
 
         outcome = await deliver_attached_channel_message(
             state, SimpleNamespace(id="deadbeef"), member, message
         )
 
-        assert outcome == "queued"
+        assert outcome == "interrupted"
+        state.sessions.stop_turn.assert_awaited_once()
+        assert state.sessions.stop_turn.call_args.kwargs["preserve_queue"] is True
         assert slot._queue[0]["kind"] == PEER_CHANNEL_REQUEST_KIND
         assert slot.peer_channel_inbox_payload()[0]["message_id"] == "interrupt3"
 
@@ -975,6 +1024,7 @@ class TestAttachedSessionWake:
         slot.queue_append(
             f"{PEER_CHANNEL_REQUEST_PREFIX}\nReview the named peer request.",
             kind=PEER_CHANNEL_REQUEST_KIND,
+            meta=containment_meta(state, slot),
         )
         task = MagicMock()
 

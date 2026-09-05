@@ -52,6 +52,7 @@ from kiro_crew.hooks import (
     _is_declared_builtin_mcp_server,
     _is_first_party_app,
     _script_hooks_capability_denied,
+    _should_carry_xattr,
     effective_denied_regexes_from_config,
     emit_internal_read_audit,
     fire_tool_hooks,
@@ -75,6 +76,7 @@ from kiro_crew.hooks import (
     set_global_hook_store,
     stat_identity,
     validate_file_path,
+    verified_replace_file_nolink,
 )
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -100,7 +102,11 @@ def _same(a: str, b: str) -> bool:
     returns the long one, so a raw string compare passes on POSIX and fails
     only on Windows.
     """
-    return os.path.realpath(a) == os.path.realpath(b)
+
+    def _normalized(path: str) -> str:
+        return os.path.normcase(os.path.normpath(os.path.realpath(path)))
+
+    return _normalized(a) == _normalized(b)
 
 
 def _identity(path: Path) -> tuple[int, int]:
@@ -226,9 +232,7 @@ class TestHooksConfigFromDict:
         assert cfg.auto_deny_tools == []
 
     def test_non_dict_items_in_lists_are_dropped(self):
-        cfg = HooksConfig.from_dict(
-            {"auto_replies": ["nope", {"pattern": "p", "reply": "r"}, 3]}
-        )
+        cfg = HooksConfig.from_dict({"auto_replies": ["nope", {"pattern": "p", "reply": "r"}, 3]})
         assert len(cfg.auto_replies) == 1
         assert cfg.auto_replies[0].pattern == "p"
 
@@ -400,6 +404,47 @@ class TestSafeReadFile:
         with pytest.raises(FileNotFoundError):
             safe_read_file(str(tmp_path / "nope.txt"))
 
+    def test_sensitive_refusal_message_escapes_the_path(self, monkeypatch):
+        """The refused path is caller/attacker influenced and the message reaches
+        log records via ``exc_info``; a raw newline in it would forge a second
+        record (refs #6371, the #6281/#6315 log-forgery class).
+        """
+        forged = "/tmp/pods/wt-evil\nWARNING forged: reclaim authorized"
+        # The message carries the RESOLVED path (drive-lettered and
+        # backslashed on Windows), so compute the expectation the same way
+        # production does.
+        resolved = os.path.realpath(os.path.expanduser(forged))
+        monkeypatch.setattr(hooks_mod, "is_sensitive_path", lambda p: True)
+        with pytest.raises(PermissionError, match="sensitive path") as excinfo:
+            safe_read_file(forged)
+        message = str(excinfo.value)
+        assert "\n" not in message
+        assert repr(resolved) in message
+
+    def test_symlink_refusal_message_escapes_the_path(self, tmp_path, monkeypatch):
+        """The ELOOP arm keeps the pre-race resolved path — including any
+        newline-bearing directory name — so its message must escape it too.
+        """
+        import errno as _errno
+
+        f = tmp_path / "map.json"
+        f.write_text("{}", encoding="utf-8")
+        resolved = os.path.realpath(str(f))
+
+        real_open = os.open
+
+        def _eloop(path, flags, *args, **kwargs):
+            if str(path) == resolved:
+                raise OSError(_errno.ELOOP, "symlink swapped in")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", _eloop)
+        with pytest.raises(PermissionError, match="refusing to follow symlink") as excinfo:
+            safe_read_file(str(f))
+        message = str(excinfo.value)
+        assert "\n" not in message
+        assert repr(resolved) in message
+
 
 class TestSafeReadFileBytes:
     def test_reads_bytes(self, tmp_path):
@@ -484,9 +529,13 @@ class TestFdRealPath:
             got = _fd_real_path(fd)
         finally:
             os.close(fd)
-        # A platform with no supported mechanism fails closed (None); where one
-        # exists it must name the same file.
-        assert got is None or _same(got, str(f))
+        # Windows is a supported descriptor-containment platform. Other
+        # platforms without a supported mechanism still fail closed (None).
+        if os.name == "nt":
+            assert got is not None
+            assert _same(got, str(f))
+        else:
+            assert got is None or _same(got, str(f))
 
 
 class TestSafeReadPrefix:
@@ -506,13 +555,36 @@ class TestSafeReadPrefix:
 
 
 class TestIsAccessControlXattr:
-    @pytest.mark.parametrize("attr", ["security.selinux", "system.posix_acl_access"])
+    @pytest.mark.parametrize("attr", ["system.posix_acl_access", "system.posix_acl_default"])
     def test_access_control_attrs(self, attr):
         assert _is_access_control_xattr(attr) is True
 
     @pytest.mark.parametrize("attr", ["user.comment", "trusted.thing", ""])
     def test_informational_attrs(self, attr):
         assert _is_access_control_xattr(attr) is False
+
+    @pytest.mark.parametrize(
+        "attr",
+        ["security.capability", "security.ima", "security.evm", "security.selinux"],
+    )
+    def test_a_privileged_attr_is_neither_carried_nor_fail_closed(self, attr):
+        """These are outside the carry entirely, so also outside the refusal.
+
+        The carry replays attributes onto an inode holding CALLER-supplied
+        content, so a privilege- or integrity-bearing name must never be
+        reproduced (see ``atomic_write._CARRIED_ACCESS_CONTROL_XATTRS``). Since it
+        is never collected, no ``setxattr`` is attempted for it and it cannot
+        refuse a save either -- which also stops ``security.selinux`` from failing
+        every write on an enforcing host that denies ``relabelto``.
+        """
+        assert _should_carry_xattr(attr) is False
+        assert _is_access_control_xattr(attr) is False
+
+    @pytest.mark.parametrize(
+        "attr", ["system.posix_acl_access", "system.posix_acl_default", "user.comment"]
+    )
+    def test_the_carried_set(self, attr):
+        assert _should_carry_xattr(attr) is True
 
 
 class TestSafeReadFileBytesNolink:
@@ -782,9 +854,7 @@ class TestSafeReadFileInternal:
     def test_allowlist_entry_that_is_no_longer_sensitive_is_denied(self, monkeypatch):
         # Defense in depth: the carve-out is only valid for a path the shared
         # file gate otherwise blocks.
-        monkeypatch.setitem(
-            hooks_mod._INTERNAL_READ_ALLOWLIST, "drifted", "Documents/plain.txt"
-        )
+        monkeypatch.setitem(hooks_mod._INTERNAL_READ_ALLOWLIST, "drifted", "Documents/plain.txt")
         with pytest.raises(PermissionError, match="non-sensitive"):
             safe_read_file_internal("drifted")
 
@@ -946,9 +1016,7 @@ class TestComputerUseReadOnlyAutoApprove:
         assert _cu_read_only_auto_approve("") is False
 
     def test_enable_state_probe_failure_fails_closed(self, monkeypatch):
-        monkeypatch.setattr(
-            hooks_mod, "computer_use_action_from_title", lambda name: "get_state"
-        )
+        monkeypatch.setattr(hooks_mod, "computer_use_action_from_title", lambda name: "get_state")
         monkeypatch.setattr(
             hooks_mod, "computer_use_action_classes", lambda action: (hooks_mod.CU_CLASS_OBSERVE,)
         )
@@ -1263,9 +1331,7 @@ class TestFireDispatch:
     async def test_disabled_and_other_event_hooks_are_skipped(self, tmp_path, recorder):
         store = ScriptHookStore(tmp_path)
         store.create({"name": "on", "command": "true", "event": HOOK_EVENT_STOP})
-        store.create(
-            {"name": "off", "command": "true", "event": HOOK_EVENT_STOP, "enabled": False}
-        )
+        store.create({"name": "off", "command": "true", "event": HOOK_EVENT_STOP, "enabled": False})
         store.create({"name": "other", "command": "true", "event": HOOK_EVENT_PRE_TOOL_USE})
         await store.fire(HOOK_EVENT_STOP, context="x")
         assert [h.name for h, _c, _e in recorder] == ["on"]
@@ -1308,9 +1374,7 @@ class TestFireDispatch:
         )
         await store.fire(HOOK_EVENT_POST_TOOL_USE, tool_name="other")
         assert recorder == []
-        await store.fire(
-            HOOK_EVENT_POST_TOOL_USE, tool_name="fs_read", tool_response={"ok": True}
-        )
+        await store.fire(HOOK_EVENT_POST_TOOL_USE, tool_name="fs_read", tool_response={"ok": True})
         assert [h.name for h, _c, _e in recorder] == ["post"]
         assert recorder[0][2]["tool_response"] == {"ok": True}
 
@@ -1628,8 +1692,8 @@ class TestSafeWriteFileNolinkXattrs:
     def test_an_uncopyable_access_control_attr_refuses_the_write(self, tmp_path, monkeypatch):
         self._require_xattrs()
         f = _write(tmp_path / "a.txt", "old")
-        monkeypatch.setattr(os, "listxattr", lambda fd: ["security.selinux"])
-        monkeypatch.setattr(os, "getxattr", lambda fd, attr: b"label")
+        monkeypatch.setattr(os, "listxattr", lambda fd: ["system.posix_acl_access"])
+        monkeypatch.setattr(os, "getxattr", lambda fd, attr: b"acl")
 
         def _refuse(fd, attr, value):
             raise OSError(1, "cannot set")
@@ -1637,6 +1701,34 @@ class TestSafeWriteFileNolinkXattrs:
         monkeypatch.setattr(os, "setxattr", _refuse)
         assert safe_write_file_nolink(str(f), "new") is False
         assert f.read_text(encoding="utf-8") == "old"
+
+    def test_a_privileged_attr_is_not_carried_and_does_not_refuse(self, tmp_path, monkeypatch):
+        """File capabilities and integrity signatures must not reach the copy.
+
+        ``safe_write_file_nolink`` also installs a fresh inode holding
+        caller-supplied content, so it shares ``atomic_write``'s allowlist:
+        replaying ``security.capability`` there would attach the old file's
+        privileges to the new bytes, and ``security.ima``/``security.evm`` are
+        signatures over bytes that no longer exist. The ACL beside them is still
+        carried, so this is a filter and not a blanket stop.
+        """
+        self._require_xattrs()
+        f = _write(tmp_path / "a.txt", "old")
+        present = [
+            "security.capability",
+            "security.ima",
+            "security.evm",
+            "security.selinux",
+            "system.posix_acl_access",
+        ]
+        monkeypatch.setattr(os, "listxattr", lambda fd: list(present))
+        monkeypatch.setattr(os, "getxattr", lambda fd, attr: attr.encode())
+        written: list[str] = []
+        monkeypatch.setattr(os, "setxattr", lambda fd, attr, value: written.append(attr))
+
+        assert safe_write_file_nolink(str(f), "new") is True
+        assert f.read_text(encoding="utf-8") == "new"
+        assert written == ["system.posix_acl_access"]
 
     def test_an_uncopyable_informational_attr_is_best_effort(self, tmp_path, monkeypatch):
         self._require_xattrs()
@@ -1796,9 +1888,7 @@ class TestSafeReadFileInternalOutcomes:
 
     def test_a_read_whose_audit_cannot_be_recorded_is_denied(self, sensitive_home, monkeypatch):
         _write(sensitive_home, "opaque-value")
-        monkeypatch.setattr(
-            hooks_mod, "_emit_internal_read_audit", lambda read_id, outcome: False
-        )
+        monkeypatch.setattr(hooks_mod, "_emit_internal_read_audit", lambda read_id, outcome: False)
         # audit-or-deny: the carve-out's validity depends on the audit landing.
         assert safe_read_file_internal("probe") is None
 
@@ -1874,3 +1964,172 @@ class TestReadOnlyKindAutoApprove:
     def test_a_mutating_kind_falls_through_to_interactive_approval(self):
         assert HookManager().on_tool_call("some_tool", tool_kind="edit").action == TOOL_ALLOW
         assert HookManager().on_tool_call("some_tool", tool_kind="other").action == TOOL_ALLOW
+
+
+class TestVerifiedReplaceFileNolink:
+    """Compare-and-swap through one descriptor: verify and replace share a
+    single name resolution, and every post-verify concurrency change answers
+    conflict — the newer file wins, never the stale edit."""
+
+    @staticmethod
+    def _sha(text: str) -> str:
+        import hashlib
+
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def test_matching_base_replaces(self, tmp_path):
+        f = _write(tmp_path / "a.txt", "BEFORE")
+        assert (
+            verified_replace_file_nolink(str(f), "AFTER", self._sha("BEFORE"), max_bytes=1_000_000)
+            == "ok"
+        )
+        assert f.read_text(encoding="utf-8") == "AFTER"
+
+    def test_stale_base_is_a_conflict_and_leaves_the_file(self, tmp_path):
+        f = _write(tmp_path / "a.txt", "THEIRS")
+        out = verified_replace_file_nolink(
+            str(f), "MINE", self._sha("WHAT I SAW"), max_bytes=1_000_000
+        )
+        assert out == "conflict"
+        assert f.read_text(encoding="utf-8") == "THEIRS"
+
+    def test_file_grown_past_cap_is_too_large(self, tmp_path):
+        f = _write(tmp_path / "a.txt", "x" * 100)
+        out = verified_replace_file_nolink(str(f), "new", self._sha("x" * 100), max_bytes=50)
+        assert out == "too_large"
+        assert f.read_text(encoding="utf-8") == "x" * 100
+
+    def test_missing_file_is_refused(self, tmp_path):
+        out = verified_replace_file_nolink(
+            str(tmp_path / "gone.txt"), "x", self._sha("anything"), max_bytes=1_000_000
+        )
+        assert out == "refused"
+        assert not (tmp_path / "gone.txt").exists()
+
+    def test_within_root_containment_still_applies(self, tmp_path):
+        outside = _write(tmp_path / "outside.txt", "SECRET")
+        root = tmp_path / "root"
+        root.mkdir()
+        out = verified_replace_file_nolink(
+            str(outside), "clobber", self._sha("SECRET"), within_root=str(root), max_bytes=1_000_000
+        )
+        assert out == "refused"
+        assert outside.read_text(encoding="utf-8") == "SECRET"
+
+    def test_external_atomic_save_after_verify_is_a_conflict(self, tmp_path, monkeypatch):
+        """THE finding class: an external editor completes its own atomic save
+        (new inode) in the window between hash verification and the rename.
+        The identity re-checks anchored to the verified descriptor detect the
+        swap and answer conflict; the external editor's newer content survives.
+        The injection point is the staging write (os.fsync), which sits
+        strictly after verification and strictly before the rename."""
+        f = _write(tmp_path / "a.txt", "BASE")
+        real_fsync = os.fsync
+        fired = {"done": False}
+
+        def racing_fsync(fd):
+            if not fired["done"]:
+                fired["done"] = True
+                # An editor's atomic save: stage + replace = NEW inode.
+                side = tmp_path / ".editor-save.tmp"
+                side.write_text("NEWER FROM OUTSIDE", encoding="utf-8")
+                os.replace(side, f)
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", racing_fsync)
+        out = verified_replace_file_nolink(
+            str(f), "STALE EDIT", self._sha("BASE"), max_bytes=1_000_000
+        )
+        monkeypatch.undo()
+        assert fired["done"], "the race never ran — the test would be vacuous"
+        assert out == "conflict"
+        assert f.read_text(encoding="utf-8") == "NEWER FROM OUTSIDE"
+
+    def test_external_in_place_write_after_verify_is_a_conflict(self, tmp_path, monkeypatch):
+        """Same window, same-inode variant: an in-place rewrite keeps (dev,ino)
+        so the identity check cannot see it — the mtime/size re-check does."""
+        f = _write(tmp_path / "a.txt", "BASE")
+        real_fsync = os.fsync
+        fired = {"done": False}
+
+        def racing_fsync(fd):
+            if not fired["done"]:
+                fired["done"] = True
+                # In-place write through the SAME inode, different length.
+                with open(f, "r+b") as fh:
+                    fh.write(b"NEWER IN PLACE, LONGER THAN BASE")
+                    fh.truncate()
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", racing_fsync)
+        out = verified_replace_file_nolink(
+            str(f), "STALE EDIT", self._sha("BASE"), max_bytes=1_000_000
+        )
+        monkeypatch.undo()
+        assert fired["done"], "the race never ran — the test would be vacuous"
+        assert out == "conflict"
+        assert f.read_text(encoding="utf-8") == "NEWER IN PLACE, LONGER THAN BASE"
+
+    def test_same_length_in_place_rewrite_is_still_a_conflict(self, tmp_path, monkeypatch):
+        """The mtime half of the freshness pair, exercised alone: a rewrite of
+        the SAME length keeps st_size, so only st_mtime_ns can catch it. The
+        mtime is advanced explicitly because a sub-timestamp-tick rewrite is
+        stat-invisible — the documented residue this check cannot close."""
+        f = _write(tmp_path / "a.txt", "BASE")
+        real_fsync = os.fsync
+        fired = {"done": False}
+
+        def racing_fsync(fd):
+            if not fired["done"]:
+                fired["done"] = True
+                with open(f, "r+b") as fh:
+                    fh.write(b"EGAB")  # same length as BASE
+                    fh.truncate()
+                # An in-place rewrite landing within one filesystem timestamp
+                # tick leaves NO stat-visible trace (same inode, size, and
+                # mtime_ns) — that sub-tick case is the documented unclosable
+                # residue, verified empirically on this filesystem. Advance
+                # the mtime explicitly so this test pins the mtime half of
+                # the comparison, which real editor saves (milliseconds to
+                # minutes later) always trip.
+                st = os.stat(f)
+                os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", racing_fsync)
+        out = verified_replace_file_nolink(
+            str(f), "STALE EDIT", self._sha("BASE"), max_bytes=1_000_000
+        )
+        monkeypatch.undo()
+        assert fired["done"], "the race never ran — the test would be vacuous"
+        assert out == "conflict"
+        assert f.read_text(encoding="utf-8") == "EGAB"
+
+    def test_mode_survives_a_verified_replace(self, tmp_path):
+        if _IS_WINDOWS:
+            pytest.skip("POSIX mode bits are not meaningful on Windows")
+        f = _write(tmp_path / "a.txt", "BEFORE")
+        os.chmod(f, 0o600)
+        assert (
+            verified_replace_file_nolink(str(f), "AFTER", self._sha("BEFORE"), max_bytes=1_000_000)
+            == "ok"
+        )
+        assert _stat.S_IMODE(os.stat(f).st_mode) == 0o600
+
+    def test_a_malformed_base_hash_is_refused_not_skipped(self, tmp_path):
+        """Deny-by-default: an unverifiable base refuses — it must never skip
+        verification and proceed (fail-open is the lost-update class itself)."""
+        f = _write(tmp_path / "a.txt", "BASE")
+        for bad in ("", "not-hex", "ABCDEF" + "0" * 58, None):
+            out = verified_replace_file_nolink(
+                str(f), "NEW", bad, max_bytes=1_000_000  # type: ignore[arg-type]
+            )
+            assert out == "refused", f"base_hash={bad!r}"
+            assert f.read_text(encoding="utf-8") == "BASE"
+
+    def test_wrapper_contract_unchanged(self, tmp_path):
+        """safe_write_file_nolink is the engine's no-verify entry point: no
+        base hash, no conflict vocabulary, bool contract preserved."""
+        f = _write(tmp_path / "a.txt", "old")
+        assert safe_write_file_nolink(str(f), "new") is True
+        assert f.read_text(encoding="utf-8") == "new"

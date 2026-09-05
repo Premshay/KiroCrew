@@ -233,6 +233,21 @@ class TestCapabilityGate:
         g2 = CapabilityGate.from_dict({}, default_enabled=False)
         assert not g2.enabled
 
+    def test_from_dict_rejects_non_boolean_enabled(self):
+        # bool("false") is True — a stringly-typed disable must not permit.
+        # A present null is not "absent": default-ON scopes must not stay on.
+        for bogus in ("false", "true", 1, 0, ["yes"], None):
+            with pytest.raises(PlatformCompositionError, match="boolean"):
+                CapabilityGate.from_dict({"enabled": bogus}, default_enabled=True)
+
+    def test_known_capability_rejects_non_boolean_enabled(self):
+        # Default-ON siblings (memory_writes, browse, …) used to coerce
+        # enabled: "false" through bool() and stay on.
+        with pytest.raises(PlatformCompositionError, match="boolean"):
+            parse_profile(
+                {"name": "host", "capabilities": {"memory_writes": {"enabled": "false"}}}
+            )
+
     def test_scopes_compose_independently(self):
         a = CapabilityGate(
             enabled=True,
@@ -377,6 +392,55 @@ class TestLoader:
     def test_unknown_governed_key_fails_closed(self):
         with pytest.raises(PlatformCompositionError):
             parse_policy(_policy_body(bogus_scope={"mode": "allow"}))
+
+    def test_typod_sandbox_child_fails_closed(self):
+        """A typo'd ``min_level`` must RAISE, not vanish into the reserved scope.
+
+        ``sandbox`` used to accept ANY child into the write-only
+        ``sandbox._flags`` scope, so ``min_levl`` parsed clean and left the
+        floor absent — green validation, zero enforcement, on the ordinal with
+        the widest blast radius.  The message names the key so the operator can
+        see WHICH key was rejected.
+        """
+        with pytest.raises(PlatformCompositionError) as exc:
+            parse_policy(_policy_body(sandbox={"min_levl": "strict"}))
+        assert "sandbox.min_levl" in str(exc.value)
+        assert "fail-closed" in str(exc.value)
+
+    def test_typod_sandbox_child_does_not_silently_drop_the_floor(self):
+        """The regression's CONSEQUENCE: it must not parse to an absent floor.
+
+        Pinned separately from the raise so a future change that re-tolerates
+        the key cannot pass by merely raising somewhere else — what must never
+        happen again is a ceiling that reports success while
+        ``sandbox.min_level`` is unset.
+        """
+        try:
+            ceiling = parse_policy(_policy_body(sandbox={"min_levl": "strict"}))
+        except PlatformCompositionError:
+            return
+        pytest.fail(f"parsed clean with sandbox.min_level={ceiling.get('sandbox.min_level')!r}")
+
+    def test_reserved_sandbox_boot_flags_still_parse(self):
+        """The compatibility half: the documented reserved flags must still load."""
+        ceiling = parse_policy(
+            _policy_body(
+                sandbox={
+                    "min_level": "strict",
+                    "require_isolation": True,
+                    "env_scrub_prefixes": ["AWS_SECRET"],
+                }
+            )
+        )
+        assert isinstance(ceiling.get("sandbox.min_level"), OrdinalControl)
+        flags = ceiling.controls["sandbox._flags"]
+        assert flags == {"require_isolation": True, "env_scrub_prefixes": ["AWS_SECRET"]}
+
+    def test_sandbox_min_level_alone_still_parses(self):
+        """The overwhelmingly common shape must be untouched by the new check."""
+        ceiling = parse_policy(_policy_body(sandbox={"min_level": "strict"}))
+        assert isinstance(ceiling.get("sandbox.min_level"), OrdinalControl)
+        assert "sandbox._flags" not in ceiling.controls
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1678,6 +1742,8 @@ class TestValidateReportsUngovernedCapabilities:
 
     def test_fully_enumerated_block_reports_no_gap(self, capsys):
         body = {scope.split(".", 1)[1]: {"enabled": True} for scope in _capability_scopes()}
+        # agentcore requires a known inner posture when enabled.
+        body["agentcore"] = {"enabled": True, "posture": "workload"}
         out = self._validate(capsys, parse_policy(_policy_body(capabilities=body)))
         assert "UNGOVERNED" not in out
         assert "✅ valid" in out

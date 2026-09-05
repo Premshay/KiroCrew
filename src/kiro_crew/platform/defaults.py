@@ -16,10 +16,23 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from kiro_crew.platform.interfaces import ImportSource, McpScope
+    from kiro_crew.platform.interfaces import (
+        ImportSource,
+        InboundToken,
+        McpScope,
+        SessionPrincipal,
+        WorkloadIdentity,
+    )
+    from kiro_crew.security import DeniedCommandRule
+    from kiro_crew.skill_providers.base import SkillProvider
 
 from kiro_crew import security, sso_status
-from kiro_crew.platform.interfaces import CapabilityResult, InterceptDecision
+from kiro_crew.platform.interfaces import (
+    CapabilityResult,
+    InterceptDecision,
+    MobileConnectMethod,
+    OtlpDestination,
+)
 
 # ``agent``, ``sandbox``, ``embeddings``, ``apps.registry`` and ``slack.enterprise``
 # import ``kiro_crew.platform`` at module-load time, so importing them at the top
@@ -36,15 +49,20 @@ from kiro_crew.platform.interfaces import CapabilityResult, InterceptDecision
 
 
 class DefaultProviderRegistry:
-    """Kiro-CLI-ACP only.  Leaves the dormant ACP_BACKEND_CLAUDE seam untouched."""
+    """Registers nothing: every KNOWN backend is already in the baseline."""
 
     def create_factory(self, cfg: Any) -> Callable[..., Any]:
         return cfg.create_provider_factory()
 
     def register_acp_backends(self) -> None:
-        # The public edition registers no extra ACP backends.  The companion
-        # re-registers a Claude backend here via the acp/client.py:_is_claude
-        # seam.
+        # Nothing to register, and nothing this seam could register: the baseline now
+        # covers every id in ``ACP_BACKENDS_KNOWN``, and
+        # ``register_selectable_backend`` rejects an id outside that set, so there is
+        # no id it accepts that is not already selectable. The seam stays because the
+        # ProviderRegistry protocol declares it and an edition overrides this method;
+        # an edition adding a genuinely new harness has to widen
+        # ``ACP_BACKENDS_KNOWN`` as well, which is a core change, not an extension
+        # point this hook opens on its own.
         return None
 
     def agent_runtime_policy(self, agent_name: str) -> dict[str, Any] | None:
@@ -206,6 +224,41 @@ class DefaultIdentityProvider:
         return []
 
 
+class DefaultAgentIdentityProvider:
+    """Disabled agent-identity seam — standalone has no workload or Gateway.
+
+    ``enabled()`` is False so every public call site is a no-op. Other methods
+    return the disabled answer (``None`` / ``{}`` / the input principal) so a
+    ``safe_context_call`` fallback that degrades to the same values cannot
+    flip the seam on.
+    """
+
+    def enabled(self) -> bool:
+        return False
+
+    def workload_identity(self) -> "WorkloadIdentity | None":
+        return None
+
+    def status(self) -> Dict[str, object]:
+        # Display-only. Never token material — a token-like key here would
+        # leak bearer into the dashboard status payload.
+        return {}
+
+    def gateway_mcp_spec(self) -> Dict[str, object] | None:
+        return None
+
+    async def annotate_principal(self, principal: "SessionPrincipal") -> "SessionPrincipal":
+        return principal
+
+    async def vend_workload_access_token(self, principal: "SessionPrincipal") -> str | None:
+        return None
+
+    async def vend_gateway_inbound_token(
+        self, principal: "SessionPrincipal"
+    ) -> "InboundToken | None":
+        return None
+
+
 class DefaultEmbeddingSource:
     """Bundled in-process model (vendored llama.cpp), unsigned local inference.
 
@@ -256,6 +309,20 @@ class DefaultPromptSourceProvider:
     """No edition prompt/SOP roots — only user-authored prompts are listed."""
 
     def prompt_source_roots(self) -> List[Path]:
+        return []
+
+
+class DefaultSkillDiscoveryProvider:
+    """No edition skill discovery providers — the built-in catalog only."""
+
+    def skill_providers(self) -> List["SkillProvider"]:
+        return []
+
+
+class DefaultDeniedRuleProvider:
+    """No edition denied-command rules — the built-in catalog only."""
+
+    def denied_rules(self) -> List["DeniedCommandRule"]:
         return []
 
 
@@ -439,6 +506,24 @@ class DefaultTelemetryProvider:
     def frontend_rum_config(self) -> Optional[dict]:
         return None
 
+    def otlp_destinations(self, cfg: Any) -> "tuple[OtlpDestination, ...]":
+        # Byte-identical to the endpoint-only OTLP exporter this seam replaced:
+        # ONE destination when telemetry.otlp_endpoint is a non-empty string,
+        # NONE otherwise — so egress stays off by default and the standalone
+        # build reaches exactly the collector it reached before. Read with
+        # getattr so any telemetry-config shape works, and never logged here:
+        # the value can carry credentials in userinfo or query parameters.
+        endpoint = str(getattr(cfg, "otlp_endpoint", "") or "").strip()
+        if not endpoint:
+            return ()
+        return (
+            OtlpDestination(
+                name="telemetry.otlp_endpoint",
+                endpoint=endpoint,
+                signals=frozenset({"metrics"}),
+            ),
+        )
+
 
 class DefaultKnowledgeProvider:
     """No extra connectors — the public edition ships only the built-in set."""
@@ -496,3 +581,20 @@ class DefaultJailProvider:
     def maybe_reexec_into_jail(self, argv: List[str], mode: str) -> Optional[int]:
         # None → no re-exec; the command runs in-process exactly as today.
         return None
+
+
+class DefaultMobileConnectProvider:
+    """The personal-install phone-connection pair.
+
+    ``tailnet_qr`` rides the existing tailnet publish + QR mint surface
+    (``/api/tailnet/mobile/*``); ``login_link`` rides the one-time mobile
+    sign-in link (``/api/auth/mobile-link``).  Descriptors only — each method's
+    own endpoint keeps its full guard stack.  An enterprise companion replaces
+    this list via ``dataclasses.replace(ctx, mobile_connect=...)``.
+    """
+
+    def connect_methods(self) -> List[MobileConnectMethod]:
+        return [
+            MobileConnectMethod(id="tailnet_qr", kind="tailnet_qr"),
+            MobileConnectMethod(id="login_link", kind="login_link"),
+        ]

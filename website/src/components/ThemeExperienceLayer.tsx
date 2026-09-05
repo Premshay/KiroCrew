@@ -34,6 +34,8 @@ import { grantConsent, getStoredConsent, revokeConsent } from '../utils/themeCon
 // active theme's manifest sounds (message-received / notification triggers).
 import { MC_THEME_SOUND_EVENT, type ThemeSoundDetail } from '../hooks/themeSound'
 import { MC_NOTIFICATION_EVENT } from '../hooks/notificationEvent'
+import { useIsNarrowViewport } from '../hooks/useIsMobile'
+import { useAppSelector } from '../store'
 
 import { i18nT } from '../i18n/t'
 // postMessage types accepted from theme iframes — everything else is ignored.
@@ -56,8 +58,6 @@ const OVERLAY_Z_MAX = 45
 // window (agent-chosen default; the overlay may also self-hide via
 // `theme:visibility` sooner, which the router already honours).
 const ACTIVATE_ONCE_MS = 8000
-// Topbar hidden below this width when the manifest sets `hideOnMobile`.
-const MOBILE_MQ = '(max-width: 767px)'
 
 const OVERLAY_POSITIONS: ReadonlySet<ThemeOverlayPosition> = new Set<ThemeOverlayPosition>([
   'top', 'bottom', 'left', 'right',
@@ -171,6 +171,15 @@ function parseIdleSeconds(trigger: string): number | null {
 export default function ThemeExperienceLayer() {
   const { theme: mode, colorTheme, customThemeDataMap, setColorTheme } = useTheme()
 
+  // A remote Crew is a separate SPA in a full-bleed iframe; switching Crews only
+  // toggles `display` on the local dashboard's wrapper inside `App`. This layer is
+  // a SIBLING of `<App />` (mounted in main.tsx) and its overlay/topbar iframes are
+  // `position: fixed` at up to OVERLAY_Z_MAX — so App's own `display: none` wrapper
+  // cannot hide them, and z-45 composites above the remote pane stack at z-1. Read
+  // the active remote-Crew id here so the render gate below can unmount the whole
+  // layer, mirroring how App hides the local dashboard.
+  const activeInstanceId = useAppSelector((s) => s.instances.activeId)
+
   const active = colorTheme.startsWith('custom-')
     ? customThemeDataMap.get(colorTheme.slice('custom-'.length))
     : undefined
@@ -255,12 +264,9 @@ export default function ThemeExperienceLayer() {
 
   const [reduced, setReduced] = useState(readReducedMotion)
   const [muted, setMuted] = useState(() => localStorage.getItem(MUTE_KEY) === '1')
-  const [isNarrow, setIsNarrow] = useState(
-    () =>
-      typeof window !== 'undefined' &&
-      typeof window.matchMedia === 'function' &&
-      window.matchMedia(MOBILE_MQ).matches === true,
-  )
+  // NOT useIsMobile: this layer mounts above the router on every route, embed included,
+  // so the hook's `/embed/` always-false carve-out would un-hide a hideOnMobile topbar.
+  const isNarrow = useIsNarrowViewport()
   // Overlay trigger bookkeeping: ids of idle-overlays currently visible, and ids
   // of `activate`+`once` overlays whose one-shot window has elapsed.
   const [idleOverlayIds, setIdleOverlayIds] = useState<ReadonlySet<string>>(new Set())
@@ -429,6 +435,16 @@ export default function ThemeExperienceLayer() {
     }
   }, [audioEnabled, stopAllSounds])
   useEffect(() => stopAllSounds, [stopAllSounds])
+  // Switching to a remote Crew unmounts this layer (see the render gate below),
+  // but React runs that teardown only after the commit — and themed audio lives in
+  // refs, not in the tree. Stop it as soon as a remote Crew becomes active so its
+  // ambient bed can't keep playing over another Crew's dashboard.
+  useEffect(() => {
+    if (activeInstanceId !== null) {
+      stopAllSounds()
+      activatedForSlugRef.current = undefined
+    }
+  }, [activeInstanceId, stopAllSounds])
 
   // Dashboard-side trigger emission. On activation of an enabled audio theme:
   // play the `activate` cue and start the ambient bed (fade-in). On switch-away:
@@ -497,15 +513,6 @@ export default function ThemeExperienceLayer() {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
     const mql = window.matchMedia('(prefers-reduced-motion: reduce)')
     const handler = () => setReduced(mql.matches)
-    mql.addEventListener('change', handler)
-    return () => mql.removeEventListener('change', handler)
-  }, [])
-
-  // Track the mobile breakpoint for topbar `hideOnMobile`.
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
-    const mql = window.matchMedia(MOBILE_MQ)
-    const handler = () => setIsNarrow(mql.matches)
     mql.addEventListener('change', handler)
     return () => mql.removeEventListener('change', handler)
   }, [])
@@ -684,6 +691,10 @@ export default function ThemeExperienceLayer() {
     return () => window.removeEventListener('keydown', onKey)
   }, [showConsent, declineExperience])
 
+  // A remote Crew owns the viewport: unmount every overlay/topbar iframe, the mute
+  // button and the consent modal. `display: none` on App's local-dashboard wrapper
+  // cannot reach a fixed-position sibling, so unmounting is the only real teardown.
+  if (activeInstanceId !== null) return null
   if (!anyExperience || !slug) return null
 
   // First-activation consent gate for persona/audio packs.

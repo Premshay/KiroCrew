@@ -28,6 +28,8 @@ from kiro_crew.mcp_caller import (
     CallerContext,
     caller_identity_capability,
     set_current_caller,
+    set_current_tenant_nonce,
+    tenant_nonce_from_meta,
 )
 from kiro_crew.sel import sel
 from kiro_crew.validation import (
@@ -617,11 +619,19 @@ def call_tool_with_logging(
     try:
         args = validate_fn(name, raw_args)
     except ValidationError as e:
+        # No ``tool_kind``: it is a CLASSIFICATION of the invocation -- callers
+        # that write their own rows pass things like "authz" -- and this wrapper
+        # has no per-tool taxonomy to supply. It used to pass ``session_key``,
+        # which is both wrong and redundant, since ``caller_identity`` on the same
+        # record already carries it. The effect was that every row written through
+        # here, across all five MCP servers, held a high-cardinality session key
+        # where a kind belongs, which made the field useless to filter or
+        # aggregate on while still looking populated (#6448). The parameter
+        # defaults to "", and an honestly empty kind beats a false one.
         sel().log_tool_invocation(
             session_key=session_key,
             source="mcp",
             tool_name=name,
-            tool_kind=session_key,
             outcome="failed",
             downstream_service=downstream_service,
             error=str(e),
@@ -646,7 +656,7 @@ def call_tool_with_logging(
         session_key=session_key,
         source="mcp",
         tool_name=name,
-        tool_kind=session_key,
+        # No ``tool_kind`` -- see the ValidationError path above.
         outcome=outcome,
         downstream_service=downstream_service,
         resources=resources,
@@ -861,6 +871,7 @@ def _run_stdio_dispatch_loop(
         tool_args: dict,
         cancel_evt: threading.Event,
         caller_ctx: "CallerContext | None" = None,
+        tenant_nonce: str = "",
     ) -> None:
         """Worker thread: run tool, store result unless cancelled."""
         global _thread_cancel_event
@@ -870,6 +881,11 @@ def _run_stdio_dispatch_loop(
         # a module slot: dispatch is strictly sequential (one worker at a
         # time, joined before the next dispatch).
         set_current_caller(caller_ctx)
+        # And the connection's namespace separator, which is present even when
+        # the caller is not: a tool that keys per-tenant state for a caller the
+        # gateway could not name reads it instead of a process-global fallback
+        # (#5322). Cleared in the same places as the caller.
+        set_current_tenant_nonce(tenant_nonce)
         try:
             result_text = call_tool_fn(tool_name, tool_args)
         except ToolCancelled:
@@ -884,6 +900,7 @@ def _run_stdio_dispatch_loop(
             )
             _thread_cancel_event = None
             set_current_caller(None)
+            set_current_tenant_nonce("")
             _result_ready.set()
             return
         except Exception as exc:
@@ -894,6 +911,7 @@ def _run_stdio_dispatch_loop(
         finally:
             _thread_cancel_event = None
             set_current_caller(None)
+            set_current_tenant_nonce("")
         # Audit decision is made atomically with the cancellation check, under
         # the same lock that guards response delivery: exactly ONE audit event
         # per request (a failed+late-cancel race must not emit two).
@@ -1109,6 +1127,11 @@ def _run_stdio_dispatch_loop(
             # on every forwarded call, so a block present here is
             # gateway-authored. None in the non-pooled stdio topology.
             _caller_ctx = CallerContext.from_meta(params.get("_meta"))
+            # The connection's namespace separator. Parsed separately because it
+            # arrives WITHOUT an identity for a caller the gateway could not
+            # name — the case it exists for (#5322) — so it cannot be folded
+            # into ``_caller_ctx``, which is None exactly then.
+            _tenant_nonce = tenant_nonce_from_meta(params.get("_meta"))
             # A queued request may have been cancelled while waiting -- emit
             # no response (per MCP spec) but audit the cancellation.
             if req_id is not None and str(req_id) in _cancelled_ids:
@@ -1152,6 +1175,7 @@ def _run_stdio_dispatch_loop(
                 # an Error response and the failure is SEL-audited with the
                 # caller identity (an escaped exception would kill the loop).
                 set_current_caller(_caller_ctx)
+                set_current_tenant_nonce(_tenant_nonce)
                 try:
                     result_text = call_tool_fn(tool_name, tool_args)
                 except Exception as exc:
@@ -1164,6 +1188,7 @@ def _run_stdio_dispatch_loop(
                     )
                 finally:
                     set_current_caller(None)
+                    set_current_tenant_nonce("")
                 respond(req_id, build_tool_response(result_text))
             else:
                 # Dispatch tool in worker thread so we can receive cancel notifications
@@ -1178,7 +1203,14 @@ def _run_stdio_dispatch_loop(
                 _result_box.clear()
                 _worker_thread = threading.Thread(
                     target=_run_tool,
-                    args=(req_id, tool_name, tool_args, _cancel_event, _caller_ctx),
+                    args=(
+                        req_id,
+                        tool_name,
+                        tool_args,
+                        _cancel_event,
+                        _caller_ctx,
+                        _tenant_nonce,
+                    ),
                     daemon=True,
                 )
                 _worker_thread.start()

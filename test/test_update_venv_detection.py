@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 from unittest.mock import AsyncMock, MagicMock
@@ -213,9 +214,17 @@ class TestRestartGateway:
         execv_called: list[bool] = []
         monkeypatch.setattr("os.execv", lambda *a, **k: execv_called.append(True))
 
-        await _restart_gateway(state)
+        result = await _restart_gateway(state)
 
         assert execv_called == []
+        assert result.blocked is True
+        assert result.maintenance == state.restart_barrier.payload()
+        assert state._update_progress == {
+            "step": "blocked",
+            "detail": "Gateway restart is waiting for session acknowledgements; "
+            "no sessions were stopped.",
+            "maintenance": result.maintenance,
+        }
         assert state.restart_barrier.payload()["pending"] == ["dashboard:owner"]
 
     @pytest.mark.asyncio
@@ -336,6 +345,7 @@ class TestRestartGateway:
             await release.wait()
 
         state.sessions = MagicMock()
+        state.sessions.restart_barrier_snapshot = AsyncMock(return_value=[])
         state.sessions.close_all = blocking_close
         monkeypatch.setattr("kiro_crew.dashboard.chat.save_all_slots_to_history", lambda s: None)
         monkeypatch.setattr("os.execv", lambda *a, **k: execv_called.append(a))
@@ -343,9 +353,9 @@ class TestRestartGateway:
 
         first = asyncio.create_task(_restart_gateway(state))
         await entered.wait()
-        assert await _restart_gateway(state) is False
+        assert (await _restart_gateway(state)).restarted is False
         release.set()
-        assert await first is True
+        assert (await first).restarted is True
         assert len(execv_called) == 1
 
 
@@ -371,6 +381,40 @@ class TestApiUpdateApplyVenvDispatch:
 
         assert response.status == 409
         assert response.body and b"restart_ack_required" in response.body
+
+    @pytest.mark.asyncio
+    async def test_busy_session_blocks_policy_update_before_it_mutates(self, monkeypatch, tmp_path) -> None:
+        """A policy command cannot update files before its required restart is safe."""
+        from kiro_crew.dashboard.handlers.updates import api_update_apply
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        state = _make_state(monkeypatch, tmp_path)
+        state._slots = {"owner": _ChatSlot("owner")}
+        state.sessions.restart_barrier_snapshot = AsyncMock(
+            return_value=[{"session_key": "dashboard:owner", "busy": True}]
+        )
+        policy_calls: list[None] = []
+
+        async def _policy_update() -> bool:
+            policy_calls.append(None)
+            return True
+
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_provider.apply_policy_update", _policy_update
+        )
+        request = MagicMock(spec=web.Request)
+        request.app = {"state": state}
+
+        response = await api_update_apply(request)
+
+        assert response.status == 409
+        body = json.loads(response.body)
+        assert body == {
+            "ok": False,
+            "code": "restart_ack_required",
+            "maintenance": state.restart_barrier.payload(),
+        }
+        assert policy_calls == []
 
     @pytest.mark.asyncio
     async def test_pip_path_invokes_pip_install_then_restarts(

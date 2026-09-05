@@ -357,6 +357,37 @@ class TestListServers:
         monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
         assert not any(s.name == "srv" for s in list_servers())
 
+    def test_dashboard_disabled_server_keeps_a_disabled_row(self, tmp_path, monkeypatch) -> None:
+        """``/api/mcp/toggle`` off writes ``disabled: true`` into the Kiro global
+        AND onto the agent entry (the agent-side marker is what stops a running
+        kiro-cli session's server). The row must survive that, or the user has
+        nothing to switch back on — and it carries the agent entry's full spec,
+        because the global copy can be the bare stub the toggle creates."""
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        (agent_dir / "defaults.json").write_text(
+            json.dumps(
+                {"mcpServers": {"srv": {"command": "real-cmd", "args": ["-x"], "disabled": True}}}
+            )
+        )
+        store = tmp_path / "store.json"
+        store.write_text(json.dumps({"mcpServers": {}}))
+        kiro_mcp = tmp_path / "kiro.json"
+        kiro_mcp.write_text(json.dumps({"mcpServers": {"srv": {"disabled": True}}}))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            "kiro_crew.mcp_discovery._MCP_SOURCES",
+            ((store, SCOPE_KIROCREW), (kiro_mcp, SCOPE_KIRO_GLOBAL)),
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (store, kiro_mcp))
+        monkeypatch.setattr("kiro_crew.mcp_discovery.Path.home", lambda: tmp_path)
+        rows = [s for s in list_servers() if s.name == "srv"]
+        assert len(rows) == 1
+        assert rows[0].disabled is True
+        assert rows[0].source == "agent"
+        assert rows[0].command == "real-cmd"
+        assert rows[0].args == ["-x"]
+
     def test_disabled_mcp_json_still_carries_disabled_tools(self, tmp_path, monkeypatch) -> None:
         """disabledTools from a disabled mcp.json entry are applied to an existing agent server."""
         agent_dir = tmp_path / "agents"
@@ -2383,8 +2414,8 @@ class TestProbeTempContainment:
         home.mkdir()
         monkeypatch.setattr(bt, "config_dir", lambda: home)
         monkeypatch.setattr(platform_compat, "IS_POSIX", False)
-        # The IS_POSIX patch also flips restrict_dir_to_owner onto its icacls
-        # branch, which cannot run on the POSIX host executing this test --
+        # The IS_POSIX patch also flips restrict_dir_to_owner onto its Windows
+        # DACL branch, which cannot run on the POSIX host executing this test --
         # shim it to POSIX behavior so ALLOCATION survives and the test
         # exercises the logic it targets.
         monkeypatch.setattr(
@@ -2442,8 +2473,8 @@ class TestProbeTempContainment:
         home.mkdir()
         monkeypatch.setattr(bt, "config_dir", lambda: home)
         monkeypatch.setattr(platform_compat, "IS_POSIX", False)
-        # The IS_POSIX patch also flips restrict_dir_to_owner onto its icacls
-        # branch, which cannot run on the POSIX host executing this test --
+        # The IS_POSIX patch also flips restrict_dir_to_owner onto its Windows
+        # DACL branch, which cannot run on the POSIX host executing this test --
         # shim it to POSIX behavior so ALLOCATION survives and the test
         # exercises the logic it targets.
         monkeypatch.setattr(
@@ -2502,6 +2533,50 @@ class TestProbeTempContainment:
         root = home / "run" / "mcp-tmp"
         assert not root.exists() or not any(root.iterdir())
 
+    @pytest.mark.asyncio
+    async def test_probe_drops_reserved_kirocrew_namespace_from_spec_env(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """SECURITY: the probe is the SIBLING site of the cron tool bridge.
+
+        Both apply a config-declared ``env`` to a child they spawn themselves, but
+        only ``cron_script`` had a ``KIROCREW_*`` deny (``_CRON_ENV_DENY``, via
+        ``KIROCREW_OWNER_ID``) -- the probe applied none. Putting the
+        reserved-namespace deny in the shared sanitizer rather than in the cron
+        deny-set is what covers this path too, so this test is the reason for that
+        placement. A gateway-authored value must still be INHERITED: the probe
+        builds its env from ``dict(os.environ)`` and only the OVERRIDE is refused.
+        """
+        import sys
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "real-home"))
+        monkeypatch.delenv("KIROCREW_CLI", raising=False)
+
+        server = McpServerInfo(
+            name="identity-forger",
+            command=sys.executable,
+            args=["-c", "pass"],
+            env={
+                "KIROCREW_CLI": "1",
+                "KIROCREW_SESSION_KEY": "some-other-session",
+                "KIROCREW_HOME": str(tmp_path / "attacker-home"),
+                "MCP_TOKEN": "keep-me",
+            },
+        )
+        with patch(
+            "kiro_crew.mcp_discovery.create_subprocess_limited",
+            new_callable=AsyncMock,
+            side_effect=OSError("stop after env capture"),
+        ) as spawn_mock:
+            await probe_server(server)
+
+        captured = spawn_mock.call_args.kwargs["env"]
+        assert "KIROCREW_CLI" not in captured
+        assert "KIROCREW_SESSION_KEY" not in captured
+        # Inherited value survives; the spec's override of it does not.
+        assert captured["KIROCREW_HOME"] == str(tmp_path / "real-home")
+        assert captured["MCP_TOKEN"] == "keep-me"
+
     @pytest.mark.skipif(
         not platform_compat.IS_POSIX,
         reason="POSIX-only control: on Windows the finally-path deferral to the "
@@ -2533,7 +2608,11 @@ class TestProbeServerProcessCleanup:
         proc = AsyncMock()
         proc.returncode = None  # process still running
         proc.stdin = MagicMock()
+        proc.stdin.write = MagicMock()
+        proc.stdin.drain = AsyncMock()
         proc.stdin.close = MagicMock()
+        proc.stderr = MagicMock()
+        proc.stderr.read = AsyncMock(return_value=b"")
         proc.kill = MagicMock()
         if wait_side_effect:
             proc.wait = AsyncMock(side_effect=wait_side_effect)
@@ -2562,7 +2641,7 @@ class TestProbeServerProcessCleanup:
     async def test_fallback_kill_on_timeout(self) -> None:
         """When graceful shutdown times out, falls back to proc.kill()."""
         proc = self._make_mock_proc(
-            wait_side_effect=[asyncio.TimeoutError(), AsyncMock(return_value=0)()]
+            wait_side_effect=[asyncio.TimeoutError(), 0]
         )
         server = McpServerInfo(name="test", command="echo")
 
@@ -2769,6 +2848,8 @@ class TestProbeServerTimeout:
         mock_proc.stdin.close = MagicMock()
         mock_proc.stdout = AsyncMock()
         mock_proc.stdout.readline = AsyncMock(side_effect=[init_resp, asyncio.TimeoutError])
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read = AsyncMock(return_value=b"")
         mock_proc.returncode = None
         mock_proc.kill = MagicMock()
         mock_proc.wait = AsyncMock(return_value=0)
@@ -2793,14 +2874,15 @@ class TestProbeServerTimeout:
 
         mock_proc = AsyncMock()
         mock_proc.stdin = AsyncMock()
-        # `StreamWriter.write` is synchronous; only `drain()` is awaited. As an
-        # AsyncMock auto-child it returned a coroutine nobody awaits, surfacing later
-        # as an unraisable "never awaited" warning attributed to whichever test
-        # triggered the GC. The sibling test above already pins this.
+        # StreamWriter.write/close are synchronous while drain is async; stderr.read
+        # is async but returns bytes. Model each boundary explicitly so AsyncMock
+        # cannot invent a coroutine-returning bytes.decode() on the error path.
         mock_proc.stdin.write = MagicMock()
         mock_proc.stdin.close = MagicMock()
         mock_proc.stdout = AsyncMock()
         mock_proc.stdout.readline = AsyncMock(side_effect=asyncio.TimeoutError)
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read = AsyncMock(return_value=b"")
         mock_proc.returncode = None
         mock_proc.kill = MagicMock()
         mock_proc.wait = AsyncMock(return_value=0)
@@ -4117,7 +4199,9 @@ class TestFirstPartyManagedArgv:
         seen: dict[str, bool] = {}
 
         def _capture(argv, **kwargs):
-            seen["flag"] = kwargs.get("first_party_fixed_argv", True)
+            # Omitting the synchronous API's default is equivalent to passing
+            # False and keeps narrow injected preparation seams compatible.
+            seen["flag"] = kwargs.get("first_party_fixed_argv", False)
             raise RuntimeError("stop at the wrap")
 
         server = McpServerInfo(name="playwright-mcp", command="node")

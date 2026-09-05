@@ -7,10 +7,11 @@ agent sends come from *your* number, which is what makes the channel powerful
 (message yourself as a command line, have the agent send reminders to friends,
 lend a hand in your groups) and also what makes its safety rules strict.
 
-Requires the optional dependency extra:
+Requires one optional dependency, installed into the environment that runs the
+gateway:
 
 ```bash
-pip install 'kirocrew[whatsapp]'
+pip install 'neonize==0.4.3.post0'
 ```
 
 ## Risks — read before enabling
@@ -176,10 +177,10 @@ personal-scale rate limiting as replies.
 
 | Command | Effect |
 |---|---|
-| `/new` | Start a fresh session (new context). |
+| `/new` (or `/start`) | Start a fresh session (new context). |
 | `/compact` | Compact the current session's context now, and report the result. |
 | `/status` | Runtime summary (sessions, uptime, counters). |
-| `/stop` | Interrupt the running turn, or clear the queue if nothing is running. |
+| `/stop` (or `/cancel`) | Interrupt the running turn, or clear the queue if nothing is running. |
 | `/help` | List the commands. |
 
 `/help` is answerable by anyone the access policy admits, because it discloses
@@ -246,7 +247,7 @@ and exact, so `/stop the presses` reaches the agent as a sentence.
 ## Troubleshooting
 
 - **"Channel enabled but the optional dependency is missing"** — install
-  `kirocrew[whatsapp]` into the gateway's environment and restart.
+  `neonize` (see above) into the gateway's environment and restart.
 - **Badge shows "The link was revoked"**: the phone revoked the link, or WhatsApp
   expired it. Nothing in the dashboard can restart pairing, so restart the gateway
   with the channel enabled and scan the fresh code. The old session file is

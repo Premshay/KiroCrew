@@ -126,6 +126,7 @@ def _rewrite(
     tmp_path: Path,
     *,
     stub_servers: frozenset[str] = frozenset(),
+    shared_readonly_servers: frozenset[str] = frozenset(),
     pooling_enabled: bool = True,
     forward_env: bool = False,
 ) -> tuple[dict, int]:
@@ -137,9 +138,82 @@ def _rewrite(
         sandbox_mode="auto",
         approval_mode="interactive",
         stub_servers=stub_servers,
+        shared_readonly_servers=shared_readonly_servers,
         pooling_enabled=pooling_enabled,
         forward_env=forward_env,
     )
+
+
+class TestSharedReadonlyServers:
+    def test_allowlisted_credential_free_server_uses_one_neutral_pool_identity(
+        self, tmp_path: Path
+    ) -> None:
+        server = {"command": sys.executable, "args": ["-m", "context7"]}
+        first, _ = _rewrite(
+            {"name": "reviewer", "mcpServers": {"context7": server}},
+            tmp_path,
+            stub_servers=frozenset({"context7"}),
+            shared_readonly_servers=frozenset({"context7"}),
+        )
+        second, _ = _rewrite(
+            {"name": "implementer", "mcpServers": {"context7": server}},
+            tmp_path,
+            stub_servers=frozenset({"context7"}),
+            shared_readonly_servers=frozenset({"context7"}),
+        )
+
+        first_args = first["mcpServers"]["context7"]["args"]
+        second_args = second["mcpServers"]["context7"]["args"]
+        assert first_args == second_args
+        assert first_args[first_args.index("--agent") + 1] == "kirocrew-shared-readonly"
+        assert first_args[first_args.index("--work-dir") + 1].endswith("shared-readonly")
+
+    def test_allowlisted_server_creates_its_shared_work_directory(
+        self, tmp_path: Path
+    ) -> None:
+        from kiro_crew.mcp_gateway.rewriter import rewrite_agents
+
+        source_dir = tmp_path / "agents"
+        source_dir.mkdir()
+        (source_dir / "reviewer.json").write_text(
+            json.dumps(
+                {
+                    "name": "reviewer",
+                    "mcpServers": {
+                        "context7": {"command": sys.executable},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        overlay_dir = tmp_path / "gateway" / "agents"
+
+        rewrite_agents(
+            source_dir=source_dir,
+            overlay_dir=overlay_dir,
+            socket_path=tmp_path / "gateway.sock",
+            work_dir=tmp_path / "workspace",
+            stub_servers=frozenset({"context7"}),
+            shared_readonly_servers=frozenset({"context7"}),
+        )
+
+        assert (overlay_dir.parent / "shared-readonly").is_dir()
+
+    def test_environment_bearing_server_stays_session_scoped(self, tmp_path: Path) -> None:
+        out, _ = _rewrite(
+            {
+                "name": "reviewer",
+                "mcpServers": {
+                    "context7": {"command": sys.executable, "env": {"TOKEN": "x"}}
+                },
+            },
+            tmp_path,
+            stub_servers=frozenset({"context7"}),
+            shared_readonly_servers=frozenset({"context7"}),
+            forward_env=True,
+        )
+        args = out["mcpServers"]["context7"]["args"]
+        assert args[args.index("--agent") + 1] == "reviewer"
 
 
 def test_disabled_poolable_server_is_not_wrapped(tmp_path: Path) -> None:
@@ -771,7 +845,7 @@ def test_env_sidecar_directory_goes_through_make_owner_only_dir(
 def test_failed_sidecar_protection_leaves_no_readable_credentials(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """An icacls failure must not leave the credentials on disk.
+    """A lockdown failure must not leave the credentials on disk.
 
     The previous order wrote the sidecar first (with a mode argument that is
     inert on Windows) and applied the DACL afterwards, catching the failure with
@@ -803,7 +877,7 @@ def test_failed_sidecar_protection_leaves_no_readable_credentials(
         test would stop short of the behaviour under test.
         """
         if Path(path).parent.name == "env":
-            raise OSError("icacls: access denied")
+            raise OSError("SetNamedSecurityInfoW: access denied")
 
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_POSIX", False)
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)

@@ -22,6 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     "session_send",
     "session_read_message",
     "session_create",
+    "session_close",
 )
 
 # Boundary-aware matcher: the tool name must stand alone in the rendered
@@ -254,6 +256,22 @@ class Channel:
         """Return true only for the channel's canonical coordinator identity."""
         return self.orchestrator_id is not None and member.id == self.orchestrator_id
 
+    def set_coordinator(self, agent_id: str) -> bool:
+        """Assign the channel's one coordinator to an existing member."""
+        agent = self.members.get(agent_id)
+        if not agent:
+            return False
+        for member in self.members.values():
+            member.is_orchestrator = member.id == agent_id
+        agent.listen_mode = ListenMode.ALL
+        self.orchestrator_id = agent_id
+        self._broadcast(
+            "channel_coordinator_changed",
+            {"channel_id": self.id, "agent_id": agent_id},
+        )
+        self._save()
+        return True
+
     def add_agent(
         self,
         role: str,
@@ -324,6 +342,7 @@ class Channel:
                 listen_mode = ListenMode(listen_mode)
             except ValueError:
                 listen_mode = ListenMode.MENTION
+        is_orchestrator = self.orchestrator_id is None and not self.members
         agent_id = uuid.uuid4().hex[:8]
         agent = ChannelAgent(
             id=agent_id,
@@ -332,10 +351,13 @@ class Channel:
             task="",
             session_key=session_key,
             state="listening",
+            is_orchestrator=is_orchestrator,
             listen_mode=listen_mode,
             attached_session=True,
         )
         self.members[agent_id] = agent
+        if is_orchestrator:
+            self.orchestrator_id = agent_id
         self._broadcast("channel_agent_joined", {"channel_id": self.id, "agent": agent.to_dict()})
         self._save()
         return agent
@@ -595,10 +617,19 @@ class Channel:
                 state="listening" if ad.get("attached_session") else "done",
                 is_orchestrator=ad.get("is_orchestrator", False),
                 approval_policy=ApprovalPolicy(ad.get("approval_policy", "writes")),
-                listen_mode=ListenMode(ad.get("listen_mode", "all" if ad.get("is_orchestrator") else "mention")),
+                listen_mode=ListenMode(
+                    ad.get("listen_mode", "all" if ad.get("is_orchestrator") else "mention")
+                ),
                 attached_session=bool(ad.get("attached_session")),
             )
             ch.members[aid] = agent
+        if ch.orchestrator_id not in ch.members:
+            # Attachment order is the only user-authored ownership signal in
+            # legacy session-only channels that were saved without a coordinator.
+            first_attached = next(
+                (member for member in ch.members.values() if member.attached_session), None
+            )
+            ch.orchestrator_id = first_attached.id if first_attached is not None else None
         # ``orchestrator_id`` is the authority record. Older persisted channel
         # data can retain an obsolete display flag after a coordinator transfer.
         for member in ch.members.values():
@@ -651,14 +682,32 @@ class ChannelManager:
         self._load_all()
 
     def _save_channel(self, channel: Channel) -> None:
-        """Persist channel state to disk."""
+        """Persist channel state to disk.
+
+        Routed through the shared :func:`atomic_write` helper rather than a
+        hand-rolled temp-write-and-rename. The hand-rolled form derived its temp
+        name from the destination (``<id>.json.tmp``), so two writers persisting
+        the same channel raced on one filename: the loser could publish a
+        half-written payload, or fail outright when its rename found the temp
+        already moved. It also missed the helper's bounded retry for the Windows
+        rename window, where a scanner holding the temp file makes a correct
+        write lose its payload.
+
+        Durability and permission semantics are deliberately unchanged: no
+        ``fsync`` (the pre-existing best-effort contract for channel state) and
+        no explicit ``mode``, so the file still lands at the umask default.
+        ``json.dumps`` is ASCII-only by default, so the helper's UTF-8 encoding
+        puts the same bytes on disk as the previous locale-default text handle.
+
+        ``os.makedirs`` stays OUTSIDE the ``try`` on purpose. The helper creates
+        the parent itself, so this call is now belt-and-braces -- but moving
+        directory creation inside the ``try`` would newly swallow a "cannot
+        create the channels directory" failure that callers see raised today.
+        """
         os.makedirs(self._CHANNELS_DIR, exist_ok=True)
         path = os.path.join(self._CHANNELS_DIR, f"{channel.id}.json")
-        tmp = path + ".tmp"
         try:
-            with open(tmp, "w") as f:
-                json.dump(channel.serialize(), f)
-            os.replace(tmp, path)
+            atomic_write(path, json.dumps(channel.serialize()))
         except Exception:
             logger.exception("Failed to save channel %s", channel.id)
 
@@ -688,6 +737,8 @@ class ChannelManager:
                 )
                 ch._max_agents = self._max_agents
                 self._channels[ch.id] = ch
+                if data.get("orchestrator_id") != ch.orchestrator_id:
+                    self._save_channel(ch)
                 logger.info("Restored channel %s (%s)", ch.id, ch.topic)
             except Exception:
                 logger.exception("Failed to load channel from %s", path)
@@ -731,6 +782,23 @@ class ChannelManager:
     def list_channels(self) -> list[dict[str, Any]]:
         return [ch.to_dict() for ch in self._channels.values()]
 
+    def find_member(self, session_key: str) -> tuple[Channel, ChannelAgent] | None:
+        """Resolve a live session key to the channel member that owns it.
+
+        Membership is the only authority on which slotless ACP session belongs
+        to a channel worker, so callers outside this module resolve identity
+        here rather than parsing the ``channel:<channel>:<agent>`` key shape --
+        an attached dashboard session keeps its own ``dashboard:`` key and must
+        still resolve to its member row.
+        """
+        if not session_key:
+            return None
+        for channel in self._channels.values():
+            for member in channel.members.values():
+                if member.session_key == session_key:
+                    return channel, member
+        return None
+
     @property
     def count(self) -> int:
         return len(self._channels)
@@ -766,6 +834,24 @@ async def run_channel_agent(
     is_yolo: Any = None,  # callable returning bool
 ) -> None:
     """Two-phase agent lifecycle: working → listening."""
+    # An attached member IS a dashboard session, not a worker this function
+    # owns. Its slot already holds the provider session, and ``_deliver`` routes
+    # every message for it through ``_delivery_fn`` — never through ``inbox`` —
+    # so the subscribe loop below could never yield for it. What it WOULD do is
+    # call ``get_or_create``, whose contract hands back the key's per-session
+    # semaphore held until ``release``, and then park in that loop for the life
+    # of the channel. The slot's next dashboard turn would block inside
+    # ``get_or_create`` waiting for that permit, indefinitely and without
+    # logging a line: a spinner that never resolves, and a Stop that finds no
+    # live turn to cancel. Guarded here rather than at the call sites so no
+    # future caller can reintroduce it.
+    if agent.attached_session:
+        agent.state = "listening"
+        channel._broadcast(
+            "channel_agent_status",
+            {"channel_id": channel.id, "agent_id": agent.id, "state": "listening"},
+        )
+        return
     agent.state = "pending"
     channel._broadcast(
         "channel_agent_status",
@@ -866,7 +952,11 @@ async def _stream_task(
         EVENT_TEXT_CHUNK,
         EVENT_TOOL_CALL,
     )
-    from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+    from kiro_crew.security import (
+        redact_and_truncate,
+        redact_credentials,
+        redact_exfiltration_urls,
+    )
     from kiro_crew.sel import sel
 
     chunks: list[str] = []
@@ -923,8 +1013,14 @@ async def _stream_task(
                     await client.approve_tool(event.request_id)
                     continue
                 # Normal mode — interactive approval
-                sanitized_input, _ = redact_credentials(event.tool_input[:500])
-                sanitized_input, _ = redact_exfiltration_urls(sanitized_input)
+                # Redact over the FULL input, then bound: cutting first can
+                # split a credential at the boundary into fragments no
+                # redaction regex matches, leaking it into the approval prompt.
+                # tool_input is model-authored and size-unbounded, so the
+                # full-text pass runs off-loop (no-blocking-call-on-event-loop).
+                sanitized_input = await asyncio.to_thread(
+                    redact_and_truncate, event.tool_input, 500
+                )
                 sanitized_name, _ = redact_credentials(event.text or "")
                 sanitized_name, _ = redact_exfiltration_urls(sanitized_name)
                 loop = asyncio.get_running_loop()

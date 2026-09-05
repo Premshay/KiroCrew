@@ -28,6 +28,7 @@ from kiro_crew import session_ledger, work_items
 from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard.handlers import kiro_usage_api
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.session_memory import SessionMemorySampler
@@ -1058,7 +1059,12 @@ async def api_sessions(request: web.Request) -> web.Response:
         offset = 0
     want_preview = (request.query.get("preview") or "").lower() in ("1", "true", "yes")
     exclude_open = (request.query.get("exclude_open") or "").lower() in ("1", "true", "yes")
-    all_sessions = state.conversation_log.list_sessions()
+    # list_sessions() globs, stats, and reads the first line of EVERY session file
+    # in the history dir — O(all sessions). At 2000 sessions, that's ~200 ms of
+    # blocking IO (measured: 208 ms / 2000 files on a dev host). Running that on
+    # the event loop freezes chat, heartbeat, and every other coroutine for the
+    # full duration. Offload to a worker thread (#3057).
+    all_sessions = await asyncio.to_thread(state.conversation_log.list_sessions)
     if exclude_open:
         open_keys = _open_slot_transcript_keys(state)
         # Fold through ``_canonical_key`` as well: ``list_sessions`` deduplicates
@@ -1081,11 +1087,17 @@ async def api_sessions(request: web.Request) -> web.Response:
         log = state.conversation_log
 
         def _attach_previews(sessions: list[dict]) -> None:
+            def _sanitize(text: str) -> str:
+                # Injected so redaction runs BEFORE the preview's length cap:
+                # a credential split by truncation leaves a partial token the
+                # patterns cannot match, letting its raw prefix through.
+                text, _ = _h.redact_exfiltration_urls(text)
+                text, _ = _h.redact_credentials(text)
+                return text
+
             for s in sessions:
-                preview = log.last_message_preview(s.get("key", ""))
+                preview = log.last_message_preview(s.get("key", ""), sanitize=_sanitize)
                 if preview:
-                    preview, _ = _h.redact_exfiltration_urls(preview)
-                    preview, _ = _h.redact_credentials(preview)
                     s["preview"] = preview
 
         # Tail reads are sync file IO — keep them off the event loop.
@@ -1282,7 +1294,13 @@ async def api_session_detail(request: web.Request) -> web.Response:
     key = request.match_info["key"]
     if not state.conversation_log:
         return web.json_response([])
-    return web.json_response(state.conversation_log.read_messages(key))
+    # read_messages() opens and parses the transcript on a cache miss, which for
+    # the multi-MB sessions a long-lived store accumulates is 100-300 ms of
+    # blocking file IO — on the event loop, stalling every other request. Off the
+    # loop, like every other conversation_log read in this module (list_sessions,
+    # get_metadata, session_mtime, search_sessions, delete_session).
+    messages = await asyncio.to_thread(state.conversation_log.read_messages, key)
+    return web.json_response(messages)
 
 
 async def api_session_delete(request: web.Request) -> web.Response:
@@ -1437,6 +1455,23 @@ async def _remove_slot_for_history_key(state: DashboardState, key: str) -> None:
         )
     except (OSError, work_items.WorkItemError):
         logger.warning("History delete: work-item sweep failed for %s", key, exc_info=True)
+    # The per-session compaction-threshold override dies with permanent
+    # deletion, and ``destroy()`` above only runs when a LIVE slot exists — a
+    # slotless delete of archived history would otherwise leave the override
+    # for a deterministic (channel) key to be silently inherited by a
+    # recreated session. Same fold-matching sweep as the ledger purge; safe to
+    # run unconditionally (the slot path's destroy already popped its entry).
+    try:
+        raw_candidates = set(pin_slot_keys) | {key}
+        dropped = state.sessions.drop_autocompact_overrides_matching(
+            raw_candidates | folded_keys,
+            {_normalize_slot_key(k) for k in raw_candidates} | folded_keys,
+            _normalize_slot_key,
+        )
+        if dropped:
+            logger.info("History delete: dropped %d autocompact override(s) for %s", dropped, key)
+    except Exception:
+        logger.warning("History delete: override sweep failed for %s", key, exc_info=True)
 
 
 async def api_sessions_clear(request: web.Request) -> web.Response:
@@ -1450,39 +1485,35 @@ async def api_sessions_clear(request: web.Request) -> web.Response:
     if not state.conversation_log:
         return web.json_response({"error": "no conversation log"}, status=400)
 
-    # Same definition of "open as a tab" the Older-sessions list excludes on, so
-    # a session cannot be simultaneously hidden from that list and eligible for
-    # this delete.
-    protected = _open_slot_transcript_keys(state)
+    # Bind after the None guard so mypy's narrowing carries into the closure.
+    log = state.conversation_log
 
-    sessions = state.conversation_log.list_sessions()
+    # list_sessions() globs, stats, and reads the first line of EVERY session file
+    # in the history dir — O(all sessions). Offload to keep the event loop responsive.
+    all_sessions = await asyncio.to_thread(log.list_sessions)
+
     count = 0
     skipped = 0
     failed = 0
     cleanup_tasks = []
-    for s in sessions:
+    for s in all_sessions:
         key = s["key"]
-        if key in protected:
+
+        # Re-check per iteration: a resume publishing a slot during the
+        # list_sessions scan OR during an earlier delete-await now appears here.
+        if key in _open_slot_transcript_keys(state):
             skipped += 1
             continue
+
         try:
-            meta = state.conversation_log.get_metadata(key)
-        except Exception:
-            logger.warning(
-                "api_sessions_clear: unreadable metadata for %s, skipping", key, exc_info=True
-            )
-            skipped += 1
-            continue
-        if not isinstance(meta, dict):
-            skipped += 1
-            continue
-        if meta.get("pinned"):
-            skipped += 1
-            continue
-        try:
-            # delete_session enters _locked (flock + os.close) — offload off the
-            # event loop so a wedged peer can't stall the bulk clear on it.
-            if await asyncio.to_thread(state.conversation_log.delete_session, key):
+            # Offload off the event loop — delete_session enters _locked (flock).
+            # skip_pinned=True makes the pin-check-and-delete atomic so a
+            # concurrent pin cannot sneak in between the metadata read and the
+            # unlink. The invariant (lock, real test) now lives in history.py.
+            result = await asyncio.to_thread(log.delete_session, key, skip_pinned=True)
+            if result is None:
+                skipped += 1
+            elif result:
                 cleanup_tasks.append(_remove_slot_for_history_key(state, key))
                 count += 1
             else:
@@ -1511,16 +1542,102 @@ async def api_approvals(request: web.Request) -> web.Response:
 
 
 async def api_approval_resolve(request: web.Request) -> web.Response:
-    """POST /api/approvals/{id}/{action} — approve or reject."""
+    """POST /api/approvals/{id}/{action} — approve, reject, or reject_once."""
     state: DashboardState = request.app["state"]
     approval_id = request.match_info["id"]
     action = request.match_info["action"]
-    if action not in ("approve", "reject"):
+    if action not in ("approve", "reject", "reject_once"):
         return web.json_response({"error": "invalid action"}, status=400)
-    ok = state.resolve_approval(approval_id, action == "approve")
+    ok = state.resolve_approval(
+        approval_id, action == "approve", rejected_once=action == "reject_once"
+    )
     if not ok:
         return web.json_response({"error": "not found or expired"}, status=404)
     return web.json_response({"ok": True})
+
+
+async def api_session_directive(request: web.Request) -> web.Response:
+    """POST /api/session-directive — park a validated session directive.
+
+    The provider-neutral leg of the session-directive protocol. Its only caller is
+    a Kiro Crew directive tool (``mcp_tools.control._emit_directive``), which has
+    already validated the payload; this route carries that payload to the gateway
+    OUT OF BAND so the turn's consumer can apply it without having to trust the
+    model-visible marker in the tool result. See
+    :mod:`kiro_crew.dashboard.directive_queue` for why that is not weaker than the
+    marker gate it backs up.
+
+    Authenticated via X-Internal-Secret, and the session is selected by the
+    X-Session-Key header every MCP subprocess already sends — the SAME shape as
+    ``api_session_keepalive``. The header is not taken on faith: on the unix
+    socket ``token_auth`` kernel-verifies the peer and denies 403 when it resolves
+    to a session key other than the declared one, which is the check that stops a
+    caller parking a directive against somebody else's session.
+
+    Unknown ``kind`` is a 400, not a silent drop: the only legitimate callers are
+    Kiro Crew's own directive tools, so an unrecognized kind means the request did
+    not come from one and the caller should hear about it.
+    """
+    # Re-assert the caller's locality BEFORE the header is read. The route is in
+    # server.py's strict allowlist, but a ``local_only=False`` deployment
+    # reclassifies strict paths as MIXED — so the auth middleware also admits a
+    # cookie/token-authenticated browser caller here, and such a caller picks its
+    # own ``X-Session-Key``. That is somebody else's session: a parked record is
+    # applied verbatim by the next consumer frame in the named turn, so accepting
+    # it would hand a remote cookie holder a cross-session mutation (arm a loop,
+    # retarget a project). ``internal_auth`` is set only after a constant-time
+    # ``X-Internal-Secret`` match on a same-machine transport; ``peer_verified``
+    # only after the kernel-attested AF_UNIX peer resolved to the DECLARED key —
+    # either one is positive proof of a local caller, and a cookie carries
+    # neither. Same predicate as ``handlers/updates.py``'s host-locality gate.
+    if not (request.get("internal_auth") or request.get("peer_verified")):
+        logger.warning(
+            "session-directive REFUSED (not_local_caller): neither internal_auth nor "
+            "peer_verified was set, so the caller could not be proven local. "
+            "Nothing was parked."
+        )
+        return web.json_response(
+            {"error": "local caller required", "code": "not_local_caller"},
+            status=403,
+        )
+    session_key = request.headers.get("X-Session-Key", "").strip()
+    if not session_key:
+        logger.warning(
+            "session-directive REFUSED (session_key_required): the caller sent no "
+            "X-Session-Key, so no session could be named and nothing was parked. On a "
+            "backend that emits no _meta.kiro identity this is fatal: the marker cannot "
+            "be trusted either, so the directive is dropped entirely."
+        )
+        return web.json_response(
+            {"error": "X-Session-Key required", "code": "session_key_required"},
+            status=400,
+        )
+    body: dict = {}
+    try:
+        if request.can_read_body:
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+    except Exception:
+        return web.json_response(
+            {"error": "malformed JSON body", "code": "invalid_body"}, status=400
+        )
+    kind = str(body.get("kind") or "").strip()
+    args = body.get("args")
+    if not isinstance(args, dict):
+        args = {}
+    try:
+        record_id = directive_queue.publish(session_key, kind, args)
+    except ValueError as exc:
+        logger.warning(
+            "session-directive REFUSED (invalid_directive) for session_key=%r kind=%r: "
+            "%s. Nothing was parked.",
+            session_key,
+            kind,
+            exc,
+        )
+        return web.json_response({"error": str(exc), "code": "invalid_directive"}, status=400)
+    return web.json_response({"ok": True, "id": record_id})
 
 
 async def api_session_keepalive(request: web.Request) -> web.Response:
@@ -2397,6 +2514,264 @@ async def api_sessions_restart(request: web.Request) -> web.Response:
     count = await _reset_all_sessions(request)
     return web.json_response(
         {"ok": True, "sessions_reset": count, "mcp_synced": synced, "mcp_sync_ok": sync_ok}
+    )
+
+
+# ── Coordinated-reset blockers owned by channels ──
+
+# A blocking slotless session this surface has no safe action for. The reason is
+# what the operator is shown INSTEAD of a control, so each value names why no
+# button appears rather than collapsing to "unknown".
+_BLOCKER_NOT_A_CHANNEL_WORKER = "not_a_channel_worker"
+_BLOCKER_ATTACHED_DASHBOARD_SESSION = "attached_dashboard_session"
+# Rejected on the clear path only: the barrier moved between the operator
+# reading the list and confirming, so this key is no longer blocking anything.
+_BLOCKER_NOT_BLOCKING = "not_blocking"
+
+# One confirmation covers a bounded batch. A request naming more keys than any
+# channel could hold is a malformed caller, not an operator clicking a button.
+_MAX_BLOCKER_CLEAR_KEYS = 64
+
+
+def _blocker_lock(state: DashboardState) -> LoopBoundLock:
+    """Serialise bulk clears so two operators cannot interleave one batch.
+
+    DashboardState can outlive the event loop that first serves this endpoint,
+    so a LoopBoundLock prevents a later loop from awaiting a lock bound to a
+    closed predecessor.
+    """
+    lock = getattr(state, "_restart_blocker_lock", None)
+    if not isinstance(lock, LoopBoundLock):
+        lock = LoopBoundLock()
+        state._restart_blocker_lock = lock
+    return lock
+
+
+def _restart_blocker_view(
+    state: DashboardState, status: dict[str, object]
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Name every slotless session blocking the reset, and who owns it.
+
+    Dashboard-slot sessions are deliberately absent: they acknowledge for
+    themselves through ``/api/session-maintenance`` and are reported by the
+    barrier's own ``pending`` list.  This split is what keeps a channel-owned
+    worker -- which has no operator to acknowledge on its behalf -- from being
+    the anonymous "busy slotless worker" that a reset simply refuses on.
+    """
+    manager = getattr(state, "channel_manager", None)
+    finder = getattr(manager, "find_member", None) if manager is not None else None
+    channel_blockers: list[dict[str, object]] = []
+    other_blockers: list[dict[str, object]] = []
+    raw = status.get("unmanaged_busy")
+    for key in raw if isinstance(raw, list) else []:
+        if not isinstance(key, str):
+            continue
+        found = finder(key) if callable(finder) else None
+        if found is None:
+            other_blockers.append({"session_key": key, "reason": _BLOCKER_NOT_A_CHANNEL_WORKER})
+            continue
+        channel, member = found
+        if member.attached_session:
+            # An attached member is an operator's own dashboard session that
+            # joined a channel. Its reset belongs to the slot that owns it, not
+            # to a channel-maintenance control, so no action is offered here.
+            other_blockers.append(
+                {"session_key": key, "reason": _BLOCKER_ATTACHED_DASHBOARD_SESSION}
+            )
+            continue
+        channel_blockers.append(
+            {
+                "session_key": key,
+                "channel_id": channel.id,
+                "channel_topic": channel.topic,
+                "agent_id": member.id,
+                "role": member.role,
+                "agent_name": member.agent_name,
+                "state": member.state,
+                "is_coordinator": channel.is_active_coordinator(member),
+            }
+        )
+    channel_blockers.sort(key=lambda row: str(row["session_key"]))
+    other_blockers.sort(key=lambda row: str(row["session_key"]))
+    return channel_blockers, other_blockers
+
+
+def _blocker_payload(state: DashboardState, status: dict[str, object]) -> dict[str, object]:
+    """The wire shape both endpoints answer with."""
+    channel_blockers, other_blockers = _restart_blocker_view(state, status)
+    return {"channel_blockers": channel_blockers, "other_blockers": other_blockers}
+
+
+async def api_sessions_restart_blockers(request: web.Request) -> web.Response:
+    """GET /api/sessions/restart-blockers — name what is blocking a reset.
+
+    Read-only: it refreshes an ALREADY-OPEN barrier against live work but never
+    opens one, so merely viewing the maintenance surface cannot start requiring
+    acknowledgements from sessions nobody asked to reset.
+    """
+    state: DashboardState = request.app["state"]
+    status = await _restart_barrier_status(state, open_if_busy=False)
+    return web.json_response({"ok": True, "maintenance": status, **_blocker_payload(state, status)})
+
+
+async def api_sessions_clear_restart_blockers(request: web.Request) -> web.Response:
+    """POST /api/sessions/restart-blockers/clear — clear channel workers' context.
+
+    Body: ``{"confirm": true, "session_keys": ["channel:<id>:<agent>", ...]}``.
+
+    Each key runs the channel's own per-worker Clear context lifecycle
+    (:func:`kiro_crew.dashboard.handlers_channel.clear_agent_context`), so this
+    surface adds reach, not new semantics: channel membership, the shared
+    message buffer and exchange counts all survive, and the worker cold-starts
+    on its next message.  It is NOT a dismissal and not a cooperative stop.
+
+    The barrier is re-read before every key and once more at the end, so a
+    worker that finished on its own between the operator's read and their
+    confirmation is skipped rather than reset, and the returned blocker list is
+    the state after the batch rather than the state that prompted it.
+    """
+    state: DashboardState = request.app["state"]
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "invalid_request"}, status=400
+        )
+    keys = body.get("session_keys")
+    if not isinstance(keys, list) or not keys or not all(isinstance(k, str) and k for k in keys):
+        return web.json_response(
+            {
+                "error": "session_keys must be a non-empty list of strings",
+                "code": "invalid_request",
+            },
+            status=400,
+        )
+    # Deduplicated, but order-preserving: the operator sees results in the order
+    # the list was shown to them.
+    requested: list[str] = list(dict.fromkeys(keys))
+    if len(requested) > _MAX_BLOCKER_CLEAR_KEYS:
+        return web.json_response(
+            {"error": "too many session keys", "code": "too_many_keys"}, status=400
+        )
+    if body.get("confirm") is not True:
+        return web.json_response(
+            {
+                "error": "clearing channel worker context requires confirmation",
+                "code": "confirmation_required",
+            },
+            status=409,
+        )
+
+    manager = getattr(state, "channel_manager", None)
+    if manager is None or not callable(getattr(manager, "find_member", None)):
+        return web.json_response(
+            {"error": "channels are unavailable", "code": "channels_unavailable"}, status=409
+        )
+
+    # Deferred: handlers_channel imports the channel runtime, which this module
+    # sits upstream of in the dashboard's import order.
+    from kiro_crew.dashboard.handlers_channel import (
+        broadcast_context_cleared,
+        clear_agent_context,
+    )
+
+    results: list[dict[str, object]] = []
+    async with _blocker_lock(state):
+        status = await _restart_barrier_status(state, open_if_busy=False)
+        if status.get("active") is not True:
+            return web.json_response(
+                {
+                    "error": "no coordinated reset is waiting on these sessions",
+                    "code": "no_active_barrier",
+                    "maintenance": status,
+                    **_blocker_payload(state, status),
+                },
+                status=409,
+            )
+        for key in requested:
+            # Re-read per key: an earlier clear in this batch, an unrelated
+            # reset, or the worker simply finishing all change what is still
+            # blocking, and a stale membership row must not authorise a reset.
+            status = await _restart_barrier_status(state, open_if_busy=False)
+            clearable, unactionable = _restart_blocker_view(state, status)
+            row = next(
+                (candidate for candidate in clearable if candidate["session_key"] == key), None
+            )
+            if row is None:
+                blocked = next(
+                    (candidate for candidate in unactionable if candidate["session_key"] == key),
+                    None,
+                )
+                reason = str(blocked["reason"]) if blocked else _BLOCKER_NOT_BLOCKING
+                _sel().log_api_access(
+                    caller="dashboard",
+                    operation="channel.clear_context",
+                    outcome="denied",
+                    source="dashboard",
+                    resources=f"restart-blocker:{key}:{reason}",
+                )
+                results.append({"session_key": key, "outcome": "skipped", "reason": reason})
+                continue
+            found = manager.find_member(key)
+            if found is None:
+                results.append(
+                    {"session_key": key, "outcome": "skipped", "reason": _BLOCKER_NOT_BLOCKING}
+                )
+                continue
+            channel, member = found
+            try:
+                cleared = await clear_agent_context(state, member)
+            except asyncio.CancelledError:
+                # The operator's request went away mid-batch. Report nothing as
+                # having happened that did not, and let the cancel propagate.
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Clearing channel worker %s during restart maintenance failed",
+                    key,
+                    exc_info=True,
+                )
+                _sel().log_api_access(
+                    caller="dashboard",
+                    operation="channel.clear_context",
+                    outcome="denied",
+                    source="dashboard",
+                    resources=f"restart-blocker:{key}",
+                    error=redact(str(exc)),
+                )
+                results.append(
+                    {
+                        "session_key": key,
+                        "outcome": "failed",
+                        "reason": "clear_failed",
+                        "detail": redact(str(exc)),
+                    }
+                )
+                continue
+            label = member.role or member.id
+            _sel().log_api_access(
+                caller="dashboard",
+                operation="channel.clear_context",
+                outcome="allowed",
+                source="dashboard",
+                resources=f"restart-blocker:{channel.id}:agent:{label}",
+            )
+            broadcast_context_cleared(channel, "agent", member.id, [label] if cleared else [])
+            results.append(
+                {
+                    "session_key": key,
+                    "outcome": "cleared" if cleared else "skipped",
+                    "reason": "" if cleared else "no_session",
+                    "channel_id": channel.id,
+                    "role": member.role,
+                }
+            )
+        status = await _restart_barrier_status(state, open_if_busy=False)
+    _publish_restart_barrier(state)
+    return web.json_response(
+        {"ok": True, "results": results, "maintenance": status, **_blocker_payload(state, status)}
     )
 
 

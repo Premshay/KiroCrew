@@ -34,6 +34,22 @@ def _set_active(root, names):
     cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
+def _set_bindings(root, bindings):
+    cfg_path = store.data_dir(root) / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg.setdefault("review", {})["namespace_bindings"] = bindings
+    cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def _source(owner="acme", repository="service"):
+    return {
+        "provider": "github",
+        "host": "github.com",
+        "owner": owner,
+        "repository": repository,
+    }
+
+
 class TestNamespaceManagement(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -158,6 +174,92 @@ class TestActiveNamespaceUnion(unittest.TestCase):
         _set_active(self.root, ["proj-a"])
         titles = [p["title"] for p in L.list_patterns_for_review(self.root)]
         self.assertEqual(titles, ["ProjA-lesson"])
+
+
+class TestRepositoryNamespaceResolution(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = Path(self.tmp) / "apps" / "code-review-sage"
+        store.ensure_layout(self.root)
+        L.consolidate_apply(
+            "# default\n\n" + L.render_pattern(L._normalize_pattern(_pattern("Legacy rule"))),
+            self.root,
+        )
+        L.create_namespace("service-rules", self.root)
+        L.consolidate_apply(
+            "# scoped\n\n" + L.render_pattern(L._normalize_pattern(_pattern("Service rule"))),
+            self.root,
+            namespace="service-rules",
+        )
+        _set_active(self.root, ["service-rules", "default"])
+        _set_bindings(self.root, {
+            "service-rules": {"scope": "repository", "repository": _source()},
+        })
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_unrelated_repository_excludes_scoped_namespace(self):
+        resolved = L.resolve_effective_rules(_source("other", "repo"), root=self.root)
+
+        self.assertEqual(resolved["effective_namespaces"], ["default"])
+        self.assertEqual([rule["pattern"]["title"] for rule in resolved["effective_rules"]], ["Legacy rule"])
+        self.assertEqual(resolved["namespaces"][0]["reason"], "repository_binding_mismatch")
+
+    def test_explicit_global_namespace_applies_to_every_repository(self):
+        _set_bindings(self.root, {
+            "service-rules": {"scope": "global"},
+        })
+
+        resolved = L.resolve_effective_rules(_source("other", "repo"), root=self.root)
+
+        self.assertEqual(resolved["effective_namespaces"], ["service-rules", "default"])
+        self.assertEqual(resolved["namespaces"][0]["reason"], "explicit_global_binding")
+
+    def test_unbound_active_namespace_remains_legacy_global_with_warning(self):
+        _set_bindings(self.root, {})
+
+        resolved = L.resolve_effective_rules(_source("other", "repo"), root=self.root)
+
+        self.assertEqual(resolved["effective_namespaces"], ["service-rules", "default"])
+        self.assertEqual(resolved["namespaces"][0]["reason"], "legacy_active_namespace")
+        self.assertTrue(any("service-rules" in warning for warning in resolved["warnings"]))
+
+    def test_invalid_repository_binding_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "repository"):
+            L.validate_namespace_bindings({
+                "service-rules": {"scope": "repository", "repository": {"provider": "gitlab"}},
+            })
+
+    def test_rule_order_and_dedup_are_deterministic(self):
+        L.create_namespace("global-rules", self.root)
+        duplicated = _pattern("Duplicate rule")
+        L.consolidate_apply(
+            "# global\n\n" + L.render_pattern(L._normalize_pattern(duplicated)),
+            self.root,
+            namespace="global-rules",
+        )
+        L.consolidate_apply(
+            L.common_file(self.root, "service-rules").read_text(encoding="utf-8")
+            + "\n"
+            + L.render_pattern(L._normalize_pattern(duplicated)),
+            self.root,
+            namespace="service-rules",
+        )
+        _set_active(self.root, ["service-rules", "global-rules", "service-rules"])
+        _set_bindings(self.root, {
+            "service-rules": {"scope": "global"},
+            "global-rules": {"scope": "global"},
+        })
+
+        first = L.resolve_effective_rules(_source(), root=self.root)
+        second = L.resolve_effective_rules(_source(), root=self.root)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["effective_namespaces"], ["service-rules", "global-rules"])
+        duplicate = [rule for rule in first["effective_rules"] if rule["pattern"]["title"] == "Duplicate rule"]
+        self.assertEqual(len(duplicate), 1)
+        self.assertEqual(duplicate[0]["namespace"], "service-rules")
 
 
 class TestConfigDrivenSettings(unittest.TestCase):

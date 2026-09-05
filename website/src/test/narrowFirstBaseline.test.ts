@@ -258,6 +258,7 @@ describe('narrow-first layout baseline', () => {
     const CONTENT_WIDTH_VAR = '--mc-content-width'
     const NEAR = 200
     const offenders: string[] = []
+    const matchedWrappers: string[] = []
     for (const { file, src } of await SOURCES) {
       for (const m of src.matchAll(/className=(?:"([^"]*)"|\{`([^`]*)`\})/g)) {
         const tokens = (m[1] ?? m[2] ?? '').split(/\s+/)
@@ -265,6 +266,7 @@ describe('narrow-first layout baseline', () => {
         const near = src.slice(Math.max(0, m.index! - NEAR), m.index! + m[0].length + NEAR)
         if (!near.includes(CONTENT_WIDTH_VAR)) continue
         const px = tokens.find((t) => /^px-\d+(?:\.\d+)?$/.test(t))
+        if (px) matchedWrappers.push(file.slice(SRC.length + 1))
         if (px && px !== `px-${gutter![1]}`) {
           offenders.push(`${file.slice(SRC.length + 1)}: ${px}`)
         }
@@ -276,6 +278,16 @@ describe('narrow-first layout baseline', () => {
         + `${CONTENT_WIDTH_VAR}) but do not carry its gutter (px-${gutter![1]}), so they `
         + `render a second left edge inside one column`,
     ).toEqual([])
+    // The proximity scan is intentionally structural rather than a named-file
+    // allowlist, but that means a refactor can move the width declaration beyond
+    // NEAR (or into CSS) and silently make a wrapper disappear. Pin the measured
+    // floor so coverage shrinkage is an explicit review decision rather than a
+    // green test that now checks fewer surfaces.
+    expect(
+      matchedWrappers.length,
+      `the ${CONTENT_WIDTH_VAR} proximity scan covered fewer chat-column wrappers; `
+        + `inspect the moved wrappers before lowering this floor`,
+    ).toBeGreaterThanOrEqual(16)
   })
 
   it('lands the top bar glyphs on the page gutter, derived not hand-typed', async () => {
@@ -297,14 +309,26 @@ describe('narrow-first layout baseline', () => {
     // from the art's, so a square box is what makes the ink fill it and start at the
     // box's own left edge -- i.e. what makes the sum below the whole story. A `w-5 h-6`
     // slip would centre the art inside the taller box and inset the ink silently, so
-    // the two edges are pinned EQUAL rather than pinned to a literal.
-    const mark = app.match(/<img src=\{avatar\}[^\n]*className="w-(\d+(?:\.\d+)?) h-(\d+(?:\.\d+)?) rounded-md/)
+    // the two edges are pinned EQUAL rather than pinned to a literal. The img lives in
+    // MobileNavGlyph and its className is a template literal (a visibility class is
+    // appended after the load-proof swap), so the match runs to the backtick.
+    const mark = app.match(/<img src=\{avatar\}[^\n]*className=\{?[`"]w-(\d+(?:\.\d+)?) h-(\d+(?:\.\d+)?) rounded-md/)
     expect(mark, 'the nav button should render the branding avatar as the mark').toBeTruthy()
     expect(
       mark![1],
       `the mark's box is w-${mark![1]} h-${mark![2]}: a non-square box letterboxes the `
         + `square logo and insets its ink from the gutter`,
     ).toBe(mark![2])
+
+    // The hamburger fallback (shown until the logo's own load event, and after an
+    // error) must occupy the SAME box, or the swap would shift the button's tap
+    // target and pull the glyph off the gutter line the sum below derives.
+    const fallback = app.match(/data-testid="mobile-nav-fallback" className="w-(\d+(?:\.\d+)?) h-(\d+(?:\.\d+)?) /)
+    expect(fallback, 'the nav button should keep a fallback glyph in the same box').toBeTruthy()
+    expect(
+      [fallback![1], fallback![2]],
+      'the fallback hamburger box must match the logo box, or the swap moves the tap target',
+    ).toEqual([mark![1], mark![2]])
 
     const ui = await readFile(join(SRC, 'components', 'ui.tsx'), 'utf8')
     const gutter = ui.match(/px-(\d+(?:\.\d+)?) md:px-\d+(?:\.\d+)? pt-2 pb-3/)

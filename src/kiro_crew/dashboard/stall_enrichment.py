@@ -29,6 +29,8 @@ Captured per enrichment:
 * an explicit UTC **stall timestamp** and the observed heartbeat silence —
   the crash-dump filename carries boot time, so the log line is what
   records the real stall time;
+* the bounded Python stack currently executing on the event-loop thread, so a
+  recovered stall retains the causal evidence otherwise available only at exit;
 * every ESTABLISHED non-loopback TCP connection owned by this process,
   with local/remote endpoints and the kernel ``tx_queue``/``rx_queue``
   byte counts (a large ``rx_queue`` at stall time is direct evidence of an
@@ -49,7 +51,9 @@ import ipaddress
 import os
 import struct
 import sys
+import threading
 import time
+import traceback
 from pathlib import Path
 
 from kiro_crew.acp.liveness import socket_inodes
@@ -58,6 +62,30 @@ __all__ = ["collect_stall_enrichment"]
 
 # /proc/net/tcp{,6} socket-state code for ESTABLISHED.
 _TCP_ESTABLISHED = "01"
+_EVENT_LOOP_STACK_LIMIT = 20
+
+
+def _event_loop_stack_lines(frames: dict[int, object] | None = None) -> list[str]:
+    """Render the running event-loop stack without inspecting frame locals."""
+    thread_id = threading.main_thread().ident
+    if thread_id is None:
+        return ["(event-loop stack unavailable: main thread has no identifier)"]
+    current_frames = sys._current_frames() if frames is None else frames
+    frame = current_frames.get(thread_id)
+    if frame is None:
+        return ["(event-loop stack unavailable: no main-thread frame)"]
+    try:
+        extracted = traceback.extract_stack(frame, limit=_EVENT_LOOP_STACK_LIMIT)
+    except Exception as exc:  # noqa: BLE001 — enrichment must never hurt the watchdog
+        return [f"(event-loop stack capture failed: {exc!r})"]
+    if not extracted:
+        return ["(event-loop stack unavailable: empty main-thread stack)"]
+    lines = ["EVENT LOOP STACK (outermost -> innermost):"]
+    for item in extracted:
+        path = Path(item.filename)
+        short_path = "/".join(path.parts[-2:]) or item.filename
+        lines.append(f"  {item.name} ({short_path}:{item.lineno})")
+    return lines
 
 
 def _decode_proc_addr(hex_addr: str, hex_port: str) -> tuple[str, int]:
@@ -116,6 +144,10 @@ def collect_stall_enrichment(silence_secs: float) -> list[str]:
         "captured by watchdog daemon thread before dump-then-exit ==="
     )
     lines = [header]
+    try:
+        lines.extend(_event_loop_stack_lines())
+    except Exception as exc:  # noqa: BLE001 — a frame can disappear mid-capture
+        lines.append(f"(event-loop stack capture failed: {exc!r})")
     if not sys.platform.startswith("linux"):
         lines.append("(socket capture unavailable: non-Linux platform)")
         return lines

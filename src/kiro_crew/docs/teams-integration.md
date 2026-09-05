@@ -38,14 +38,20 @@ Framework **pushes** activities to a messaging endpoint you host. Kiro Crew:
 
   The gateway itself speaks HTTP, so something must terminate TLS in front of it;
   Teams will not deliver to a non-HTTPS endpoint.
-- The Teams extra installed (for inbound JWT validation):
+- The JWT dependency installed (for inbound token validation), in the
+  environment that runs the gateway:
 
   ```bash
-  pip install "kirocrew[teams]"
+  pip install "PyJWT[crypto]==2.13.0"
   ```
 
-  If the channel is enabled without this extra, Kiro Crew logs an actionable
-  error and skips Teams (the rest of the gateway still starts).
+  This is the whole of the `teams` extra. Installing the dependency directly is
+  the form that works on every layout: Kiro Crew is not published on PyPI, so
+  `pip install "kirocrew[teams]"` cannot resolve, and the direct-URL form below
+  reinstalls Kiro Crew itself rather than just adding the dependency.
+
+  If the channel is enabled without it, Kiro Crew logs an actionable error and
+  skips Teams (the rest of the gateway still starts).
 
  > [!NOTE]
  > The error `invalid-egg-fragment` occurs because modern `pip` (v22+) deprecated and removed support for using `#egg=package_name[extra]` in direct Git URLs.
@@ -122,8 +128,12 @@ Then enable the channel and add your allow-list in `~/.kiro/crew/config.json`:
 - **`app_password` is env-only.** It is read from `MICROSOFT_APP_PASSWORD`
   (env or `.env`) and is deliberately **not** loaded from `config.json`, which the
   agent can read — putting it there has no effect and the channel will not start.
-- `soft_threshold_pct` / `hard_threshold_pct` — context-window nudges
-  (defaults 80 / 95), same as the other channels.
+- `soft_threshold_pct` / `hard_threshold_pct` — context-window nudges (defaults `80` / `95`), same as the other channels.
+- `session_folder` — optional dashboard sidebar folder for Teams conversations (default `""`, which leaves them unfiled).
+
+Defaults: `enabled` is `false`; `app_id` and `tenant_id` are `""`; `allowed_emails` is `[]`; and `app_password` is `""` until `MICROSOFT_APP_PASSWORD` supplies it. `app_password` remains env-only even though the in-memory config field has that default.
+
+Transport capabilities: streaming and reactions are disabled; editing, inbound and outbound files, rich blocks, and proactive sends are enabled; threads are disabled. Text chunks are capped at 16,000 characters and interactive prompts at five buttons.
 
 ## 3. Package the Teams app and start a chat
 

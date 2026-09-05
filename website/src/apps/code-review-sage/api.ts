@@ -6,7 +6,10 @@
 import type {
   AddRepoResponse,
   ChatState,
-  ConsolidateResponse,
+  ConsolidationPreviewApplyResponse,
+  ConsolidationPreviewDetailResponse,
+  ConsolidationPreviewListResponse,
+  ConsolidationPreviewRequest,
   FollowupStart,
   LearningsResponse,
   NamespacesResponse,
@@ -75,8 +78,9 @@ export const sageApi = {
   /** Stored history for one reviewed change, plus whether a follow-up session
    *  would restore the reviewer's own context. */
   chatState: (runId: string, changeId: string): Promise<ChatState> =>
-    getJSON(`/chat?run_id=${encodeURIComponent(runId)}`
-      + `&change_id=${encodeURIComponent(changeId)}`),
+    getJSON(
+      `/chat?run_id=${encodeURIComponent(runId)}` + `&change_id=${encodeURIComponent(changeId)}`,
+    ),
 
   /** Arm the resume and get what the chat slot needs. Rejects with a
    *  `SageApiError` whose `code` is `followup_not_recorded` /
@@ -87,8 +91,7 @@ export const sageApi = {
   // --- Runs (threads) ---
   runs: (): Promise<RunsResponse> => getJSON('/runs'),
 
-  run: (runId: string): Promise<{ run: Run }> =>
-    getJSON(`/runs/${encodeURIComponent(runId)}`),
+  run: (runId: string): Promise<{ run: Run }> => getJSON(`/runs/${encodeURIComponent(runId)}`),
 
   /** The run's Focus Report as data — this is what renders INLINE, so no part of
    * viewing a report goes through the artifact store. */
@@ -103,14 +106,27 @@ export const sageApi = {
 
   /** Publish a finished run's findings to its pull request. Never automatic —
    *  reviews are read in the app unless the user asks for them to be posted. */
-  postComments: (runId: string, select?: { changeId: string; keys?: string[] }): Promise<{
-    ok: boolean; run_id: string; posting: boolean; pending: number
-  }> => sendJSON(`/runs/${encodeURIComponent(runId)}/post`, 'POST',
-    // `keys` omitted means every comment still pending for this change; the
-    // backend filters by change_id and treats a null key list as "all".
-    select
-      ? { change_id: select.changeId, ...(select.keys ? { keys: select.keys } : {}) }
-      : {}),
+  postComments: (
+    runId: string,
+    select?: { changeId: string; keys?: string[] },
+  ): Promise<{
+    ok: boolean
+    run_id: string
+    posting: boolean
+    pending: number
+  }> =>
+    sendJSON(
+      `/runs/${encodeURIComponent(runId)}/post`,
+      'POST',
+      // `keys` omitted means every comment still pending for this change; the
+      // backend filters by change_id and treats a null key list as "all".
+      select
+        ? {
+            change_id: select.changeId,
+            ...(select.keys ? { keys: select.keys } : {}),
+          }
+        : {},
+    ),
 
   /** Post a selection spanning several changes as ONE request.
    *
@@ -123,10 +139,16 @@ export const sageApi = {
   postCommentGroups: (
     runId: string,
     groups: { changeId: string; keys?: string[] }[],
-  ): Promise<{ ok: boolean; run_id: string; posting: boolean; pending: number }> =>
+  ): Promise<{
+    ok: boolean
+    run_id: string
+    posting: boolean
+    pending: number
+  }> =>
     sendJSON(`/runs/${encodeURIComponent(runId)}/post`, 'POST', {
-      groups: groups.map(g => ({
-        change_id: g.changeId, ...(g.keys ? { keys: g.keys } : {}),
+      groups: groups.map((g) => ({
+        change_id: g.changeId,
+        ...(g.keys ? { keys: g.keys } : {}),
       })),
     }),
 
@@ -145,8 +167,14 @@ export const sageApi = {
   reviewRepo: (
     repo: string,
     force = false,
-  ): Promise<{ run_id?: string; repo: string; changes: string[]; skipped: number; status: string; message?: string }> =>
-    sendJSON('/review-repo', 'POST', { repo, force }),
+  ): Promise<{
+    run_id?: string
+    repo: string
+    changes: string[]
+    skipped: number
+    status: string
+    message?: string
+  }> => sendJSON('/review-repo', 'POST', { repo, force }),
 
   // --- Repo + PR discovery ---
   recentRepos: (days?: number): Promise<RecentReposResponse> =>
@@ -161,8 +189,7 @@ export const sageApi = {
   pinRepo: (owner: string, repo: string): Promise<{ repos: PinnedRepo[] }> =>
     sendJSON('/repos', 'POST', { owner, repo }),
 
-  pinRepoUrl: (url: string): Promise<AddRepoResponse> =>
-    sendJSON('/repos', 'POST', { repo: url }),
+  pinRepoUrl: (url: string): Promise<AddRepoResponse> => sendJSON('/repos', 'POST', { repo: url }),
 
   unpinRepo: (owner: string, repo: string): Promise<{ repos: PinnedRepo[] }> =>
     sendJSON('/repos', 'DELETE', { owner, repo }),
@@ -187,8 +214,42 @@ export const sageApi = {
   learnings: (namespace: string): Promise<LearningsResponse> =>
     getJSON(`/learnings?namespace=${encodeURIComponent(namespace)}`),
 
-  /** Merge a namespace's staged learnings into the ruleset reviews load. The
-   *  merge itself is one worker turn; this returns as soon as it is running. */
-  consolidateLearnings: (namespace: string): Promise<ConsolidateResponse> =>
-    sendJSON('/learnings/consolidate', 'POST', { namespace }),
+  archiveLearningRule: (namespace: string, recordId: string): Promise<{ ok: boolean }> =>
+    sendJSON('/learnings/rules/archive', 'POST', { namespace, record_id: recordId }),
+
+  restoreLearningRule: (namespace: string, recordId: string): Promise<{ ok: boolean }> =>
+    sendJSON('/learnings/rules/restore', 'POST', { namespace, record_id: recordId }),
+
+  /** Request a proposal for the explicit candidate snapshot. This never applies
+   * changes; the preview's dedicated confirmation endpoint owns that write. */
+  requestConsolidationPreview: (
+    namespace: string,
+    candidateIds: string[],
+  ): Promise<ConsolidationPreviewRequest> =>
+    sendJSON('/learnings/consolidate', 'POST', {
+      namespace,
+      candidate_ids: candidateIds,
+    }),
+
+  consolidationPreviews: (namespace: string): Promise<ConsolidationPreviewListResponse> =>
+    getJSON(`/learnings/consolidation-previews?namespace=${encodeURIComponent(namespace)}`),
+
+  consolidationPreview: (
+    namespace: string,
+    previewId: string,
+  ): Promise<ConsolidationPreviewDetailResponse> =>
+    getJSON(
+      `/learnings/consolidation-previews/${encodeURIComponent(previewId)}?namespace=` +
+        encodeURIComponent(namespace),
+    ),
+
+  applyConsolidationPreview: (
+    namespace: string,
+    previewId: string,
+  ): Promise<ConsolidationPreviewApplyResponse> =>
+    sendJSON('/learnings/consolidation-previews/apply', 'POST', {
+      namespace,
+      preview_id: previewId,
+      confirm: true,
+    }),
 }

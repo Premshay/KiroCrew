@@ -46,6 +46,35 @@ async def test_start_next_holds_user_while_orchestrating(tmp_path) -> None:
     assert [i["content"] for i in slot._queue] == ["user typed mid-plan"]
 
 
+@pytest.mark.asyncio
+async def test_drained_queue_ids_repeat_on_successor_status(tmp_path) -> None:
+    """A reconnect that misses ``queue_pop`` can retire the exact card on the
+    successor's first status frame, without touching later queued prompts."""
+    state, slot, client = _state_and_slot(tmp_path)
+
+    async def _empty(_message):
+        return
+        yield  # pragma: no cover - generator shape only
+
+    client.stream = _empty
+    client.stream_command = _empty
+    client.client.set_claude_autonomous_turn_handler = None
+    queue_id = slot.queue_append("run this next")
+
+    assert await _start_next_queued_turn(state, slot) is True
+    assert slot.task is not None
+    await slot.task
+
+    assert any(
+        call.args
+        == (
+            "chat_status",
+            {"slot": slot.key, "status": "Thinking…", "queue_ids": [queue_id]},
+        )
+        for call in state.broadcast_ws.call_args_list
+    )
+
+
 def _state_and_slot(tmp_path: Path):
     state = _make_state(tmp_path)
     state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
@@ -76,6 +105,31 @@ def _stream_raises(client: MagicMock, exc: BaseException) -> None:
 
 
 class TestTurnTeardownRelease:
+    @pytest.mark.asyncio
+    async def test_hung_identity_check_does_not_block_session_start(self, tmp_path, monkeypatch) -> None:
+        """A protective account check must not leave an unrelated provider thinking forever."""
+        from kiro_crew.dashboard import chat_runner
+
+        state, slot, client = _state_and_slot(tmp_path)
+
+        async def _empty(_message):
+            return
+            yield  # pragma: no cover - generator shape only
+
+        class _HungIdentityService:
+            async def identity_changed_since_sessions(self):
+                await asyncio.Event().wait()
+
+        client.stream = _empty
+        client.stream_command = _empty
+        client.client.set_claude_autonomous_turn_handler = None
+        state.kiro_prerequisite_service = _HungIdentityService()
+        monkeypatch.setattr(chat_runner, "_IDENTITY_RECONCILE_READ_TIMEOUT_SECS", 0.01)
+
+        await _run_chat(state, slot, "test message")
+
+        state.sessions.get_or_create.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_release_survives_cancellation_during_session_reset(self, tmp_path) -> None:
         """The regression: a cancelled reset must not strand the permit.

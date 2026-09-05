@@ -16,7 +16,40 @@ from __future__ import annotations
 # WebSocket live) at once. Each warm instance is a full dashboard SPA, so this
 # bounds memory/socket usage; least-recently-used instances beyond the cap are
 # lazily evicted and reconnected on demand.
-DEFAULT_WARM_SET_CAP: int = 5
+#
+# ``WARM_SET_CAP_AUTO`` (0) is the default and means "as many as are connected":
+# the cap is resolved per request from the live connected count (see
+# ``kiro_crew.instances.warm_set.resolve_warm_set_cap``), so a crew the operator
+# deliberately connected is never evicted.
+#
+# Auto is the default because eviction is INDISTINGUISHABLE FROM A DISCONNECT at
+# the pane: the iframe is unmounted, the token is re-minted and the remote SPA
+# cold-boots on the next click (surfacing the error panel outright if readiness
+# misses its timeout). A fixed cap below the connected count therefore turns
+# ordinary tab switching into an apparent connection flap, and the operator has
+# no way to attribute it -- the tunnel is up the whole time. Tracking the
+# connected count removes that class of misconfiguration rather than asking
+# anyone to keep two numbers in sync by hand.
+WARM_SET_CAP_AUTO: int = 0
+DEFAULT_WARM_SET_CAP: int = WARM_SET_CAP_AUTO
+
+# Upper bound on the AUTO-resolved warm set. Auto follows the connected count,
+# which is a statement of user intent and not a resource budget -- a fleet of 30
+# connected crews would otherwise mount 30 dashboard SPAs in one renderer.
+# Beyond this many connected crews eviction resumes, so the worst case stays
+# bounded while the common small-fleet case (the reason auto exists) never
+# evicts. An EXPLICIT integer cap is honoured verbatim and is deliberately not
+# clamped by this: an operator who names a number has made the budget decision
+# themselves, including a number larger than this.
+#
+# 8 is a judgement, not a measurement: comfortably above the 5 this default used
+# to be (so no install gets a tighter warm set than it had), and still in the
+# range a single renderer has been seen to carry. The per-pane cost that bounds
+# it is CPU and worker threads rather than heap -- each pane is a full SPA with
+# its own polling and WebSocket, and a pane the user opens a diff in spawns its
+# own highlighter worker pool (see website/src/main.tsx on why those are no
+# longer spawned eagerly).
+WARM_SET_CAP_AUTO_CEILING: int = 8
 
 # First local loopback port handed out for an SSH ``-L`` forward. The port
 # allocator increments from here, skipping ports already in use and ports the
@@ -139,6 +172,36 @@ DEFAULT_TOKEN_REFRESH_FRACTION: float = 0.8
 # the link is genuinely down and the caller returns an error rather than serving
 # an unconfirmed token. Kept tight so a tab activation never blocks perceptibly.
 DEFAULT_TOKEN_PROBE_TIMEOUT_SECS: float = 2.0
+
+# Connect timeout (secs) for one generic chat-proxy request over an already-open
+# tunnel (see SshTunnelManager.proxy_request — no SSH spawn). Connect-phase only:
+# the forward terminates on the local loopback, so a healthy tunnel accepts in
+# milliseconds and anything slower means the forward is dead, not busy.
+DEFAULT_PROXY_CONNECT_TIMEOUT_SECS: float = 10.0
+
+# Read-IDLE timeout (secs) for a chat-proxy response. Deliberately NOT a total
+# timeout: a proxied chat turn streams SSE for minutes, so any total budget
+# either kills live turns or is meaninglessly huge. Idle is the right axis —
+# the peer's SSE drain loop emits a keepalive comment every ~30s even when the
+# model is silent, so 120s of true silence means the stream is dead, and the
+# caller gets a clean error instead of a connection that never closes.
+DEFAULT_PROXY_READ_IDLE_TIMEOUT_SECS: float = 120.0
+
+# Cap (bytes) on an inbound request body forwarded through the chat proxy. A
+# chat message plus attachments metadata is a few KB; anything MB-sized headed
+# for a peer is either abuse or a bug, and the hub must not buffer unbounded
+# input on behalf of either side. Mirrors the reply-side discipline of
+# SEARCH_REPLY_MAX_BYTES: bound before buffering.
+PROXY_REQUEST_BODY_MAX_BYTES: int = 2 * 1024 * 1024
+
+# How many times the chat proxy will percent-decode a caller-supplied path
+# before refusing it. The path is decoded to a FIXED POINT so the string the
+# policy inspects is the string the peer will resolve — one decode pass is not
+# enough, because the router already consumed one and `%252e%252e` therefore
+# arrives as `%2e%2e` and reads as clean. Real paths need zero or one pass;
+# a chain deeper than this is only ever an attempt to outrun the decoder, so
+# the bound is a refusal (not a truncation) and keeps the loop finite.
+PROXY_PATH_MAX_DECODE_PASSES: int = 4
 
 # Timeout (secs) for one session-transfer request over an already-open tunnel
 # (POST the bundle to the peer's import endpoint — no SSH spawn). Far larger than

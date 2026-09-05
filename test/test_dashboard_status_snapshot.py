@@ -169,12 +169,18 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             "update_check_status",
             "update_command",
             "update_latest_version",
+            "update_latest_version_display",
             "update_channel",
+            "update_channel_move_pending",
             "update_managed_by",
             "update_commits_ahead",
             "update_commits_behind",
+            "update_can_arm",
             "update_last_checked_at",
             "update_check_interval_secs",
+            "update_required",
+            "update_min_version",
+            "version_display",
         }
 
     def test_the_shared_reader_never_flattens_a_missing_verdict(self) -> None:
@@ -186,6 +192,37 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             assert status_fields_of(updates)["update_available"] is None
             updates._update_info.update({"update_available": False})
             assert status_fields_of(updates)["update_available"] is False
+        finally:
+            updates._update_info.clear()
+            updates._update_info.update(original)
+
+    def test_version_display_folds_the_running_stamp_on_stable_only(self, monkeypatch) -> None:
+        """The About page's version chip reads ``version_display`` — the
+        RUNNING build's promoted-stamp fold. The raw ``version`` the WS frame
+        appends is NOT part of this reader and stays untouched: the SPA
+        compares it across pushes to force a reload over a gateway upgrade,
+        and folding it would collapse two RCs of the same release into one
+        string, masking the very upgrade that comparison exists to catch."""
+        from kiro_crew.dashboard.handlers import updates
+
+        original = dict(updates._update_info)
+        monkeypatch.setattr(updates, "_local_version", "0.4.0rc14")
+        try:
+            updates._update_info.clear()
+            updates._update_info.update({"channel": "stable", "latest_version": "0.5.0rc3"})
+            fields = status_fields_of(updates)
+            assert fields["version_display"] == "0.4.0"
+            # The candidate's fold rides the same rule; its raw sibling (the
+            # snooze/skip and arm key) is untouched.
+            assert fields["update_latest_version_display"] == "0.5.0"
+            assert fields["update_latest_version"] == "0.5.0rc3"
+            updates._update_info.update({"channel": "insider"})
+            fields = status_fields_of(updates)
+            assert fields["version_display"] == "0.4.0rc14"
+            assert fields["update_latest_version_display"] == "0.5.0rc3"
+            # Channel not yet resolved (no check has run): raw, never "".
+            updates._update_info.clear()
+            assert status_fields_of(updates)["version_display"] == "0.4.0rc14"
         finally:
             updates._update_info.clear()
             updates._update_info.update(original)
@@ -342,3 +379,48 @@ class TestBuildInfoResolution:
             start_time=time.time(),
         )
         assert st._build_info == ("", "")
+
+
+class TestServedBundleId:
+    """The served-bundle hash the SPA compares across status pushes.
+
+    It is what lets a tab reload over a SAME-version rebuild (a git checkout's
+    in-app update), which moves neither ``version`` nor ``commit`` — see
+    ``DashboardState.served_bundle_id``.
+    """
+
+    def test_missing_bundle_reports_empty(self, tmp_path: pathlib.Path) -> None:
+        # No built frontend (source tree, unit tests): empty means UNKNOWN to
+        # the SPA — never a change, so no reload can fire off it.
+        assert DashboardState.served_bundle_id(tmp_path / "absent.html") == ""
+
+    def test_hashes_and_caches_by_stat(self, tmp_path: pathlib.Path) -> None:
+        index = tmp_path / "index.html"
+        index.write_text("<html>build-one</html>")
+        first = DashboardState.served_bundle_id(index)
+        assert first and len(first) == 16
+        # Same stat → same id, answered from cache (idempotent read).
+        assert DashboardState.served_bundle_id(index) == first
+
+    def test_rebuild_changes_id(self, tmp_path: pathlib.Path) -> None:
+        # A rebuild rewrites index.html with new hashed asset names — in
+        # practice a different length and a later mtime. The cache key is
+        # (mtime_ns, size), so model both moving: a same-length rewrite inside
+        # one mtime tick is not a case a real `npm run build` can produce.
+        import os
+
+        index = tmp_path / "index.html"
+        index.write_text("<html>build-one</html>")
+        first = DashboardState.served_bundle_id(index)
+        index.write_text("<html>build-two, with new hashed asset names</html>")
+        st = index.stat()
+        os.utime(index, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        assert DashboardState.served_bundle_id(index) != first
+
+    def test_snapshot_carries_bundle_id(self, state: DashboardState) -> None:
+        # The field rides the shared snapshot (WS push + /api/status alike);
+        # in this test env there is a real built bundle or there is not — both
+        # shapes are legal, but the KEY must be present so the SPA can compare.
+        snap = state.status_snapshot()
+        assert "bundle_id" in snap
+        assert isinstance(snap["bundle_id"], str)

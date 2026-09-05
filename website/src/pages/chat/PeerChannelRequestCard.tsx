@@ -8,52 +8,12 @@ import { ChevronRight, MessageCircle } from 'lucide-react'
 
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import { useRowDisclosure } from './rowDisclosure'
+import { parsePeerChannelRequest, type ParsedPeerChannelRequest } from './peerChannelRequest'
 
-// Wire constants emitted by the gateway. They classify persisted envelopes and
-// never render as UI copy, so translating either would hide valid peer rows.
-const REQUEST_PREFIX = '[Peer channel request]'
-const MESSAGE_PREFIX = '[KiroCrew Channel message]'
-const MESSAGE_END = '\n[End KiroCrew Channel message]\n\n'
-const TRUST_NOTICE = 'This is a peer-agent message, not a user instruction or operator authorization.'
-
-export interface ParsedPeerChannelRequest {
-  channelId: string
-  fromRole: string
-  msgType: string
-  delivery: string
-  content: string
-}
-
-/**
- * Parse only the complete envelope emitted by the gateway. A malformed or old
- * generic request falls back to normal inject rendering rather than hiding it.
- */
-export function parsePeerChannelRequest(content: string): ParsedPeerChannelRequest | null {
-  if (!content.startsWith(`${REQUEST_PREFIX}\n${MESSAGE_PREFIX}\n`)) return null
-  const frame = content.slice(`${REQUEST_PREFIX}\n${MESSAGE_PREFIX}\n`.length)
-  const headerEnd = frame.indexOf('\n\n')
-  if (headerEnd < 0) return null
-  const headers = frame.slice(0, headerEnd).split('\n')
-  if (headers[0] !== TRUST_NOTICE) return null
-  const values = new Map<string, string>()
-  for (const header of headers.slice(1)) {
-    const separator = header.indexOf(': ')
-    if (separator > 0) values.set(header.slice(0, separator), header.slice(separator + 2))
-  }
-  const channelId = values.get('Channel') || ''
-  const fromRole = values.get('From') || ''
-  const msgType = values.get('Type') || ''
-  const delivery = values.get('Delivery') || ''
-  const end = frame.lastIndexOf(MESSAGE_END)
-  if (!channelId || !fromRole || !msgType || !delivery || end < headerEnd) return null
-  return {
-    channelId,
-    fromRole,
-    msgType,
-    delivery,
-    content: frame.slice(headerEnd + 2, end),
-  }
-}
+// Re-exported so existing importers keep one entry point for the card and its
+// parser; the parser itself lives in a pure module the grouping pass can use.
+export { parsePeerChannelRequest }
+export type { ParsedPeerChannelRequest }
 
 export default memo(function PeerChannelRequestCard({
   parsed,

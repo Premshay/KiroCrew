@@ -34,8 +34,13 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
 
+from kiro_crew import name_grant
 from kiro_crew.acp.client import AcpError, AcpProcessDied, AcpPromptBusy, AcpTimeoutError
-from kiro_crew.acp.types import STOP_REASON_CANCELLED, STOP_REASON_END_TURN
+from kiro_crew.acp.types import (
+    STOP_REASON_CANCELLED,
+    STOP_REASON_COMPACTION_FAILED,
+    STOP_REASON_END_TURN,
+)
 from kiro_crew.agent_discovery import project_agent_files, project_agent_name
 from kiro_crew.config.loader import (
     ACTIVATION_REVIEW,
@@ -59,12 +64,14 @@ from kiro_crew.dashboard.chat_utils import (
     remember_slack_options,
     run_config_write,
 )
+from kiro_crew.dashboard.state import append_and_surface
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import (
     HOOK_REPLY,
     TOOL_AUTO_APPROVE,
     TOOL_DENY,
+    event_is_spawn_run,
     safe_read_file_bytes,
     validate_file_path,
 )
@@ -74,12 +81,15 @@ from kiro_crew.llm_helpers import (
 )
 from kiro_crew.messaging import auto_title, privacy_mode
 from kiro_crew.messaging.commands import (
+    compact_unsupported_backend,
+    compact_unsupported_reply,
     cron_command_reply,
     spawn_command_reply,
     task_command_reply,
 )
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import canonical_key
+from kiro_crew.messaging.renderer import credential_redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
@@ -102,6 +112,7 @@ from kiro_crew.safety_override import (
     safety_override,
 )
 from kiro_crew.security import (
+    CREDENTIAL_REDACTION_TAGS,
     StreamRedactor,
     is_sensitive_path,
     redact,
@@ -158,13 +169,18 @@ APPROVAL_AUTO = "auto"
 APPROVAL_INTERACTIVE = "interactive"
 
 
-def _should_auto_approve_spawn(context_builder, event_title: str) -> bool:
-    """Check if a spawn_run tool call should be auto-approved."""
+def _should_auto_approve_spawn(context_builder, event) -> bool:
+    """Check if a spawn_run tool call should be auto-approved.
+
+    Takes the PERMISSION EVENT, not the title: the title is model-authored
+    (a shell command's title can be forged to ``spawn_run``), so the check
+    keys on ``event_is_spawn_run``'s canonical identity.
+    """
     return bool(
         context_builder
         and context_builder.hooks
         and context_builder.hooks.auto_approve_subagent_spawn
-        and event_title == "spawn_run"
+        and event_is_spawn_run(event)
     )
 
 
@@ -2211,6 +2227,23 @@ async def _handle_compact_command(
             )
             return
 
+        # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+        # backend that cannot serve a manual /compact treats the prompt as
+        # ordinary text and never answers, so dispatching would strand the
+        # 120s wait below. Informational, never an error.
+        unsupported = compact_unsupported_backend(provider)
+        if unsupported:
+            await slack.post_message(channel, compact_unsupported_reply(unsupported), reply_ts)
+            sel().log_tool_invocation(
+                session_key=session_key,
+                source="slack",
+                tool_name="compact",
+                tool_kind="command",
+                outcome="auto_managed_backend",
+                metadata={"backend": unsupported},
+            )
+            return
+
         _t0 = time.monotonic()
 
         # --- Phase 1: Pre-compaction UI (cosmetic — log failures, don't abort) ---
@@ -2241,9 +2274,7 @@ async def _handle_compact_command(
                 outcome = "completed"
             elif cr["type"] == "failed":
                 error = cr.get("summary", "")
-                result_text = (
-                    f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
-                )
+                result_text = f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
                 outcome = "failed"
             else:
                 result_text = "⚠️ Compaction timed out."
@@ -2523,8 +2554,13 @@ async def maybe_route_linked_thread(
     # context). The LLM's own output is redacted before display.
     _safe_text, _ = redact_exfiltration_urls(text)
     _safe_text, _ = redact_credentials(_safe_text)
-    _linked_slot.append("user", _safe_text, "msg msg-u")
-    _dashboard_state.broadcast_ws("chat_message", {"slot": _linked_slot_key, "role": "user", "content": _safe_text, "cls": "msg msg-u"})  # type: ignore[attr-defined]
+    # Nothing rendered this Slack-typed row optimistically in the dashboard, so
+    # broadcast_user=True: append delivers the ONE identity-carrying frame
+    # (the old manual frame here carried no ``meta.mid``, so a client receiving
+    # the row through a second door rendered a duplicate — #5981 family).
+    append_and_surface(
+        _dashboard_state, _linked_slot, "user", _safe_text, "msg msg-u", broadcast_user=True  # type: ignore[arg-type]
+    )
     if not _linked_slot.running:
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -3081,6 +3117,14 @@ async def handle_message(
         # mapping with it. So the asker becomes the session key outright.
         if asker_key:
             session_key = asker_key
+            # Same reason as the linked-thread reroute below: overrides are keyed
+            # BY SESSION and the hydration at entry ran for the PREVIOUS key, so
+            # without this the agent re-resolution reads a key nobody hydrated and
+            # falls through to the channel or default agent -- discarding a binding
+            # the asker's own metadata records correctly. The pinned path needs it
+            # exactly as much: `asker_key` is a different conversation, which is
+            # the whole reason it is substituted here.
+            _hydrate_thread_overrides(session_key, conversation_log)
     elif thread_owner_key and thread_owner_key != session_key:
         logger.info(
             "🔗 Slack thread %s linked to dashboard session %s — routing there",
@@ -3088,6 +3132,14 @@ async def handle_message(
             thread_owner_key,
         )
         session_key = thread_owner_key
+        # Thread overrides are keyed BY SESSION, and the hydration at entry ran
+        # for the previous key. Re-hydrate for the new owner in the same breath
+        # as the reroute -- otherwise the agent re-resolution below reads a key
+        # that was never hydrated and falls through to the channel or default
+        # agent, discarding a binding the session's own metadata records
+        # correctly. Same shape as transport_dispatch._resolve_thread_owner.
+        # The helper guards repeated I/O per session, so this is cheap.
+        _hydrate_thread_overrides(session_key, conversation_log)
 
     client: LLMProvider | None = None
     try:
@@ -3470,18 +3522,42 @@ async def handle_message(
                         is_shell=event.is_shell,
                     )
                     if tool_result.action == TOOL_AUTO_APPROVE:
-                        await client.approve_tool(event.request_id)
-                        Stats().inc_tool_auto_approved()
-                        sel().log_tool_invocation(
-                            session_key=session_key,
-                            source="slack",
-                            tool_name=event.title,
-                            tool_kind=event.tool_kind,
-                            outcome="auto_approved",
-                            request_id=event.request_id,
-                            metadata={"reason": "hook_auto_approve"},
+                        # The hook granted this by NAME (its `auto_approve_tools`
+                        # globs, or the read-only allowlist). Honour it only
+                        # while each program name in the command still resolves
+                        # to the program it appears to name; a shadowed,
+                        # agent-tree or unidentified resolution DOWNGRADES to
+                        # the remaining rungs below (spawn hook, approval mode,
+                        # trust/YOLO, the interactive buttons) — never a hard
+                        # block.
+                        _ng_refusal = await name_grant.refusal_for_event(event)
+                        if _ng_refusal is None:
+                            await client.approve_tool(event.request_id)
+                            Stats().inc_tool_auto_approved()
+                            sel().log_tool_invocation(
+                                session_key=session_key,
+                                source="slack",
+                                tool_name=event.title,
+                                tool_kind=event.tool_kind,
+                                outcome="auto_approved",
+                                request_id=event.request_id,
+                                metadata={"reason": "hook_auto_approve"},
+                            )
+                            continue
+                        logger.warning(
+                            "declining a hook auto-approve: %s; the request "
+                            "falls through to the Slack handler's normal "
+                            "approval ladder",
+                            _ng_refusal.log_text,
                         )
-                        continue
+                        name_grant.log_decline(
+                            source="slack",
+                            session_key=session_key,
+                            event=event,
+                            refusal=_ng_refusal,
+                            tier="hook_auto_approve",
+                            sel_factory=sel,
+                        )
                     if tool_result.action == TOOL_DENY:
                         await client.reject_tool(event.request_id)
                         Stats().inc_tool_denial()
@@ -3501,7 +3577,7 @@ async def handle_message(
                         continue
 
                 # auto_approve_subagent_spawn → auto-approve spawn_run tool calls
-                if _should_auto_approve_spawn(context_builder, event.title or ""):
+                if _should_auto_approve_spawn(context_builder, event):
                     await client.approve_tool(event.request_id)
                     Stats().inc_tool_auto_approved()
                     sel().log_tool_invocation(
@@ -3611,6 +3687,9 @@ async def handle_message(
                     _stop_reason
                     and _stop_reason != STOP_REASON_END_TURN
                     and _stop_reason != STOP_REASON_CANCELLED
+                    # Expected terminal state after a failed auto-compaction;
+                    # handled below with a session reset, so not "unexpected".
+                    and _stop_reason != STOP_REASON_COMPACTION_FAILED
                 ):
                     logger.warning(
                         "Unexpected stop_reason %r for %s — treating as normal completion",
@@ -3630,8 +3709,26 @@ async def handle_message(
             # the payload shape and model reflection cannot drift across surfaces.
             record_interaction_event(client, session_key, "slack")
 
-        # Check context usage — fires background compaction at configured threshold, never blocks
-        sessions.check_context_usage(session_key, client)
+        if _stop_reason == STOP_REASON_COMPACTION_FAILED:
+            # The completion was synthetic — the backend abandoned the turn
+            # after a failed auto-compaction and never sent end_turn, so it
+            # still counts the prompt as in progress. Reset now (mirrors the
+            # dashboard runner's needs_session_reset) or the NEXT message
+            # collides with "prompt already in progress" and burns the busy
+            # recovery path. No re-queue: the compaction notice already told
+            # the user. The context-usage probe is skipped — compaction just
+            # failed and the session was torn down.
+            try:
+                await sessions.reset(session_key)
+            except Exception:
+                logger.debug(
+                    "Failed to reset session %s after compaction failure",
+                    session_key,
+                    exc_info=True,
+                )
+        else:
+            # Check context usage — fires background compaction at configured threshold, never blocks
+            sessions.check_context_usage(session_key, client)
 
     except AcpTimeoutError as e:
         _had_error = True
@@ -3810,6 +3907,23 @@ async def handle_message(
                 "Redacted %d credential pattern(s) introduced by reply decorator", len(_cred_after)
             )
 
+    # Per-turn tally of redaction placeholders in the text actually SENT, so the
+    # user learns their pasteable text was rewritten. Read from the TAG in
+    # `clean_text` rather than from `cred_warnings`, which only reaches the log:
+    # on the streaming path that list is empty here because each chunk was already
+    # redacted upstream, so re-redacting `clean_text` reports nothing. Counting the
+    # artifact answers the question the user has -- "is what I am about to copy
+    # still what the assistant wrote?" -- and stays correct wherever the
+    # substitution happened (per-chunk, the StreamRedactor wire pass, the final
+    # render, or the post-decorator scan). Sum every tag the redactor can emit
+    # (`CREDENTIAL_REDACTION_TAGS`) so an encoded-credential-only reply is not
+    # missed.
+    #
+    # The thinking block (redacted separately below) adds to this SAME tally so a
+    # single warning covers the turn if either the answer or the thinking was
+    # rewritten -- one turn, one notice, never two identical warnings.
+    _cred_redactions = sum(clean_text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
+
     # ── Review mode: ephemeral draft instead of public post ──
     if channel_activation == ACTIVATION_REVIEW:
         from kiro_crew.slack.blocks import review_draft_blocks
@@ -3905,6 +4019,12 @@ async def handle_message(
         thinking_mrkdwn, cred_warnings = redact_credentials(thinking_mrkdwn)
         for w in cred_warnings:
             logger.warning("Credential redacted in thinking: %s", w)
+        # Fold thinking redactions into the SAME per-turn tally as the answer so
+        # a single warning covers the turn (see the tally comment above the
+        # review-mode branch). Count the fully redacted text before it is
+        # condensed -- condensing can truncate, which would drop a placeholder
+        # from the count even though the credential was still rewritten.
+        _cred_redactions += sum(thinking_mrkdwn.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
         thinking_block = _condense_thinking(thinking_mrkdwn)
         if thinking_ts:
             try:
@@ -3924,6 +4044,20 @@ async def handle_message(
             await slack.delete_message(channel, thinking_ts)
         except Exception:
             logger.debug("Failed to delete empty thinking placeholder", exc_info=True)
+
+    # One notice per turn, AFTER the answer (and thinking) have been posted, so it
+    # reads below the text it describes. Posted as a SEPARATE threaded message
+    # rather than folded into the answer: Slack has already committed the rich
+    # answer via stop_stream/chat_update above and the answer text must stay
+    # exactly as redacted (never relaxed, never annotated inline). Best-effort --
+    # a failed notice must not turn a delivered answer into a failed turn.
+    if _cred_redactions > 0:
+        try:
+            await slack.post_message(
+                channel, credential_redaction_notice(_cred_redactions), reply_ts
+            )
+        except Exception:
+            logger.warning("Failed to post credential redaction notice", exc_info=True)
 
     # Persist the turn BEFORE posting anything that invites an answer to it.
     # The control below carries a staleness token derived from this session's last

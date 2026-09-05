@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from kiro_crew.channel import (
@@ -87,7 +89,59 @@ class TestChannel:
         assert member.attached_session is True
         assert member.session_key == "dashboard:crew-codex"
         assert member.state == "listening"
+        assert member.is_orchestrator is True
+        assert ch.orchestrator_id == member.id
         assert ch.attach_session("dashboard:crew-codex", role="Duplicate") is None
+
+    def test_only_first_attached_session_is_coordinator(self):
+        ch, _ = self._make_channel()
+        first = ch.attach_session("dashboard:crew-codex", role="Codex")
+        second = ch.attach_session("dashboard:crew-claude", role="Claude")
+
+        assert first is not None and second is not None
+        assert ch.orchestrator_id == first.id
+        assert first.is_orchestrator is True
+        assert second.is_orchestrator is False
+
+    def test_set_coordinator_transfers_canonical_authority(self):
+        ch, events = self._make_channel()
+        first = ch.attach_session("dashboard:crew-codex", role="Codex")
+        second = ch.attach_session("dashboard:crew-claude", role="Claude")
+
+        assert first is not None and second is not None
+        assert ch.set_coordinator(second.id) is True
+        assert ch.orchestrator_id == second.id
+        assert first.is_orchestrator is False
+        assert second.is_orchestrator is True
+        assert second.listen_mode is ListenMode.ALL
+        assert events[-1] == (
+            "channel_coordinator_changed",
+            {"channel_id": ch.id, "agent_id": second.id},
+        )
+
+    def test_set_coordinator_rejects_unknown_member(self):
+        ch, _ = self._make_channel()
+        member = ch.attach_session("dashboard:crew-codex", role="Codex")
+
+        assert member is not None
+        assert ch.set_coordinator("missing") is False
+        assert ch.orchestrator_id == member.id
+
+    def test_restore_repairs_legacy_session_only_channel_without_coordinator(self):
+        ch, _ = self._make_channel()
+        first = ch.attach_session("dashboard:crew-codex", role="Codex")
+        second = ch.attach_session("dashboard:crew-claude", role="Claude")
+        assert first is not None and second is not None
+        serialized = ch.serialize()
+        serialized["orchestrator_id"] = None
+        for member in serialized["members"].values():
+            member["is_orchestrator"] = False
+
+        restored = Channel.deserialize(serialized)
+
+        assert restored.orchestrator_id == first.id
+        assert restored.members[first.id].is_orchestrator is True
+        assert restored.members[second.id].is_orchestrator is False
 
     def test_remove_agent(self):
         ch, events = self._make_channel()
@@ -364,6 +418,23 @@ class TestChannelManager:
         mgr.create("a")
         mgr.create("b")
         assert len(mgr.list_channels()) == 2
+
+    def test_load_persists_legacy_session_only_coordinator_repair(self):
+        original = Channel(id="ch1", topic="test")
+        first = original.attach_session("dashboard:crew-codex", role="Codex")
+        assert first is not None
+        data = original.serialize()
+        data["orchestrator_id"] = None
+        data["members"][first.id]["is_orchestrator"] = False
+        with open(f"{self._dir}/ch1.json", "w") as handle:
+            json.dump(data, handle)
+
+        ChannelManager(channels_dir=self._dir)
+
+        with open(f"{self._dir}/ch1.json") as handle:
+            saved = json.load(handle)
+        assert saved["orchestrator_id"] == first.id
+        assert saved["members"][first.id]["is_orchestrator"] is True
 
 
 class TestChannelAgentFailures:

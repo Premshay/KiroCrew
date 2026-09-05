@@ -34,7 +34,7 @@ _APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _APP_ROOT not in sys.path:  # allow `python3 sage_lib/pipeline.py` (run as script)
     sys.path.insert(0, _APP_ROOT)
 
-from sage_lib import adapters, blast_radius, discovery, results, store  # noqa: E402
+from sage_lib import adapters, blast_radius, discovery, learning, results, store  # noqa: E402
 
 # Identifies a pending review as OURS. The poster matches on it to delete only its
 # own stale draft (never a human's in-progress one), and the driver matches on it to
@@ -205,6 +205,28 @@ def rule_pack_for_repo(repo_identity: str, config: dict | None = None) -> str | 
     return resolve_rule_pack(pack_name)
 
 
+def source_identity_for_review_link(link: str, config: dict | None = None) -> dict[str, str] | None:
+    """Return the canonical source repository identity, if the link names one.
+
+    Legacy standalone change tokens do not name a repository. They retain their
+    historical global/legacy rule behaviour but can never match a repository binding.
+    """
+    try:
+        return adapters.source_identity_for_pr_link(link, config=config)
+    except adapters.AdapterParseError:
+        return None
+
+
+def resolve_rules_for_review_link(
+    link: str, config: dict | None = None, root: Path | None = None
+) -> dict:
+    """Freeze the explainable namespace/rule set for one review before dispatch."""
+    cfg = config if config is not None else store.load_config(root)
+    return learning.resolve_effective_rules(
+        source_identity_for_review_link(link, cfg), config=cfg, root=root
+    )
+
+
 # ---------------------------------------------------------------------------
 # Prepare a target for the Phase 1 gate (normalize + blast radius)
 # ---------------------------------------------------------------------------
@@ -217,6 +239,8 @@ def prepare_target(link: str, raw_payload: dict | str, config: dict | None = Non
     radius = blast_radius.analyze(target.files, cfg.get("sensitive_globs", []))
     return {
         "target": target.to_dict(),
+        "source_identity": source_identity_for_review_link(link, cfg),
+        "rule_resolution": resolve_rules_for_review_link(link, cfg),
         "blast_radius": radius,
         "rule_pack": rule_pack_for_repo(target.repo_identity, cfg),
         "warnings": adapters.validate_review_target(target),

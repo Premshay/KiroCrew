@@ -1,19 +1,15 @@
-"""CLI chat and TUI subcommands."""
+"""CLI chat subcommands."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import gc
 import logging
 import os
 import re
-import shutil
-import subprocess
 import sys
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 
 from kiro_crew.acp._dispatch import is_shell_kind
 from kiro_crew.acp.client import AcpError, AcpTimeoutError
@@ -23,10 +19,9 @@ from kiro_crew.config.loader import (
     ConfigReadError,
     build_provider_factory,
     config_path,
-    read_config_for_update,
-    write_config_atomically,
+    update_config_locked,
 )
-from kiro_crew.constants import BANNER, DATA_WARNING, MIN_NODE_MAJOR
+from kiro_crew.constants import BANNER, DATA_WARNING
 from kiro_crew.hooks import (
     TOOL_DENY,
     HookManager,
@@ -264,80 +259,6 @@ def _build_tool_gate(agent: str = "") -> _ToolGate:
     )
 
 
-def _tui(args: argparse.Namespace) -> None:
-    """Launch the Ink TUI, replacing the current process."""
-    cfg = KiroCrewConfig.load()
-    port = getattr(args, "port", None) or cfg.to_dict().get("dashboard", {}).get("port", 5476)
-
-    # Find TUI — prefer self-contained bundle, fall back to source tree
-    base = Path(__file__).resolve().parent.parent.parent
-    tui_js = None
-
-    # 1. Bundled (no node_modules needed) — check tui_dist/ and source tree
-    for candidate in [
-        Path(__file__).resolve().parent / "tui_dist" / "bundle.mjs",
-        base / "tui" / "dist" / "bundle.mjs",
-    ]:
-        if candidate.is_file():
-            tui_js = candidate
-            break
-
-    # 2. Walk up to workspace src tree for bundle.mjs or index.js+node_modules
-    if not tui_js:
-        p = Path(__file__).resolve()
-        for _ in range(15):
-            p = p.parent
-            bundle = p / "src" / "KiroCrew" / "tui" / "dist" / "bundle.mjs"
-            if bundle.is_file():
-                tui_js = bundle
-                break
-            idx = p / "src" / "KiroCrew" / "tui" / "dist" / "index.js"
-            if idx.is_file() and (p / "src" / "KiroCrew" / "tui" / "node_modules").is_dir():
-                tui_js = idx
-                break
-
-    if not tui_js:
-        print("TUI not built. Run: cd tui && npm install && npm run build")
-        print("  (or use: kirocrew chat  /  kirocrew gateway)")
-        sys.exit(1)
-
-    # Check node against the shared floor
-    if not shutil.which("node"):
-        print(f"Node.js not found. Install Node.js >= {MIN_NODE_MAJOR}.")
-        sys.exit(1)
-    try:
-        ret = subprocess.call(
-            [
-                "node",
-                "-e",
-                f"process.exit(Number(process.version.slice(1).split('.')[0]) < {MIN_NODE_MAJOR} ? 1 : 0)",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if ret != 0:
-            print(f"Node.js >= {MIN_NODE_MAJOR} required. Current version is too old.")
-            sys.exit(1)
-    except FileNotFoundError:
-        print("Node.js not found.")
-        sys.exit(1)
-
-    cmd = ["node", str(tui_js), "--port", str(port), "--cwd", os.getcwd()]
-    if getattr(args, "yolo", False):
-        cmd.append("--yolo")
-    if getattr(args, "session", None):
-        cmd.extend(["--session", args.session])
-    if getattr(args, "workspace", None):
-        cmd.extend(["--workspace", args.workspace])
-    if getattr(args, "agent", None):
-        cmd.extend(["--agent", args.agent])
-    home_override = getattr(args, "home", None) or os.environ.get("KIROCREW_HOME", "")
-    if home_override:
-        cmd.extend(["--home", home_override])
-
-    os.execvp("node", cmd)
-
-
 async def _chat(message: str | None, model: str | None, agent: str | None = None) -> None:
     """Run a single message or interactive chat session."""
     cfg = KiroCrewConfig.load()
@@ -500,9 +421,14 @@ def _target_path(event: LLMEvent) -> str:
     sensitive-path keystone was in fact reading two of the three, so a
     ``filePath`` target was displayed as vetted while never having been gated.
 
-    The FIRST path is shown when a call carries several. The gate denies on ANY of
-    them, so anything forbidden has already been refused before this runs; what is
-    left is a disclosure choice, and a prompt is a question rather than a manifest.
+    The FIRST path is shown when a call carries several, with a ``(+N more)``
+    count appended so the human is never told one file while consenting to a
+    batch — before the extraction became nesting-aware a multi-target batch
+    yielded nothing here, so the single-path display was honest by
+    construction; now that every nested target is collected, a bare first path
+    would under-disclose. The gate denies on ANY of them, so anything forbidden
+    has already been refused before this runs; what is left is a disclosure
+    choice, and a prompt is a question rather than a manifest.
 
     Returns ``""`` when the call carries no path, which is the ordinary case for
     a tool that acts on no file. That is deliberately NOT a refusal: most builtin
@@ -511,7 +437,11 @@ def _target_path(event: LLMEvent) -> str:
     which DO name a file.
     """
     found = target_paths(event.raw_tool_params)
-    return found[0] if found else ""
+    if not found:
+        return ""
+    if len(found) == 1:
+        return found[0]
+    return f"{found[0]} (+{len(found) - 1} more)"
 
 
 def _display_path(path: str) -> str:
@@ -1075,32 +1005,22 @@ async def _interactive(
         print()
 
 
-def _ensure_config_key(section: str, key: str, default: object) -> None:
-    """Write a default value to config.json if the key is missing.
-
-    Seeding a default is never worth destroying real settings, so an unreadable
-    config skips the write entirely rather than seeding onto ``{}``.
-    """
-    p = config_path()
-    try:
-        data = read_config_for_update(p)
-    except ConfigReadError:
-        logger.warning("Skipping config seed for %s.%s: config unreadable", section, key)
-        return
-    if key not in data.get(section, {}):
-        data.setdefault(section, {})[key] = default
-        write_config_atomically(p, data)
-
-
 def _ensure_default_agent_in_config() -> None:
-    """Ensure config.json includes a default KiroCrew agent for fresh installs."""
-    p = config_path()
-    try:
-        data = read_config_for_update(p)
-    except ConfigReadError:
-        logger.warning("Skipping default-agent seed: config unreadable")
-        return
-    if not data.get("agents"):
+    """Ensure config.json includes a default Kiro Crew agent for fresh installs.
+
+    Through :func:`update_config_locked` so the seed shares the advisory
+    ``<path>.lock`` with every other config writer. The read that decides
+    whether to seed has to happen INSIDE that lock: a dashboard or
+    ``kirocrew config set`` write landing between an outside read and this
+    write would be replaced by a document that never saw it.
+    """
+
+    def _seed(data: dict) -> dict | None:
+        if data.get("agents"):
+            # Another writer already seeded, or the operator has agents of
+            # their own: returning None skips the write entirely rather than
+            # rewriting the file with identical bytes.
+            return None
         data["agents"] = {
             "default": {
                 "kiro_agent": "kirocrew",
@@ -1109,4 +1029,14 @@ def _ensure_default_agent_in_config() -> None:
             }
         }
         data["default_agent"] = "default"
-        write_config_atomically(p, data)
+        return data
+
+    try:
+        # stamp_meta=False: this seed is a delta, and the writer it replaced
+        # stamped nothing. Adding a meta block here would make a fresh install's
+        # first chat rewrite a key this function does not own.
+        update_config_locked(config_path(), mutate=_seed, stamp_meta=False)
+    except ConfigReadError:
+        # Unchanged semantics: fail closed. Seeding over an unreadable config
+        # would drop every other setting it holds.
+        logger.warning("Skipping default-agent seed: config unreadable")

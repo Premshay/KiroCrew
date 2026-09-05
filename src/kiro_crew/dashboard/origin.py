@@ -20,6 +20,7 @@ while CLI and MCP-stdio callers can import the leaf directly and skip the
 from __future__ import annotations
 
 import logging
+import re
 
 # ``socket`` is not used directly here anymore (the hostname helpers moved to
 # ``urls``), but it is re-exported on purpose: callers and tests patch
@@ -57,6 +58,8 @@ from kiro_crew.dashboard.urls import (  # noqa: F401
 )
 
 if TYPE_CHECKING:  # aiohttp is needed for annotations only
+    from collections.abc import Iterable
+
     from aiohttp import web
 
 logger = logging.getLogger(__name__)
@@ -214,6 +217,30 @@ def request_is_unix_socket(request: web.Request) -> bool:
     return sock is not None and getattr(sock, "family", None) == _AF_UNIX
 
 
+#: Request key meaning "a layer has already recorded, or deliberately owns, the
+#: audit for this request's refusal". Read by ONE consumer — the deny-audit
+#: boundary middleware in ``server.py``, which records a raised 401/403 that
+#: nobody claimed, so a barrier written tomorrow is audited by POSITION instead
+#: of by remembering a helper call. It lives here rather than in ``server.py``
+#: because the barriers that must claim do not all live there: the two
+#: middlewares do, but the WebSocket origin refusals in ``ws.py`` /
+#: ``stt_stream.py`` / ``handlers.terminal`` are handlers, and importing
+#: ``server`` from a handler is a cycle. Same reason ``check_origin`` itself
+#: lives here.
+AUDIT_CLAIMED_KEY = "_kc_audit_claimed"
+
+
+def mark_audit_claimed(request: web.Request) -> None:
+    """Declare that this request's refusal is already audited.
+
+    Call it at a deny site that writes its OWN audit record, so the boundary
+    does not add a second, less specific one. Not calling it is the safe
+    direction: the boundary then records the refusal itself under a generic
+    reason, which is the whole point of the guarantee being positional.
+    """
+    request[AUDIT_CLAIMED_KEY] = True
+
+
 def check_origin(
     request: web.Request,
     *,
@@ -316,3 +343,55 @@ def check_host(request: web.Request) -> bool:
     allowed = build_allowed_hosts(allowed_origins)
     host = _host_without_port(raw_host).lower()
     return host in allowed
+
+
+# ---------------------------------------------------------------------------
+# Frame-ancestor origin for sandboxed documents
+# ---------------------------------------------------------------------------
+
+
+# A CSP host-source is ``scheme://host[:port]`` where host admits only letters,
+# digits and hyphens (CSP3 grammar). Ancestor origins are re-validated against this
+# before they reach a header: a value carrying a space would smuggle a second
+# source and one carrying a semicolon a whole directive. A bracketed IPv6 literal is
+# also NOT expressible — ``http://[::1]:5476`` is refused by the browser with "the
+# directive 'frame-ancestors' does not support the source expression" and the entry
+# is dropped (verified in Chrome 152) — so there is no valid spelling for an
+# IPv6-loopback ancestor and emitting one only adds console noise.
+_FRAME_ANCESTOR_ORIGIN_RE = re.compile(r"^https?://[A-Za-z0-9.\-]+(:[0-9]{1,5})?$")
+
+
+def frame_ancestors_value(extra: "Iterable[str]" = ()) -> str:
+    """The complete CSP ``frame-ancestors`` value for a framed, sandboxed response.
+
+    ``'self'`` plus the ancestors ``'self'`` cannot express. Both halves are
+    load-bearing, and each covers a case the other gets wrong:
+
+    * **``'self'`` covers the serving origin, and a server-derived origin must NOT
+      replace it.** ``'self'`` is resolved by the BROWSER against the frame's actual
+      URL, so it is correct no matter what a proxy did to the request. Deriving the
+      origin from ``Host`` instead breaks behind a TLS-terminating tunnel, which
+      rewrites ``Host`` to the loopback backend and may not forward
+      ``X-Forwarded-Proto``: the header then names ``http://localhost:<port>`` while
+      the browser is on ``https://<tunnel-host>``, no ancestor matches, and the frame
+      is refused. That regression is invisible on a direct loopback connection.
+    * **``'self'`` alone is not enough, because the directive is matched against
+      EVERY ancestor.** Kiro Crew frames at depth: the Instances embed puts a remote
+      dashboard inside the local one, so a widget sits three levels down (local
+      dashboard → embedded dashboard → widget) and its grandparent is a different
+      origin. With only ``'self'`` the browser answers "Framing '...' violates ...
+      frame-ancestors", which the user sees as a blank frame while the ``GET``
+      returns 200.
+
+    *extra* is those ancestor origins — for the dashboard, ``server.
+    _extra_frame_ancestors``, which derives the embedding parent's port from a
+    validly-signed token claim, so a local page with no token can never inject one.
+    Every entry is re-validated against :data:`_FRAME_ANCESTOR_ORIGIN_RE`, so a
+    malformed or inexpressible source cannot reach the header regardless of where
+    the caller computed it.
+    """
+    origins = ["'self'"]
+    for candidate in extra:
+        if candidate and _FRAME_ANCESTOR_ORIGIN_RE.match(candidate) and candidate not in origins:
+            origins.append(candidate)
+    return " ".join(origins)

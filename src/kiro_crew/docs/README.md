@@ -15,6 +15,7 @@ organized for someone browsing the repository.
 | [configuration.md](configuration.md) | Config file reference, environment variables, and sandbox modes. |
 | [use-cases.md](use-cases.md) | Real-world workflows. |
 | [troubleshooting.md](troubleshooting.md) | Common problems and fixes. |
+| [blocked-commands.md](blocked-commands.md) | Why a command was refused, what the agent is told to do instead, and how to check your credential setup. |
 
 ## Core capabilities
 
@@ -33,6 +34,7 @@ organized for someone browsing the repository.
 | [agent-questions.md](agent-questions.md) | Letting an agent pause mid-turn to ask a clickable question. |
 | [followup-suggestions.md](followup-suggestions.md) | Agent-proposed next steps above the composer. |
 | [feature-tips.md](feature-tips.md) | Personalized tips pointing at features you have not used. |
+| [inbound-webhooks.md](inbound-webhooks.md) | Letting external systems trigger an agent turn over HTTP. |
 | [deploy-web.md](deploy-web.md) | Publishing artifacts to a public HTTPS URL on your own AWS. |
 | [snapshot-and-restore.md](snapshot-and-restore.md) | Backing up and restoring Kiro Crew state. |
 

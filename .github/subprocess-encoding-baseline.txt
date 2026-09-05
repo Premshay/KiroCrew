@@ -20,8 +20,6 @@
 9 src/kiro_crew/apps/builtins/auto_improvement/tests/test_pr_recipe.py
 1 src/kiro_crew/apps/builtins/auto_improvement/tests/test_pr_watchers.py
 1 src/kiro_crew/apps/builtins/auto_improvement/tests/test_runner.py
-2 src/kiro_crew/apps/builtins/design_tweak/backend/server.py
-1 src/kiro_crew/apps/builtins/dev_fleet/server.py
 1 src/kiro_crew/apps/builtins/dev_fleet/skills/feature-demo-recording/references/deps.py
 3 src/kiro_crew/apps/builtins/dev_fleet/skills/feature-demo-recording/references/narrate.py
 1 src/kiro_crew/apps/builtins/dev_fleet/skills/feature-demo-recording/references/record_template.py
@@ -40,7 +38,6 @@
 2 src/kiro_crew/cli_setup.py
 1 src/kiro_crew/cloud/aws.py
 4 src/kiro_crew/cron_script.py
-1 src/kiro_crew/dashboard/handlers/core.py
 1 src/kiro_crew/dashboard/handlers/knowledge.py
 1 src/kiro_crew/dashboard/handlers/terminal.py
 1 src/kiro_crew/dashboard/handlers_system.py
@@ -65,7 +62,6 @@
 2 test/test_acp_backend_kas.py
 1 test/test_agent_home_isolation.py
 1 test/test_agent_import_hoist.py
-4 test/test_ai_review_workflows.py
 1 test/test_beacon.py
 1 test/test_bench_cli.py
 3 test/test_brand_name_gate.py
@@ -126,7 +122,6 @@
 2 test/test_source_launcher.py
 3 test/test_spawn_exec_shim.py
 2 test/test_stable_release_gate.py
-1 test/test_stt_stream.py
 1 test/test_tailnet_e2e.py
 3 test/test_windows_job_limits.py
 1 test/test_worktree_create.py

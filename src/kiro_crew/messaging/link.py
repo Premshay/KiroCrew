@@ -116,6 +116,14 @@ _TELEMETRY_LOCAL_PREFIXES: tuple[tuple[str, str], ...] = (
     ("secretary", "secretary"),
     ("side", "side"),
     ("wf-pool", "workflow_pool"),
+    ("wf-author", "workflow_author"),
+    # A workflow STAGE's own session (``wf:<run_id>:<n>``, built by
+    # ``workflows/agent_exec.py``). Listed after the two ``wf-*`` namespaces
+    # above and matched by ``_in_namespace`` on ``wf:``/``wf_`` only, so it
+    # cannot absorb them. Without it every workflow turn reads as ``other``,
+    # pooled with genuinely unrecognised key shapes — which is the one reading
+    # this label set exists to keep separate.
+    ("wf", "workflow"),
     # ``channel:`` is a namespace of its own (reply-token-bound sends), distinct
     # from the per-transport namespaces above.
     ("channel", "channel"),
@@ -125,6 +133,12 @@ _TELEMETRY_LOCAL_PREFIXES: tuple[tuple[str, str], ...] = (
 _TELEMETRY_EXACT_KEYS: dict[str, str] = {
     "_bg": "background",
     "_hb": "heartbeat",
+    # The CLI chat session's fixed key. Present so this function is a strict
+    # SUPERSET of the labels ``validation.infer_use_case`` produced: the turn
+    # histogram switched to this helper to gain the background surfaces, and
+    # losing "cli" in the trade would have renamed an existing series to
+    # "other" — a silent break dressed as a widening.
+    "cli_chat": "cli",
 }
 
 #: A bare dashboard chat-slot key (``chat-12-1785445181``). The token row store
@@ -170,6 +184,13 @@ def telemetry_channel_of(key: str | None) -> str:
             return label
     if _TELEMETRY_CHAT_SLOT_RE.match(key):
         return "dashboard"
+    # A BARE Slack thread_ts key, via the module's own predicate rather than a
+    # fourth spelling of that shape. The rest of the system already treats such a
+    # key as Slack (``canonical_key`` namespaces it), so labelling it ``other``
+    # here would have contradicted them — and Slack is a live surface, so that
+    # would have renamed a real series.
+    if is_legacy_slack_key(key):
+        return SLACK_NAMESPACE
     return "other"
 
 
@@ -237,6 +258,13 @@ UNBIND_REASON_SESSION_DESTROYED = "session_destroyed"
 # rather than its cause.
 UNBIND_REASON_ENTRY_DELETED = "entry_deleted"
 
+# ``SessionMap.prune`` collected the entry as stale: its native session file is
+# gone and the entry held nothing that had to outlive it. Distinct from
+# ``entry_deleted`` because nobody asked for this one — it is the map's own
+# garbage collection, so a binding appearing under this reason says the STALE
+# predicate let a live conversation through rather than that a caller removed it.
+UNBIND_REASON_PRUNED_STALE = "pruned_stale"
+
 #: The closed vocabulary. A reason outside this set is normalized to
 #: ``unspecified`` at the map's choke point, so it can neither fragment the audit
 #: trail nor reach the channel notice's phrasing map as a miss.
@@ -248,6 +276,7 @@ UNBIND_REASONS: frozenset[str] = frozenset(
         UNBIND_REASON_ORIGIN_REBIND,
         UNBIND_REASON_SESSION_DESTROYED,
         UNBIND_REASON_ENTRY_DELETED,
+        UNBIND_REASON_PRUNED_STALE,
     }
 )
 
@@ -355,7 +384,7 @@ def legacy_key(key: str) -> str | None:
     """Return the bare ``thread_ts`` for a ``slack:<thread>`` key, else None."""
     prefix = f"{SLACK_NAMESPACE}:"
     if key.startswith(prefix):
-        rest = key[len(prefix):]
+        rest = key[len(prefix) :]
         if is_legacy_slack_key(rest):
             return rest
     return None
