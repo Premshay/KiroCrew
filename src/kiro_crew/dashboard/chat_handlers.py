@@ -5458,8 +5458,21 @@ async def _apply_remote_pick_locked(
     except RemoteTurnError as exc:
         return web.json_response({"error": str(exc), "code": "remote_pick_failed"}, status=502)
     value = body[control]
+    agent_changed = control == "agent" and value != slot.agent
     setattr(slot, control, value)
     if control == "agent":
+        if agent_changed:
+            # The peer's agent switch clears this provider-bound state before
+            # its reset; its mirror must not retain a model the replacement
+            # agent cannot serve.
+            slot.model = ""
+            slot._model_pick_gen += 1
+            slot._fallback_candidate_idx = 0
+            slot._fallback_walked = []
+            slot._active_fallback_model = ""
+            slot._fallback_primary_model = ""
+            slot._fallback_slot_model = ""
+            slot._fallback_pick_gen = 0
         # The peer resolved this agent against ITS bindings and committed a
         # workspace for it — the same derivation the local switch does further
         # down. Mirroring what it reported keeps the header and the next turn's
@@ -5486,6 +5499,8 @@ async def _apply_remote_pick_locked(
     # can only ever disagree with itself, which is why the local model/effort/
     # workspace routes can leave it to the flush and this one cannot.
     persisted: dict[str, Any] = {control: value}
+    if agent_changed:
+        persisted["model"] = ""
     if control == "agent" and slot.workspace:
         # The mirrored workspace is as much the peer's committed state as the
         # agent is, so it goes in the same write — persisting one without the
@@ -5636,10 +5651,11 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     # slotSwitch failure-recovery relies on, with no rollback machinery to
     # race against concurrent writers (e.g. the project endpoint, which does
     # not take this lock).
-    # Two locks, in the order documented at _slot_switch_session_lock:
-    # slot._lock, then the session lock. An ExitStack because the session
-    # lock's KEY is only known after the in-lock read below, and locking on
-    # any earlier read could leave this holding the wrong session lock.
+    # Three locks, in the order documented at _slot_switch_session_lock:
+    # slot._lock, then the session lock, then _model_pick_lock. An ExitStack
+    # because the session lock's KEY is only known after the in-lock read
+    # below, and locking on any earlier read could leave this holding the
+    # wrong session lock.
     async with contextlib.AsyncExitStack() as _stack:
         await _stack.enter_async_context(slot._lock)
         # The session the switch resets — ``effective_session_key``, never
@@ -5657,6 +5673,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # a binding landed while this request waited on slot._lock (see
         # _slot_switch_session_lock).
         await _stack.enter_async_context(_slot_switch_session_lock(session_key))
+        await _stack.enter_async_context(slot._model_pick_lock)
         # App isolation on the SESSION, not just the slot (the cancel routes'
         # policy): slot ownership does not imply ownership of a linked
         # channel session, so an app caller may not switch the agent a
@@ -5685,6 +5702,15 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # otherwise deliberately not rolled back on a failing reset (see the
         # teardown_incomplete comment), so this is the ONE case that unwinds.
         prior_agent = slot.agent
+        agent_changed = agent_name != prior_agent
+        prior_model = slot.model
+        prior_model_pick_gen = slot._model_pick_gen
+        prior_fallback_candidate_idx = slot._fallback_candidate_idx
+        prior_fallback_walked = slot._fallback_walked
+        prior_active_fallback_model = slot._active_fallback_model
+        prior_fallback_primary_model = slot._fallback_primary_model
+        prior_fallback_slot_model = slot._fallback_slot_model
+        prior_fallback_pick_gen = slot._fallback_pick_gen
         # Stored verbatim — never rewritten to whatever currently answers. See
         # the same reasoning in api_chat_slot_create.
         new_workspace = slot.workspace
@@ -5728,6 +5754,24 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # concurrent same-agent dispatch would restore the old agent under a
         # turn already running the new one.
         committed_agent = slot.agent
+        committed_model: _CommitToken | None = None
+        committed_active_fallback_model: _CommitToken | None = None
+        committed_model_pick_gen: int | None = None
+        if agent_changed:
+            # Model ids and fallback recovery are tied to the provider that
+            # serves this agent. Leave no old-provider id for a replacement
+            # session to send while the reset below awaits.
+            slot.model = _CommitToken("")
+            committed_model = slot.model
+            slot._model_pick_gen += 1
+            committed_model_pick_gen = slot._model_pick_gen
+            slot._fallback_candidate_idx = 0
+            slot._fallback_walked = []
+            slot._active_fallback_model = _CommitToken("")
+            committed_active_fallback_model = slot._active_fallback_model
+            slot._fallback_primary_model = ""
+            slot._fallback_slot_model = ""
+            slot._fallback_pick_gen = 0
 
         # Resolve workspace from agent bindings. The response value is seeded
         # from the slot's CURRENT workspace, not a "default" literal: if
@@ -5813,6 +5857,20 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             """
             if slot.agent is committed_agent:
                 slot.agent = prior_agent
+            if (
+                committed_model is not None
+                and slot.model is committed_model
+                and slot._active_fallback_model is committed_active_fallback_model
+                and slot._model_pick_gen == committed_model_pick_gen
+            ):
+                slot.model = prior_model
+                slot._model_pick_gen = prior_model_pick_gen
+                slot._fallback_candidate_idx = prior_fallback_candidate_idx
+                slot._fallback_walked = prior_fallback_walked
+                slot._active_fallback_model = prior_active_fallback_model
+                slot._fallback_primary_model = prior_fallback_primary_model
+                slot._fallback_slot_model = prior_fallback_slot_model
+                slot._fallback_pick_gen = prior_fallback_pick_gen
             if committed_workspace is not None and slot.workspace is committed_workspace:
                 slot.workspace = pre_await_workspace
             if committed_project is not None and slot.project is committed_project:
@@ -5957,7 +6015,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 await asyncio.to_thread(
                     state.conversation_log.update_metadata,
                     _history_key_for(name),
-                    {"agent": agent_name},
+                    {"agent": agent_name, "model": str(slot.model)},
                 )
             except Exception:
                 logger.warning("Failed to persist agent for slot %s", name, exc_info=True)
@@ -5980,7 +6038,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     await asyncio.to_thread(
                         state.conversation_log.update_metadata,
                         _history_key_for(name),
-                        {"agent": str(slot.agent)},
+                        {"agent": str(slot.agent), "model": str(slot.model)},
                     )
                 except Exception:
                     logger.warning(
