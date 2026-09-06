@@ -310,6 +310,10 @@ still winning after a config edit), `test/test_collection_status_endpoint.py`
 presence without the endpoint string),
 `test/metrics/test_schema.py` (redaction / namespace).
 
+The singleton `_consolidate` session maps to the bounded `consolidation` source
+label through `messaging.link`'s exact-key table. Similarly prefixed keys such as
+`_consolidateXYZ` and `_consolidate:123` remain `other`; this key is not a namespace.
+
 ### Resource attributes: what identifies a series (and what egresses)
 
 The SDK `Resource` is the payload contract for both sinks: it labels every
