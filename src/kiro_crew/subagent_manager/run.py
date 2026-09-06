@@ -1097,6 +1097,7 @@ class RunEventCoordinator(ManagerComponent):
         # leaves TurnUsage.duration_ms at 0, so the row needs this.
         # Includes transient-retry backoff, which is real wall time the caller
         # waited for this turn.
+        info._first_stream_started = time.time()
         _turn_t0 = time.monotonic()
         async for event in _stream_with_transient_retry():
             # Refresh the activity clock for every event kind that BELONGS to

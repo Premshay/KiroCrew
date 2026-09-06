@@ -67,6 +67,13 @@ def test_stalled_false_when_runtime_launched():
     assert mgr._is_startup_stalled(info, now) is False
 
 
+def test_stalled_false_after_first_provider_stream_begins():
+    mgr = _make_manager(startup_timeout=120)
+    now = 1_000.0
+    info = _info(_exec_started=now - 600, _first_stream_started=now - 590, _pid=None, turns=0)
+    assert mgr._is_startup_stalled(info, now) is False
+
+
 def test_stalled_false_when_a_turn_was_produced():
     mgr = _make_manager(startup_timeout=120)
     now = 1_000.0
