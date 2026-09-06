@@ -4263,6 +4263,39 @@ class TestConsolidateSession:
             mock_consolidate.assert_called_once_with("dashboard:chat-ok", include_history=True)
 
     @pytest.mark.asyncio
+    async def test_consolidate_now_coalesces_concurrent_calls(self, tmp_path):
+        """Concurrent direct calls share one consolidation task and result."""
+        from kiro_crew.memory import MemoryStore
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        key = "dashboard:chat-coalesce"
+        conv_log.append(key, "user", "hello world")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_consolidate(*_args, **_kwargs):
+            started.set()
+            await release.wait()
+            return None
+
+        with patch.object(consolidator, "_consolidate", side_effect=fake_consolidate) as mock_consolidate:
+            first = asyncio.create_task(consolidator.consolidate_now(key))
+            await started.wait()
+            second = asyncio.create_task(consolidator.consolidate_now(key))
+            await asyncio.sleep(0)
+            mock_consolidate.assert_awaited_once_with(key, include_history=True)
+
+            release.set()
+            assert await asyncio.gather(first, second) == [True, True]
+
+        assert key not in consolidator._direct_tasks
+        assert key not in consolidator._running
+
+    @pytest.mark.asyncio
     async def test_consolidate_now_skips_empty(self, tmp_path):
         """consolidate_now does nothing for sessions with no unconsolidated messages."""
         from kiro_crew.memory import MemoryStore

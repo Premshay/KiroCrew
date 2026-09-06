@@ -382,6 +382,7 @@ class HistoryConsolidator:
         self._last_lifecycle: float = 0.0
         self._running: set[str] = set()
         self._tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        self._direct_tasks: dict[str, asyncio.Task[bool]] = {}
         # Track last activity per session for idle-based history consolidation
         self._last_activity: dict[str, float] = {}
         self._history_consolidated: dict[str, float] = {}  # key → last history consolidation time
@@ -669,7 +670,8 @@ class HistoryConsolidator:
         """Consolidate a session synchronously (blocking).
 
         Unlike consolidate_session() which is fire-and-forget, this awaits
-        completion. Used by the CLI command.
+        completion. Concurrent calls for the same session await one shared
+        task. Used by the CLI command.
 
         Returns ``False`` when the consolidation retry backoff refused the
         span — so the CLI can report the skip instead of a false success —
@@ -680,14 +682,36 @@ class HistoryConsolidator:
         checked inside _consolidate(), and _run_skill_detection() re-checks
         the sensitive-session guard over its own window.
         """
+        task = self._direct_tasks.get(key)
+        if task is not None:
+            return await asyncio.shield(task)
+
+        task = asyncio.create_task(self._consolidate_direct(key))
+        self._direct_tasks[key] = task
+
+        def _on_done(fut: asyncio.Task[bool], k: str = key) -> None:
+            if self._direct_tasks.get(k) is fut:
+                self._direct_tasks.pop(k, None)
+
+        task.add_done_callback(_on_done)
+        return await asyncio.shield(task)
+
+    async def _consolidate_direct(self, key: str) -> bool:
+        """Run one direct consolidation after any automatic pass finishes."""
+        while key in self._running:
+            await asyncio.sleep(0.05)
         if self._log.unconsolidated_count(key) < 1:
             return True
         messages = self._log._read_messages(key)
         if _session_touched_sensitive(messages):
             self._logger.info("consolidate_now skipped for %s: sensitive session", key)
             return True
-        outcome = await self._consolidate(key, include_history=True)
-        return outcome is not _CONSOLIDATION_REFUSED
+        self._running.add(key)
+        try:
+            outcome = await self._consolidate(key, include_history=True)
+            return outcome is not _CONSOLIDATION_REFUSED
+        finally:
+            self._running.discard(key)
 
     async def _consolidate(
         self, key: str, include_history: bool = True
