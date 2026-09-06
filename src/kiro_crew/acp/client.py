@@ -4177,6 +4177,9 @@ class AcpClient:
             model_id = model_registry.resolve_wire_model_id(
                 model_id, self._model_registry_namespace
             )
+        # An advisory belongs to the request that emitted it.  A clean explicit
+        # switch must not inherit the served-model attribution from startup.
+        self._last_substitution_model = None
         if self.backend in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION:
             model_id = await self._push_model_config_option(model_id, strict=True)
         else:
@@ -4185,7 +4188,7 @@ class AcpClient:
                 {"sessionId": self._session_id, "modelId": model_id},
             )
         self._model = model_id
-        self._resolved_model_id = model_id
+        self._resolved_model_id = self._last_substitution_model or model_id
         if self._seeds_local_settings:
             # Re-seed the per-session settings file: a pooled runtime seeded it at
             # spawn with the POOL DEFAULT model + its allowlist, and the spawn-only
@@ -4493,6 +4496,9 @@ class AcpClient:
                 METHOD_SET_MODEL,
                 {"sessionId": self._session_id, "modelId": self._model},
             )
+        # session/new reports the backend default before an explicit override.
+        # A config-option advisory may have substituted the served model.
+        self._resolved_model_id = self._last_substitution_model or self._model
         logger.info("ACP model: %s", self._model)
 
     async def _reseed_after_capture(self) -> None:
