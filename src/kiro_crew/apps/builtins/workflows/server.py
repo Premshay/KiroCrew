@@ -31,7 +31,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from kiro_crew.apps.proxy_auth import verify_proxy_request
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.platform import boot_platform, redact_via_context
 from kiro_crew.workflows.runner import WorkflowRunner
 from kiro_crew.workflows.validate import validate
 
@@ -48,9 +49,7 @@ def _redact_obj(obj: Any) -> Any:
     ``_send`` so every response surface is covered.
     """
     if isinstance(obj, str):
-        s, _ = redact_exfiltration_urls(obj)
-        s, _ = redact_credentials(s)
-        return s
+        return redact_via_context(obj)
     if isinstance(obj, list):
         return [_redact_obj(x) for x in obj]
     if isinstance(obj, dict):
@@ -226,6 +225,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    # This backend is a separate process, so it must compose the platform before
+    # serving any workflow output or reaching a platform-aware security control.
+    boot_platform(KiroCrewConfig.load())
     logging.basicConfig(level=logging.INFO)
     server = ThreadingHTTPServer(("127.0.0.1", PORT), _Handler)
     logger.info("workflows app backend on 127.0.0.1:%d", PORT)
