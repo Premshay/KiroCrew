@@ -658,6 +658,12 @@ cron/heartbeat/lesson extraction) to extract:
 - `preferences_update` → overwrites `preferences.md` if changed
 - `projects_update` → overwrites `projects.md` if changed
 
+Each history pass receives at most 64 KiB of rendered transcript as a
+message-aligned prefix. On success, only that prefix advances
+`last_consolidated`; the remaining tail is left for a later pass. A single
+message larger than the window is not truncated or marked consolidated, because
+that would silently discard its unprocessed remainder.
+
 The two `*_update` values replace the whole file, so each is gated by
 `_is_plausible_memory_file()` before writing: a value that does not start with
 the file's mandated markdown header (`# User Preferences` / `# Active

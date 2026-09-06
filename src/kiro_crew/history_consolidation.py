@@ -52,6 +52,10 @@ _CONSOLIDATION_THRESHOLD = 30
 _CONSOLIDATION_MAX_ATTEMPTS = 5
 _CONSOLIDATION_BACKOFF_BASE_SECS = 900.0
 _CONSOLIDATION_BACKOFF_MAX_SECS = 86400.0
+# The consolidator cannot know a provider's tokenizer or hidden system prompt.
+# This conservative character window leaves room for provider-supplied context
+# while preserving message boundaries.
+_CONSOLIDATION_CHUNK_MAX_CHARS = 64 * 1024
 _SKILL_DETECTION_WINDOW = 200
 
 _CONSOLIDATION_META_KEYS: frozenset[str] = frozenset(
@@ -94,6 +98,21 @@ def _fmt_message(message: dict) -> str:
         f"[{message.get('ts', '?')[:16]}] {message['role'].upper()}"
         f"{tools}: {message['content']}"
     )
+
+
+def _consolidation_chunk(messages: list[dict]) -> list[dict]:
+    """Return the longest message-aligned prefix that fits one consolidation pass."""
+    chunk: list[dict] = []
+    size = 0
+    for message in messages:
+        rendered_size = len(_fmt_message(message))
+        if not chunk and rendered_size > _CONSOLIDATION_CHUNK_MAX_CHARS:
+            return []
+        if chunk and size + rendered_size > _CONSOLIDATION_CHUNK_MAX_CHARS:
+            break
+        chunk.append(message)
+        size += rendered_size
+    return chunk
 
 
 _PLACEHOLDER_BODIES = frozenset(
@@ -759,6 +778,15 @@ class HistoryConsolidator:
                 generation=generation_at_snapshot,
                 offset=total - len(unconsolidated),
             )
+            if include_history:
+                chunk = _consolidation_chunk(unconsolidated)
+                if not chunk:
+                    await self._note_environment_failure(
+                        key, "one transcript message exceeds the automatic consolidation window"
+                    )
+                    return None
+            else:
+                chunk = unconsolidated
 
             # Resolve workspace-scoped memory from session metadata
             meta = self._log.get_metadata(key)
@@ -770,7 +798,7 @@ class HistoryConsolidator:
             else:
                 memory = self._memory
 
-            conversation = "\n".join(_fmt_message(m) for m in unconsolidated)
+            conversation = "\n".join(_fmt_message(m) for m in chunk)
 
             current_prefs = memory.read_preferences()
             current_projects = memory.read_projects()
@@ -933,7 +961,7 @@ class HistoryConsolidator:
                 # asyncio.create_task). Running it inline would let cross-process
                 # lock contention stall the whole gateway loop.
                 await run_in_embed_pool(memory.append_history, entry)
-                self._logger.info("Consolidated %d messages for %s", len(unconsolidated), key)
+                self._logger.info("Consolidated %d messages for %s", len(chunk), key)
 
             # Structured memory writes (Phase 2/3). Offloaded to a worker thread:
             # _write_structured_memory embeds each item via a blocking urllib call
@@ -1043,7 +1071,7 @@ class HistoryConsolidator:
                 await asyncio.to_thread(
                     self._log.mark_consolidated,
                     key,
-                    total,
+                    attempted.offset + len(chunk),
                     generation_at_snapshot,
                 )
 

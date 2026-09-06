@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from windows_sim import builtin_open_sharing_violation
 
-from kiro_crew import history, history_search
+from kiro_crew import history, history_consolidation, history_search
 from kiro_crew.history import (
     _CONSOLIDATION_THRESHOLD,
     _METADATA_CACHE_MAX,
@@ -2759,6 +2759,45 @@ class TestConsolidationOffset:
 
         asyncio.run(run())
         assert c._prefs_offset["k"] == _CONSOLIDATION_THRESHOLD
+
+
+class TestConsolidationChunks:
+    def test_refuses_to_truncate_an_oversized_first_message(self):
+        message = {
+            "role": "user",
+            "content": "x" * history_consolidation._CONSOLIDATION_CHUNK_MAX_CHARS,
+        }
+
+        assert history_consolidation._consolidation_chunk([message]) == []
+
+    @pytest.mark.asyncio
+    async def test_marks_only_the_message_aligned_prefix(self):
+        cap = history_consolidation._CONSOLIDATION_CHUNK_MAX_CHARS
+        first = {"role": "user", "content": "first " + "x" * (cap // 3)}
+        second = {"role": "assistant", "content": "second " + "y" * (cap // 3)}
+        tail = {"role": "user", "content": "tail " + "z" * (cap // 2)}
+        log = MagicMock()
+        log.snapshot_for_consolidation.return_value = ([first, second, tail], 10, 7)
+        log.consolidation_retry_state.return_value = (0, 0.0)
+        log.get_metadata.return_value = {}
+
+        memory = MagicMock()
+        memory.read_preferences.return_value = ""
+        memory.read_projects.return_value = ""
+        consolidator = HistoryConsolidator(log=log, memory=memory, sessions=None)
+        prompts: list[str] = []
+
+        async def fake_llm(prompt: str) -> dict:
+            prompts.append(prompt)
+            return {"history_entry": "First two messages were consolidated."}
+
+        with patch.object(consolidator, "_call_llm", side_effect=fake_llm):
+            await consolidator._consolidate("k", include_history=True)
+
+        assert first["content"] in prompts[0]
+        assert second["content"] in prompts[0]
+        assert tail["content"] not in prompts[0]
+        log.mark_consolidated.assert_called_once_with("k", 9, 7)
 
 
 class TestConsolidationDoesNotBlockLoop:
