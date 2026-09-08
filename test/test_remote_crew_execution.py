@@ -1279,6 +1279,7 @@ class TestRemotePickApplication:
         written = state.conversation_log.update_metadata.call_args.args[1]
         assert written == {"agent": "reviewer", "model": "", "workspace": "peer-ws"}
 
+    @pytest.mark.asyncio
     async def test_an_agent_change_clears_and_persists_provider_bound_state(
         self, tmp_path, monkeypatch
     ):
@@ -1320,6 +1321,7 @@ class TestRemotePickApplication:
             "workspace": "peer-ws",
         }
 
+    @pytest.mark.asyncio
     async def test_a_same_agent_pick_keeps_provider_bound_state(self, tmp_path, monkeypatch):
         """An affirmed agent does not reset its current model or fallback recovery."""
         from kiro_crew.dashboard.chat_handlers import _apply_remote_pick
