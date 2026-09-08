@@ -58,6 +58,8 @@ const isTool = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
   !isSpawnRunItem(it) && !isMcpAppItem(it, appToolCallIds) && !isDiffCardItem(it)
 const isHiddenTool = (it: TurnItem) => it.kind === 'single' && it.msg.role === 'tool' && !it.msg.content.startsWith('🔧')
 const isConclusion = (it: TurnItem) => it.kind === 'single' && (it.msg.role === 'assistant' || it.msg.role === 'streaming' || it.msg.role === 'file')
+const isAssistantReply = (it: TurnItem) =>
+  it.kind === 'single' && (it.msg.role === 'assistant' || it.msg.role === 'streaming')
 /**
  * "Always visible" items — must render inline regardless of TurnBlock collapse state.
  * mcp_oauth: user must always see the Authorize button to act on it.
@@ -119,7 +121,7 @@ const isCrewReply = (it: TurnItem) =>
   // fallback for rows written before the marker moved, and for the live frame.
   (it.msg.meta?.crew_reply === true || /(^|\s)crew-reply(\s|$)/.test(it.msg.cls || ''))
 
-/** A renderable assistant message (widget/image), a mid-turn hand-back
+/** A renderable message (widget/image), a mid-turn hand-back
  *  ([OPTIONS:] marker), a crew-mode answer, a role that must surface inline
  *  (mcp_oauth, error), a workflow_run / spawn_run / workflow-completion /
  *  sub-agent-completion card, or an MCP App-bearing tool call (interactive
@@ -149,11 +151,16 @@ type Seg =
  * `idx` is the item's index in the caller's list, offset by `offset` when the
  * caller passes a slice.
  */
-function splitSegments(items: TurnItem[], appToolCallIds: ReadonlySet<string>, offset = 0): Seg[] {
+function splitSegments(
+  items: TurnItem[],
+  appToolCallIds: ReadonlySet<string>,
+  offset = 0,
+  showAssistantReplies = false,
+): Seg[] {
   const segs: Seg[] = []
   for (let i = 0; i < items.length; i++) {
     const it = items[i]
-    if (isVisibleInline(it, appToolCallIds)) {
+    if ((showAssistantReplies && isAssistantReply(it)) || isVisibleInline(it, appToolCallIds)) {
       segs.push({ type: 'visible', it, idx: offset + i })
     } else {
       const last = segs[segs.length - 1]
@@ -337,7 +344,11 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
     const conclusionIdx = turn.interim ? -1 : findConclusionIdx(items)
     const beforeItems = turn.interim ? items : (conclusionIdx > 0 ? items.slice(0, conclusionIdx) : [])
     // Only the non-visible-inline pre-conclusion items are actually collapsed.
-    return beforeItems.some(it => !isVisibleInline(it, appToolCallIds) && msgIdxs(it).includes(currentMessageIdx))
+    return beforeItems.some(it =>
+      !isVisibleInline(it, appToolCallIds) &&
+      !(collapseAll && !turn.interim && isAssistantReply(it)) &&
+      msgIdxs(it).includes(currentMessageIdx),
+    )
   }, [items, term, currentMessageIdx, collapseAll, appToolCallIds, turn.interim])
   // Revealing a search match must win over the current disclosure state, and it
   // has to travel the SAME channel the host owns, or a controlled row would
@@ -382,9 +393,7 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
     )
   }
 
-  // collapseAll mode: collapse everything except the last assistant message (original behavior)
   if (collapseAll) {
-    // Find last substantive assistant message as conclusion (skip weak ones like bare OPTIONS)
     const conclusionIdx = findConclusionIdx(items)
     const conclusion = conclusionIdx >= 0 ? items[conclusionIdx] : null
     const after = conclusionIdx >= 0 ? items.slice(conclusionIdx + 1) : items
@@ -393,7 +402,7 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
     // Split pre-conclusion items into ordered segments (see splitSegments):
     // visible items render in place; collapsed runs hide behind the reasoning
     // toggle.
-    const segs = splitSegments(beforeItems, appToolCallIds)
+    const segs = splitSegments(beforeItems, appToolCallIds, 0, true)
     const stepCount = countCollapsedSteps(segs)
 
     if (!turn.complete || stepCount === 0) {
