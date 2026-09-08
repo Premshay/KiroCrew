@@ -182,7 +182,7 @@ describe('TurnBlock — renderable content stays visible in collapseAll mode', (
     expect(imgItem?.closest('[style*="overflow"]')).toBeNull()
   })
 
-  it('plain prose between tool calls still collapses (no regression)', () => {
+  it('plain assistant replies between tool calls remain visible', () => {
     const items: TurnItem[] = [
       { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read', ts: '1' }, idx: 0 },
       { kind: 'single', msg: { role: 'assistant', content: 'Inspecting the config file before patching.', ts: '2' }, idx: 1 },
@@ -197,12 +197,33 @@ describe('TurnBlock — renderable content stays visible in collapseAll mode', (
         collapseAll={true}
       />
     )
-    // Plain prose at idx 1 should be inside a collapsed (overflow:hidden) section.
+    // Assistant prose at idx 1 is a reply, not reasoning, so it remains visible
+    // even when tool activity is collapsed.
     const proseItem = container.querySelector('[data-testid="item-1"]')
     expect(proseItem).not.toBeNull()
-    expect(proseItem?.closest('[style*="overflow"]')).not.toBeNull()
+    expect(proseItem?.closest('[style*="overflow"]')).toBeNull()
     // Conclusion still visible.
     expect(container.querySelector('[data-testid="item-3"]')).not.toBeNull()
+  })
+
+  it('does not hide a completed reply when a checkpoint follows it', () => {
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'assistant', content: 'The user will see their private draft published without warning.', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 mcp__kirocrew-core__session_checkpoint', ts: '2' }, idx: 1 },
+      { kind: 'single', msg: { role: 'assistant', content: 'That is why the issue is serious even when the collision is rare.', ts: '3' }, idx: 2 },
+    ]
+    const { container } = render(
+      <TurnBlock
+        turn={makeTurn(items)}
+        renderItem={(it, i) => <div data-testid={`item-${i}`}>{it.kind === 'single' ? it.msg.content : 'group'}</div>}
+        collapseAll={true}
+      />,
+    )
+
+    const replyBeforeCheckpoint = container.querySelector('[data-testid="item-0"]')
+    expect(replyBeforeCheckpoint).not.toBeNull()
+    expect(replyBeforeCheckpoint?.closest('[style*="overflow"]')).toBeNull()
+    expect(container.querySelector('[data-testid="item-1"]')?.closest('[style*="overflow"]')).not.toBeNull()
   })
 })
 
@@ -385,7 +406,7 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
     expect(container.querySelector('[data-testid="item-3"]')).not.toBeNull()
   })
 
-  it('a mid-turn assistant message WITHOUT an options marker still collapses (predicate is not over-broad)', () => {
+  it('a mid-turn assistant reply without options remains visible', () => {
     const items: TurnItem[] = [
       { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read', ts: '1' }, idx: 0 },
       { kind: 'single', msg: { role: 'assistant', content: 'Reading the config file before I patch it, to be sure of its shape.', ts: '2' }, idx: 1 },
@@ -399,11 +420,11 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
         collapseAll={true}
       />
     )
-    // Plain reasoning at idx 1 (no [OPTIONS:] marker) must stay INSIDE the
-    // collapsed section — surfacing it would defeat "hide intermediate reasoning".
+    // The absence of an [OPTIONS:] marker does not make an assistant reply
+    // reasoning. Tool calls remain inside the collapsed section instead.
     const prose = container.querySelector('[data-testid="item-1"]')
     expect(prose).not.toBeNull()
-    expect(prose?.closest('[style*="overflow"]')).not.toBeNull()
+    expect(prose?.closest('[style*="overflow"]')).toBeNull()
     // Conclusion still visible.
     expect(container.querySelector('[data-testid="item-3"]')).not.toBeNull()
   })
@@ -426,19 +447,19 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
         collapseAll={true}
       />
     )
-    // All three answers render OUTSIDE the collapsible pane...
+    // All three answers render OUTSIDE the collapsible pane, as every assistant
+    // reply now does...
     for (const i of [1, 2, 3]) {
       const el = container.querySelector(`[data-testid="item-${i}"]`)
       expect(el).not.toBeNull()
       expect(el?.closest('[style*="overflow"]')).toBeNull()
     }
-    // ...while the templated ack is still free to fold away.
-    expect(container.querySelector('[data-testid="item-0"]')?.closest('[style*="overflow"]')).not.toBeNull()
+    // The templated acknowledgement is still a visible assistant reply.
+    expect(container.querySelector('[data-testid="item-0"]')?.closest('[style*="overflow"]')).toBeNull()
   })
 
-  it('does not treat a stray class containing "crew-reply" as a marker', () => {
-    // Substring safety: the match is on a whole class token, so a class like
-    // "not-crew-reply-thing" must not smuggle a message past the collapse.
+  it('keeps an assistant reply visible regardless of a stray crew-reply-like class', () => {
+    // A class can never reclassify an assistant reply as hidden reasoning.
     const items: TurnItem[] = [
       { kind: 'single', msg: { role: 'assistant', content: 'intermediate reasoning that should stay hidden', cls: 'msg msg-a not-crew-replyish', ts: '1' }, idx: 0 },
       { kind: 'single', msg: { role: 'assistant', content: 'the actual conclusion of this turn, long enough to count.', cls: 'msg msg-a', ts: '2' }, idx: 1 },
@@ -450,7 +471,7 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
         collapseAll={true}
       />
     )
-    expect(container.querySelector('[data-testid="item-0"]')?.closest('[style*="overflow"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="item-0"]')?.closest('[style*="overflow"]')).toBeNull()
   })
 
   it('the "Worked through N steps" count excludes the now-visible hand-back', () => {
