@@ -3458,10 +3458,84 @@ class TestAgentSliceMemoryHigh:
         with patch("os.sysconf", side_effect=lambda n: sixteen_g // 4096 if "PHYS" in n else 4096):
             mb = sb._default_slice_memory_high_mb()
         assert mb == int(sixteen_g * sb._SLICE_MEMORY_HIGH_FRACTION) // (1024 * 1024)
+        # Unreadable RAM falls back on BOTH derivations at once, and the two
+        # fallback constants are equal -- so the unclamped value would put
+        # memory.high exactly ON memory.max, leaving no band to throttle in.
+        # The clamp applies here for the same reason it applies to a configured
+        # ceiling: the soft limit has to sit below the hard one to do anything.
+        clamped_fallback = int(sb._SLICE_FALLBACK_MEMORY_HIGH_MB * sb._SLICE_HIGH_OF_MAX_RATIO)
+        assert clamped_fallback < sb._CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB
         with patch("os.sysconf", side_effect=OSError("no sysconf")):
-            assert sb._default_slice_memory_high_mb() == sb._SLICE_FALLBACK_MEMORY_HIGH_MB
+            assert sb._default_slice_memory_high_mb() == clamped_fallback
         with patch("os.sysconf", return_value=0):
-            assert sb._default_slice_memory_high_mb() == sb._SLICE_FALLBACK_MEMORY_HIGH_MB
+            assert sb._default_slice_memory_high_mb() == clamped_fallback
+
+    @_POSIX_ONLY
+    def test_a_configured_aggregate_ceiling_pulls_memory_high_below_it(self):
+        """An operator ceiling lower than the host fraction must move
+        MemoryHigh with it, or the soft band silently disappears.
+
+        The two values are derived from different inputs -- MemoryHigh from
+        physical RAM, MemoryMax from config -- so setting a ceiling below 75%
+        of RAM used to leave memory.high ABOVE memory.max. The slice then went
+        straight from unbounded to hard cap, with no throttling step, which is
+        exactly the shape memory.high exists to prevent.
+        """
+        import kiro_crew.sandbox as sb
+
+        ninety_six_g = 96 * 1024**3
+        host_high = int(ninety_six_g * sb._SLICE_MEMORY_HIGH_FRACTION) // (1024 * 1024)
+        with patch("os.sysconf", side_effect=lambda n: ninety_six_g // 4096 if "PHYS" in n else 4096):
+            # 52 GiB ceiling: well under the host's 72 GiB high.
+            with patch("kiro_crew.sandbox._slice_limits_from_config", return_value=(53248, 32768)):
+                clamped = sb._default_slice_memory_high_mb()
+            assert clamped < 53248, "memory.high must sit below the memory.max it protects"
+            assert clamped == int(53248 * sb._SLICE_HIGH_OF_MAX_RATIO)
+            # A ceiling ABOVE the host fraction never lifts it: config may only
+            # lower this UID-global value, never raise it for other instances.
+            with patch("kiro_crew.sandbox._slice_limits_from_config", return_value=(90112, 32768)):
+                assert sb._default_slice_memory_high_mb() == host_high
+
+    @_POSIX_ONLY
+    def test_an_unconfigured_host_keeps_the_shipped_fraction(self):
+        """No operator ceiling means no behaviour change: the default max is
+        80% of RAM and the default high stays the shipped 75%, not 80% x the
+        ratio, so an install that configures nothing sees exactly what it saw
+        before."""
+        import kiro_crew.sandbox as sb
+
+        ninety_six_g = 96 * 1024**3
+        with patch("os.sysconf", side_effect=lambda n: ninety_six_g // 4096 if "PHYS" in n else 4096):
+            with patch(
+                "kiro_crew.sandbox._slice_limits_from_config",
+                return_value=(sb._default_max_total_memory_mb(), 32768),
+            ):
+                mb = sb._default_slice_memory_high_mb()
+        assert mb == int(ninety_six_g * sb._SLICE_MEMORY_HIGH_FRACTION) // (1024 * 1024)
+
+    @_POSIX_ONLY
+    def test_an_unreadable_ceiling_never_raises_memory_high(self):
+        """The clamp is best-effort in one direction only: if the ceiling
+        cannot be read, keep the host-derived value rather than widening it."""
+        import kiro_crew.sandbox as sb
+
+        ninety_six_g = 96 * 1024**3
+        host_high = int(ninety_six_g * sb._SLICE_MEMORY_HIGH_FRACTION) // (1024 * 1024)
+        with patch("os.sysconf", side_effect=lambda n: ninety_six_g // 4096 if "PHYS" in n else 4096):
+            with patch(
+                "kiro_crew.sandbox._slice_limits_from_config",
+                side_effect=RuntimeError("config gone"),
+            ):
+                assert sb._default_slice_memory_high_mb() == host_high
+
+    @_POSIX_ONLY
+    def test_a_tiny_ceiling_still_leaves_a_usable_high(self):
+        """A ceiling small enough to round the clamp toward zero must not
+        produce a MemoryHigh of 0, which would throttle every allocation."""
+        import kiro_crew.sandbox as sb
+
+        with patch("kiro_crew.sandbox._slice_limits_from_config", return_value=(1, 32768)):
+            assert sb._default_slice_memory_high_mb() >= 1
 
     def test_worker_checks_pressure_after_reconcile(self):
         # Throttle visibility rides the reconcile worker: every scheduled

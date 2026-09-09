@@ -5710,11 +5710,12 @@ _SLICE_MEMORY_HIGH_FRACTION = 0.75
 _SLICE_FALLBACK_MEMORY_HIGH_MB = 12288
 
 # Last MemoryHigh value applied to the slice by THIS process ("24576M" /
-# "infinity"), or None before the first reconcile. The desired value is
-# host-derived and constant for the process's life (no config input), so
-# after the first successful apply every later reconcile reduces to a
-# string compare and no-ops. Kept as a reconcile (rather than a one-shot)
-# so an apply that failed transiently is retried on the next spawn.
+# "infinity"), or None before the first reconcile. The desired value moves
+# only when the host or the configured aggregate ceiling does, so in the
+# steady state every reconcile after the first apply reduces to a string
+# compare and no-ops. Kept as a reconcile (rather than a one-shot) both so an
+# apply that failed transiently is retried on the next spawn, and so a changed
+# ceiling is picked up without waiting for a restart.
 _SLICE_MEMHIGH_APPLIED: str | None = None
 # Process-level kill switch: set after a failed apply so a broken systemctl is
 # warned about ONCE and never hammered on every subsequent spawn.
@@ -5722,18 +5723,52 @@ _SLICE_MEMHIGH_DISABLED = False
 
 
 def _default_slice_memory_high_mb() -> int:
-    """Return the default slice ``memory.high`` in MB: a fixed fraction
-    (:data:`_SLICE_MEMORY_HIGH_FRACTION`) of physical RAM, falling back to
-    :data:`_SLICE_FALLBACK_MEMORY_HIGH_MB` if host RAM can't be determined.
+    """Return the slice ``memory.high`` in MB.
+
+    A fixed fraction (:data:`_SLICE_MEMORY_HIGH_FRACTION`) of physical RAM,
+    falling back to :data:`_SLICE_FALLBACK_MEMORY_HIGH_MB` if host RAM can't be
+    determined -- then clamped below the aggregate ``memory.max`` actually in
+    force.
+
+    The clamp exists because the two values come from different inputs. This
+    one is host-derived; ``memory.max`` is host-derived only until an operator
+    sets ``resource_limits.max_total_memory_mb``. Set a ceiling under 75% of
+    RAM and the soft band ended up ABOVE the hard cap, so the slice went
+    straight from unbounded to OOM-kill with no throttling step -- silently,
+    since both values were individually what they claimed to be. Observed on a
+    94 GiB host with a 40 GiB ceiling: ``memory.high`` sat at 70.7 GiB and the
+    slice ran pinned against ``memory.max``.
+
+    Config may only LOWER this value, never raise it. That preserves the reason
+    the ceiling is not a config knob in the first place (see
+    :func:`_ensure_agent_slice_memory_high`): the slice is UID-global, so one
+    permissive instance must not be able to lift the protection the others rely
+    on. A ``min`` can only tighten it.
     """
     try:
         total_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         mb = int(total_bytes * _SLICE_MEMORY_HIGH_FRACTION) // (1024 * 1024)
-        if mb > 0:
-            return mb
+        if mb <= 0:
+            mb = _SLICE_FALLBACK_MEMORY_HIGH_MB
     except (ValueError, OSError, AttributeError):
-        pass
-    return _SLICE_FALLBACK_MEMORY_HIGH_MB
+        mb = _SLICE_FALLBACK_MEMORY_HIGH_MB
+    try:
+        ceiling_mb, _ = _slice_limits_from_config()
+    except Exception:
+        # Unreadable config keeps the host-derived value. Widening on a failed
+        # read would relax a protection because we could not confirm it.
+        logger.debug("slice memory.high: ceiling unreadable, keeping host default")
+        return mb
+    # Compare against the CEILING itself, not against the scaled result. Scaling
+    # first and taking a min would re-derive the default through two more
+    # truncations and land 1 MB below it, changing the shipped value on hosts
+    # that configure nothing -- a silent drift, and the exact thing this
+    # function must not do.
+    if 1 <= ceiling_mb <= mb:
+        # Floor of 1 MB: a ceiling small enough to round the scaled value to
+        # zero would otherwise throttle every allocation in the slice.
+        mb = max(1, int(ceiling_mb * _SLICE_HIGH_OF_MAX_RATIO))
+    return mb
 
 
 def _ensure_agent_slice_memory_high() -> None:
@@ -5741,10 +5776,11 @@ def _ensure_agent_slice_memory_high() -> None:
 
     The slice is UID-GLOBAL: every gateway instance under this user (live,
     dev-backend, pods with delegation) parents scopes into the same slice, so
-    the ceiling is deliberately NOT config-driven — a per-instance config key
-    would let one instance (e.g. a dev gateway configured permissively) lift
-    or lower the ceiling that protects the others. The value is always the
-    host-derived default (:func:`_default_slice_memory_high_mb`).
+    there is no config key for this ceiling — a per-instance one would let a
+    permissively configured instance lift the protection the others rely on.
+    The value comes from :func:`_default_slice_memory_high_mb`, which reads the
+    aggregate ceiling only to clamp DOWNWARD to it, so the UID-global guarantee
+    still holds: another instance can tighten this, never widen it.
 
     Runs ``systemctl --user set-property --runtime`` — unprivileged: the user
     manager owns the slice, and the memory controller is delegated wherever the
@@ -6109,6 +6145,12 @@ def pytest_cgroup_scope_argv(
 # spawn's existing headroom — and meaningfully below 1.0 so the OS and the
 # gateway keep breathing room even when agent work saturates the ceiling.
 _CGROUP_TOTAL_MEMORY_FRACTION = 0.80
+# How far below the slice's aggregate memory.max the soft band sits when an
+# operator has configured a ceiling of their own. Deliberately the SHIPPED
+# ratio (0.75/0.80) rather than a new number: the defaults already encode how
+# much room throttling needs before the hard cap, and a configured ceiling
+# deserves the same proportion rather than an invented one.
+_SLICE_HIGH_OF_MAX_RATIO = _SLICE_MEMORY_HIGH_FRACTION / _CGROUP_TOTAL_MEMORY_FRACTION
 # Fallback aggregate memory.max (MB) when physical RAM can't be read. Above
 # the per-scope fallback (8192) for the same "never clamp a single scope
 # tighter than its own ceiling" reason as the fraction.
