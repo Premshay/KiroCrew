@@ -71,6 +71,41 @@ def test_wrapper_holds_permits_until_the_scoped_pytest_returns(wrapper, monkeypa
     assert _run[1][:3] == ["systemd-run", "--wait", "--"]
 
 
+def test_wrapper_grants_workers_to_the_contained_child(wrapper, monkeypatch) -> None:
+    """The grant reaches pytest through the scope's own environment, not only
+    through this process's: systemd-run does not inherit the caller's env."""
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(wrapper.xdist_budget, "claim_exact_worker_slots", lambda count: True)
+    monkeypatch.setattr(wrapper.xdist_budget, "release_worker_slots", lambda: None)
+
+    def fake_scope(argv, **kwargs):
+        seen["kwargs"] = kwargs
+        return argv
+
+    monkeypatch.setattr(wrapper, "pytest_cgroup_scope_argv", fake_scope)
+    monkeypatch.setattr(
+        wrapper.subprocess, "run", lambda command, **kw: subprocess.CompletedProcess(command, 0)
+    )
+
+    assert wrapper.main(["-n", "3"]) == 0
+    assert seen["kwargs"]["environment"] == {"PREGRANTED_WORKERS": "3"}
+    assert "TMPDIR" in seen["kwargs"]["inherit_environment"]
+
+
+def test_inheritable_environment_skips_the_wrappers_own_unit_variables(
+    wrapper, monkeypatch
+) -> None:
+    """Unit-scoped variables describe the wrapper's service, not pytest's."""
+    monkeypatch.setenv("TMPDIR", "/scratch/session")
+    monkeypatch.setenv("INVOCATION_ID", "cafe")
+    monkeypatch.setenv("NOTIFY_SOCKET", "/run/notify")
+
+    names = wrapper.inheritable_environment()
+
+    assert "TMPDIR" in names
+    assert "INVOCATION_ID" not in names and "NOTIFY_SOCKET" not in names
+
+
 def test_wrapper_fails_busy_without_launching_pytest(wrapper, monkeypatch, capsys) -> None:
     monkeypatch.setattr(wrapper.xdist_budget, "claim_exact_worker_slots", lambda count: False)
     monkeypatch.setattr(wrapper.subprocess, "run", lambda *_a, **_kw: pytest.fail("must not run"))

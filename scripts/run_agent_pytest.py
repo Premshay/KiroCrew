@@ -22,6 +22,41 @@ sys.path.insert(0, str(REPO_ROOT))
 import xdist_budget  # noqa: E402  (repo paths must be present before these imports)
 from kiro_crew.sandbox import pytest_cgroup_scope_argv  # noqa: E402
 
+# Variables the service manager owns for each unit it starts. Forwarding this
+# process's copies would describe the wrapper's own unit to pytest's.
+_UNIT_MANAGED_ENV = frozenset(
+    {
+        "INVOCATION_ID",
+        "JOURNAL_STREAM",
+        "LISTEN_FDNAMES",
+        "LISTEN_FDS",
+        "LISTEN_PID",
+        "MAINPID",
+        "MANAGERPID",
+        "MEMORY_PRESSURE_WATCH",
+        "MEMORY_PRESSURE_WRITE",
+        "NOTIFY_SOCKET",
+        "SYSTEMD_EXEC_PID",
+        "WATCHDOG_PID",
+        "WATCHDOG_USEC",
+    }
+)
+
+
+def inheritable_environment() -> list[str]:
+    """Names to carry into the contained run so it matches a direct one.
+
+    Containment exists to bound memory, not to reshape the environment. Dropping
+    the caller's copy is not neutral: without ``TMPDIR`` the suite writes its
+    temporary trees to the shared ``/tmp``, which fails tests that assert on
+    their own scratch paths and leaves residue outside the session's directory.
+    """
+    return sorted(
+        name
+        for name in os.environ
+        if name and "=" not in name and name not in _UNIT_MANAGED_ENV
+    )
+
 
 def requested_workers(args: list[str]) -> int:
     """Return the exact permit count for pytest's xdist options.
@@ -82,11 +117,15 @@ def main(args: list[str] | None = None) -> int:
         )
         return 75
 
-    env = os.environ.copy()
-    env[xdist_budget._PREGRANTED_WORKERS_ENV] = str(count)
+    granted = {xdist_budget._PREGRANTED_WORKERS_ENV: str(count)}
+    # Both paths must carry the grant: the transient unit reads --setenv, and
+    # the cgroup-unavailable fallback runs pytest as a direct child of this env.
+    env = {**os.environ, **granted}
     command = pytest_cgroup_scope_argv(
         [sys.executable, "-m", "pytest", *pytest_args],
         working_directory=str(REPO_ROOT),
+        environment=granted,
+        inherit_environment=inheritable_environment(),
     )
     try:
         return subprocess.run(command, cwd=REPO_ROOT, env=env, check=False).returncode
