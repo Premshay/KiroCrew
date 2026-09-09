@@ -1954,6 +1954,25 @@ class TestCgroupScopeArgv:
         finally:
             self._reset_probe()
 
+    def test_pytest_service_is_waited_and_has_its_own_memory_ceiling(self):
+        import kiro_crew.sandbox as sb
+
+        self._reset_probe()
+        try:
+            with patch("kiro_crew.sandbox._probe_cgroup_scope", return_value=(True, "ok")):
+                out = sb.pytest_cgroup_scope_argv(
+                    ["python", "-m", "pytest"], working_directory="/repo"
+                )
+            assert "--scope" not in out and "--wait" in out and "--pipe" in out
+            assert "MemoryHigh=16384M" in out
+            assert "MemoryMax=20480M" in out
+            assert "MemorySwapMax=0" in out
+            assert "OOMPolicy=kill" in out
+            assert "--working-directory=/repo" in out
+            assert out[out.index("--") + 1 :] == ["python", "-m", "pytest"]
+        finally:
+            self._reset_probe()
+
     @_POSIX_ONLY
     def test_cpu_controller_delegated_real_path(self):
         """Cover the uncached probe body: reads the user-slice controllers file

@@ -37,7 +37,12 @@ _SLOT_DIR_ENV = "KIROCREW_TEST_SLOT_DIR"
 #: xdist's own ceiling for ``-n auto``. Read here because this hook replaces
 #: xdist's default implementation rather than running alongside it.
 _XDIST_ENV_CAP = "PYTEST_XDIST_AUTO_NUM_WORKERS"
-_DEFAULT_WORKER_CAP = 32
+# The slot range is deliberately small and constant across every worktree on
+# this host.  It is a host-safety budget, not a per-suite tuning knob: a full
+# xdist worker was observed using roughly 2.5 GiB alongside resident models.
+_HOST_WORKER_CAP = 6
+_PREGRANTED_WORKERS_ENV = "PREGRANTED_WORKERS"
+_DEFAULT_WORKER_CAP = _HOST_WORKER_CAP
 _GIB = 1024**3
 # The LIVE memory readings are taken in MiB, because in GiB anything under 1 GiB
 # truncates to 0 -- which is the same value they use for "could not determine", and an
@@ -288,7 +293,7 @@ def _static_memory_bounded_capacity(cores: int) -> int:
     configuration this suite runs on, and its unit is pinned by existing tests.
     """
     return _bounded_by(
-        cores,
+        min(cores, _HOST_WORKER_CAP),
         (
             (_host_total_gib() * 1024, _GIB_PER_WORKER),
             (_cgroup_limit_mib(), _GIB_PER_WORKER),
@@ -396,6 +401,79 @@ def _claim_worker_slots(capacity: int, cap: int) -> int:
     return max(1, taken)
 
 
+def claim_exact_worker_slots(count: int) -> bool:
+    """Atomically claim exactly *count* host-global worker permits.
+
+    The agent test wrapper uses this for both ``-n auto`` and explicit
+    ``-n N``.  Unlike :func:`_claim_worker_slots`, it never downsizes a run:
+    retaining a partial claim while waiting would deadlock two contenders, and
+    silently creating fewer explicit workers would make the command lie.  On
+    contention it releases every provisional lock and returns ``False``.
+
+    The fds remain open in this wrapper process until it reaps the contained
+    pytest service.  Kernel lock cleanup therefore also covers a wrapper crash.
+    """
+    if count < 1 or count > _HOST_WORKER_CAP:
+        raise ValueError(f"worker count must be between 1 and {_HOST_WORKER_CAP}")
+    if _held_slots:
+        return len(_held_slots) == count
+
+    try:
+        root = _slot_root()
+        slot_dir = _slot_dir()
+        if root.exists() and root.is_symlink():
+            return False
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        if slot_dir.is_symlink() or not slot_dir.is_dir():
+            return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    for index in range(_HOST_WORKER_CAP):
+        try:
+            fd = os.open(str(_slot_path(slot_dir, index)), os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            release_worker_slots()
+            return False
+        if platform_compat.try_acquire_lock(fd, exclusive=True):
+            _held_slots.append(fd)
+            if len(_held_slots) == count:
+                return True
+        else:
+            os.close(fd)
+    release_worker_slots()
+    return False
+
+
+def pregranted_workers() -> int | None:
+    """Return the wrapper's already-reserved xdist count, when valid.
+
+    ``PREGRANTED_WORKERS`` is intentionally consumed only by the auto-worker
+    hook.  Explicit pytest counts are handled before pytest starts by the
+    wrapper, while this prevents auto mode from claiming the same permits a
+    second time.
+    """
+    raw = os.environ.get(_PREGRANTED_WORKERS_ENV)
+    if raw is None:
+        return None
+    try:
+        count = int(raw)
+    except ValueError:
+        warnings.warn(
+            f"xdist worker budget: ignoring invalid {_PREGRANTED_WORKERS_ENV}={raw!r}",
+            stacklevel=2,
+        )
+        return None
+    if 1 <= count <= _HOST_WORKER_CAP:
+        return count
+    warnings.warn(
+        f"xdist worker budget: ignoring {_PREGRANTED_WORKERS_ENV}={raw!r}; "
+        f"expected 1..{_HOST_WORKER_CAP}",
+        stacklevel=2,
+    )
+    return None
+
+
 def _warn_if_clamped(resolved: int, cap: int, unbudgeted: int) -> None:
     """Say why parallelism is lower than the core count, if it is.
 
@@ -419,8 +497,8 @@ def _warn_if_clamped(resolved: int, cap: int, unbudgeted: int) -> None:
             f"{_host_total_gib()} GiB installed). Each worker needs about "
             f"{_GIB_PER_WORKER_AVAILABLE} GiB, mostly to collect the suite. A run this "
             "narrow is slow, not stuck -- free some memory, run a subset "
-            "(pytest test/test_thing.py), or pass an explicit -n <N> to bypass "
-            "this budget.",
+            "(pytest test/test_thing.py), or use run_agent_pytest.py with an "
+            "explicit -n <N> (up to the host-wide limit).",
             stacklevel=1,
         )
     if resolved < cap:  # slots were held by another run on this host
@@ -448,7 +526,7 @@ def resolve_workers() -> int:
 
     **Per-run cap** -- the most this single run may take, the tightest of:
 
-    1. ``KIROCREW_MAX_TEST_WORKERS``, default 32. The optimal worker count for this
+    1. The fixed six-worker host budget. The optimal worker count for this
        suite plateaus around 24-32 and then *regresses*: every extra worker re-imports
        the full app (aiohttp/boto3/numpy/pdfplumber/transcribe) and writes its own
        ``.coverage.*`` file to combine at the end. Measured on a 64-core host:
@@ -495,7 +573,8 @@ def resolve_workers() -> int:
     cores = os.cpu_count() or 1
     # What the run would have got with no memory reading and no contention. Only used
     # to decide whether to SAY something, never to grant.
-    unbudgeted = min(cores, max(1, _int_env(_MAX_WORKERS_ENV, _DEFAULT_WORKER_CAP)))
+    configured_cap = max(1, _int_env(_MAX_WORKERS_ENV, _DEFAULT_WORKER_CAP))
+    unbudgeted = min(cores, _HOST_WORKER_CAP, configured_cap)
     capacity = _static_memory_bounded_capacity(cores)
     # Only a POSITIVE value is a ceiling. Unset, empty, non-numeric, zero and
     # negative all fall back to inert -- a typo must not silently serialize the

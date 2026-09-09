@@ -871,6 +871,9 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
         import xdist_budget
     except ImportError:  # pragma: no cover - partial checkout
         return None
+    pregranted = xdist_budget.pregranted_workers()
+    if pregranted is not None:
+        return pregranted
     return xdist_budget.resolve_workers()
 
 

@@ -74,7 +74,7 @@ Run from the worktree root:
 
 ```bash
 # Backend (Python) — isort, flake8, mypy are ALL blocking in CI
-python -m pytest -q          # setup.cfg addopts already runs xdist (-n auto --dist loadgroup)
+python scripts/run_agent_pytest.py -q  # host-wide xdist budget + pytest's -n auto --dist loadgroup
 isort --check-only src/kiro_crew test
 flake8 src/kiro_crew test
 mypy src/kiro_crew/
@@ -97,7 +97,7 @@ failures. If you need to override addopts (e.g. to skip coverage during
 iteration), use exactly this form, which preserves the xdist flags:
 
 ```bash
-python -m pytest -q --override-ini="addopts=--ignore=build/private -n auto --dist loadgroup"
+python scripts/run_agent_pytest.py -q --override-ini="addopts=--ignore=build/private -n auto --dist loadgroup"
 ```
 
 Never a bare `--override-ini=addopts=` (it silently drops `--dist loadgroup`).

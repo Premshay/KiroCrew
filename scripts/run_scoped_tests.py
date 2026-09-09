@@ -281,7 +281,7 @@ def validated_targets(targets: list[str], root: Path) -> list[str]:
 
 
 def backend_argv(targets: list[str] | None) -> list[str]:
-    argv = [sys.executable, "-m", "pytest", "-q"]
+    argv = [sys.executable, str(REPO_ROOT / "scripts" / "run_agent_pytest.py"), "-q"]
     if targets:
         # `--` ends option parsing so nothing after it can be read as a flag.
         # Coverage is off: a subset's coverage is not comparable to the repo
@@ -524,14 +524,15 @@ def _self_test() -> int:
     except SelectionUntrustworthy as exc:
         failures.append(f"cross-surface backend list unusable: {exc}")
 
-    # Full-suite argv must stay CI's exact command, so a fallback is not a
-    # different, weaker check than the gate it replaces. The launcher is compared
-    # by BASENAME because it is resolved to an absolute path -- `subprocess.run`
-    # with shell=False cannot execute a bare `npm` on native Windows, where what
-    # exists on PATH is `npm.cmd`.
+    # The backend command stays pytest's full floor, routed through the
+    # host-budget wrapper so concurrent worktrees cannot exceed six workers.
+    # The frontend launcher is compared by BASENAME because it is resolved to an
+    # absolute path -- `subprocess.run` with shell=False cannot execute a bare
+    # `npm` on native Windows, where what exists on PATH is `npm.cmd`.
     check(
         "backend full argv",
-        backend_argv(None) == [sys.executable, "-m", "pytest", "-q"],
+        backend_argv(None)
+        == [sys.executable, str(REPO_ROOT / "scripts" / "run_agent_pytest.py"), "-q"],
     )
     try:
         fe_full = frontend_argv(None)

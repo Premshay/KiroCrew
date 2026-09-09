@@ -5498,6 +5498,13 @@ _CGROUP_FALLBACK_MAX_MEMORY_MB = 8192
 # the aggregate enforcement boundary — see ensure_agents_slice_limits().
 _CGROUP_AGENTS_SLICE = "kirocrew-agents.slice"
 
+# Full pytest workers collect nearly the entire repository independently.  This
+# is intentionally tighter than the general agent-scope ceiling: tests are an
+# operator-initiated batch workload and must yield before they starve a live
+# gateway or resident inference server.
+_PYTEST_SCOPE_MEMORY_HIGH_MB = 16 * 1024
+_PYTEST_SCOPE_MEMORY_MAX_MB = 20 * 1024
+
 
 def _default_max_memory_mb() -> int:
     """Return the default cgroup ``memory.max`` in MB: a fixed fraction
@@ -6028,6 +6035,48 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
         "-q",
         f"--slice={_CGROUP_AGENTS_SLICE}",
         *props,
+        "--",
+        *argv,
+    ]
+
+
+def pytest_cgroup_scope_argv(
+    argv: list[str], *, working_directory: str | None = None
+) -> list[str]:
+    """Run pytest as a waited-for transient service with a test-specific budget.
+
+    The caller remains the parent process, holding the host-global xdist permit
+    file descriptors until ``systemd-run --wait`` returns.  ``OOMPolicy=kill``
+    sets cgroup v2's ``memory.oom.group=1``, so a cgroup-limit breach kills the
+    complete test tree rather than leaving a parent and orphaned workers behind.
+    """
+    available, reason = _probe_cgroup_scope()
+    if not available:
+        _warn_cgroup_unavailable(reason)
+        return argv
+    systemd_run = platform_compat.trusted_system_bin("systemd-run")
+    if not systemd_run:
+        _warn_cgroup_unavailable("systemd-run is not in a trusted system directory")
+        return argv
+    workdir_arg = [f"--working-directory={working_directory}"] if working_directory else []
+    return [
+        systemd_run,
+        "--user",
+        "--wait",
+        "--pipe",
+        "-q",
+        *workdir_arg,
+        f"--slice={_CGROUP_AGENTS_SLICE}",
+        "-p",
+        f"TasksMax={_CGROUP_DEFAULT_MAX_PROCESSES}",
+        "-p",
+        f"MemoryHigh={_PYTEST_SCOPE_MEMORY_HIGH_MB}M",
+        "-p",
+        f"MemoryMax={_PYTEST_SCOPE_MEMORY_MAX_MB}M",
+        "-p",
+        "MemorySwapMax=0",
+        "-p",
+        "OOMPolicy=kill",
         "--",
         *argv,
     ]

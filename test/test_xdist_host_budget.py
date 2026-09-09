@@ -428,13 +428,13 @@ def test_an_unwritable_slot_dir_drops_to_one_worker_and_says_why(
 
 
 def test_alone_gets_the_whole_machine(budget_host: pathlib.Path) -> None:
-    """The speed guarantee: testing alone is unchanged by this budget."""
-    assert ct.resolve_workers() == 10
+    """A quiet host gets the fixed, host-wide safety ceiling."""
+    assert ct.resolve_workers() == ct._HOST_WORKER_CAP
 
 
 def test_second_run_takes_what_is_left(budget_host: pathlib.Path) -> None:
     budget_host.mkdir(parents=True, exist_ok=True)
-    holder = _hold_slots_in_subprocess(budget_host, 7)
+    holder = _hold_slots_in_subprocess(budget_host, 3)
     try:
         assert ct.resolve_workers() == 3
     finally:
@@ -451,7 +451,7 @@ def test_unknown_memory_falls_back_to_cores(
     budget_host: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(ct, "_host_total_gib", lambda: 0)
-    assert ct.resolve_workers() == 10
+    assert ct.resolve_workers() == ct._HOST_WORKER_CAP
 
 
 def test_a_loaded_laptop_is_bounded_by_what_is_free_not_by_what_it_owns(
@@ -497,7 +497,7 @@ def test_garbage_env_cap_falls_back_to_default(
     budget_host: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(ct._MAX_WORKERS_ENV, "not-a-number")
-    assert ct.resolve_workers() == 10
+    assert ct.resolve_workers() == ct._HOST_WORKER_CAP
 
 
 def test_the_xdist_env_var_is_honoured_as_a_ceiling(
@@ -537,7 +537,7 @@ def test_an_unusable_xdist_env_var_is_inert(
     """
     monkeypatch.setenv(ct._XDIST_ENV_CAP, raw)
 
-    assert ct.resolve_workers() == 10
+    assert ct.resolve_workers() == ct._HOST_WORKER_CAP
 
 
 # ── saying so ──────────────────────────────────────────────────────────
@@ -567,7 +567,7 @@ def test_a_healthy_host_is_silent(
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        assert ct.resolve_workers() == 10
+        assert ct.resolve_workers() == ct._HOST_WORKER_CAP
 
     # THIS module's warnings only. ``simplefilter("always")`` + ``record=True``
     # captures every warning raised in the window, including a ``ResourceWarning``
@@ -605,17 +605,17 @@ def test_big_host_still_capped_at_default(
     assert ct.resolve_workers() == ct._DEFAULT_WORKER_CAP
 
 
-def test_two_runs_on_a_big_host_both_get_the_cap(
+def test_two_runs_on_a_big_host_share_the_one_host_cap(
     slot_dir: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """End of the same regression, seen through the hook."""
+    """The six-slot ceiling is shared across worktrees, not per suite."""
     monkeypatch.setattr(os, "cpu_count", lambda: 64)
     monkeypatch.setattr(ct, "_host_total_gib", lambda: 512)
     monkeypatch.delenv(ct._MAX_WORKERS_ENV, raising=False)
     slot_dir.mkdir(parents=True, exist_ok=True)
     holder = _hold_slots_in_subprocess(slot_dir, ct._DEFAULT_WORKER_CAP)
     try:
-        assert ct.resolve_workers() == ct._DEFAULT_WORKER_CAP
+        assert ct.resolve_workers() == 1
     finally:
         holder.communicate()
 
@@ -643,3 +643,35 @@ def test_released_capacity_is_reusable(slot_dir: pathlib.Path) -> None:
     assert ct._claim_worker_slots(4, 64) == 4
     ct.release_worker_slots()
     assert ct._claim_worker_slots(4, 64) == 4
+
+
+def test_exact_claim_is_all_or_nothing(slot_dir: pathlib.Path) -> None:
+    """A wrapper must not strand partial permits while another suite runs."""
+    slot_dir.mkdir(parents=True, exist_ok=True)
+    holder = _hold_slots_in_subprocess(slot_dir, 3)
+    try:
+        assert ct.claim_exact_worker_slots(ct._HOST_WORKER_CAP) is False
+        assert ct._held_slots == []
+    finally:
+        holder.communicate()
+
+
+def test_exact_claim_holds_the_requested_permits(slot_dir: pathlib.Path) -> None:
+    assert ct.claim_exact_worker_slots(4) is True
+    assert len(ct._held_slots) == 4
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "7", "not-a-number"])
+def test_invalid_pregranted_worker_count_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv(ct._PREGRANTED_WORKERS_ENV, raw)
+    with pytest.warns(UserWarning, match="PREGRANTED_WORKERS"):
+        assert ct.pregranted_workers() is None
+
+
+def test_valid_pregranted_worker_count_skips_a_second_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(ct._PREGRANTED_WORKERS_ENV, "4")
+    assert ct.pregranted_workers() == 4

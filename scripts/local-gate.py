@@ -64,6 +64,7 @@ _SELECTOR = _REPO_ROOT / "scripts" / "ci-surface-tests.py"
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 from run_scoped_tests import (  # noqa: E402  (path set immediately above)
     SelectionUntrustworthy,
+    backend_argv,
     validated_targets,
 )
 
@@ -162,7 +163,7 @@ class Plan:
 def _backend_full(plan: Plan) -> None:
     plan.add(
         "backend (full)",
-        [sys.executable, "-m", "pytest", "-q", "-n", "auto", "--dist", "loadgroup"],
+        backend_argv(None),
         _REPO_ROOT,
     )
 
@@ -239,8 +240,7 @@ def build_plan(args: argparse.Namespace) -> Plan:
                 "backend (cross-surface guards)",
                 # `--` ends option parsing, matching `run_scoped_tests.backend_argv`.
                 # Belt and braces: `validated_targets` already refuses a leading `-`.
-                [sys.executable, "-m", "pytest", "-q", "-n", "auto", "--dist", "loadgroup",
-                 "--", *must_run],
+                backend_argv(must_run),
                 _REPO_ROOT,
             )
         return plan
