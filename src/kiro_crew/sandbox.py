@@ -6044,23 +6044,21 @@ def pytest_cgroup_scope_argv(
     argv: list[str],
     *,
     working_directory: str | None = None,
-    environment: dict[str, str] | None = None,
     inherit_environment: list[str] | None = None,
 ) -> list[str]:
     """Run pytest as a waited-for transient service with a test-specific budget.
 
-    The caller remains the parent process, holding the host-global xdist permit
-    file descriptors until ``systemd-run --wait`` returns.  ``OOMPolicy=kill``
-    sets cgroup v2's ``memory.oom.group=1``, so a cgroup-limit breach kills the
-    complete test tree rather than leaving a parent and orphaned workers behind.
+    ``OOMPolicy=kill`` sets cgroup v2's ``memory.oom.group=1``, so a limit
+    breach kills the complete test tree rather than leaving a parent and
+    orphaned workers behind.  The unit outlives its starter, which is why the
+    caller runs the worker-permit holder INSIDE it rather than around it.
 
     A transient unit starts from the user manager's environment, not the
-    caller's, so anything pytest must see is emitted as ``--setenv``: explicit
-    values through ``environment``, and names to take from this process through
-    ``inherit_environment``.  Exporting a variable is not enough on its own.
-    Containment is meant to change the memory ceiling and nothing else, so a
-    caller that forwards its own environment gets a run shaped like a direct
-    one; the name-only form keeps those values off this command line.
+    caller's, so anything pytest must see is named in ``inherit_environment``;
+    exporting a variable is not enough on its own.  Containment is meant to
+    change the memory ceiling and nothing else, so a caller that forwards its
+    own environment gets a run shaped like a direct one.  The name-only form
+    keeps those values off a command line every process on the host can read.
     """
     available, reason = _probe_cgroup_scope()
     if not available:
@@ -6072,7 +6070,6 @@ def pytest_cgroup_scope_argv(
         return argv
     workdir_arg = [f"--working-directory={working_directory}"] if working_directory else []
     setenv_args = [f"--setenv={name}" for name in sorted(inherit_environment or ())]
-    setenv_args += [f"--setenv={name}={value}" for name, value in sorted((environment or {}).items())]
     return [
         systemd_run,
         "--user",

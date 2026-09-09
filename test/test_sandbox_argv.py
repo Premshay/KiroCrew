@@ -1973,27 +1973,23 @@ class TestCgroupScopeArgv:
         finally:
             self._reset_probe()
 
-    def test_pytest_service_carries_the_worker_grant_as_setenv(self):
-        """A transient unit starts from the user manager's environment, so an
-        exported grant is invisible to pytest unless it is passed explicitly."""
+    def test_pytest_service_inherits_named_variables_by_name(self):
+        """A transient unit starts from the user manager's environment, so a
+        variable the caller exported is invisible to pytest unless it is named.
+
+        Name-only: the manager takes the caller's value rather than writing it
+        onto a command line every process on the host can read."""
         import kiro_crew.sandbox as sb
 
         self._reset_probe()
         try:
             with patch("kiro_crew.sandbox._probe_cgroup_scope", return_value=(True, "ok")):
-                out = sb.pytest_cgroup_scope_argv(
-                    ["python", "-m", "pytest"],
-                    environment={"PREGRANTED_WORKERS": "6"},
-                )
-            assert "--setenv=PREGRANTED_WORKERS=6" in out
-            assert out.index("--setenv=PREGRANTED_WORKERS=6") < out.index("--")
-            # Name-only: the caller's value is taken by the manager rather than
-            # written onto a command line every process on the host can read.
-            with patch("kiro_crew.sandbox._probe_cgroup_scope", return_value=(True, "ok")):
                 inherited = sb.pytest_cgroup_scope_argv(
                     ["python", "-m", "pytest"], inherit_environment=["TMPDIR", "PATH"]
                 )
             assert "--setenv=PATH" in inherited and "--setenv=TMPDIR" in inherited
+            assert inherited.index("--setenv=TMPDIR") < inherited.index("--")
+            assert not any("=" in a.split("=", 1)[1] for a in inherited if a.startswith("--setenv="))
             with patch("kiro_crew.sandbox._probe_cgroup_scope", return_value=(True, "ok")):
                 bare = sb.pytest_cgroup_scope_argv(["python", "-m", "pytest"])
             assert not any(a.startswith("--setenv=") for a in bare)
