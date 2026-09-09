@@ -53,6 +53,14 @@ _CONSOLIDATION_MAX_ATTEMPTS = 5
 _CONSOLIDATION_BACKOFF_BASE_SECS = 900.0
 _CONSOLIDATION_BACKOFF_MAX_SECS = 86400.0
 _SKILL_DETECTION_WINDOW = 200
+# Rendered bytes of transcript one history consolidation prompt may carry. The
+# unconsolidated tail is otherwise unbounded: a session that goes a long time
+# between passes — or whose consolidation kept failing — renders every message
+# since the marker into one prompt, and past some length no provider accepts it.
+# The span that most needs extracting is then the one that can never be
+# extracted. 64 KiB leaves room beside it for the instructions and the current
+# memory blocks in every context window Kiro Crew dispatches to.
+_CONSOLIDATION_PROMPT_BUDGET = 64 * 1024
 
 _CONSOLIDATION_META_KEYS: frozenset[str] = frozenset(
     {
@@ -76,11 +84,22 @@ _CONSOLIDATION_REFUSED = _ConsolidationRefusedSentinel()
 
 
 class AttemptedSpan(NamedTuple):
-    """Identity of the transcript span a billed consolidation turn covered."""
+    """Identity of the transcript span a billed consolidation turn covered.
+
+    ``total`` and ``prompted`` answer different questions and must not be
+    collapsed. ``total`` is how far the TRANSCRIPT reached when the turn was
+    charged, and identifies the span for the retry accounting: while a span
+    keeps failing it does not move, which is what makes the attempt cap hold
+    (see :meth:`ConversationLog._attempts_describe_current_span`). ``prompted``
+    is how far the PROMPT reached, and is the only offset the abandon path may
+    write to the durable marker — the tail past it was never sent to any
+    provider, so marking it consolidated would drop it from memory unread.
+    """
 
     total: int
     generation: int
     offset: int
+    prompted: int
 
 
 class _ConsolidationNotDispatched(Exception):
@@ -94,6 +113,41 @@ def _fmt_message(message: dict) -> str:
         f"[{message.get('ts', '?')[:16]}] {message['role'].upper()}"
         f"{tools}: {message['content']}"
     )
+
+
+def _consolidation_chunk(messages: list[dict]) -> list[dict]:
+    """Return the longest message-aligned prefix of *messages* that fits the budget.
+
+    Message-aligned rather than byte-truncated so the marker can advance by a
+    whole number of messages: a prompt cut mid-message would leave the durable
+    offset describing a boundary that does not exist in the transcript, and the
+    remainder would be re-rendered from a different starting point on the next
+    pass. The caller marks exactly this prefix consolidated and leaves the rest
+    for the pass after it.
+
+    The separator is charged too. The prompt joins the rendered messages with
+    ``"\\n"``, so a budget computed from the rendered sizes alone lets the
+    transcript block exceed the ceiling by one byte per message — enough to
+    matter on a tail of thousands.
+
+    A first message that alone exceeds the budget is returned anyway rather than
+    refused. Its size is a permanent property of the transcript, so refusing it
+    stalls the session forever at whatever backoff the refusal arms, and every
+    message behind it with it. Sending it is no worse than the unbounded prompt
+    this budget replaces, and it terminates: an over-context provider error is a
+    normal failed attempt, and the attempt cap abandons that one message so the
+    tail behind it consolidates on the next pass.
+    """
+    budget = _CONSOLIDATION_PROMPT_BUDGET
+    used = 0
+    for index, message in enumerate(messages):
+        # One separator per message after the first, matching the "\n".join
+        # the prompt builder performs over exactly these rendered strings.
+        rendered = len(_fmt_message(message)) + (1 if index else 0)
+        if index and used + rendered > budget:
+            return messages[:index]
+        used += rendered
+    return messages
 
 
 _PLACEHOLDER_BODIES = frozenset(
@@ -444,9 +498,13 @@ class HistoryConsolidator:
         indefinitely.
 
         *span* is the pre-turn snapshot identity (see :class:`AttemptedSpan`), used
-        both to stamp the charge and to place the abandon marker — the same values
-        for both, so the marker cannot be written for a span other than the one the
-        cap was reached on.
+        both to stamp the charge and to place the abandon marker, so the marker
+        cannot be written for a span other than the one the cap was reached on.
+        The abandon marker lands at ``span.prompted``, NOT ``span.total``: only
+        the prompted prefix was ever put in front of a provider, and marking the
+        tail behind it would retire messages no model has read. That tail is left
+        unconsolidated and is picked up by the next pass, which charges its own
+        attempts against it.
         """
         try:
             attempts, retry_at = await asyncio.to_thread(
@@ -484,10 +542,12 @@ class HistoryConsolidator:
             key,
             attempts,
             reason,
-            span.total,
+            span.prompted - span.offset,
         )
         try:
-            await asyncio.to_thread(self._log.mark_consolidated, key, span.total, span.generation)
+            await asyncio.to_thread(
+                self._log.mark_consolidated, key, span.prompted, span.generation
+            )
         except Exception:
             # The count stays at the cap, so retry_eligible() keeps refusing —
             # the span stops spending even though the marker is missing.
@@ -709,7 +769,7 @@ class HistoryConsolidator:
         # The span identity any failure charge is stamped with. Rebuilt from the
         # snapshot below; the zero value only ever reaches a charge if the snapshot
         # itself raised, and that path is not billed.
-        attempted = AttemptedSpan(0, 0, 0)
+        attempted = AttemptedSpan(0, 0, 0, 0)
         try:
             # Atomically snapshot the unconsolidated tail, the total message
             # count (the absolute offset handed to mark_consolidated below), and
@@ -754,10 +814,26 @@ class HistoryConsolidator:
             # the same lock hold — no second read that a concurrent rotation could
             # land between. A failure charge stamped with these values describes
             # what the turn attempted even if the file changed underneath it.
+            offset = total - len(unconsolidated)
+            # Bound what this pass prompts, and mark exactly that. History
+            # consolidation owns a durable marker, so a bounded prompt is only
+            # safe if the marker follows the prompt rather than the snapshot:
+            # advancing to `total` after prompting a prefix is the same silent
+            # loss the bound exists to prevent, just moved.
+            #
+            # Prefs-only passes keep the whole tail. Their window is tracked by
+            # an in-memory offset that `maybe_consolidate`'s done-callback
+            # advances to the count it scheduled against, with no channel back
+            # from here — so bounding this prompt without also making that
+            # offset follow it would drop the remainder from preference and
+            # project extraction outright. Unbounded is the lesser fault while
+            # that offset is a scheduling artifact rather than a durable marker.
+            chunk = _consolidation_chunk(unconsolidated) if include_history else unconsolidated
             attempted = AttemptedSpan(
                 total=total,
                 generation=generation_at_snapshot,
-                offset=total - len(unconsolidated),
+                offset=offset,
+                prompted=offset + len(chunk),
             )
 
             # Resolve workspace-scoped memory from session metadata
@@ -770,7 +846,7 @@ class HistoryConsolidator:
             else:
                 memory = self._memory
 
-            conversation = "\n".join(_fmt_message(m) for m in unconsolidated)
+            conversation = "\n".join(_fmt_message(m) for m in chunk)
 
             current_prefs = memory.read_preferences()
             current_projects = memory.read_projects()
@@ -933,7 +1009,12 @@ class HistoryConsolidator:
                 # asyncio.create_task). Running it inline would let cross-process
                 # lock contention stall the whole gateway loop.
                 await run_in_embed_pool(memory.append_history, entry)
-                self._logger.info("Consolidated %d messages for %s", len(unconsolidated), key)
+                self._logger.info(
+                    "Consolidated %d of %d unconsolidated messages for %s",
+                    len(chunk),
+                    len(unconsolidated),
+                    key,
+                )
 
             # Structured memory writes (Phase 2/3). Offloaded to a worker thread:
             # _write_structured_memory embeds each item via a blocking urllib call
@@ -1033,6 +1114,13 @@ class HistoryConsolidator:
 
             # Only advance the consolidated offset for history consolidation.
             # Prefs-only consolidation uses a separate in-memory offset.
+            #
+            # The marker lands at the end of the PROMPTED prefix, not at the
+            # snapshot total: when the budget split the tail, everything past
+            # the prefix is still unread and the next pass starts there. A
+            # session whose tail outgrew one prompt therefore drains over
+            # successive passes instead of losing the remainder in one write.
+            #
             # mark_consolidated does a synchronous, fsync-backed rewrite of the
             # whole transcript (up to a couple of MB) behind the per-file lock.
             # _consolidate runs on the gateway event loop (fired via
@@ -1043,7 +1131,7 @@ class HistoryConsolidator:
                 await asyncio.to_thread(
                     self._log.mark_consolidated,
                     key,
-                    total,
+                    attempted.prompted,
                     generation_at_snapshot,
                 )
 
