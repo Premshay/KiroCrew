@@ -31,7 +31,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import aclosing, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,6 +95,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_STEER_ADVERTISED,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_CLIENT_CAPABILITIES,
+    CLAUDE_STEER_IDLE_BEHAVIOR,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -110,7 +111,6 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_CALL,
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
-    CLAUDE_STEER_IDLE_BEHAVIOR,
     JSONRPC_METHOD_NOT_FOUND,
     KNOWN_SESSION_UPDATES,
     METHOD_AGENT_SWITCHED,
@@ -3627,6 +3627,9 @@ class AcpClient:
         # agentInfo.version from the initialize response — the version the
         # spawned process runs, not the file on disk. "" until the handshake.
         self._agent_version = ""
+        # messageId -> (text streamed so far, number of deltas seen); see
+        # _is_replayed_message. Cleared per connection alongside _turn_done.
+        self._streamed_by_message_id: OrderedDict[str, tuple[str, int]] = OrderedDict()
         # Models advertised by the backend in the session/new (or session/load)
         # response. claude-agent-acp returns the real versioned Claude list
         # (Opus 4.8/4.7, Sonnet 4.6, …); kiro-cli returns its own. Captured so
@@ -6479,6 +6482,9 @@ class AcpClient:
         self._cancel_grace_secs = _CANCEL_GRACE_SECS
         self._resumed = False
         self._turn_done = asyncio.Event()
+        # Re-created, not cleared: _reset_state also runs on clients built
+        # without __init__ (test doubles), where the attribute is absent.
+        self._streamed_by_message_id = OrderedDict()
         self._last_stop_reason = ""
         self._pending_oauth_requests.clear()
         self._oauth_emitted_servers.clear()
@@ -9150,6 +9156,38 @@ class AcpClient:
         logger.warning("ACP: rejecting unknown server request: method=%s id=%s", msg.method, msg.id)
         await self._send_error(msg.id, JSONRPC_METHOD_NOT_FOUND, f"Method not found: {msg.method}")
 
+    #: How many in-flight assistant messages keep streaming state. A turn has
+    #: one; the rest is slack for a backend that interleaves.
+    _STREAM_MEMO_LIMIT = 8
+
+    def _is_replayed_message(self, message_id: object, text: str) -> bool:
+        """Whether this chunk merely repeats what the same message already streamed.
+
+        claude-agent-acp against an OpenAI-compatible endpoint sends the whole
+        assistant message once more after its deltas, under the same
+        ``messageId``. Read as another delta it doubles every paragraph the turn
+        produced — and because that text is what a sub-agent reports back, the
+        PARENT session pays for it twice. Captured live on the local fleet lane
+        2026-09-10: ``'alpha' + ' beta' + ' gamma'`` then ``'alpha beta gamma'``.
+
+        Two deltas must already have been seen before a match counts. A message
+        whose second delta happens to equal its first ("ha" + "ha") is
+        indistinguishable from a replay by text alone, and dropping a real
+        delta is the worse error: this returns False for it. A backend that
+        sends no ``messageId`` (kiro-cli) is never deduped, since without an
+        identity there is nothing to accumulate against.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            return False
+        streamed, deltas = self._streamed_by_message_id.get(message_id, ("", 0))
+        if deltas >= 2 and text == streamed:
+            return True
+        self._streamed_by_message_id[message_id] = (streamed + text, deltas + 1)
+        self._streamed_by_message_id.move_to_end(message_id)
+        while len(self._streamed_by_message_id) > self._STREAM_MEMO_LIMIT:
+            self._streamed_by_message_id.popitem(last=False)
+        return False
+
     def _extract_text_chunk(self, msg: JsonRpcMessage) -> tuple[str | None, bool]:
         """Extract text from an agent_message_chunk or agent_thought_chunk update.
 
@@ -9173,6 +9211,9 @@ class AcpClient:
             text = content.get("text")
             content_type = content.get("type", "text")
             is_thinking = content_type in ("thinking", "reasoning")
+            if not is_thinking and isinstance(text, str) and text:
+                if self._is_replayed_message(update.get("messageId"), text):
+                    return None, False
             return text, is_thinking
         if kind == UPDATE_AGENT_THOUGHT_CHUNK:
             content = update.get("content", {})
