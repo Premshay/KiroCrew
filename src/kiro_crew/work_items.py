@@ -992,7 +992,6 @@ def evaluate_items(
     return results
 
 
-
 # ---------------------------------------------------------------------------
 # Slice 3: launched-subagent assignment, launch receipts, worker surface.
 #
@@ -1441,27 +1440,34 @@ def _read_coordinator_key(dir_path: Path) -> str:
     return key
 
 
+def _worker_context_unlocked(
+    dir_path: Path, worker_key: str, item_id: str
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]:
+    """Re-verify ownership while the caller holds the coordinator store lock."""
+    _check_worker_key(worker_key)
+    coordinator_key = _read_coordinator_key(dir_path)
+    state = _read_state_unlocked(dir_path)
+    cycle = state["active_cycle"]
+    if cycle is None:
+        raise WorkItemAssignmentStale("the work cycle closed while the worker was acting")
+    try:
+        item = _find_item(cycle, item_id)
+    except WorkItemNotFound as exc:
+        raise WorkItemAssignmentStale("the work item is no longer active") from exc
+    assignment = item["assignment"]
+    if assignment is None or assignment["worker_session_key"] != worker_key:
+        raise WorkItemAssignmentDenied("the work item is not assigned to this worker")
+    if item["state"] in TERMINAL_STATES or assignment["status"] not in ASSIGNMENT_ACTIVE:
+        raise WorkItemAssignmentStale("the assignment is no longer active")
+    return state, item, assignment, coordinator_key
+
+
 def _worker_context(
     dir_path: Path, worker_key: str, item_id: str
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]:
-    """Re-verify ownership under the store lock before a worker read or write."""
-    _check_worker_key(worker_key)
-    coordinator_key = _read_coordinator_key(dir_path)
+    """Re-verify ownership under the store lock before a worker read."""
     with _locked(dir_path):
-        state = _read_state_unlocked(dir_path)
-        cycle = state["active_cycle"]
-        if cycle is None:
-            raise WorkItemAssignmentStale("the work cycle closed while the worker was acting")
-        try:
-            item = _find_item(cycle, item_id)
-        except WorkItemNotFound as exc:
-            raise WorkItemAssignmentStale("the work item is no longer active") from exc
-        assignment = item["assignment"]
-        if assignment is None or assignment["worker_session_key"] != worker_key:
-            raise WorkItemAssignmentDenied("the work item is not assigned to this worker")
-        if item["state"] in TERMINAL_STATES or assignment["status"] not in ASSIGNMENT_ACTIVE:
-            raise WorkItemAssignmentStale("the assignment is no longer active")
-        return state, item, assignment, coordinator_key
+        return _worker_context_unlocked(dir_path, worker_key, item_id)
 
 
 def _worker_view(item: dict[str, Any]) -> dict[str, Any]:
@@ -1532,19 +1538,22 @@ def worker_report_progress(
         raise WorkItemError("progress kind must be progress or blocker")
     event_text = _text(text, _MAX_TEXT, "text", required=True)
     dir_path, _raw, _item, _assignment = _find_worker_item(worker_key, item_id)
-    state, item, assignment, coordinator_key = _worker_context(dir_path, worker_key, item_id)
-    now = _now_iso()
-    _append_event(
-        item,
-        kind=kind,
-        text=event_text,
-        now=now,
-        actor=assignment["worker_fingerprint"],
-    )
-    item["updated_at"] = now
-    state["active_cycle"]["updated_at"] = now
-    _write_state(dir_path, coordinator_key, state)
-    return _worker_view(item)
+    with _locked(dir_path):
+        state, item, assignment, coordinator_key = _worker_context_unlocked(
+            dir_path, worker_key, item_id
+        )
+        now = _now_iso()
+        _append_event(
+            item,
+            kind=kind,
+            text=event_text,
+            now=now,
+            actor=assignment["worker_fingerprint"],
+        )
+        item["updated_at"] = now
+        state["active_cycle"]["updated_at"] = now
+        _write_state(dir_path, coordinator_key, state)
+        return _worker_view(item)
 
 
 def _normalize_handoff_input(
@@ -1603,30 +1612,33 @@ def worker_submit_handoff(
         outcome, next_action, verification, canonical_ref, blocker, release_condition
     )
     dir_path, _raw, _item, _assignment = _find_worker_item(worker_key, item_id)
-    state, item, assignment, coordinator_key = _worker_context(dir_path, worker_key, item_id)
-    now = _now_iso()
-    fingerprint = assignment["worker_fingerprint"]
-    item["worker_handoff"] = {
-        "outcome": outcome_text,
-        "canonical_ref": ref_text,
-        "next_action": action_text,
-        "verification": verification_text,
-        "blocker": blocker_text,
-        "release_condition": release_text,
-        "at": now,
-        "actor": fingerprint,
-    }
-    _append_event(
-        item,
-        kind="worker_handoff",
-        text=outcome_text,
-        now=now,
-        actor=fingerprint,
-    )
-    item["updated_at"] = now
-    state["active_cycle"]["updated_at"] = now
-    _write_state(dir_path, coordinator_key, state)
-    return _worker_view(item)
+    with _locked(dir_path):
+        state, item, assignment, coordinator_key = _worker_context_unlocked(
+            dir_path, worker_key, item_id
+        )
+        now = _now_iso()
+        fingerprint = assignment["worker_fingerprint"]
+        item["worker_handoff"] = {
+            "outcome": outcome_text,
+            "canonical_ref": ref_text,
+            "next_action": action_text,
+            "verification": verification_text,
+            "blocker": blocker_text,
+            "release_condition": release_text,
+            "at": now,
+            "actor": fingerprint,
+        }
+        _append_event(
+            item,
+            kind="worker_handoff",
+            text=outcome_text,
+            now=now,
+            actor=fingerprint,
+        )
+        item["updated_at"] = now
+        state["active_cycle"]["updated_at"] = now
+        _write_state(dir_path, coordinator_key, state)
+        return _worker_view(item)
 
 
 def _archive_path(dir_path: Path, cycle_id: str) -> Path:

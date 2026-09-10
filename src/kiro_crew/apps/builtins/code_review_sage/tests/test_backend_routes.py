@@ -2744,8 +2744,8 @@ class TestReviewersUsePoolConcurrency:
         await asyncio.gather(*(mod._run_review_bg(r, [f"https://x/pull/{i}"])
                                for i, r in enumerate(runs)))
 
-        assert seen.get("concurrency") == 0, (
-            "the backend must delegate concurrency to the bounded pool; got "
+        assert seen.get("concurrency") == 1, (
+            "the backend must serialize result attribution; got "
             f"{seen.get('concurrency')!r}")
 
 

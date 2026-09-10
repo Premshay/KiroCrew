@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { ClipboardCopy, ExternalLink, PackageCheck, Play, Send, Sparkle } from 'lucide-react'
 
+import SimpleSelect from '../../components/SimpleSelect'
 import { S } from './styles'
 import type { DesignRound, ReviewBrief, Report } from './types'
 
@@ -56,10 +57,15 @@ export default function DesignRoundPanel(p: Props) {
         <p style={{ ...S.cardHint, margin: 0 }}>
           Prepare an immutable, grounded round from this critique. Opening Claude Design and sending it are explicit owner actions; DesignSync’s file list is the source of truth while it builds.
         </p>
-        <select aria-label="Claude Design output mode" style={S.contextInput} value={mode} disabled={p.busy} onChange={(event) => setMode(event.target.value as typeof mode)}>
-          <option value="generate-design">Static high-fidelity design</option>
-          <option value="generate-prototype">Interactive prototype</option>
-        </select>
+        <SimpleSelect
+          aria-label="Claude Design output mode"
+          style={S.contextInput}
+          value={mode}
+          disabled={p.busy}
+          options={['generate-design', 'generate-prototype']}
+          optionLabels={['Static high-fidelity design', 'Interactive prototype']}
+          onChange={(value) => setMode(value as typeof mode)}
+        />
         <textarea
           style={{ ...S.contextInput, minHeight: '56px', resize: 'vertical' }} value={target}
           disabled={p.busy} placeholder="What should this round design or transform?"

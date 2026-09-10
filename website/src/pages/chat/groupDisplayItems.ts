@@ -1,14 +1,14 @@
-import type { ChatMessage } from '../../types'
-import type { DisplayItem, TurnItem } from './types'
-import { isSubagentCompletionMessage } from './subagentCompletion'
-import { isPeerChannelTurnOpener } from './peerChannelRequest'
-import { isNoteRow } from '../../lib/noteContract'
+import type { ChatMessage } from "../../types";
+import type { DisplayItem, TurnItem } from "./types";
+import { isSubagentCompletionMessage } from "./subagentCompletion";
+import { isPeerChannelTurnOpener } from "./peerChannelRequest";
+import { isNoteRow } from "../../lib/noteContract";
 
 /** Roles that fold into a collapsible group in the turn view. Thinking is NOT
  *  here: it carries real content and renders as its own standalone block (a
  *  content-bearing reasoning trace), so grouping it into the "N tool calls"
  *  collapsible would bury and mislabel it. */
-export const GROUPABLE = new Set(['permission'])
+export const GROUPABLE = new Set(["permission"]);
 
 /**
  * The reasoning roles, and what "content-bearing reasoning" means. These are
@@ -32,22 +32,26 @@ export const GROUPABLE = new Set(['permission'])
  * mechanics in chatSlice are a different concern — they manage streaming
  * placeholders, not display classification — and deliberately stay separate.)
  */
-export const REASONING_ROLES = ['thinking'] as const
+export const REASONING_ROLES = ["thinking"] as const;
 
-const REASONING_ROLE_SET: ReadonlySet<string> = new Set(REASONING_ROLES)
+const REASONING_ROLE_SET: ReadonlySet<string> = new Set(REASONING_ROLES);
 
 /** Is this message a reasoning trace (regardless of whether it has content)?
  *  Structurally typed so raw-snapshot (wire-shape) surfaces can reuse it. */
 export const isReasoningRole = (msg: { role: string }): boolean =>
-  REASONING_ROLE_SET.has(msg.role)
+  REASONING_ROLE_SET.has(msg.role);
 
 /** A content-bearing reasoning message; empty placeholders render nothing and never count. */
-export const hasReasoningContent = (msg: { role: string; content: string }): boolean =>
-  isReasoningRole(msg) && !!msg.content
+export const hasReasoningContent = (msg: {
+  role: string;
+  content: string;
+}): boolean => isReasoningRole(msg) && !!msg.content;
 
 /** Item-level form of {@link hasReasoningContent} for TurnItem scans. */
-export const isReasoningBurst = (t: TurnItem): t is Extract<TurnItem, { kind: 'single' }> =>
-  t.kind === 'single' && hasReasoningContent(t.msg)
+export const isReasoningBurst = (
+  t: TurnItem,
+): t is Extract<TurnItem, { kind: "single" }> =>
+  t.kind === "single" && hasReasoningContent(t.msg);
 
 /**
  * Roles that OPEN a turn, and are therefore the rows a reader can be anchored to.
@@ -59,7 +63,7 @@ export const isReasoningBurst = (t: TurnItem): t is Extract<TurnItem, { kind: 's
  * that opened a turn without being pinnable made the pin scan walk past every one
  * of them — measured at a 61-display-row gap in a loop-driven session.
  */
-export const TURN_OPENER_ROLES = new Set(['user', 'nudge', 'subagent'])
+export const TURN_OPENER_ROLES = new Set(["user", "nudge", "subagent"]);
 
 /**
  * Whether *msg* opens a turn — the single predicate both this pass and the
@@ -78,7 +82,7 @@ export const TURN_OPENER_ROLES = new Set(['user', 'nudge', 'subagent'])
  * every opener it does not recognise.
  */
 export const isTurnOpener = (msg: ChatMessage): boolean =>
-  TURN_OPENER_ROLES.has(msg.role) || isPeerChannelTurnOpener(msg)
+  TURN_OPENER_ROLES.has(msg.role) || isPeerChannelTurnOpener(msg);
 
 /**
  * The synthesis injection that closes a sub-agent fan-out.
@@ -93,8 +97,30 @@ export const isTurnOpener = (msg: ChatMessage): boolean =>
  * that may be reworded, the meta key is a wire contract.
  */
 const isSynthesisInjection = (msg: ChatMessage): boolean =>
-  msg.role === 'inject' &&
-  (msg.meta as Record<string, unknown> | undefined)?.injectKind === 'synthesis'
+  msg.role === "inject" &&
+  (msg.meta as Record<string, unknown> | undefined)?.injectKind === "synthesis";
+
+/**
+ * The last assistant row of a COMPLETED turn, identified by the per-turn stats
+ * the runner stamps on exactly that row (`_attach_turn_stats`, chat_runner.py).
+ *
+ * This is how the region walk finds where a synthesis turn ENDED. A synthesis
+ * row opens a turn whose answer is real, user-facing content no later synthesis
+ * restates, so that answer must stay outside every later fold — but the rows
+ * after it, which belong to the NEXT wave, are interim work that should fold.
+ * Nothing else in the display layer marks a turn boundary: the runner's
+ * `chat_segment` finalize is a live wire event, not a property of a persisted
+ * row, so a reload has only this meta to go on.
+ *
+ * A turn that produced no assistant message carries no stats, and neither does
+ * an answer still streaming. Both are handled by the caller degrading to the
+ * previous behaviour (leave the region unfolded) rather than guessing a
+ * boundary, because a wrong guess hides an answer behind a toggle that promises
+ * a repeat below.
+ */
+const isTurnEnd = (msg: ChatMessage): boolean =>
+  msg.role === "assistant" &&
+  !!(msg.meta as Record<string, unknown> | undefined)?.turn_stats;
 
 /**
  * An injected row that is NOT part of the fan-out, and whose presence therefore
@@ -117,26 +143,26 @@ const isSynthesisInjection = (msg: ChatMessage): boolean =>
  * `recovery` is deliberately NOT here: a tool-stall recovery inside a fan-out is
  * a continuation of the very work being folded.
  */
-const FOREIGN_INJECT_KINDS = new Set(['cron', 'user_replay'])
+const FOREIGN_INJECT_KINDS = new Set(["cron", "user_replay"]);
 const isForeignInjection = (msg: ChatMessage): boolean => {
-  if (msg.role !== 'inject') return false
-  if (isNoteRow(msg)) return true
-  const kind = (msg.meta as Record<string, unknown> | undefined)?.injectKind
-  return typeof kind === 'string' && FOREIGN_INJECT_KINDS.has(kind)
-}
+  if (msg.role !== "inject") return false;
+  if (isNoteRow(msg)) return true;
+  const kind = (msg.meta as Record<string, unknown> | undefined)?.injectKind;
+  return typeof kind === "string" && FOREIGN_INJECT_KINDS.has(kind);
+};
 
 /** A dashboard row emitted while no prompt is consuming the provider stream. */
 const isBetweenTurnWork = (item: TurnItem): boolean =>
-  item.kind === 'single' && item.msg.meta?.between_turn === true
+  item.kind === "single" && item.msg.meta?.between_turn === true;
 
 export interface GroupedTurns {
-  turns: DisplayItem[]
+  turns: DisplayItem[];
   /** Index into `turns` of the turn object produced by the TRAILING flush, or
    *  -1 when the trailing group did not collapse into a turn (it was spread as
    *  loose items instead, and so carries no `complete` flag). This is the only
    *  element whose `complete` value depends on whether the slot is still
    *  running. */
-  trailingTurnIdx: number
+  trailingTurnIdx: number;
 }
 
 /**
@@ -153,15 +179,15 @@ export interface GroupedTurns {
  * The trailing (still-running) turn is never part of a folded region.
  */
 function foldInterimRegion(turns: DisplayItem[], start: number): void {
-  if (start >= turns.length) return
-  const region = turns.splice(start)
-  const items: TurnItem[] = []
+  if (start >= turns.length) return;
+  const region = turns.splice(start);
+  const items: TurnItem[] = [];
   for (const d of region) {
-    if (d.kind === 'turn') items.push(...d.items)
-    else items.push(d)
+    if (d.kind === "turn") items.push(...d.items);
+    else items.push(d);
   }
-  if (items.length === 0) return
-  turns.push({ kind: 'turn', items, complete: true, interim: true })
+  if (items.length === 0) return;
+  turns.push({ kind: "turn", items, complete: true, interim: true });
 }
 
 /**
@@ -180,48 +206,65 @@ function foldInterimRegion(turns: DisplayItem[], start: number): void {
  */
 export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
   // Phase 1: build raw items (singles + groups)
-  const raw: TurnItem[] = []
-  let group: ChatMessage[] = [], groupStart = 0
+  const raw: TurnItem[] = [];
+  let group: ChatMessage[] = [],
+    groupStart = 0;
   for (let i = 0; i < messages.length; i++) {
     // Permission messages handled by pinned ApprovalBar — skip entirely
-    if (messages[i].role === 'permission') continue
+    if (messages[i].role === "permission") continue;
     // A sub-agent completion the card cannot parse stays internal: the LLM sees
     // it, the user does not. One it CAN parse renders as a compact outcome row,
     // which is the only scrollback record that a wave's results arrived.
-    if (messages[i].role === 'subagent' && !isSubagentCompletionMessage(messages[i])) continue
+    if (
+      messages[i].role === "subagent" &&
+      !isSubagentCompletionMessage(messages[i])
+    )
+      continue;
     if (GROUPABLE.has(messages[i].role)) {
-      if (!group.length) groupStart = i
-      group.push(messages[i])
+      if (!group.length) groupStart = i;
+      group.push(messages[i]);
     } else {
-      if (group.length) { raw.push({ kind: 'group', msgs: group, startIdx: groupStart }); group = [] }
-      raw.push({ kind: 'single', msg: messages[i], idx: i })
+      if (group.length) {
+        raw.push({ kind: "group", msgs: group, startIdx: groupStart });
+        group = [];
+      }
+      raw.push({ kind: "single", msg: messages[i], idx: i });
     }
   }
-  if (group.length) raw.push({ kind: 'group', msgs: group, startIdx: groupStart })
+  if (group.length)
+    raw.push({ kind: "group", msgs: group, startIdx: groupStart });
 
   // Phase 2: group into turns (user message → next user message).
   // A pending synthesis makes the immediate per-completion assistant summary
   // redundant. Keep that suppression separate from the durable between-turn
   // boundary below: neither kind of work belongs to the preceding user turn.
-  let lastSubagentHadSynthesis = false
-  let inBetweenTurnWork = false
-  const turns: DisplayItem[] = []
-  let turnItems: TurnItem[] = []
+  let lastSubagentHadSynthesis = false;
+  let inBetweenTurnWork = false;
+  const turns: DisplayItem[] = [];
+  let turnItems: TurnItem[] = [];
   // First index in `turns` after the last USER/nudge prompt — the start of the
   // region a synthesis injection retroactively folds as interim. A sub-agent
   // completion deliberately does NOT reset it: the completions, and the replies
   // the agent writes to each of them, ARE the interim work being folded.
-  let regionStart = 0
+  let regionStart = 0;
   // Set when the open region also carries an injected row that the synthesis
   // turn will not restate (see isForeignInjection). Such a region is left
   // UNFOLDED — degrading to the pre-fold rendering is always safe, whereas
   // folding it would hide unrelated content behind the fan-out's toggle.
-  let regionHasForeign = false
+  let regionHasForeign = false;
+  // Set while the batch being accumulated still holds an un-flushed synthesis
+  // ANSWER, which `settlePendingSynthesisAnswer` below splits off before any
+  // later fold can reach it.
+  let pendingSynthesisAnswer = false;
   const hasWorkingSteps = (items: TurnItem[]) =>
-    items.some(t =>
-      (t.kind === 'single' && (t.msg.role === 'tool' || t.msg.role === 'assistant' || t.msg.role === 'streaming')) ||
-      t.kind === 'group'
-    )
+    items.some(
+      (t) =>
+        (t.kind === "single" &&
+          (t.msg.role === "tool" ||
+            t.msg.role === "assistant" ||
+            t.msg.role === "streaming")) ||
+        t.kind === "group",
+    );
   // A batch that carries TWO OR MORE content-bearing reasoning bursts must be
   // wrapped as a {kind:'turn'}, even when it has no tool/assistant "working
   // steps" and even when it is short. The per-turn reasoning-burst dedup
@@ -241,93 +284,168 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
   // a separate predicate. Empty placeholder bursts do not count (they render
   // nothing, and mergeTurnThinking ignores them too).
   const contentThinkingCount = (items: TurnItem[]) =>
-    items.reduce((n, t) => n + (isReasoningBurst(t) ? 1 : 0), 0)
+    items.reduce((n, t) => n + (isReasoningBurst(t) ? 1 : 0), 0);
   const flushTurn = (items: TurnItem[], complete: boolean) => {
-    if ((hasWorkingSteps(items) && items.length > 2) || contentThinkingCount(items) >= 2) {
-      turns.push({ kind: 'turn', items, complete })
+    if (
+      (hasWorkingSteps(items) && items.length > 2) ||
+      contentThinkingCount(items) >= 2
+    ) {
+      turns.push({ kind: "turn", items, complete });
     } else {
-      turns.push(...items)
+      turns.push(...items);
     }
-  }
+  };
+  /**
+   * Settle an un-flushed synthesis ANSWER sitting at the head of the open batch.
+   *
+   * A synthesis row opens a turn whose answer is real, user-facing content that
+   * no later synthesis restates, so it must never end up inside a later wave's
+   * fold. Splitting it off at its turn boundary and re-anchoring the region
+   * behind it is what lets the rows AFTER it — the next wave's interim work —
+   * fold normally.
+   *
+   * Called at EVERY flush site that can be holding such an answer: the synthesis
+   * branch, and the `subagent` turn-opener a queue-drained completion arrives
+   * as. Missing the second one let the next synthesis mistake that wave's own
+   * per-completion reply for the answer boundary and leave the wave unfolded.
+   *
+   * With no locatable turn end the answer cannot be separated, so the region is
+   * marked foreign and degrades to UNFOLDED — the pre-fix rendering. Showing
+   * interim prose is a cosmetic cost; hiding an answer behind a toggle that
+   * promises a repeat below is a correctness one.
+   */
+  const settlePendingSynthesisAnswer = () => {
+    if (!pendingSynthesisAnswer) return;
+    const end = turnItems.findIndex(
+      (t) => t.kind === "single" && isTurnEnd(t.msg),
+    );
+    if (end >= 0) {
+      flushTurn(turnItems.slice(0, end + 1), true);
+      turnItems = turnItems.slice(end + 1);
+      regionStart = turns.length;
+      // A fresh region starts after the answer, so a foreign row that
+      // disqualified the PREVIOUS one must not disqualify this one too —
+      // otherwise one cron reply in wave 1 suppresses every later wave's fold.
+      // RE-DERIVED, never simply cleared: the retained batch can itself hold the
+      // foreign row the old flag was set for (a cron drained AFTER the answer),
+      // and clearing on that would fold an unrelated prompt's reply behind the
+      // fan-out toggle — the exact outcome the foreign guard exists to prevent.
+      // A foreign row arriving later still raises the flag on its own.
+      regionHasForeign = turnItems.some(
+        (t) => t.kind === "single" && isForeignInjection(t.msg),
+      );
+    } else {
+      regionHasForeign = true;
+    }
+    pendingSynthesisAnswer = false;
+  };
   for (const item of raw) {
     // The synthesis injection closes a fan-out: flush what is open, then fold
     // everything since the user's prompt into ONE interim turn. Checked BEFORE
     // the opener test because an `inject` row is not an opener — without this it
     // would be swallowed into the region it is supposed to terminate, and the
     // synthesis answer would fold away with the summaries it replaces.
-    if (item.kind === 'single' && isSynthesisInjection(item.msg)) {
-      if (turnItems.length > 0) { flushTurn(turnItems, true); turnItems = [] }
-      if (!regionHasForeign) foldInterimRegion(turns, regionStart)
+    if (item.kind === "single" && isSynthesisInjection(item.msg)) {
+      // A previous synthesis in this same user turn left its answer inside the
+      // open batch; get it out before the fold below runs.
+      settlePendingSynthesisAnswer();
+      if (turnItems.length > 0) {
+        flushTurn(turnItems, true);
+        turnItems = [];
+      }
+      if (!regionHasForeign) foldInterimRegion(turns, regionStart);
       // The synthesis row leads the turn that carries the answer, so it opens
       // the next batch rather than joining the region behind it.
-      turnItems.push(item)
-      regionStart = turns.length
+      turnItems.push(item);
+      regionStart = turns.length;
       // ...and that batch will contain the synthesis ANSWER, which is a real
       // answer no LATER synthesis restates. A synthesis turn can itself spawn a
       // wave (the gateway re-arms `_pending_synthesis` whenever a wave's last
       // agent finishes, whichever turn spawned it), putting a second synthesis
-      // row in the same user turn — and the batch opened here does not reach
-      // `turns` until that second row flushes it, so an unguarded fold would
-      // collapse round one's answer behind round two's toggle. Marking the new
-      // region foreign keeps it unfolded: a nested wave's interim work then
-      // renders as it did before this change, which is the safe direction.
-      regionHasForeign = true
-      continue
+      // row in the same user turn. That answer must stay outside round two's
+      // fold — but the rows AFTER it are round two's interim work and must fold,
+      // which is why this no longer disqualifies the whole region: doing so left
+      // every wave after the first rendering its per-completion prose in full,
+      // beside a synthesis that restates it — the duplication the fold exists
+      // to remove.
+      pendingSynthesisAnswer = true;
+      continue;
     }
-    if (item.kind === 'single' && isForeignInjection(item.msg)) regionHasForeign = true
+    if (item.kind === "single" && isForeignInjection(item.msg))
+      regionHasForeign = true;
     // Between-turn provider output is a new lifecycle without a user-authored
     // opener. Flush the completed foreground turn before it so the idle reply
     // cannot become that turn's conclusion or be folded by a later synthesis.
-    const startsBetweenTurnWork = isBetweenTurnWork(item) && !inBetweenTurnWork
-    inBetweenTurnWork = isBetweenTurnWork(item)
+    const startsBetweenTurnWork = isBetweenTurnWork(item) && !inBetweenTurnWork;
+    inBetweenTurnWork = isBetweenTurnWork(item);
     if (startsBetweenTurnWork) {
-      if (turnItems.length > 0) { flushTurn(turnItems, true); turnItems = [] }
-      lastSubagentHadSynthesis = false
-      regionHasForeign = true
-      turnItems.push(item)
-      continue
+      if (turnItems.length > 0) {
+        flushTurn(turnItems, true);
+        turnItems = [];
+      }
+      lastSubagentHadSynthesis = false;
+      regionHasForeign = true;
+      turnItems.push(item);
+      continue;
     }
     // A nudge opens a new turn exactly like a user message does — it IS the
     // turn's prompt. Without this it gets swallowed into the previous turn's
     // collapsed step group and the cycle chip disappears. A sub-agent
     // completion is the same case: the gateway injects it as the next turn's
     // input, so the agent's reply belongs BELOW the card, not beside it.
-    if (item.kind === 'single' && isTurnOpener(item.msg)) {
-      if (turnItems.length > 0) { flushTurn(turnItems, true); turnItems = [] }
-      lastSubagentHadSynthesis = item.msg.role === 'subagent' &&
-        !!(item.msg.meta as Record<string, unknown> | undefined)?.synthesisPending
-      turns.push(item)
+    if (item.kind === "single" && isTurnOpener(item.msg)) {
+      // A `subagent` completion opener flushes the open batch WITHOUT resetting
+      // the region (the completions are part of the interim work), so an answer
+      // still sitting in that batch has to be settled here too -- otherwise it
+      // is flushed into the region a later synthesis folds, and that synthesis
+      // then reads the next wave's own reply as the answer boundary.
+      settlePendingSynthesisAnswer();
+      if (turnItems.length > 0) {
+        flushTurn(turnItems, true);
+        turnItems = [];
+      }
+      lastSubagentHadSynthesis =
+        item.msg.role === "subagent" &&
+        !!(item.msg.meta as Record<string, unknown> | undefined)
+          ?.synthesisPending;
+      turns.push(item);
       // A user/nudge prompt begins a fresh interim region; a sub-agent
       // completion belongs to the one already open.
-      if (item.msg.role !== 'subagent') { regionStart = turns.length; regionHasForeign = false }
-      continue
+      if (item.msg.role !== "subagent") {
+        regionStart = turns.length;
+        regionHasForeign = false;
+        // The prompt ends the previous fan-out outright: any synthesis answer it
+        // left behind is now in a region no later fold can reach.
+        pendingSynthesisAnswer = false;
+      }
+      continue;
     }
     if (
       lastSubagentHadSynthesis &&
-      item.kind === 'single' &&
-      (item.msg.role === 'assistant' || item.msg.role === 'streaming') &&
+      item.kind === "single" &&
+      (item.msg.role === "assistant" || item.msg.role === "streaming") &&
       !isSubagentCompletionMessage(item.msg)
     ) {
-      lastSubagentHadSynthesis = false
-      continue
+      lastSubagentHadSynthesis = false;
+      continue;
     }
-    lastSubagentHadSynthesis = false
-    turnItems.push(item)
+    lastSubagentHadSynthesis = false;
+    turnItems.push(item);
   }
   // Flush the trailing group as complete, and remember whether that flush
   // actually produced a turn object (flushTurn spreads the items instead when
   // the turn is too short to collapse). Only that element carries a `complete`
   // flag for the running state to affect.
-  let trailingTurnIdx = -1
+  let trailingTurnIdx = -1;
   if (turnItems.length > 0) {
-    const before = turns.length
-    flushTurn(turnItems, true)
-    const last = turns[turns.length - 1]
-    if (turns.length === before + 1 && last && last.kind === 'turn') {
-      trailingTurnIdx = turns.length - 1
+    const before = turns.length;
+    flushTurn(turnItems, true);
+    const last = turns[turns.length - 1];
+    if (turns.length === before + 1 && last && last.kind === "turn") {
+      trailingTurnIdx = turns.length - 1;
     }
   }
-  return { turns, trailingTurnIdx }
+  return { turns, trailingTurnIdx };
 }
 
 /** Two turn items describe the same rows: same kind, same underlying message
@@ -341,27 +459,32 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
 // future field derived from anything else will be silently frozen by the
 // substitution — such a field must be added to these comparisons.
 const sameTurnItem = (a: TurnItem, b: TurnItem): boolean => {
-  if (a.kind === 'single') return b.kind === 'single' && a.msg === b.msg && a.idx === b.idx
-  if (b.kind !== 'group') return false
-  if (a.startIdx !== b.startIdx || a.msgs.length !== b.msgs.length) return false
-  for (let i = 0; i < a.msgs.length; i++) if (a.msgs[i] !== b.msgs[i]) return false
-  return true
-}
+  if (a.kind === "single")
+    return b.kind === "single" && a.msg === b.msg && a.idx === b.idx;
+  if (b.kind !== "group") return false;
+  if (a.startIdx !== b.startIdx || a.msgs.length !== b.msgs.length)
+    return false;
+  for (let i = 0; i < a.msgs.length; i++)
+    if (a.msgs[i] !== b.msgs[i]) return false;
+  return true;
+};
 
 const sameDisplayItem = (a: DisplayItem, b: DisplayItem): boolean => {
-  if (a.kind === 'turn') {
-    if (b.kind !== 'turn') return false
-    if (a.complete !== b.complete || a.items.length !== b.items.length) return false
+  if (a.kind === "turn") {
+    if (b.kind !== "turn") return false;
+    if (a.complete !== b.complete || a.items.length !== b.items.length)
+      return false;
     // Part of the PURITY INVARIANT above: `interim` is derived from the message
     // list (the presence of a synthesis row), so it must be compared or the
     // substitution below would freeze a turn at a stale fold state.
-    if (!!a.interim !== !!b.interim) return false
-    for (let i = 0; i < a.items.length; i++) if (!sameTurnItem(a.items[i], b.items[i])) return false
-    return true
+    if (!!a.interim !== !!b.interim) return false;
+    for (let i = 0; i < a.items.length; i++)
+      if (!sameTurnItem(a.items[i], b.items[i])) return false;
+    return true;
   }
-  if (b.kind === 'turn') return false
-  return sameTurnItem(a, b)
-}
+  if (b.kind === "turn") return false;
+  return sameTurnItem(a, b);
+};
 
 /**
  * Identity-preserving wrapper around {@link groupDisplayItems}.
@@ -387,31 +510,32 @@ const sameDisplayItem = (a: DisplayItem, b: DisplayItem): boolean => {
  * whatever this returns.
  */
 export function createTurnGrouper(): (messages: ChatMessage[]) => GroupedTurns {
-  let prevMessages: ChatMessage[] | null = null
-  let prevResult: GroupedTurns | null = null
+  let prevMessages: ChatMessage[] | null = null;
+  let prevResult: GroupedTurns | null = null;
   return (messages: ChatMessage[]): GroupedTurns => {
-    if (prevMessages === messages && prevResult) return prevResult
-    const next = groupDisplayItems(messages)
+    if (prevMessages === messages && prevResult) return prevResult;
+    const next = groupDisplayItems(messages);
     if (prevResult) {
-      const prevTurns = prevResult.turns
-      let allReused = next.turns.length === prevTurns.length &&
-        next.trailingTurnIdx === prevResult.trailingTurnIdx
+      const prevTurns = prevResult.turns;
+      let allReused =
+        next.turns.length === prevTurns.length &&
+        next.trailingTurnIdx === prevResult.trailingTurnIdx;
       for (let i = 0; i < next.turns.length; i++) {
-        const p = prevTurns[i]
-        if (p && sameDisplayItem(next.turns[i], p)) next.turns[i] = p
-        else allReused = false
+        const p = prevTurns[i];
+        if (p && sameDisplayItem(next.turns[i], p)) next.turns[i] = p;
+        else allReused = false;
       }
       // Every element (and the trailing index) survived: keep the previous
       // top-level object too, so the [groupedTurns] memos downstream also hit.
       if (allReused) {
-        prevMessages = messages
-        return prevResult
+        prevMessages = messages;
+        return prevResult;
       }
     }
-    prevMessages = messages
-    prevResult = next
-    return next
-  }
+    prevMessages = messages;
+    prevResult = next;
+    return next;
+  };
 }
 
 /**
@@ -419,11 +543,14 @@ export function createTurnGrouper(): (messages: ChatMessage[]) => GroupedTurns {
  * still running the trailing turn is not complete yet, so exactly one element is
  * replaced and every other item keeps its identity.
  */
-export function applyRunningState(grouped: GroupedTurns, slotRunning: boolean): DisplayItem[] {
-  const { turns, trailingTurnIdx } = grouped
-  if (trailingTurnIdx < 0 || !slotRunning) return turns
-  const out = turns.slice()
-  const t = out[trailingTurnIdx]
-  if (t && t.kind === 'turn') out[trailingTurnIdx] = { ...t, complete: false }
-  return out
+export function applyRunningState(
+  grouped: GroupedTurns,
+  slotRunning: boolean,
+): DisplayItem[] {
+  const { turns, trailingTurnIdx } = grouped;
+  if (trailingTurnIdx < 0 || !slotRunning) return turns;
+  const out = turns.slice();
+  const t = out[trailingTurnIdx];
+  if (t && t.kind === "turn") out[trailingTurnIdx] = { ...t, complete: false };
+  return out;
 }

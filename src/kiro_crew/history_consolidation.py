@@ -70,6 +70,7 @@ _CONSOLIDATION_NO_LANE_RETRY_S = 5 * 60.0
 # This conservative character window leaves room for provider-supplied context
 # while preserving message boundaries.
 _CONSOLIDATION_CHUNK_MAX_CHARS = 64 * 1024
+_CONSOLIDATION_OVERSIZED_MESSAGE_MAX_CHARS = 8 * 1024
 # The dedicated session key consolidation turns run under, so a long
 # consolidation never queues behind short title/metadata jobs on the shared
 # background session.
@@ -234,10 +235,19 @@ def _consolidation_chunk(messages: list[dict]) -> list[dict]:
     size = 0
     for message in messages:
         rendered_size = len(_fmt_message(message))
+        if rendered_size > _CONSOLIDATION_OVERSIZED_MESSAGE_MAX_CHARS:
+            truncated = dict(message)
+            marker = "\n[content truncated for consolidation]"
+            content = str(truncated.get("content", ""))
+            overhead = rendered_size - len(content)
+            content_limit = max(
+                0, _CONSOLIDATION_OVERSIZED_MESSAGE_MAX_CHARS - overhead - len(marker)
+            )
+            truncated["content"] = content[:content_limit] + marker
+            message = truncated
+            rendered_size = len(_fmt_message(message))
         if chunk and size + rendered_size > _CONSOLIDATION_CHUNK_MAX_CHARS:
             break
-        if not chunk and rendered_size > _CONSOLIDATION_CHUNK_MAX_CHARS:
-            return []
         chunk.append(message)
         size += rendered_size
     return chunk
@@ -395,11 +405,14 @@ def _strip_skill_frontmatter(text: str | None) -> str:
     ``stage_skill_candidate`` re-emits frontmatter of its own. Text without a
     leading block is returned unchanged (stripped). A fence LOCATOR, not a
     field parser — deliberately outside ``kiro_crew.frontmatter``; editing
-    its grammar means revisiting ``_frontmatter_value``'s dialect too.
+    its grammar means revisiting ``_frontmatter_value``'s dialect too. Like
+    that dialect's fence, an optional carriage return before each fence
+    newline is tolerated, so the locator strips exactly the block the field
+    parser reads.
     """
     if not text:
         return ""
-    m = re.match(r"^\s*---\n.*?\n---\n?(.*)$", text, re.DOTALL)
+    m = re.match(r"^\s*---\r?\n.*?\r?\n---\r?\n?(.*)$", text, re.DOTALL)
     return (m.group(1) if m else text).strip()
 
 

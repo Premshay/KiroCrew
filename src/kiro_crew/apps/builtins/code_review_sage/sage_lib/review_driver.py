@@ -1203,38 +1203,23 @@ def run_review(
         failed_records: list[dict] = []
         for link in changes:
             change_id = _cid(link)
-            progress(change_id, "failed", {"error": runtime_error})
-            failed_records.append(
-                {
-                    "change": link,
-                    "change_id": change_id,
-                    "gate_spawn_ok": False,
-                    "gate_error": runtime_error,
-                    "gate_verdict": "UNKNOWN",
-                    "phase2_ran": False,
-                    "deep_spawn_ok": False,
-                    "deep_error": runtime_error,
-                    "deep_reviewed": False,
-                    "result_recorded": False,
-                    "design_block": False,
-                    "deep_rounds": 0,
-                    "skipped_reason": "runtime_unavailable",
-                }
-            )
+            progress(change_id, "failed", {
+                "error": runtime_error, "reason": "runtime_unavailable"})
+            failed_records.append({
+                "change": link, "change_id": change_id,
+                "gate_spawn_ok": False, "gate_error": runtime_error,
+                "gate_verdict": "UNKNOWN", "phase2_ran": False,
+                "deep_spawn_ok": False, "deep_error": runtime_error,
+                "deep_reviewed": False, "result_recorded": False,
+                "design_block": False, "deep_rounds": 0,
+                "skipped_reason": "runtime_unavailable",
+            })
         return {
-            "ok": False,
-            "error": runtime_error,
-            "changes": len(failed_records),
-            "gate_spawns": 0,
-            "deep_spawns": 0,
-            "design_blocked": 0,
-            "phase2_skipped_on_block": 0,
-            "cancelled": 0,
-            "deep_reviewed": 0,
-            "deep_rounds": 0,
-            "design_comments_posted": 0,
-            "result_records": 0,
-            "failures": failed_records,
+            "ok": False, "error": runtime_error,
+            "changes": len(failed_records), "gate_spawns": 0, "deep_spawns": 0,
+            "design_blocked": 0, "phase2_skipped_on_block": 0, "cancelled": 0,
+            "deep_reviewed": 0, "deep_rounds": 0, "design_comments_posted": 0,
+            "result_records": 0, "failures": failed_records,
             "per_change": failed_records,
         }
 
@@ -1359,7 +1344,8 @@ def run_review(
             )
         except pipeline.adapters.AdapterError as exc:
             refused = f"refusing to review: {exc}"
-            progress(change_id, "failed", {"error": refused})
+            progress(change_id, "failed", {
+                "error": refused, "reason": "review_failed"})
             return {
                 "change": link,
                 "change_id": change_id,
@@ -1423,7 +1409,9 @@ def run_review(
         # already-written verdicts/findings.
         if not review_spawn.get("ok", False):
             rec["skipped_reason"] = "review_failed"
-            progress(change_id, "failed", {"error": review_spawn.get("error", "review failed")})
+            progress(change_id, "failed", {
+                "error": review_spawn.get("error", "review failed"),
+                "reason": "review_failed"})
             return rec
         if not rec["deep_reviewed"]:
             if rev_rec is None:
@@ -1433,17 +1421,17 @@ def run_review(
                 # consumers key on; environment failures are discriminated by
                 # the preflight before any dispatch.
                 rec["skipped_reason"] = "no_review_recorded"
-                progress(change_id, "failed", {"error": "review produced no result record"})
+                progress(change_id, "failed", {
+                    "error": "review produced no result record",
+                    "reason": "no_review_recorded"})
             else:
                 # A record landed but never marked the review complete: the
                 # worker got far enough to write, then stopped short. Distinct
                 # from "wrote nothing" so the two can be triaged apart.
                 rec["skipped_reason"] = "review_record_incomplete"
-                progress(
-                    change_id,
-                    "failed",
-                    {"error": "review wrote a result record but never completed the review"},
-                )
+                progress(change_id, "failed", {
+                    "error": "review wrote a result record but never completed the review",
+                    "reason": "review_record_incomplete"})
             return rec
 
         # --- Bounded coverage backstop: AT MOST ONE targeted follow-up, and only

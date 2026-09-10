@@ -33,6 +33,7 @@ from kiro_crew.dashboard.handlers_channel import (
     api_channel_post,
     deliver_attached_channel_message,
 )
+from kiro_crew.dashboard.session_control import containment_meta
 from kiro_crew.dashboard.state import (
     PEER_CHANNEL_REQUEST_KIND,
     PEER_CHANNEL_REQUEST_PREFIX,
@@ -118,6 +119,9 @@ class TestSessionChannelTools:
             }
         )
         monkeypatch.setattr(mcp_core, "_post", post)
+        monkeypatch.setattr(
+            mcp_core, "_resolve_session_key_strict", lambda: "dashboard:crew-codex"
+        )
 
         result = mcp_core._call_tool_inner(
             "session_channel_post",
@@ -194,6 +198,9 @@ class TestSessionChannelTools:
     def test_arms_a_strict_post_restart_verification(self, monkeypatch) -> None:
         post = MagicMock(return_value={"ok": True})
         monkeypatch.setattr(mcp_core, "_post", post)
+        monkeypatch.setattr(
+            mcp_core, "_resolve_session_key_strict", lambda: "dashboard:crew-codex"
+        )
 
         result = mcp_core._call_tool_inner(
             "session_restart_continuation",
@@ -1017,6 +1024,7 @@ class TestAttachedSessionWake:
         slot.queue_append(
             f"{PEER_CHANNEL_REQUEST_PREFIX}\nReview the named peer request.",
             kind=PEER_CHANNEL_REQUEST_KIND,
+            meta=containment_meta(state, slot),
         )
         task = MagicMock()
 

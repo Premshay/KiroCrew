@@ -193,7 +193,7 @@ describe('agent templates inspector — overview', () => {
     renderPage()
     await open('kirocrew')
 
-    expect(await screen.findByText(/a crew set to inherit uses this model/i)).toBeInTheDocument()
+    expect(await screen.findByText(/an agent set to inherit uses this model/i)).toBeInTheDocument()
 
     await open('reviewer')
     expect(await screen.findByText(/falls back to the global default/i)).toBeInTheDocument()
@@ -215,7 +215,7 @@ describe('agent templates inspector — overview', () => {
     renderPage()
     await open('kirocrew')
 
-    expect(await screen.findByText('No crews use this template yet')).toBeInTheDocument()
+    expect(await screen.findByText('No agents use this template yet')).toBeInTheDocument()
   })
 
   it('discovers a template model catalog through its sole bound crew', async () => {
@@ -389,7 +389,7 @@ describe('agent templates inspector — delete', () => {
     renderPage()
     await open('reviewer')
 
-    expect(await screen.findByText(/research .*repoint them on the Crews tab/i)).toBeInTheDocument()
+    expect(await screen.findByText(/research .*repoint them on the Agents tab/i)).toBeInTheDocument()
     expect(screen.queryByTestId('delete-template')).not.toBeInTheDocument()
   })
 

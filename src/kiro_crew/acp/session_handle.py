@@ -54,12 +54,9 @@ from kiro_crew.acp.client import (
     acp_config_option,
     acp_config_option_values,
     compaction_failure_detail,
-    # Upstream also imports parse_slash_command and format_command_result here,
-    # for its ``stream_command`` method. This handle has never carried that
-    # method, so both names would be dead imports; they return only if
-    # ``stream_command`` is added. That absence is a live defect rather than a
-    # deliberate omission -- ``session_provider`` calls ``stream_command`` on
-    # this handle -- but it predates this merge and is tracked separately.
+    compaction_failure_is_transient,
+    format_command_result,
+    parse_slash_command,
     prompt_timeout_for_ceiling,
     resolve_usable_model,
 )
@@ -76,9 +73,11 @@ from kiro_crew.acp.liveness import (
     boottime_now,
     consult_offloaded,
 )
-from kiro_crew.acp.prompt_blocks import build_prompt_blocks
+from kiro_crew.acp.mcp_session_report import McpSessionReport
+from kiro_crew.acp.prompt_blocks import build_prompt_blocks, summarize_prompt_structure
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -326,6 +325,14 @@ def _watchdog_evidence_class(evidence: str) -> str:
 # AcpClient's _CANCEL_GRACE_SECS floor without the process-kill (which is
 # impossible on a multiplexed runtime).
 _CANCEL_GRACE_SECS = 10.0
+# Commands that must stay on the PROMPT transport even where native
+# commands/execute is available: kiro-cli 2.14.0 exits rc=0 without a response
+# on commands/execute for these, and compaction must observe status updates on
+# the prompt stream.
+_PROMPT_TRANSPORT_COMMANDS = frozenset({"compact", "help"})
+# Native command turns receive an explicit bound because they do not arm the
+# chat-turn watchdog while an unanswered RPC would otherwise retain the slot.
+_COMMAND_TURN_TIMEOUT_SECS = 60.0
 # Post-compaction metadata grace: kiro-cli emits fresh _kiro.dev/metadata with
 # the real post-compaction contextUsagePercentage ~1s after the completed
 # status (live-probe confirmed). Mirrors AcpClient's constant.
@@ -429,6 +436,15 @@ class AcpRuntimeProtocol(Protocol):
         Read by :meth:`AcpSessionHandle.prompt` to decide if an image may travel
         as an inline block. Fails closed, so a backend that never handshaked
         gets text only.
+        """
+        ...
+
+    @property
+    def agent_version(self) -> str:
+        """``agentInfo.version`` from the handshake — the version the process runs.
+
+        ``""`` until the handshake completes; a capability gate reading it
+        fails closed on that.
         """
         ...
 
@@ -550,6 +566,13 @@ class AcpSessionHandle:
         # (None otherwise). Arms the post-failure budget in _dispatch_events,
         # which ends an abandoned turn instead of draining to the ceiling.
         self._compaction_failed_at: float | None = None
+        # Retryability of the LAST failed compaction, read by the dashboard's
+        # STOP_REASON_COMPACTION_FAILED branch to decide between re-queuing the
+        # abandoned message and giving up. Public (no leading underscore)
+        # because that consumer reaches it through getattr on whichever of the
+        # two client classes is serving the slot. Verdict only — see the twin
+        # comment in AcpClient for why the reason text is not forwarded.
+        self.last_compaction_transient: bool = False
         # Consumers that implement the low-fidelity child downgrade (dashboard
         # card / interactive approver) opt IN; for everyone else the handle
         # itself fail-closes low-fidelity child permission requests below, so
@@ -602,6 +625,11 @@ class AcpSessionHandle:
         # OAuth requests collected by drain_init(). Dashboard startup drains
         # this list through AcpSessionProvider after create_session returns.
         self._pending_oauth_requests: list[dict[str, str]] = []
+        # What THIS session's MCP servers reported at init — parity with
+        # AcpClient._mcp_report. On the shared runtime the frames are staged
+        # per sessionId before this handle's queue exists, so the report is
+        # genuinely this session's and not the process's.
+        self._mcp_report = McpSessionReport()
         # JSON-RPC request id -> {"once","always","reject"} optionId map, so
         # approve_tool / reject_tool echo the exact ids the agent advertised
         # (kiro "allow_once"/"allow_always"; claude-agent-acp "allow"/"reject").
@@ -678,6 +706,132 @@ class AcpSessionHandle:
         Dispatches events from the per-session queue with the same logic as
         AcpClient._dispatch_events. Detects turn boundaries via the JSON-RPC
         response matching the prompt's request_id.
+
+        ``timeout=None`` (every dashboard turn) resolves from
+        ``agent.chat_turn_timeout_secs`` so the transport wait follows a raised
+        turn ceiling instead of cutting the turn at the 2h default underneath it.
+        """
+
+        async def _build() -> tuple[str, dict[str, Any]]:
+            # Offloaded: the builder stats and reads image files (up to
+            # MAX_IMAGE_BYTES each) and base64-encodes them. Inline, that
+            # blocking I/O runs on the gateway loop and pauses every other
+            # session's streaming for the duration.
+            prompt_blocks = await asyncio.to_thread(
+                build_prompt_blocks,
+                message,
+                allow_image=self._runtime.supports_image_prompt,
+            )
+            # Content-free outbound STRUCTURE diagnostics (issue #6022): one
+            # line per turn build recording block counts, per-type counts, and
+            # the serialized byte size — NEVER any block text or bytes — so an
+            # operator can tell a stale/invalid model id apart from a
+            # structurally malformed payload the next time a turn is rejected
+            # as "Improperly formed request". summarize_prompt_structure is
+            # itself no-raise, so this cannot break the live turn.
+            logger.debug(
+                "acp prompt structure for session %s: %s",
+                self._session_id,
+                summarize_prompt_structure(prompt_blocks),
+            )
+            return METHOD_PROMPT, {
+                "sessionId": self._session_id,
+                # An image reaches the model ONLY as an image block. Sending a
+                # local image path as a single text block would ship a
+                # filesystem path as prose (Slack, dashboard) and the model
+                # would never see the picture. Gated on the agent's advertised
+                # capability; when it is absent the path stays in the text as a
+                # tool-openable reference rather than being dropped.
+                "prompt": prompt_blocks,
+            }
+
+        # Explicit aclose in a finally: abandoning THIS wrapper (gen.aclose()
+        # at any yield) must finalize the inner turn generator NOW — its
+        # finally is what unmarks the turn and re-sets _turn_done. Left to the
+        # event loop's async-generator GC hook, the handle would read as
+        # turn-active until some later collection pass.
+        turn = self._run_turn(_build, timeout)
+        try:
+            async for event in turn:
+                yield event
+        finally:
+            await turn.aclose()
+
+    async def stream_command(
+        self, command: str, timeout: float | None = None
+    ) -> AsyncIterator[AcpEvent]:
+        """Execute a slash command natively and yield AcpEvents until it completes.
+
+        Sends ``_kiro.dev/commands/execute`` with the TuiCommand OBJECT form
+        (``{command, args}``) — kiro-cli 2.14.0 exits without a response on the
+        STRING form (see :meth:`compact`), so the object form is load-bearing —
+        and drains ``session/update`` events with the same turn discipline as
+        :meth:`prompt`. The command's own output arrives in the RESPONSE result
+        (message/data), not as update chunks, so the dispatch loop
+        surfaces it as a text chunk (``extract_command_result=True``). Mirrors
+        AcpClient.stream_command for the shared runtime.
+
+        Two carve-outs keep the PROMPT transport (delegate to :meth:`prompt`):
+
+        - ``_PROMPT_TRANSPORT_COMMANDS`` (/compact, /help) — kiro-cli 2.14.0
+          returns no response for these over commands/execute, and the
+          compaction flow (session.py, Slack !compact) depends on watching
+          ``compaction/status`` on the prompt stream.
+        - a non-kiro backend (KAS) — ``_kiro.dev/commands/execute`` is
+          kiro-cli-specific; KAS sessions keep degrading softly through
+          session/prompt instead of erroring on an unimplemented method.
+
+        The native turn is bounded at ``_COMMAND_TURN_TIMEOUT_SECS`` (matching
+        send_command's RPC wait) because neither turn watchdog arms on a
+        command turn; an explicit ``timeout`` still wins.
+        """
+        cmd_name, cmd_args = parse_slash_command(command)
+        # Positive capability gate: only the kiro harness implements
+        # _kiro.dev/commands/execute, so native execution requires
+        # acp_backend == ACP_BACKEND_KIRO — every other harness (KAS today,
+        # any harness added later) fails CLOSED onto the prompt transport
+        # instead of inheriting a kiro-only RPC (harness parity H5/H6).
+        native = (
+            self._runtime.acp_backend == ACP_BACKEND_KIRO
+            and cmd_name not in _PROMPT_TRANSPORT_COMMANDS
+        )
+        if not native:
+            async for event in self.prompt(command, timeout=timeout):
+                yield event
+            return
+
+        async def _build() -> tuple[str, dict[str, Any]]:
+            return METHOD_COMMANDS_EXECUTE, {
+                "sessionId": self._session_id,
+                "command": {"command": cmd_name, "args": cmd_args},
+            }
+
+        # Same deterministic finalization as prompt(): see the comment there.
+        turn = self._run_turn(
+            _build,
+            timeout if timeout is not None else _COMMAND_TURN_TIMEOUT_SECS,
+            extract_command_result=True,
+        )
+        try:
+            async for event in turn:
+                yield event
+        finally:
+            await turn.aclose()
+
+    async def _run_turn(
+        self,
+        build_request: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
+        timeout: float | None,
+        *,
+        extract_command_result: bool = False,
+    ) -> AsyncGenerator[AcpEvent, None]:
+        """Shared turn lifecycle for :meth:`prompt` and :meth:`stream_command`.
+
+        Owns the concurrent-turn guard, the per-turn state resets, the pre-turn
+        stale-frame drain, the request send, event dispatch, and turn-done
+        bookkeeping. ``build_request`` returns the JSON-RPC ``(method, params)``
+        to send; it runs BEFORE the turn is marked active (see the comment at
+        the send site below).
 
         ``timeout=None`` (every dashboard turn) resolves from
         ``agent.chat_turn_timeout_secs`` so the transport wait follows a raised
@@ -835,40 +989,13 @@ class AcpSessionHandle:
         # exception hierarchy. Re-raised unchanged, so cancellation still
         # propagates.
         try:
-            # Build the prompt blocks FIRST (the slow, cancellable part), then
-            # mark the turn active immediately before the write: a child
-            # permission frame read by the runtime between the write and the
-            # mark would otherwise be auto-answered as "between turns" even
-            # though this owner's turn had begun. Marking pre-build instead
-            # would claim an active turn during a long image-encoding stint
-            # in which nothing consumes the queue. The BaseException guard
-            # unmarks on any failure so a dead write cannot leave the session
-            # permanently routed-to.
-            _prompt_blocks = await asyncio.to_thread(
-                build_prompt_blocks,
-                message,
-                allow_image=self._runtime.supports_image_prompt,
-            )
+            # Build the request first (prompt construction may encode images),
+            # then mark it active immediately before its wire write.
+            _method, _params = await build_request()
             _mark = getattr(self._runtime, "mark_turn_active", None)
             if _mark is not None:
                 _mark(self._session_id, True)
-            req_id = await self._runtime.send_request(
-                METHOD_PROMPT,
-                {
-                    "sessionId": self._session_id,
-                    # An image reaches the model ONLY as an image block. Sending a
-                    # local image path as a single text block would ship a
-                    # filesystem path as prose (Slack, dashboard) and the model
-                    # would never see the picture. Gated on the agent's advertised
-                    # capability; when it is absent the path stays in the text as a
-                    # tool-openable reference rather than being dropped.
-                    # Offloaded (above): the builder stats and reads image files
-                    # (up to MAX_IMAGE_BYTES each) and base64-encodes them.
-                    # Inline, that blocking I/O runs on the gateway loop and
-                    # pauses every other session's streaming for the duration.
-                    "prompt": _prompt_blocks,
-                },
-            )
+            req_id = await self._runtime.send_request(_method, _params)
         except BaseException:
             self._turn_done.set()
             _mark = getattr(self._runtime, "mark_turn_active", None)
@@ -898,7 +1025,9 @@ class AcpSessionHandle:
                         f"{redact_text(str(_n_title)[:4096])[:120]}"
                     ),
                 )
-            async for event in self._dispatch_events(req_id, timeout):
+            async for event in self._dispatch_events(
+                req_id, timeout, extract_command_result=extract_command_result
+            ):
                 # Park accounting. The consumer holds this event from here until
                 # it comes back for the next one, and that interval is CONSUMER
                 # time, not backend silence: the dispatch loop is suspended at
@@ -1055,8 +1184,9 @@ class AcpSessionHandle:
         advertised (claude-agent-acp offers ``reject`` → behavior:"deny",
         surfacing a clear "permission denied" rather than the cryptic "Tool use
         aborted" the adapter throws on a ``cancelled`` outcome). Falls back to
-        ``cancelled`` when no reject option was advertised (kiro-cli), which kiro
-        handles as an ordinary rejection.
+        ``cancelled`` when no deny-shaped option was advertised — NOT a per-tool
+        signal: kiro-cli maps it to cancelling the TURN, auto-denying every
+        later tool call in it without prompting (#7681).
         """
         recorded = self._permission_options.pop(request_id, None)
         # Answered (see approve_tool) — a rejection ends the human wait too.
@@ -1068,6 +1198,15 @@ class AcpSessionHandle:
                 {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": reject_id}},
             )
         else:
+            # Same last-resort warning as AcpClient.reject_tool — this is the
+            # second of the two ``cancelled`` fallback sites, and the silent
+            # cascade is the bug report's whole complaint (#7681).
+            logger.warning(
+                "reject_tool: no deny option advertised for req=%s; answering "
+                "'cancelled', which the backend may treat as cancelling the "
+                "remainder of the turn's tool calls",
+                request_id,
+            )
             await self._runtime.send_response(
                 request_id,
                 {"outcome": {"outcome": OUTCOME_CANCELLED}},
@@ -1484,6 +1623,15 @@ class AcpSessionHandle:
         return self._model or self._resolved_model_id
 
     @property
+    def agent_version(self) -> str:
+        """The version the shared process RUNS (``""`` until its handshake).
+
+        Delegates to the runtime because the handshake is per process, not per
+        session: every handle on one runtime reports the same value.
+        """
+        return self._runtime.agent_version
+
+    @property
     def config_options(self) -> list[dict[str, Any]]:
         """ACP-reported configOptions (effort, model, mode selectors)."""
         return self._config_options
@@ -1799,15 +1947,22 @@ class AcpSessionHandle:
                 self._queue.put_nowait(_m)
 
     async def _dispatch_events(
-        self, req_id: int, timeout: float
+        self, req_id: int, timeout: float, *, extract_command_result: bool = False
     ) -> AsyncIterator[AcpEvent]:
-        """Core event dispatch loop. Yields AcpEvent objects from the session queue."""
+        """Core event dispatch loop. Yields AcpEvent objects from the session queue.
+
+        Native command output arrives in its response result rather than an
+        update frame, so command turns surface that result before completion.
+        """
         deadline = time.monotonic() + timeout
         last_data_ts = time.monotonic()
         # Cleared per turn: armed by the compaction branch below on a
         # `failed` status, then read by the post-failure budget check at the
         # loop top (mirrors AcpClient._prompt_loop).
         self._compaction_failed_at = None
+        # A native switch notification is authoritative; command result data is
+        # only the fallback when no notification arrived during this turn.
+        saw_agent_switch = False
         # Consumer time already accounted for at the moment `last_data_ts` was
         # taken. The idle clocks below measure BACKEND silence, so any park that
         # happens after this point must be subtracted from them.
@@ -2212,6 +2367,23 @@ class AcpSessionHandle:
                         # Single-shot: the flag is consumed here so a later genuine
                         # cancel can never be misattributed to a stale probe.
                         self._stale_probe = False
+                    if extract_command_result and isinstance(result, dict):
+                        text = format_command_result(result)
+                        if text:
+                            yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=text)
+                        if not saw_agent_switch:
+                            data = result.get("data")
+                            if isinstance(data, dict) and data.get("agent"):
+                                agent_info = data["agent"]
+                                name = (
+                                    agent_info.get("name", "")
+                                    if isinstance(agent_info, dict)
+                                    else ""
+                                )
+                                if name:
+                                    yield AcpEvent(
+                                        kind=EVENT_AGENT_SWITCHED, text=name
+                                    )
                     self._last_stop_reason = reason
                     self._tool_dispatched = False
                     self._turn_done.set()
@@ -2362,11 +2534,15 @@ class AcpSessionHandle:
                             # reason so the notice stops collapsing to
                             # "unknown error".
                             self._compaction_failed_at = time.monotonic()
+                            self.last_compaction_transient = (
+                                compaction_failure_is_transient(params)
+                            )
                         summary = compaction_failure_detail(params)
                     yield AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)
                 elif action == "clear":
                     yield AcpEvent(kind=EVENT_CLEAR_STATUS)
                 elif action == "agent_switched":
+                    saw_agent_switch = True
                     params = msg.params or {}
                     yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=params.get("agentName", ""))
                 elif action == "subagent_list":
@@ -2379,6 +2555,19 @@ class AcpSessionHandle:
                         # it apart from the SAME event kind produced by the
                         # routed KAS lifecycle path below, which does belong to
                         # this session.
+                        #
+                        # Deliberately ``fanout_no_owner`` and NOT the report
+                        # path's ``_owns_mcp_frame``: this event feeds the
+                        # subagent idle-stall clock, whose contract treats a
+                        # LONE session as the owner of an ownerless roster
+                        # (the flag is only set once a second queue registers).
+                        # The stricter frame-must-name-me test would mark a
+                        # lone session's roster global, the clock would ignore
+                        # it, and an active subagent would read as stalled.
+                        # The MCP report constructions below use the strict
+                        # test because publishing a co-tenant's server as our
+                        # own is the error THERE; here the error is the
+                        # opposite one.
                         yield AcpEvent(
                             kind=EVENT_SUBAGENT_LIST,
                             subagents=subs,
@@ -2416,6 +2605,7 @@ class AcpSessionHandle:
                         kind=EVENT_MCP_OAUTH_REQUEST,
                         server_name=request["serverName"],
                         oauth_url=request["oauthUrl"],
+                        runtime_global=not self._owns_mcp_frame(msg),
                     )
                 elif action == "mcp_server_initialized":
                     params = msg.params or {}
@@ -2427,6 +2617,7 @@ class AcpSessionHandle:
                         yield AcpEvent(
                             kind=EVENT_MCP_SERVER_INITIALIZED,
                             server_name=server_name,
+                            runtime_global=not self._owns_mcp_frame(msg),
                         )
                 elif action == "mcp_server_init_failure":
                     params = msg.params or {}
@@ -2448,6 +2639,7 @@ class AcpSessionHandle:
                             kind=EVENT_MCP_SERVER_INIT_FAILURE,
                             server_name=server_name,
                             text=err,
+                            runtime_global=not self._owns_mcp_frame(msg),
                         )
 
             # Timeout — no complete received. Yield a terminal EVENT_COMPLETE with a
@@ -2741,6 +2933,36 @@ class AcpSessionHandle:
                 "SEL audit failed for tool_interrupted at %s", site, exc_info=True
             )
 
+    def queued_frame_count(self) -> int:
+        """How many frames are waiting on this session's queue right now.
+
+        For a caller that has to decide which frames predate a request it is
+        about to send: read this first, then send. The answer is only meaningful
+        at that instant, which is why it is the caller's to take rather than
+        something ``drain_init`` re-derives later.
+        """
+        return self._queue.qsize()
+
+    def _owns_mcp_frame(self, msg: JsonRpcMessage) -> bool:
+        """Whether *msg* names THIS session as the server registration's owner.
+
+        The one spelling of MCP-frame ownership on the shared runtime, used by
+        both the raw-report path and the events that feed the live one, so the
+        two cannot answer it differently.
+
+        A POSITIVE test, deliberately: the runtime's ``fanout_no_owner`` marks a
+        sessionless frame only once more than one queue is registered, because
+        its original consumer (the subagent idle-stall clock) is right to treat
+        a lone session as the sole owner of whatever arrives. This view is not —
+        it publishes server names and failure reasons as "what THIS session
+        mounted", so a co-tenant that emits a sessionless frame before it has
+        registered its own queue would otherwise have its servers attributed
+        here. Requiring the frame to name us refuses that regardless of how many
+        queues exist, and it stays correct when a third transport arrives.
+        """
+        params = msg.params if isinstance(msg.params, dict) else {}
+        return bool(self._session_id) and params.get("sessionId") == self._session_id
+
     def _accept_oauth_request(self, msg: JsonRpcMessage) -> dict[str, str] | None:
         """Validate and deduplicate one MCP OAuth notification."""
         params = msg.params if isinstance(msg.params, dict) else {}
@@ -2768,12 +2990,21 @@ class AcpSessionHandle:
         self._pending_oauth_requests.clear()
         return pending
 
+    def mcp_session_report(self) -> McpSessionReport:
+        """This session's MCP registration report — parity with AcpClient.
+
+        Does NOT drain: the report is the session's standing answer to "which
+        servers actually started here". An unreported server means *not
+        reported*, never *not mounted*.
+        """
+        return self._mcp_report
+
     async def drain_init(
         self,
         duration: float = _MCP_DRAIN_DURATION,
         idle_exit: float = _MCP_DRAIN_IDLE_EXIT,
         no_report_ceiling: float | None = None,
-        ignore_queued_reports: bool = False,
+        stale_report_frames: int = 0,
     ) -> None:
         """Drain MCP-init / oauth / config frames from the queue after set_mode.
 
@@ -2797,14 +3028,20 @@ class AcpSessionHandle:
         ``pop_pending_oauth_requests``; everything else is logged/discarded.
         Best-effort — never raises.
 
-        ``ignore_queued_reports``: registration frames already sitting on the
-        queue when the drain starts describe the roster that initialized during
-        ``session/new`` — for a session whose mode was then SWITCHED via
-        ``set_mode``, that is the PRE-switch agent's roster, and the
-        switched-to agent's own servers may still be booting. Passing True
-        keeps that stale backlog from arming the idle shortcut (the frames are
-        still drained and processed normally); only a report observed after
-        the pre-drain backlog is exhausted counts as the active agent's.
+        ``stale_report_frames``: how many frames on the queue describe the roster
+        that initialized during ``session/new``. For a session whose mode was
+        then SWITCHED via ``set_mode``, that is the PRE-switch agent's roster,
+        and the switched-to agent's own servers may still be booting. Those
+        frames are still drained and processed normally; they just neither arm
+        the idle shortcut nor enter the report.
+
+        The COUNT is the caller's to measure, and it must be read before the
+        ``set_mode`` request goes out — the only moment "already queued" and
+        "pre-switch" mean the same thing. Measuring it here instead would count
+        the switched-to agent's own registrations, which the backend can emit
+        before it answers set_mode, and consume them without recording: a
+        session left at a false "no report" for as long as its servers keep
+        talking.
         """
         if no_report_ceiling is None:
             no_report_ceiling = _MCP_DRAIN_NO_REPORT_CEILING
@@ -2815,7 +3052,14 @@ class AcpSessionHandle:
         # caller knows no MCP server can register (MCP-free runtime). The idle
         # shortcut is then active from the start, i.e. the pre-fix behavior.
         reported = no_report_ceiling <= 0.0
-        stale_backlog = ignore_queued_reports and not self._queue.empty()
+        # Exactly the frames the caller counted before it sent set_mode are the
+        # pre-switch agent's. A count, not a test for emptiness: a queue that the
+        # ACTIVE agent refills before the backlog is drained never goes empty, so
+        # an emptiness test would keep the flag set for the whole drain and skip
+        # recording every report the switched-to agent makes. And it comes from
+        # the CALLER rather than a qsize() read here, because by the time this
+        # runs the active agent's own registrations may already have landed.
+        stale_frames = max(0, stale_report_frames)
         drained = 0
         while True:
             now = time.monotonic()
@@ -2823,10 +3067,6 @@ class AcpSessionHandle:
             if now >= limit:
                 break
             remaining = limit - now
-            if stale_backlog and self._queue.empty():
-                # The pre-drain backlog is exhausted; anything from here on
-                # arrived after set_mode and speaks for the ACTIVE agent.
-                stale_backlog = False
             try:
                 msg = await asyncio.wait_for(
                     self._queue.get(),
@@ -2841,8 +3081,25 @@ class AcpSessionHandle:
                 await self._queue.put(None)
                 break
             drained += 1
+            # This frame is the pre-switch agent's iff the snapshot still has
+            # room for it; the counter is spent here so a refill cannot buy a
+            # later frame the same treatment.
+            stale_backlog = stale_frames > 0
+            if stale_backlog:
+                stale_frames -= 1
             try:
                 action = classify_notification(msg)
+                if not stale_backlog:
+                    # Deliberately narrower than the "still drained and
+                    # processed normally" treatment the stale backlog gets
+                    # otherwise: those frames describe the PRE-switch agent's
+                    # roster, so recording one could show a server the current
+                    # agent does not have as mounted here. Skipping it can
+                    # instead leave a server that is genuinely up looking
+                    # unreported until it reports again — and that is the safe
+                    # direction, because the report renders an unreported server
+                    # as "no report", never as "not mounted".
+                    self._mcp_report.record_frame(msg, owned=self._owns_mcp_frame(msg))
                 if not reported and not stale_backlog and action in _MCP_DRAIN_REPORT_ACTIONS:
                     # First server report: arm the idle shortcut and give the
                     # remaining servers up to ``duration`` from this point.
@@ -2981,11 +3238,24 @@ class AcpSessionHandle:
                 status_type = "completed"
             elif kind == kas_wire.KIND_SUMMARIZATION_FAILED:
                 status_type = "failed"
+                # Parity with AcpClient._handle_compaction_status: log the WHOLE
+                # frame at WARNING. This branch previously logged nothing at
+                # all, so a KAS summarization failure left the chat row as the
+                # only record of it — and when the row's reason collapsed to a
+                # placeholder there was nothing to grep server-side and no way
+                # to learn which field the reason actually arrived in.
+                # redact_text, not the bare frame: conversationSummary rides in
+                # this payload, so an unredacted dump would persist whatever the
+                # conversation contained -- a pasted credential included -- into
+                # gateway.log. Same scrub the notice below applies, for the same
+                # reason.
+                logger.warning("KAS summarization failed — raw frame: %s", redact_text(str(kiro)))
                 # KAS is the third producer of a failed compaction status and
                 # rides the SAME dispatch loop, so it gets the same bounded
                 # post-failure wait — a KAS turn abandoned after failed
                 # summarization must not drain to the ceiling either.
                 self._compaction_failed_at = time.monotonic()
+                self.last_compaction_transient = compaction_failure_is_transient(kiro)
             else:
                 status_type = "started"
             # conversationSummary is backend-echoed, LLM-influenced text that

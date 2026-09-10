@@ -462,6 +462,8 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
             run["runtime"] = dict(resolution)
 
         dispatch = review_pool.make_sync_dispatch(loop, pool, on_resolution=_record_runtime)
+        # Runtime preflight is read once and shared with the driver so both the
+        # batch lifecycle and every per-change failure describe the same host state.
         runtime_error = await asyncio.to_thread(review_pool.runtime_preflight)
         if not runtime_error:
             await pool.begin_batch()
@@ -475,7 +477,9 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                 cancelled=lambda: run_id in _CANCELLED,
                 rule_resolutions=run.get("rule_resolutions"),
                 preflight=lambda: runtime_error,
-                concurrency=0,
+                # Shared staging paths and result attribution stay deterministic
+                # when this driver serializes changes, even with a warm pool.
+                concurrency=1,
             )
         finally:
             if not runtime_error:
@@ -499,6 +503,11 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
             run["error"] = summary.get("error", "review failed")
         else:
             await asyncio.to_thread(_record_reviewed, run)
+        if run["status"] == "error":
+            # Keep the machine-readable cause beside the human error sentence.
+            reason = _first_change_failure(summary)[1]
+            if reason:
+                run["reason"] = reason
     except Exception as exc:  # pragma: no cover - defensive
         run["status"] = "error"
         run["error"] = str(exc)
@@ -515,17 +524,28 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
         await _notify_finished(run)
 
 
-def _first_change_error(summary: dict) -> str:
-    """The most useful per-change failure reason, for a run-level error message."""
+def _first_change_failure(summary: dict) -> tuple[str, str]:
+    """The most useful per-change failure, as ``(sentence, reason_token)``.
+
+    Both halves come from the SAME record in one pass, which is the whole reason
+    this is not two functions. The sentence is often built from ``deep_error`` --
+    prose from the spawn -- while the token lives in that record's
+    ``skipped_reason``; a second independent scan for the token would happily
+    return a LATER record's token and pair it with this record's sentence,
+    labelling a failure with an unrelated cause.
+
+    The token half is ``""`` when the chosen record kept no ``skipped_reason``.
+    """
     for rec in summary.get("per_change") or []:
         for key in ("deep_error", "gate_error", "skipped_reason"):
             val = str(rec.get(key) or "").strip()
             if val:
-                return {
-                    "no_review_recorded": "the reviewer finished but wrote no " "findings record",
+                sentence = {
+                    "no_review_recorded": "the reviewer finished but wrote no "
+                                          "findings record",
                     "review_record_incomplete": "the reviewer wrote a findings "
-                    "record but never completed the "
-                    "review",
+                                                "record but never completed the "
+                                                "review",
                     # Reason-level fallback only: a preflight-failed record
                     # carries the specific runtime message in its error fields,
                     # which the key order above prefers, and the run-level error
@@ -533,10 +553,16 @@ def _first_change_error(summary: dict) -> str:
                     # the reason itself always renders as a cause, never as a
                     # bare enum value.
                     "runtime_unavailable": "the reviewer never ran: its agent "
-                    "runtime is unavailable on this host",
+                                           "runtime is unavailable on this host",
                     "review_failed": "the review turn failed",
                 }.get(val, val)
-    return ""
+                return sentence, str(rec.get("skipped_reason") or "").strip()
+    return "", ""
+
+
+def _first_change_error(summary: dict) -> str:
+    """The most useful per-change failure reason, for a run-level error message."""
+    return _first_change_failure(summary)[0]
 
 
 def _run_headline(run: dict) -> str:

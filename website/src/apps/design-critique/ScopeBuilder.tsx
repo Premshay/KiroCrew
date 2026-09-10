@@ -1,5 +1,6 @@
 import { Save, Trash2 } from 'lucide-react'
 
+import SimpleSelect from '../../components/SimpleSelect'
 import { S } from './styles'
 import type { ProjectContext, ReviewBrief, ReviewIntent } from './types'
 import { i18nT } from '../../i18n/t'
@@ -20,16 +21,16 @@ export default function ScopeBuilder(p: Props) {
     <details style={S.contextBuilder}>
       <summary style={S.contextSummary}>{i18nT('apps.designCritique.scopeBuilder.project_context_and_review_scope')}</summary>
       <div style={S.contextGrid}>
-        <select
+        <SimpleSelect
           style={S.contextInput}
           value={brief.contextId}
           disabled={p.busy}
           aria-label={i18nT('apps.designCritique.scopeBuilder.saved_project_context')}
-          onChange={(event) => p.onSelectContext(event.target.value)}
-        >
-          <option value="">{i18nT('apps.designCritique.scopeBuilder.no_saved_project_context')}</option>
-          {p.contexts.map((context) => <option key={context.id} value={context.id}>{context.name}</option>)}
-        </select>
+          clearLabel={i18nT('apps.designCritique.scopeBuilder.no_saved_project_context')}
+          options={p.contexts.map((context) => context.id)}
+          optionLabels={p.contexts.map((context) => context.name)}
+          onChange={p.onSelectContext}
+        />
         <input
           style={S.contextInput}
           value={brief.projectName}
@@ -46,17 +47,19 @@ export default function ScopeBuilder(p: Props) {
           aria-label={i18nT('apps.designCritique.scopeBuilder.repository_or_local_path')}
           onChange={(event) => p.onChange({ repository: event.target.value })}
         />
-        <select
+        <SimpleSelect
           style={S.contextInput}
           value={brief.intent}
           disabled={p.busy}
           aria-label={i18nT('apps.designCritique.scopeBuilder.review_intent')}
-          onChange={(event) => p.onChange({ intent: event.target.value as ReviewIntent })}
-        >
-          <option value="ground">{i18nT('apps.designCritique.scopeBuilder.ground_existing_work')}</option>
-          <option value="reference">{i18nT('apps.designCritique.scopeBuilder.reference_existing_system')}</option>
-          <option value="invent">{i18nT('apps.designCritique.scopeBuilder.explore_new_direction')}</option>
-        </select>
+          options={['ground', 'reference', 'invent']}
+          optionLabels={[
+            i18nT('apps.designCritique.scopeBuilder.ground_existing_work'),
+            i18nT('apps.designCritique.scopeBuilder.reference_existing_system'),
+            i18nT('apps.designCritique.scopeBuilder.explore_new_direction'),
+          ]}
+          onChange={(value) => p.onChange({ intent: value as ReviewIntent })}
+        />
         <textarea
           style={{ ...S.contextInput, minHeight: '62px', resize: 'vertical' }}
           value={brief.contextPaths}

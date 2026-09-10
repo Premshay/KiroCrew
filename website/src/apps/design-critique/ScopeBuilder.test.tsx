@@ -15,7 +15,7 @@ const brief: ReviewBrief = {
 }
 
 describe('ScopeBuilder', () => {
-  it('keeps reusable project context separate from the review target', () => {
+  it('keeps reusable project context separate from the review target', async () => {
     const onChange = vi.fn()
     const onSaveContext = vi.fn()
     render(
@@ -33,7 +33,8 @@ describe('ScopeBuilder', () => {
     fireEvent.change(screen.getByLabelText('Review target'), {
       target: { value: 'The operator handoff process and its empty state.' },
     })
-    fireEvent.change(screen.getByLabelText('Review intent'), { target: { value: 'invent' } })
+    fireEvent.click(screen.getByRole('combobox', { name: 'Review intent' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'Explore a new direction' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save project context' }))
 
     expect(onChange).toHaveBeenCalledWith({ targets: 'The operator handoff process and its empty state.' })

@@ -579,8 +579,6 @@ class TestRuntimePreflight(unittest.TestCase):
                 unittest.mock.patch.object(rp, "resolve_kiro_cli", _resolver):
             rp.runtime_preflight()
         self.assertEqual(calls, ["resolve"])
-
-
 class TestRuntimeModelSnapshots(unittest.TestCase):
     def test_reviewer_info_exposes_only_its_own_runtime_snapshot(self):
         with unittest.mock.patch.object(rp, "_resolve_review_agent", return_value="reviewer"), \

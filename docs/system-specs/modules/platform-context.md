@@ -48,6 +48,8 @@ interface, the public edition is complete standalone.
 | `mcp_tooling` | adapter | `DefaultMcpToolingProvider` (all methods empty) | enterprise MCP server + skills + provider MCP scopes |
 | `agent_catalog` | adapter | `DefaultAgentCatalogProvider` (`builtin_agents()` → `[]`) | edition agent-catalog rows |
 | `prompt_sources` | adapter | `DefaultPromptSourceProvider` (`prompt_source_roots()` → `[]`) | edition prompt/SOP roots |
+| `skill_discovery` | adapter | `DefaultSkillDiscoveryProvider` (`skill_providers()` → `[]`) | edition skill discovery providers for the multi-provider search |
+| `denied_rules` | adapter | `DefaultDeniedRuleProvider` (`denied_rules()` → `[]`) | edition denied-command rules that are default-on but USER-DISABLEABLE (distinct from `security`, the un-weakenable overlay floor) |
 | `import_sources` | adapter | `DefaultImportSourceProvider` (`import_sources()` → `[]`) | edition onboarding-import sources |
 | `capability_manager` | adapter | `DefaultCapabilityManager` (`available()` → `False`) | operations-based external package manager: MCP servers, skills, agent packages, and client plugins |
 | `external_access` | adapter | `DefaultExternalAccessPolicy` (`admits_registry()` / `admits_cloud_deployment()` → `True`) | allowlist installable content to an internal registry; withhold cloud deployment |
@@ -126,11 +128,9 @@ cfg = KiroCrewConfig.load()
 ctx = boot_platform(cfg)      # platform/bootstrap.py (idempotent)
 ```
 
-`boot_platform` is the single idempotent entry point. `cli.main`, `run_gateway`,
-and the separately spawned MCP gateway daemon call it before their event loops;
-only the first call in a process resolves the profile and installs the context.
-The daemon needs the composed credential policy when it launches pooled MCP
-backends. `bootstrap_context`:
+`boot_platform` is the single idempotent entry point — `cli.main` and
+`run_gateway` both call it; only the first call resolves the profile and
+installs the context. `bootstrap_context`:
 1. `build_default_context(cfg, profile=resolve_profile(...))` composes all `Default*` adapters and selects the applicable Level-1 governance ceiling through `load_security_policy`.
 2. If profile != standalone: `discover_companion_context` (fail-closed), then validate `contract_version` and the ADD-only security floor.
 3. `assert_governance_paths_protected`, `assert_policy_signature_satisfied`, and `assert_profiles_within_ceiling` validate the final context before `set_context`; these gates prevent an agent-writable trust root, an absent required signature, or a profile looser than its ceiling from becoming active.
@@ -957,6 +957,21 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   companion returns its resolved package prompt roots. **Split out of
   `McpToolingProvider` into its own Protocol** (a distinct concern). v1 addition;
   `Default` returns `[]`.
+- `SkillDiscoveryProvider.skill_providers() -> List[SkillProvider]` — WIRED: the
+  dashboard discover registry (`handlers/discover._build_registry`) registers each
+  returned provider after the built-in one, gated per provider by the same
+  `external_access.admits_registry("skill", name, api_base)` decision the built-in
+  provider passes through — a managed allowlist applies uniformly, with no
+  edition-specific carve-out. ADD-only and de-duped by name (the built-in wins a
+  collision, so an edition cannot silently replace an identity the policy
+  admitted). Each returned object implements the
+  `kiro_crew.skill_providers.base.SkillProvider` protocol and SHOULD expose an
+  `api_base` naming its catalog endpoint (the identity an allowlist is written
+  against; a provider without one is gated on an empty base). Provider-sourced
+  result fields flow through the existing `_redact_external` scrub before
+  reaching the dashboard. Read fail-closed through `safe_context_call` (fallback
+  `[]`). Default `[]`, so the public edition searches only the built-in catalog.
+  v1 addition; `Default` returns `[]`.
 - `ImportSourceProvider.import_sources() -> List[ImportSource]` — WIRED:
   `onboarding_import._sources()` unions the returned descriptors over the core
   builtins for every scan, apply, and id-validation path, so a registered source
@@ -1013,19 +1028,23 @@ new module/class names.
   section is not dropped on `save()`/PATCH. Excluded from the JSON schema
   (`build_json_schema` skips leading-underscore fields). Data-preservation half
   of the eventual `ConfigSchemaContributor`; Settings-visibility half is TODO.
-- ACP claude seam (all inside the dormant `_is_claude` path, inert on kiro-cli):
-  `AcpClient._claude_session_mcp_servers()` (Default `[]`) feeds both
-  `session/new` + `session/load` `mcpServers`; `_spawn` calls the
-  companion-attached `_write_claude_local_settings()` (via `getattr`) on the
-  PRIMARY spawn path; `AcpClient`/`AcpProvider` take a `permission_mode` kwarg
-  (Default `None`); `acp/types.py` adds `CC_PERMISSION_MODE_DEFAULT` /
-  `CC_PERMISSION_MODE_AUTO`. `ProviderRegistry.agent_client_binding()` is also
-  consumed by direct `AcpRuntime` build sites (`SessionManager`'s `_bg` and
-  subagent runtimes plus Code Review Sage's `ReviewPool`) through the narrow
-  `platform.acp_binding` adapter. It accepts only the established transport
-  keys and merges `extra_env`; caller-owned sandbox, work directory, MCP overlay,
-  and audit settings cannot be replaced by a binding. The standalone registry
-  remains unbound, so its runtime construction is byte-identical.
+- ACP claude seam (inert on kiro-cli, and implemented in the core now that CC is
+  selectable): `AcpClient._session_mcp_servers()` translates the materialized
+  kiro agent spec (`acp/session_mcp.py`) and feeds both `session/new` +
+  `session/load` `mcpServers` — gated on membership in
+  `ACP_BACKENDS_SESSION_MCP_ARRAY`, not on `_is_claude`, since reading no agent
+  file is a property of the transport rather than of Anthropic; `_spawn` calls
+  `_write_claude_local_settings()` (still identity-gated — it writes a literal
+  `.claude/` path) on the PRIMARY
+  spawn path (permission mode, `availableModels`, resolved model — snapshotted and
+  restored by `_reset_state`); `AcpClient`/`AcpProvider` take a `permission_mode`
+  kwarg (Default `None`); `acp/types.py` adds `CC_PERMISSION_MODE_DEFAULT` /
+  `CC_PERMISSION_MODE_AUTO`.
+- Direct ACP runtime construction can consume the same narrowed binding through
+  `platform.acp_binding`: only `acp_backend`, `extra_env`, `model`, and
+  `model_switch_method` are accepted. The adapter merges environment entries but
+  cannot replace the caller's sandbox, work directory, MCP overlay, or audit
+  policy; unbound construction remains the native Kiro path.
 - Slack message-gate seams (let an edition compose a fail-closed
   challenge-and-redirect posture without editing the core; `InterceptDecision`
   enum = `PROCESS | REDIRECTED | DROPPED`):

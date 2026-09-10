@@ -7,16 +7,33 @@ import re as _re
 from dataclasses import dataclass, field
 from typing import Any
 
-# Backend identifiers + the selectable registry live in the leaf module
+# Backend identifiers, the capability sets and the selectable registry live in the
+# leaf module
 # ``kiro_crew.acp_backends`` (it imports nothing from this package, which is what
 # lets the config loader and the dashboard read them). Re-exported here so every
 # existing ``from kiro_crew.acp.types import ACP_BACKEND_*`` call site is
 # unchanged — see the "ACP Backend Identifiers" section below for why they moved.
 from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing importers
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_ACP_RUNTIME,
+    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_INTERNAL_SANDBOX,
+    ACP_BACKENDS_KIRO_IDENTITY_STORE,
+    ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
+    ACP_BACKENDS_MEMBER_DISPATCH,
+    ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_SEED_LOCAL_SETTINGS,
+    ACP_BACKENDS_SESSION_MCP_ARRAY,
+    ACP_BACKENDS_SESSION_SHARING,
+    ACP_BACKENDS_STEER,
+    model_registry_namespace,
     selectable_backends,
 )
 
@@ -78,22 +95,13 @@ METHOD_MCP_SERVER_INIT_FAILURE = "_kiro.dev/mcp/server_init_failure"
 METHOD_SUBAGENT_LIST_UPDATE = "_kiro.dev/subagent/list_update"
 METHOD_KIRO_SESSION_UPDATE = "_kiro.dev/session/update"
 METHOD_SET_CONFIG_OPTION = "session/set_config_option"
-#: Mid-turn steer, kiro-cli / KAS spelling. Takes ``{sessionId, message}`` where
-#: *message* is a single ``<user_message>``-wrapped string, and is answered by a
-#: ``steering_consumed`` echo that carries the injected blocks back.
+# kiro-cli / KAS mid-turn steering. Claude uses METHOD_CLAUDE_STEER below with
+# a different request shape, so these methods must remain distinct.
 METHOD_STEER = "_session/steer"
-#: Mid-turn steer, claude-agent-acp spelling — a DIFFERENT method taking a
-#: DIFFERENT shape: ``{sessionId, prompt: ContentBlock[], _meta}``. Sending the
-#: kiro spelling to claude-agent-acp is answered with method-not-found, and the
-#: kiro *payload* under this name fails validation (``prompt`` must be a
-#: non-empty array), so the two cannot share a call. There is no consumed echo
-#: here: the request's own response is the settlement signal.
+# claude-agent-acp's steering endpoint is distinct from kiro-cli's METHOD_STEER.
+# On an idle session it must decline the request so Crew can retain and visibly
+# requeue the directive rather than letting the adapter start an untracked turn.
 METHOD_CLAUDE_STEER = "_session/steering"
-#: Ask claude-agent-acp to DECLINE a steer that arrives with no running turn
-#: instead of silently promoting it to a fresh turn (its default,
-#: ``startedNewTurn``). KiroCrew owns that fallback — an unconsumed steer is
-#: requeued as a visible, cancellable card — and a backend-started turn would
-#: run the text while the pending entry stayed registered, delivering it twice.
 CLAUDE_STEER_IDLE_BEHAVIOR = "promptRequired"
 #: ``configId`` under which KAS exposes the session model. KAS implements no
 #: ``session/set_model``, so this is the only way to switch a model on it.
@@ -117,17 +125,14 @@ TODO_TEXT_MAX = 500
 
 # Capabilities we advertise during `initialize`.
 #
-# `fs`, `terminal`, and `elicitation` stay absent or false until KiroCrew has
-# handlers for them. Advertising a request capability before its matching
-# handler exists makes ACP agents use a path that deterministically fails with
-# JSON-RPC ``-32601``. Agents that use elicitation for MCP confirmation fall
-# back to the supported ``session/request_permission`` path when it is absent.
+# `fs` and `terminal` stay false: KiroCrew does not serve the agent's file or
+# terminal requests over ACP — the agent uses its own tools for that, and
+# advertising them would invite requests we have no handler for.
 ACP_CLIENT_CAPABILITIES: dict = {
     "fs": {"readTextFile": False, "writeTextFile": False},
     "terminal": False,
     # claude-agent-acp only forwards nested Task/Agent transcript updates when
-    # the client explicitly opts in. The data still arrives as ordinary ACP
-    # session/update frames; this does not open a callback surface.
+    # the client explicitly opts in. This opens no callback surface.
     "_meta": {"subagent-transcript": True},
 }
 
@@ -146,86 +151,18 @@ ACP_CLIENT_CAPABILITIES: dict = {
 # extends (``register_selectable_backend``). A frozen ``ACP_BACKENDS_SELECTABLE``
 # snapshot here would be read before boot registration and silently miss it.
 
-# ── Capability membership (harness-parity H6, H7) ──
-# Every capability a backend may claim is an OPT-IN set here, never a negation at
-# the call site. ``not is_claude_backend`` reads correctly with two backends and
-# then silently hands the capability to the third, so a harness that has never
-# demonstrated the capability inherits it — and the operator who never opted into
-# that harness is the one who finds out. Adding a member is a deliberate edit
-# with evidence; inheriting a default is not a decision. See
-# docs/system-specs/modules/harness-parity.md.
+# ── Capability membership ──
+# The ``ACP_BACKENDS_*`` capability sets are DEFINED in the leaf module
+# ``kiro_crew.acp_backends`` and re-exported by the import above, so
+# ``from kiro_crew.acp.types import ACP_BACKENDS_STEER`` still resolves. They moved
+# for the same reason the backend identifiers did: a consumer outside this package
+# must be able to ask a capability question without importing ``kiro_crew.acp``,
+# whose ``__init__`` pulls in the client and runtime.
 
-# Backends whose single process can host N concurrent ACP sessions (AcpRuntime
-# demux) AND can persist a SHARED subagent session across teardown. KAS runs on
-# AcpRuntime (multi-session), but its teardown maps to _kiro/session/delete,
-# which removes the persisted session — so a shared subagent would strand
-# spawn_continue (conversation_gone). KAS therefore opts in only once a
-# keep-aware teardown lands (native subagent work); until then its subagents get
-# dedicated sessions. claude-agent-acp runs through AcpClient (one process per
-# session) and is not a member.
-ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO})
-
-# Backends implementing a mid-turn steer extension. Membership says only that a
-# wire format exists here AND that AcpClient.steer speaks it — the two spellings
-# are NOT interchangeable (see METHOD_STEER vs METHOD_CLAUDE_STEER), so adding a
-# member without adding its branch buys a silently dropped message rather than a
-# steer. claude-agent-acp joined once it shipped `_session/steering`; its
-# membership is confirmed per-connection by ACP_BACKENDS_STEER_ADVERTISED below.
-ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE})
-
-# Members whose handshake ANNOUNCES steering, so the capability is confirmed per
-# connection rather than assumed from the backend name. claude-agent-acp gained
-# `_session/steering` in 0.65.0 and advertises it at initialize
-# (``_meta.steering.supported``); an older build on PATH answers to the same
-# backend name and would take the steer nowhere, and the dashboard would report
-# it as steered. kiro-cli announces nothing, so absence of the flag is not
-# evidence THERE — which is why this is its own opt-in set and not a check
-# applied to every member.
+# claude-agent-acp advertises its steering extension at initialize. Keep the
+# connection-level confirmation separate from the transport-level steer set: an
+# older adapter may have the same backend identity but no working steering RPC.
 ACP_BACKENDS_STEER_ADVERTISED = frozenset({ACP_BACKEND_CLAUDE})
-
-# Backends carrying their OWN internal OS sandbox, which on macOS cannot nest
-# inside Kiro Crew's seatbelt (kernel EPERM) — so ``sandbox.wrap_argv`` skips
-# Crew's own layer for them. This is the one membership test that fails OPEN:
-# claiming it for a harness with no internal sandbox hands isolation to a layer
-# that never starts and leaves the agent process unconfined. Only kiro-cli
-# qualifies; a Node or Python harness does not, however it is spawned.
-#
-# KAS is NOT a member even though Crew now spawns it as ``kiro-cli acp
-# --agent-engine v3`` and the process on the end of the argv IS kiro-cli. The
-# relay spawns the KAS server without an ``--sandbox`` argument, and KAS's
-# sandbox factory resolves an absent config to its no-op backend, so no OS
-# sandbox starts inside — adding KAS here would skip Crew's seatbelt in favour of
-# a layer that does not exist. See :mod:`kiro_crew.acp.kas_transport`.
-ACP_BACKENDS_INTERNAL_SANDBOX = frozenset({ACP_BACKEND_KIRO})
-
-# Backends served by AcpRuntime + AcpSessionHandle — the kiro-agent family
-# (kiro-cli and KAS) whose single process hosts N sessions via demux.
-# claude-agent-acp runs one AcpClient per session and is NOT a
-# member. Membership drives the shared runtime start path and the kiro-family
-# spawn conventions: members read the cli.json effort/tool-search overlay and
-# receive effort at spawn, whereas claude applies it via a live push after the
-# session is ready. Stated as opt-in membership (harness-parity H5/H6) so the
-# four sites that mean "kiro or kas" say so positively rather than as
-# ``not is_claude_backend`` — an inference that silently captures every harness
-# added later. This is a SUPERSET of ACP_BACKENDS_SESSION_SHARING: running on
-# AcpRuntime is necessary for session sharing but not sufficient (KAS runs here
-# yet is excluded from sharing until keep-aware teardown lands).
-ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
-
-# Backends whose sign-in lives in kiro-cli's OWN identity store, so an external
-# ``kiro-cli logout`` (or a switch to another account) invalidates a process that
-# is already running. Membership is what authorizes retiring a live session's
-# child when that store starts naming a different account: a harness
-# authenticated some other way must not be recycled on a store it never reads.
-# KAS is a member: it is spawned as ``kiro-cli acp --agent-engine v3
-# --auth-method cli`` (see :mod:`kiro_crew.acp.kas_transport`), and that
-# ``--auth-method cli`` is precisely the demonstration this set waits for — the
-# relay resolves every access token from kiro-cli's own store, so a logout that
-# invalidates the kiro backend invalidates a running KAS relay identically.
-# Excluding it would let a KAS session keep serving turns on the previous
-# account's credentials. Positive membership rather than "not claude"
-# (harness-parity H5).
-ACP_BACKENDS_KIRO_IDENTITY_STORE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 # ── Provider labels ──
 # The backend identity key persisted in the session map. It indexes three
@@ -237,8 +174,8 @@ ACP_BACKENDS_KIRO_IDENTITY_STORE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS}
 # An absent label means kiro-cli, which is the default backend.
 PROVIDER_LABEL_DEFAULT = "acp"
 PROVIDER_LABEL_CLAUDE = "claude_code"
-PROVIDER_LABEL_CODEX = "codex_acp"
 PROVIDER_LABEL_KAS = "kas"
+PROVIDER_LABEL_CODEX = "codex"
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
 # level of clientCapabilities; every other capability it honours lives under
@@ -248,19 +185,30 @@ PROVIDER_LABEL_KAS = "kas"
 # is opened, because that is how a client selects KAS feature flags.
 KAS_CLIENT_CAPABILITIES: dict = {
     **ACP_CLIENT_CAPABILITIES,
-    "_meta": {**ACP_CLIENT_CAPABILITIES["_meta"], "kiro": {"settings": {}}},
+    "_meta": {"kiro": {"settings": {}}},
 }
 
 # ── Claude backend permission modes ──
 # Values written into a per-session settings.local.json
 # ``permissions.defaultMode`` for the ``ACP_BACKEND_CLAUDE`` backend.
 # ``default`` = per-tool approval; ``auto`` = the SDK auto-accept mode
-# (Auto-mode / permission-UI parity). Nothing in the base client writes that file
-# today — it is an edition override — so these are defined here to give the
-# client's ``permission_mode`` kwarg and any writer one canonical vocabulary
-# rather than duplicating string literals.
+# (Auto-mode / permission-UI parity). ``AcpClient._write_claude_local_settings``
+# is the writer; these exist so it and the client's ``permission_mode`` kwarg
+# share one vocabulary rather than duplicating string literals.
 CC_PERMISSION_MODE_DEFAULT = "default"
 CC_PERMISSION_MODE_AUTO = "auto"
+# NOT a mode Crew ever selects, and never written: it is the one value the
+# adapter treats as "never call the host back at all", which would take a claude
+# session out of the host gate entirely. Named so that value has one spelling
+# here rather than a literal at each guard.
+#
+# It does NOT describe an inherited file. The settings writer is create-or-decline
+# and never READS a file it did not author, so a ``bypassPermissions`` already
+# sitting in a user's own ``settings.local.json`` (or in ``~/.claude``) is neither
+# detected nor stripped -- that session's tool calls do not reach the host gate.
+# That is the disclosed boundary recorded on ``_write_claude_local_settings``, not
+# something this constant closes.
+CC_PERMISSION_MODE_BYPASS = "bypassPermissions"
 
 # ── ACP Session Update Types ──
 
@@ -276,8 +224,8 @@ UPDATE_CONFIG_OPTION = "config_option_update"
 UPDATE_SESSION_INFO = "session_info_update"
 UPDATE_USAGE = "usage_update"
 
-# Updates the client recognises, whether or not it acts on each one. Listed here
-# so the "unhandled session update" log doesn't fire for them.
+# Updates we recognise but don't yet surface (plumbing-only). Listed here so the
+# "unhandled session update" log doesn't fire for them.
 KNOWN_SESSION_UPDATES = frozenset(
     {
         UPDATE_USER_MESSAGE_CHUNK,
@@ -421,8 +369,6 @@ class TurnUsage:
     output_tokens: int = 0
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
-    thinking_tokens: int = 0
-    total_tokens: int = 0
     cost_usd: float = 0.0
     credits: float = 0.0
     num_turns: int = 0
@@ -515,12 +461,7 @@ def _command_from_tool_params(params: dict) -> str | None:
 
 @dataclass(frozen=True)
 class ProviderChildActivity:
-    """Validated provider-native child activity carried by a normal ACP update.
-
-    ``child_id`` remains gateway-internal: the dashboard derives an opaque card
-    id before sending any event to a browser. ``phase`` describes only evidence
-    the provider sent; in particular Codex activity is never child completion.
-    """
+    """Validated provider-native child activity from a normal ACP update."""
 
     provider: str
     child_id: str
@@ -540,6 +481,10 @@ class AcpEvent:
     tool_purpose: str = ""
     context_usage_pct: float = 0.0
     stop_reason: str = ""
+    #: True when Kiro Crew fabricated this terminal event because the provider
+    #: omitted its result frame. Consumers must not treat it as raw completion
+    #: evidence even when compatibility requires ``stop_reason=end_turn``.
+    synthetic_completion: bool = False
     request_id: str | int = ""
     options: list[dict[str, str]] = field(default_factory=list)
     tool_input: str = ""
@@ -548,13 +493,21 @@ class AcpEvent:
     #: the original bytes never ride this display event.  Approval surfaces use
     #: it to refuse a durable command grant for a value the user could not see.
     tool_input_redacted: bool = False
+    #: The tool's result text, VERBATIM enough that a control marker embedded in
+    #: it still parses. Two consumers read markers out of this string rather than
+    #: out of a structured field: a session directive (``session_directive.peek``,
+    #: which arms/stops a monitor loop) and an MCP App render marker
+    #: (``mcp_apps_render.find_marker``). A builder that serialises an
+    #: unrecognised result envelope with ``json.dumps`` escapes every quote in it,
+    #: which leaves both sentinels intact while destroying the payload behind
+    #: them -- so the frame still looks like it carries a directive and names
+    #: nothing. EVERY builder must therefore run
+    #: ``acp/_dispatch._repair_escaped_marker`` over its joined output before
+    #: redaction and the head cut; a new provider's builder is pinned to that by
+    #: ``test_session_directive_transport.py``. See
+    #: docs/system-specs/features/agent-host-contract.md §9.
     tool_output: str = ""
     tool_final: bool = False  # True when this tool_result is the final (status=completed) update
-    # True only for the adapter-owned Codex context-compaction lifecycle tool.
-    # It is presentation/telemetry state, never a model-authored instruction.
-    # The completion frame invalidates pre-compaction context usage because the
-    # adapter does not immediately provide a replacement measurement.
-    is_context_compaction: bool = False
     usage: TurnUsage = field(default_factory=TurnUsage)
     raw_tool_params: dict | None = (
         None  # original tool params before diff conversion (for file-chip snapshots)
@@ -562,21 +515,50 @@ class AcpEvent:
     # MCP OAuth notification fields (EVENT_MCP_OAUTH_REQUEST):
     server_name: str = ""
     oauth_url: str = ""
+    #: True when this text chunk is a backend CONTROL NOTICE that arrived as
+    #: ordinary assistant text -- today only the claude adapter's compaction
+    #: notices, which it emits as plain ``agent_message_chunk`` content with no
+    #: marker of any kind (see ``parse_claude_compaction_notice``).
+    #:
+    #: The chunk is still delivered, because classifying one is a GUESS about
+    #: prose and a layer that dropped it would turn any wrong guess into deleted
+    #: model output. This flag lets a consumer show the text while not counting it
+    #: as the turn's own ANSWER -- the distinction the dashboard needs to decide
+    #: whether a compacted turn still owes a reply. Recognition stays in the ACP
+    #: layer: a consumer that re-parsed the text would be re-deciding a protocol
+    #: question it does not own.
+    control_notice: bool = False
+    #: True for a completed native context-compaction tool update. This remains
+    #: distinct from a text control notice because recovery must wait for the
+    #: tool's final status before resetting the session context.
+    is_context_compaction: bool = False
+    #: True when this event was SYNTHESIZED by the client rather than read off a
+    #: backend frame. Only the claude compaction terminal sets it: an automatic
+    #: compaction sends no terminal of its own, so one is manufactured once the
+    #: turn ends (``AcpClient._settle_claude_compaction``). A consumer that
+    #: treats a compaction terminal as a MID-TURN segment boundary must NOT do so
+    #: for a synthesized one -- it arrives after every text chunk of the turn, so
+    #: acting on it as a boundary discards whatever the backend produced after
+    #: compacting.
+    synthesized: bool = False
     # Native subagent list (EVENT_SUBAGENT_LIST) — kiro-cli per-subagent state.
     subagents: list[dict[str, Any]] | None = None
     #: True when the frame behind this event named no owner and was fanned out to
     #: several sessions on one runtime (see ``JsonRpcMessage.fanout_no_owner``).
     #: A consumer must not read such an event as ITS OWN activity -- it is
-    #: another tenant's traffic. Only the roster broadcast sets this today; the
-    #: same event kind reached through a routed ``session/update`` (the KAS
+    #: another tenant's traffic. Set by the roster broadcast (which never names
+    #: an owner) and by the MCP registration notifications when the frame did
+    #: not name this session -- a registration frame MAY carry a
+    #: ``params.sessionId``, and one that does is owned by the session it names.
+    #: The same event kind reached through a routed ``session/update`` (the KAS
     #: sub-agent lifecycle path) leaves it False, because that frame belongs to
     #: exactly one session.
     runtime_global: bool = False
     # Owning sub-agent session id (EVENT_SUBAGENT_ACTIVITY) — ties a tool call
     # to a specific native sub-agent card.
     sub_session_id: str = ""
-    # Structured provider-native child activity (Claude Task/Agent or Codex
-    # subAgentActivity). The raw provider identity never reaches the browser.
+    # Validated provider-native child activity, kept separate from ACP-native
+    # subagent lifecycle events so consumers retain its provider provenance.
     provider_child: ProviderChildActivity | None = None
     # Agent TODO-list snapshot (EVENT_TODO_UPDATE) — normalised
     # {description, tasks:[{id,text,completed}]}. Every todo_list command
@@ -596,8 +578,17 @@ class AcpEvent:
     #: classification (cache hit), not the miss-default False.
     raw_params_trusted: bool = False
     shell_classified: bool = False
-    # Canonical, NON-model-authored tool identity from provider metadata (see
-    # ``_dispatch.trusted_mcp_identity``). ``title`` is LLM-authored prose — for shell
+    #: mcp_identity_trusted: mcp_server_name/tool_name below were populated
+    #: from a provenance-verified source — the origin-scoped tool_call caches
+    #: (permission path) or ``_meta.kiro`` on the tool_call frame itself —
+    #: never an inline/agent-authored fallback. Mirrors ``raw_params_trusted``:
+    #: ``child_mcp_identity_trusted`` requires this flag IN ADDITION to
+    #: non-empty identity fields, so a future population path that forgets it
+    #: fails CLOSED (identity not counted as verified) instead of silently
+    #: passing on non-emptiness alone.
+    mcp_identity_trusted: bool = False
+    # Canonical, NON-model-authored tool identity from ``_meta.kiro`` (see
+    # ``_dispatch._kiro_tool_name``). ``title`` is LLM-authored prose — for shell
     # tools ``select_tool_title`` even prefers the model's ``description`` — so a
     # security gate MUST key on these, never on ``title``. ``mcp_server_name`` is
     # populated ONLY for MCP-served tools (empty for built-ins/shell), so a
@@ -606,15 +597,6 @@ class AcpEvent:
     # (fail-closed: callers that gate on these get no match).
     tool_name: str = ""
     mcp_server_name: str = ""
-    # The adapter metadata parser sets this only after it recovered both fields
-    # from a provenance-verified source: the origin-scoped tool_call caches (the
-    # permission path) or ``_meta.kiro`` on the tool_call frame itself, never an
-    # inline agent-authored fallback. Callers must not infer provenance from
-    # non-empty strings, or an inline fallback could turn a forged directive
-    # marker into a state mutation — which is why ``child_mcp_identity_trusted``
-    # requires this flag IN ADDITION to non-empty identity fields: a future
-    # population path that forgets to set it fails CLOSED.
-    mcp_identity_trusted: bool = False
     # Diff content block fields — authoritative before/after text from kiro-cli
     # for write tools. Used by chat_runner to derive the "before" snapshot
     # without a racy disk read (the write has already landed by the time the

@@ -86,6 +86,7 @@ from kiro_crew.config.paths import (  # noqa: F401, kiro_agents_dir
     ensure_data_home,
     kiro_agents_dir,
 )
+from kiro_crew.config.sections import coerce_effort
 
 # Superseded-default reporting (#5244). Leaf module: stdlib only, so importing it
 # here creates no cycle.
@@ -8030,6 +8031,10 @@ class KiroCrewConfig:
             # A publish failure must never make the config unloadable; the gate
             # keeps using the threshold it already had.
             logger.warning("Publishing autocompact threshold failed: %s", e)
+        try:
+            publish_config_timezone(cfg, _autocompact_ticket)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Publishing config timezone failed: %s", e)
         return cfg
 
     @classmethod
@@ -10415,6 +10420,30 @@ def publish_autocompact_pct(config: "KiroCrewConfig", ticket: int | None = None)
 def published_autocompact_pct() -> float:
     """The published compaction threshold."""
     return _CONFIG_AUTOCOMPACT_PCT
+
+
+# The scheduler reads this on its event-loop hot path. Publish the value during
+# config load rather than re-reading config.json for every cron calculation.
+_CONFIG_TIMEZONE: str = ""
+_CONFIG_TIMEZONE_TICKET: int = 0
+_CONFIG_TIMEZONE_LOCK = threading.Lock()
+
+
+def publish_config_timezone(config: "KiroCrewConfig", ticket: int | None = None) -> None:
+    """Publish the configured timezone with the same load-order guard as compaction."""
+    global _CONFIG_TIMEZONE, _CONFIG_TIMEZONE_TICKET
+    if ticket is None:
+        ticket = next_config_load_ticket()
+    with _CONFIG_TIMEZONE_LOCK:
+        if ticket < _CONFIG_TIMEZONE_TICKET:
+            return
+        _CONFIG_TIMEZONE_TICKET = ticket
+        _CONFIG_TIMEZONE = config.timezone
+
+
+def published_config_timezone() -> str:
+    """Return the last successfully loaded default timezone, or ``""``."""
+    return _CONFIG_TIMEZONE
 
 
 def resolve_effective_agent(agent_name: str | None, project_dir: str | None = None) -> str:
