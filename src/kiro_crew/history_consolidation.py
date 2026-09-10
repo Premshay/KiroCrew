@@ -59,15 +59,27 @@ _CONSOLIDATION_BACKOFF_MAX_SECS = 86400.0
 _SKILL_DETECTION_WINDOW = 200
 
 # A consolidation lease is honoured only while its holder still looks alive, and
-# never longer than this. The liveness test is exact where the platform can
-# answer it, so the common failure — a process that crashed or was killed
-# mid-pass — frees the session on the very next attempt rather than waiting this
-# out. The ceiling covers what liveness cannot: a Windows holder (no start-time
-# identity, so a recycled PID reads as the original) and a holder that is alive
-# but wedged forever. An hour is far past any real pass and is not a timeout for
-# one — nothing cancels the holder when it expires, the lease simply stops
-# excluding a peer.
+# never longer than this SINCE ITS LAST HEARTBEAT. The liveness test is exact
+# where the platform can answer it, so the common failure — a process that
+# crashed or was killed mid-pass — frees the session on the very next attempt
+# rather than waiting this out. The ceiling covers what liveness cannot: a
+# Windows holder (no start-time identity, so a recycled PID reads as the
+# original) and a holder that is alive but wedged forever. It is not a timeout
+# for the pass — nothing cancels the holder when it expires, the lease simply
+# stops excluding a peer.
+#
+# Measured from the last heartbeat rather than from acquisition, because a
+# ceiling on the whole pass expires under a holder that is alive and working:
+# a long transcript on a slow provider is exactly the case that most needs the
+# exclusion, and it was the case that lost it. A wedged holder stops renewing,
+# so the ceiling still bounds it — that is the thing this number was written
+# to bound, and the only thing it now measures.
 _CONSOLIDATION_LEASE_CEILING_SECS = 3600.0
+
+# How often the holder proves it is still working. Well under the ceiling, so a
+# renewal can be missed several times over — a starved event loop, a slow
+# metadata write — before a peer is allowed to conclude the holder is wedged.
+_CONSOLIDATION_LEASE_RENEW_SECS = 300.0
 
 # Lease fields on the session's metadata line. The token identifies one
 # ACQUISITION (so a second attempt from the same process is still excluded, and
@@ -79,6 +91,8 @@ _CONSOLIDATION_LEASE_CEILING_SECS = 3600.0
 _LEASE_TOKEN = "consolidation_lease_token"
 _LEASE_PID = "consolidation_lease_pid"
 _LEASE_START = "consolidation_lease_start"
+# Last heartbeat, not acquisition time: refreshed for as long as the holder is
+# working, so the ceiling above measures silence rather than duration.
 _LEASE_AT = "consolidation_lease_at"
 
 _CONSOLIDATION_META_KEYS: frozenset[str] = frozenset(
@@ -581,6 +595,50 @@ class HistoryConsolidator:
             return token
         return None
 
+    def _renew_consolidation_lease(self, key: str, token: str) -> bool:
+        """Refresh the lease's heartbeat, but only while *token* is still ours.
+
+        Guarded on the token for the same reason the release is: a pass whose
+        lease was already taken by a peer must not stamp its own liveness onto
+        the peer's claim.
+
+        Returns False when the lease is no longer ours, which is not an error
+        the caller can act on — the pass is already unguarded at that point and
+        stopping it would waste a turn that is nearly always about to finish.
+
+        Blocking file IO — call it off the event loop.
+        """
+        try:
+            return bool(
+                self._log.update_metadata_if(
+                    key,
+                    {_LEASE_AT: _time.time()},
+                    lambda meta: meta.get(_LEASE_TOKEN) == token,
+                )
+            )
+        except Exception:
+            # A missed heartbeat costs nothing on its own: the ceiling is many
+            # intervals wide, so the next one covers it.
+            self._logger.debug(
+                "Consolidation lease renewal did not complete for %s", key, exc_info=True
+            )
+            return False
+
+    async def _heartbeat_consolidation_lease(self, key: str, token: str) -> None:
+        """Renew *token*'s lease until cancelled.
+
+        Runs beside the pass rather than inside it: the renewal has to land
+        while the provider turn is in flight, and that turn is one await with
+        nothing to hook. Cancelled by the pass's own finally, so the heartbeat
+        cannot outlive the lease it describes.
+        """
+        while True:
+            await asyncio.sleep(_CONSOLIDATION_LEASE_RENEW_SECS)
+            if not await asyncio.to_thread(self._renew_consolidation_lease, key, token):
+                # Someone else holds it now. Nothing to renew and nothing to
+                # stop — leave the pass to finish rather than spin.
+                return
+
     def _release_consolidation_lease(self, key: str, token: str) -> None:
         """Drop the lease, but only while *token* is still the one on disk.
 
@@ -881,6 +939,7 @@ class HistoryConsolidator:
         # Held from the gate below to the finally block. Declared out here so the
         # release is reachable from paths that return before it is taken.
         lease: str | None = None
+        lease_heartbeat: asyncio.Future | None = None
         # The span identity any failure charge is stamped with. Rebuilt from the
         # snapshot below; the zero value only ever reaches a charge if the snapshot
         # itself raised, and that path is not billed.
@@ -937,6 +996,11 @@ class HistoryConsolidator:
                     "_consolidate skipped for %s: consolidation already in flight", key
                 )
                 return _CONSOLIDATION_BUSY
+            # Keep proving the holder is working for as long as the pass runs.
+            # The ceiling measures silence, and everything after this line —
+            # the prompt, the provider turn, the memory writes — is one stretch
+            # of it with no natural place to stamp liveness.
+            lease_heartbeat = asyncio.ensure_future(self._heartbeat_consolidation_lease(key, lease))
             # Freeze the whole span identity from that one snapshot. The offset is
             # derived rather than returned because the snapshot slices at it
             # (``messages[offset:]``), so the subtraction is exact and comes from
@@ -1248,6 +1312,14 @@ class HistoryConsolidator:
             raise
         finally:
             self._running.discard(key)
+            if lease_heartbeat is not None:
+                # Stopped BEFORE the release: a renewal landing after the lease
+                # is cleared would write a heartbeat for a token no longer on
+                # disk (harmless, the CAS refuses it) or, worse, race a peer's
+                # fresh acquisition into looking older than it is.
+                lease_heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await lease_heartbeat
             if lease is not None:
                 # Best effort, and deliberately still attempted while the task is
                 # unwinding under cancellation: an unreleased lease excludes this

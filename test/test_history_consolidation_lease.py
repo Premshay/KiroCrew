@@ -14,6 +14,8 @@ holder's claim stops counting, and that a refused pass leaves every piece of
 "this span has been processed" bookkeeping untouched.
 """
 
+import asyncio
+import contextlib
 import os
 import time
 from typing import Any
@@ -26,6 +28,7 @@ from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.history_consolidation import (
     _CONSOLIDATION_BUSY,
     _CONSOLIDATION_LEASE_CEILING_SECS,
+    _CONSOLIDATION_LEASE_RENEW_SECS,
     _LEASE_AT,
     _LEASE_PID,
     _LEASE_START,
@@ -104,6 +107,118 @@ class TestWhoStillHoldsALease:
         """The backstop for a wedged holder, and for a platform without identity."""
         stale = _live_lease(at=time.time() - _CONSOLIDATION_LEASE_CEILING_SECS - 1)
         assert not _lease_holder_is_live(stale, now=time.time())
+
+
+class TestTheHeartbeatKeepsALiveHolder:
+    """The ceiling measures SILENCE, not how long the pass has run.
+
+    Measured from acquisition, it expired under a holder that was alive and
+    working — a long transcript on a slow provider, which is the case that most
+    needs the exclusion. A wedged holder stops renewing, so the ceiling still
+    bounds the thing it was written to bound.
+    """
+
+    def test_the_renew_interval_leaves_room_for_missed_beats(self) -> None:
+        assert _CONSOLIDATION_LEASE_RENEW_SECS * 4 <= _CONSOLIDATION_LEASE_CEILING_SECS
+
+    def test_a_renewal_carries_the_holder_past_the_ceiling(self, tmp_path) -> None:
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        token = c._acquire_consolidation_lease(KEY)
+        assert token
+        # Backdate the acquisition past the ceiling, as a pass longer than an
+        # hour would leave it.
+        with history_mod.allow_on_loop_persist():
+            log.update_metadata(
+                KEY, {_LEASE_AT: time.time() - _CONSOLIDATION_LEASE_CEILING_SECS - 1}
+            )
+        assert not _lease_holder_is_live(log.get_metadata(KEY), now=time.time())
+
+        assert c._renew_consolidation_lease(KEY, token) is True
+
+        assert _lease_holder_is_live(log.get_metadata(KEY), now=time.time())
+        assert c._acquire_consolidation_lease(KEY) is None, "a peer took a live holder's lease"
+
+    def test_a_stale_token_cannot_renew_someone_elses_lease(self, tmp_path) -> None:
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        token = c._acquire_consolidation_lease(KEY)
+        assert token
+
+        assert c._renew_consolidation_lease(KEY, "not-our-token") is False
+        assert log.get_metadata(KEY)[_LEASE_TOKEN] == token
+
+    @pytest.mark.asyncio
+    async def test_the_heartbeat_renews_until_cancelled(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "kiro_crew.history_consolidation._CONSOLIDATION_LEASE_RENEW_SECS", 0.001
+        )
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        token = c._acquire_consolidation_lease(KEY)
+        assert token
+        beats: list[str] = []
+
+        with patch.object(
+            c, "_renew_consolidation_lease", side_effect=lambda k, t: beats.append(t) or True
+        ):
+            task = asyncio.ensure_future(c._heartbeat_consolidation_lease(KEY, token))
+            for _ in range(500):
+                if len(beats) >= 3:
+                    break
+                await asyncio.sleep(0.005)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert beats[:3] == [token, token, token]
+        before = len(beats)
+        await asyncio.sleep(0.02)
+        assert len(beats) == before, "the heartbeat outlived its own cancellation"
+
+    @pytest.mark.asyncio
+    async def test_the_heartbeat_stops_once_the_lease_is_someone_elses(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Nothing to renew and nothing to stop — it must not spin."""
+        monkeypatch.setattr(
+            "kiro_crew.history_consolidation._CONSOLIDATION_LEASE_RENEW_SECS", 0.001
+        )
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+
+        with patch.object(c, "_renew_consolidation_lease", return_value=False):
+            await asyncio.wait_for(c._heartbeat_consolidation_lease(KEY, "gone"), timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_a_pass_renews_while_the_provider_turn_is_in_flight(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The renewal has to land during the one await the pass spends."""
+        monkeypatch.setattr(
+            "kiro_crew.history_consolidation._CONSOLIDATION_LEASE_RENEW_SECS", 0.001
+        )
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        renewed: list[str] = []
+
+        async def _turn(_prompt):
+            # Stand where the provider turn stands, long enough for a beat.
+            for _ in range(200):
+                if renewed:
+                    break
+                await asyncio.sleep(0.005)
+            return {"history_entry": "e"}
+
+        with (
+            patch.object(c, "_call_llm", _turn),
+            patch.object(
+                c, "_renew_consolidation_lease", side_effect=lambda k, t: renewed.append(t) or True
+            ),
+        ):
+            await c._consolidate(KEY, include_history=True)
+
+        assert renewed, "the pass never proved its holder was still working"
 
 
 class TestTakingAndDroppingTheLease:
