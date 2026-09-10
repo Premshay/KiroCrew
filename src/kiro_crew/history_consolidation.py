@@ -53,14 +53,22 @@ _CONSOLIDATION_MAX_ATTEMPTS = 5
 _CONSOLIDATION_BACKOFF_BASE_SECS = 900.0
 _CONSOLIDATION_BACKOFF_MAX_SECS = 86400.0
 _SKILL_DETECTION_WINDOW = 200
-# Rendered bytes of transcript one history consolidation prompt may carry. The
-# unconsolidated tail is otherwise unbounded: a session that goes a long time
+# Rendered CHARACTERS of transcript one history consolidation prompt may carry.
+# The unconsolidated tail is otherwise unbounded: a session that goes a long time
 # between passes — or whose consolidation kept failing — renders every message
 # since the marker into one prompt, and past some length no provider accepts it.
 # The span that most needs extracting is then the one that can never be
-# extracted. 64 KiB leaves room beside it for the instructions and the current
-# memory blocks in every context window Kiro Crew dispatches to.
-_CONSOLIDATION_PROMPT_BUDGET = 64 * 1024
+# extracted.
+#
+# Characters, not bytes: the ceiling exists to keep a prompt inside a context
+# window, and a context window is measured in tokens. Code points track tokens
+# far more evenly across scripts than UTF-8 bytes do — a CJK transcript is
+# roughly one token per character but three bytes per character, so a byte
+# budget would cut it to a third of the span it gives a Latin one for no reason
+# the provider cares about. 65_536 characters leaves room beside the transcript
+# for the instructions and the current memory blocks in every context window
+# Kiro Crew dispatches to.
+_CONSOLIDATION_PROMPT_BUDGET_CHARS = 64 * 1024
 
 _CONSOLIDATION_META_KEYS: frozenset[str] = frozenset(
     {
@@ -70,6 +78,7 @@ _CONSOLIDATION_META_KEYS: frozenset[str] = frozenset(
         "consolidation_attempts_generation",
         "consolidation_attempts_offset",
         "consolidation_attempts_count",
+        "consolidation_attempts_prompted",
     }
 )
 
@@ -88,12 +97,17 @@ class AttemptedSpan(NamedTuple):
 
     ``total`` and ``prompted`` answer different questions and must not be
     collapsed. ``total`` is how far the TRANSCRIPT reached when the turn was
-    charged, and identifies the span for the retry accounting: while a span
-    keeps failing it does not move, which is what makes the attempt cap hold
-    (see :meth:`ConversationLog._attempts_describe_current_span`). ``prompted``
-    is how far the PROMPT reached, and is the only offset the abandon path may
-    write to the durable marker — the tail past it was never sent to any
-    provider, so marking it consolidated would drop it from memory unread.
+    charged. ``prompted`` is how far the PROMPT reached, and is the only offset
+    the abandon path may write to the durable marker — the tail past it was
+    never sent to any provider, so marking it consolidated would drop it from
+    memory unread.
+
+    The retry accounting stamps BOTH, and needs both: ``total`` is what a later
+    transcript is compared against to tell new content from the same content,
+    and ``prompted`` is what says whether that comparison means anything. An
+    attempt that stopped short of ``total`` covered a prefix, and a prefix does
+    not change when messages are appended behind it (see
+    :meth:`ConversationLog._attempts_describe_current_span`).
     """
 
     total: int
@@ -127,7 +141,7 @@ def _consolidation_chunk(messages: list[dict]) -> list[dict]:
 
     The separator is charged too. The prompt joins the rendered messages with
     ``"\\n"``, so a budget computed from the rendered sizes alone lets the
-    transcript block exceed the ceiling by one byte per message — enough to
+    transcript block exceed the ceiling by one character per message — enough to
     matter on a tail of thousands.
 
     A first message that alone exceeds the budget is returned anyway rather than
@@ -138,7 +152,7 @@ def _consolidation_chunk(messages: list[dict]) -> list[dict]:
     normal failed attempt, and the attempt cap abandons that one message so the
     tail behind it consolidates on the next pass.
     """
-    budget = _CONSOLIDATION_PROMPT_BUDGET
+    budget = _CONSOLIDATION_PROMPT_BUDGET_CHARS
     used = 0
     for index, message in enumerate(messages):
         # One separator per message after the first, matching the "\n".join
@@ -726,28 +740,61 @@ class HistoryConsolidator:
         t.add_done_callback(_on_done)
 
     async def consolidate_now(self, key: str) -> bool:
-        """Consolidate a session synchronously (blocking).
+        """Consolidate a session synchronously (blocking), draining the tail.
 
         Unlike consolidate_session() which is fire-and-forget, this awaits
         completion. Used by the CLI command.
 
-        Returns ``False`` when the consolidation retry backoff refused the
-        span — so the CLI can report the skip instead of a false success —
-        and ``True`` for every other completion (including the nothing-to-do
-        and sensitive-session skips, which were already reported as done).
+        Passes repeat until the tail is drained. One pass renders at most
+        :data:`_CONSOLIDATION_PROMPT_BUDGET_CHARS` (see
+        :func:`_consolidation_chunk`), and the CLI process exits when this
+        returns — there is no idle sweep behind it to pick up a remainder the
+        way there is for every in-gateway entry point. A single pass would
+        therefore report a tail larger than the budget as fully consolidated
+        while most of it was never read.
+
+        The loop stops on the first pass that consolidates nothing, not only on
+        an empty tail: a refusal, an unreadable transcript, or a span that the
+        marker cannot advance over all leave the count where it was, and
+        repeating them is an infinite loop rather than progress.
+
+        Returns ``False`` when the first pass was refused by the consolidation
+        retry backoff — so the CLI can report the skip instead of a false
+        success — and ``True`` for every other outcome (including the
+        nothing-to-do and sensitive-session skips, which were already reported
+        as done). A partial drain that then stalls returns ``True``: work did
+        happen, and the caller reports the remainder from its own count rather
+        than from this flag.
 
         Safety: defense-in-depth — the consolidation retry backoff is also
         checked inside _consolidate(), and _run_skill_detection() re-checks
         the sensitive-session guard over its own window.
         """
-        if self._log.unconsolidated_count(key) < 1:
+        remaining = self._log.unconsolidated_count(key)
+        if remaining < 1:
             return True
         messages = self._log._read_messages(key)
         if _session_touched_sensitive(messages):
             self._logger.info("consolidate_now skipped for %s: sensitive session", key)
             return True
-        outcome = await self._consolidate(key, include_history=True)
-        return outcome is not _CONSOLIDATION_REFUSED
+        first_pass = True
+        while remaining > 0:
+            outcome = await self._consolidate(key, include_history=True)
+            if outcome is _CONSOLIDATION_REFUSED:
+                return not first_pass
+            after = self._log.unconsolidated_count(key)
+            if after >= remaining:
+                if after > 0:
+                    self._logger.warning(
+                        "consolidate_now made no progress on %s: %d message(s) "
+                        "still unconsolidated",
+                        key,
+                        after,
+                    )
+                return True
+            remaining = after
+            first_pass = False
+        return True
 
     async def _consolidate(
         self, key: str, include_history: bool = True
