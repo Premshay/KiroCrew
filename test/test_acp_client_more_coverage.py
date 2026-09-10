@@ -55,6 +55,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_RESULT,
     JSONRPC_METHOD_NOT_FOUND,
     METHOD_COMMANDS_EXECUTE,
+    UPDATE_AGENT_MESSAGE_CHUNK,
     UPDATE_AGENT_THOUGHT_CHUNK,
     UPDATE_TOOL_CALL,
     AcpEvent,
@@ -1000,6 +1001,78 @@ class TestExtractHelpers:
             },
         )
         assert client._extract_text_chunk(msg) == ("weighing options", True)
+
+    def test_final_assembled_chunk_is_not_replayed(self, tmp_path):
+        """A backend that repeats the whole message after its deltas is deduped.
+
+        claude-agent-acp against an OpenAI-compatible lane streams the assistant
+        message as deltas and then sends the assembled text once more under the
+        SAME ``messageId``. Read as another delta it doubles every paragraph of
+        the turn — captured live 2026-09-10 as
+        ``'alpha' + ' beta' + ' gamma' + 'alpha beta gamma'``.
+        """
+        client = _client(tmp_path)
+
+        def chunk(text, mid="chatcmpl-1"):
+            return _notify(
+                "session/update",
+                {
+                    "update": {
+                        "sessionUpdate": UPDATE_AGENT_MESSAGE_CHUNK,
+                        "content": {"text": text},
+                        "messageId": mid,
+                    }
+                },
+            )
+
+        assert client._extract_text_chunk(chunk("alpha")) == ("alpha", False)
+        assert client._extract_text_chunk(chunk(" beta")) == (" beta", False)
+        assert client._extract_text_chunk(chunk(" gamma")) == (" gamma", False)
+        # The replay of everything already streamed for this messageId.
+        assert client._extract_text_chunk(chunk("alpha beta gamma")) == (None, False)
+
+    def test_a_second_delta_equal_to_the_first_is_kept(self, tmp_path):
+        """Only a replay of MULTIPLE deltas is dropped, never a real repetition.
+
+        A message whose second delta happens to equal the first ("ha" + "ha")
+        is indistinguishable from a replay by text alone, so the guard also
+        requires that more than one delta was already seen.
+        """
+        client = _client(tmp_path)
+
+        def chunk(text):
+            return _notify(
+                "session/update",
+                {
+                    "update": {
+                        "sessionUpdate": UPDATE_AGENT_MESSAGE_CHUNK,
+                        "content": {"text": text},
+                        "messageId": "chatcmpl-2",
+                    }
+                },
+            )
+
+        assert client._extract_text_chunk(chunk("ha")) == ("ha", False)
+        assert client._extract_text_chunk(chunk("ha")) == ("ha", False)
+
+    def test_chunks_without_a_message_id_are_never_deduped(self, tmp_path):
+        """kiro-cli sends no ``messageId``; its stream must pass through whole."""
+        client = _client(tmp_path)
+
+        def chunk(text):
+            return _notify(
+                "session/update",
+                {
+                    "update": {
+                        "sessionUpdate": UPDATE_AGENT_MESSAGE_CHUNK,
+                        "content": {"text": text},
+                    }
+                },
+            )
+
+        assert client._extract_text_chunk(chunk("a")) == ("a", False)
+        assert client._extract_text_chunk(chunk("b")) == ("b", False)
+        assert client._extract_text_chunk(chunk("ab")) == ("ab", False)
 
     def test_thought_chunk_with_malformed_content_degrades(self, tmp_path):
         client = _client(tmp_path)
