@@ -5844,24 +5844,36 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         def _rollback_switch() -> None:
             """Unwind this request's commit — only the values still OURS.
 
-            EVERY field is unwound on IDENTITY of its commit token, never
-            value equality: unlocked writers (the in-turn /agent and
-            set_project directives in chat_runner, members, openai_compat)
-            can write the SAME text during this handler's awaits — the
-            in-turn set_project directive can legitimately write the very
-            project this handler derived — and a value compare-and-set would
-            erase that successful concurrent write. Any write replaces the
-            token object, so an identity match proves the field is still
-            this commit's; a field this request never committed (the
-            write-side CAS lost) has a None token and is never touched.
+            Fields are unwound on IDENTITY of their commit token, never value
+            equality: unlocked writers (the in-turn /agent and set_project
+            directives in chat_runner, members, openai_compat) can write the
+            SAME text during this handler's awaits — the in-turn set_project
+            directive can legitimately write the very project this handler
+            derived — and a value compare-and-set would erase that successful
+            concurrent write. Any write replaces the token object, so an
+            identity match proves the field is still this commit's; a field
+            this request never committed (the write-side CAS lost) has a None
+            token and is never touched.
+
+            ``slot.model`` is the exception, on its own comment below: its
+            unlocked writers include rewrites that are not picks at all, so
+            identity there proves nothing about ownership.
             """
             if slot.agent is committed_agent:
                 slot.agent = prior_agent
+            # slot.model is the ONE field authorized by generation rather than
+            # token identity, because it has writers that are not picks: a
+            # concurrent turn normalizes it (chat_runner _normalize_model) and
+            # backfills its canonical id, replacing the token object without
+            # touching _model_pick_gen. Requiring identity here let those
+            # incidental rewrites read as "a concurrent pick owns this", so a
+            # rejected switch kept its own cleared model and prior_model was
+            # never restored. The generation is what actually separates the two
+            # cases: every real pick bumps it, no incidental rewrite does.
             if (
-                committed_model is not None
-                and slot.model is committed_model
-                and slot._active_fallback_model is committed_active_fallback_model
+                committed_model_pick_gen is not None
                 and slot._model_pick_gen == committed_model_pick_gen
+                and slot._active_fallback_model is committed_active_fallback_model
             ):
                 slot.model = prior_model
                 slot._model_pick_gen = prior_model_pick_gen
@@ -6019,6 +6031,13 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 )
             except Exception:
                 logger.warning("Failed to persist agent for slot %s", name, exc_info=True)
+                # The switch stands in memory but not on disk, so a restart
+                # would rehydrate the previous agent and model — the pair this
+                # request just replaced because they were incompatible. The
+                # periodic flush writes the same two fields, but only while
+                # _dirty is set, so a swallowed failure has to re-arm it or the
+                # write is simply lost.
+                slot._dirty = True
 
         if effective_session_key(slot) != session_key:
             # A binding can land during the metadata await too — the rebound
@@ -6044,6 +6063,10 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                     logger.warning(
                         "Failed to restore agent metadata for slot %s", name, exc_info=True
                     )
+                    # Same reasoning as the persist above, mirrored: the 409
+                    # says nothing changed, so metadata still naming the
+                    # rolled-back switch has to be corrected by the flush.
+                    slot._dirty = True
             return web.json_response(
                 {"error": "slot session was rebound during the switch", "code": "session_rebound"},
                 status=409,
