@@ -1047,12 +1047,100 @@ class TestDeliveryOutbox(_Base):
                 return [{"head": {"sha": "head"}}]
             if path.endswith("/reviews"):
                 return [{"id": "45", "state": "COMMENTED", "commit_id": "head",
-                         "body": wire["body"]}]
+                         "user": {"login": "sage-bot"}, "body": wire["body"]}]
             return []
+
+        with unittest.mock.patch.object(D.discovery, "run_gh_json", github), \
+                unittest.mock.patch.object(D, "_authenticated_login", lambda: "sage-bot"):
+            status, review_id, error = D._probe_delivery(self.LINK, intent, wire)
+        self.assertEqual((status, review_id, error), (D.DeliveryProbe.FOUND, "45", ""))
+
+    def test_a_matching_review_from_another_account_is_not_our_delivery(self):
+        """The marker is readable by anyone who can read the PR."""
+        payload = {"body": "summary", "commit_id": "head", "comments": []}
+        operation_id = "f" * 32
+        wire = D._outbound_payload(payload, operation_id)
+        intent = {"operation_id": operation_id, "target": self.LINK,
+                  "revision": "head", "payload_digest": D._payload_digest(wire)}
+
+        def github(path, jq=None, *, paginate=False, host=None):
+            if path.endswith("/pulls/1"):
+                return [{"head": {"sha": "head"}}]
+            if path.endswith("/reviews"):
+                return [{"id": "45", "state": "COMMENTED", "commit_id": "head",
+                         "user": {"login": "someone-else"}, "body": wire["body"]}]
+            return []
+
+        with unittest.mock.patch.object(D.discovery, "run_gh_json", github), \
+                unittest.mock.patch.object(D, "_authenticated_login", lambda: "sage-bot"):
+            status, review_id, error = D._probe_delivery(self.LINK, intent, wire)
+        self.assertEqual(status, D.DeliveryProbe.CONFLICT)
+        self.assertIn("another account", error)
+        self.assertEqual(review_id, "")
+
+    def test_an_unverifiable_account_is_unknown_not_confirmed(self):
+        """Fail closed: an unreadable login must not confirm a delivery."""
+        payload = {"body": "summary", "commit_id": "head", "comments": []}
+        operation_id = "1" * 32
+        wire = D._outbound_payload(payload, operation_id)
+        intent = {"operation_id": operation_id, "target": self.LINK,
+                  "revision": "head", "payload_digest": D._payload_digest(wire)}
+
+        def github(path, jq=None, *, paginate=False, host=None):
+            if path.endswith("/pulls/1"):
+                return [{"head": {"sha": "head"}}]
+            if path.endswith("/reviews"):
+                return [{"id": "45", "state": "COMMENTED", "commit_id": "head",
+                         "user": {"login": "sage-bot"}, "body": wire["body"]}]
+            return []
+
+        with unittest.mock.patch.object(D.discovery, "run_gh_json", github), \
+                unittest.mock.patch.object(D, "_authenticated_login", lambda: None):
+            status, _review_id, error = D._probe_delivery(self.LINK, intent, wire)
+        self.assertEqual(status, D.DeliveryProbe.UNKNOWN)
+        self.assertIn("could not confirm the posting account", error)
+
+    def test_a_deleted_predecessor_is_absent_not_a_permanent_conflict(self):
+        """A draft that is gone cannot reappear, so CONFLICT stranded the run."""
+        payload = {"body": "summary", "commit_id": "head", "comments": []}
+        operation_id = "2" * 32
+        wire = D._outbound_payload(payload, operation_id)
+        intent = {"operation_id": operation_id, "target": self.LINK,
+                  "revision": "head", "payload_digest": D._payload_digest(wire),
+                  "predecessor": {"operation_id": "3" * 32, "review_id": "99",
+                                  "payload_digest": "sha256:whatever"}}
+
+        def github(path, jq=None, *, paginate=False, host=None):
+            if path.endswith("/pulls/1"):
+                return [{"head": {"sha": "head"}}]
+            return []  # the predecessor draft was deleted; no reviews remain
 
         with unittest.mock.patch.object(D.discovery, "run_gh_json", github):
             status, review_id, error = D._probe_delivery(self.LINK, intent, wire)
-        self.assertEqual((status, review_id, error), (D.DeliveryProbe.FOUND, "45", ""))
+        self.assertEqual((status, review_id, error), (D.DeliveryProbe.ABSENT, "", ""))
+
+    def test_a_predecessor_that_left_the_draft_state_is_still_a_conflict(self):
+        """Submitted, not deleted: posting again would duplicate a delivery."""
+        payload = {"body": "summary", "commit_id": "head", "comments": []}
+        operation_id = "4" * 32
+        wire = D._outbound_payload(payload, operation_id)
+        intent = {"operation_id": operation_id, "target": self.LINK,
+                  "revision": "head", "payload_digest": D._payload_digest(wire),
+                  "predecessor": {"operation_id": "5" * 32, "review_id": "99",
+                                  "payload_digest": "sha256:whatever"}}
+
+        def github(path, jq=None, *, paginate=False, host=None):
+            if path.endswith("/pulls/1"):
+                return [{"head": {"sha": "head"}}]
+            if path.endswith("/reviews"):
+                return [{"id": "99", "state": "COMMENTED", "commit_id": "head",
+                         "user": {"login": "sage-bot"}, "body": "submitted already"}]
+            return []
+
+        with unittest.mock.patch.object(D.discovery, "run_gh_json", github):
+            status, _review_id, error = D._probe_delivery(self.LINK, intent, wire)
+        self.assertEqual(status, D.DeliveryProbe.CONFLICT)
+        self.assertIn("no longer a matching pending draft", error)
 
     def test_unknown_marker_revision_and_payload_mismatches_are_conflicts(self):
         payload = {"body": "summary", "commit_id": "head", "comments": []}

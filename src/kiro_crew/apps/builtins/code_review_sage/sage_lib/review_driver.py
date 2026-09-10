@@ -815,6 +815,14 @@ def _predecessor_instruction(predecessor: dict | None) -> str:
             "a review discovered only by the generic Sage marker or a human draft.\n")
 
 
+def _authenticated_login() -> str | None:
+    """The `gh` login this host posts as, or None when it cannot be determined."""
+    try:
+        return discovery.current_login()
+    except (discovery.GhError, discovery.GhSetupError, OSError):
+        return None
+
+
 def _probe_delivery(link: str, intent: dict, payload: dict) -> tuple[DeliveryProbe, str, str]:
     """Reconcile an operation against GitHub without mutating remote state."""
     operation_id = intent.get("operation_id")
@@ -849,9 +857,15 @@ def _probe_delivery(link: str, intent: dict, payload: dict) -> tuple[DeliveryPro
     predecessor_digest = str((predecessor or {}).get("payload_digest") or "")
     found_id = ""
     predecessor_seen = False
+    predecessor_exists = False
     for review in reviews:
         review_id = str(review.get("id") or "")
         body = str(review.get("body") or "")
+        # Recorded before the PENDING filter below, so a predecessor that was
+        # submitted (or otherwise left the draft state) is distinguishable from
+        # one that is genuinely gone. The two need opposite answers.
+        if predecessor_id and review_id == predecessor_id:
+            predecessor_exists = True
         if marker in body:
             try:
                 comments = discovery.run_gh_json(f"repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/comments",
@@ -860,6 +874,21 @@ def _probe_delivery(link: str, intent: dict, payload: dict) -> tuple[DeliveryPro
                 return DeliveryProbe.UNKNOWN, "", f"could not read posted review {review_id}: {exc}"
             if _payload_digest(_remote_payload(review, comments)) != str(intent.get("payload_digest") or ""):
                 return DeliveryProbe.CONFLICT, "", "operation marker matched a review with different payload"
+            # Matching body and payload prove the CONTENT is ours, not that we
+            # posted it. The marker is readable by anyone who can read this PR,
+            # and the record carrying the intent is worker-writable, so content
+            # alone would let a review posted by another account be adopted as
+            # this operation's own delivery. Checked here rather than at the
+            # marker, so a genuine payload mismatch still reports as the
+            # conflict it is.
+            author = str(((review.get("user") or {}).get("login") or ""))
+            login = _authenticated_login()
+            if login is None:
+                return (DeliveryProbe.UNKNOWN, "",
+                        "could not confirm the posting account for a matched review")
+            if author.casefold() != login.casefold():
+                return (DeliveryProbe.CONFLICT, "",
+                        "operation marker matched a review posted by another account")
             found_id = review_id
             continue
         if str(review.get("state") or "") != "PENDING":
@@ -880,7 +909,15 @@ def _probe_delivery(link: str, intent: dict, payload: dict) -> tuple[DeliveryPro
             return DeliveryProbe.CONFLICT, "", "multiple pending drafts block confirmation"
         return DeliveryProbe.FOUND, found_id, ""
     if predecessor and not predecessor_seen:
-        return DeliveryProbe.CONFLICT, "", "known predecessor draft is absent or changed"
+        # A predecessor still on the PR but no longer a matching pending draft
+        # is a real conflict — it may have been submitted, and posting again
+        # would duplicate a delivered review. One that is not on the PR at all
+        # was deleted, and there is nothing left to reconcile: answering
+        # CONFLICT there stranded the operation permanently, because no retry
+        # could ever make the deleted draft reappear.
+        if predecessor_exists:
+            return (DeliveryProbe.CONFLICT, "",
+                    "known predecessor draft is no longer a matching pending draft")
     return DeliveryProbe.ABSENT, "", ""
 
 
