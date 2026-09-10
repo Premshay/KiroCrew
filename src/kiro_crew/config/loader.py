@@ -4601,7 +4601,6 @@ class KiroCrewConfig:
         if not gateway.enabled:
             return {
                 "mcp_gateway_overlay": None,
-                "mcp_gateway_settings_mcp_json": None,
                 "mcp_gateway_socket": None,
                 "mcp_gateway_claude_servers": [],
             }
@@ -4609,7 +4608,6 @@ class KiroCrewConfig:
         overlay = gateway.overlay_dir or str(default_overlay_dir())
         return {
             "mcp_gateway_overlay": overlay,
-            "mcp_gateway_settings_mcp_json": str(Path(overlay).parent / "settings" / "mcp.json"),
             "mcp_gateway_socket": gateway.socket_path or str(default_socket_path()),
             "mcp_gateway_claude_servers": gateway.claude_session_servers,
         }

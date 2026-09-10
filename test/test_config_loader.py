@@ -4513,7 +4513,6 @@ class TestOrchestratorWatchdogThemeAreParsed:
 
         assert cfg.mcp_gateway_provider_kwargs() == {
             "mcp_gateway_overlay": "/run/kiro/overlay",
-            "mcp_gateway_settings_mcp_json": "/run/kiro/settings/mcp.json",
             "mcp_gateway_socket": "/run/kiro/gateway.sock",
             "mcp_gateway_claude_servers": ["context7"],
         }
