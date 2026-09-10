@@ -766,9 +766,13 @@ class HistoryConsolidator:
         happen, and the caller reports the remainder from its own count rather
         than from this flag.
 
-        Safety: defense-in-depth — the consolidation retry backoff is also
-        checked inside _consolidate(), and _run_skill_detection() re-checks
-        the sensitive-session guard over its own window.
+        Safety: the pre-check above is a scheduling short-circuit over the
+        transcript as it stands now; a live session can append a sensitive
+        tool event between passes, so enforcement lives in _consolidate(),
+        which re-checks the guard against the snapshot it is about to prompt.
+        The consolidation retry backoff is re-checked there too, and
+        _run_skill_detection() re-checks the sensitive guard over its own
+        window.
         """
         remaining = self._log.unconsolidated_count(key)
         if remaining < 1:
@@ -855,6 +859,19 @@ class HistoryConsolidator:
             if not self.retry_eligible(key, message_count=total):
                 self._logger.info("_consolidate refused for %s: consolidation retry backoff", key)
                 return _CONSOLIDATION_REFUSED
+            # Sensitive-session enforcement, on the same terms as the retry
+            # gate above: every entry point funnels through here, so a span
+            # that touched a sensitive path is skipped before anything reaches
+            # the provider. Callers keep their whole-session pre-checks as
+            # scheduling short-circuits; this gate is what holds when the tail
+            # a caller cleared is no longer the tail being prompted — a later
+            # pass of a multi-pass drain, or a future entry point with no
+            # pre-check of its own. Checked against the atomic snapshot rather
+            # than a fresh read, so no second transcript read lands on the
+            # event loop, and the span judged covers the span prompted.
+            if _session_touched_sensitive(unconsolidated):
+                self._logger.info("_consolidate skipped for %s: sensitive session", key)
+                return None
             # Freeze the whole span identity from that one snapshot. The offset is
             # derived rather than returned because the snapshot slices at it
             # (``messages[offset:]``), so the subtraction is exact and comes from

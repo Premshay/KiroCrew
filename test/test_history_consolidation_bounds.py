@@ -439,6 +439,63 @@ class TestConsolidateNowDrainsTheTail:
         assert log.unconsolidated_count(KEY) == 4
 
     @pytest.mark.asyncio
+    async def test_a_tail_that_turns_sensitive_mid_drain_is_never_prompted(
+        self, tmp_path
+    ) -> None:
+        """The tail a pass prompts is not the tail the pre-check cleared.
+
+        A live session keeps appending while the drain runs, so a sensitive tool
+        event can land between passes. The one pre-check before the loop cleared
+        a transcript that no longer exists by the second pass.
+        """
+        # Sized so one pass consumes several messages: the sensitive append has
+        # to leave net progress behind it, or the loop exits on the no-progress
+        # branch and never reaches a second pass at all.
+        log = _log_with(tmp_path, ["x" * (_CONSOLIDATION_PROMPT_BUDGET_CHARS // 5)] * 12)
+        c = _make_consolidator(log)
+        real = c._consolidate
+        prompts: list[str] = []
+        leaked = False
+
+        async def _leak_between_passes(key: str, include_history: bool = True):
+            nonlocal leaked
+            outcome = await real(key, include_history=include_history)
+            if not leaked:
+                leaked = True
+                with history_mod.allow_on_loop_persist():
+                    log.append(KEY, "tool", "cat /home/u/.ssh/id_ed25519")
+            return outcome
+
+        async def _record(prompt: str) -> dict:
+            prompts.append(prompt)
+            return {"history_entry": "e"}
+
+        with patch.object(c, "_call_llm", _record):
+            with patch.object(c, "_consolidate", _leak_between_passes):
+                assert await c.consolidate_now(KEY) is True
+
+        assert len(prompts) == 1, "the drain prompted a span that had turned sensitive"
+        assert not any(".ssh/" in p for p in prompts), "sensitive tail reached the provider"
+        assert log.unconsolidated_count(KEY), "the unread remainder must stay unmarked"
+
+    @pytest.mark.asyncio
+    async def test_consolidate_refuses_a_sensitive_snapshot_without_a_pre_check(
+        self, tmp_path
+    ) -> None:
+        """The choke point holds for a caller that carries no pre-check."""
+        log = _log_with(tmp_path, [f"m{i}" for i in range(4)])
+        with history_mod.allow_on_loop_persist():
+            log.append(KEY, "tool", "cat /home/u/.aws/credentials")
+        c = _make_consolidator(log)
+        call = AsyncMock(return_value={"history_entry": "e"})
+
+        with patch.object(c, "_call_llm", call):
+            assert await c._consolidate(KEY, include_history=True) is None
+
+        call.assert_not_awaited()
+        assert log.unconsolidated_count(KEY) == 5, "nothing may be marked as read"
+
+    @pytest.mark.asyncio
     async def test_a_refusal_after_progress_is_not_a_skip(self, tmp_path) -> None:
         """Work happened; the caller reports the remainder from its own count."""
         log = _log_with(tmp_path, ["x" * (_CONSOLIDATION_PROMPT_BUDGET_CHARS // 2)] * 8)
