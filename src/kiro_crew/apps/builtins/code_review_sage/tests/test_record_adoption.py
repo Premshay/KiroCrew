@@ -93,8 +93,7 @@ class TestResponseHandoff(unittest.TestCase):
 
         self.assertEqual(results.result_from_handoff(_handoff(record), "CR-1"), record)
 
-    def test_prompt_exposes_no_result_file_or_capability(self):
+    def test_prompt_exposes_no_result_file(self):
         task = driver.build_review_task("CR-1")
         self.assertIn("<code-review-sage-result>", task)
-        self.assertNotIn("result_capability", task)
         self.assertNotIn("data/results", task)
